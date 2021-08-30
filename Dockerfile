@@ -18,6 +18,7 @@ RUN apt-get clean && apt-get update &&\
       iproute2 \
       make \
       gnupg \
+      apt-utils \
       iputils-ping &&\
   apt-get -y clean all
 
@@ -53,7 +54,7 @@ ENV STATSD_CONF_FILE ${AIS_CONF_DIR}/statsd.conf
 
 ENV MOUNTPATH /tmp/ais
 
-COPY aisnode_config.sh aisnode_config.sh
+COPY deploy/dev/local/aisnode_config.sh aisnode_config.sh
 COPY deploy/dev/docker/entrypoint/entrypoint.sh entrypoint.sh
 
 RUN mkdir -p $GOPATH/src/github.com/NVIDIA && \
