@@ -1,11 +1,12 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -13,82 +14,66 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/bench/aisloader/stats"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	jsoniter "github.com/json-iterator/go"
 )
 
-var examples = `
-1. Cleanup (i.e., destroy) an existing bucket:
+var examples = `# 1. Cleanup (i.e., destroy) an existing bucket:
+     $ aisloader -bucket=ais://abc -duration 0s -totalputsize=0 -cleanup=true
+     $ aisloader -bucket=mybucket -provider=aws -cleanup=true -duration 0s -totalputsize=0
+# 2. Timed 100% PUT via 8 parallel workers into an ais bucket (that may or may not exists) with
+     complete cleanup upon termination (NOTE: cleanup involves emptying the specified bucket):
+     $ aisloader -bucket=ais://abc -duration 30s -numworkers=8 -minsize=1K -maxsize=1K -pctput=100 --cleanup=true
+# 3. Timed (for 1h) 100% GET from an existing AWS S3 bucket, no cleanup:
+     $ aisloader -bucket=nvaws -duration 1h -numworkers=30 -pctput=0 -provider=aws -cleanup=false
+# or, same:
+     $ aisloader -bucket=s3://nvaws -duration 1h -numworkers=30 -pctput=0 -cleanup=false
 
-	$ aisloader -bucket=ais://abc -duration 0s -totalputsize=0 -cleanup=true
-	$ aisloader -bucket=mybucket -provider=aws -cleanup=true -duration 0s -totalputsize=0
+# 4. Mixed 30%/70% PUT and GET of variable-size objects to/from an AWS S3 bucket.
+#    PUT will generate random object names and the duration is limited only by the total size (10GB).
+#    Cleanup enabled - upon completion all generated objects and the bucket itself will be deleted:
+     $ aisloader -bucket=s3://nvaws -duration 0s -cleanup=true -numworkers=3 -minsize=1024 -maxsize=1MB -pctput=30 -totalputsize=10G
+# 5. PUT 1GB total into an ais bucket with cleanup disabled, object size = 1MB, duration unlimited:
+     $ aisloader -bucket=ais://abc -cleanup=false -totalputsize=1G -duration=0 -minsize=1MB -maxsize=1MB -numworkers=8 -pctput=100
+# 6. 100% GET from an ais bucket (no cleanup):
+     $ aisloader -bucket=ais://abc -duration 15s -numworkers=3 -pctput=0 -cleanup=false
+# or, same:
+     $ aisloader -bucket=abc -provider=ais -duration 5s -numworkers=3 -pctput=0 -cleanup=false
 
-2. Time-based 100% PUT into ais bucket with complete cleanup upon exit:
-
-	$ aisloader -bucket=ais://abc -duration 10s -numworkers=3 -minsize=1K -maxsize=1K -pctput=100 --cleanup=true
-
-3. Timed (for 1h) 100% GET from an AWS S3 bucket, no cleanup:
-
-	$ aisloader -bucket=nvaws -duration 1h -numworkers=30 -pctput=0 -provider=aws -cleanup=false
-   or, same:
-	$ aisloader -bucket=s3://nvaws -duration 1h -numworkers=30 -pctput=0 -cleanup=false
-
-4. Mixed 30%/70% PUT and GET of variable-size objects to/from an AWS S3 bucket.
-   PUT will generate random object names and the duration is limited only by the total size (10GB).
-   Cleanup enabled - upon completion all generated objects and the bucket itself will be deleted:
-
-	$ aisloader -bucket=s3://nvaws -duration 0s -cleanup=true -numworkers=3 -minsize=1024 -maxsize=1MB -pctput=30 -totalputsize=10G
-
-5. PUT 1GB total into an ais bucket with cleanup disabled, object size = 1MB, duration unlimited:
-
-	$ aisloader -bucket=ais://abc -cleanup=false -totalputsize=1G -duration=0 -minsize=1MB -maxsize=1MB -numworkers=8 -pctput=100
-
-6. 100% GET from an ais bucket (no cleanup):
-
-	$ aisloader -bucket=ais://abc -duration 5s -numworkers=3 -pctput=0 -cleanup=false
-  or, same:
-	$ aisloader -bucket=abc -provider=ais -duration 5s -numworkers=3 -pctput=0 -cleanup=false
-
-7. PUT 2000 objects named as 'aisloader/hex({0..2000}{loaderid})', cleanup upon exit:
-
-	$ aisloader -bucket=ais://abc -duration 10s -numworkers=3 -loaderid=11 -loadernum=20 -maxputs=2000 -objNamePrefix="aisloader" -cleanup=true
-
-8. Use random object names and loaderID to report statistics:
-
-	$ aisloader -loaderid=10
-
-9. PUT objects with random name generation being based on the specified loaderID and the total number of concurrent aisloaders:
-
-	$ aisloader -loaderid=10 -loadernum=20
-
-10. Same as above except that loaderID is computed by the aisloader as hash(loaderstring) & 0xff:
-
-	$ aisloader -loaderid=loaderstring -loaderidhashlen=8
-
-11. Print loaderID and exit (all 3 examples below) with the resulting loaderID shown on the right:",
-
-	$ aisloader -getloaderid (0x0)",
-	$ aisloader -loaderid=10 -getloaderid (0xa)
-	$ aisloader -loaderid=loaderstring -loaderidhashlen=8 -getloaderid (0xdb)
-
+# 7. PUT 2000 objects named as 'aisloader/hex({0..2000}{loaderid})', cleanup upon exit:
+     $ aisloader -bucket=ais://abc -duration 10s -numworkers=3 -loaderid=11 -loadernum=20 -maxputs=2000 -objNamePrefix="aisloader" -cleanup=true
+# 8. Use random object names and loaderID to report statistics:
+     $ aisloader -loaderid=10
+# 9. PUT objects with random name generation being based on the specified loaderID and the total number of concurrent aisloaders:
+     $ aisloader -loaderid=10 -loadernum=20
+# 10. Same as above except that loaderID is computed by the aisloader as hash(loaderstring) & 0xff:
+     $ aisloader -loaderid=loaderstring -loaderidhashlen=8
+# 11. Print loaderID and exit (all 3 examples below) with the resulting loaderID commented on the right:",
+     $ aisloader -getloaderid 			# 0x0
+     $ aisloader -loaderid=10 -getloaderid	# 0xa
+     $ aisloader -loaderid=loaderstring -loaderidhashlen=8 -getloaderid	# 0xdb
 `
 
+const readme = cmn.GitHubHome + "/blob/master/docs/howto_benchmark.md"
+
 func printUsage(f *flag.FlagSet) {
+	fmt.Printf("aisloader v%s (build %s)\n", _version, _buildtime)
 	fmt.Println("\nAbout")
 	fmt.Println("=====")
-	fmt.Printf("AIS loader (aisloader v%s, build %s) is a tool to measure storage performance.\n", _version, _build)
-	fmt.Println("It's a load generator that has been developed (and is currently used) to benchmark and")
-	fmt.Println("stress-test AIStore(tm) but can be easily extended for any S3-compatible backend.")
-	fmt.Println("For usage, run: `aisloader` or `aisloader usage` or `aisloader --help`.")
-	fmt.Println("Further details at https://github.com/NVIDIA/aistore/blob/master/docs/howto_benchmark.md")
+	fmt.Println("AIS Loader (aisloader) is a benchmarking tool to measure AIStore performance.")
+	fmt.Println("It's a load generator that has been developed to benchmark and stress-test AIStore")
+	fmt.Println("but can be easily extended to benchmark any S3-compatible backend.")
+	fmt.Println("For usage, run: `aisloader`, or `aisloader usage`, or `aisloader --help`.")
+	fmt.Println("Further details at " + readme)
 
 	fmt.Println("\nCommand-line options")
 	fmt.Println("====================")
 	f.PrintDefaults()
 	fmt.Println()
 
-	fmt.Println("\nExamples")
+	fmt.Println("Examples")
 	fmt.Println("========")
 	fmt.Print(examples)
 }
@@ -106,14 +91,14 @@ func prettyBytes(n int64) string {
 	if n <= 0 { // process special case that B2S do not cover
 		return "-"
 	}
-	return cos.B2S(n, 1)
+	return cos.ToSizeIEC(n, 1)
 }
 
 func prettySpeed(n int64) string {
 	if n <= 0 {
 		return "-"
 	}
-	return cos.B2S(n, 2) + "/s"
+	return cos.ToSizeIEC(n, 2) + "/s"
 }
 
 // prettyDuration converts an integer representing a time in nano second to a string
@@ -141,16 +126,16 @@ func prettyLatency(min, avg, max int64) string {
 }
 
 func prettyTimestamp() string {
-	return time.Now().Format("15:04:05")
+	return time.Now().Format(cos.StampSec)
 }
 
 func preWriteStats(to io.Writer, jsonFormat bool) {
-	fmt.Fprintln(to)
 	if !jsonFormat {
+		fmt.Fprintln(to)
 		fmt.Fprintf(to, statsPrintHeader,
 			"Time", "OP", "Count", "Size (Total)", "Latency (min, avg, max)", "Throughput (Avg)", "Errors (Total)")
 	} else {
-		fmt.Fprintln(to, "[")
+		fmt.Fprint(to, "[")
 	}
 }
 
@@ -213,7 +198,8 @@ func writeStatsJSON(to io.Writer, s sts, withcomma ...bool) {
 		Cfg: jsonStatsFromReq(s.getConfig),
 	}
 
-	jsonOutput := cos.MustMarshal(jStats)
+	jsonOutput, err := json.MarshalIndent(jStats, "", "  ")
+	cos.AssertNoErr(err)
 	fmt.Fprintf(to, "\n%s", string(jsonOutput))
 	// print comma by default
 	if len(withcomma) == 0 || withcomma[0] {
@@ -221,7 +207,7 @@ func writeStatsJSON(to io.Writer, s sts, withcomma ...bool) {
 	}
 }
 
-func fprintf(w io.Writer, format string, a ...interface{}) {
+func fprintf(w io.Writer, format string, a ...any) {
 	_, err := fmt.Fprintf(w, format, a...)
 	debug.AssertNoErr(err)
 }
@@ -278,24 +264,34 @@ func writeHumanReadibleFinalStats(to io.Writer, t sts) {
 	pl := prettyLatency
 	pt := prettyTimestamp
 	preWriteStats(to, false)
-	p(to, statsPrintHeader, pt(), "PUT",
-		pn(t.put.Total()),
-		pb(t.put.TotalBytes()),
-		pl(t.put.MinLatency(), t.put.AvgLatency(), t.put.MaxLatency()),
-		ps(t.put.Throughput(t.put.Start(), time.Now())),
-		pn(t.put.TotalErrs()))
-	p(to, statsPrintHeader, pt(), "GET",
-		pn(t.get.Total()),
-		pb(t.get.TotalBytes()),
-		pl(t.get.MinLatency(), t.get.AvgLatency(), t.get.MaxLatency()),
-		ps(t.get.Throughput(t.get.Start(), time.Now())),
-		pn(t.get.TotalErrs()))
-	p(to, statsPrintHeader, pt(), "CFG",
-		pn(t.getConfig.Total()),
-		pb(t.getConfig.TotalBytes()),
-		pl(t.getConfig.MinLatency(), t.getConfig.AvgLatency(), t.getConfig.MaxLatency()),
-		pb(t.getConfig.Throughput(t.getConfig.Start(), time.Now())),
-		pn(t.getConfig.TotalErrs()))
+
+	sput := &t.put
+	if sput.Total() > 0 {
+		p(to, statsPrintHeader, pt(), "PUT",
+			pn(sput.Total()),
+			pb(sput.TotalBytes()),
+			pl(sput.MinLatency(), sput.AvgLatency(), sput.MaxLatency()),
+			ps(sput.Throughput(sput.Start(), time.Now())),
+			pn(sput.TotalErrs()))
+	}
+	sget := &t.get
+	if sget.Total() > 0 {
+		p(to, statsPrintHeader, pt(), "GET",
+			pn(sget.Total()),
+			pb(sget.TotalBytes()),
+			pl(sget.MinLatency(), sget.AvgLatency(), sget.MaxLatency()),
+			ps(sget.Throughput(sget.Start(), time.Now())),
+			pn(sget.TotalErrs()))
+	}
+	sconfig := &t.getConfig
+	if sconfig.Total() > 0 {
+		p(to, statsPrintHeader, pt(), "CFG",
+			pn(sconfig.Total()),
+			pb(sconfig.TotalBytes()),
+			pl(sconfig.MinLatency(), sconfig.AvgLatency(), sconfig.MaxLatency()),
+			pb(sconfig.Throughput(sconfig.Start(), time.Now())),
+			pn(sconfig.TotalErrs()))
+	}
 }
 
 // writeStatus writes stats to the writter.
@@ -311,7 +307,7 @@ func writeStats(to io.Writer, jsonFormat, final bool, s, t sts) {
 
 // printRunParams show run parameters in json format
 func printRunParams(p params) {
-	b, _ := jsoniter.MarshalIndent(struct {
+	b, err := jsoniter.MarshalIndent(struct {
 		Seed          int64  `json:"seed,string"`
 		URL           string `json:"proxy"`
 		Bucket        string `json:"bucket"`
@@ -342,6 +338,7 @@ func printRunParams(p params) {
 		Backing:       p.readerType,
 		Cleanup:       p.cleanUp.Val,
 	}, "", "   ")
+	cos.AssertNoErr(err)
 
 	fmt.Printf("Runtime configuration:\n%s\n\n", string(b))
 }

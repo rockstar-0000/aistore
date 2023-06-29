@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -9,183 +9,227 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/nl"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/res"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 // TODO: uplift via higher-level query and similar (#668)
 
 // verb /v1/xactions
-func (t *targetrunner) xactHandler(w http.ResponseWriter, r *http.Request) {
-	var (
-		xactMsg xaction.XactReqMsg
-		bck     *cluster.Bck
-	)
-	if _, err := t.checkRESTItems(w, r, 0, true, cmn.URLPathXactions.L); err != nil {
+func (t *target) xactHandler(w http.ResponseWriter, r *http.Request) {
+	if _, err := t.parseURL(w, r, 0, true, apc.URLPathXactions.L); err != nil {
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
-		var (
-			query = r.URL.Query()
-			what  = query.Get(cmn.URLParamWhat)
-		)
-		if uuid := query.Get(cmn.URLParamUUID); uuid != "" {
-			t.getXactByID(w, r, what, uuid)
-			return
-		}
-		if cmn.ReadJSON(w, r, &xactMsg) != nil {
-			return
-		}
-		if xactMsg.Bck.Name != "" {
-			bck = cluster.NewBckEmbed(xactMsg.Bck)
-			if err := bck.Init(t.owner.bmd); err != nil {
-				t.writeErrSilent(w, r, err, http.StatusNotFound)
-				return
-			}
-		}
-		xactQuery := xreg.XactFilter{
-			ID: xactMsg.ID, Kind: xactMsg.Kind, Bck: bck, OnlyRunning: xactMsg.OnlyRunning,
-		}
-		t.queryMatchingXact(w, r, what, xactQuery)
+		t.httpxget(w, r)
 	case http.MethodPut:
-		var msg cmn.ActionMsg
-		if cmn.ReadJSON(w, r, &msg) != nil {
-			return
-		}
-		if err := cos.MorphMarshal(msg.Value, &xactMsg); err != nil {
-			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
-			return
-		}
-		if !xactMsg.Bck.IsEmpty() {
-			bck = cluster.NewBckEmbed(xactMsg.Bck)
-			if err := bck.Init(t.owner.bmd); err != nil {
-				t.writeErr(w, r, err)
-				return
-			}
-		}
-		switch msg.Action {
-		case cmn.ActXactStart:
-			if err := t.cmdXactStart(&xactMsg, bck); err != nil {
-				t.writeErr(w, r, err)
-				return
-			}
-		case cmn.ActXactStop:
-			if xactMsg.ID != "" {
-				xreg.DoAbortByID(xactMsg.ID)
-				return
-			}
-			xreg.DoAbort(xactMsg.Kind, bck)
-			return
-		default:
-			t.writeErrAct(w, r, msg.Action)
-		}
+		t.httpxput(w, r)
 	default:
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPut)
 	}
 }
 
-func (t *targetrunner) getXactByID(w http.ResponseWriter, r *http.Request, what, uuid string) {
-	if what != cmn.GetWhatXactStats {
+func (t *target) httpxget(w http.ResponseWriter, r *http.Request) {
+	var (
+		xactMsg xact.QueryMsg
+		bck     *meta.Bck
+		query   = r.URL.Query()
+		what    = query.Get(apc.QparamWhat)
+	)
+	if uuid := query.Get(apc.QparamUUID); uuid != "" {
+		t.xget(w, r, what, uuid)
+		return
+	}
+	if cmn.ReadJSON(w, r, &xactMsg) != nil {
+		return
+	}
+	debug.Assert(xactMsg.Kind == "" || xact.IsValidKind(xactMsg.Kind), xactMsg.Kind)
+
+	// TODO: always return both running & idle, propagate the (api) change throughout
+	if what == apc.WhatAllRunningXacts {
+		out, _ := xreg.GetAllRunning(xactMsg.Kind, false /*separate idle*/)
+		t.writeJSON(w, r, out, what)
+		return
+	}
+	if what != apc.WhatQueryXactStats {
 		t.writeErrf(w, r, fmtUnknownQue, what)
 		return
 	}
-	xact := xreg.GetXact(uuid)
-	if xact != nil {
-		t.writeJSON(w, r, xact.Stats(), what)
-		return
+
+	if xactMsg.Bck.Name != "" {
+		bck = meta.CloneBck(&xactMsg.Bck)
+		if err := bck.Init(t.owner.bmd); err != nil {
+			t.writeErr(w, r, err, http.StatusNotFound, Silent)
+			return
+		}
 	}
-	err := cmn.NewXactionNotFoundError("[" + uuid + "]")
-	t.writeErrSilent(w, r, err, http.StatusNotFound)
+	xactQuery := xreg.Flt{
+		ID: xactMsg.ID, Kind: xactMsg.Kind, Bck: bck, OnlyRunning: xactMsg.OnlyRunning,
+	}
+	t.xquery(w, r, what, xactQuery)
 }
 
-func (t *targetrunner) queryMatchingXact(w http.ResponseWriter, r *http.Request, what string, xactQuery xreg.XactFilter) {
-	debug.Assert(what == cmn.GetWhatQueryXactStats)
-	if what != cmn.GetWhatQueryXactStats {
+func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
+	var (
+		xargs xact.ArgsMsg
+		bck   *meta.Bck
+	)
+	msg, err := t.readActionMsg(w, r)
+	if err != nil {
+		return
+	}
+	if err := cos.MorphMarshal(msg.Value, &xargs); err != nil {
+		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
+		return
+	}
+	if !xargs.Bck.IsEmpty() {
+		bck = meta.CloneBck(&xargs.Bck)
+		if err := bck.Init(t.owner.bmd); err != nil && msg.Action != apc.ActXactStop {
+			// proceed anyway to stop
+			t.writeErr(w, r, err)
+			return
+		}
+	}
+	if config := cmn.GCO.Get(); config.FastV(4, cos.SmoduleAIS) {
+		nlog.Infof("%s %s", msg.Action, xargs.String())
+	}
+	switch msg.Action {
+	case apc.ActXactStart:
+		debug.Assert(xact.IsValidKind(xargs.Kind), xargs.String())
+		if err := t.xstart(r, &xargs, bck); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+	case apc.ActXactStop:
+		debug.Assert(xact.IsValidKind(xargs.Kind) || xact.IsValidUUID(xargs.ID), xargs.String())
+		err := cmn.ErrXactUserAbort
+		if msg.Name == cmn.ErrXactICNotifAbort.Error() {
+			err = cmn.ErrXactICNotifAbort
+		}
+		flt := xreg.Flt{ID: xargs.ID, Kind: xargs.Kind, Bck: bck}
+		xreg.DoAbort(flt, err)
+	default:
+		t.writeErrAct(w, r, msg.Action)
+	}
+}
+
+func (t *target) xget(w http.ResponseWriter, r *http.Request, what, uuid string) {
+	if what != apc.WhatXactStats {
 		t.writeErrf(w, r, fmtUnknownQue, what)
 		return
 	}
-	stats, err := xreg.GetStats(xactQuery)
+	xctn, err := xreg.GetXact(uuid)
+	if err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	if xctn != nil {
+		t.writeJSON(w, r, xctn.Snap(), what)
+		return
+	}
+	err = cmn.NewErrXactNotFoundError("[" + uuid + "]")
+	t.writeErr(w, r, err, http.StatusNotFound, Silent)
+}
+
+func (t *target) xquery(w http.ResponseWriter, r *http.Request, what string, xactQuery xreg.Flt) {
+	stats, err := xreg.GetSnap(xactQuery)
 	if err == nil {
 		t.writeJSON(w, r, stats, what)
 		return
 	}
-	if _, ok := err.(*cmn.ErrXactionNotFound); ok {
-		t.writeErrSilent(w, r, err, http.StatusNotFound)
+	if cmn.IsErrXactNotFound(err) {
+		t.writeErr(w, r, err, http.StatusNotFound, Silent)
 	} else {
 		t.writeErr(w, r, err)
 	}
 }
 
-func (t *targetrunner) cmdXactStart(xactMsg *xaction.XactReqMsg, bck *cluster.Bck) error {
+func (t *target) xstart(r *http.Request, args *xact.ArgsMsg, bck *meta.Bck) error {
 	const erfmb = "global xaction %q does not require bucket (%s) - ignoring it and proceeding to start"
 	const erfmn = "xaction %q requires a bucket to start"
 
-	if !xaction.IsValidKind(xactMsg.Kind) {
-		return fmt.Errorf(cmn.FmtErrUnknown, t.si, "xaction kind", xactMsg.Kind)
+	if !xact.IsValidKind(args.Kind) {
+		return fmt.Errorf(cmn.FmtErrUnknown, t, "xaction kind", args.Kind)
 	}
-
-	if dtor := xaction.XactsDtor[xactMsg.Kind]; dtor.Scope == xaction.ScopeBck && bck == nil {
-		return fmt.Errorf(erfmn, xactMsg.Kind)
+	if dtor := xact.Table[args.Kind]; dtor.Scope == xact.ScopeB && bck == nil {
+		return fmt.Errorf(erfmn, args.Kind)
 	}
-
-	switch xactMsg.Kind {
-	// 1. globals
-	case cmn.ActLRU:
+	switch args.Kind {
+	// 1. global x-s
+	case apc.ActLRU:
 		if bck != nil {
-			glog.Errorf(erfmb, xactMsg.Kind, bck)
+			nlog.Errorf(erfmb, args.Kind, bck)
 		}
+		q := r.URL.Query()
+		force := cos.IsParseBool(q.Get(apc.QparamForce)) // NOTE: the only 'force' use case so far
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
-		go t.RunLRU(xactMsg.ID, wg, xactMsg.Force != nil && *xactMsg.Force, xactMsg.Buckets...)
+		go t.runLRU(args.ID, wg, force, args.Buckets...)
 		wg.Wait()
-	case cmn.ActResilver:
+	case apc.ActStoreCleanup:
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		go t.runStoreCleanup(args.ID, wg, args.Buckets...)
+		wg.Wait()
+	case apc.ActResilver:
 		if bck != nil {
-			glog.Errorf(erfmb, xactMsg.Kind, bck)
+			nlog.Errorf(erfmb, args.Kind, bck)
 		}
-		notif := &xaction.NotifXact{
-			NotifBase: nl.NotifBase{
+		notif := &xact.NotifXact{
+			Base: nl.Base{
 				When: cluster.UponTerm,
 				Dsts: []string{equalIC},
-				F:    t.callerNotifyFin,
+				F:    t.notifyTerm,
 			},
 		}
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
-		go t.runResilver(xactMsg.ID, wg, false /*skipGlobMisplaced*/, notif)
+		go t.runResilver(res.Args{UUID: args.ID, Notif: notif}, wg)
 		wg.Wait()
 	// 2. with bucket
-	case cmn.ActPrefetchObjects:
-		args := &cmn.ListRangeMsg{}
-		rns := xreg.RenewPrefetch(xactMsg.ID, t, bck, args)
-		xact := rns.Entry.Get()
-		xact.AddNotif(&xaction.NotifXact{
-			NotifBase: nl.NotifBase{
+	case apc.ActPrefetchObjects:
+		var (
+			smsg = &apc.ListRange{}
+		)
+		rns := xreg.RenewPrefetch(args.ID, t, bck, smsg)
+		if rns.Err != nil {
+			nlog.Errorf("%s: %s %v", t, bck, rns.Err)
+			debug.AssertNoErr(rns.Err)
+			return rns.Err
+		}
+		xctn := rns.Entry.Get()
+		xctn.AddNotif(&xact.NotifXact{
+			Base: nl.Base{
 				When: cluster.UponTerm,
 				Dsts: []string{equalIC},
-				F:    t.callerNotifyFin,
+				F:    t.notifyTerm,
 			},
-			Xact: xact,
+			Xact: xctn,
 		})
-		go xact.Run(nil)
-	case cmn.ActLoadLomCache:
-		return xreg.RenewBckLoadLomCache(t, xactMsg.ID, bck)
+		go xctn.Run(nil)
+	case apc.ActLoadLomCache:
+		rns := xreg.RenewBckLoadLomCache(t, args.ID, bck)
+		return rns.Err
 	// 3. cannot start
-	case cmn.ActPutCopies:
-		return fmt.Errorf("cannot start %q (is driven by PUTs into a mirrored bucket)", xactMsg)
-	case cmn.ActDownload, cmn.ActEvictObjects, cmn.ActDeleteObjects, cmn.ActMakeNCopies, cmn.ActECEncode:
-		return fmt.Errorf("initiating %q must be done via a separate documented API", xactMsg)
+	case apc.ActPutCopies:
+		return fmt.Errorf("cannot start %q (is driven by PUTs into a mirrored bucket)", args)
+	case apc.ActDownload, apc.ActEvictObjects, apc.ActDeleteObjects, apc.ActMakeNCopies, apc.ActECEncode:
+		return fmt.Errorf("initiating %q must be done via a separate documented API", args)
 	// 4. unknown
 	case "":
-		return fmt.Errorf("%q: unspecified (empty) xaction kind", xactMsg)
+		return fmt.Errorf("%q: unspecified (empty) xaction kind", args)
 	default:
-		return fmt.Errorf(cmn.FmtErrUnsupported, xactMsg, "kind")
+		return cmn.NewErrUnsupp("start xaction", args.Kind)
 	}
 	return nil
 }

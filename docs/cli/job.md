@@ -7,25 +7,90 @@ redirect_from:
  - /docs/cli/job.md/
 ---
 
-# CLI Reference for Job (xaction) management
+# Introduction, background, definitions
 
-Batch operations that run asynchronously and may take many seconds (minutes, or even hours) to execute are called eXtended actions or xactions.
-> Note: In CLI docs, the terms "xaction" and "job" are used interchangeably.
+Batch operations that run asynchronously and may take seconds (minutes, hours, etc.) to execute - are called eXtended actions (xactions).
 
-AIS *xactions* run asynchronously, have one of the enumerated kinds, start/stop times, and xaction-specific statistics. For more information, please refer to this [document](/xaction/README.md).
+Internally, `xaction` is an abstraction at the root of the inheritance hierarchy that also contains specific user-visible jobs: `copy-bucket`, `evict-objects`, and more.
+
+> For the most recently updated list of all supported jobs and their respective compile-time properties, see the [source](https://github.com/NVIDIA/aistore/blob/master/xact/api.go#L108).
+
+**All jobs run asynchronously, have start and stop times, and common generic statistics**
+
+Further, each and every job kind has its own display name, access permissions, scope (bucket and/or global), and a number of boolean properties - examples including:
+
+| Property | Description |
+| --- | --- |
+| `Startable` | true if user can start this job via generic jobi-start API |
+| `RefreshCap` | the system must refresh capacity stats upon the job's completion |
+
+Many kinds of jobs can be manually started via generic job API (which's in turn utilized by the `ais start` command - see next).
+
+Notable exceptions include electing new primary and listing objects in a given bucket - in both of those cases, there's a separate, more convenient and intuitive API that does the job, so to speak.
+
+> Job starting, stopping (i.e., aborting), and monitoring commands all have equivalent *shorter* versions. For instance `ais start download` can be expressed as `ais start download`, while `ais wait copy-bucket Z8WkHxwIrr` is the same as `ais wait Z8WkHxwIrr`.
+
+Rest of this document covers starting, stopping, and otherwise managing job kinds and specific job instances. For [job monitoring](/docs/cli/show.md#ais-show-job), please use `ais show job` command and its numerous subcommands and options.
+
+* [`ais show job`](/docs/cli/show.md#ais-show-job)
+
+### See also
+
+- [static descriptors (source code)](https://github.com/NVIDIA/aistore/blob/master/xact/api.go#L108)
+- [`xact` package README](/xact/README.md).
+- [`batch jobs`](/docs/batch.md)
+- [CLI: `dsort` (distributed shuffle)](/docs/cli/dsort.md)
+- [CLI: `download` from any remote source](/docs/cli/download.md)
+- [built-in `rebalance`](/docs/rebalance.md)
+
+# `ais job` command
+
+Has the following static completions aka subcommands:
+
+```console
+$ ais job <TAB-TAB>
+start   stop    wait    rm     show
+
+```
+and further:
+
+```console
+$ ais job --help
+NAME:
+   ais job - monitor, query, start/stop and manage jobs and eXtended actions (xactions)
+
+USAGE:
+   ais job command [command options] [arguments...]
+
+COMMANDS:
+   start  run batch job
+   stop   terminate a single batch job or multiple jobs (press <TAB-TAB> to select, '--help' for options)
+   wait   wait for a specific batch job to complete (press <TAB-TAB> to select, '--help' for options)
+   rm     cleanup finished jobs
+   show   show running and finished jobs ('--all' for all, or press <TAB-TAB> to select, '--help' for options)
+
+OPTIONS:
+   --help, -h  show help
+```
+
+Notice, though, that `start`, stop`, and `wait` (verbs) have shorter versions, e.g.:
+
+* `ais start` is a built-in alias for `ais job start`, and so on.
+
+> For all configured pre-built and user-defined aliases (aka "shortcuts"), run `ais alias` or `ais alias --help`
 
 ## Table of Contents
-- [Start xaction](#start-xaction)
-- [Stop xaction](#stop-xaction)
+- [Start job](#start-job)
+- [Stop job](#stop-job)
 - [Show job statistics](#show-job-statistics)
-	- [Show Job Extended Statistics](#show-job-extended-statistics)
-- [Wait for xaction](#wait-for-xaction)
+  - [Show extended statistics](#show-extended-statistics)
+- [Wait for job](#wait-for-job)
 - [Distributed Sort](#distributed-sort)
 - [Downloader](#downloader)
 
-## Start Jobs
+## Start job
 
-`ais job start <JOB_NAME> [arguments...]`
+`ais start <JOB_NAME> [arguments...]`
 
 Start a certain job. Some jobs require additional arguments such as bucket name to execute.
 
@@ -40,7 +105,7 @@ Note: `job start download|dsort` have slightly different options. Please see the
 Starts LRU xaction on all nodes
 
 ```console
-$ ais job start lru
+$ ais start lru
 Started "lru" xaction.
 ```
 An administrator may choose to run LRU on a subset of buckets. This can be achieved by using the `--buckets` flag to provide a comma-separated list of buckets, for instance `--buckets bck1,gcp://bck2`, on which LRU needs to be performed.
@@ -48,49 +113,64 @@ Additionally, the `--force`(`-f`) option can be used to override the bucket's `l
 
 **Note:** To ensure safety, the force flag (`-f`) only works when a list of buckets is provided.
 ```console
-$ ais job start lru --buckets ais://buck1,aws://buck2 -f
+$ ais start lru --buckets ais://buck1,aws://buck2 -f
 ```
 
-## Stop Jobs
+## Stop job
 
-`ais job stop xaction XACTION_ID|XACTION_NAME [BUCKET]`
+`ais stop [NAME] [JOB_ID] [NODE_ID] [BUCKET]`
 
-Stop a job. The bucket argument is used to determine the bucket name if it is required.
+Stop a single job or multiple jobs.
 
-`ais job stop download JOB_ID`
-`ais job stop dsort JOB_ID`
+### Examples stopping a single job:
+
+* `ais stop download JOB_ID`
+* `ais stop JOB_ID`
+* `ais stop dsort JOB_ID`
+
+### Examples stopping multiple jobs:
+
+* `ais stop download --all`              # stop all downloads
+* `ais stop copy-bucket ais://abc --all` # stop all `copy-bucket` jobs where the destination bucket is ais://abc
+* `ais stop resilver t[rt2erGhbr]`       # ask target  t[rt2erGhbr] to stop resilvering
+
+and more.
 
 Note: `job stop download|dsort` have slightly different options. Please see their documentation for more:
 * [`job stop download`](download.md#stop-download-job)
 * [`job stop dsort`](dsort.md#stop-dsort-job)
 
-### Examples
+### More Examples
 
 #### Stop cluster-wide LRU
 
-Stops currently running LRU xaction.
+Stops currently running LRU eviction.
 
 ```console
-$ ais job stop xaction lru
-Stopped "lru" xaction.
+$ ais stop lru
+Stopped LRU eviction.
 ```
 
-## Show Job Statistics
+## Show job statistics
 
-`ais show job xaction [XACTION_ID|XACTION_NAME] [BUCKET]`
+`ais show job [NAME] [JOB_ID] [NODE_ID] [BUCKET]`
 
-Display details about `XACTION_ID` or `XACTION_NAME` xaction. If no arguments are given, displays details about all xactions.
-The second argument is used to determine the bucket name if it is required.
+You can show jobs by any combination of the optional (filtering) arguments: NAME, JOB_ID, etc..
 
-Note: `job show download|dsort` have slightly different options. Please see their documentation for more:
+Use `--all` option to include finished (or aborted) jobs.
+
+As usual, press `<TAB-TAB> to select and see `--help` for details.
+
+> `job show download|dsort` have slightly different options. Please see their documentation for more:
 * [`job show download`](download.md#show-download-jobs-and-job-status)
 * [`job show dsort`](dsort.md#show-dsort-jobs-and-job-status)
 
-### Show Job Extended Statistics
+### Show extended statistics
 
 All jobs show the number of processed objects(column `OBJECTS`) and the total size of the data(column `BYTES`).
-Both values are cumulative for the entire xaction life-time.
-Some jobs provide extended statistics and it is available when you show information about a certain xaction name.
+Both values are cumulative for the entire job's life-time.
+
+Certain kinds of supported jobs provide extended statistics, including:
 
 #### Show EC Encoding Statistics
 
@@ -123,7 +203,7 @@ The output contains a few extra columns:
 | `--json` | `bool` | Output details in JSON format | `false` |
 | `--all` | `bool` | If set, additionally displays old, finished xactions | `false` |
 | `--active` | `bool` | If set, displays only running xactions | `false` |
-| `--verbose` `-v` | `bool` | If set, displays extended information about xactions where available | `false` |
+| `--verbose` `-v` | `bool` | If set, displays all xaction statistics including extended ones. If the number of xaction to display is greater than one, the flag is ignored. | `false` |
 
 Certain extended actions have additional CLI. In particular, rebalance stats can also be displayed using the following command:
 
@@ -133,18 +213,57 @@ Display details about the most recent rebalance xaction.
 
 | Flag | Type | Description | Default |
 | --- | --- | --- | --- |
-| `--refresh [N]` | `string` | watch the rebalance until it finishes or CTRL-C is pressed. Display the current stats every N seconds, where N ends with time suffix: s, m. If N is not defined it prints stats every 1 second | `1s` |
+| `--refresh` | `duration` | Refresh interval - time duration between reports. The usual unit suffixes are supported and include `m` (for minutes), `s` (seconds), `ms` (milliseconds). Ctrl-C to stop monitoring. | ` ` |
 | `--all` | `bool` | If set, show all rebalance xactions | `false` |
 
 Output of this command differs from the generic xaction output.
 
-## Wait for Jobs
+### Examples
 
-`ais job wait xaction XACTION_ID|XACTION_NAME [BUCKET]`
+Default compact tabular view:
 
-Wait for the `XACTION_ID` or `XACTION_NAME` xaction to finish.
+```console
+$ ais show job --all
+NODE             ID              KIND    BUCKET                          OBJECTS         BYTES           START           END             STATE
+zXZXt8084        FXjl0NWGOU      ec-put  TESTAISBUCKET-ec-mpaths         5               4.56MiB         12-02 13:04:50  12-02 13:04:50  Aborted
+```
 
-Note: `job wait download|dsort` have slightly different options. Please see their documentation for more:
+Verbose tabular view:
+
+```console
+$ ais show job FXjl0NWGOU --verbose
+PROPERTY                 VALUE
+.aborted                 true
+.bck                     ais://TESTAISBUCKET-ec-mpaths
+.end                     12-02 13:04:50
+.id                      FXjl0NWGOU
+.kind                    ec-put
+.start                   12-02 13:04:50
+ec.delete.err.n          0
+ec.delete.n              0
+ec.delete.time           0s
+ec.encode.err.n          0
+ec.encode.n              5
+ec.encode.size           4.56MiB
+ec.encode.time           16.964552ms
+ec.obj.process.time      17.142239ms
+ec.queue.len.n           0
+in.obj.n                 0
+in.obj.size              0
+is_idle                  true
+loc.obj.n                5
+loc.obj.size             4.56MiB
+out.obj.n                0
+out.obj.size             0
+```
+
+## Wait for job
+
+`ais wait [NAME] [JOB_ID] [NODE_ID] [BUCKET]`
+
+Wait for the specified job to finish.
+
+> `job wait download|dsort` have slightly different options. Please see their documentation for more:
 * [`job wait download`](download.md#wait-for-download-job)
 * [`job wait dsort`](dsort.md#wait-for-dsort-job)
 
@@ -152,18 +271,18 @@ Note: `job wait download|dsort` have slightly different options. Please see thei
 
 | Flag | Type | Description | Default |
 | --- | --- | --- | --- |
-| `--refresh` | `duration` | Refresh rate | `1s` |
+| `--refresh` | `duration` | Refresh interval - time duration between reports. The usual unit suffixes are supported and include `m` (for minutes), `s` (seconds), `ms` (milliseconds) | ` ` |
 
 ## Distributed Sort
 
-`ais job start dsort`
+`ais start dsort` or `ais start dsort`
 
 Run [dSort](/docs/dsort.md).
 [Further reference for this command can be found here.](dsort.md)
 
 ## Downloader
 
-`ais job start download`
+`ais start download` or `ais start download`
 
 Run the AIS [Downloader](/docs/README.md).
 [Further reference for this command can be found here.](downloader.md)

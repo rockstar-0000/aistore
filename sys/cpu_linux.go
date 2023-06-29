@@ -1,6 +1,6 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 // isContainerized returns true if the application is running
@@ -29,7 +29,7 @@ func isContainerized() (yes bool) {
 		return nil
 	})
 	if err != nil {
-		glog.Errorf("Failed to read system info: %v", err)
+		nlog.Errorf("Failed to read system info: %v", err)
 	}
 	return
 }

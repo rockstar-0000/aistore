@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -10,12 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
+	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tutils"
-	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tools"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -34,12 +35,12 @@ type (
 )
 
 // newDiscoverServerPrimary returns a proxy runner after initializing the fields that are needed by this test
-func newDiscoverServerPrimary() *proxyrunner {
+func newDiscoverServerPrimary() *proxy {
 	var (
-		p       = &proxyrunner{}
-		tracker = stats.NewTrackerMock()
+		p       = &proxy{}
+		tracker = mock.NewStatsTracker()
 	)
-	p.si = cluster.NewSnode("primary", cmn.Proxy, cluster.NetInfo{}, cluster.NetInfo{}, cluster.NetInfo{})
+	p.si = meta.NewSnode("primary", apc.Proxy, meta.NetInfo{}, meta.NetInfo{}, meta.NetInfo{})
 	p.client.data = &http.Client{}
 	p.client.control = &http.Client{}
 
@@ -58,7 +59,7 @@ func newDiscoverServerPrimary() *proxyrunner {
 	owner := newBMDOwnerPrx(config)
 	owner.put(newBucketMD())
 	p.owner.bmd = owner
-	p.keepalive = newProxyKeepalive(p, tracker, atomic.NewBool(true))
+	p.keepalive = newPalive(p, tracker, atomic.NewBool(true))
 	return p
 }
 
@@ -70,8 +71,8 @@ func discoverServerDefaultHandler(sv, lv int64) *httptest.Server {
 		func(w http.ResponseWriter, r *http.Request) {
 			msg := cluMeta{
 				VoteInProgress: false,
-				Smap:           &smapX{Smap: cluster.Smap{Version: smapVersion}},
-				BMD:            &bucketMD{BMD: cluster.BMD{Version: bmdVersion}},
+				Smap:           &smapX{Smap: meta.Smap{Version: smapVersion}},
+				BMD:            &bucketMD{BMD: meta.BMD{Version: bmdVersion}},
 			}
 			b, _ := jsoniter.Marshal(msg)
 			w.Write(b)
@@ -89,8 +90,8 @@ func discoverServerVoteOnceHandler(sv, lv int64) *httptest.Server {
 		cnt++
 		msg := cluMeta{
 			VoteInProgress: cnt == 1,
-			Smap:           &smapX{Smap: cluster.Smap{Version: smapVersion}},
-			BMD:            &bucketMD{BMD: cluster.BMD{Version: bmdVersion}},
+			Smap:           &smapX{Smap: meta.Smap{Version: smapVersion}},
+			BMD:            &bucketMD{BMD: meta.BMD{Version: bmdVersion}},
 		}
 		b, _ := jsoniter.Marshal(msg)
 		w.Write(b)
@@ -110,8 +111,8 @@ func discoverServerFailTwiceHandler(sv, lv int64) *httptest.Server {
 		if cnt > 2 {
 			msg := cluMeta{
 				VoteInProgress: false,
-				Smap:           &smapX{Smap: cluster.Smap{Version: smapVersion}},
-				BMD:            &bucketMD{BMD: cluster.BMD{Version: bmdVersion}},
+				Smap:           &smapX{Smap: meta.Smap{Version: smapVersion}},
+				BMD:            &bucketMD{BMD: meta.BMD{Version: bmdVersion}},
 			}
 			b, _ := jsoniter.Marshal(msg)
 			w.Write(b)
@@ -138,8 +139,8 @@ func discoverServerVoteInProgressHandler(_, _ int64) *httptest.Server {
 		func(w http.ResponseWriter, r *http.Request) {
 			msg := cluMeta{
 				VoteInProgress: true,
-				Smap:           &smapX{Smap: cluster.Smap{Version: 12345}},
-				BMD:            &bucketMD{BMD: cluster.BMD{Version: 67890}},
+				Smap:           &smapX{Smap: meta.Smap{Version: 12345}},
+				BMD:            &bucketMD{BMD: meta.BMD{Version: 67890}},
 			}
 			b, _ := jsoniter.Marshal(msg)
 			w.Write(b)
@@ -279,7 +280,7 @@ func TestDiscoverServers(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			tutils.CheckSkip(t, tutils.SkipTestArgs{Long: tc.onlyLong})
+			tools.CheckSkip(t, tools.SkipTestArgs{Long: tc.onlyLong})
 			var (
 				primary      = newDiscoverServerPrimary()
 				discoverSmap = newSmap()
@@ -289,9 +290,9 @@ func TestDiscoverServers(t *testing.T) {
 				ts := s.httpHandler(s.smapVersion, s.bmdVersion)
 				addrInfo := serverTCPAddr(ts.URL)
 				if s.isProxy {
-					discoverSmap.addProxy(cluster.NewSnode(s.id, cmn.Proxy, addrInfo, addrInfo, addrInfo))
+					discoverSmap.addProxy(meta.NewSnode(s.id, apc.Proxy, addrInfo, addrInfo, addrInfo))
 				} else {
-					discoverSmap.addTarget(cluster.NewSnode(s.id, cmn.Target, addrInfo, addrInfo, addrInfo))
+					discoverSmap.addTarget(meta.NewSnode(s.id, apc.Target, addrInfo, addrInfo, addrInfo))
 				}
 			}
 			svm := primary.uncoverMeta(discoverSmap)

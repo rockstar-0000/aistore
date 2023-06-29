@@ -1,6 +1,6 @@
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -10,61 +10,60 @@ import (
 	"math"
 	"net/http"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
-type (
-	dummyBackendProvider struct {
-		t cluster.Target
-	}
-)
+const mock = "mock-backend"
+
+type mockBP struct {
+	t cluster.TargetPut
+}
 
 // interface guard
-var _ cluster.BackendProvider = (*dummyBackendProvider)(nil)
+var _ cluster.BackendProvider = (*mockBP)(nil)
 
-func NewDummyBackend(t cluster.Target) (cluster.BackendProvider, error) {
-	return &dummyBackendProvider{t: t}, nil
+func NewDummyBackend(t cluster.TargetPut) (cluster.BackendProvider, error) { return &mockBP{t: t}, nil }
+
+func (*mockBP) Provider() string  { return mock }
+func (*mockBP) MaxPageSize() uint { return math.MaxUint32 }
+
+func (*mockBP) CreateBucket(*meta.Bck) (int, error) {
+	return http.StatusBadRequest, cmn.NewErrUnsupp("create", mock+" bucket")
 }
 
-func (*dummyBackendProvider) Provider() string  { return "dummy" }
-func (*dummyBackendProvider) MaxPageSize() uint { return math.MaxUint32 }
-
-func (*dummyBackendProvider) CreateBucket(*cluster.Bck) (errCode int, err error) {
-	return creatingBucketNotSupportedErr("backend")
+func (*mockBP) HeadBucket(_ ctx, bck *meta.Bck) (cos.StrKVs, int, error) {
+	return cos.StrKVs{}, http.StatusNotFound, cmn.NewErrRemoteBckOffline(bck.Bucket())
 }
 
-func (*dummyBackendProvider) HeadBucket(_ context.Context, bck *cluster.Bck) (bckProps cos.SimpleKVs, errCode int, err error) {
-	return cos.SimpleKVs{}, http.StatusNotFound, cmn.NewErrRemoteBckOffline(bck.Bck)
+func (*mockBP) ListObjects(bck *meta.Bck, _ *apc.LsoMsg, _ *cmn.LsoResult) (int, error) {
+	return http.StatusNotFound, cmn.NewErrRemoteBckOffline(bck.Bucket())
 }
 
-func (*dummyBackendProvider) ListObjects(bck *cluster.Bck, _ *cmn.SelectMsg) (bckList *cmn.BucketList, errCode int, err error) {
-	return nil, http.StatusNotFound, cmn.NewErrRemoteBckOffline(bck.Bck)
-}
-
-// The function must not fail - it should return empty list.
-func (*dummyBackendProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
+// cannot fail - return empty list
+func (*mockBP) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
 	return
 }
 
-func (*dummyBackendProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objMeta cos.SimpleKVs, errCode int, err error) {
-	return cos.SimpleKVs{}, http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
+func (*mockBP) HeadObj(_ ctx, lom *cluster.LOM) (*cmn.ObjAttrs, int, error) {
+	return &cmn.ObjAttrs{}, http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*dummyBackendProvider) GetObj(_ context.Context, lom *cluster.LOM) (errCode int, err error) {
+func (*mockBP) GetObj(_ ctx, lom *cluster.LOM, _ cmn.OWT) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*dummyBackendProvider) GetObjReader(context.Context, *cluster.LOM) (r io.ReadCloser, expectedCksm *cos.Cksum,
-	errCode int, err error) {
+func (*mockBP) GetObjReader(context.Context, *cluster.LOM) (io.ReadCloser, *cos.Cksum, int, error) {
 	return nil, nil, 0, nil
 }
 
-func (*dummyBackendProvider) PutObj(_ io.ReadCloser, lom *cluster.LOM) (version string, errCode int, err error) {
-	return "", http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
+func (*mockBP) PutObj(_ io.ReadCloser, lom *cluster.LOM) (int, error) {
+	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*dummyBackendProvider) DeleteObj(lom *cluster.LOM) (errCode int, err error) {
+func (*mockBP) DeleteObj(lom *cluster.LOM) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }

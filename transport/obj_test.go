@@ -1,20 +1,17 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
 // How to run:
 //
-// 1) run all tests while redirecting glog to STDERR:
-// go test -v -logtostderr=true
+// 1) run all unit tests
+// go test -v
 //
-// 2) run tests matching "Multi" with debug enabled and glog level=1 (non-verbose):
-// AIS_DEBUG=transport=1 go test -v -run=Multi -tags=debug
-//
-// 3) run tests matching "Multi" with debug enabled, glog level=4 (super-verbose) and glog redirect:
-// AIS_DEBUG=transport=4 go test -v -run=Multi -tags=debug -logtostderr=true
+// 2) run tests matching "Multi" with debug enabled:
+// go test -v -run=Multi -tags=debug
 
 import (
 	"encoding/binary"
@@ -33,15 +30,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
 	"github.com/NVIDIA/aistore/3rdparty/golang/mux"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/devtools/tassert"
-	"github.com/NVIDIA/aistore/devtools/tlog"
-	"github.com/NVIDIA/aistore/devtools/tutils"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/tassert"
+	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/transport"
 )
 
@@ -57,10 +55,19 @@ ut et voluptates repudiandae sint et molestiae non-recusandae.`
 	text = lorem + duis + et + temporibus
 )
 
+type dummyStatsTracker struct{}
+
+// interface guard
+var _ cos.StatsUpdater = (*dummyStatsTracker)(nil)
+
+func (*dummyStatsTracker) Add(string, int64)         {}
+func (*dummyStatsTracker) Inc(string)                {}
+func (*dummyStatsTracker) Get(string) int64          { return 0 }
+func (*dummyStatsTracker) AddMany(...cos.NamedVal64) {}
+
 var (
 	objmux   *mux.ServeMux
 	msgmux   *mux.ServeMux
-	MMSA     *memsys.MMSA
 	duration time.Duration // test duration
 )
 
@@ -74,9 +81,14 @@ func TestMain(t *testing.M) {
 	if duration, err = time.ParseDuration(d); err != nil {
 		cos.Exitf("Invalid duration %q", d)
 	}
-	MMSA = memsys.DefaultPageMM()
 
-	sc := transport.Init()
+	config := cmn.GCO.BeginUpdate()
+	config.Transport.MaxHeaderSize = memsys.PageSize
+	config.Transport.IdleTeardown = cos.Duration(time.Second)
+	config.Transport.QuiesceTime = cos.Duration(10 * time.Second)
+	config.Log.Level = "3"
+	cmn.GCO.CommitUpdate(config)
+	sc := transport.Init(&dummyStatsTracker{}, config)
 	go sc.Run()
 
 	objmux = mux.NewServeMux()
@@ -109,12 +121,13 @@ func Example_headers() {
 			hlen = int(binary.BigEndian.Uint64(body[off:]))
 			off += 16 // hlen and hlen-checksum
 			hdr = transport.ExtObjHeader(body[off:], hlen)
-			if !hdr.IsLast() {
-				fmt.Printf("%+v (%d)\n", hdr, hlen)
-				off += hlen + int(hdr.ObjAttrs.Size)
-			} else {
+
+			if transport.ReservedOpcode(hdr.Opcode) {
 				break
 			}
+
+			fmt.Printf("%+v (%d)\n", hdr, hlen)
+			off += hlen + int(hdr.ObjAttrs.Size)
 		}
 	}
 
@@ -122,27 +135,27 @@ func Example_headers() {
 	defer ts.Close()
 
 	httpclient := transport.NewIntraDataClient()
-	stream := transport.NewObjStream(httpclient, ts.URL, nil)
+	stream := transport.NewObjStream(httpclient, ts.URL, cos.GenTie(), nil)
 
 	sendText(stream, lorem, duis)
 	stream.Fin()
 
 	// Output:
-	// {Bck:aws://@uuid#namespace/abc ObjName:X ObjAttrs:{Atime:663346294 Size:231 Ver:1 Cksum:(xxhash,h1...) AddMD:map[]} Opaque:[] SID: Opcode:0} (69)
-	// {Bck:ais://abracadabra ObjName:p/q/s ObjAttrs:{Atime:663346294 Size:213 Ver:222222222222222222222222 Cksum:(xxhash,h2...) AddMD:map[xx:11 yy:22]} Opaque:[49 50 51] SID: Opcode:0} (110)
+	// {Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{Cksum:xxhash[h1] CustomMD:map[] Ver:1 Atime:663346294 Size:231} Opcode:0} (69)
+	// {Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{Cksum:xxhash[h2] CustomMD:map[xx:11 yy:22] Ver:222222222222222222222222 Atime:663346294 Size:213} Opcode:0} (110)
 }
 
 func sendText(stream *transport.Stream, txt1, txt2 string) {
 	var wg sync.WaitGroup
-	cb := func(transport.ObjHdr, io.ReadCloser, interface{}, error) {
+	cb := func(transport.ObjHdr, io.ReadCloser, any, error) {
 		wg.Done()
 	}
-	sgl1 := MMSA.NewSGL(0)
+	sgl1 := memsys.PageMM().NewSGL(0)
 	sgl1.Write([]byte(txt1))
 	hdr := transport.ObjHdr{
 		Bck: cmn.Bck{
 			Name:     "abc",
-			Provider: cmn.ProviderAmazon,
+			Provider: apc.AWS,
 			Ns:       cmn.Ns{UUID: "uuid", Name: "namespace"},
 		},
 		ObjName: "X",
@@ -151,7 +164,6 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 			Atime: 663346294,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h1"),
 			Ver:   "1",
-			AddMD: cos.SimpleKVs{},
 		},
 		Opaque: nil,
 	}
@@ -159,12 +171,12 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 	stream.Send(&transport.Obj{Hdr: hdr, Reader: sgl1, Callback: cb})
 	wg.Wait()
 
-	sgl2 := MMSA.NewSGL(0)
+	sgl2 := memsys.PageMM().NewSGL(0)
 	sgl2.Write([]byte(txt2))
 	hdr = transport.ObjHdr{
 		Bck: cmn.Bck{
 			Name:     "abracadabra",
-			Provider: cmn.ProviderAIS,
+			Provider: apc.AIS,
 			Ns:       cmn.NsGlobal,
 		},
 		ObjName: "p/q/s",
@@ -173,17 +185,17 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 			Atime: 663346294,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h2"),
 			Ver:   "222222222222222222222222",
-			AddMD: cos.SimpleKVs{"xx": "11", "yy": "22"},
 		},
 		Opaque: []byte{'1', '2', '3'},
 	}
+	hdr.ObjAttrs.SetCustomMD(cos.StrKVs{"xx": "11", "yy": "22"})
 	wg.Add(1)
 	stream.Send(&transport.Obj{Hdr: hdr, Reader: sgl2, Callback: cb})
 	wg.Wait()
 }
 
 func Example_obj() {
-	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) {
+	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
 		object, err := io.ReadAll(objReader)
 		if err != nil {
@@ -193,6 +205,7 @@ func Example_obj() {
 			panic(fmt.Sprintf("size %d != %d", len(object), hdr.ObjAttrs.Size))
 		}
 		fmt.Printf("%s...\n", string(object[:16]))
+		return nil
 	}
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
@@ -203,7 +216,7 @@ func Example_obj() {
 		return
 	}
 	httpclient := transport.NewIntraDataClient()
-	stream := transport.NewObjStream(httpclient, ts.URL+transport.ObjURLPath(trname), nil)
+	stream := transport.NewObjStream(httpclient, ts.URL+transport.ObjURLPath(trname), cos.GenTie(), nil)
 	sendText(stream, lorem, duis)
 	sendText(stream, et, temporibus)
 	stream.Fin()
@@ -217,6 +230,7 @@ func Example_obj() {
 
 // test random streaming
 func Test_OneStream(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
 
@@ -225,7 +239,7 @@ func Test_OneStream(t *testing.T) {
 }
 
 func Test_MultiStream(t *testing.T) {
-	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 
 	tlog.Logf("Duration %v\n", duration)
 	ts := httptest.NewServer(objmux)
@@ -292,7 +306,7 @@ func Test_MultipleNetworks(t *testing.T) {
 
 		httpclient := transport.NewIntraDataClient()
 		url := ts.URL + transport.ObjURLPath(trname)
-		streams = append(streams, transport.NewObjStream(httpclient, url, nil))
+		streams = append(streams, transport.NewObjStream(httpclient, url, cos.GenTie(), nil))
 	}
 
 	totalSend := int64(0)
@@ -306,14 +320,14 @@ func Test_MultipleNetworks(t *testing.T) {
 	for _, stream := range streams {
 		stream.Fin()
 	}
-	time.Sleep(time.Second) // FIN has been sent but not necessarily received
+	time.Sleep(3 * time.Second) // FIN has been sent but not necessarily received
 
 	if *totalRecv != totalSend {
 		t.Fatalf("total received bytes %d is different from expected: %d", *totalRecv, totalSend)
 	}
 }
 
-func Test_OnSendCallback(t *testing.T) {
+func Test_nSendCallback(t *testing.T) {
 	objectCnt := 10000
 	if testing.Short() {
 		objectCnt = 1000
@@ -329,7 +343,7 @@ func Test_OnSendCallback(t *testing.T) {
 	defer transport.Unhandle(trname)
 	httpclient := transport.NewIntraDataClient()
 	url := ts.URL + transport.ObjURLPath(trname)
-	stream := transport.NewObjStream(httpclient, url, nil)
+	stream := transport.NewObjStream(httpclient, url, cos.GenTie(), nil)
 
 	var (
 		totalSend int64
@@ -384,7 +398,7 @@ func Test_ObjAttrs(t *testing.T) {
 	defer ts.Close()
 
 	var receivedCount atomic.Int64
-	recvFunc := func(hdr transport.ObjHdr, objReader io.Reader, err error) {
+	recvFunc := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
 
 		idx := hdr.Opaque[0]
@@ -397,6 +411,7 @@ func Test_ObjAttrs(t *testing.T) {
 		cos.Assertf(written == hdr.ObjAttrs.Size, "written: %d, expected: %d", written, hdr.ObjAttrs.Size)
 
 		receivedCount.Inc()
+		return nil
 	}
 	trname := "objattrs"
 	err := transport.HandleObjStream(trname, recvFunc)
@@ -404,7 +419,7 @@ func Test_ObjAttrs(t *testing.T) {
 	defer transport.Unhandle(trname)
 	httpclient := transport.NewIntraDataClient()
 	url := ts.URL + transport.ObjURLPath(trname)
-	stream := transport.NewObjStream(httpclient, url, nil)
+	stream := transport.NewObjStream(httpclient, url, cos.GenTie(), nil)
 
 	random := newRand(mono.NanoTime())
 	for idx, attrs := range testAttrs {
@@ -412,13 +427,13 @@ func Test_ObjAttrs(t *testing.T) {
 			reader io.ReadCloser
 			hdr    = transport.ObjHdr{
 				Bck: cmn.Bck{
-					Provider: cmn.ProviderAIS,
+					Provider: apc.AIS,
 				},
 				ObjAttrs: attrs,
 				Opaque:   []byte{byte(idx)},
 			}
 		)
-		slab, err := MMSA.GetSlab(memsys.PageSize)
+		slab, err := memsys.PageMM().GetSlab(memsys.PageSize)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -435,36 +450,37 @@ func Test_ObjAttrs(t *testing.T) {
 	}
 }
 
-func receive10G(hdr transport.ObjHdr, objReader io.Reader, err error) {
+func receive10G(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 	cos.Assert(err == nil || cos.IsEOF(err))
 	written, _ := io.Copy(io.Discard, objReader)
 	cos.Assert(written == hdr.ObjAttrs.Size)
+	return nil
 }
 
 func Test_CompressedOne(t *testing.T) {
 	trname := "cmpr-one"
 	config := cmn.GCO.BeginUpdate()
-	config.Compression.BlockMaxSize = 256 * cos.KiB
+	config.Transport.LZ4BlockMaxSize = 256 * cos.KiB
+	config.Transport.IdleTeardown = cos.Duration(time.Second)
+	config.Transport.QuiesceTime = cos.Duration(8 * time.Second)
 	cmn.GCO.CommitUpdate(config)
-	if err := config.Compression.Validate(); err != nil {
+	if err := config.Transport.Validate(); err != nil {
 		tassert.CheckFatal(t, err)
 	}
 
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
 
-	err := transport.HandleObjStream(trname, receive10G, memsys.DefaultPageMM() /* optionally, specify memsys*/)
+	err := transport.HandleObjStream(trname, receive10G)
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 
 	httpclient := transport.NewIntraDataClient()
 	url := ts.URL + transport.ObjURLPath(trname)
-	err = os.Setenv("AIS_STREAM_BURST_NUM", "2")
-	tassert.CheckFatal(t, err)
-	defer os.Unsetenv("AIS_STREAM_BURST_NUM")
-	stream := transport.NewObjStream(httpclient, url, &transport.Extra{Compression: cmn.CompressAlways})
+	t.Setenv("AIS_STREAM_BURST_NUM", "2")
+	stream := transport.NewObjStream(httpclient, url, cos.GenTie(), &transport.Extra{Compression: apc.CompressAlways})
 
-	slab, _ := MMSA.GetSlab(memsys.MaxPageSlabSize)
+	slab, _ := memsys.PageMM().GetSlab(memsys.MaxPageSlabSize)
 	random := newRand(mono.NanoTime())
 	buf := slab.Alloc()
 	_, _ = random.Read(buf)
@@ -509,18 +525,16 @@ func Test_CompressedOne(t *testing.T) {
 }
 
 func Test_DryRun(t *testing.T) {
-	tutils.CheckSkip(t, tutils.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 
-	err := os.Setenv("AIS_STREAM_DRY_RUN", "true")
-	defer os.Unsetenv("AIS_STREAM_DRY_RUN")
-	tassert.CheckFatal(t, err)
+	t.Setenv("AIS_STREAM_DRY_RUN", "true")
 
-	stream := transport.NewObjStream(nil, "dummy/null", nil)
+	stream := transport.NewObjStream(nil, "dummy/null", cos.GenTie(), nil)
 
 	random := newRand(mono.NanoTime())
-	sgl := MMSA.NewSGL(cos.MiB)
+	sgl := memsys.PageMM().NewSGL(cos.MiB)
 	defer sgl.Free()
-	buf, slab := MMSA.AllocSize(cos.KiB * 128)
+	buf, slab := memsys.PageMM().AllocSize(cos.KiB * 128)
 	defer slab.Free(buf)
 	for sgl.Len() < cos.MiB {
 		random.Read(buf)
@@ -556,18 +570,20 @@ func Test_DryRun(t *testing.T) {
 }
 
 func Test_CompletionCount(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	var (
 		numSent                   int64
 		numCompleted, numReceived atomic.Int64
 	)
 
-	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) {
+	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
 		written, _ := io.Copy(io.Discard, objReader)
 		cos.Assert(written == hdr.ObjAttrs.Size)
 		numReceived.Inc()
+		return nil
 	}
-	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ interface{}, _ error) {
+	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
 		numCompleted.Inc()
 	}
 
@@ -580,10 +596,8 @@ func Test_CompletionCount(t *testing.T) {
 	defer transport.Unhandle(trname)
 	httpclient := transport.NewIntraDataClient()
 	url := ts.URL + transport.ObjURLPath(trname)
-	err = os.Setenv("AIS_STREAM_BURST_NUM", "256")
-	tassert.CheckFatal(t, err)
-	defer os.Unsetenv("AIS_STREAM_BURST_NUM")
-	stream := transport.NewObjStream(httpclient, url, nil) // provide for sizeable queue at any point
+	t.Setenv("AIS_STREAM_BURST_NUM", "256")
+	stream := transport.NewObjStream(httpclient, url, cos.GenTie(), nil) // provide for sizeable queue at any point
 	random := newRand(mono.NanoTime())
 	rem := int64(0)
 	for idx := 0; idx < 10000; idx++ {
@@ -635,9 +649,9 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 
 	if compress {
 		config := cmn.GCO.BeginUpdate()
-		config.Compression.BlockMaxSize = cos.KiB * 256
+		config.Transport.LZ4BlockMaxSize = cos.KiB * 256
 		cmn.GCO.CommitUpdate(config)
-		if err := config.Compression.Validate(); err != nil {
+		if err := config.Transport.Validate(); err != nil {
 			tassert.CheckFatal(t, err)
 		}
 	}
@@ -648,13 +662,13 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 	if compress || usePDU {
 		extra = &transport.Extra{}
 		if compress {
-			extra.Compression = cmn.CompressAlways
+			extra.Compression = apc.CompressAlways
 		}
 		if usePDU {
-			extra.SizePDU = transport.DefaultSizePDU
+			extra.SizePDU = memsys.DefaultBufSize
 		}
 	}
-	stream := transport.NewObjStream(httpclient, url, extra)
+	stream := transport.NewObjStream(httpclient, url, cos.GenTie(), extra)
 	trname, sessID := stream.ID()
 	now := time.Now()
 
@@ -687,9 +701,10 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 	stream.Fin()
 	stats := stream.GetStats()
 	if netstats == nil {
-		termReason, termErr := stream.TermInfo()
-		fmt.Printf("send$ %s[%d]: offset=%d, num=%d(%d), term(%s, %v)\n",
-			trname, sessID, stats.Offset.Load(), stats.Num.Load(), num, termReason, termErr)
+		reason, termErr := stream.TermInfo()
+		tassert.Errorf(t, reason != "", "expecting reason for termination")
+		fmt.Printf("send$ %s[%d]: offset=%d, num=%d(%d), term(%q, %v)\n",
+			trname, sessID, stats.Offset.Load(), stats.Num.Load(), num, reason, termErr)
 	} else {
 		lock.Lock()
 		eps := make(transport.EndpointStats)
@@ -704,9 +719,9 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 	}
 }
 
-func makeRecvFunc(t *testing.T) (*int64, transport.ReceiveObj) {
+func makeRecvFunc(t *testing.T) (*int64, transport.RecvObj) {
 	totalReceived := new(int64)
-	return totalReceived, func(hdr transport.ObjHdr, objReader io.Reader, err error) {
+	return totalReceived, func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil || cos.IsEOF(err))
 		written, err := io.Copy(io.Discard, objReader)
 		if err != nil && !cos.IsEOF(err) {
@@ -716,6 +731,7 @@ func makeRecvFunc(t *testing.T) (*int64, transport.ReceiveObj) {
 			t.Fatalf("size %d != %d", written, hdr.ObjAttrs.Size)
 		}
 		*totalReceived += written
+		return nil
 	}
 }
 
@@ -728,13 +744,13 @@ func newRand(seed int64) *rand.Rand {
 func genStaticHeader(random *rand.Rand) (hdr transport.ObjHdr) {
 	hdr.Bck = cmn.Bck{
 		Name:     "a",
-		Provider: cmn.ProviderAIS,
+		Provider: apc.AIS,
 	}
 	hdr.ObjName = strconv.FormatInt(random.Int63(), 10)
 	hdr.Opaque = []byte("123456789abcdef")
 	hdr.ObjAttrs.Size = cos.GiB
-	hdr.ObjAttrs.SetCustom(strconv.FormatInt(random.Int63(), 10), "d")
-	hdr.ObjAttrs.SetCustom("e", "")
+	hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int63(), 10), "d")
+	hdr.ObjAttrs.SetCustomKey("e", "")
 	hdr.ObjAttrs.SetCksum(cos.ChecksumXXHash, "xxhash")
 	return
 }
@@ -742,6 +758,7 @@ func genStaticHeader(random *rand.Rand) (hdr transport.ObjHdr) {
 func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 	x := random.Int63()
 	hdr.Bck.Name = strconv.FormatInt(x, 10)
+	hdr.Bck.Provider = apc.AIS
 	hdr.ObjName = path.Join(hdr.Bck.Name, strconv.FormatInt(math.MaxInt64-x, 10))
 
 	pos := x % int64(len(text))
@@ -761,19 +778,19 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 		} else {
 			hdr.ObjAttrs.Size = (x & 0xfffff) + 1
 		}
-		hdr.ObjAttrs.SetCustom(strconv.FormatInt(random.Int63(), 10), s)
+		hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int63(), 10), s)
+		hdr.ObjAttrs.SetCustomKey(s, "")
 		hdr.ObjAttrs.SetCksum(cos.ChecksumMD5, "md5")
-		hdr.ObjAttrs.SetCustom(s, "")
 	case 2:
 		hdr.ObjAttrs.Size = (x & 0xffff) + 1
 		hdr.ObjAttrs.SetCksum(cos.ChecksumXXHash, "xxhash")
 		for i := 0; i < int(x&0x1f); i++ {
-			hdr.ObjAttrs.SetCustom(strconv.FormatInt(random.Int63(), 10), s)
+			hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int63(), 10), s)
 		}
 	default:
 		hdr.ObjAttrs.Size = 0
 		hdr.ObjAttrs.Ver = s
-		hdr.ObjAttrs.SetCustom(s, "")
+		hdr.ObjAttrs.SetCustomKey(s, "")
 		hdr.ObjAttrs.SetCksum(cos.ChecksumNone, "")
 	}
 	return
@@ -811,7 +828,7 @@ func makeRandReader(random *rand.Rand, usePDU bool) (transport.ObjHdr, *randRead
 	if hdr.ObjSize() == 0 {
 		return hdr, nil
 	}
-	slab, err := MMSA.GetSlab(memsys.DefaultBufSize)
+	slab, err := memsys.PageMM().GetSlab(memsys.DefaultBufSize)
 	if err != nil {
 		panic("Failed getting slab: " + err.Error())
 	}
@@ -866,9 +883,9 @@ type randReaderCtx struct {
 	idx    int
 }
 
-func (rrc *randReaderCtx) sentCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ interface{}, err error) {
+func (rrc *randReaderCtx) sentCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 	if err != nil {
-		rrc.t.Errorf("sent-callback %d(%s) returned an error: %v", rrc.idx, hdr.FullName(), err)
+		rrc.t.Errorf("sent-callback %d(%s) returned an error: %v", rrc.idx, hdr.Cname(), err)
 	}
 	rr := rrc.rr
 	if rr != nil {
@@ -877,7 +894,7 @@ func (rrc *randReaderCtx) sentCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ 
 	rrc.mu.Lock()
 	rrc.posted[rrc.idx] = nil
 	if rrc.idx > 0 && rrc.posted[rrc.idx-1] != nil {
-		rrc.t.Errorf("sent-callback %d(%s) fired out of order", rrc.idx, hdr.FullName())
+		rrc.t.Errorf("sent-callback %d(%s) fired out of order", rrc.idx, hdr.Cname())
 	}
 	rrc.posted[rrc.idx] = nil
 	rrc.mu.Unlock()

@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -8,46 +8,37 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
-func S2B(s string) (int64, error) {
+func IsParseBool(s string) bool {
+	yes, err := ParseBool(s)
+	_ = err // error means false
+	return yes
+}
+
+// ParseBool converts string to bool (case-insensitive):
+//
+//	y, yes, on -> true
+//	n, no, off, <empty value> -> false
+//
+// strconv handles the following:
+//
+//	1, true, t -> true
+//	0, false, f -> false
+func ParseBool(s string) (value bool, err error) {
 	if s == "" {
-		return 0, nil
+		return
 	}
-	s = strings.ToUpper(s)
-	for k, v := range toBiBytes {
-		if ns := strings.TrimSuffix(s, k); ns != s {
-			f, err := strconv.ParseFloat(strings.TrimSpace(ns), 64)
-			return int64(float64(v) * f), err
-		}
+	s = strings.ToLower(s)
+	switch s {
+	case "y", "yes", "on":
+		return true, nil
+	case "n", "no", "off":
+		return false, nil
 	}
-	ns := strings.TrimSuffix(s, "B")
-	f, err := strconv.ParseFloat(strings.TrimSpace(ns), 64)
-	return int64(f), err
-}
-
-func B2S(b int64, digits int) string {
-	if b >= TiB {
-		return fmt.Sprintf("%.*f%s", digits, float32(b)/float32(TiB), "TiB")
-	}
-	if b >= GiB {
-		return fmt.Sprintf("%.*f%s", digits, float32(b)/float32(GiB), "GiB")
-	}
-	if b >= MiB {
-		return fmt.Sprintf("%.*f%s", digits, float32(b)/float32(MiB), "MiB")
-	}
-	if b >= KiB {
-		return fmt.Sprintf("%.*f%s", digits, float32(b)/float32(KiB), "KiB")
-	}
-	return fmt.Sprintf("%dB", b)
-}
-
-func UnsignedB2S(b uint64, digits int) string {
-	return B2S(int64(b), digits)
-}
-
-func I2S(i int64) string {
-	return strconv.FormatInt(i, 10)
+	return strconv.ParseBool(s)
 }
 
 func StringSliceToIntSlice(strs []string) ([]int64, error) {
@@ -66,24 +57,22 @@ func StrToSentence(str string) string {
 	if str == "" {
 		return ""
 	}
-
 	capitalized := CapitalizeString(str)
-
 	if !strings.HasSuffix(capitalized, ".") {
 		capitalized += "."
 	}
-
 	return capitalized
 }
 
-func ConvertToString(value interface{}) (valstr string, err error) {
+func ConvertToString(value any) (valstr string, err error) {
 	switch v := value.(type) {
 	case string:
 		valstr = v
 	case bool, int, int32, int64, uint32, uint64, float32, float64:
 		valstr = fmt.Sprintf("%v", v)
 	default:
-		err = fmt.Errorf("failed to assert type on param: %v (type %T)", value, value)
+		debug.FailTypeCast(value)
+		err = fmt.Errorf("failed to assert type: %v(%T)", value, value)
 	}
 	return
 }

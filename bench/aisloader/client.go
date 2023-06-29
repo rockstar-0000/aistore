@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
@@ -56,13 +57,18 @@ type (
 		trace        *httptrace.ClientTrace
 		tracedClient *http.Client
 	}
+	tracePutter struct {
+		tctx   *traceCtx
+		cksum  *cos.Cksum
+		reader cos.ReadOpenCloser
+	}
 
 	// httpLatencies stores latency of a http request
 	httpLatencies struct {
-		ProxyConn           time.Duration // from request is created to proxy connection is established
-		Proxy               time.Duration // from proxy connection is established to redirected
-		TargetConn          time.Duration // from request is redirected to target connection is established
-		Target              time.Duration // from target connection is established to request is completed
+		ProxyConn           time.Duration // from (request is created) to (proxy connection is established)
+		Proxy               time.Duration // from (proxy connection is established) to redirected
+		TargetConn          time.Duration // from (request is redirected) to (target connection is established)
+		Target              time.Duration // from (target connection is established) to (request is completed)
 		PostHTTP            time.Duration // from http ends to after read data from http response and verify hash (if specified)
 		ProxyWroteHeader    time.Duration // from ProxyConn to header is written
 		ProxyWroteRequest   time.Duration // from ProxyWroteHeader to response body is written
@@ -72,6 +78,10 @@ type (
 		TargetFirstResponse time.Duration // from TargetWroteRequest to first byte of response
 	}
 )
+
+////////////////////////
+// traceableTransport //
+////////////////////////
 
 // RoundTrip records the proxy redirect time and keeps track of requests.
 func (t *traceableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -133,63 +143,72 @@ func (t *traceableTransport) GotFirstResponseByte() {
 	}
 }
 
-func newTraceCtx() *traceCtx {
-	tctx := &traceCtx{}
+//////////////////////////////////
+// detailed http trace _putter_ //
+//////////////////////////////////
 
-	tctx.tr = &traceableTransport{
-		transport: cmn.NewTransport(transportArgs),
-		tsBegin:   time.Now(),
-	}
-	tctx.trace = &httptrace.ClientTrace{
-		GotConn:              tctx.tr.GotConn,
-		WroteHeaders:         tctx.tr.WroteHeaders,
-		WroteRequest:         tctx.tr.WroteRequest,
-		GotFirstResponseByte: tctx.tr.GotFirstResponseByte,
-	}
-	tctx.tracedClient = &http.Client{
-		Transport: tctx.tr,
-		Timeout:   600 * time.Second,
+// implements callback of the type `api.NewRequestCB`
+func (putter *tracePutter) do(reqArgs *cmn.HreqArgs) (*http.Request, error) {
+	req, err := reqArgs.Req()
+	if err != nil {
+		return nil, err
 	}
 
-	return tctx
+	// The HTTP package doesn't automatically set this for files, so it has to be done manually
+	// If it wasn't set, we would need to deal with the redirect manually.
+	req.GetBody = func() (io.ReadCloser, error) {
+		return putter.reader.Open()
+	}
+	if putter.cksum != nil {
+		req.Header.Set(apc.HdrObjCksumType, putter.cksum.Ty())
+		req.Header.Set(apc.HdrObjCksumVal, putter.cksum.Val())
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), putter.tctx.trace)), nil
+}
+
+func put(proxyURL string, bck cmn.Bck, object string, cksum *cos.Cksum, reader cos.ReadOpenCloser) (err error) {
+	var (
+		baseParams = api.BaseParams{
+			Client: httpClient,
+			URL:    proxyURL,
+			Method: http.MethodPut,
+			Token:  loggedUserToken,
+			UA:     ua,
+		}
+		args = api.PutArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    object,
+			Cksum:      cksum,
+			Reader:     reader,
+			SkipVC:     true,
+		}
+	)
+	_, err = api.PutObject(args)
+	return
 }
 
 // PUT with HTTP trace
-func putWithTrace(proxyURL string, bck cmn.Bck, object string, cksum *cos.Cksum,
-	reader cos.ReadOpenCloser) (httpLatencies, error) {
-	reqArgs := cmn.ReqArgs{
-		Method: http.MethodPut,
-		Base:   proxyURL,
-		Path:   cmn.URLPathObjects.Join(bck.Name, object),
-		Query:  cmn.AddBckToQuery(nil, bck),
-		BodyR:  reader,
+func putWithTrace(proxyURL string, bck cmn.Bck, object string, cksum *cos.Cksum, reader cos.ReadOpenCloser) (httpLatencies, error) {
+	reqArgs := cmn.AllocHra()
+	{
+		reqArgs.Method = http.MethodPut
+		reqArgs.Base = proxyURL
+		reqArgs.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqArgs.Query = bck.AddToQuery(nil)
+		reqArgs.BodyR = reader
 	}
-
-	tctx := newTraceCtx()
-	newReq := func(reqArgs cmn.ReqArgs) (request *http.Request, err error) {
-		req, err := reqArgs.Req()
-		if err != nil {
-			return nil, err
-		}
-
-		// The HTTP package doesn't automatically set this for files, so it has to be done manually
-		// If it wasn't set, we would need to deal with the redirect manually.
-		req.GetBody = func() (io.ReadCloser, error) {
-			return reader.Open()
-		}
-		if cksum != nil {
-			req.Header.Set(cmn.HdrObjCksumType, cksum.Ty())
-			req.Header.Set(cmn.HdrObjCksumVal, cksum.Val())
-		}
-		request = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
-		return
+	putter := tracePutter{
+		tctx:   newTraceCtx(),
+		cksum:  cksum,
+		reader: reader,
 	}
-
-	_, err := api.DoReqWithRetry(tctx.tracedClient, newReq, reqArgs) // nolint:bodyclose // it's closed inside
+	_, err := api.DoWithRetry(putter.tctx.tracedClient, putter.do, reqArgs) //nolint:bodyclose // it's closed inside
+	cmn.FreeHra(reqArgs)
 	if err != nil {
 		return httpLatencies{}, err
 	}
-
+	tctx := putter.tctx
 	tctx.tr.tsHTTPEnd = time.Now()
 	l := httpLatencies{
 		ProxyConn:           timeDelta(tctx.tr.tsProxyConn, tctx.tr.tsBegin),
@@ -207,25 +226,23 @@ func putWithTrace(proxyURL string, bck cmn.Bck, object string, cksum *cos.Cksum,
 	return l, nil
 }
 
-//
-// Put executes PUT
-//
-func put(proxyURL string, bck cmn.Bck, object string, cksum *cos.Cksum, reader cos.ReadOpenCloser) error {
-	var (
-		baseParams = api.BaseParams{
-			Client: httpClient,
-			URL:    proxyURL,
-			Method: http.MethodPut,
-		}
-		args = api.PutObjectArgs{
-			BaseParams: baseParams,
-			Bck:        bck,
-			Object:     object,
-			Cksum:      cksum,
-			Reader:     reader,
-		}
-	)
-	return api.PutObject(args)
+func newTraceCtx() *traceCtx {
+	tctx := &traceCtx{}
+	tctx.tr = &traceableTransport{
+		transport: cmn.NewTransport(transportArgs),
+		tsBegin:   time.Now(),
+	}
+	tctx.trace = &httptrace.ClientTrace{
+		GotConn:              tctx.tr.GotConn,
+		WroteHeaders:         tctx.tr.WroteHeaders,
+		WroteRequest:         tctx.tr.WroteRequest,
+		GotFirstResponseByte: tctx.tr.GotFirstResponseByte,
+	}
+	tctx.tracedClient = &http.Client{
+		Transport: tctx.tr,
+		Timeout:   600 * time.Second,
+	}
+	return tctx
 }
 
 func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, length int64) (*http.Request, error) {
@@ -233,22 +250,20 @@ func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, len
 		hdr   http.Header
 		query = url.Values{}
 	)
-
-	query = cmn.AddBckToQuery(query, bck)
-	if etlID != "" {
-		query.Add(cmn.URLParamUUID, etlID)
+	query = bck.AddToQuery(query)
+	if etlName != "" {
+		query.Add(apc.QparamUUID, etlName)
 	}
 	if length > 0 {
-		hdr = cmn.RangeHdr(offset, length)
+		hdr = cmn.MakeRangeHdr(offset, length)
 	}
-	reqArgs := cmn.ReqArgs{
+	reqArgs := cmn.HreqArgs{
 		Method: http.MethodGet,
 		Base:   proxyURL,
-		Path:   cmn.URLPathObjects.Join(bck.Name, objName),
+		Path:   apc.URLPathObjects.Join(bck.Name, objName),
 		Query:  query,
 		Header: hdr,
 	}
-
 	return reqArgs.Req()
 }
 
@@ -264,19 +279,19 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, off
 	if err != nil {
 		return 0, err
 	}
-	defer cos.Close(resp.Body)
+	defer resp.Body.Close()
 
 	if validate {
-		hdrCksumValue = resp.Header.Get(cmn.HdrObjCksumVal)
-		hdrCksumType = resp.Header.Get(cmn.HdrObjCksumType)
+		hdrCksumValue = resp.Header.Get(apc.HdrObjCksumVal)
+		hdrCksumType = resp.Header.Get(apc.HdrObjCksumType)
 	}
 	src := fmt.Sprintf("GET (object %s from bucket %s)", objName, bck)
-	n, cksumValue, err := readResponse(resp, io.Discard, src, hdrCksumType)
+	n, cksumValue, err := readDiscard(resp, src, hdrCksumType)
 	if err != nil {
 		return 0, err
 	}
 	if validate && hdrCksumValue != cksumValue {
-		return 0, cmn.NewInvalidCksumError(hdrCksumValue, cksumValue)
+		return 0, cmn.NewErrInvalidCksum(hdrCksumValue, cksumValue)
 	}
 	return n, err
 }
@@ -302,17 +317,17 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool
 
 	tctx.tr.tsHTTPEnd = time.Now()
 	if validate {
-		hdrCksumValue = resp.Header.Get(cmn.HdrObjCksumVal)
-		hdrCksumType = resp.Header.Get(cmn.HdrObjCksumType)
+		hdrCksumValue = resp.Header.Get(apc.HdrObjCksumVal)
+		hdrCksumType = resp.Header.Get(apc.HdrObjCksumType)
 	}
 
 	src := fmt.Sprintf("GET (object %s from bucket %s)", objName, bck)
-	n, cksumValue, err := readResponse(resp, io.Discard, src, hdrCksumType)
+	n, cksumValue, err := readDiscard(resp, src, hdrCksumType)
 	if err != nil {
 		return 0, httpLatencies{}, err
 	}
 	if validate && hdrCksumValue != cksumValue {
-		err = cmn.NewInvalidCksumError(hdrCksumValue, cksumValue)
+		err = cmn.NewErrInvalidCksum(hdrCksumValue, cksumValue)
 	}
 
 	latencies := httpLatencies{
@@ -336,9 +351,9 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool
 func getConfig(server string) (httpLatencies, error) {
 	tctx := newTraceCtx()
 
-	url := server + cmn.URLPathDaemon.S
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.URL.RawQuery = api.GetWhatRawQuery(cmn.GetWhatConfig, "")
+	url := server + apc.URLPathDae.S
+	req, _ := http.NewRequest(http.MethodGet, url, http.NoBody)
+	req.URL.RawQuery = api.GetWhatRawQuery(apc.WhatNodeConfig, "")
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
 
 	resp, err := tctx.tracedClient.Do(req)
@@ -347,7 +362,8 @@ func getConfig(server string) (httpLatencies, error) {
 	}
 	defer resp.Body.Close()
 
-	_, err = discardResponse(resp, "GetConfig")
+	_, _, err = readDiscard(resp, "GetConfig", "" /*cksum type*/)
+
 	l := httpLatencies{
 		ProxyConn: timeDelta(tctx.tr.tsProxyConn, tctx.tr.tsBegin),
 		Proxy:     time.Since(tctx.tr.tsProxyConn),
@@ -356,7 +372,7 @@ func getConfig(server string) (httpLatencies, error) {
 }
 
 func listObjCallback(ctx *api.ProgressContext) {
-	fmt.Printf("\rFetched %d objects", ctx.Info().Count)
+	fmt.Printf("\rListing %d objects", ctx.Info().Count)
 	// Final message moves output to new line, to keep output tidy
 	if ctx.IsFinished() {
 		fmt.Println()
@@ -365,9 +381,12 @@ func listObjCallback(ctx *api.ProgressContext) {
 
 // listObjectNames returns a slice of object names of all objects that match the prefix in a bucket.
 func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string) ([]string, error) {
-	msg := &cmn.SelectMsg{Prefix: prefix, PageSize: cmn.DefaultListPageSizeAIS}
+	msg := &apc.LsoMsg{Prefix: prefix, PageSize: apc.DefaultPageSizeCloud}
+	if bck.IsAIS() || bck.IsRemoteAIS() {
+		msg.PageSize = apc.DefaultPageSizeAIS
+	}
 	ctx := api.NewProgressContext(listObjCallback, longListTime)
-	objList, err := api.ListObjects(baseParams, bck, msg, 0, ctx)
+	objList, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{Progress: ctx})
 	if err != nil {
 		return nil, err
 	}
@@ -379,31 +398,21 @@ func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string) ([]s
 	return objs, nil
 }
 
-func discardResponse(r *http.Response, src string) (int64, error) {
-	n, _, err := readResponse(r, io.Discard, src, "")
-	return n, err
-}
-
-func readResponse(r *http.Response, w io.Writer, src, cksumType string) (int64, string, error) {
+func readDiscard(r *http.Response, tag, cksumType string) (int64, string, error) {
 	var (
 		n          int64
 		cksum      *cos.CksumHash
 		err        error
 		cksumValue string
 	)
-
 	if r.StatusCode >= http.StatusBadRequest {
 		bytes, err := io.ReadAll(r.Body)
 		if err == nil {
-			return 0, "", fmt.Errorf("bad status %d from %s, response: %s", r.StatusCode, src, string(bytes))
+			return 0, "", fmt.Errorf("bad status %d from %s, response: %s", r.StatusCode, tag, string(bytes))
 		}
-		return 0, "", fmt.Errorf("bad status %d from %s, err: %v", r.StatusCode, src, err)
+		return 0, "", fmt.Errorf("bad status %d from %s: %v", r.StatusCode, tag, err)
 	}
-
-	buf, slab := mmsa.Alloc()
-	defer slab.Free(buf)
-
-	n, cksum, err = cos.CopyAndChecksum(w, r.Body, buf, cksumType)
+	n, cksum, err = cos.CopyAndChecksum(io.Discard, r.Body, nil, cksumType)
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to read HTTP response, err: %v", err)
 	}

@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -11,13 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -28,8 +30,7 @@ import (
 //
 // All other methods and the metasync's own state are private and internal.
 //
-// Method called doSync does most of the work and is commented in its step-wise
-// execution.
+// Method `do()` does most of the work (comments inline).
 //
 // REVS (see interface below) stands for REplicated, Versioned and Shared/Synchronized.
 //
@@ -38,10 +39,10 @@ import (
 // "metasyncer" provides a generic transport to send an arbitrary payload that
 // combines any number of data units having the following layout:
 //
-//         (shared-replicated-object, associated action-message)
+//         (shared-replicated-object, associated action-message),
 //
-// Action message (above, see aisMsg) provides receivers with a context as
-// to what exactly to do with the newly received versioned replica.
+// where `associated action-message` (aisMsg) provides receivers with the operation
+// ("action") and other relevant context.
 //
 // Further, the metasyncer:
 //
@@ -79,36 +80,37 @@ const (
 	revsBMDTag   = "BMD"
 	revsConfTag  = "Conf"
 	revsTokenTag = "token"
+	revsEtlMDTag = "EtlMD"
 
-	revsMaxTags   = 5
+	revsMaxTags   = 6         // NOTE
 	revsActionTag = "-action" // prefix revs tag
 )
 
 const (
-	revsReqSync = iota
-	revsReqNotify
+	reqSync = iota
+	reqNotify
 )
 
-const faisync = "failing to sync"
+const failsync = "failing to sync"
 
 type (
 	revs interface {
-		tag() string             // enum { revsSmapTag, ... }
-		version() int64          // the version
-		marshal() (b []byte)     // marshals the revs
-		jit(p *proxyrunner) revs // current (just-in-time) instance
-		sgl() *memsys.SGL        // jsp-encoded SGL
-		String() string          // smap.String(), etc.
+		tag() string         // enum { revsSmapTag, ... }
+		version() int64      // the version
+		marshal() (b []byte) // marshals the revs
+		jit(p *proxy) revs   // current (just-in-time) instance
+		sgl() *memsys.SGL    // jsp-encoded SGL
+		String() string      // smap.String(), etc.
 	}
 	revsPair struct {
 		revs revs
 		msg  *aisMsg
 	}
 	revsReq struct {
-		pairs     []revsPair
 		wg        *sync.WaitGroup
 		failedCnt *atomic.Int32
-		reqType   int // enum: revsReqSync, etc.
+		pairs     []revsPair
+		reqType   int // enum: reqSync, etc.
 	}
 	msPayload map[string][]byte     // tag => revs' body
 	ndRevs    map[string]int64      // tag => version (see nodesRevs)
@@ -116,7 +118,7 @@ type (
 
 	// main
 	metasyncer struct {
-		p            *proxyrunner      // parent
+		p            *proxy            // parent
 		nodesRevs    map[string]ndRevs // cluster-wide node ID => ndRevs sync-ed
 		sgls         map[string]tagl   // tag => (version => SGL)
 		lastSynced   map[string]revs   // tag => revs last/current sync-ed
@@ -141,7 +143,9 @@ func (req revsReq) isNil() bool { return len(req.pairs) == 0 }
 // metasyncer //
 ////////////////
 
-func newMetasyncer(p *proxyrunner) (y *metasyncer) {
+func (*metasyncer) Name() string { return "metasyncer" }
+
+func newMetasyncer(p *proxy) (y *metasyncer) {
 	y = &metasyncer{p: p}
 	y.nodesRevs = make(map[string]ndRevs, 8)
 	y.inigls()
@@ -156,10 +160,8 @@ func newMetasyncer(p *proxyrunner) (y *metasyncer) {
 	return
 }
 
-func (*metasyncer) Name() string { return "metasyncer" }
-
 func (y *metasyncer) Run() error {
-	glog.Infof("Starting %s", y.Name())
+	nlog.Infof("Starting %s", y.Name())
 	for {
 		config := cmn.GCO.Get()
 		select {
@@ -175,7 +177,7 @@ func (y *metasyncer) Run() error {
 				y.timerStopped = true
 				break
 			}
-			failedCnt := y.doSync(revsReq.pairs, revsReq.reqType)
+			failedCnt := y.do(revsReq.pairs, revsReq.reqType)
 			if revsReq.wg != nil {
 				if revsReq.failedCnt != nil {
 					revsReq.failedCnt.Store(int32(failedCnt))
@@ -205,7 +207,7 @@ func (y *metasyncer) Run() error {
 }
 
 func (y *metasyncer) Stop(err error) {
-	glog.Infof("Stopping %s, err: %v", y.Name(), err)
+	nlog.Infof("Stopping %s: %v", y.Name(), err)
 
 	y.stopCh <- struct{}{}
 	close(y.stopCh)
@@ -224,7 +226,7 @@ func (y *metasyncer) notify(wait bool, pair revsPair) (failedCnt int) {
 		req.wg = &sync.WaitGroup{}
 		req.wg.Add(1)
 		req.failedCnt = failedCntAtomic
-		req.reqType = revsReqNotify
+		req.reqType = reqNotify
 	}
 	y.workCh <- req
 
@@ -239,12 +241,12 @@ func (y *metasyncer) sync(pairs ...revsPair) *sync.WaitGroup {
 	debug.Assert(len(pairs) > 0)
 	req := revsReq{pairs: pairs}
 	req.wg = &sync.WaitGroup{}
-	if y.isPrimary() != nil {
-		debug.Assert(false)
+	if err := y.isPrimary(); err != nil {
+		nlog.Errorln(err)
 		return req.wg
 	}
 	req.wg.Add(1)
-	req.reqType = revsReqSync
+	req.reqType = reqSync
 	y.workCh <- req
 	return req.wg
 }
@@ -263,121 +265,130 @@ drain:
 		}
 	}
 	y.workCh <- revsReq{}
-	glog.Infof("%s: becoming non-primary", y.p.si)
+	nlog.Infof("%s: becoming non-primary", y.p)
 }
 
 // main method; see top of the file; returns number of "sync" failures
-func (y *metasyncer) doSync(pairs []revsPair, revsReqType int) (failedCnt int) {
+func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 	var (
-		refused      cluster.NodeMap
-		method       string
-		newTargetIDs []string
-		smap         = y.p.owner.smap.get()
-		config       = cmn.GCO.Get()
+		refused meta.NodeMap
+		newTIDs []string
+		method  = http.MethodPut
 	)
+	if reqT == reqNotify {
+		method = http.MethodPost
+	}
 	if daemon.stopping.Load() {
 		return
 	}
 
-	// step 1: validation & enforcement (CoW, non-decremental versioning, duplication)
-	if revsReqType == revsReqNotify {
-		method = http.MethodPost
-	} else {
-		debug.Assert(revsReqType == revsReqSync)
-		method = http.MethodPut
-	}
-
-	// step 2: build payload and update last sync-ed
+	// step: build payload and update last sync-ed
 	payload := make(msPayload, 2*len(pairs))
 	for _, pair := range pairs {
 		var (
 			revsBody []byte
 			msg, tag = pair.msg, pair.revs.tag()
-			revs     = y.useJIT(pair)
+			revs     = pair.revs
 		)
-		// NOTE: in extremely rare cases the revs here may still be carrying sgl that has been freed
-		//       via becomeNonPrimary => y.free(); checking sgl.IsNil() looks like the most lightweight
-		//       vs possible (tracking) alternatives
-		if sgl := revs.sgl(); sgl != nil && !sgl.IsNil() {
-			// fast path
-			revsBody = sgl.Bytes()
-			y.addnew(revs)
-		} else {
-			// slow path
+		if reqT == reqNotify {
 			revsBody = revs.marshal()
-			if sgl := revs.sgl(); sgl != nil {
+		} else {
+			revs = y.jit(pair)
+
+			// in an unlikely event, the revs may still carry sgl that has been freed
+			// via becomeNonPrimary => y.free() sequence; checking sgl.IsNil() is a compromise
+			if sgl := revs.sgl(); sgl != nil && !sgl.IsNil() {
+				// fast path
+				revsBody = sgl.Bytes()
 				y.addnew(revs)
+			} else {
+				// slow path
+				revsBody = revs.marshal()
+				if sgl := revs.sgl(); sgl != nil {
+					y.addnew(revs)
+				}
 			}
+			y.lastSynced[tag] = revs
 		}
-		y.lastSynced[tag] = revs
 		if tag == revsRMDTag {
 			md := revs.(*rebMD)
-			newTargetIDs = md.TargetIDs
+			newTIDs = md.TargetIDs
 		}
 		payload[tag] = revsBody                           // payload
 		payload[tag+revsActionTag] = cos.MustMarshal(msg) // action message always on the wire even when empty
 	}
 
-	// step 3: b-cast
+	// step: bcast
 	var (
-		urlPath = cmn.URLPathMetasync.S
+		urlPath = apc.URLPathMetasync.S
 		body    = payload.marshal(y.p.gmm)
 		to      = cluster.AllNodes
+		smap    = y.p.owner.smap.get()
 	)
 	defer body.Free()
 
-	if revsReqType == revsReqNotify {
+	if reqT == reqNotify {
 		to = cluster.Targets
 	}
-	args := allocBcastArgs()
-	args.req = cmn.ReqArgs{Method: method, Path: urlPath, BodyR: body}
+	args := allocBcArgs()
+	args.req = cmn.HreqArgs{Method: method, Path: urlPath, BodyR: body}
 	args.smap = smap
-	args.timeout = config.Timeout.MaxKeepalive.D() // making exception for this critical op
+	args.timeout = cmn.Timeout.MaxKeepalive() // making exception for this critical op
 	args.to = to
 	args.ignoreMaintenance = true
 	results := y.p.bcastGroup(args)
-	freeBcastArgs(args)
+	freeBcArgs(args)
 
-	// step 4: count failures and fill-in refused
+	// step: count failures and fill-in refused
 	for _, res := range results {
 		if res.err == nil {
-			if revsReqType == revsReqSync {
+			if reqT == reqSync {
 				y.syncDone(res.si, pairs)
 			}
 			continue
 		}
-		// failing to sync
-		glog.Warningf("%s: %s %s, err: %v(%d)", y.p.si, faisync, res.si, res.err, res.status)
-		// in addition to "connection-refused" always retry newTargetID - the joining one
-		if cos.IsErrConnectionRefused(res.err) || cos.StringInSlice(res.si.ID(), newTargetIDs) {
+		sname := res.si.StringEx()
+		err := res.unwrap()
+		// failing to sync - not retrying, ignoring
+		if res.si.InMaintOrDecomm() {
+			nlog.Infof("%s: %s %s (maintenance %#b): %v(%d)", y.p, failsync, sname, res.si.Flags, err, res.status)
+			continue
+		}
+		// - retrying, counting
+		if cos.IsRetriableConnErr(err) || cos.StringInSlice(res.si.ID(), newTIDs) { // always retry newTIDs (joining)
 			if refused == nil {
-				refused = make(cluster.NodeMap, 2)
+				refused = make(meta.NodeMap, 2)
 			}
 			refused.Add(res.si)
 		} else {
+			nlog.Warningf("%s: %s %s: %v(%d)", y.p, failsync, sname, err, res.status)
 			failedCnt++
 		}
 	}
-	freeCallResults(results)
-	// step 5: handle connection-refused right away
+	freeBcastRes(results)
+	// step: handle connection-refused right away
+	lr := len(refused)
 	for i := 0; i < 4; i++ {
 		if len(refused) == 0 {
+			if lr > 0 {
+				nlog.Infof("%s: %d node%s sync-ed", y.p, lr, cos.Plural(lr))
+			}
 			break
 		}
-		time.Sleep(config.Timeout.CplaneOperation.D())
+		time.Sleep(cmn.Timeout.CplaneOperation())
 		smap = y.p.owner.smap.get()
 		if !smap.isPrimary(y.p.si) {
 			y.becomeNonPrimary()
 			return
 		}
-		if !y.handleRefused(method, urlPath, body, refused, pairs, smap, config) {
+		if !y.handleRefused(method, urlPath, body, refused, pairs, smap) {
 			break
 		}
 	}
-	// step 6: housekeep and return new pending
+	// step: housekeep and return new pending
 	smap = y.p.owner.smap.get()
 	for sid := range y.nodesRevs {
-		si := smap.GetNodeNotMaint(sid)
+		si := smap.GetActiveNode(sid)
 		if si == nil {
 			delete(y.nodesRevs, sid)
 		}
@@ -386,16 +397,13 @@ func (y *metasyncer) doSync(pairs []revsPair, revsReqType int) (failedCnt int) {
 	return
 }
 
-func (y *metasyncer) useJIT(pair revsPair) revs {
+func (y *metasyncer) jit(pair revsPair) revs {
 	var (
 		s              string
 		revs, msg, tag = pair.revs, pair.msg, pair.revs.tag()
 		jitRevs        = revs.jit(y.p)
 		skipping       bool
 	)
-	if msg.Action != "" {
-		s = ", action " + msg.Action
-	}
 	if jitRevs != nil && jitRevs.version() > revs.version() {
 		// making exception for BMD (and associated bucket-level transactions) unless:
 		if tag == revsBMDTag {
@@ -409,19 +417,22 @@ func (y *metasyncer) useJIT(pair revsPair) revs {
 			skipping = true
 		}
 	}
+	if msg.Action != "" {
+		s = ", " + msg.String()
+	}
 	if skipping {
-		glog.Infof("%s: sync newer %s v%d%s (skipping %s)", y.p.si, tag, jitRevs.version(), s, revs)
+		nlog.Infof("%s: newer %s v%d%s - skipping %s", y.p, tag, jitRevs.version(), s, revs)
 	} else {
-		glog.Infof("%s: sync %s v%d%s", y.p.si, tag, revs.version(), s)
+		nlog.Infof("%s: %s v%d%s", y.p, tag, revs.version(), s)
 	}
 	return revs
 }
 
 // keeping track of per-daemon versioning - TODO: extend to take care of aisMsg where pairs may be empty
-func (y *metasyncer) syncDone(si *cluster.Snode, pairs []revsPair) {
+func (y *metasyncer) syncDone(si *meta.Snode, pairs []revsPair) {
 	ndr, ok := y.nodesRevs[si.ID()]
 	smap := y.p.owner.smap.get()
-	if smap.GetNodeNotMaint(si.ID()) == nil {
+	if smap.GetActiveNode(si.ID()) == nil {
 		if ok {
 			delete(y.nodesRevs, si.ID())
 		}
@@ -437,16 +448,16 @@ func (y *metasyncer) syncDone(si *cluster.Snode, pairs []revsPair) {
 	}
 }
 
-func (y *metasyncer) handleRefused(method, urlPath string, body io.Reader, refused cluster.NodeMap,
-	pairs []revsPair, smap *smapX, config *cmn.Config) (ok bool) {
-	args := allocBcastArgs()
-	args.req = cmn.ReqArgs{Method: method, Path: urlPath, BodyR: body}
-	args.network = cmn.NetworkIntraControl
-	args.timeout = config.Timeout.MaxKeepalive.D()
-	args.nodes = []cluster.NodeMap{refused}
+func (y *metasyncer) handleRefused(method, urlPath string, body io.Reader, refused meta.NodeMap, pairs []revsPair,
+	smap *smapX) (ok bool) {
+	args := allocBcArgs()
+	args.req = cmn.HreqArgs{Method: method, Path: urlPath, BodyR: body}
+	args.network = cmn.NetIntraControl
+	args.timeout = cmn.Timeout.MaxKeepalive()
+	args.nodes = []meta.NodeMap{refused}
 	args.nodeCount = len(refused)
 	results := y.p.bcastNodes(args)
-	freeBcastArgs(args)
+	freeBcArgs(args)
 	for _, res := range results {
 		if res.err == nil {
 			delete(refused, res.si.ID())
@@ -456,33 +467,33 @@ func (y *metasyncer) handleRefused(method, urlPath string, body io.Reader, refus
 		// failing to sync
 		if res.status == http.StatusConflict {
 			if e := err2MsyncErr(res.err); e != nil {
-				msg := fmt.Sprintf("%s [hr]: %s %s, err: %s [%v]", y.p.si, faisync, res.si, e.Message, e.Cii)
+				msg := fmt.Sprintf("%s [hr]: %s %s: %s [%v]", y.p.si, failsync, res.si, e.Message, e.Cii)
 				if !y.remainPrimary(e, res.si, smap) {
-					glog.Errorln(msg + " - aborting")
-					freeCallResults(results)
+					nlog.Errorln(msg + " - aborting")
+					freeBcastRes(results)
 					return false
 				}
-				glog.Warningln(msg)
+				nlog.Warningln(msg)
 				continue
 			}
 		}
-		glog.Warningf("%s [hr]: %s %s, err: %v(%d)", y.p.si, faisync, res.si, res.err, res.status)
+		nlog.Warningf("%s [hr]: %s %s: %v(%d)", y.p, failsync, res.si, res.unwrap(), res.status)
 	}
-	freeCallResults(results)
+	freeBcastRes(results)
 	return true
 }
 
 // pending (map), if requested, contains only those daemons that need
 // to get at least one of the most recently sync-ed tag-ed revs
-func (y *metasyncer) _pending() (pending cluster.NodeMap, smap *smapX) {
+func (y *metasyncer) _pending() (pending meta.NodeMap, smap *smapX) {
 	smap = y.p.owner.smap.get()
 	if !smap.isPrimary(y.p.si) {
 		y.becomeNonPrimary()
 		return
 	}
-	for _, serverMap := range []cluster.NodeMap{smap.Tmap, smap.Pmap} {
+	for _, serverMap := range []meta.NodeMap{smap.Tmap, smap.Pmap} {
 		for _, si := range serverMap {
-			if si.ID() == y.p.si.ID() {
+			if si.ID() == y.p.SID() {
 				continue
 			}
 			ndr, ok := y.nodesRevs[si.ID()]
@@ -497,7 +508,7 @@ func (y *metasyncer) _pending() (pending cluster.NodeMap, smap *smapX) {
 						break
 					} else if v > revs.version() {
 						// skip older versions (TODO: don't skip sending associated aisMsg)
-						glog.Errorf("v: %d; revs.version: %d", v, revs.version())
+						nlog.Errorf("v: %d; revs.version: %d", v, revs.version())
 					}
 				}
 				if inSync {
@@ -505,7 +516,7 @@ func (y *metasyncer) _pending() (pending cluster.NodeMap, smap *smapX) {
 				}
 			}
 			if pending == nil {
-				pending = make(cluster.NodeMap, 2)
+				pending = make(meta.NodeMap, 2)
 			}
 			pending.Add(si)
 		}
@@ -514,11 +525,11 @@ func (y *metasyncer) _pending() (pending cluster.NodeMap, smap *smapX) {
 }
 
 // gets invoked when retryTimer fires; returns updated number of still pending
-// using MethodPut since revsReqType here is always revsReqSync
+// using MethodPut since reqT here is always reqSync
 func (y *metasyncer) handlePending() (failedCnt int) {
 	pending, smap := y._pending()
 	if len(pending) == 0 {
-		glog.Infof("no pending revs - all good")
+		nlog.Infof("no pending revs - all good")
 		return
 	}
 	var (
@@ -542,19 +553,18 @@ func (y *metasyncer) handlePending() (failedCnt int) {
 		pairs = append(pairs, revsPair{revs, msg})
 	}
 	var (
-		config  = cmn.GCO.Get()
-		urlPath = cmn.URLPathMetasync.S
+		urlPath = apc.URLPathMetasync.S
 		body    = payload.marshal(y.p.gmm)
-		args    = allocBcastArgs()
+		args    = allocBcArgs()
 	)
-	args.req = cmn.ReqArgs{Method: http.MethodPut, Path: urlPath, BodyR: body}
-	args.network = cmn.NetworkIntraControl
-	args.timeout = config.Timeout.MaxKeepalive.D()
-	args.nodes = []cluster.NodeMap{pending}
+	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: urlPath, BodyR: body}
+	args.network = cmn.NetIntraControl
+	args.timeout = cmn.Timeout.MaxKeepalive()
+	args.nodes = []meta.NodeMap{pending}
 	args.nodeCount = len(pending)
 	defer body.Free()
 	results := y.p.bcastNodes(args)
-	freeBcastArgs(args)
+	freeBcArgs(args)
 	for _, res := range results {
 		if res.err == nil {
 			y.syncDone(res.si, pairs)
@@ -564,25 +574,25 @@ func (y *metasyncer) handlePending() (failedCnt int) {
 		// failing to sync
 		if res.status == http.StatusConflict {
 			if e := err2MsyncErr(res.err); e != nil {
-				msg := fmt.Sprintf("%s [hp]: %s %s, err: %s [%v]", y.p.si, faisync, res.si, e.Message, e.Cii)
+				msg := fmt.Sprintf("%s [hp]: %s %s: %s [%v]", y.p.si, failsync, res.si, e.Message, e.Cii)
 				if !y.remainPrimary(e, res.si, smap) {
 					// return zero so that the caller stops retrying (y.retryTimer)
-					glog.Errorln(msg + " - aborting")
-					freeCallResults(results)
+					nlog.Errorln(msg + " - aborting")
+					freeBcastRes(results)
 					return 0
 				}
-				glog.Warningln(msg)
+				nlog.Warningln(msg)
 				continue
 			}
 		}
-		glog.Warningf("%s [hp]: %s %s, err: %v(%d)", y.p.si, faisync, res.si, res.err, res.status)
+		nlog.Warningf("%s [hp]: %s %s: %v(%d)", y.p, failsync, res.si, res.err, res.status)
 	}
-	freeCallResults(results)
+	freeBcastRes(results)
 	return
 }
 
 // cie and isPrimary checks versus remote clusterInfo
-func (y *metasyncer) remainPrimary(e *errMsync, from *cluster.Snode, smap *smapX) bool /*yes*/ {
+func (y *metasyncer) remainPrimary(e *errMsync, from *meta.Snode, smap *smapX) bool /*yes*/ {
 	if !cos.IsValidUUID(e.Cii.Smap.UUID) || e.Cii.Smap.Version == 0 {
 		return true
 	}
@@ -591,11 +601,11 @@ func (y *metasyncer) remainPrimary(e *errMsync, from *cluster.Snode, smap *smapX
 		cos.ExitLogf("%s: split-brain uuid [%s %s] vs %v from %s", ciError(90), y.p.si, smap.StringEx(),
 			e.Cii, from)
 	}
-	if e.Cii.Smap.Primary.ID == "" || e.Cii.Smap.Primary.ID == y.p.si.ID() {
+	if e.Cii.Smap.Primary.ID == "" || e.Cii.Smap.Primary.ID == y.p.SID() {
 		return true
 	}
 	if e.Cii.Smap.Version > smap.Version {
-		glog.Warningf("%s: detected primary change: %s vs %s [%v] from %s", y.p.si, smap.StringEx(),
+		nlog.Warningf("%s: detected primary change: %s vs %s [%v] from %s", y.p, smap.StringEx(),
 			e.Message, e.Cii, from)
 		y.becomeNonPrimary()
 		return false
@@ -603,7 +613,7 @@ func (y *metasyncer) remainPrimary(e *errMsync, from *cluster.Snode, smap *smapX
 	if e.Cii.Smap.Version < smap.Version {
 		return true
 	}
-	glog.Errorf("%s: [%s %s] vs %v from %s", ciError(90), y.p.si, smap.StringEx(), e.Cii, from)
+	nlog.Errorf("%s: [%s %s] vs %v from %s", ciError(90), y.p, smap.StringEx(), e.Cii, from)
 	return true // TODO: iffy; may need to do more
 }
 
@@ -613,7 +623,7 @@ func (y *metasyncer) isPrimary() (err error) {
 		return
 	}
 	err = newErrNotPrimary(y.p.si, smap)
-	glog.Error(err)
+	nlog.Errorln(err)
 	return
 }
 
@@ -647,8 +657,7 @@ func (y *metasyncer) addnew(revs revs) {
 		if sgl == revs.sgl() {
 			return
 		}
-		// free duplicate (created previously via "slow path")
-		debug.Assert(sgl.Len() == revs.sgl().Len())
+		// free the duplicate (created previously via "slow path")
 		sgl.Free()
 	}
 	vgl[revs.version()] = revs.sgl()
@@ -694,16 +703,25 @@ func (payload msPayload) unmarshal(reader io.ReadCloser, tag string) (err error)
 //////////////
 // errMsync //
 //////////////
+
 func (e *errMsync) Error() string { return e.Message }
 
-func (e *errMsync) message(errs ...error) {
+// TODO: use cos.Errs
+func (e *errMsync) message(errs ...error) error {
 	var filtered []error
 	for _, err := range errs {
 		if err != nil {
 			filtered = append(filtered, err)
 		}
 	}
+	l := len(filtered)
+	debug.Assert(l > 0)
 	e.Message = fmt.Sprintf("%v", filtered)
+	nlog.Warningln(cos.MustMarshalToString(e)) // extended info
+	if l == 1 {
+		return filtered[0]
+	}
+	return fmt.Errorf("%v (and %d more error%s)", filtered[0], l-1, cos.Plural(l-1))
 }
 
 func err2MsyncErr(err error) (e *errMsync) {

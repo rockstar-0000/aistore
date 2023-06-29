@@ -1,85 +1,128 @@
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sync"
+	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 )
 
-type (
-	remAISCluster struct {
-		url  string
-		smap *cluster.Smap
-		m    *AISBackendProvider
+// NOTE: some of the methods here are part of the of the *extended* native AIS API outside
+// generic `BackendProvider` (see cluster/backend.go)
 
+// TODO:
+// - include `appliedCfgVer` in the GetInfo* response (to synchronize p._remais, etc.)
+// - periodically refresh remote Smap
+// - use m.remote[uuid].smap to load balance and retry disconnects
+
+const ua = "aisnode/backend"
+
+type (
+	remAis struct {
+		smap *meta.Smap
+		m    *AISBackendProvider
+		url  string
 		uuid string
 		bp   api.BaseParams
 	}
 	AISBackendProvider struct {
-		t      cluster.Target
-		mu     *sync.RWMutex
-		remote map[string]*remAISCluster // by UUID:  1 to 1
-		alias  map[string]string         // by alias: many to 1 UUID
+		t             cluster.TargetPut
+		remote        map[string]*remAis // by UUID
+		alias         cos.StrKVs         // alias => UUID
+		mu            sync.RWMutex
+		appliedCfgVer int64
 	}
 )
 
 // interface guard
 var _ cluster.BackendProvider = (*AISBackendProvider)(nil)
 
-// TODO: house-keep refreshing remote Smap
-// TODO: utilize m.remote[uuid].smap to load balance and retry disconnects
+var (
+	preg, treg *regexp.Regexp
+)
 
-func NewAIS(t cluster.Target) *AISBackendProvider {
+func NewAIS(t cluster.TargetPut) *AISBackendProvider {
+	suff := regexp.QuoteMeta(meta.SnameSuffix)
+	preg = regexp.MustCompile(regexp.QuoteMeta(meta.PnamePrefix) + `\S*` + suff + ": ")
+	treg = regexp.MustCompile(regexp.QuoteMeta(meta.TnamePrefix) + `\S*` + suff + ": ")
 	return &AISBackendProvider{
 		t:      t,
-		mu:     &sync.RWMutex{},
-		remote: make(map[string]*remAISCluster),
-		alias:  make(map[string]string),
+		remote: make(map[string]*remAis),
+		alias:  make(cos.StrKVs),
 	}
 }
 
-func (r *remAISCluster) String() string {
-	var aliases []string
-	for alias, uuid := range r.m.alias {
+func (r *remAis) String() string {
+	var alias string
+	for a, uuid := range r.m.alias {
 		if uuid == r.smap.UUID {
-			aliases = append(aliases, alias)
+			alias = a
+			break
 		}
 	}
-	return fmt.Sprintf("remote cluster (url: %s, aliases: %q, uuid: %v, smap: %s)", r.url, aliases, r.smap.UUID, r.smap)
+	return fmt.Sprintf("remote cluster (%s, %q, %q, %s)", r.url, alias, r.smap.UUID, r.smap)
 }
 
-// NOTE: this and the next method are part of the of the *extended* AIS cloud API
-//       in addition to the basic GetObj, et al.
+func unsetUUID(bck *cmn.Bck) { bck.Ns.UUID = "" }
+
+func extractErrCode(e error, uuid string) (int, error) {
+	if e == nil {
+		return http.StatusOK, nil
+	}
+	herr := cmn.Err2HTTPErr(e)
+	if herr == nil {
+		return http.StatusInternalServerError, e
+	}
+	if uuid != "" {
+		msg := herr.Message
+		loc := preg.FindStringIndex(msg)
+		if loc == nil {
+			loc = treg.FindStringIndex(msg)
+		}
+		if loc != nil && loc[1] > loc[0]+2 {
+			herr.Message = msg[loc[0]:loc[1]-2] + "@" + uuid + ": " + msg[loc[1]:]
+		}
+	}
+	return herr.Status, herr
+}
 
 // apply new or updated (attach, detach) cmn.BackendConfAIS configuration
-func (m *AISBackendProvider) Apply(v interface{}, action string) error {
-	var (
-		cfg         = cmn.GCO.Get()
-		clusterConf = cmn.BackendConfAIS{}
-		err         = cos.MorphMarshal(v, &clusterConf)
-	)
-	if err != nil {
-		return fmt.Errorf("invalid ais cloud config (%+v, %T), err: %v", v, v, err)
+func (m *AISBackendProvider) Apply(v any, action string, cfg *cmn.ClusterConfig) (err error) {
+	conf := cmn.BackendConfAIS{}
+	if err = cos.MorphMarshal(v, &conf); err != nil {
+		err = fmt.Errorf("%s: invalid ais backend config (%+v, %T): %v", m.t, v, v, err)
+		debug.AssertNoErr(err)
+		return
 	}
+	nlog.Infof("%s: apply %q %+v Conf v%d", m.t, action, conf, cfg.Version)
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	err = m._apply(cfg, conf, action)
+	if err == nil {
+		m.appliedCfgVer = cfg.Version
+	}
+	m.mu.Unlock()
+	return
+}
 
+func (m *AISBackendProvider) _apply(cfg *cmn.ClusterConfig, clusterConf cmn.BackendConfAIS, action string) error {
 	// detach
-	if action == cmn.ActDetach {
+	if action == apc.ActDetachRemAis {
 		for alias, uuid := range m.alias {
 			if _, ok := clusterConf[alias]; !ok {
 				if _, ok = clusterConf[uuid]; !ok {
@@ -91,9 +134,16 @@ func (m *AISBackendProvider) Apply(v interface{}, action string) error {
 		return nil
 	}
 
+	// validate aliases
+	for alias := range clusterConf {
+		if err := cmn.ValidateRemAlias(alias); err != nil {
+			return err
+		}
+	}
+
 	// init and attach
 	for alias, clusterURLs := range clusterConf {
-		remAis := &remAISCluster{}
+		remAis := &remAis{}
 		if offline, err := remAis.init(alias, clusterURLs, cfg); err != nil { // and check connectivity
 			if offline {
 				continue
@@ -107,10 +157,33 @@ func (m *AISBackendProvider) Apply(v interface{}, action string) error {
 	return nil
 }
 
+// return (m.remote + m.alias) in-memory info wo/ connecting to remote cluster(s)
+// (compare with GetInfo() below)
+// TODO: caller to pass its cached version to optimize-out allocations
+func (m *AISBackendProvider) GetInfoInternal() (res cluster.Remotes) {
+	m.mu.RLock()
+	res.A = make([]*cluster.RemAis, 0, len(m.remote))
+	for uuid, remAis := range m.remote {
+		out := &cluster.RemAis{UUID: uuid, URL: remAis.url}
+		for a, u := range m.alias {
+			if uuid == u {
+				out.Alias = a
+				break
+			}
+		}
+		res.A = append(res.A, out)
+	}
+	res.Ver = m.appliedCfgVer
+	m.mu.RUnlock()
+	return
+}
+
 // At the same time a cluster may have registered both types of remote AIS
-// clusters(HTTP and HTTPS). So, the method must use both kind of clients and
+// clusters(HTTP and HTTPS). So, the method must use both kinds of clients and
 // select the correct one at the moment it sends a request.
-func (m *AISBackendProvider) GetInfo(clusterConf cmn.BackendConfAIS) (cia cmn.BackendInfoAIS) {
+// See also: GetInfoInternal()
+// TODO: ditto
+func (m *AISBackendProvider) GetInfo(clusterConf cmn.BackendConfAIS) (res cluster.Remotes) {
 	var (
 		cfg         = cmn.GCO.Get()
 		httpClient  = cmn.NewClient(cmn.TransportArgs{Timeout: cfg.Client.Timeout.D()})
@@ -120,56 +193,48 @@ func (m *AISBackendProvider) GetInfo(clusterConf cmn.BackendConfAIS) (cia cmn.Ba
 			SkipVerify: cfg.Net.HTTP.SkipVerify,
 		})
 	)
-	cia = make(cmn.BackendInfoAIS, len(m.remote))
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	res.A = make([]*cluster.RemAis, 0, len(m.remote))
 	for uuid, remAis := range m.remote {
 		var (
-			aliases []string
-			info    = &cmn.RemoteAISInfo{}
+			out    = &cluster.RemAis{UUID: uuid, URL: remAis.url}
+			client = httpClient
 		)
-		client := httpClient
 		if cos.IsHTTPS(remAis.url) {
 			client = httpsClient
 		}
-		info.URL = remAis.url
 		for a, u := range m.alias {
 			if uuid == u {
-				aliases = append(aliases, a)
+				out.Alias = a
+				break
 			}
 		}
-		if len(aliases) == 1 {
-			info.Alias = aliases[0]
-		} else if len(aliases) > 1 {
-			info.Alias = fmt.Sprintf("%v", aliases)
-		}
+
 		// online?
-		if smap, err := api.GetClusterMap(api.BaseParams{Client: client, URL: remAis.url}); err == nil {
+		if smap, err := api.GetClusterMap(api.BaseParams{Client: client, URL: remAis.url, UA: ua}); err == nil {
 			if smap.UUID != uuid {
-				glog.Errorf("%s: unexpected (or changed) uuid %q", remAis, smap.UUID)
+				nlog.Errorf("%s: UUID has changed %q", remAis, smap.UUID)
 				continue
 			}
-			info.Online = true
 			if smap.Version < remAis.smap.Version {
-				glog.Errorf("%s: detected older Smap %s - proceeding to override anyway", remAis, smap)
+				nlog.Errorf("%s: detected older Smap %s - proceeding to override anyway", remAis, smap)
 			}
 			remAis.smap = smap
 		}
-		info.Primary = remAis.smap.Primary.String()
-		info.Smap = remAis.smap.Version
-		info.Targets = int32(remAis.smap.CountActiveTargets())
-		cia[uuid] = info
+		out.Smap = remAis.smap
+		res.A = append(res.A, out)
 	}
-	// defunct
+	// defunct (cluster config not updated yet locally?)
 	for alias, clusterURLs := range clusterConf {
 		if _, ok := m.alias[alias]; !ok {
 			if _, ok = m.remote[alias]; !ok {
-				info := &cmn.RemoteAISInfo{}
-				info.URL = fmt.Sprintf("%v", clusterURLs)
-				cia[alias] = info
+				out := &cluster.RemAis{Alias: alias, UUID: apc.RemAisDefunct}
+				out.URL = fmt.Sprintf("%v", clusterURLs)
+				res.A = append(res.A, out)
 			}
 		}
 	}
+	m.mu.RUnlock()
 	return
 }
 
@@ -177,10 +242,10 @@ func (m *AISBackendProvider) GetInfo(clusterConf cmn.BackendConfAIS) (cia cmn.Ba
 // same time. So, the method must use both kind of clients and select the
 // correct one at the moment it sends a request. First successful request
 // saves the good client for the future usage.
-func (r *remAISCluster) init(alias string, confURLs []string, cfg *cmn.Config) (offline bool, err error) {
+func (r *remAis) init(alias string, confURLs []string, cfg *cmn.ClusterConfig) (offline bool, err error) {
 	var (
 		url           string
-		remSmap, smap *cluster.Smap
+		remSmap, smap *meta.Smap
 		httpClient    = cmn.NewClient(cmn.TransportArgs{Timeout: cfg.Client.Timeout.D()})
 		httpsClient   = cmn.NewClient(cmn.TransportArgs{
 			Timeout:    cfg.Client.Timeout.D(),
@@ -193,8 +258,8 @@ func (r *remAISCluster) init(alias string, confURLs []string, cfg *cmn.Config) (
 		if cos.IsHTTPS(u) {
 			client = httpsClient
 		}
-		if smap, err = api.GetClusterMap(api.BaseParams{Client: client, URL: u}); err != nil {
-			glog.Warningf("remote cluster failing to reach %q via %s, err: %v", alias, u, err)
+		if smap, err = api.GetClusterMap(api.BaseParams{Client: client, URL: u, UA: ua}); err != nil {
+			nlog.Warningf("remote cluster failing to reach %q via %s: %v", alias, u, err)
 			continue
 		}
 		if remSmap == nil {
@@ -217,17 +282,17 @@ func (r *remAISCluster) init(alias string, confURLs []string, cfg *cmn.Config) (
 	}
 	r.smap, r.url = remSmap, url
 	if cos.IsHTTPS(url) {
-		r.bp = api.BaseParams{Client: httpsClient, URL: url}
+		r.bp = api.BaseParams{Client: httpsClient, URL: url, UA: ua}
 	} else {
-		r.bp = api.BaseParams{Client: httpClient, URL: url}
+		r.bp = api.BaseParams{Client: httpClient, URL: url, UA: ua}
 	}
 	r.uuid = remSmap.UUID
 	return
 }
 
 // NOTE: supporting remote attachments both by alias and by UUID interchangeably,
-//       with mappings: 1(uuid) to 1(cluster) and 1(alias) to 1(cluster)
-func (m *AISBackendProvider) add(newAis *remAISCluster, newAlias string) (err error) {
+// with mappings: 1(uuid) to 1(cluster) and 1(alias) to 1(cluster)
+func (m *AISBackendProvider) add(newAis *remAis, newAlias string) (err error) {
 	if remAis, ok := m.remote[newAlias]; ok {
 		return fmt.Errorf("cannot attach %s: alias %q is already in use as uuid for %s",
 			newAlias, newAlias, remAis)
@@ -248,10 +313,10 @@ func (m *AISBackendProvider) add(newAis *remAISCluster, newAlias string) (err er
 		}
 		m.alias[newAlias] = newAis.smap.UUID // alias
 		if newAis.url != remAis.url {
-			glog.Warningf("%s: different new URL %s - overriding", remAis, newAis)
+			nlog.Warningf("%s: different new URL %s - overriding", remAis, newAis)
 		}
 		if newAis.smap.Version < remAis.smap.Version {
-			glog.Errorf("%s: detected older Smap %s - proceeding to override anyway", remAis, newAis)
+			nlog.Errorf("%s: detected older Smap %s - proceeding to override anyway", remAis, newAis)
 		}
 		tag = "updated"
 		goto ad
@@ -267,234 +332,300 @@ func (m *AISBackendProvider) add(newAis *remAISCluster, newAlias string) (err er
 	m.alias[newAlias] = newAis.smap.UUID
 ad:
 	m.remote[newAis.smap.UUID] = newAis
-	glog.Infof("%s %s", newAis, tag)
+	nlog.Infof("%s %s", newAis, tag)
 	return
 }
 
-func (m *AISBackendProvider) remoteCluster(uuid string) (*remAISCluster, error) {
+func (m *AISBackendProvider) getRemAis(aliasOrUUID string) (remAis *remAis, err error) {
 	m.mu.RLock()
-	remAis, ok := m.remote[uuid]
-	if !ok {
-		// double take (see "for user convenience" above)
-		orig := uuid
-		if uuid, ok = m.alias[uuid /*alias?*/]; !ok {
-			m.mu.RUnlock()
-			return nil, cmn.NewNotFoundError("%s: remote cluster %q", m.t.Snode(), orig)
+	remAis, _, err = m.resolve(aliasOrUUID)
+	m.mu.RUnlock()
+	return
+}
+
+func (m *AISBackendProvider) headRemAis(aliasOrUUID string) (remAis *remAis, alias, uuid string, err error) {
+	m.mu.RLock()
+	remAis, uuid, err = m.resolve(aliasOrUUID)
+	if err != nil {
+		m.mu.RUnlock()
+		return
+	}
+	for a, u := range m.alias {
+		if u == uuid {
+			alias = a
+			break
 		}
-		remAis, ok = m.remote[uuid]
-		cos.Assert(ok)
 	}
 	m.mu.RUnlock()
-	return remAis, nil
+	return
 }
 
-func prepareBck(bck cmn.Bck) cmn.Bck {
-	bck.Ns.UUID = ""
-	return bck
-}
-
-func extractErrCode(e error) (int, error) {
-	if e == nil {
-		return http.StatusOK, nil
+// resolve (alias | UUID) => remAis, UUID
+// is called under lock
+func (m *AISBackendProvider) resolve(uuid string) (*remAis, string, error) {
+	remAis, ok := m.remote[uuid]
+	if ok {
+		return remAis, uuid, nil
 	}
-	if httpErr := cmn.Err2HTTPErr(e); httpErr != nil {
-		return httpErr.Status, httpErr
+	alias := uuid
+	if uuid, ok = m.alias[alias]; !ok {
+		return nil, "", cos.NewErrNotFound("%s: remote cluster %q", m.t, alias)
 	}
-	return http.StatusInternalServerError, e
+	remAis, ok = m.remote[uuid]
+	debug.Assertf(ok, "%q vs %q", alias, uuid)
+	return remAis, uuid, nil
 }
 
 /////////////////////
 // BackendProvider //
 /////////////////////
 
-func (*AISBackendProvider) Provider() string  { return cmn.ProviderAIS }
-func (*AISBackendProvider) MaxPageSize() uint { return cmn.DefaultListPageSizeAIS }
+func (*AISBackendProvider) Provider() string  { return apc.AIS }
+func (*AISBackendProvider) MaxPageSize() uint { return apc.DefaultPageSizeAIS }
 
-func (*AISBackendProvider) CreateBucket(_ *cluster.Bck) (errCode int, err error) {
+func (*AISBackendProvider) CreateBucket(_ *meta.Bck) (errCode int, err error) {
 	debug.Assert(false) // Bucket creation happens only with reverse proxy to AIS cluster.
 	return 0, nil
 }
 
-func (m *AISBackendProvider) HeadBucket(_ context.Context, remoteBck *cluster.Bck) (bckProps cos.SimpleKVs, errCode int, err error) {
-	debug.Assert(remoteBck.Provider == cmn.ProviderAIS)
+// TODO: remote AIS clusters provide native frontend API with additional capabilities
+// that, in particular, include `dontAddRemote` = (true | false).
+// Here we have to hardcode the value to keep HeadBucket() consistent across all backends.
+// For similar limitations, see also ListBuckets() below.
+func (m *AISBackendProvider) HeadBucket(_ ctx, remoteBck *meta.Bck) (bckProps cos.StrKVs, errCode int, err error) {
+	var (
+		remAis      *remAis
+		p           *cmn.BucketProps
+		alias, uuid string
+	)
+	if remAis, alias, uuid, err = m.headRemAis(remoteBck.Ns.UUID); err != nil {
+		return
+	}
+	debug.Assert(uuid == remAis.uuid)
+	bck := remoteBck.Clone()
+	unsetUUID(&bck)
+	if p, err = api.HeadBucket(remAis.bp, bck, false /*dontAddRemote*/); err != nil {
+		errCode, err = extractErrCode(err, remAis.uuid)
+		return
+	}
 
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		return nil, errCode, err
-	}
-	bck := prepareBck(remoteBck.Bck)
-	p, err := api.HeadBucket(aisCluster.bp, bck)
-	if err != nil {
-		errCode, err = extractErrCode(err)
-		return bckProps, errCode, err
-	}
-	bckProps = make(cos.SimpleKVs)
+	bckProps = make(cos.StrKVs, 32)
 	err = cmn.IterFields(p, func(uniqueTag string, field cmn.IterField) (e error, b bool) {
 		bckProps[uniqueTag] = fmt.Sprintf("%v", field.Value())
 		return nil, false
 	})
-	debug.AssertNoErr(err)
-	return bckProps, 0, nil
+	// an extra
+	bckProps[apc.HdrBackendProvider] = apc.AIS
+	bckProps[apc.HdrRemAisUUID] = remAis.uuid
+	bckProps[apc.HdrRemAisAlias] = alias
+	bckProps[apc.HdrRemAisURL] = remAis.url
+
+	return
 }
 
-func (m *AISBackendProvider) ListObjects(remoteBck *cluster.Bck, msg *cmn.SelectMsg) (bckList *cmn.BucketList, errCode int, err error) {
-	debug.Assert(remoteBck.Provider == cmn.ProviderAIS)
-
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		return nil, errCode, err
+func (m *AISBackendProvider) ListObjects(remoteBck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (errCode int, err error) {
+	var remAis *remAis
+	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
+		return
 	}
-
 	remoteMsg := msg.Clone()
 	remoteMsg.PageSize = calcPageSize(remoteMsg.PageSize, m.MaxPageSize())
 
-	// TODO: Currently we cannot remember the `UUID` from remote cluster and
-	//  embed it into `ContinuationToken`. The problem is that when local data
-	//  is needed then all targets list cloud objects and currently we don't
-	//  support listing objects (AIS bucket) with same `UUID` from multiple clients.
-	//
-	// Clearing `remoteMsg.UUID` is necessary otherwise the remote cluster
-	// will think that it already knows this UUID and problems will arise.
+	// TODO:
+	// Currently, not encoding xaction (aka request) `UUID` from the remote cluster
+	// in the `ContinuationToken` (note below).
 	remoteMsg.UUID = ""
 
-	bck := prepareBck(remoteBck.Bck)
-	bckList, err = api.ListObjectsPage(aisCluster.bp, bck, remoteMsg)
-	if err != nil {
-		errCode, err = extractErrCode(err)
-		return bckList, errCode, err
-	}
-	// Set original UUID of the request (UUID of remote cluster is already
-	// embedded into `ContinuationToken`).
-	bckList.UUID = msg.UUID
-	return bckList, 0, nil
-}
+	// likewise, let remote ais gateway decide
+	remoteMsg.SID = ""
 
-func (m *AISBackendProvider) listBucketsCluster(uuid string, query cmn.QueryBcks) (bcks cmn.Bcks, err error) {
-	var (
-		aisCluster  *remAISCluster
-		remoteQuery = cmn.QueryBcks{Provider: cmn.ProviderAIS, Ns: cmn.Ns{Name: query.Ns.Name}}
-	)
-	if aisCluster, err = m.remoteCluster(uuid); err != nil {
+	bck := remoteBck.Clone()
+	unsetUUID(&bck)
+
+	var lstRes *cmn.LsoResult
+	if lstRes, err = api.ListObjectsPage(remAis.bp, bck, remoteMsg); err != nil {
+		errCode, err = extractErrCode(err, remAis.uuid)
 		return
 	}
-	bcks, err = api.ListBuckets(aisCluster.bp, remoteQuery)
+	*lst = *lstRes
+
+	// Restore the original request UUID (UUID of the remote cluster is already inside `ContinuationToken`).
+	lst.UUID = msg.UUID
+	return
+}
+
+func (m *AISBackendProvider) ListBuckets(qbck cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
+	if !qbck.Ns.IsAnyRemote() {
+		// caller provided uuid (or alias)
+		bcks, err = m.blist(qbck.Ns.UUID, qbck)
+		errCode, err = extractErrCode(err, qbck.Ns.UUID)
+		return
+	}
+
+	// all attached
+	m.mu.RLock()
+	uuids := make([]string, 0, len(m.remote))
+	for u := range m.remote {
+		uuids = append(uuids, u)
+	}
+	m.mu.RUnlock()
+	if len(uuids) == 0 {
+		return
+	}
+	for _, uuid := range uuids {
+		remoteBcks, errV := m.blist(uuid, qbck)
+		bcks = append(bcks, remoteBcks...)
+		if errV != nil && err == nil {
+			err = errV
+		}
+	}
+	if len(uuids) == 1 {
+		errCode, err = extractErrCode(err, uuids[0])
+	} else {
+		errCode, err = extractErrCode(err, "")
+	}
+	return
+}
+
+// NOTE:
+// remote AIS clusters provide native frontend with additional capabilities which
+// also include apc.Flt* _location_ specifier. Here we simply hardcode the `apc.FltExists`
+// to keep `ListBuckets` consistent across (aws, gcp, etc.) backends.
+
+func (m *AISBackendProvider) blist(uuid string, qbck cmn.QueryBcks) (bcks cmn.Bcks, err error) {
+	var (
+		remAis      *remAis
+		remoteQuery = cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{Name: qbck.Ns.Name}}
+	)
+	if remAis, err = m.getRemAis(uuid); err != nil {
+		return
+	}
+	bcks, err = api.ListBuckets(remAis.bp, remoteQuery, apc.FltExists)
 	if err != nil {
-		_, err = extractErrCode(err)
+		_, err = extractErrCode(err, uuid)
 		return nil, err
 	}
 	for i, bck := range bcks {
-		bck.Ns.UUID = uuid // if `uuid` is alias we need to preserve it
+		bck.Ns.UUID = uuid // if user-provided `uuid` is in fact an alias - keep it
 		bcks[i] = bck
 	}
 	return bcks, nil
 }
 
-func (m *AISBackendProvider) ListBuckets(query cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
-	if !query.Ns.IsAnyRemote() {
-		bcks, err = m.listBucketsCluster(query.Ns.UUID, query)
-	} else {
-		for uuid := range m.remote {
-			remoteBcks, tryErr := m.listBucketsCluster(uuid, query)
-			bcks = append(bcks, remoteBcks...)
-			if tryErr != nil {
-				err = tryErr
-			}
-		}
+// TODO: remote AIS clusters provide native frontend API with additional capabilities
+// in part including apc.Flt* location specifier.
+// Here, and elsewhere down below, we hardcode (the default) `apc.FltPresent` to, eesentially,
+// keep HeadObj() consistent across backends.
+func (m *AISBackendProvider) HeadObj(_ ctx, lom *cluster.LOM) (oa *cmn.ObjAttrs, errCode int, err error) {
+	var (
+		remAis    *remAis
+		op        *cmn.ObjectProps
+		remoteBck = lom.Bck().Clone()
+	)
+	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
+		return
 	}
-	errCode, err = extractErrCode(err)
+	unsetUUID(&remoteBck)
+	if op, err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, apc.FltPresent); err != nil {
+		errCode, err = extractErrCode(err, remAis.uuid)
+		return
+	}
+	oa = &cmn.ObjAttrs{}
+	*oa = op.ObjAttrs
+	oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
 	return
 }
 
-func (m *AISBackendProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objHdrMeta cos.SimpleKVs, errCode int, err error) {
-	remoteBck := lom.Bucket()
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		return nil, errCode, err
+func (m *AISBackendProvider) GetObj(_ ctx, lom *cluster.LOM, owt cmn.OWT) (errCode int, err error) {
+	var (
+		remAis    *remAis
+		r         io.ReadCloser
+		remoteBck = lom.Bck().Clone()
+	)
+	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
+		return
 	}
-	bck := prepareBck(remoteBck)
-	p, err := api.HeadObject(aisCluster.bp, bck, lom.ObjName)
-	if err != nil {
-		errCode, err = extractErrCode(err)
-		return nil, errCode, err
+	unsetUUID(&remoteBck)
+	if r, err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, nil /*api.GetArgs*/); err != nil {
+		return extractErrCode(err, remAis.uuid)
 	}
-	objHdrMeta = make(cos.SimpleKVs)
-	err = cmn.IterFields(p, func(tag string, field cmn.IterField) (e error, b bool) {
-		headerName := cmn.PropToHeader(tag)
-		objHdrMeta[headerName] = fmt.Sprintf("%v", field.Value())
-		return nil, false
-	})
-	debug.AssertNoErr(err)
-	return objHdrMeta, 0, nil
-}
-
-func (m *AISBackendProvider) GetObj(_ context.Context, lom *cluster.LOM) (errCode int, err error) {
-	remoteBck := lom.Bucket()
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		return errCode, err
-	}
-
-	bck := prepareBck(remoteBck)
-	r, err := api.GetObjectReader(aisCluster.bp, bck, lom.ObjName)
-	if err != nil {
-		return extractErrCode(err)
-	}
-
-	params := cluster.PutObjectParams{
-		Tag:      fs.WorkfileColdget,
-		Reader:   r,
-		RecvType: cluster.ColdGet,
+	params := cluster.AllocPutObjParams()
+	{
+		params.WorkTag = fs.WorkfileColdget
+		params.Reader = r
+		params.OWT = owt
+		params.Atime = time.Now()
 	}
 	err = m.t.PutObject(lom, params)
-	return extractErrCode(err)
+	cluster.FreePutObjParams(params)
+	return extractErrCode(err, remAis.uuid)
 }
 
-func (m *AISBackendProvider) GetObjReader(_ context.Context, lom *cluster.LOM) (r io.ReadCloser, expectedCksm *cos.Cksum,
-	errCode int, err error) {
-	remoteBck := lom.Bucket()
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		return nil, nil, errCode, err
-	}
-
-	r, err = api.GetObjectReader(aisCluster.bp, remoteBck, lom.ObjName)
-	errCode, err = extractErrCode(err)
-	return r, nil, errCode, err
-}
-
-func (m *AISBackendProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (version string, errCode int, err error) {
-	remoteBck := lom.Bucket()
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		cos.Close(r)
-		return "", errCode, err
-	}
+func (m *AISBackendProvider) GetObjReader(_ ctx, lom *cluster.LOM) (r io.ReadCloser, expCksum *cos.Cksum, errCode int, err error) {
 	var (
-		bck  = prepareBck(lom.Bucket())
-		args = api.PutObjectArgs{
-			BaseParams: aisCluster.bp,
-			Bck:        bck,
-			Object:     lom.ObjName,
-			Cksum:      lom.Checksum(),
-			Reader:     r.(cos.ReadOpenCloser),
-			Size:       uint64(lom.SizeBytes(true)), // It's special because it's still workfile.
-		}
+		remAis    *remAis
+		op        *cmn.ObjectProps
+		remoteBck = lom.Bck().Clone()
 	)
-	if err = api.PutObject(args); err != nil {
-		errCode, err = extractErrCode(err)
-		return "", errCode, err
+	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
+		return
 	}
-	// NOTE: the caller is expected to load it and get the current version, if exists
-	return lom.Version(true), 0, nil
+	unsetUUID(&remoteBck)
+	if op, err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, apc.FltPresent); err != nil {
+		errCode, err = extractErrCode(err, remAis.uuid)
+		return
+	}
+	oa := lom.ObjAttrs()
+	*oa = op.ObjAttrs
+	oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
+	expCksum = oa.Cksum
+	lom.SetCksum(nil)
+	// reader
+	r, err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, nil /*api.GetArgs*/)
+	errCode, err = extractErrCode(err, remAis.uuid)
+	return
+}
+
+func (m *AISBackendProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (errCode int, err error) {
+	var (
+		oah       api.ObjAttrs
+		remAis    *remAis
+		remoteBck = lom.Bck().Clone()
+	)
+	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
+		cos.Close(r)
+		return
+	}
+	unsetUUID(&remoteBck)
+	args := api.PutArgs{
+		BaseParams: remAis.bp,
+		Bck:        remoteBck,
+		ObjName:    lom.ObjName,
+		Cksum:      lom.Checksum(),
+		Reader:     r.(cos.ReadOpenCloser),
+		Size:       uint64(lom.SizeBytes(true)), // _special_ as it's still a workfile at this point
+	}
+	if oah, err = api.PutObject(args); err != nil {
+		errCode, err = extractErrCode(err, remAis.uuid)
+		return
+	}
+	// compare w/ lom.CopyAttrs
+	oa := lom.ObjAttrs()
+	*oa = oah.Attrs()
+
+	oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
+	return
 }
 
 func (m *AISBackendProvider) DeleteObj(lom *cluster.LOM) (errCode int, err error) {
-	remoteBck := lom.Bucket()
-	aisCluster, err := m.remoteCluster(remoteBck.Ns.UUID)
-	if err != nil {
-		return errCode, err
+	var (
+		remAis    *remAis
+		remoteBck = lom.Bck().Clone()
+	)
+	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
+		return
 	}
-	bck := prepareBck(remoteBck)
-	err = api.DeleteObject(aisCluster.bp, bck, lom.ObjName)
-	return extractErrCode(err)
+	unsetUUID(&remoteBck)
+	err = api.DeleteObject(remAis.bp, remoteBck, lom.ObjName)
+	return extractErrCode(err, remAis.uuid)
 }

@@ -1,4 +1,4 @@
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 RUN apt-get clean && apt-get update &&\
   set -eux &&\
@@ -21,15 +21,12 @@ RUN apt-get clean && apt-get update &&\
       iputils-ping &&\
   apt-get -y clean all
 
-RUN curl -sL https://deb.nodesource.com/setup_10.x | bash -
-RUN apt-get install -y nodejs
-
 RUN wget https://bootstrap.pypa.io/get-pip.py &&\
   python3 get-pip.py &&\
   pip install awscli s3cmd
 
 # Setting ENV variables
-ENV GOLANG_VERSION 1.16
+ENV GOLANG_VERSION 1.20
 
 # Reassign arguments to environment variables so run.sh can use them
 ENV GOPATH /go
@@ -55,6 +52,7 @@ ENV MOUNTPATH /tmp/ais
 
 COPY aisnode_config.sh aisnode_config.sh
 COPY entrypoint/entrypoint.sh entrypoint.sh
+COPY limits.conf /etc/security/limits.conf
 
 RUN mkdir -p $GOPATH/src/github.com/NVIDIA && \
     cd $GOPATH/src/github.com/NVIDIA && \

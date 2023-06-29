@@ -5,14 +5,12 @@ linters:
     - revive
     - asciicheck
     - bodyclose
-    - deadcode
     - durationcheck
     - errcheck
     - exportloopref
     - gci
     - gocritic
     - gofmt
-    - gofumpt
     - goheader
     - goimports
     - gomoddirectives
@@ -24,23 +22,25 @@ linters:
     - misspell
     - nolintlint
     - prealloc
-    - rowserrcheck
-    - sqlclosecheck
+    - reassign
     - staticcheck
     - typecheck
     - unconvert
     - unparam
     - unused
-    - varcheck
     - whitespace
 
     # See: https://golangci-lint.run/usage/linters/
     #
-    # TODO: Following linters should be enabled at some:
-    # - ifshort
-    # - nilerr
+    # linters that could be only occasionally useful:
+    # - errchkjson
+    # - nilnil
     #
-    # Following linters produce false positives (enable only when needed):
+    # linters disabled because of generics:
+    # - rowserrcheck
+    # - sqlclosecheck
+    #
+    # linters that used to produce false positives:
     # - goconst
     # - godot
     # - goerr113
@@ -48,8 +48,9 @@ linters:
     # - nestif
     # - scopelint
     # - structcheck - doesn't handle embedded structs
+    # - gofumpt
     #
-    # Following linters are not really helpful:
+    # linters that are not really helpful:
     # - cyclop
     # - exhaustive
     # - forbidigo
@@ -62,27 +63,31 @@ linters:
     # - thelper
     # - tparallel
     # - wrapcheck
+    #
+    # linters that seem to be abandoned:
+    # - deadcode
+    # - varcheck
 
 linters-settings:
   revive:
     ignore-generated-header: true
     severity: warning
     rules:
-      # name: early-return
       # name: import-shadowing
       # name: unhandled-error
       # name: line-length-limit
-      - name: if-return
       - name: blank-imports
       - name: context-as-argument
       - name: context-keys-type
       - name: dot-imports
+      - name: early-return
       - name: error-naming
       - name: error-strings
       - name: exported
+      - name: if-return
+      - name: imports-blacklist
       - name: increment-decrement
       - name: indent-error-flow
-      - name: imports-blacklist
       - name: modifies-value-receiver
       - name: package-comments
       - name: range
@@ -106,18 +111,6 @@ linters-settings:
     disable:
       - fieldalignment # TODO: Enable, for now reports a lot of problems.
       - shadow # Reports a lot of false-positives and conflicts with other linters.
-    settings:
-      printf: # Analyzer name, run `go tool vet help` to see all analyzers.
-        funcs: # Run `go tool vet help printf` to see available settings for `printf` analyzer.
-          - github.com/NVIDIA/aistore/3rdparty/glog.Infof
-          - github.com/NVIDIA/aistore/3rdparty/glog.Warningf
-          - github.com/NVIDIA/aistore/3rdparty/glog.Errorf
-          - github.com/NVIDIA/aistore/3rdparty/glog.Fatalf
-          - github.com/NVIDIA/aistore/cmn/debug.Assertf
-          - github.com/NVIDIA/aistore/cmn/debug.Errorf
-          - github.com/NVIDIA/aistore/cmn/debug.Infof
-          - github.com/NVIDIA/aistore/cmn/cos.Exitf
-          - github.com/NVIDIA/aistore/cmn/cos.ExitLogf
   golint:
     min-confidence: 0
   errcheck:
@@ -127,7 +120,6 @@ linters-settings:
     enabled-tags:
       - performance
       - style
-      - experimental
     disabled-checks:
       - ifElseChain
       - hugeParam # produces a lot of false-positives (TODO: see if some errors are possible improvements)
@@ -169,10 +161,10 @@ issues:
     - linters: gocritic
       text: "builtinShadow: shadowing of predeclared identifier: new"
 
-    - linters: gocritic
+    - linters: [gocritic, gofmt, goimports]
       source: "///" # commentFormatting
 
-    - linters: gocritic
+    - linters: [gocritic, gofmt, goimports]
       source: "//==" # commentFormatting
 
     - linters: staticcheck
@@ -195,10 +187,11 @@ issues:
   max-per-linter: 0
 
 run:
+  go: '1.20'
   tests: true # enable linting test files
 
   build-tags:
     - hrw aws azure gcp hdfs # Build hrw and backend providers so that staticcheck doesn't complain about unused export functions.
 
   concurrency: 4
-  deadline: 5m
+  deadline: 6m

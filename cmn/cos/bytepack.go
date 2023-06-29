@@ -1,13 +1,12 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
 	"encoding/binary"
 	"errors"
-	"unsafe"
 
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
@@ -63,13 +62,13 @@ import (
 
 type (
 	BytePack struct {
-		off int
 		b   []byte
+		off int
 	}
 
 	ByteUnpack struct {
-		off int
 		b   []byte
+		off int
 	}
 
 	MapStrUint16 map[string]uint16
@@ -121,7 +120,7 @@ func (br *ByteUnpack) ReadByte() (byte, error) {
 	if br.off >= len(br.b) {
 		return 0, ErrBufferUnderrun
 	}
-	Assert(br.off < len(br.b))
+	debug.Assert(br.off < len(br.b))
 	b := br.b[br.off]
 	br.off++
 	return b, nil
@@ -222,6 +221,8 @@ func (br *ByteUnpack) ReadMapStrUint16() (MapStrUint16, error) {
 	return mp, nil
 }
 
+func (br *ByteUnpack) Len() int { return len(br.b) - br.off }
+
 //
 // Packer
 //
@@ -268,7 +269,7 @@ func (bw *BytePack) WriteUint32(i uint32) {
 }
 
 func (bw *BytePack) WriteBytes(b []byte) {
-	bw.WriteString(*(*string)(unsafe.Pointer(&b)))
+	bw.WriteString(UnsafeS(b))
 }
 
 func (bw *BytePack) WriteString(s string) {
@@ -278,7 +279,7 @@ func (bw *BytePack) WriteString(s string) {
 		return
 	}
 	written := copy(bw.b[bw.off:], s)
-	Assert(written == l)
+	debug.Assert(written == l)
 	bw.off += l
 }
 

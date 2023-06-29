@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 
 // worker routines
@@ -13,31 +13,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/devtools/readers"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools/readers"
 )
-
-var mmsa *memsys.MMSA
-
-func init() {
-	mmsa = memsys.DefaultPageMM()
-}
 
 func doPut(wo *workOrder) {
 	var sgl *memsys.SGL
-	if runParams.usingSG {
-		sgl = mmsa.NewSGL(wo.size)
-		defer func() {
-			// FIXME: due to critical bug (https://github.com/golang/go/issues/30597)
-			// we need to postpone `sgl.Free` to a little bit later time, otherwise
-			// we will experience 'read after free'. Sleep time is number taken
-			// from thin air - increase if panics are still happening.
-			go func() {
-				time.Sleep(4 * time.Second)
-				sgl.Free()
-			}()
-		}()
+	if runParams.readerType == readers.ReaderTypeSG {
+		sgl = gmm.NewSGL(wo.size)
+		wo.sgl = sgl
 	}
 
 	r, err := readers.NewReader(readers.ParamReader{

@@ -1,19 +1,16 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
-	"encoding/base64"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/OneOfOne/xxhash"
 )
 
 const (
@@ -28,6 +25,7 @@ const (
 
 func IsHTTPS(url string) bool { return strings.HasPrefix(url, "https://") }
 func IsHTTP(url string) bool  { return strings.HasPrefix(url, "http://") }
+
 func ParseURL(s string) (u *url.URL, valid bool) {
 	if s == "" {
 		return
@@ -55,31 +53,20 @@ func IsAzureURL(u *url.URL) bool {
 	return strings.Contains(u.Host, azBlobURL)
 }
 
-// Splits url into [(scheme)://](address).
-// It's not possible to use url.Parse as (from url.Parse() docs)
-// 'Trying to parse a hostname and path without a scheme is invalid'
-func ParseURLScheme(url string) (scheme, address string) {
-	s := strings.SplitN(url, "://", 2)
-	if len(s) == 1 {
-		return "", s[0]
-	}
-	return s[0], s[1]
-}
-
 // WARNING: `ReparseQuery` might affect non-tensorflow clients using S3-compatible API
 // with AIStore. To be used with caution.
 func ReparseQuery(r *http.Request) {
-	if strings.ContainsRune(r.URL.Path, '?') {
-		q := r.URL.Query()
-		tmpURL, err := url.Parse(r.URL.Path)
-		debug.AssertNoErr(err)
-		for k, v := range tmpURL.Query() {
-			q.Add(k, strings.Join(v, ","))
-		}
-
-		r.URL.Path = tmpURL.Path
-		r.URL.RawQuery = q.Encode()
+	if !strings.ContainsRune(r.URL.Path, '?') {
+		return
 	}
+	q := r.URL.Query()
+	tmpURL, err := url.Parse(r.URL.Path)
+	debug.AssertNoErr(err)
+	for k, v := range tmpURL.Query() {
+		q.Add(k, strings.Join(v, ","))
+	}
+	r.URL.Path = tmpURL.Path
+	r.URL.RawQuery = q.Encode()
 }
 
 // JoinWords uses forward slash to join any number of words into a single path.
@@ -106,12 +93,4 @@ func JoinPath(url, path string) string {
 		return url + "/" + path
 	}
 	return url + path
-}
-
-func OrigURLBck2Name(origURLBck string) (bckName string) {
-	_, b := ParseURLScheme(origURLBck)
-	b1 := xxhash.ChecksumString64S(b, MLCG32)
-	b2 := strconv.FormatUint(b1, 16)
-	bckName = base64.RawURLEncoding.EncodeToString([]byte(b2))
-	return
 }

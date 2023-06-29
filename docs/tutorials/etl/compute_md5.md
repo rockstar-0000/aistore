@@ -13,6 +13,9 @@ In this example, we will see how ETL can be used to do something as simple as co
 We will go over two ways of starting ETL to achieve our goal.
 Get ready!
 
+
+`Note: ETL is still in development so some steps may not work exactly as written below.`
+
 ## Prerequisites
 
 * AIStore cluster deployed on Kubernetes. We recommend following guide below.
@@ -26,7 +29,7 @@ There are three ways of approaching this problem:
 
 1. **Simplified flow**
 
-    In this example, we will be using `python3` runtime.
+    In this example, we will be using `python3.11v2` runtime.
     In simplified flow, we are only expected to write a simple `transform` function, which can look like this (`code.py`):
 
     ```python
@@ -42,12 +45,12 @@ There are three ways of approaching this problem:
 
     Once we have the `transform` function defined, we can use CLI to build and initialize ETL:
     ```console
-    $ ais etl init code --from-file=code.py --runtime=python3
-    JGHEoo89gg
+    $ ais etl init code --from-file=code.py --runtime=python3.11v2 --name=transformer-md5
+    transformer-md5
     ```
 
 2. **Simplified flow with input/output**
-   Similar to the above example, we will be using the `python3` runtime.
+   Similar to the above example, we will be using the `python3.11v2` runtime.
    However, the python code in this case expects data as standard input and writes the output bytes to standard output, as shown in the following `code.py`:
 
    ```python
@@ -62,8 +65,8 @@ There are three ways of approaching this problem:
 
    We can now use the CLI to build and initialize ETL with `io://` communicator type:
    ```console
-   $ ais etl init code --from-file=code.py --runtime=python3 --comm-type="io://"
-   QWHFsp92yp
+   $ ais etl init code --from-file=code.py --runtime=python3.11v2 --comm-type="io://" --name="compute-md5"
+   compute-md5
    ```
 
 3. **Regular flow**
@@ -153,9 +156,6 @@ There are three ways of approaching this problem:
     kind: Pod
     metadata:
       name: transformer-md5
-      annotations:
-        communication_type: hpush://
-        wait_timeout: 2m
     spec:
       containers:
         - name: server
@@ -169,13 +169,10 @@ There are three ways of approaching this problem:
     **Important**: the server listens on the same port as specified in `ports.containerPort`.
     It is required, as a target needs to know the precise socket address of the ETL container.
 
-    Another note is that we pass additional parameters via the `annotations` field.
-    We specified the communication type and wait time (for the Pod to start).
-
     Once we have our `spec.yaml`, we can initialize ETL with CLI:
     ```console
-    $ ais etl init spec spec.yaml
-    JGHEoo89gg
+    $ ais etl init spec --from-file=spec.yaml --name=transformer-md5 --comm-type="hpush://"
+    transformer-md5
     ```
 
 Just before we started ETL containers, our Pods looked like this:
@@ -214,9 +211,9 @@ As expected, two more Pods are up and running - one for each target.
 Finally, we can use newly created Pods to transform the objects on the fly for us:
 
 ```console
-$ ais bucket create transform
-$ echo "some text :)" | ais object put - transform/shard.in
-$ ais etl object JGHEoo89gg transform/shard.in -
+$ ais create transform
+$ echo "some text :)" | ais put - transform/shard.in
+$ ais etl object transformer-md5 transform/shard.in -
 393c6706efb128fbc442d3f7d084a426
 ```
 
@@ -225,15 +222,15 @@ Voilà! The ETL container successfully computed the `md5` on the `transform/shar
 Alternatively, one can use the offline ETL feature to transform the whole bucket.
 
 ```console
-$ ais bucket create transform
-$ echo "some text :)" | ais object put - transform/shard.in
-$ ais etl bucket JGHEoo89gg ais://transform ais://transform-md5 --wait
+$ ais create transform
+$ echo "some text :)" | ais put - transform/shard.in
+$ ais etl bucket transformer-md5 ais://transform ais://transform-md5 --wait
 ```
 
 Once ETL isn't needed anymore, the Pods can be stopped with:
 
 ```console
-$ ais etl stop JGHEoo89gg
+$ ais etl stop transformer-md5
 ETL containers stopped successfully.
 $ kubectl get pods
 NAME                      READY   STATUS    RESTARTS   AGE

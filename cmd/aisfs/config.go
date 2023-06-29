@@ -1,6 +1,6 @@
 // Package aisfs - command-line mounting utility for aisfs.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -10,13 +10,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/aisfs/fs"
-	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 )
-
-const configDirName = fs.Name
 
 type (
 	Config struct {
@@ -53,7 +52,7 @@ type (
 var defaultConfig = Config{
 	Cluster: ClusterConfig{
 		URL:           "http://127.0.0.1:8080",
-		SkipVerifyCrt: cos.IsParseBool(os.Getenv(cmn.EnvVars.SkipVerifyCrt)),
+		SkipVerifyCrt: cos.IsParseBool(os.Getenv(env.AIS.SkipVerifyCrt)),
 	},
 	Timeout: TimeoutConfig{
 		TCPTimeoutStr:  "60s",
@@ -97,7 +96,7 @@ func (c *Config) validate() (err error) {
 	if c.IO.WriteBufSize < 0 {
 		return fmt.Errorf("invalid io.write_buf_size value: %d: expected non-negative value", c.IO.WriteBufSize)
 	}
-	if v, err := cos.S2B(c.MemoryLimit); err != nil {
+	if v, err := cos.ParseSize(c.MemoryLimit, cos.UnitsIEC); err != nil {
 		return fmt.Errorf("invalid memory_limit value: %q: %v", c.MemoryLimit, err)
 	} else if v < 0 {
 		return fmt.Errorf("invalid memory_limit value: %q: expected non-negative value", c.MemoryLimit)
@@ -106,28 +105,28 @@ func (c *Config) validate() (err error) {
 }
 
 func (c *Config) writeTo(srvCfg *fs.ServerConfig) {
-	memoryLimit, _ := cos.S2B(c.MemoryLimit)
+	memoryLimit, _ := cos.ParseSize(c.MemoryLimit, cos.UnitsIEC)
 	srvCfg.SkipVerifyCrt = c.Cluster.SkipVerifyCrt
 	srvCfg.TCPTimeout = c.Timeout.TCPTimeout
 	srvCfg.HTTPTimeout = c.Timeout.HTTPTimeout
-	srvCfg.SyncInterval.Store(c.Periodic.SyncInterval)
+	srvCfg.SyncInterval.Store(int64(c.Periodic.SyncInterval))
 	srvCfg.MemoryLimit.Store(uint64(memoryLimit))
 	srvCfg.MaxWriteBufSize.Store(c.IO.WriteBufSize)
 }
 
 func loadConfig(bucket string) (cfg *Config, err error) {
 	var (
-		configFileName = bucket + "_mount.json"
-		configDirPath  = cmn.AppConfigPath(configDirName)
+		configFname = bucket + ".aisfs.mount.json"
+		configDir   = cos.HomeConfigDir(fname.HomeAisFS) // $HOME/.config/ais/aisfs
 	)
 	cfg = &Config{}
-	if err = jsp.LoadAppConfig(configDirPath, configFileName, &cfg); err != nil {
+	if err = jsp.LoadAppConfig(configDir, configFname, &cfg); err != nil {
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to load config: %v", err)
 		}
 
 		cfg = &defaultConfig
-		err = jsp.SaveAppConfig(configDirPath, configFileName, cfg)
+		err = jsp.SaveAppConfig(configDir, configFname, cfg)
 		if err != nil {
 			err = fmt.Errorf("failed to generate config file: %v", err)
 		}

@@ -2,7 +2,7 @@
 // with io.Reader and io.Writer interfaces on top of a scatter-gather lists
 // (of reusable buffers)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys_test
 
@@ -63,12 +63,9 @@ func BenchmarkSmallAlloc32K(b *testing.B) {
 }
 
 func benchAlloc(b *testing.B, objsiz, sbufSize int64) {
-	mem := &memsys.MMSA{MinPctFree: 50, Name: "dmem"}
-	err := mem.Init(false /*panicOnErr*/)
-	defer mem.Terminate()
-	if err != nil {
-		b.Fatal(err)
-	}
+	mem := &memsys.MMSA{Name: "dmem", MinPctFree: 50}
+	mem.Init(0)
+	defer mem.Terminate(false)
 
 	// reset initial conditions & start b-timer
 	cos.FreeMemToOS()
@@ -115,12 +112,9 @@ func BenchmarkSmallWrite32K(b *testing.B) {
 }
 
 func benchWrite(b *testing.B, objsiz, sbufSize int64) {
-	mem := &memsys.MMSA{MinPctFree: 50, Name: "dmem"}
-	err := mem.Init(false /*panicOnErr*/)
-	defer mem.Terminate()
-	if err != nil {
-		b.Fatal(err)
-	}
+	mem := &memsys.MMSA{Name: "emem", MinPctFree: 50}
+	mem.Init(0)
+	defer mem.Terminate(false)
 
 	// reset initial conditions & start b-timer
 	cos.FreeMemToOS()
@@ -170,13 +164,10 @@ func BenchmarkSmallWRF32K(b *testing.B) {
 }
 
 func benchWRF(b *testing.B, objsiz, sbufSize int64) {
-	mem := &memsys.MMSA{MinPctFree: 50, Name: "dmem"}
-	err := mem.Init(false /*panicOnErr*/)
+	mem := &memsys.MMSA{Name: "fmem", MinPctFree: 50}
+	mem.Init(0)
+	defer mem.Terminate(false)
 	cha := make(chan *memsys.SGL, 1024*16)
-	defer mem.Terminate()
-	if err != nil {
-		b.Fatal(err)
-	}
 
 	// reset initial conditions
 	cos.FreeMemToOS()
@@ -230,12 +221,9 @@ func BenchmarkLargeFile32K(b *testing.B) {
 }
 
 func benchFile(b *testing.B, sbufSize int64) {
-	mem := &memsys.MMSA{MinPctFree: 50, Name: "dmem"}
-	err := mem.Init(false /*panicOnErr*/)
-	defer mem.Terminate()
-	if err != nil {
-		b.Fatal(err)
-	}
+	mem := &memsys.MMSA{Name: "gmem", MinPctFree: 50}
+	mem.Init(0)
+	defer mem.Terminate(false)
 
 	// reset initial conditions
 	cos.FreeMemToOS()

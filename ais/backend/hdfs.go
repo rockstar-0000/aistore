@@ -1,8 +1,8 @@
-// +build hdfs
+//go:build hdfs
 
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -13,21 +13,23 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/colinmarc/hdfs/v2"
 )
 
 type (
 	hdfsProvider struct {
-		t cluster.Target
+		t cluster.TargetPut
 		c *hdfs.Client
 	}
 )
@@ -35,11 +37,12 @@ type (
 // interface guard
 var _ cluster.BackendProvider = (*hdfsProvider)(nil)
 
-func NewHDFS(t cluster.Target) (cluster.BackendProvider, error) {
-	providerConf, ok := cmn.GCO.Get().Backend.ProviderConf(cmn.ProviderHDFS)
-	debug.Assert(ok)
-	hdfsConf := providerConf.(cmn.BackendConfHDFS)
-
+func NewHDFS(t cluster.TargetPut) (cluster.BackendProvider, error) {
+	var (
+		config   = cmn.GCO.Get()
+		anyConf  = config.Backend.Get(apc.HDFS)
+		hdfsConf = anyConf.(cmn.BackendConfHDFS)
+	)
 	client, err := hdfs.NewClient(hdfs.ClientOptions{
 		Addresses:           hdfsConf.Addresses,
 		User:                hdfsConf.User,
@@ -67,18 +70,18 @@ func hdfsErrorToAISError(err error) (int, error) {
 	return http.StatusBadRequest, err
 }
 
-func (*hdfsProvider) Provider() string  { return cmn.ProviderHDFS }
+func (*hdfsProvider) Provider() string  { return apc.HDFS }
 func (*hdfsProvider) MaxPageSize() uint { return 10000 }
 
 ///////////////////
 // CREATE BUCKET //
 ///////////////////
 
-func (hp *hdfsProvider) CreateBucket(bck *cluster.Bck) (errCode int, err error) {
+func (hp *hdfsProvider) CreateBucket(bck *meta.Bck) (errCode int, err error) {
 	return hp.checkDirectoryExists(bck)
 }
 
-func (hp *hdfsProvider) checkDirectoryExists(bck *cluster.Bck) (errCode int, err error) {
+func (hp *hdfsProvider) checkDirectoryExists(bck *meta.Bck) (errCode int, err error) {
 	debug.Assert(bck.Props != nil)
 	refDirectory := bck.Props.Extra.HDFS.RefDirectory
 	debug.Assert(refDirectory != "")
@@ -97,15 +100,15 @@ func (hp *hdfsProvider) checkDirectoryExists(bck *cluster.Bck) (errCode int, err
 // HEAD BUCKET //
 /////////////////
 
-func (hp *hdfsProvider) HeadBucket(_ context.Context, bck *cluster.Bck) (bckProps cos.SimpleKVs,
+func (hp *hdfsProvider) HeadBucket(_ ctx, bck *meta.Bck) (bckProps cos.StrKVs,
 	errCode int, err error) {
 	if errCode, err = hp.checkDirectoryExists(bck); err != nil {
 		return
 	}
 
-	bckProps = make(cos.SimpleKVs)
-	bckProps[cmn.HdrBackendProvider] = cmn.ProviderHDFS
-	bckProps[cmn.HdrBucketVerEnabled] = "false"
+	bckProps = make(cos.StrKVs)
+	bckProps[apc.HdrBackendProvider] = apc.HDFS
+	bckProps[apc.HdrBucketVerEnabled] = "false"
 	return
 }
 
@@ -113,29 +116,30 @@ func (hp *hdfsProvider) HeadBucket(_ context.Context, bck *cluster.Bck) (bckProp
 // LIST OBJECTS //
 //////////////////
 
-func (hp *hdfsProvider) ListObjects(bck *cluster.Bck, msg *cmn.SelectMsg) (bckList *cmn.BucketList,
-	errCode int, err error) {
+func (hp *hdfsProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (int, error) {
+	var (
+		h   = cmn.BackendHelpers.HDFS
+		idx int
+	)
 	msg.PageSize = calcPageSize(msg.PageSize, hp.MaxPageSize())
 
-	h := cmn.BackendHelpers.HDFS
-	bckList = &cmn.BucketList{Entries: make([]*cmn.BucketEntry, 0, msg.PageSize)}
-	err = hp.c.Walk(bck.Props.Extra.HDFS.RefDirectory, func(path string, fi os.FileInfo, err error) error {
+	err := hp.c.Walk(bck.Props.Extra.HDFS.RefDirectory, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			if cos.IsEOF(err) {
 				return nil
 			}
 			return err
 		}
-		if uint(len(bckList.Entries)) >= msg.PageSize {
+		if uint(len(lst.Entries)) >= msg.PageSize {
 			return skipDir(fi)
 		}
 		objName := strings.TrimPrefix(strings.TrimPrefix(path, bck.Props.Extra.HDFS.RefDirectory), string(filepath.Separator))
 		if msg.Prefix != "" {
 			if fi.IsDir() {
-				if !cmn.DirNameContainsPrefix(objName, msg.Prefix) {
+				if !cmn.DirHasOrIsPrefix(objName, msg.Prefix) {
 					return skipDir(fi)
 				}
-			} else if !cmn.ObjNameContainsPrefix(objName, msg.Prefix) {
+			} else if !cmn.ObjHasPrefix(objName, msg.Prefix) {
 				return skipDir(fi)
 			}
 		}
@@ -148,14 +152,17 @@ func (hp *hdfsProvider) ListObjects(bck *cluster.Bck, msg *cmn.SelectMsg) (bckLi
 		if fi.IsDir() {
 			return nil
 		}
-		entry := &cmn.BucketEntry{
-			Name:    objName,
-			Version: "",
+
+		var entry *cmn.LsoEntry
+		if idx < len(lst.Entries) {
+			entry = lst.Entries[idx]
+		} else {
+			entry = &cmn.LsoEntry{Name: objName}
+			lst.Entries = append(lst.Entries, entry)
 		}
-		if msg.WantProp(cmn.GetPropsSize) {
-			entry.Size = fi.Size()
-		}
-		if msg.WantProp(cmn.GetPropsChecksum) {
+		idx++
+		entry.Size = fi.Size()
+		if msg.WantProp(apc.GetPropsChecksum) {
 			fr, err := hp.c.Open(path)
 			if err != nil {
 				return err
@@ -169,18 +176,17 @@ func (hp *hdfsProvider) ListObjects(bck *cluster.Bck, msg *cmn.SelectMsg) (bckLi
 				entry.Checksum = v
 			}
 		}
-		bckList.Entries = append(bckList.Entries, entry)
 		return nil
 	})
 	if err != nil {
-		errCode, err = hdfsErrorToAISError(err)
-		return nil, errCode, err
+		return hdfsErrorToAISError(err)
 	}
+	lst.Entries = lst.Entries[:idx]
 	// Set continuation token only if we reached the page size.
-	if uint(len(bckList.Entries)) >= msg.PageSize {
-		bckList.ContinuationToken = bckList.Entries[len(bckList.Entries)-1].Name
+	if uint(len(lst.Entries)) >= msg.PageSize {
+		lst.ContinuationToken = lst.Entries[len(lst.Entries)-1].Name
 	}
-	return bckList, 0, nil
+	return 0, nil
 }
 
 // `hdfs.Walk` does not correctly handle `SkipDir` if the `fi` is non-directory.
@@ -204,21 +210,20 @@ func (*hdfsProvider) ListBuckets(cmn.QueryBcks) (buckets cmn.Bcks, errCode int, 
 // HEAD OBJECT //
 /////////////////
 
-func (hp *hdfsProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objMeta cos.SimpleKVs, errCode int, err error) {
-	filePath := filepath.Join(lom.Bck().Props.Extra.HDFS.RefDirectory, lom.ObjName)
-	fr, err := hp.c.Open(filePath)
-	if err != nil {
+func (hp *hdfsProvider) HeadObj(_ ctx, lom *cluster.LOM) (oa *cmn.ObjAttrs, errCode int, err error) {
+	var (
+		fr       *hdfs.FileReader
+		filePath = filepath.Join(lom.Bck().Props.Extra.HDFS.RefDirectory, lom.ObjName)
+	)
+	if fr, err = hp.c.Open(filePath); err != nil {
 		errCode, err = hdfsErrorToAISError(err)
-		return nil, errCode, err
+		return
 	}
-
-	objMeta = make(cos.SimpleKVs, 2)
-	objMeta[cmn.HdrBackendProvider] = cmn.ProviderHDFS
-	objMeta[cmn.HdrObjSize] = strconv.FormatInt(fr.Stat().Size(), 10)
-	objMeta[cluster.VersionObjMD] = ""
-
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[head_object] %s", lom)
+	oa = &cmn.ObjAttrs{}
+	oa.SetCustomKey(cmn.SourceObjMD, apc.HDFS)
+	oa.Size = fr.Stat().Size()
+	if verbose {
+		nlog.Infof("[head_object] %s", lom)
 	}
 	return
 }
@@ -227,21 +232,23 @@ func (hp *hdfsProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objMeta co
 // GET OBJECT //
 ////////////////
 
-func (hp *hdfsProvider) GetObj(ctx context.Context, lom *cluster.LOM) (errCode int, err error) {
+func (hp *hdfsProvider) GetObj(ctx context.Context, lom *cluster.LOM, owt cmn.OWT) (errCode int, err error) {
 	reader, _, errCode, err := hp.GetObjReader(ctx, lom)
 	if err != nil {
 		return errCode, err
 	}
-	params := cluster.PutObjectParams{
-		Tag:      fs.WorkfileColdget,
-		Reader:   reader,
-		RecvType: cluster.ColdGet,
+	params := cluster.AllocPutObjParams()
+	{
+		params.WorkTag = fs.WorkfileColdget
+		params.Reader = reader
+		params.OWT = owt
+		params.Atime = time.Now()
 	}
 	if err = hp.t.PutObject(lom, params); err != nil {
 		return
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[get_object] %s", lom)
+	if verbose {
+		nlog.Infof("[get_object] %s", lom)
 	}
 	return
 }
@@ -258,13 +265,7 @@ func (hp *hdfsProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r i
 		errCode, err = hdfsErrorToAISError(err)
 		return
 	}
-
-	customMD := cos.SimpleKVs{
-		cluster.SourceObjMD:  cluster.SourceHDFSObjMD,
-		cluster.VersionObjMD: "",
-	}
-
-	lom.SetCustom(customMD)
+	lom.SetCustomKey(cmn.SourceObjMD, apc.HDFS)
 	setSize(ctx, fr.Stat().Size())
 	return wrapReader(ctx, fr), nil, 0, nil
 }
@@ -273,8 +274,7 @@ func (hp *hdfsProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r i
 // PUT OBJECT //
 ////////////////
 
-func (hp *hdfsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (version string,
-	errCode int, err error) {
+func (hp *hdfsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (errCode int, err error) {
 	filePath := filepath.Join(lom.Bck().Props.Extra.HDFS.RefDirectory, lom.ObjName)
 	fw, err := hp.c.Create(filePath)
 	if err != nil {
@@ -304,17 +304,16 @@ func (hp *hdfsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (version strin
 finish:
 	cos.Close(r)
 
-	// TODO: Cleanup if there was an error during `c.Create` or `io.Copy`. We need
-	//  to remove directories and file.
+	// TODO: Cleanup if there was an error during `c.Create` or `io.Copy` (remove directories and file).
 	if err != nil {
 		errCode, err = hdfsErrorToAISError(err)
-		return "", errCode, err
+		return errCode, err
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[put_object] %s", lom)
+	if verbose {
+		nlog.Infof("[put_object] %s", lom)
 	}
 
-	return "", 0, nil
+	return 0, nil
 }
 
 ///////////////////
@@ -327,8 +326,8 @@ func (hp *hdfsProvider) DeleteObj(lom *cluster.LOM) (errCode int, err error) {
 		errCode, err = hdfsErrorToAISError(err)
 		return errCode, err
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[delete_object] %s", lom)
+	if verbose {
+		nlog.Infof("[delete_object] %s", lom)
 	}
 	return 0, nil
 }

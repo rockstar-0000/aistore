@@ -1,11 +1,12 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
 import (
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	. "github.com/onsi/ginkgo"
@@ -31,8 +32,8 @@ var _ = Describe("IterFields", func() {
 
 	Describe("IterFields", func() {
 		DescribeTable("should successfully iterate fields in structs",
-			func(v interface{}, expected map[string]interface{}) {
-				got := make(map[string]interface{})
+			func(v any, expected map[string]any) {
+				got := make(map[string]any)
 				err := cmn.IterFields(v, func(tag string, field cmn.IterField) (error, bool) {
 					got[tag] = field.Value()
 					return nil, false
@@ -42,15 +43,14 @@ var _ = Describe("IterFields", func() {
 			},
 			Entry("list BucketProps fields",
 				cmn.BucketProps{
-					Provider: cmn.ProviderAIS,
+					Provider: apc.AIS,
 					BackendBck: cmn.Bck{
 						Name:     "name",
-						Provider: cmn.ProviderGoogle,
+						Provider: apc.GCP,
 					},
 					EC: cmn.ECConf{
 						Enabled:      true,
 						ParitySlices: 1024,
-						BatchSize:    32,
 					},
 					LRU: cmn.LRUConf{},
 					Cksum: cmn.CksumConf{
@@ -60,25 +60,23 @@ var _ = Describe("IterFields", func() {
 						AWS: cmn.ExtraPropsAWS{CloudRegion: "us-central"},
 					},
 				},
-				map[string]interface{}{
-					"provider": cmn.ProviderAIS,
+				map[string]any{
+					"provider": apc.AIS,
 
 					"backend_bck.name":     "name",
-					"backend_bck.provider": cmn.ProviderGoogle,
+					"backend_bck.provider": apc.GCP,
 
 					"mirror.enabled":      false,
 					"mirror.copies":       int64(0),
-					"mirror.util_thresh":  int64(0),
 					"mirror.burst_buffer": 0,
-					"mirror.optimize_put": false,
 
-					"ec.enabled":       true,
-					"ec.parity_slices": 1024,
-					"ec.data_slices":   0,
-					"ec.batch_size":    32,
-					"ec.objsize_limit": int64(0),
-					"ec.compression":   "",
-					"ec.disk_only":     false,
+					"ec.enabled":           true,
+					"ec.parity_slices":     1024,
+					"ec.data_slices":       0,
+					"ec.objsize_limit":     int64(0),
+					"ec.compression":       "",
+					"ec.bundle_multiplier": 0,
+					"ec.disk_only":         false,
 
 					"versioning.enabled":           false,
 					"versioning.validate_warm_get": false,
@@ -90,17 +88,17 @@ var _ = Describe("IterFields", func() {
 					"checksum.enable_read_range": false,
 
 					"lru.enabled":           false,
-					"lru.lowwm":             int64(0),
-					"lru.highwm":            int64(0),
-					"lru.out_of_space":      int64(0),
 					"lru.dont_evict_time":   cos.Duration(0),
 					"lru.capacity_upd_time": cos.Duration(0),
 
 					"extra.aws.cloud_region": "us-central",
+					"extra.aws.endpoint":     "",
 
-					"access":   cmn.AccessAttrs(0),
-					"md_write": cmn.MDWritePolicy(""),
-					"created":  int64(0),
+					"access":  apc.AccessAttrs(0),
+					"created": int64(0),
+
+					"write_policy.data": apc.WritePolicy(""),
+					"write_policy.md":   apc.WritePolicy(""),
 				},
 			),
 			Entry("list BucketPropsToUpdate fields",
@@ -113,26 +111,26 @@ var _ = Describe("IterFields", func() {
 					Cksum: &cmn.CksumConfToUpdate{
 						Type: api.String(cos.ChecksumXXHash),
 					},
-					Access:  api.AccessAttrs(1024),
-					MDWrite: api.MDWritePolicy("never"),
+					Access: api.AccessAttrs(1024),
+					WritePolicy: &cmn.WritePolicyConfToUpdate{
+						MD: api.WritePolicy(apc.WriteDelayed),
+					},
 				},
-				map[string]interface{}{
+				map[string]any{
 					"backend_bck.name":     (*string)(nil),
 					"backend_bck.provider": (*string)(nil),
 
 					"mirror.enabled":      (*bool)(nil),
 					"mirror.copies":       (*int64)(nil),
-					"mirror.util_thresh":  (*int64)(nil),
 					"mirror.burst_buffer": (*int)(nil),
-					"mirror.optimize_put": (*bool)(nil),
 
-					"ec.enabled":       api.Bool(true),
-					"ec.parity_slices": api.Int(1024),
-					"ec.data_slices":   (*int)(nil),
-					"ec.batch_size":    (*int)(nil),
-					"ec.objsize_limit": (*int64)(nil),
-					"ec.compression":   (*string)(nil),
-					"ec.disk_only":     (*bool)(nil),
+					"ec.enabled":           api.Bool(true),
+					"ec.parity_slices":     api.Int(1024),
+					"ec.data_slices":       (*int)(nil),
+					"ec.objsize_limit":     (*int64)(nil),
+					"ec.compression":       (*string)(nil),
+					"ec.bundle_multiplier": (*int)(nil),
+					"ec.disk_only":         (*bool)(nil),
 
 					"versioning.enabled":           (*bool)(nil),
 					"versioning.validate_warm_get": (*bool)(nil),
@@ -144,21 +142,23 @@ var _ = Describe("IterFields", func() {
 					"checksum.enable_read_range": (*bool)(nil),
 
 					"lru.enabled":           (*bool)(nil),
-					"lru.lowwm":             (*int64)(nil),
-					"lru.highwm":            (*int64)(nil),
 					"lru.dont_evict_time":   (*cos.Duration)(nil),
 					"lru.capacity_upd_time": (*cos.Duration)(nil),
-					"lru.out_of_space":      (*int64)(nil),
 
-					"access":   api.AccessAttrs(1024),
-					"md_write": api.MDWritePolicy("never"),
+					"access": api.AccessAttrs(1024),
+
+					"write_policy.data": (*apc.WritePolicy)(nil),
+					"write_policy.md":   api.WritePolicy(apc.WriteDelayed),
 
 					"extra.hdfs.ref_directory": (*string)(nil),
+					"extra.aws.cloud_region":   (*string)(nil),
+					"extra.aws.endpoint":       (*string)(nil),
+					"extra.http.original_url":  (*string)(nil),
 				},
 			),
 			Entry("check for omit tag",
 				Foo{A: 1, B: 2},
-				map[string]interface{}{
+				map[string]any{
 					"b": 2,
 				},
 			),
@@ -166,13 +166,13 @@ var _ = Describe("IterFields", func() {
 
 		It("list all the fields (not only leafs)", func() {
 			v := bar{Foo: Foo{A: 3, B: 10}, C: "string"}
-			expected := map[string]interface{}{
+			expected := map[string]any{
 				"foo.b": 10,
 				"foo":   Foo{A: 3, B: 10},
 				"c":     "string",
 			}
 
-			got := make(map[string]interface{})
+			got := make(map[string]any)
 			err := cmn.IterFields(v, func(tag string, field cmn.IterField) (error, bool) {
 				got[tag] = field.Value()
 				return nil, false
@@ -183,13 +183,13 @@ var _ = Describe("IterFields", func() {
 
 		It("list inline fields", func() {
 			v := barInline{Foo: Foo{A: 3, B: 10}, C: "string"}
-			expected := map[string]interface{}{
+			expected := map[string]any{
 				"b": 10,
 				"":  Foo{A: 3, B: 10},
 				"c": "string",
 			}
 
-			got := make(map[string]interface{})
+			got := make(map[string]any)
 			err := cmn.IterFields(v, func(tag string, field cmn.IterField) (error, bool) {
 				got[tag] = field.Value()
 				return nil, false
@@ -201,7 +201,7 @@ var _ = Describe("IterFields", func() {
 
 	Describe("UpdateFieldValue", func() {
 		DescribeTable("should successfully update the fields in struct",
-			func(v interface{}, values map[string]interface{}, expected interface{}) {
+			func(v any, values map[string]any, expected any) {
 				for name, value := range values {
 					err := cmn.UpdateFieldValue(v, name, value)
 					Expect(err).NotTo(HaveOccurred())
@@ -214,12 +214,10 @@ var _ = Describe("IterFields", func() {
 						ValidateWarmGet: true,
 					},
 				},
-				map[string]interface{}{
+				map[string]any{
 					"mirror.enabled":      "true", // type == bool
 					"mirror.copies":       "120",  // type == int
-					"mirror.util_thresh":  int64(0),
 					"mirror.burst_buffer": "9560", // type == int64
-					"mirror.optimize_put": false,
 
 					"ec.enabled":       true,
 					"ec.parity_slices": 1024,
@@ -230,8 +228,8 @@ var _ = Describe("IterFields", func() {
 
 					"checksum.type": cos.ChecksumXXHash,
 
-					"access":   "12", // type == uint64
-					"md_write": "never",
+					"access":          "12", // type == uint64
+					"write_policy.md": apc.WriteNever,
 				},
 				&cmn.BucketProps{
 					Mirror: cmn.MirrorConf{
@@ -251,8 +249,8 @@ var _ = Describe("IterFields", func() {
 						Enabled:         false,
 						ValidateWarmGet: true,
 					},
-					Access:  12,
-					MDWrite: "never",
+					Access:      12,
+					WritePolicy: cmn.WritePolicyConf{MD: apc.WriteNever},
 				},
 			),
 			Entry("update some BucketPropsToUpdate",
@@ -261,7 +259,7 @@ var _ = Describe("IterFields", func() {
 						ValidateWarmGet: api.Bool(true),
 					},
 				},
-				map[string]interface{}{
+				map[string]any{
 					"mirror.enabled":      "true", // type == bool
 					"mirror.copies":       "120",  // type == int
 					"mirror.burst_buffer": "9560", // type == int64
@@ -275,8 +273,8 @@ var _ = Describe("IterFields", func() {
 
 					"checksum.type": cos.ChecksumXXHash,
 
-					"access":   "12", // type == uint64
-					"md_write": "never",
+					"access":          "12", // type == uint64
+					"write_policy.md": apc.WriteNever,
 				},
 				&cmn.BucketPropsToUpdate{
 					Versioning: &cmn.VersionConfToUpdate{
@@ -297,26 +295,28 @@ var _ = Describe("IterFields", func() {
 						Type:            api.String(cos.ChecksumXXHash),
 						ValidateWarmGet: api.Bool(true),
 					},
-					Access:  api.AccessAttrs(12),
-					MDWrite: api.MDWritePolicy(cmn.WriteNever),
+					Access: api.AccessAttrs(12),
+					WritePolicy: &cmn.WritePolicyConfToUpdate{
+						MD: api.WritePolicy(apc.WriteNever),
+					},
 				},
 			),
 		)
 
 		DescribeTable("should error on update",
-			func(v interface{}, values map[string]interface{}) {
+			func(v any, values map[string]any) {
 				for name, value := range values {
 					err := cmn.UpdateFieldValue(v, name, value)
 					Expect(err).To(HaveOccurred())
 				}
 			},
-			Entry("non-pointer struct", cmn.BucketProps{}, map[string]interface{}{
+			Entry("non-pointer struct", cmn.BucketProps{}, map[string]any{
 				"mirror.enabled": true,
 			}),
-			Entry("readonly field", &cmn.BucketProps{}, map[string]interface{}{
-				"provider": cmn.ProviderAIS,
+			Entry("readonly field", &cmn.BucketProps{}, map[string]any{
+				"provider": apc.AIS,
 			}),
-			Entry("field not found", &Foo{}, map[string]interface{}{
+			Entry("field not found", &Foo{}, map[string]any{
 				"foo.bar": 2,
 			}),
 		)

@@ -1,6 +1,6 @@
 // Package api provides AIStore API over HTTP(S)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -9,144 +9,140 @@ import (
 	"sort"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/downloader"
+	"github.com/NVIDIA/aistore/ext/dload"
 )
 
-func DownloadSingle(baseParams BaseParams, description string,
+func DownloadSingle(bp BaseParams, description string,
 	bck cmn.Bck, objName, link string, intervals ...time.Duration) (string, error) {
-	dlBody := downloader.DlSingleBody{
-		DlSingleObj: downloader.DlSingleObj{
+	dlBody := dload.SingleBody{
+		SingleObj: dload.SingleObj{
 			ObjName: objName,
 			Link:    link,
 		},
 	}
-
 	if len(intervals) > 0 {
 		dlBody.ProgressInterval = intervals[0].String()
 	}
-
 	dlBody.Bck = bck
 	dlBody.Description = description
-	return DownloadWithParam(baseParams, downloader.DlTypeSingle, &dlBody)
+	return DownloadWithParam(bp, dload.TypeSingle, &dlBody)
 }
 
-func DownloadRange(baseParams BaseParams, description string, bck cmn.Bck, template string, intervals ...time.Duration) (string, error) {
-	dlBody := downloader.DlRangeBody{
-		Template: template,
-	}
-
+func DownloadRange(bp BaseParams, description string, bck cmn.Bck, template string, intervals ...time.Duration) (string, error) {
+	dlBody := dload.RangeBody{Template: template}
 	if len(intervals) > 0 {
 		dlBody.ProgressInterval = intervals[0].String()
 	}
-
 	dlBody.Bck = bck
 	dlBody.Description = description
-	return DownloadWithParam(baseParams, downloader.DlTypeRange, dlBody)
+	return DownloadWithParam(bp, dload.TypeRange, dlBody)
 }
 
-func DownloadWithParam(baseParams BaseParams, dlt downloader.DlType, body interface{}) (string, error) {
-	baseParams.Method = http.MethodPost
+func DownloadWithParam(bp BaseParams, dlt dload.Type, body any) (id string, err error) {
+	bp.Method = http.MethodPost
 	msg := cos.MustMarshal(body)
-	return doDlDownloadRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathDownload.S,
-		Body:       cos.MustMarshal(downloader.DlBody{Type: dlt, RawMessage: msg}),
-	})
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathDownload.S
+		reqParams.Body = cos.MustMarshal(dload.Body{Type: dlt, RawMessage: msg})
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
+	}
+	id, err = reqParams.doDlDownloadRequest()
+	FreeRp(reqParams)
+	return
 }
 
-func DownloadMulti(baseParams BaseParams, description string, bck cmn.Bck, msg interface{}, intervals ...time.Duration) (string, error) {
-	dlBody := downloader.DlMultiBody{}
-
+func DownloadMulti(bp BaseParams, description string, bck cmn.Bck, msg any, intervals ...time.Duration) (string, error) {
+	dlBody := dload.MultiBody{}
 	if len(intervals) > 0 {
 		dlBody.ProgressInterval = intervals[0].String()
 	}
-
 	dlBody.Bck = bck
 	dlBody.Description = description
 	dlBody.ObjectsPayload = msg
-	return DownloadWithParam(baseParams, downloader.DlTypeMulti, dlBody)
+	return DownloadWithParam(bp, dload.TypeMulti, dlBody)
 }
 
-func DownloadBackend(baseParams BaseParams, description string, bck cmn.Bck, prefix, suffix string, intervals ...time.Duration) (string, error) {
-	dlBody := downloader.DlBackendBody{
-		Prefix: prefix,
-		Suffix: suffix,
+func DownloadBackend(bp BaseParams, descr string, bck cmn.Bck, prefix, suffix string, ivals ...time.Duration) (string, error) {
+	dlBody := dload.BackendBody{Prefix: prefix, Suffix: suffix}
+	if len(ivals) > 0 {
+		dlBody.ProgressInterval = ivals[0].String()
 	}
-
-	if len(intervals) > 0 {
-		dlBody.ProgressInterval = intervals[0].String()
-	}
-
 	dlBody.Bck = bck
-	dlBody.Description = description
-	return DownloadWithParam(baseParams, downloader.DlTypeBackend, dlBody)
+	dlBody.Description = descr
+	return DownloadWithParam(bp, dload.TypeBackend, dlBody)
 }
 
-func DownloadStatus(baseParams BaseParams, id string, onlyActiveTasks ...bool) (downloader.DlStatusResp, error) {
-	dlBody := downloader.DlAdminBody{
-		ID: id,
+func DownloadStatus(bp BaseParams, id string, onlyActive bool) (dlStatus *dload.StatusResp, err error) {
+	dlBody := dload.AdminBody{ID: id, OnlyActive: onlyActive}
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathDownload.S
+		reqParams.Body = cos.MustMarshal(dlBody)
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 	}
 
-	if len(onlyActiveTasks) > 0 {
-		// Status of only active downloader tasks. Skip details of finished/errored tasks
-		dlBody.OnlyActiveTasks = onlyActiveTasks[0]
-	}
-
-	baseParams.Method = http.MethodGet
-	return doDlStatusRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathDownload.S,
-		Body:       cos.MustMarshal(dlBody),
-	})
+	dlStatus = &dload.StatusResp{}
+	_, err = reqParams.DoReqAny(dlStatus)
+	FreeRp(reqParams)
+	return
 }
 
-func DownloadGetList(baseParams BaseParams, regex string) (dlList downloader.DlJobInfos, err error) {
-	dlBody := downloader.DlAdminBody{
-		Regex: regex,
+func DownloadGetList(bp BaseParams, regex string, onlyActive bool) (dlList dload.JobInfos, err error) {
+	dlBody := dload.AdminBody{Regex: regex, OnlyActive: onlyActive}
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathDownload.S
+		reqParams.Body = cos.MustMarshal(dlBody)
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 	}
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathDownload.S,
-		Body:       cos.MustMarshal(dlBody),
-	}, &dlList)
+	_, err = reqParams.DoReqAny(&dlList)
+	FreeRp(reqParams)
 	sort.Sort(dlList)
-	return dlList, err
+	return
 }
 
-func AbortDownload(baseParams BaseParams, id string) error {
-	dlBody := downloader.DlAdminBody{
-		ID: id,
+func AbortDownload(bp BaseParams, id string) error {
+	dlBody := dload.AdminBody{ID: id}
+	bp.Method = http.MethodDelete
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathDownloadAbort.S
+		reqParams.Body = cos.MustMarshal(dlBody)
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 	}
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathDownloadAbort.S,
-		Body:       cos.MustMarshal(dlBody),
-	})
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func RemoveDownload(baseParams BaseParams, id string) error {
-	dlBody := downloader.DlAdminBody{
-		ID: id,
+func RemoveDownload(bp BaseParams, id string) error {
+	dlBody := dload.AdminBody{ID: id}
+	bp.Method = http.MethodDelete
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathDownloadRemove.S
+		reqParams.Body = cos.MustMarshal(dlBody)
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 	}
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathDownloadRemove.S,
-		Body:       cos.MustMarshal(dlBody),
-	})
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func doDlDownloadRequest(reqParams ReqParams) (string, error) {
-	var resp downloader.DlPostResp
-	err := DoHTTPRequest(reqParams, &resp)
+// TODO: simplify `dload.DlPostResp` => string
+func (reqParams *ReqParams) doDlDownloadRequest() (string, error) {
+	var resp dload.DlPostResp
+	_, err := reqParams.DoReqAny(&resp)
 	return resp.ID, err
-}
-
-func doDlStatusRequest(reqParams ReqParams) (resp downloader.DlStatusResp, err error) {
-	err = DoHTTPRequest(reqParams, &resp)
-	return resp, err
 }

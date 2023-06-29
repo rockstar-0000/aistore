@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -11,11 +11,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
@@ -23,39 +24,39 @@ const numMarkers = 1
 
 // List of AIS metadata files and directories (basenames only)
 var mdFilesDirs = []string{
-	cmn.MarkersDirName,
+	fname.MarkersDir,
 
-	cmn.BmdFname,
-	cmn.BmdPreviousFname,
+	fname.Bmd,
+	fname.BmdPrevious,
 
-	cmn.VmdFname,
+	fname.Vmd,
 }
 
 func MarkerExists(marker string) bool {
-	markerPath := filepath.Join(cmn.MarkersDirName, marker)
+	markerPath := filepath.Join(fname.MarkersDir, marker)
 	return CountPersisted(markerPath) > 0
 }
 
 func PersistMarker(marker string) (fatalErr, writeErr error) {
 	var (
-		relname            = filepath.Join(cmn.MarkersDirName, marker)
-		availableMpaths, _ = Get()
-		cnt                int
+		cnt             int
+		relname         = filepath.Join(fname.MarkersDir, marker)
+		availableMpaths = GetAvail()
 	)
 	if len(availableMpaths) == 0 {
-		fatalErr = ErrNoMountpaths
+		fatalErr = cmn.ErrNoMountpaths
 		return
 	}
 	for _, mi := range availableMpaths {
 		fpath := filepath.Join(mi.Path, relname)
-		if err := Access(fpath); err == nil {
+		if err := cos.Stat(fpath); err == nil {
 			cnt++
 			if cnt > numMarkers {
 				if err := cos.RemoveFile(fpath); err != nil {
 					if writeErr == nil {
 						writeErr = err
 					}
-					glog.Errorf("Failed to cleanup %q marker: %v", fpath, err)
+					nlog.Errorf("Failed to cleanup %q marker: %v", fpath, err)
 				} else {
 					cnt--
 				}
@@ -66,7 +67,7 @@ func PersistMarker(marker string) (fatalErr, writeErr error) {
 				file.Close()
 				cnt++
 			} else {
-				glog.Errorf("Failed to create %q marker: %v", fpath, err)
+				nlog.Errorf("Failed to create %q marker: %v", fpath, err)
 			}
 		}
 	}
@@ -76,16 +77,18 @@ func PersistMarker(marker string) (fatalErr, writeErr error) {
 	return
 }
 
-func RemoveMarker(marker string) {
+func RemoveMarker(marker string) (err error) {
 	var (
-		availableMpaths, _ = Get()
-		relname            = filepath.Join(cmn.MarkersDirName, marker)
+		availableMpaths = GetAvail()
+		relname         = filepath.Join(fname.MarkersDir, marker)
 	)
 	for _, mi := range availableMpaths {
-		if err := cos.RemoveFile(filepath.Join(mi.Path, relname)); err != nil {
-			glog.Errorf("Failed to cleanup %q from %q: %v", relname, mi.Path, err)
+		if er1 := cos.RemoveFile(filepath.Join(mi.Path, relname)); er1 != nil {
+			nlog.Errorf("Failed to remove %q marker from %q: %v", relname, mi.Path, er1)
+			err = er1
 		}
 	}
+	return
 }
 
 // PersistOnMpaths persists `what` on mountpaths under "mountpath.Path/path" filename.
@@ -94,9 +97,9 @@ func RemoveMarker(marker string) {
 // Returns how many times it has successfully stored a file.
 func PersistOnMpaths(fname, backupName string, meta jsp.Opts, atMost int, b []byte, sgl *memsys.SGL) (cnt, availCnt int) {
 	var (
-		wto                io.WriterTo
-		availableMpaths, _ = Get()
-		bcnt               int
+		wto             io.WriterTo
+		bcnt            int
+		availableMpaths = GetAvail()
 	)
 	availCnt = len(availableMpaths)
 	debug.Assert(atMost > 0)
@@ -118,7 +121,7 @@ func PersistOnMpaths(fname, backupName string, meta jsp.Opts, atMost int, b []by
 			wto = sgl // not reopening - see sgl.WriteTo()
 		}
 		if err := jsp.SaveMeta(fpath, meta, wto); err != nil {
-			glog.Errorf("Failed to persist %q on %q, err: %v", fname, mi, err)
+			nlog.Errorf("Failed to persist %q on %q, err: %v", fname, mi, err)
 		} else {
 			cnt++
 		}
@@ -131,23 +134,11 @@ func PersistOnMpaths(fname, backupName string, meta jsp.Opts, atMost int, b []by
 	return
 }
 
-func RemoveDaemonIDs() {
-	available, disabled := Get()
-	for _, mi := range available {
-		err := removeXattr(mi.Path, daemonIDXattr)
-		debug.AssertNoErr(err)
-	}
-	for _, mi := range disabled {
-		err := removeXattr(mi.Path, daemonIDXattr)
-		debug.AssertNoErr(err)
-	}
-}
-
 func CountPersisted(fname string) (cnt int) {
-	available, _ := Get()
+	available := GetAvail()
 	for mpath := range available {
 		fpath := filepath.Join(mpath, fname)
-		if err := Access(fpath); err == nil {
+		if err := cos.Stat(fpath); err == nil {
 			cnt++
 		}
 	}

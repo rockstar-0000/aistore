@@ -7,13 +7,58 @@ redirect_from:
  - /docs/configuration.md/
 ---
 
-## Introduction
+AIS configuration comprises:
 
-AIS configuration consists of cluster-wide (global) defaults and node-specific values - the latter includes node's own hostnames (or IP addresses) and mountpaths (disks).
+| Name | Scope | Comment |
+| --- | --- | --- |
+| [ClusterConfig](https://github.com/NVIDIA/aistore/blob/master/cmn/config.go#L48) | Global | [Named sections](https://github.com/NVIDIA/aistore/blob/master/deploy/dev/local/aisnode_config.sh#L13) containing name-value knobs |
+| [LocalConfig](https://github.com/NVIDIA/aistore/blob/master/cmn/config.go#L49) | Local | Allows to override global defaults on a per-node basis |
 
-Optionally and in addition, there's also a node-specific "config override" - a set of values that were changed for this node from global (inherited) defaults.
+Cluster-wide (global) configuration is protected, namely: checksummed, versioned, and safely replicated. In effect, global config defines cluster-wide defaults inherited by each node joining the cluster.
 
-It is important to note that configuring cluster for production requires careful consideration. For example, AIS supports 3 (**three**) logical networks and will, therefore, benefit, performance-wise, if provisioned with up to 3 isolated physical networks or VLANs. The logical networks are:
+Local config includes:
+
+1. node's own hostnames (or IP addresses) and [mountpaths](overview.md#terminology) (data drives);
+2. optionally, names-and-values that were changed for *this* specific node. For each node in the cluster, the corresponding capability (dubbed *config-override*) boils down to:
+   * **inheriting** cluster configuration, and optionally
+   * optionally, **locally overriding** assorted inherited defaults (see usage examples below).
+
+Majority of the configuration knobs can be changed at runtime (and at any time). A few read-only variables are explicitly [marked](https://github.com/NVIDIA/aistore/blob/master/cmn/config.go) in the source; any attempt to modify those at runtime will return "read-only" error message.
+
+## CLI
+
+For the most part, commands to view and update (CLI, cluster, node) configuration can be found [here](/docs/cli/config.md).
+
+The [same document](docs/cli/config.md) also contains a brief theory of operation, command descriptions, numerous usage examples, and more.
+
+> **Important:** as an input, CLI accepts both plain text and JSON-formatted values. For the latter, make sure to embed the (JSON value) argument into single quotes, e.g.:
+
+```console
+$ ais config cluster backend.conf='{"gcp":{}, "aws":{}}'
+```
+
+To show the update in plain text and JSON:
+
+```console
+$ ais config cluster backend.conf --json
+
+    "backend": {"aws":{},"gcp":{}}
+
+$ ais config cluster backend.conf
+PROPERTY         VALUE
+backend.conf     map[aws:map[] gcp:map[]]
+```
+
+See also:
+
+* [Backend providers and supported backends](/docs/providers.md)
+
+
+## Configuring for production
+
+Configuring AIS cluster for production requires a careful consideration. First and foremost, there are assorted [performance](performance.md) related recommendations.
+
+Optimal performance settings will always depend on your (hardware, network) environment. Speaking of networking, AIS supports 3 (**three**) logical networks and will, therefore, benefit, performance-wise, if provisioned with up to 3 isolated physical networks or VLANs. The logical networks are:
 
 * user (aka public)
 * intra-cluster control
@@ -25,17 +70,11 @@ with the corresponding [JSON names](/deploy/dev/local/aisnode_config.sh), respec
 * `hostname_intra_control`
 * `hostname_intra_data`
 
-> For AIS Kubernetes deployments we recommended [Cilium](https://cilium.io) CNI.
-
 ## References
 
-* To enable an optional AIStore authentication server, execute `$ AUTH_ENABLED=true make deploy`. For information on AuthN server, please see [AuthN documentation](/docs/authn.md).
-* In addition to AIStore - the storage cluster, you can also deploy [aisfs](/docs/aisfs.md) - to access AIS objects as files, and [AIS CLI](/docs/cli.md) - to monitor, configure and manage AIS nodes and buckets.
-* AIS CLI is an easy-to-use command-line management tool supporting a growing number of commands and options (one of the first ones you may want to try could be `ais show cluster` - show the state and status of an AIS cluster). The CLI is documented in the [readme](/docs/cli.md); getting started with it boils down to running `make cli` and following the prompts.
-* For more testing commands and options, please refer to the [testing README](/ais/tests/README.md).
-* For `aisnode` command-line options, see: [command-line options](/docs/command_line.md).
-* For helpful links and/or background on Go, AWS, GCP, and Deep Learning: [helpful links](/docs/helpful_links.md).
-* And again, run `make help` to find out how to build, run, and test AIStore and tools.
+* For Kubernetes deployment, please refer to a separate [ais-k8s](https://github.com/NVIDIA/ais-k8s) repository that also contains [AIS/K8s Operator](https://github.com/NVIDIA/ais-k8s/blob/master/operator/README.md) and its configuration-defining [resources](https://github.com/NVIDIA/ais-k8s/blob/master/operator/pkg/resources/cmn/config.go).
+* To configure an optional AIStore authentication server, run `$ AIS_AUTHN_ENABLED=true make deploy`. For information on AuthN server, please see [AuthN documentation](/docs/authn.md).
+* AIS [CLI](/docs/cli.md) is an easy-to-use convenient command-line management/monitoring tool. To get started with CLI, run `make cli` (that generates `ais` executable) and follow the prompts.
 
 ## Cluster and Node Configuration
 
@@ -47,11 +86,7 @@ The first thing to keep in mind is that there are 3 (three) separate, and separa
 
 Specifically:
 
-### 1. Cluster Config
-
-In the documentation and in the code we can say "global configuration" or, same, "cluster configuration". The point, though, is that global config is replicated, versioned, checksummed, compressed, and - most importantly - applies to the entire cluster, all current (and future) node members.
-
-Typically, when we deploy a new AIS cluster, we use configuration template that contains all the defaults - see, for example, [JSON template](/deploy/dev/local/aisnode_config.sh). Configuration sections in this template, and the knobs within those sections, must be self-explanatory, and the majority of those, except maybe just a few, have pre-assigned default values.
+## Cluster Config
 
 To show and/or change global config, simply type one of:
 
@@ -63,33 +98,60 @@ $ ais show cluster config
 $ ais show cluster config --json
 
 # 3. show cluster-wide defaults for all variables prefixed with "time"
-$ ais show cluster time
+$ ais show config cluster time
+# or, same:
+$ ais show cluster config time
 PROPERTY                         VALUE
 timeout.cplane_operation         2s
 timeout.max_keepalive            4s
 timeout.max_host_busy            20s
 timeout.startup_time             1m
 timeout.send_file_time           5m
+timeout.transport_idle_term      4s
 
 # 4. for all nodes in the cluster set startup timeout to 2 minutes
-$ ais cluster configure timeout.startup_time=2m
+$ ais config cluster timeout.startup_time=2m
+config successfully updated
 ```
 
-### 2. Node (local) configuration
+Typically, when we deploy a new AIS cluster, we use configuration template that contains all the defaults - see, for example, [JSON template](/deploy/dev/local/aisnode_config.sh). Configuration sections in this template, and the knobs within those sections, must be self-explanatory, and the majority of those, except maybe just a few, have pre-assigned default values.
 
-Unlike global configuration that is replicated across all nodes there is also a node-specific configuration comprising:
+## Node configuration
 
-* local config and log directories
+As stated above, each node in the cluster inherits global configuration with the capability to override the latter locally.
+
+There are also node-specific settings, such as:
+
+* log directories
 * network configuration, including node's hostname(s) or IP addresses
-* node's mountpaths
+* node's [mountpaths](#managing-mountpaths)
 
-> Terminology: *mountpath* is a triplet **(local filesystem, disks this LFS utilizes, directory where AIS will store its metadata and user data)**. The following "share-nothing" rules are enforced: different mountpaths use different local filesystems, whereby each local FS uses its own disks.
+> Since AIS supports n-way mirroring and erasure coding, we typically recommend not using LVMs and hardware RAIDs.
 
-> Separately, since AIS supports n-way mirroring and erasure coding, we strongly recommend not using LVM and hardware RAID. Rather, there must be a simple 1-to-1 relationship: one local FS - one non-partitioned disk.
+### Example: show node's configuration
 
-Example
 ```console
-# ais show config CCDpt8088 --json | tail -20
+# ais show config t[CCDpt8088]
+PROPERTY                                 VALUE                                                           DEFAULT
+auth.enabled                             false                                                           -
+auth.secret                              aBitLongSecretKey                                               -
+backend.conf                             map[aws:map[] gcp:map[]]                                        -
+checksum.enable_read_range               false                                                           -
+checksum.type                            xxhash                                                          -
+checksum.validate_cold_get               true                                                            -
+checksum.validate_obj_move               false                                                           -
+checksum.validate_warm_get               false                                                           -
+...
+...
+(Hint: use `--type` to select the node config's type to show: 'cluster', 'local', 'all'.)
+...
+...
+```
+
+### Example: same as above in JSON format:
+
+```console
+$ ais show config CCDpt8088 --json | tail -20
     "lastupdate_time": "2021-03-20 18:00:20.393881867 -0700 PDT m=+2907.143584987",
     "uuid": "ZzCknLkMi",
     "config_version": "3",
@@ -111,34 +173,59 @@ Example
     }
 ```
 
-3. Node's local overrides of global defaults
-
-Finally, each clustered node can individually override *inherited* defaults. For example:
+### Example: use `--type` option to show only local config
 
 ```console
-# ais show config CCDpt8088 timeout
+# ais show config koLAt8081 --type local
+PROPERTY                         VALUE
+confdir                          /ais
+log_dir                          /tmp/ais/log
+host_net.hostname
+host_net.hostname_intra_control
+host_net.hostname_intra_data
+host_net.port                    51081
+host_net.port_intra_control      51082
+host_net.port_intra_data         51083
+fspaths.paths                    /ais/mp1,/ais/mp2,/ais/mp3,/ais/mp4
+test_fspaths.root                /tmp/ais
+test_fspaths.count               0
+test_fspaths.instance            0
+```
+
+### Local override (of global defaults)
+
+Example:
+
+```console
+$ ais show config t[CCDpt8088] timeout
+# or, same:
+$ ais config node t[CCDpt8088] timeout
+
 PROPERTY                         VALUE   DEFAULT
 timeout.cplane_operation         2s      -
+timeout.join_startup_time        3m      -
 timeout.max_host_busy            20s     -
 timeout.max_keepalive            4s      -
 timeout.send_file_time           5m      -
 timeout.startup_time             1m      -
 
-# ais cluster configure CCDpt8088 timeout.startup_time=2m
+$ ais config node t[CCDpt8088] timeout.startup_time=90s
 config for node "CCDpt8088" successfully updated
 
-# ais show config CCDpt8088 timeout
+$ ais config node t[CCDpt8088] timeout
+
 PROPERTY                         VALUE   DEFAULT
 timeout.cplane_operation         2s      -
+timeout.join_startup_time        3m      -
 timeout.max_host_busy            20s     -
 timeout.max_keepalive            4s      -
 timeout.send_file_time           5m      -
-timeout.startup_time             2m      1m
+timeout.startup_time             1m30s   1m
 ```
 
-Notice the `DEFAULT` column above where `-` indicates that the corresponding value is inherited and remains unchanged.
+In the `DEFAULT` column above hyphen (`-`) indicates that the corresponding value is inherited and, as far as the node `CCDpt8088`, remains unchanged.
 
-Rest of this document is structured as follows:
+## Rest of this document is structured as follows
 
 - [Basics](#basics)
 - [Startup override](#startup-override)
@@ -151,9 +238,7 @@ Rest of this document is structured as follows:
 - [Curl examples](#curl-examples)
 - [CLI examples](#cli-examples)
 
-AIS production deployment, in particular, requires careful consideration of at least some of the configurable aspects. For example, AIS supports 3 (three) logical networks and will, therefore, benefit, performance-wise, if provisioned with up to 3 isolated physical networks or VLANs. The logical networks are: user (aka public), intra-cluster control, and intra-cluster data - the corresponding JSON names are, respectively: `hostname`, `hostname_intra_control`, and `hostname_intra_data`.
-
-The following picture illustrates one section of the configuration template that, in part, includes listening port:
+The picture illustrates one section of the configuration template that, in part, includes listening port:
 
 ![Configuration: TCP port and URL](images/ais-config-1.png)
 
@@ -161,11 +246,9 @@ Further, `test_fspaths` section (see below) corresponds to a **single local file
 
 ![Configuration: local filesystems](images/ais-config-2-commented.png)
 
-In production we use an alternative configuration called `fspaths`: the section of the [config](/deploy/dev/local/aisnode_config.sh) that includes a number of local directories, whereby each directory is based on a different local filesystem.
+In production, we use an alternative configuration called `fspaths`: the section of the [config](/deploy/dev/local/aisnode_config.sh) that includes a number of local directories, whereby each directory is based on a different local filesystem.
 
-> Terminology: *mountpath* is a triplet **(local filesystem (LFS), disks that this LFS utilizes, LFS directory)**. The following rules are enforced: 1) different mountpaths use different LFSes, and 2) different LFSes use different disks.
-
-> The terms `fspath` (aka `filesystem path`) and `mountpath` are used interchangeably throughout AIStore docs and sources. When `fspath` configuration is enabled, the 1-to-1 relationship between configured `mountpaths` and local filesystems is enforced and validated at all times.
+For `fspath` and `mountpath` terminology and details, please see section [Managing Mountpaths](#managing-mountpaths) in this document.
 
 An example of 12 fspaths (and 12 local filesystems) follows below:
 
@@ -195,6 +278,8 @@ For examples and alternative ways to format configuration-updating requests, ple
 
 Following is a table-summary that contains a *subset* of all *settable* knobs:
 
+> **NOTE (May 2022):** this table is somewhat **outdated** and must be revisited.
+
 | Option name | Overridable | Default value | Description |
 |---|---|---|---|
 | `ec.data_slices` | No | `2` | Represents the number of fragments an object is broken into (in the range [2, 100]) |
@@ -202,16 +287,14 @@ Following is a table-summary that contains a *subset* of all *settable* knobs:
 | `ec.enabled` | No | `false` | Enables or disables data protection |
 | `ec.objsize_limit` | No | `262144` | Indicated the minimum size of an object in bytes that is erasure encoded. Smaller objects are replicated |
 | `ec.parity_slices` | No | `2` | Represents the number of redundant fragments to provide protection from failures (in the range [2, 32]) |
-| `ec.batch_size` | No | `64` | Represents the number of misplaced and broken objects(with missing EC parts) processed by EC rebalance in a singe batch (in the range [4, 256]). Increasing the batch size improves rebalance time but requires more memory |
 | `ec.compression` | No | `"never"` | LZ4 compression parameters used when EC sends its fragments and replicas over network. Values: "never" - disables, "always" - compress all data, or a set of rules for LZ4, e.g "ratio=1.2" means enable compression from the start but disable when average compression ratio drops below 1.2 to save CPU resources |
-| `mirror.burst_buffer` | No | `512` | the maximum length of the queue of objects to be mirrored. When the queue length exceeds the value, a target may skip creating replicas for new objects |
+| `mirror.burst_buffer` | No | `512` | the maximum queue size for the (pending) objects to be mirrored. When exceeded, target logs a warning. |
 | `mirror.copies` | No | `1` | the number of local copies of an object |
 | `mirror.enabled` | No | `false` | If true, for every object PUT a target creates object replica on another mountpath. Later, on object GET request, loadbalancer chooses a mountpath with lowest disk utilization and reads the object from it |
-| `mirror.util_thresh` | No | `20` | If mirroring is enabled, loadbalancer chooses an object replica to read but only if main object's mountpath utilization exceeds the replica' s mountpath utilization by this value. Main object's mountpath is the mountpath used to store the object when mirroring is disabled |
 | `rebalance.dest_retry_time` | No | `2m` | If a target does not respond within this interval while rebalance is running the target is excluded from rebalance process |
 | `rebalance.enabled` | No | `true` | Enables and disables automatic rebalance after a target receives the updated cluster map. If the (automated rebalancing) option is disabled, you can still use the REST API (`PUT {"action": "start", "value": {"kind": "rebalance"}} v1/cluster`) to initiate cluster-wide rebalancing |
 | `rebalance.multiplier` | No | `4` | A tunable that can be adjusted to optimize cluster rebalancing time (advanced usage only) |
-| `rebalance.quiescent` | No | `20s` | Rebalance moves to the next stage or starts the next batch of objects when no objects are received during this time interval |
+| `transport.quiescent` | No | `20s` | Rebalance moves to the next stage or starts the next batch of objects when no objects are received during this time interval |
 | `versioning.enabled` | No | `true` | Enables and disables versioning. For the supported 3rd party backends, versioning is _on_ only when it enabled for (and supported by) the specific backend |
 | `versioning.validate_warm_get` | No | `false` | If false, a target returns a requested object immediately if it is cached. If true, a target fetches object's version(via HEAD request) from Cloud and if the received version mismatches locally cached one, the target redownloads the object and then returns it to a client |
 | `checksum.enable_read_range` | Yes | `false` | See [Supported Checksums and Brief Theory of Operations](checksum.md) |
@@ -221,7 +304,7 @@ Following is a table-summary that contains a *subset* of all *settable* knobs:
 | `client.client_long_timeout` | Yes | `30m` | Default _long_ client timeout |
 | `client.client_timeout` | Yes | `10s` | Default client timeout |
 | `client.list_timeout` | Yes | `2m` | Client list objects timeout |
-| `compression.block_size` | Yes | `262144` | Maximum data block size used by LZ4, greater values may increase compression ration but requires more memory. Value is one of 64KB, 256KB(AIS default), 1MB, and 4MB |
+| `transport.block_size` | Yes | `262144` | Maximum data block size used by LZ4, greater values may increase compression ration but requires more memory. Value is one of 64KB, 256KB(AIS default), 1MB, and 4MB |
 | `disk.disk_util_high_wm` | Yes | `80` | Operations that implement self-throttling mechanism, e.g. LRU, turn on the maximum throttle if disk utilization is higher than `disk_util_high_wm` |
 | `disk.disk_util_low_wm` | Yes | `60` | Operations that implement self-throttling mechanism, e.g. LRU, do not throttle themselves if disk utilization is below `disk_util_low_wm` |
 | `disk.iostat_time_long` | Yes | `2s` | The interval that disk utilization is checked when disk utilization is below `disk_util_low_wm`. |
@@ -239,14 +322,14 @@ Following is a table-summary that contains a *subset* of all *settable* knobs:
 | `lru.capacity_upd_time` | Yes | `10m` | Determines how often AIStore updates filesystem usage |
 | `lru.dont_evict_time` | Yes | `120m` | LRU does not evict an object which was accessed less than dont_evict_time ago |
 | `lru.enabled` | Yes | `true` | Enables and disabled the LRU |
-| `lru.highwm` | Yes | `90` | LRU starts immediately if a filesystem usage exceeds the value |
-| `lru.lowwm` | Yes | `75` | If filesystem usage exceeds `highwm` LRU tries to evict objects so the filesystem usage drops to `lowwm` |
+| `space.highwm` | Yes | `90` | LRU starts immediately if a filesystem usage exceeds the value |
+| `space.lowwm` | Yes | `75` | If filesystem usage exceeds `highwm` LRU tries to evict objects so the filesystem usage drops to `lowwm` |
 | `periodic.notif_time` | Yes | `30s` | An interval of time to notify subscribers (IC members) of the status and statistics of a given asynchronous operation (such as Download, Copy Bucket, etc.)  |
 | `periodic.stats_time` | Yes | `10s` | A *housekeeping* time interval to periodically update and log internal statistics, remove/rotate old logs, check available space (and run LRU *xaction* if need be), etc. |
 | `resilver.enabled` | Yes | `true` | Enables and disables automatic reresilver after a mountpath has been added or removed. If the (automated resilvering) option is disabled, you can still use the REST API (`PUT {"action": "start", "value": {"kind": "resilver", "node": targetID}} v1/cluster`) to initiate resilvering |
 | `timeout.max_host_busy` | Yes | `20s` | Maximum latency of control-plane operations that may involve receiving new bucket metadata and associated processing |
 | `timeout.send_file_time` | Yes | `5m` | Timeout for sending/receiving an object from another target in the same cluster |
-| `vmodule` | Yes | `""` | Overrides logging level for a given modules.<br>{"name": "vmodule", "value": "target\*=2"} sets log level to 2 for target modules |
+| `timeout.transport_idle_term` | Yes | `4s` | Max idle time to temporarily teardown long-lived intra-cluster connection |
 
 ## Startup override
 
@@ -283,26 +366,37 @@ $ aisnode -config=/etc/ais.json -local_config=/etc/ais_local.json -role=target -
 
 ## Managing mountpaths
 
-Configuration option `fspaths` specifies the list of local directories where storage targets store objects. An `fspath` aka `mountpath` (both terms are used interchangeably) is a local directory serviced by a local filesystem.
+* [Mountpath](overview.md#terminology) - is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS can fully own and utilize (to store user data and system metadata). Note that any given disk (or RAID) can have (at most) one mountpath (meaning **no disk sharing**) and mountpath directories cannot be nested. Further:
+   - a mountpath can be temporarily disabled and (re)enabled;
+   - a mountpath can also be detached and (re)attached, thus effectively supporting growth and "shrinkage" of local capacity;
+   - it is safe to execute the 4 listed operations (enable, disable, attach, detach) at any point during runtime;
+   - in a typical deployment, the total number of mountpaths would compute as a direct product of (number of storage targets) x (number of disks in each target).
 
-> There must be a 1-to-1 relationship between `fspath` and an underlying local filesystem. Note as well that this may be not the case for the development environments where multiple mountpaths are allowed to coexist within a single filesystem (e.g., tmpfs).
+Configuration option `fspaths` specifies the list of local mountpath directories. Each configured `fspath` is, simply, a local directory that provides the basis for AIS `mountpath`.
 
-> AIS [mountpath](overview.md#terminology) is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS utilizes to store user data and AIS metadata. A mountpath can be disabled and (re)enabled, automatically or administratively, at any point during runtime. In a given cluster, a total number of mountpaths would normally compute as a direct product of (number of storage targets) x (number of disks in each target).
+> In regards **non-sharing of disks** between mountpaths: for development we make an exception, such that multiple mountpaths are actually allowed to share a disk and coexist within a single filesystem. This is done strictly for development convenience, though.
 
-AIStore [HTTP API](http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](/health/fshc.md).
+AIStore [REST API](http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](/health/fshc.md).
 
 ## Disabling extended attributes
 
-To make sure that AIStore does not utilize xattrs, configure `checksum.type`=`none`, `versioning.enabled`=`true`,
-and `md_write`=`never` for all targets in a AIStore cluster.
+To make sure that AIStore does not utilize xattrs, configure:
+* `checksum.type`=`none`
+* `versioning.enabled`=`true`, and
+* `write_policy.md`=`never`
+
+for all targets in AIStore cluster.
+
+Or, simply update global configuration (to have those cluster-wide defaults later inherited by all newly created buckets).
+
 This can be done via the [common configuration "part"](/deploy/dev/local/aisnode_config.sh) that'd be further used to deploy the cluster.
 
 Extended attributes can be disabled on per bucket basis. To do this, turn off saving metadata to disks (CLI):
 
 ```console
-$ ais bucket props ais://mybucket md_write=never
+$ ais bucket props ais://mybucket write_policy.md=never
 Bucket props successfully updated
-"md_write" set to: "never" (was: "")
+"write_policy.md" set to: "never" (was: "")
 ```
 
 Disable extended attributes only if you need fast and **temporary** storage.
@@ -335,46 +429,49 @@ AIStore gateway can act as a reverse proxy vis-à-vis AIStore storage targets. T
 
 The following assumes that `G` and `T` are the (hostname:port) of one of the deployed gateways (in a given AIS cluster) and one of the targets, respectively.
 
-#### Cluster-wide operation (all nodes)
+### Cluster-wide operation (all nodes)
+
 * Set the stats logging interval to 1 second
 
 ```console
-$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "periodic.stats_time", "value": "1s"}' 'http://G/v1/cluster'
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "set-config","name": "periodic.stats_time", "value": "1s"}' 'http://G/v1/cluster'
 ```
 
 or, same:
 
 ```console
-$ curl -i -X PUT 'http://G/v1/cluster/setconfig?periodic.stats_time=1s'
+$ curl -i -X PUT 'http://G/v1/cluster/set-config?periodic.stats_time=1s'
 ```
 
 > Notice the two alternative ways to form the requests.
 
-#### Cluster-wide operation (all nodes)
+### Cluster-wide operation (all nodes)
 * Set the stats logging interval to 2 minutes
 
 ```console
-$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "periodic.stats_time", "value": "2m"}' 'http://G/v1/cluster'
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "set-config","name": "periodic.stats_time", "value": "2m"}' 'http://G/v1/cluster'
 ```
 
-#### Cluster-wide operation (all nodes)
-* Elevate log verbosity to `4` for all sources matching `ais/targ*` regex
+### Cluster-wide operation (all nodes)
+* Set the default number of n-way copies to 4 (can still be redefined on a per-bucket basis)
 
 ```console
-$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "vmodule", "value": "ais/targ*=4"}' 'http://G/v1/cluster'
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "set-config","name": "mirror.copies", "value": "4"}' 'http://G/v1/cluster'
+
+# or, same using CLI:
+$ ais config cluster mirror.copies 4
 ```
 
-#### Single-node operation (single node)
-* Set log verbosity to `1` for all source files that match the `ais/targ*` regex
+### Single-node operation (single node)
+* Set log level = 1
 
 ```console
-$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "setconfig","name": "vmodule", "value": "ais/targ*=1"}' 'http://T/v1/daemon'
-```
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action": "set-config","name": "log.level", "value": "1"}' 'http://T/v1/daemon'
+# or, same:
+$ curl -i -X PUT 'http://T/v1/daemon/set-config?log.level=1'
 
-or, same:
-
-```console
-$ curl -i -X PUT 'http://T/v1/daemon/setconfig?vmodule=ais/targ*=1'
+# or, same using CLI (assuming the node in question is t[tZktGpbM]):
+$ ais config node t[tZktGpbM] log.level 1
 ```
 
 ## CLI examples
@@ -382,24 +479,26 @@ $ curl -i -X PUT 'http://T/v1/daemon/setconfig?vmodule=ais/targ*=1'
 [AIS CLI](/docs/cli.md) is an integrated management-and-monitoring command line tool. The following CLI command sequence, first - finds out all AIS knobs that contain substring "time" in their names, second - modifies `list_timeout` from 2 minutes to 5 minutes, and finally, displays the modified value:
 
 ```console
-$ ais show config --type all 844974_8080 --json | jq '.timeout.list_timeout'
+$ ais show config p[rZTp8080] --type all --json | jq '.timeout.list_timeout'
 "2m"
+
 $ ais config cluster timeout.list_timeout=5m
 Config has been updated successfully.
-$ ais show config --type all 844974_8080 --json | jq '.timeout.list_timeout'
+
+$ ais show config p[rZTp8080] --type all --json | jq '.timeout.list_timeout'
 "5m"
 ```
 
 The example above demonstrates cluster-wide configuration update but note: single-node updates are also supported.
 
-#### Cluster-wide operation (all nodes)
+### Cluster-wide operation (all nodes)
 * Set `periodic.stats_time` = 1 minute, `periodic.iostat_time_long` = 4 seconds
 
 ```console
 $ ais config cluster periodic.stats_time=1m disk.iostat_time_long=4s
 ```
 
-#### Single-node operation (single node)
+### Single-node operation (single node)
 AIS configuration includes a section called `disk`. The `disk` in turn contains several knobs - one of those knobs is `disk.iostat_time_long`, another - `disk.disk_util_low_wm`. To update one or both of those named variables on all or one of the clustered nodes, you could:
 * Set `disk.iostat_time_long` = 3 seconds, `disk.disk_util_low_wm` = 40 percent on daemon with ID `target1`
 

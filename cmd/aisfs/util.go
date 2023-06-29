@@ -1,6 +1,6 @@
 // Package aisfs - command-line mounting utility for aisfs.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -17,10 +17,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/aisfs/fs"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/containers"
+	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/urfave/cli"
 )
 
@@ -60,14 +61,14 @@ func discoverClusterURL(c *cli.Context) string {
 		defaultAISDockerURL = "http://172.50.0.2:8080"
 		dockerErrMsgFmt     = "Failed to discover docker proxy URL: %v.\nUsing default %q.\n"
 	)
-	setURLMsg := fmt.Sprintf("Set URL with: export %s=`url`.", cmn.EnvVars.Endpoint)
+	setURLMsg := fmt.Sprintf("Set URL with: export %s=`url`.", env.AIS.Endpoint)
 
-	if envURL := os.Getenv(cmn.EnvVars.Endpoint); envURL != "" {
+	if envURL := os.Getenv(env.AIS.Endpoint); envURL != "" {
 		return envURL
 	}
 
-	if containers.DockerRunning() {
-		clustersIDs, err := containers.ClusterIDs()
+	if docker.IsRunning() {
+		clustersIDs, err := docker.ClusterIDs()
 		if err != nil {
 			fmt.Fprintf(c.App.ErrWriter, dockerErrMsgFmt, err, defaultAISDockerURL)
 			fmt.Fprintln(c.App.ErrWriter, setURLMsg)
@@ -75,7 +76,7 @@ func discoverClusterURL(c *cli.Context) string {
 		}
 
 		cos.AssertMsg(len(clustersIDs) > 0, "there should be at least one cluster running when docker is detected")
-		proxyGateway, err := containers.ClusterProxyURL(clustersIDs[0])
+		proxyGateway, err := docker.ClusterEndpoint(clustersIDs[0])
 		if err != nil {
 			fmt.Fprintf(c.App.ErrWriter, dockerErrMsgFmt, err, defaultAISDockerURL)
 			fmt.Fprintln(c.App.ErrWriter, setURLMsg)
@@ -83,7 +84,8 @@ func discoverClusterURL(c *cli.Context) string {
 		}
 
 		if len(clustersIDs) > 1 {
-			fmt.Fprintf(c.App.ErrWriter, "Multiple docker clusters running. Connected to %d via %s.\n", clustersIDs[0], proxyGateway)
+			fmt.Fprintf(c.App.ErrWriter, "Multiple docker clusters running. Connected to %d via %s.\n",
+				clustersIDs[0], proxyGateway)
 			fmt.Fprintln(c.App.ErrWriter, setURLMsg)
 		}
 
@@ -99,7 +101,7 @@ func tryAccessBucket(url string, bck cmn.Bck) bool {
 		URL:    url,
 	}
 
-	_, err := api.HeadBucket(baseParams, bck)
+	_, err := api.HeadBucket(baseParams, bck, false /*don't add*/)
 	return err == nil
 }
 

@@ -1,7 +1,7 @@
 // Package jsp (JSON persistence) provides utilities to store and load arbitrary
 // JSON-encoded structures with optional checksumming and compression.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package jsp_test
 
@@ -15,9 +15,13 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/jsp"
-	"github.com/NVIDIA/aistore/devtools/tassert"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools/tassert"
+	"github.com/NVIDIA/aistore/tools/trand"
 )
+
+// go test -v -bench=. -tags=debug
+// go test -v -bench=. -tags=debug -benchtime=10s -benchmem
 
 type testStruct struct {
 	I  int    `json:"a,omitempty"`
@@ -32,7 +36,7 @@ type testStruct struct {
 func (ts *testStruct) equal(other testStruct) bool {
 	return ts.I == other.I &&
 		ts.S == other.S &&
-		string(ts.B) == string(other.B) &&
+		bytes.Equal(ts.B, other.B) &&
 		ts.ST.I64 == other.ST.I64 &&
 		reflect.DeepEqual(ts.M, other.M)
 }
@@ -41,15 +45,15 @@ func makeRandStruct() (ts testStruct) {
 	if rand.Intn(2) == 0 {
 		ts.I = rand.Int()
 	}
-	ts.S = cos.RandString(rand.Intn(100))
+	ts.S = trand.String(rand.Intn(100))
 	if rand.Intn(2) == 0 {
-		ts.B = []byte(cos.RandString(rand.Intn(200)))
+		ts.B = []byte(trand.String(rand.Intn(200)))
 	}
 	ts.ST.I64 = rand.Int63()
 	if rand.Intn(2) == 0 {
 		ts.M = make(map[string]string)
 		for i := 0; i < rand.Intn(100)+1; i++ {
-			ts.M[cos.RandString(10)] = cos.RandString(20)
+			ts.M[trand.String(10)] = trand.String(20)
 		}
 	}
 	return
@@ -57,12 +61,12 @@ func makeRandStruct() (ts testStruct) {
 
 func makeStaticStruct() (ts testStruct) {
 	ts.I = rand.Int()
-	ts.S = cos.RandString(100)
-	ts.B = []byte(cos.RandString(200))
+	ts.S = trand.String(100)
+	ts.B = []byte(trand.String(200))
 	ts.ST.I64 = rand.Int63()
 	ts.M = make(map[string]string, 10)
 	for i := 0; i < 10; i++ {
-		ts.M[cos.RandString(10)] = cos.RandString(20)
+		ts.M[trand.String(10)] = trand.String(20)
 	}
 	return
 }
@@ -90,8 +94,9 @@ func TestDecodeAndEncode(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var (
-				v testStruct
-				b = memsys.DefaultPageMM().NewSGL(cos.MiB)
+				v    testStruct
+				mmsa = memsys.PageMM()
+				b    = mmsa.NewSGL(cos.MiB)
 			)
 			defer b.Free()
 
@@ -115,7 +120,8 @@ func TestDecodeAndEncode(t *testing.T) {
 }
 
 func TestDecodeAndEncodeFuzz(t *testing.T) {
-	b := memsys.DefaultPageMM().NewSGL(cos.MiB)
+	mmsa := memsys.PageMM()
+	b := mmsa.NewSGL(cos.MiB)
 	defer b.Free()
 
 	for i := 0; i < 10000; i++ {
@@ -124,7 +130,7 @@ func TestDecodeAndEncodeFuzz(t *testing.T) {
 			opts = jsp.Options{Signature: true, Checksum: true}
 		)
 
-		x = cos.RandString(i)
+		x = trand.String(i)
 
 		err := jsp.Encode(b, x, opts)
 		tassert.CheckFatal(t, err)
@@ -151,9 +157,10 @@ func BenchmarkEncode(b *testing.B) {
 		{name: "compress", v: makeStaticStruct(), opts: jsp.Options{Compress: true}},
 		{name: "ccs", v: makeStaticStruct(), opts: jsp.CCSign(7)},
 	}
+	mmsa := memsys.PageMM()
 	for _, bench := range benches {
 		b.Run(bench.name, func(b *testing.B) {
-			body := memsys.DefaultPageMM().NewSGL(cos.MiB)
+			body := mmsa.NewSGL(cos.MiB)
 			defer func() {
 				b.StopTimer()
 				body.Free()
@@ -185,12 +192,14 @@ func BenchmarkDecode(b *testing.B) {
 	}
 	for _, bench := range benches {
 		b.Run(bench.name, func(b *testing.B) {
-			sgl := memsys.DefaultPageMM().NewSGL(cos.MiB)
+			mmsa, _ := memsys.NewMMSA("jsp")
+			defer mmsa.Terminate(false)
+			sgl := mmsa.NewSGL(cos.MiB)
+
 			err := jsp.Encode(sgl, bench.v, bench.opts)
 			tassert.CheckFatal(b, err)
-			network, err := sgl.ReadAll()
+			network := sgl.ReadAll()
 			sgl.Free()
-			tassert.CheckFatal(b, err)
 
 			b.ReportAllocs()
 			b.ResetTimer()

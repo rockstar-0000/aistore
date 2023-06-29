@@ -1,6 +1,6 @@
-// Package reb provides local resilver and global rebalance for AIStore.
+// Package reb provides global cluster-wide rebalance upon adding/removing storage nodes.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package reb
 
@@ -13,5 +13,5 @@ import (
 
 func TestRebPkg(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Rebalance Suite")
+	RunSpecs(t, t.Name())
 }

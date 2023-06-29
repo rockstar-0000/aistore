@@ -9,24 +9,28 @@ redirect_from:
 
 # CLI Reference for Aliases
 
-AIS CLI supports user-defined aliases, similar to the Unix `alias` command.
+AIS CLI supports user-defined aliases, similar to the Unix `alias` command. Defining your own alias for an existing command can make the AIS CLI more intuitive and efficient to use.
+
+> [Auto-complete](/docs/cli.md) options also hold for the alias you create!
 
 ## Table of Contents
 
 ## Create an Alias
 
-`ais alias ALIAS=AIS_COMMAND`
+`ais alias set ALIAS AIS_COMMAND`
 
-Create an alias "`ALIAS`" for `AIS_COMMAND`.
+Create an alias "`ALIAS`" for existing `AIS_COMMAND`.
 
-Note: ALIAS must be one word, or possibly multiple words connected with - (hyphen) or _ (underscore).
-For example, `ais alias show-clu=show cluster` is valid, but `ais alias show clu=show cluster` is not.
+Note: ALIAS must be a single word, or multiple words connected with - (hyphen) or _ (underscore). The arguments following ALIAS constitute the full `ais` command.
+The `ais` command can be put inside quotes for readability.
+
+For example, `ais alias set show-clu show cluster` and `ais alias set show-clu "show cluster"` create the same alias for `show cluster`.
 
 ### Examples
 
 ```console
-$ ais alias sc=show cluster
-aliased "show cluster"="sc"
+$ ais alias sc "show cluster"
+Aliased "show cluster"="sc"
 
 $ ais sc
 PROXY            MEM USED %      MEM AVAIL       UPTIME
@@ -55,12 +59,37 @@ TARGET           MEM USED %      MEM AVAIL       CAP USED %      CAP AVAIL      
 CASGt8088        0.35%           15.43GiB        14.00%          1.951TiB        0.11%           -               24h     dev      online
 ```
 
+## Remove Alias
+
+`ais alias rm ALIAS`
+
+Removes existing alias "`ALIAS`".
+
+### Examples
+
+```console
+$ ais alias
+ALIAS   COMMAND
+get     object get
+ls      bucket ls
+put     object put
+sc      show cluster
+
+$ ais alias rm sc
+
+$ ais alias
+ALIAS   COMMAND
+get     object get
+ls      bucket ls
+put     object put
+```
+
 ## List Aliases
 
-`ais alias`
+`ais alias show` or `ais alias`
 
 List all created aliases.
-Similar to how the `alias` command works, `ais alias` lists all aliases when no arguments are provided.
+`ais alias` with no arguments lists all previously added aliases -- the same behavior you expect from Unix shell `alias`. 
 
 Note that aliases are also shown in the app-level help message (`ais -h`).
 
@@ -75,8 +104,8 @@ get     object get
 ls      bucket ls
 put     object put
 
-$ ais alias sc=show cluster
-aliased "sc"="show cluster"
+$ ais alias set sc "show cluster"
+Aliased "sc"="show cluster"
 
 $ ais alias
 ALIAS   COMMAND
@@ -90,35 +119,38 @@ sc      show cluster
 
 ```console
 $ ais -h
-NAME:
-   ais - AIS CLI: command-line management utility for AIStore(tm)
+   0.8 (build 30bf97129)
 
-USAGE:
-   ais [global options] command [command options] [arguments...]
-
-VERSION:
-   0.5 (build aff1f037d)
+DESCRIPTION:
+   If [Tab] completion doesn't work:
+   * download https://github.com/NVIDIA/aistore/tree/master/cmd/cli/autocomplete
+   * and run 'install.sh'.
+   For more information, please refer to https://github.com/NVIDIA/aistore/blob/master/cmd/cli/README.md
 
 COMMANDS:
-   bucket     create/destroy buckets, list bucket's content, show existing buckets and their properties
-   object     PUT (write), GET (read), list, move (rename) and other operations on objects in a given bucket
-   cluster    monitor and manage AIS cluster: add/remove nodes, change primary gateway, etc.
-   config     set local/global AIS cluster configurations
-   mountpath  manage mountpaths (disks) in a given storage target
-   etl        execute custom transformations on objects
-   job        query and manage jobs (aka extended actions or xactions)
-   auth       add/remove/show users, manage user roles, manage access to remote clusters
-   show       show information about buckets, jobs, all other managed entities in the cluster and the cluster itself
-   help       show a list of commands; show help for a given command
-   advanced   special commands intended for development and advanced usage
-   alias      create top-level alias to a CLI command
-   search     search ais commands
+   bucket          create/destroy buckets, list bucket's content, show existing buckets and their properties
+   object          put, get, rename, remove, and other operations on objects
+   cluster         monitor and manage AIS cluster: add/remove nodes, change primary gateway, etc.
+   config          set local/global AIS cluster configurations
+   etl             execute custom transformations on objects
+   job             query and manage jobs (aka extended actions or xactions)
+   auth            add/remove/show users, manage user roles, manage access to remote clusters
+   show            show information about buckets, jobs, all other managed entities in the cluster and the cluster itself
+   help            show a list of commands; show help for a given command
+   advanced        special commands intended for development and advanced usage
+   storage         monitor and manage clustered storage
+   archive         Create archive and append files to archive
+   log             show log
+   rebalance       show rebalance details
+   remote-cluster  show attached AIS clusters
+   alias           manage top-level aliases
+   kubectl         show kubernetes pods and services
+   search          search ais commands
 
    ALIASES:
-     sc   (alias for "show cluster") show cluster details
-     get  (alias for "object get") get the object from the specified bucket
+     get  (alias for "object get") get object from the specified bucket
+     put  (alias for "object put") put object(s) into the specified bucket
      ls   (alias for "bucket ls") list buckets and their objects
-     put  (alias for "object put") put the objects into the specified bucket
 
 GLOBAL OPTIONS:
    --help, -h     show help
@@ -126,9 +158,9 @@ GLOBAL OPTIONS:
    --version, -V  print only the version
 ```
 
-## List Aliases
+## Reset Aliases
 
-`ais alias --reset`
+`ais alias reset`
 
 Clear all created aliases, and only keep the defaults.
 
@@ -142,8 +174,8 @@ ls      bucket ls
 put     object put
 sc      show cluster
 
-$ ais alias --reset
-aliases reset to default
+$ ais alias reset
+Aliases reset to default
 
 $ ais alias
 ALIAS   COMMAND
@@ -157,10 +189,9 @@ put     object put
 As with other CLI configurations, aliases are stored in the [CLI config file](/docs/cli.md#config).
 
 All aliases are stored under `"aliases"` as a map of strings (`ALIAS` to `AIS_COMMAND`).
-If an incorrect alias is manually added to the config file, it will be silently ignored.
 
 ```json
-// cat ~/.config/ais/config.json
+// cat ~/.config/ais/cli/cli.json
 {
   "cluster": {
     "url": "http://127.0.0.1:8080",
@@ -181,3 +212,11 @@ If an incorrect alias is manually added to the config file, it will be silently 
   }
 }
 ```
+Users can manually add aliases to the config file, but all commands must follow the rules for [creating an alias](#create-an-alias).
+E.g., aliases:
+
+```json
+   "show clu": "show cluster",
+   "show-clu": "show kluster",
+```
+are ignored because the name of the first one is not a single (or hyphenated ) word, while the AIS command of the second one does not exist.

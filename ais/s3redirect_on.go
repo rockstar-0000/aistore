@@ -1,8 +1,8 @@
-// +build !s3rproxy
+//go:build !s3rproxy
 
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -11,18 +11,21 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/ais/s3"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
+	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
 // s3Redirect() HTTP-redirects to a designated node in a cluster. See also:
 // * docs/s3compat.md
 // * Makefile (and look for `s3rproxy` build tag)
 // * ais/s3redirect_on.go
-func (*proxyrunner) s3Redirect(w http.ResponseWriter, _ *http.Request, _ *cluster.Snode, redirectURL, bucket string) {
+func (*proxy) s3Redirect(w http.ResponseWriter, _ *http.Request, _ *meta.Snode, redirectURL, bucket string) {
 	h := w.Header()
-	h.Set(cmn.HdrLocation, redirectURL)
-	h.Set(cmn.HdrContentType, "text/xml; charset=utf-8")
+	h.Set(cos.HdrLocation, redirectURL)
+	h.Set(cos.HdrContentType, "text/xml; charset=utf-8")
+	h.Set(cos.HdrServer, s3.AISServer)
 	w.WriteHeader(http.StatusTemporaryRedirect)
 	ep := ExtractEndpoint(redirectURL)
 	body := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
@@ -38,7 +41,7 @@ func (*proxyrunner) s3Redirect(w http.ResponseWriter, _ *http.Request, _ *cluste
 // would be `localhost:8080/s3`
 func ExtractEndpoint(path string) string {
 	ep := path
-	if idx := strings.Index(ep, "/"+cmn.S3); idx > 0 {
+	if idx := strings.Index(ep, "/"+apc.S3); idx > 0 {
 		ep = ep[:idx+3]
 	}
 	ep = strings.TrimPrefix(ep, "http://")

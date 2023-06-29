@@ -1,6 +1,6 @@
 // Package fs implements an AIStore file system.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
 	"github.com/NVIDIA/aistore/cmd/aisfs/ais"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
 )
@@ -103,7 +103,7 @@ func newNamespace(bck ais.Bucket, logger *log.Logger, cfg *ServerConfig) (*names
 				return
 			}
 
-			time.Sleep(interval)
+			time.Sleep(time.Duration(interval))
 			logger.Printf("syncing with AIS...")
 			if hasAllObjects, err := ns.cache.refresh(); err != nil {
 				logger.Printf("failed to sync, err: %v", err)

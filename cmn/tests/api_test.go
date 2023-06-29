@@ -1,11 +1,12 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
 import (
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -30,13 +31,13 @@ var _ = Describe("API", func() {
 			),
 			Entry("non-nested field and non-empty initial struct",
 				cmn.BucketProps{
-					Provider: cmn.ProviderAmazon,
+					Provider: apc.AWS,
 				},
 				cmn.BucketPropsToUpdate{
 					Access: api.AccessAttrs(1024),
 				},
 				cmn.BucketProps{
-					Provider: cmn.ProviderAmazon,
+					Provider: apc.AWS,
 					Access:   1024,
 				},
 			),
@@ -81,15 +82,16 @@ var _ = Describe("API", func() {
 			),
 			Entry("multiple nested fields and non-empty initial struct",
 				cmn.BucketProps{
-					Provider: cmn.ProviderAmazon,
+					Provider: apc.AWS,
 					Cksum: cmn.CksumConf{
 						ValidateColdGet: true,
 						ValidateWarmGet: false,
 					},
+					Mirror: cmn.MirrorConf{
+						Enabled: true,
+						Copies:  3,
+					},
 					LRU: cmn.LRUConf{
-						LowWM:   90,
-						HighWM:  95,
-						OOS:     99,
 						Enabled: true,
 					},
 				},
@@ -97,22 +99,24 @@ var _ = Describe("API", func() {
 					Cksum: &cmn.CksumConfToUpdate{
 						Type: api.String("value"),
 					},
-					LRU: &cmn.LRUConfToUpdate{
-						OOS: api.Int64(100),
+					Mirror: &cmn.MirrorConfToUpdate{
+						Enabled: api.Bool(true),
+						Copies:  api.Int64(3),
 					},
 					Access: api.AccessAttrs(10),
 				},
 				cmn.BucketProps{
-					Provider: cmn.ProviderAmazon,
+					Provider: apc.AWS,
 					Cksum: cmn.CksumConf{
 						Type:            "value",
 						ValidateColdGet: true,
 						ValidateWarmGet: false,
 					},
+					Mirror: cmn.MirrorConf{
+						Enabled: true,
+						Copies:  3,
+					},
 					LRU: cmn.LRUConf{
-						LowWM:   90,
-						HighWM:  95,
-						OOS:     100,
 						Enabled: true,
 					},
 					Access: 10,
@@ -133,11 +137,9 @@ var _ = Describe("API", func() {
 						EnableReadRange: api.Bool(false),
 					},
 					Mirror: &cmn.MirrorConfToUpdate{
-						Copies:      api.Int64(10),
-						Burst:       api.Int(32),
-						UtilThresh:  api.Int64(64),
-						OptimizePUT: api.Bool(true),
-						Enabled:     api.Bool(false),
+						Copies:  api.Int64(10),
+						Burst:   api.Int(32),
+						Enabled: api.Bool(false),
 					},
 					EC: &cmn.ECConfToUpdate{
 						Enabled:      api.Bool(true),
@@ -146,8 +148,10 @@ var _ = Describe("API", func() {
 						ParitySlices: api.Int(1024),
 						Compression:  api.String("false"),
 					},
-					Access:  api.AccessAttrs(1024),
-					MDWrite: api.MDWritePolicy(cmn.WriteDelayed),
+					Access: api.AccessAttrs(1024),
+					WritePolicy: &cmn.WritePolicyConfToUpdate{
+						MD: api.WritePolicy(apc.WriteDelayed),
+					},
 				},
 				cmn.BucketProps{
 					Versioning: cmn.VersionConf{
@@ -162,11 +166,9 @@ var _ = Describe("API", func() {
 						EnableReadRange: false,
 					},
 					Mirror: cmn.MirrorConf{
-						Copies:      10,
-						Burst:       32,
-						UtilThresh:  64,
-						OptimizePUT: true,
-						Enabled:     false,
+						Copies:  10,
+						Burst:   32,
+						Enabled: false,
 					},
 					EC: cmn.ECConf{
 						Enabled:      true,
@@ -175,8 +177,11 @@ var _ = Describe("API", func() {
 						ParitySlices: 1024,
 						Compression:  "false",
 					},
-					Access:  1024,
-					MDWrite: "delayed",
+					Access: 1024,
+					WritePolicy: cmn.WritePolicyConf{
+						Data: "",
+						MD:   apc.WriteDelayed,
+					},
 				},
 			),
 		)

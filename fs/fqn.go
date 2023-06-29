@@ -1,22 +1,26 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strings"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
 const (
 	prefCT       = '%'
 	prefProvider = '@'
-	prefNsUUID   = cmn.NsUUIDPrefix
-	prefNsName   = cmn.NsNamePrefix
+	prefNsUUID   = apc.NsUUIDPrefix
+	prefNsName   = apc.NsNamePrefix
 )
 
 const (
@@ -24,13 +28,14 @@ const (
 	WorkfileRemote       = "remote"         // getting object from neighbor target when rebalancing
 	WorkfileColdget      = "cold"           // object GET: coldget
 	WorkfilePut          = "put"            // object PUT
+	WorkfileCopy         = "copy"           // copy object
 	WorkfileAppend       = "append"         // APPEND to object (as file)
 	WorkfileAppendToArch = "append-to-arch" // APPEND to existing archive
 	WorkfileCreateArch   = "create-arch"    // CREATE multi-object archive
 )
 
 type ParsedFQN struct {
-	MpathInfo   *MountpathInfo
+	Mountpath   *Mountpath
 	ContentType string
 	Bck         cmn.Bck
 	ObjName     string
@@ -44,12 +49,10 @@ func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
 		rel           string
 		itemIdx, prev int
 	)
-
-	parsed.MpathInfo, rel, err = ParseMpathInfo(fqn)
+	parsed.Mountpath, rel, err = FQN2Mpath(fqn)
 	if err != nil {
 		return
 	}
-
 	for i := 0; i < len(rel); i++ {
 		if rel[i] != filepath.Separator {
 			continue
@@ -64,7 +67,7 @@ func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
 			}
 			provider := item[1:]
 			parsed.Bck.Provider = provider
-			if !cmn.IsNormalizedProvider(provider) {
+			if !apc.IsProvider(provider) {
 				err = fmt.Errorf("invalid fqn %s: unknown provider %q", fqn, provider)
 				return
 			}
@@ -101,7 +104,7 @@ func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
 			}
 
 			item = item[1:]
-			if _, ok := CSM.RegisteredContentTypes[item]; !ok {
+			if _, ok := CSM.m[item]; !ok {
 				err = fmt.Errorf("invalid fqn %s: bad content type %q", fqn, item)
 				return
 			}
@@ -120,54 +123,75 @@ func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
 		prev = i + 1
 	}
 
-	err = fmt.Errorf("fqn is invalid: %s", fqn)
+	err = fmt.Errorf("fqn %s is invalid", fqn)
 	return
 }
 
-// ParseMpathInfo matches and extracts <mpath> from the FQN and returns the rest of FQN.
-func ParseMpathInfo(fqn string) (info *MountpathInfo, relativePath string, err error) {
-	var (
-		available = (*MPI)(mfs.available.Load())
-		max       = 0
-	)
-	if available == nil {
-		err = fmt.Errorf("failed to get mountpaths, fqn: %s", fqn)
+// FQN2Mpath matches FQN to mountpath and returns the mountpath and the relative path.
+func FQN2Mpath(fqn string) (found *Mountpath, relativePath string, err error) {
+	availablePaths := GetAvail()
+	if len(availablePaths) == 0 {
+		err = cmn.ErrNoMountpaths
 		return
 	}
-	availablePaths := *available
-	for mpath, mpathInfo := range availablePaths {
+	for mpath, mi := range availablePaths {
 		l := len(mpath)
-		if len(fqn) > l && l > max && fqn[0:l] == mpath && fqn[l] == filepath.Separator {
-			info = mpathInfo
+		if len(fqn) > l && fqn[0:l] == mpath && fqn[l] == filepath.Separator {
+			found = mi
 			relativePath = fqn[l+1:]
-			max = l
+			return
 		}
 	}
-	if info == nil {
-		err = fmt.Errorf("no mountpath match FQN: %s", fqn)
-		return
+
+	// make an extra effort to lookup in disabled
+	_, disabledPaths := Get()
+	for mpath := range disabledPaths {
+		l := len(mpath)
+		if len(fqn) > l && fqn[0:l] == mpath && fqn[l] == filepath.Separator {
+			err = cmn.NewErrMountpathNotFound("" /*mpath*/, fqn, true /*disabled*/)
+			return
+		}
 	}
+	err = cmn.NewErrMountpathNotFound("" /*mpath*/, fqn, false /*disabled*/)
 	return
 }
 
-// Path2MpathInfo takes in any path (fqn or mpath) and returns the mpathInfo of the mpath
-// with the longest common prefix and the relative path to this mpath
-func Path2MpathInfo(path string) (info *MountpathInfo, relativePath string) {
-	var (
-		availablePaths, _ = Get()
-		cleanedPath       = filepath.Clean(path)
-		max               int
-	)
-	for mpath, mpathInfo := range availablePaths {
-		rel, ok := pathPrefixMatch(mpath, cleanedPath)
-		if ok && len(mpath) > max {
-			info = mpathInfo
-			max = len(mpath)
-			relativePath = rel
-			if relativePath == "." {
-				break
-			}
-		}
-	}
+// Path2Mpath takes in any file path (e.g., ../../a/b/c) and returns the matching `mi`,
+// if exists
+func Path2Mpath(path string) (found *Mountpath, err error) {
+	found, _, err = FQN2Mpath(filepath.Clean(path))
 	return
+}
+
+// TODO: define fs.PathErr to return "ais://nnn/shard-99.tar not found"
+// instead of the current "  no such file or directory"
+func CleanPathErr(err error) {
+	var (
+		pathErr *fs.PathError
+		what    string
+	)
+	if !errors.As(err, &pathErr) {
+		return
+	}
+	parsed, errV := ParseFQN(pathErr.Path)
+	if errV != nil {
+		return
+	}
+	pathErr.Path = parsed.Bck.Cname(parsed.ObjName)
+	pathErr.Op = "[fs-path]"
+	if strings.Contains(pathErr.Err.Error(), "no such file") {
+		switch parsed.ContentType {
+		case ObjectType:
+			what = "object"
+		case WorkfileType:
+			what = "work file"
+		case ECSliceType:
+			what = "ec slice"
+		case ECMetaType:
+			what = "ec metadata"
+		default:
+			what = "????"
+		}
+		pathErr.Err = cos.NewErrNotFound(what)
+	}
 }

@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -12,33 +12,32 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
 const (
-	tagOmitempty = "omitempty"          // the field must be omitted when empty (only for read-only walk)
-	tagOmit      = cos.JSONLocalTagOmit // the field must be omitted
-	tagReadonly  = "readonly"           // the field can be only read
-	tagInline    = "inline"             // the fields of a struct are embedded into parent field keys
+	tagOmitempty = "omitempty" // the field must be omitted when empty (only for read-only walk)
+	tagOmit      = "omit"      // the field must be omitted
+	tagReadonly  = "readonly"  // the field can be only read
+	tagInline    = "inline"    // the fields of a struct are embedded into parent field keys
 )
 
 type (
-	// Represents a single field in a struct found when walking its parent.
+	// Represents a single named field
 	IterField interface {
-		// Value returns value of given field.
-		Value() interface{}
-		// SetValue sets a given value. `force` ignores `tagReadonly` and sets
-		// a given value anyway - should be used with caution.
-		SetValue(v interface{}, force ...bool) error
+		Value() any                          // returns the value
+		String() string                      // string representation of the value
+		SetValue(v any, force ...bool) error // `force` ignores `tagReadonly` (to be used with caution!)
 	}
 
 	field struct {
 		name    string
 		v       reflect.Value
 		listTag string
-		dirty   bool // Determines if the value for the field was set by `SetValue`.
 		opts    IterOpts
+		dirty   bool // indicates `SetValue` done
 	}
 
 	IterOpts struct {
@@ -46,25 +45,29 @@ type (
 		Allowed string
 		// Visits all the fields, not only the leaves.
 		VisitAll bool
-		// Determines whether this is only a read-only or write walk.
-		// Read-only walk takes into consideration `tagOmitempty`.
+		// Read-only walk is true by default (compare with `UpdateFieldValue`)
+		// Note that `tagOmitempty` is limited to read-only - has no effect when `OnlyRead == false`.
 		OnlyRead bool
 	}
 
 	updateFunc func(uniqueTag string, field IterField) (error, bool)
 )
 
+// interface guard
+var _ IterField = (*field)(nil)
+
 // IterFields walks the struct and calls `updf` callback at every leaf field that it
 // encounters. The (nested) names are created by joining the json tag with dot.
 // Iteration supports reading another, custom tag `list` with values:
-//   * `tagOmitempty` - omit empty fields (only for read run)
-//   * `tagOmit` - omit field
-//   * `tagReadonly` - field cannot be updated (returns error on `SetValue`)
+//   - `tagOmitempty` - omit empty fields (only for read run)
+//   - `tagOmit` - omit field
+//   - `tagReadonly` - field cannot be updated (returns error on `SetValue`)
+//
 // Examples of usages for tags can be found in `BucketProps` or `Config` structs.
 //
 // Passing additional options with `IterOpts` can for example call callback
 // also at the non-leaf structures.
-func IterFields(v interface{}, updf updateFunc, opts ...IterOpts) error {
+func IterFields(v any, updf updateFunc, opts ...IterOpts) error {
 	o := IterOpts{OnlyRead: true} // by default it's read run
 	if len(opts) > 0 {
 		o = opts[0]
@@ -75,7 +78,7 @@ func IterFields(v interface{}, updf updateFunc, opts ...IterOpts) error {
 
 // UpdateFieldValue updates the field in the struct with given value.
 // Returns error if the field was not found or could not be updated.
-func UpdateFieldValue(s interface{}, name string, value interface{}) error {
+func UpdateFieldValue(s any, name string, value any) error {
 	found := false
 	err := IterFields(s, func(uniqueTag string, field IterField) (error, bool) {
 		if uniqueTag == name {
@@ -93,7 +96,7 @@ func UpdateFieldValue(s interface{}, name string, value interface{}) error {
 	return nil
 }
 
-func iterFields(prefix string, v interface{}, updf updateFunc, opts IterOpts) (dirty, stop bool, err error) {
+func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, stop bool, err error) {
 	srcVal := reflect.ValueOf(v)
 	if srcVal.Kind() == reflect.Ptr {
 		srcVal = srcVal.Elem()
@@ -147,15 +150,23 @@ func iterFields(prefix string, v interface{}, updf updateFunc, opts IterOpts) (d
 			}
 		}
 
-		// If it's `interface{}` we must get concrete type.
+		// If it's `any` we must get concrete type.
 		if srcValField.Kind() == reflect.Interface && !srcValField.IsZero() {
 			srcValField = srcValField.Elem()
 		}
 
 		var dirtyField bool
-		if srcValField.Kind() != reflect.Struct {
+		if srcValField.Kind() == reflect.Slice {
+			if !jsonTagPresent {
+				continue
+			}
+			name := prefix + fieldName
+			field := &field{name: name, v: srcValField, listTag: listTag, opts: opts}
+			err, stop = updf(name, field)
+			dirtyField = field.dirty
+		} else if srcValField.Kind() != reflect.Struct {
 			// We require that not-omitted fields have JSON tag.
-			cos.Assert(jsonTagPresent)
+			debug.Assert(jsonTagPresent, prefix+"["+fieldName+"]")
 
 			// Set value for the field
 			name := prefix + fieldName
@@ -211,13 +222,16 @@ func iterFields(prefix string, v interface{}, updf updateFunc, opts IterOpts) (d
 	return
 }
 
-func copyProps(src, dst interface{}, asType string) (err error) {
+// update dst with the values from src
+func copyProps(src, dst any, asType string) error {
 	var (
 		srcVal = reflect.ValueOf(src)
 		dstVal = reflect.ValueOf(dst).Elem()
 	)
-	debug.Assertf(cos.StringInSlice(asType, []string{Daemon, Cluster}), "unexpected config level: %s", asType)
-
+	debug.Assertf(cos.StringInSlice(asType, []string{apc.Daemon, apc.Cluster}), "unexpected config level: %s", asType)
+	if srcVal.Kind() == reflect.Ptr {
+		srcVal = srcVal.Elem()
+	}
 	for i := 0; i < srcVal.NumField(); i++ {
 		copyTag, ok := srcVal.Type().Field(i).Tag.Lookup("copy")
 		if ok && copyTag == "skip" {
@@ -229,18 +243,21 @@ func copyProps(src, dst interface{}, asType string) (err error) {
 			fieldName   = srcVal.Type().Field(i).Name
 			dstValField = dstVal.FieldByName(fieldName)
 		)
-
 		if srcValField.IsNil() {
 			continue
 		}
-
 		t, ok := dstVal.Type().FieldByName(fieldName)
-		cos.AssertMsg(ok, fieldName)
-		// NOTE: the tag is used exclusively to enforce local vs global scope of the config var
-		allowed := t.Tag.Get("allow")
-		if allowed != "" && allowed != asType {
-			return fmt.Errorf("cannot set property %s with config level %q as %q",
-				fieldName, allowed, asType)
+		debug.Assert(ok, fieldName)
+
+		// "allow" tag is used exclusively to enforce local vs global scope
+		// of the config updates
+		allowedScope := t.Tag.Get("allow")
+		if allowedScope != "" && allowedScope != asType {
+			name := strings.ToLower(fieldName)
+			if allowedScope == apc.Cluster && asType == apc.Daemon {
+				return fmt.Errorf("%s configuration can only be globally updated", name)
+			}
+			return fmt.Errorf("cannot update %s configuration: expecting %q scope, got %q", name, allowedScope, asType)
 		}
 
 		if dstValField.Kind() != reflect.Struct && dstValField.Kind() != reflect.Invalid {
@@ -252,16 +269,15 @@ func copyProps(src, dst interface{}, asType string) (err error) {
 			}
 		} else {
 			// Recurse into struct
-			err = copyProps(srcValField.Elem().Interface(), dstValField.Addr().Interface(), asType)
-			if err != nil {
-				return
+			if err := copyProps(srcValField.Elem().Interface(), dstValField.Addr().Interface(), asType); err != nil {
+				return err
 			}
 		}
 	}
-	return
+	return nil
 }
 
-func mergeProps(src, dst interface{}) {
+func mergeProps(src, dst any) {
 	var (
 		srcVal = reflect.ValueOf(src).Elem()
 		dstVal = reflect.ValueOf(dst).Elem()
@@ -292,61 +308,78 @@ func mergeProps(src, dst interface{}) {
 // field //
 ///////////
 
-func (f *field) Value() interface{} {
-	return f.v.Interface()
+func (f *field) Value() any { return f.v.Interface() }
+
+func (f *field) String() (s string) {
+	if f.v.Kind() == reflect.String {
+		// NOTE: this will panic if the value's type is derived from string (e.g. WritePolicy)
+		s = f.Value().(string)
+	} else {
+		s = fmt.Sprintf("%v", f.Value())
+	}
+	return
 }
 
-func (f *field) SetValue(src interface{}, force ...bool) error {
-	cos.Assert(!f.opts.OnlyRead)
-
+func (f *field) SetValue(src any, force ...bool) error {
+	debug.Assert(!f.opts.OnlyRead)
 	dst := f.v
 	if f.listTag == tagReadonly && (len(force) == 0 || !force[0]) {
 		return fmt.Errorf("property %q is readonly", f.name)
 	}
-
 	if !dst.CanSet() {
 		return fmt.Errorf("failed to set value: %v", dst)
 	}
 
 	srcVal := reflect.ValueOf(src)
+reflectDst:
+	if srcVal.Kind() == reflect.String {
+		dstType := dst.Type().Name()
+		// added types: cos.Duration and cos.SizeIEC
+		if dstType == "Duration" || dstType == "SizeIEC" {
+			var (
+				err error
+				d   time.Duration
+				n   int64
+				s   = srcVal.String()
+			)
+			if dstType == "Duration" {
+				d, err = time.ParseDuration(s)
+				n = int64(d)
+			} else {
+				n, err = cos.ParseSize(s, cos.UnitsIEC)
+			}
+			if err == nil {
+				dst.SetInt(n)
+				f.dirty = true
+			}
+			return err
+		}
+	}
 	switch srcVal.Kind() {
 	case reflect.String:
-		s := srcVal.String()
-	reflectDst:
 		switch dst.Kind() {
 		case reflect.String:
-			dst.SetString(s)
+			dst.SetString(srcVal.String())
 		case reflect.Bool:
-			n, err := cos.ParseBool(s)
+			n, err := cos.ParseBool(srcVal.String())
 			if err != nil {
 				return err
 			}
 			dst.SetBool(n)
-		case reflect.Int64:
-			n, err := strconv.ParseInt(s, 10, 64)
-			if err != nil && dst.Type().Name() == "Duration" /*cos.Duration*/ {
-				var d time.Duration
-				d, err = time.ParseDuration(s)
-				n = int64(d)
-			}
-			if err != nil {
-				return err
-			}
-			dst.SetInt(n)
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32:
-			n, err := strconv.ParseInt(s, 10, 64)
+		case reflect.Int64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32:
+			n, err := strconv.ParseInt(srcVal.String(), 10, 64)
 			if err != nil {
 				return err
 			}
 			dst.SetInt(n)
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			n, err := strconv.ParseUint(s, 10, 64)
+			n, err := strconv.ParseUint(srcVal.String(), 10, 64)
 			if err != nil {
 				return err
 			}
 			dst.SetUint(n)
 		case reflect.Float32, reflect.Float64:
-			n, err := strconv.ParseFloat(s, dst.Type().Bits())
+			n, err := strconv.ParseFloat(srcVal.String(), dst.Type().Bits())
 			if err != nil {
 				return err
 			}
@@ -355,10 +388,35 @@ func (f *field) SetValue(src interface{}, force ...bool) error {
 			dst.Set(reflect.New(dst.Type().Elem())) // set pointer to default value
 			dst = dst.Elem()                        // dereference pointer
 			goto reflectDst
+		case reflect.Slice:
+			// A slice value looks like: "[value1 value2]"
+			s := strings.TrimPrefix(srcVal.String(), "[")
+			s = strings.TrimSuffix(s, "]")
+			if s != "" {
+				vals := strings.Split(s, " ")
+				tp := reflect.TypeOf(vals[0])
+				lst := reflect.MakeSlice(reflect.SliceOf(tp), 0, 10)
+				for _, v := range vals {
+					if v == "" {
+						continue
+					}
+					lst = reflect.Append(lst, reflect.ValueOf(v))
+				}
+				dst.Set(lst)
+			}
+		case reflect.Map:
+			// do nothing (e.g. ObjAttrs.CustomMD)
 		default:
-			cos.AssertMsg(false, fmt.Sprintf("field.name: %s, field.type: %s", f.listTag, dst.Kind()))
+			debug.Assertf(false, "field.name: %s, field.type: %s", f.listTag, dst.Kind())
 		}
 	default:
+		if !srcVal.IsValid() {
+			if src != nil {
+				debug.FailTypeCast(srcVal)
+				return nil
+			}
+			srcVal = reflect.Zero(dst.Type())
+		}
 		if dst.Kind() == reflect.Ptr {
 			if dst.IsNil() {
 				dst.Set(reflect.New(dst.Type().Elem()))

@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -13,12 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
+	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/transport"
@@ -36,7 +38,7 @@ type (
 		paritySlices int              // the number of parity slices
 		cksums       []*cos.CksumHash // checksums of parity slices (filled by reed-solomon)
 		slices       []*slice         // all EC slices (in the order of slice IDs)
-		targets      []*cluster.Snode // target list (in the order of slice IDs: targets[i] receives slices[i])
+		targets      []*meta.Snode    // target list (in the order of slice IDs: targets[i] receives slices[i])
 	}
 
 	// a mountpath putJogger: processes PUT/DEL requests to one mountpath
@@ -48,7 +50,7 @@ type (
 
 		putCh  chan *request // top priority operation (object PUT)
 		xactCh chan *request // low priority operation (ec-encode)
-		stopCh *cos.StopCh   // jogger management channel: to stop it
+		stopCh cos.StopCh    // jogger management channel: to stop it
 
 		toDisk bool // use files or SGL
 	}
@@ -105,35 +107,40 @@ func (c *putJogger) freeResources() {
 }
 
 func (c *putJogger) processRequest(req *request) {
-	var memRequired int64
 	lom, err := req.LIF.LOM()
-	defer cluster.FreeLOM(lom)
 	if err != nil {
 		return
 	}
+
 	c.parent.IncPending()
-	defer c.parent.DecPending()
+	defer func() {
+		if req.Callback != nil {
+			req.Callback(lom, err)
+		}
+		cluster.FreeLOM(lom)
+		c.parent.DecPending()
+	}()
+
 	if req.Action == ActSplit {
 		if err = lom.Load(false /*cache it*/, false /*locked*/); err != nil {
 			return
 		}
 		ecConf := lom.Bprops().EC
-		memRequired = lom.SizeBytes() * int64(ecConf.DataSlices+ecConf.ParitySlices) / int64(ecConf.ParitySlices)
-		c.toDisk = useDisk(memRequired)
+		memRequired := lom.SizeBytes() * int64(ecConf.DataSlices+ecConf.ParitySlices) / int64(ecConf.ParitySlices)
+		c.toDisk = useDisk(memRequired, c.parent.config)
 	}
 
 	c.parent.stats.updateWaitTime(time.Since(req.tm))
 	req.tm = time.Now()
 	if err = c.ec(req, lom); err != nil {
-		glog.Errorf("Failed to %s object %s (fqn: %q, err: %v)", req.Action, lom, lom.FQN, err)
-	}
-	if req.Callback != nil {
-		req.Callback(lom, err)
+		err = fmt.Errorf("%s: failed to %s %s: %w", c.parent.t, req.Action, lom.StringEx(), err)
+		nlog.Errorln(err)
+		c.parent.AddErr(err)
 	}
 }
 
 func (c *putJogger) run(wg *sync.WaitGroup) {
-	glog.Infof("Started EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
+	nlog.Infof("Started EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
 	defer wg.Done()
 	c.buffer, c.slab = mm.Alloc()
 	for {
@@ -152,7 +159,7 @@ func (c *putJogger) run(wg *sync.WaitGroup) {
 }
 
 func (c *putJogger) stop() {
-	glog.Infof("Stopping EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
+	nlog.Infof("Stopping EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
 	c.stopCh.Close()
 }
 
@@ -208,8 +215,8 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 		cksumValue, cksumType string
 		ecConf                = lom.Bprops().EC
 	)
-	if glog.FastV(4, glog.SmoduleEC) {
-		glog.Infof("Encoding %q...", lom.FQN)
+	if c.parent.config.FastV(4, cos.SmoduleEC) {
+		nlog.Infof("Encoding %q...", lom.FQN)
 	}
 	if lom.Checksum() != nil {
 		cksumType, cksumValue = lom.Checksum().Get()
@@ -218,10 +225,11 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 	if !req.IsCopy {
 		reqTargets += ecConf.DataSlices
 	}
-	targetCnt := len(c.parent.smap.Get().Tmap)
+	smap := c.parent.smap.Get()
+	targetCnt := smap.CountActiveTs()
 	if targetCnt < reqTargets {
-		return fmt.Errorf("object %s requires %d targets to encode, only %d found",
-			lom, reqTargets, targetCnt)
+		return fmt.Errorf("%v: given EC config (d=%d, p=%d), %d targets required to encode %s (have %d, %s)",
+			cmn.ErrNotEnoughTargets, ecConf.DataSlices, ecConf.ParitySlices, reqTargets, lom, targetCnt, smap.StringEx())
 	}
 
 	ctMeta := cluster.NewCTFromLOM(lom, fs.ECMetaType)
@@ -235,12 +243,11 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 		IsCopy:      req.IsCopy,
 		ObjCksum:    cksumValue,
 		CksumType:   cksumType,
-		FullReplica: c.parent.t.Snode().ID(),
+		FullReplica: c.parent.t.SID(),
 		Daemons:     make(cos.MapStrUint16, reqTargets),
 	}
 
-	c.parent.ObjectsInc()
-	c.parent.BytesAdd(lom.SizeBytes())
+	c.parent.LomAdd(lom)
 
 	ctx, err := c.newCtx(lom, meta)
 	defer c.freeCtx(ctx)
@@ -276,17 +283,17 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 	}
 	if _, exists := c.parent.t.Bowner().Get().Get(ctMeta.Bck()); !exists {
 		if errRm := cos.RemoveFile(ctMeta.FQN()); errRm != nil {
-			glog.Errorf("nested error: encode -> remove metafile: %v", errRm)
+			nlog.Errorf("nested error: encode -> remove metafile: %v", errRm)
 		}
 		return fmt.Errorf("%s metafile saved while bucket %s was being destroyed", ctMeta.ObjectName(), ctMeta.Bucket())
 	}
 	return nil
 }
 
-func (c *putJogger) ctSendCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ interface{}, err error) {
-	c.parent.t.SmallMMSA().Free(hdr.Opaque)
+func (c *putJogger) ctSendCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+	c.parent.t.ByteMM().Free(hdr.Opaque)
 	if err != nil {
-		glog.Errorf("failed to send o[%s]: %v", hdr.FullName(), err)
+		nlog.Errorf("failed to send o[%s]: %v", hdr.Cname(), err)
 	}
 	c.parent.DecPending()
 }
@@ -308,10 +315,11 @@ func (c *putJogger) cleanup(lom *cluster.LOM) error {
 		return err
 	}
 
-	mm := c.parent.t.SmallMMSA()
+	mm := c.parent.t.ByteMM()
 	request := newIntraReq(reqDel, nil, lom.Bck()).NewPack(mm)
 	o := transport.AllocSend()
-	o.Hdr = transport.ObjHdr{Bck: lom.Bucket(), ObjName: lom.ObjName, Opaque: request, Opcode: reqDel}
+	o.Hdr = transport.ObjHdr{ObjName: lom.ObjName, Opaque: request, Opcode: reqDel}
+	o.Hdr.Bck.Copy(lom.Bucket())
 	o.Callback = c.ctSendCallback
 	c.parent.IncPending()
 	return c.parent.mgr.req().Send(o, nil, nodes...)
@@ -336,12 +344,10 @@ func (c *putJogger) createCopies(ctx *encodeCtx) error {
 	return c.parent.writeRemote(nodes, ctx.lom, src, nil)
 }
 
-// Fills slices with calculated checksums, reports errors to error channel
 func checksumDataSlices(ctx *encodeCtx, cksmReaders []io.Reader, cksumType string) error {
-	buf, slab := mm.AllocSize(ctx.sliceSize)
-	defer slab.Free(buf)
+	debug.Assert(cksumType != "") // caller checks for 'none'
 	for i, reader := range cksmReaders {
-		_, cksum, err := cos.CopyAndChecksum(io.Discard, reader, buf, cksumType)
+		_, cksum, err := cos.CopyAndChecksum(io.Discard, reader, nil, cksumType)
 		if err != nil {
 			return err
 		}
@@ -351,18 +357,20 @@ func checksumDataSlices(ctx *encodeCtx, cksmReaders []io.Reader, cksumType strin
 }
 
 // generateSlicesToMemory gets FQN to the original file and encodes it into EC slices
+// writers are slices created by EC encoding process(memory is allocated)
 func generateSlicesToMemory(ctx *encodeCtx) error {
-	// writers are slices created by EC encoding process(memory is allocated)
-	conf := ctx.lom.CksumConf()
-	initSize := cos.MinI64(ctx.sliceSize, cos.MiB)
-	sliceWriters := make([]io.Writer, ctx.paritySlices)
+	var (
+		cksumType    = ctx.lom.CksumType()
+		initSize     = cos.MinI64(ctx.sliceSize, cos.MiB)
+		sliceWriters = make([]io.Writer, ctx.paritySlices)
+	)
 	for i := 0; i < ctx.paritySlices; i++ {
 		writer := mm.NewSGL(initSize)
 		ctx.slices[i+ctx.dataSlices] = &slice{obj: writer}
-		if conf.Type == cos.ChecksumNone {
+		if cksumType == cos.ChecksumNone {
 			sliceWriters[i] = writer
 		} else {
-			ctx.cksums[i] = cos.NewCksumHash(conf.Type)
+			ctx.cksums[i] = cos.NewCksumHash(cksumType)
 			sliceWriters[i] = cos.NewWriterMulti(writer, ctx.cksums[i].H)
 		}
 	}
@@ -394,7 +402,7 @@ func initializeSlices(ctx *encodeCtx) (err error) {
 
 	// We have established readers of data slices, we can already start calculating hashes for them
 	// during calculating parity slices and their hashes
-	if cksumType := ctx.lom.CksumConf().Type; cksumType != cos.ChecksumNone {
+	if cksumType := ctx.lom.CksumType(); cksumType != cos.ChecksumNone {
 		ctx.cksums = make([]*cos.CksumHash, ctx.paritySlices)
 		err = checksumDataSlices(ctx, cksmReaders, cksumType)
 	}
@@ -416,7 +424,7 @@ func finalizeSlices(ctx *encodeCtx, writers []io.Writer) error {
 		return err
 	}
 
-	if cksumType := ctx.lom.CksumConf().Type; cksumType != cos.ChecksumNone {
+	if cksumType := ctx.lom.CksumType(); cksumType != cos.ChecksumNone {
 		for i := range ctx.cksums {
 			ctx.cksums[i].Finalize()
 			ctx.slices[i+ctx.dataSlices].cksum = ctx.cksums[i].Clone()
@@ -441,19 +449,19 @@ func generateSlicesToDisk(ctx *encodeCtx) error {
 		}
 	}()
 
-	conf := ctx.lom.CksumConf()
+	cksumType := ctx.lom.CksumType()
 	for i := 0; i < ctx.paritySlices; i++ {
-		workFQN := fs.CSM.GenContentFQN(ctx.lom, fs.WorkfileType, fmt.Sprintf("ec-write-%d", i))
+		workFQN := fs.CSM.Gen(ctx.lom, fs.WorkfileType, fmt.Sprintf("ec-write-%d", i))
 		writer, err := ctx.lom.CreateFile(workFQN)
 		if err != nil {
 			return err
 		}
 		ctx.slices[i+ctx.dataSlices] = &slice{writer: writer, workFQN: workFQN}
 		writers[i] = writer
-		if conf.Type == cos.ChecksumNone {
+		if cksumType == cos.ChecksumNone {
 			sliceWriters[i] = writer
 		} else {
-			ctx.cksums[i] = cos.NewCksumHash(conf.Type)
+			ctx.cksums[i] = cos.NewCksumHash(cksumType)
 			sliceWriters[i] = cos.NewWriterMulti(writer, ctx.cksums[i].H)
 		}
 	}
@@ -461,7 +469,7 @@ func generateSlicesToDisk(ctx *encodeCtx) error {
 	return finalizeSlices(ctx, sliceWriters)
 }
 
-func (c *putJogger) sendSlice(ctx *encodeCtx, data *slice, node *cluster.Snode, idx int) error {
+func (c *putJogger) sendSlice(ctx *encodeCtx, data *slice, node *meta.Snode, idx int) error {
 	// Reopen the slice's reader, because it was read to the end by erasure
 	// encoding while calculating parity slices.
 	reader, err := ctx.slices[idx].reopenReader()
@@ -486,12 +494,12 @@ func (c *putJogger) sendSlice(ctx *encodeCtx, data *slice, node *cluster.Snode, 
 		isSlice:  true,
 		reqType:  reqPut,
 	}
-	sentCB := func(hdr transport.ObjHdr, _ io.ReadCloser, _ interface{}, err error) {
+	sentCB := func(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 		if data != nil {
 			data.release()
 		}
 		if err != nil {
-			glog.Errorf("Failed to send %s: %v", hdr.FullName(), err)
+			nlog.Errorf("Failed to send %s: %v", hdr.Cname(), err)
 		}
 	}
 
@@ -531,11 +539,11 @@ func (c *putJogger) sendSlices(ctx *encodeCtx) (err error) {
 	}
 
 	if copyErr != nil {
-		glog.Errorf("Error while copying (data=%d, parity=%d) for %q: %v",
+		nlog.Errorf("Error while copying (data=%d, parity=%d) for %q: %v",
 			ctx.dataSlices, ctx.paritySlices, ctx.lom.ObjName, copyErr)
 		err = errSliceSendFailed
-	} else if glog.FastV(4, glog.SmoduleEC) {
-		glog.Infof("EC created (data=%d, parity=%d) for %q",
+	} else if c.parent.config.FastV(4, cos.SmoduleEC) {
+		nlog.Infof("EC created (data=%d, parity=%d) for %q",
 			ctx.dataSlices, ctx.paritySlices, ctx.lom.ObjName)
 	}
 

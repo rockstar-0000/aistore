@@ -60,7 +60,7 @@ Example of setting bucket properties:
 $ ais bucket props <bucket-name> lru.lowwm=1 lru.highwm=100 lru.enabled=true
 ```
 
-To revert bucket's entire configuration back to global (configurable) defaults, use `"action":"resetbprops"` with the same PATCH endpoint, e.g.:
+To revert bucket's entire configuration back to global (configurable) defaults, use `"action":"reset-bprops"` with the same PATCH endpoint, e.g.:
 
 ```console
 $ ais bucket props <bucket-name> --reset
@@ -148,14 +148,14 @@ The service ensures is that for any given object there will be *no two replicas*
 The following example configures buckets a, b, and c to store n = 1, 2, and 3 object replicas, respectively:
 
 ```console
-$ ais job start mirror --copies 1 ais://a
-$ ais job start mirror --copies 2 ais://b
-$ ais job start mirror --copies 3 ais://c
+$ ais start mirror --copies 1 ais://a
+$ ais start mirror --copies 2 ais://b
+$ ais start mirror --copies 3 ais://c
 ```
 
-The operations (above) are in fact [extended actions](/xaction/README.md) that run asynchronously. Both Cloud and ais buckets are supported. You can monitor completion of those operations via generic [xaction API](/xaction/README.md).
+The operations (above) are in fact [extended actions](/xact/README.md) that run asynchronously. Both Cloud and ais buckets are supported. You can monitor completion of those operations via generic [xaction API](/api/xaction.go).
 
-Subsequently, all PUTs into an n-way configured bucket also generate **n** copies for all newly created objects. Which also goes to say that the ("makencopies") operation, in addition to creating or destroying replicas of existing objects will also automatically re-enable(if n > 1) or disable (if n == 1) mirroring as far as subsequent PUTs are concerned.
+Subsequently, all PUTs into an n-way configured bucket also generate **n** copies for all newly created objects. Which also goes to say that the ("make-n-copies") operation, in addition to creating or destroying replicas of existing objects will also automatically re-enable(if n > 1) or disable (if n == 1) mirroring as far as subsequent PUTs are concerned.
 
 Note again that number of local replicas is defined on a per-bucket basis.
 
@@ -168,15 +168,15 @@ Since object replicas are end-to-end protected by [checksums](#checksumming) all
 The following sequence creates a bucket named `abc`, PUTs an object into it and then converts it into a 3-way mirror:
 
 ```console
-$ ais bucket create abc
-$ ais object put /tmp/obj1 ais://abc/obj1
-$ ais job start mirror --copies 3 ais://abc
+$ ais create abc
+$ ais put /tmp/obj1 ais://abc/obj1
+$ ais start mirror --copies 3 ais://abc
 ```
 
 The next command will redefine the `abc` bucket created in the previous example as a 2-way mirror - all objects that were previously stored in three replicas will now have only two (replicas):
 
 ```console
-$ ais job start mirror --copies 2 ais://abc
+$ ais start mirror --copies 2 ais://abc
 ```
 
 ## Data redundancy: summary of the available options (and considerations)
@@ -188,7 +188,7 @@ Any of the supported options can be utilized at any time (and without downtime) 
 3. **copying buckets**  - [Copy Bucket](/docs/cli/bucket.md#copy-bucket)
 4. **erasure coding** - [Erasure coding](#erasure-coding)
 
-For instance, you first could start with plain mirroring via `ais job start mirror BUCKET --copies N`, where N would be less or equal the number of target mountpaths (disks).
+For instance, you first could start with plain mirroring via `ais start mirror BUCKET --copies N`, where N would be less or equal the number of target mountpaths (disks).
 
 > It is generally assumed (and also strongly recommended) that all storage servers (targets) in AIS cluster have the same number of disks and are otherwise identical.
 
@@ -203,7 +203,7 @@ Further, you could at some point in time decide to associate a given AIS bucket 
 Finally, you could erasure code (EC) a given bucket for `D + P` redundancy, where `D` and `P` are, respectively, the numbers of data and parity slices. For example:
 
 ```console
-$ ais job start ec-encode -d 6 -p 4 abc
+$ ais start ec-encode -d 6 -p 4 abc
 ```
 
 will erasure-code all objects in the `abc` bucket for the total of 10 slices stored on different AIS targets, plus 1 (one) full replica. In other words, this example requires at least `10 + 1 = 11` targets in the cluster.

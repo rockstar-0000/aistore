@@ -9,15 +9,18 @@
 source "$(dirname "$0")/../utils.sh"
 
 # Unmount and clears all virtual block disks.
-clean_loopback_paths
+NEXT_TIER=
+rm_loopbacks
+NEXT_TIER="_next"
+rm_loopbacks
 
 build_dest="${GOPATH}/bin"
 if [[ -n ${GOBIN} ]]; then
 	build_dest="${GOBIN}"
 fi
 
-rm -rf ~/.ais* && \
-		rm -rf ~/.authn && \
-		rm -rf /tmp/ais* && \
-		rm -f ${build_dest}/ais* # cleans 'ais' (CLI), 'aisnode' (TARGET/PROXY), 'aisfs' (FUSE), 'aisloader' && \
-		rm -f ${build_dest}/authn
+rm -rf ~/.ais*            # cluster config and metadata
+rm -rf ~/.config/ais      # CLI, AuthN (config and DB), AuthN tokens produced via CLI, aisfs
+rm -rf /tmp/ais*          # user data and cluster metadata
+rm -f ${build_dest}/ais*  # 'ais' (CLI), 'aisnode', 'aisfs', and 'aisloader' binaries
+rm -f ${build_dest}/authn # AuthN executable

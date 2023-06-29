@@ -1,21 +1,31 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
 import (
-	"fmt"
 	"runtime"
 	"sort"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/sys"
+)
+
+const (
+	freeIdleMinDur = 90 * time.Second   // time to reduce an idle slab to a minimum depth (see mindepth)
+	freeIdleZero   = freeIdleMinDur * 2 // ... to zero
+)
+
+// hk tunables (via config.Memsys section)
+var (
+	sizeToGC      int64 = cos.GiB + cos.GiB>>1 // run GC when sum(`freed`) > sizeToGC
+	memCheckAbove       = 90 * time.Second     // memory checking frequency when above low watermark
 )
 
 // API: on-demand memory freeing to the user-provided specification
@@ -27,7 +37,7 @@ func (r *MMSA) FreeSpec(spec FreeSpec) {
 		}
 	} else {
 		if spec.IdleDuration == 0 {
-			spec.IdleDuration = freeIdleMin // using the default
+			spec.IdleDuration = freeIdleMinDur // using the default
 		}
 		stats := r.GetStats()
 		for _, s := range r.rings {
@@ -36,7 +46,7 @@ func (r *MMSA) FreeSpec(spec FreeSpec) {
 				if x > 0 {
 					freed += x
 					if verbose {
-						glog.Infof("%s: idle for %v - cleanup", s.tag, idle)
+						nlog.Infof("%s: idle for %v - cleanup", s.tag, idle)
 					}
 				}
 			}
@@ -47,8 +57,7 @@ func (r *MMSA) FreeSpec(spec FreeSpec) {
 		if spec.MinSize == 0 {
 			spec.MinSize = sizeToGC // using default
 		}
-		mem, _ := sys.Mem()
-		r.doGC(mem.ActualFree, spec.MinSize, spec.ToOS /* force */, false)
+		r.doGC(spec.MinSize, spec.ToOS /* force */)
 	}
 }
 
@@ -63,97 +72,78 @@ func (r *MMSA) GetStats() (stats *Stats) {
 // private
 //
 
-// garbageCollect is called periodically by the system's house-keeper (hk)
-func (r *MMSA) garbageCollect() time.Duration {
-	var (
-		limit = int64(sizeToGC) // minimum accumulated size that triggers GC
-		depth int               // => current ring depth tbd
-	)
-
+// hkcb is called periodically by the system's house-keeper (hk)
+func (r *MMSA) hkcb() time.Duration {
 	// 1. refresh stats and sort idle < busy
 	r.refreshStatsSortIdle()
 
-	// 2. get system memory stats
-	mem, _ := sys.Mem()
-	swapping := mem.SwapUsed > r.swap.Load()
-	if swapping {
-		r.Swapping.Store(SwappingMax)
-	} else {
-		r.Swapping.Store(r.Swapping.Load() / 2)
-	}
-	r.swap.Store(mem.SwapUsed)
+	// 2. update swapping state and compute mem-pressure ranking
+	err := r.mem.Get()
+	debug.AssertNoErr(err)
+	r.updSwap(&r.mem)
+	pressure := r.Pressure(&r.mem)
 
 	// 3. memory is enough, free only those that are idle for a while
-	if mem.ActualFree > r.lowWM && !swapping {
-		r.minDepth.Store(minDepth)
-		if freed := r.freeIdle(freeIdleMin); freed > 0 {
+	if pressure == PressureLow {
+		r.optDepth.Store(optDepth)
+		if freed := r.freeIdle(); freed > 0 {
 			r.toGC.Add(freed)
-			r.doGC(mem.ActualFree, sizeToGC, false, false)
+			r.doGC(sizeToGC, false)
 		}
-		goto timex
+		return r.hkIval(pressure)
 	}
 
-	// 4. calibrate and do more aggressive freeing
-	if swapping {
-		r.minDepth.Store(1)
-		depth = 2
-		limit = sizeToGC / 4
-	} else if mem.ActualFree <= r.MinFree {
-		tmp := cos.MaxI64(r.minDepth.Load()/2, 32)
-		r.minDepth.Store(tmp)
+	// 4. calibrate and mem-free accordingly
+	var (
+		mingc = sizeToGC // minimum accumulated size that triggers GC
+		depth int        // => current ring depth tbd
+	)
+	switch pressure {
+	case OOM, PressureExtreme:
+		r.optDepth.Store(minDepth)
+		depth = minDepth
+		mingc = sizeToGC / 4
+	case PressureHigh:
+		tmp := cos.MaxI64(r.optDepth.Load()/2, optDepth/4)
+		r.optDepth.Store(tmp)
 		depth = int(tmp)
-		limit = sizeToGC / 2
-	} else { // in-between hysteresis
-		tmp := uint64(maxDepth-minDepth) * (mem.ActualFree - r.MinFree)
-		depth = minDepth + int(tmp/(r.lowWM-r.MinFree)) // Heu #2
-		debug.Assert(depth >= minDepth && depth <= maxDepth)
-		r.minDepth.Store(minDepth / 2)
+		mingc = sizeToGC / 2
+	default: // PressureModerate
+		r.optDepth.Store(optDepth)
+		depth = optDepth / 2
 	}
+
+	// 5. reduce
+	var gced bool
 	for _, s := range r.sorted { // idle first
-		idle := r.statsSnapshot.Idle[s.ringIdx()]
-		if freed := s.reduce(depth, idle > 0, true /* force */); freed > 0 {
+		if idle := r.statsSnapshot.Idle[s.ringIdx()]; idle > freeIdleMinDur/2 {
+			depth = minDepth
+		}
+		freed := s.reduce(depth)
+		if freed > 0 {
 			r.toGC.Add(freed)
-			if r.doGC(mem.ActualFree, limit, true, swapping) {
-				goto timex
+			if !gced {
+				gced = r.doGC(mingc, true)
 			}
 		}
 	}
-	// 5. still not enough? do more
-	if mem.ActualFree <= r.MinFree || swapping {
-		r.doGC(mem.ActualFree, limit, true, swapping)
+
+	// 6. GC
+	if pressure >= PressureHigh {
+		r.doGC(mingc, true)
 	}
-timex:
-	return r.getNextInterval(mem.ActualFree, mem.Total, swapping)
+	return r.hkIval(pressure)
 }
 
-func (r *MMSA) getNextInterval(free, total uint64, swapping bool) time.Duration {
-	var changed bool
-	switch {
-	case free > r.lowWM && free > total-total/5:
-		if r.duration != r.TimeIval*2 {
-			r.duration = r.TimeIval * 2
-			changed = true
-		}
-	case free <= r.MinFree || swapping:
-		if r.duration != r.TimeIval/4 {
-			r.duration = r.TimeIval / 4
-			changed = true
-		}
-	case free <= r.lowWM:
-		if r.duration != r.TimeIval/2 {
-			r.duration = r.TimeIval / 2
-			changed = true
-		}
+func (r *MMSA) hkIval(pressure int) time.Duration {
+	switch pressure {
+	case PressureLow:
+		return r.TimeIval * 2
+	case PressureModerate:
+		return r.TimeIval
 	default:
-		if r.duration != r.TimeIval {
-			r.duration = r.TimeIval
-			changed = true
-		}
+		return r.TimeIval / 2
 	}
-	if changed && verbose {
-		glog.Infof("%s: timer %v, free %s", r.Name, r.duration, cos.B2S(int64(free), 1))
-	}
-	return r.duration
 }
 
 // 1) refresh internal stats
@@ -198,28 +188,25 @@ func (r *MMSA) idleLess(i, j int) bool {
 
 // freeIdle traverses and deallocates idle slabs- those that were not used for at
 // least the specified duration; returns freed size
-func (r *MMSA) freeIdle(duration time.Duration) (freed int64) {
+func (r *MMSA) freeIdle() (total int64) {
 	for _, s := range r.rings {
-		idle := r.statsSnapshot.Idle[s.ringIdx()]
-		if idle < duration {
+		var (
+			freed int64
+			idle  = r.statsSnapshot.Idle[s.ringIdx()]
+		)
+		switch {
+		case idle > freeIdleZero:
+			freed = s.cleanup()
+		case idle > freeIdleMinDur:
+			freed = s.reduce(optDepth / 4)
+		case idle > freeIdleMinDur/2:
+			freed = s.reduce(optDepth / 2)
+		default:
 			continue
 		}
-		if idle > freeIdleZero {
-			x := s.cleanup()
-			if x > 0 {
-				freed += x
-				if verbose {
-					glog.Infof("%s: idle for %v - cleanup", s.tag, idle)
-				}
-			}
-		} else {
-			x := s.reduce(minDepth, true /* idle */, false /* force */)
-			if x > 0 {
-				freed += x
-				if verbose {
-					glog.Infof("%s: idle for %v - reduced %s", s.tag, idle, cos.B2S(x, 1))
-				}
-			}
+		total += freed
+		if verbose && freed > 0 {
+			nlog.Infof("%s idle for %v: freed %s", s.tag, idle, cos.ToSizeIEC(freed, 1))
 		}
 	}
 	return
@@ -229,28 +216,25 @@ func (r *MMSA) freeIdle(duration time.Duration) (freed int64) {
 // 1) upon periodic freeing of idle slabs
 // 2) after forceful reduction of the /less/ active slabs (done when memory is running low)
 // 3) on demand via MMSA.Free()
-func (r *MMSA) doGC(free uint64, minsize int64, force, swapping bool) (gced bool) {
+func (r *MMSA) doGC(mingc int64, force bool) (gced bool) {
 	avg, err := sys.LoadAverage()
 	if err != nil {
-		glog.Errorf("Failed to load averages, err: %v", err)
-		avg.One = 999 // fall thru on purpose
+		nlog.Errorf("Failed to load averages, err: %v", err) // (should never happen)
+		avg.One = 999
 	}
-	if avg.One > loadAvg && !force && !swapping { // Heu #3
+	if avg.One > loadAvg /*idle*/ && !force { // NOTE
 		return
 	}
-	toGC := r.toGC.Load()
-	if toGC < minsize {
+	togc := r.toGC.Load()
+	if togc < mingc {
 		return
 	}
-	str := fmt.Sprintf(
-		"%s: GC(force: %t, swapping: %t); load: %.2f; free: %s; toGC: %s",
-		r.Name, force, swapping, avg.One, cos.B2S(int64(free), 1), cos.B2S(toGC, 2))
-	if force || swapping { // Heu #4
-		glog.Warning(str)
-		glog.Warning("freeing memory to OS...")
-		cos.FreeMemToOS() // forces GC followed by an attempt to return memory to the OS
-	} else { // Heu #5
-		glog.Infof(str)
+	sgc := cos.ToSizeIEC(togc, 1)
+	if force {
+		nlog.Warningf("%s: freeing %s to the OS (load %.2f)", r, sgc, avg.One)
+		cos.FreeMemToOS()
+	} else {
+		nlog.Warningf("%s: GC %s (load %.2f)", r, sgc, avg.One)
 		runtime.GC()
 	}
 	gced = true

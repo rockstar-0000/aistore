@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -18,13 +18,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
+	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/tassert"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -54,22 +56,22 @@ type (
 )
 
 // serverTCPAddr takes a string in format of "http://ip:port" and returns its ip and port
-func serverTCPAddr(u string) cluster.NetInfo {
+func serverTCPAddr(u string) meta.NetInfo {
 	s := strings.TrimPrefix(u, "http://")
 	addr, _ := net.ResolveTCPAddr("tcp", s)
-	return *cluster.NewNetInfo("http", addr.IP.String(), strconv.Itoa(addr.Port))
+	return *meta.NewNetInfo("http", addr.IP.String(), strconv.Itoa(addr.Port))
 }
 
 // newPrimary returns a proxy runner after initializing the fields that are needed by this test
-func newPrimary() *proxyrunner {
+func newPrimary() *proxy {
 	var (
-		p       = &proxyrunner{}
-		tracker = stats.NewTrackerMock()
+		p       = &proxy{}
+		tracker = mock.NewStatsTracker()
 		smap    = newSmap()
 	)
 
 	p.owner.smap = newSmapOwner(cmn.GCO.Get())
-	p.si = cluster.NewSnode("primary", cmn.Proxy, cluster.NetInfo{}, cluster.NetInfo{}, cluster.NetInfo{})
+	p.si = meta.NewSnode("primary", apc.Proxy, meta.NetInfo{}, meta.NetInfo{}, meta.NetInfo{})
 
 	smap.addProxy(p.si)
 	smap.Primary = p.si
@@ -86,23 +88,27 @@ func newPrimary() *proxyrunner {
 	config.Client.TimeoutLong = cos.Duration(10 * time.Second)
 	config.Cksum.Type = cos.ChecksumXXHash
 	cmn.GCO.CommitUpdate(config)
-	cmn.GCO.SetGlobalConfigPath("/tmp/ais-tests/ais.config")
+	cmn.GCO.SetInitialGconfPath("/tmp/ais-tests/ais.config")
 
 	p.client.data = &http.Client{}
 	p.client.control = &http.Client{}
-	p.keepalive = newProxyKeepalive(p, tracker, atomic.NewBool(true))
+	p.keepalive = newPalive(p, tracker, atomic.NewBool(true))
 
 	o := newBMDOwnerPrx(config)
 	o.put(newBucketMD())
 	p.owner.bmd = o
 
-	p.gmm = memsys.DefaultPageMM()
+	e := newEtlMDOwnerPrx(config)
+	e.put(newEtlMD())
+	p.owner.etl = e
+
+	p.gmm = memsys.PageMM()
 	return p
 }
 
-func newSecondary(name string) *proxyrunner {
-	p := &proxyrunner{}
-	p.si = cluster.NewSnode(name, cmn.Proxy, cluster.NetInfo{}, cluster.NetInfo{}, cluster.NetInfo{})
+func newSecondary(name string) *proxy {
+	p := &proxy{}
+	p.si = meta.NewSnode(name, apc.Proxy, meta.NetInfo{}, meta.NetInfo{}, meta.NetInfo{})
 	p.owner.smap = newSmapOwner(cmn.GCO.Get())
 	p.owner.smap.put(newSmap())
 	p.client.data = &http.Client{}
@@ -129,7 +135,7 @@ func newSecondary(name string) *proxyrunner {
 // newTransportServer's http handler calls the sync function which decide how to respond to the sync call,
 // counts number of times sync call received, sends result to the result channel on each sync (error or
 // no error), completes the http request with the status returned by the sync function.
-func newTransportServer(primary *proxyrunner, s *metaSyncServer, ch chan<- transportData) *httptest.Server {
+func newTransportServer(primary *proxy, s *metaSyncServer, ch chan<- transportData) *httptest.Server {
 	cnt := 0
 	// notes: needs to assign these from 's', otherwise 'f' captures what in 's' which changes from call to call
 	isProxy := s.isProxy
@@ -141,9 +147,10 @@ func newTransportServer(primary *proxyrunner, s *metaSyncServer, ch chan<- trans
 		cnt++
 		status, err := sf(w, r, cnt)
 		ch <- transportData{isProxy, id, cnt}
-		if err != nil {
-			http.Error(w, err.Error(), status)
+		if err == nil {
+			return
 		}
+		http.Error(w, err.Error(), status)
 	}
 
 	// creates the test proxy/target server and add to primary proxy's smap
@@ -151,9 +158,9 @@ func newTransportServer(primary *proxyrunner, s *metaSyncServer, ch chan<- trans
 	addrInfo := serverTCPAddr(ts.URL)
 	clone := primary.owner.smap.get().clone()
 	if s.isProxy {
-		clone.Pmap[id] = cluster.NewSnode(id, cmn.Proxy, addrInfo, addrInfo, addrInfo)
+		clone.Pmap[id] = meta.NewSnode(id, apc.Proxy, addrInfo, addrInfo, addrInfo)
 	} else {
-		clone.Tmap[id] = cluster.NewSnode(id, cmn.Target, addrInfo, addrInfo, addrInfo)
+		clone.Tmap[id] = meta.NewSnode(id, apc.Target, addrInfo, addrInfo, addrInfo)
 	}
 	clone.Version++
 	primary.owner.smap.put(clone)
@@ -161,24 +168,24 @@ func newTransportServer(primary *proxyrunner, s *metaSyncServer, ch chan<- trans
 	return ts
 }
 
-func TestMetaSyncDeepCopy(t *testing.T) {
+func TestMetasyncDeepCopy(t *testing.T) {
 	bmd := newBucketMD()
-	bmd.add(cluster.NewBck("bucket1", cmn.ProviderAIS, cmn.NsGlobal), &cmn.BucketProps{
+	bmd.add(meta.NewBck("bucket1", apc.AIS, cmn.NsGlobal), &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
 			Type: cos.ChecksumXXHash,
 		},
 	})
-	bmd.add(cluster.NewBck("bucket2", cmn.ProviderAIS, cmn.NsGlobal), &cmn.BucketProps{
+	bmd.add(meta.NewBck("bucket2", apc.AIS, cmn.NsGlobal), &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
 			Type: cos.ChecksumXXHash,
 		},
 	})
-	bmd.add(cluster.NewBck("bucket3", cmn.ProviderAmazon, cmn.NsGlobal), &cmn.BucketProps{
+	bmd.add(meta.NewBck("bucket3", apc.AWS, cmn.NsGlobal), &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
 			Type: cos.ChecksumXXHash,
 		},
 	})
-	bmd.add(cluster.NewBck("bucket4", cmn.ProviderAmazon, cmn.NsGlobal), &cmn.BucketProps{
+	bmd.add(meta.NewBck("bucket4", apc.AWS, cmn.NsGlobal), &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
 			Type: cos.ChecksumXXHash,
 		},
@@ -194,13 +201,14 @@ func TestMetaSyncDeepCopy(t *testing.T) {
 	}
 }
 
-// TestMetaSyncTransport is the driver for metasync transport tests.
+// TestMetasyncTransport is the driver for metasync transport tests.
 // for each test case, it creates a primary proxy, starts the metasync instance, run the test case,
 // verifies the result, and stop the syncer.
-func TestMetaSyncTransport(t *testing.T) {
+func TestMetasyncTransport(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	tcs := []struct {
 		name  string
-		testf func(*testing.T, *proxyrunner, *metasyncer) ([]transportData, []transportData)
+		testf func(*testing.T, *proxy, *metasyncer) ([]transportData, []transportData)
 	}{
 		{"SyncOnce", syncOnce},
 		{"SyncOnceWait", syncOnceWait},
@@ -264,7 +272,7 @@ func failFirst(_ http.ResponseWriter, _ *http.Request, cnt int) (int, error) {
 }
 
 // syncOnce checks a mixed number of proxy and targets accept one sync call
-func syncOnce(_ *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportData, []transportData) {
+func syncOnce(_ *testing.T, primary *proxy, syncer *metasyncer) ([]transportData, []transportData) {
 	var (
 		servers = []metaSyncServer{
 			{"p1", true, alwaysOk, nil},
@@ -293,7 +301,7 @@ func syncOnce(_ *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transpo
 }
 
 // syncOnceWait checks sync(wait = true) doesn't return before all servers receive the call
-func syncOnceWait(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportData, []transportData) {
+func syncOnceWait(t *testing.T, primary *proxy, syncer *metasyncer) ([]transportData, []transportData) {
 	var (
 		servers = []metaSyncServer{
 			{"p1", true, delayedOk, nil},
@@ -322,7 +330,7 @@ func syncOnceWait(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]tra
 }
 
 // syncOnceNoWait checks sync(wait = false) returns before all servers receive the call
-func syncOnceNoWait(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportData, []transportData) {
+func syncOnceNoWait(t *testing.T, primary *proxy, syncer *metasyncer) ([]transportData, []transportData) {
 	var (
 		servers = []metaSyncServer{
 			{"p1", true, delayedOk, nil},
@@ -350,7 +358,7 @@ func syncOnceNoWait(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]t
 }
 
 // retry checks a failed sync call is retried
-func retry(_ *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportData, []transportData) {
+func retry(_ *testing.T, primary *proxy, syncer *metasyncer) ([]transportData, []transportData) {
 	var (
 		servers = []metaSyncServer{
 			{"p1", true, failFirst, nil},
@@ -379,7 +387,7 @@ func retry(_ *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportD
 }
 
 // multipleSync checks a mixed number of proxy and targets accept multiple sync calls
-func multipleSync(_ *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportData, []transportData) {
+func multipleSync(_ *testing.T, primary *proxy, syncer *metasyncer) ([]transportData, []transportData) {
 	var (
 		servers = []metaSyncServer{
 			{"p1", true, alwaysOk, nil},
@@ -443,11 +451,11 @@ func multipleSync(_ *testing.T, primary *proxyrunner, syncer *metasyncer) ([]tra
 // it has two test cases: one with a short delay to let metasyncer handle it immediately,
 // the other with a longer delay so that metasyncer times out
 // retrying connection-refused errors and falls back to the retry-pending "route"
-func refused(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transportData, []transportData) {
+func refused(t *testing.T, primary *proxy, syncer *metasyncer) ([]transportData, []transportData) {
 	var (
 		ch       = make(chan transportData, 2) // NOTE: Use 2 to avoid unbuffered channel, http handler can return.
 		id       = "p"
-		addrInfo = *cluster.NewNetInfo(
+		addrInfo = *meta.NewNetInfo(
 			httpProto,
 			"127.0.0.1",
 			"53538", // the lucky port
@@ -455,12 +463,12 @@ func refused(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transpor
 	)
 
 	// handler for /v1/metasync
-	http.HandleFunc(cmn.URLPathMetasync.S, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(apc.URLPathMetasync.S, func(w http.ResponseWriter, r *http.Request) {
 		ch <- transportData{true, id, 1}
 	})
 
 	clone := primary.owner.smap.get().clone()
-	clone.Pmap[id] = cluster.NewSnode(id, cmn.Proxy, addrInfo, addrInfo, addrInfo)
+	clone.Pmap[id] = meta.NewSnode(id, apc.Proxy, addrInfo, addrInfo, addrInfo)
 	clone.Version++
 	primary.owner.smap.put(clone)
 
@@ -518,8 +526,8 @@ func refused(t *testing.T, primary *proxyrunner, syncer *metasyncer) ([]transpor
 	return exp, exp
 }
 
-// TestMetaSyncData is the driver for metasync data tests.
-func TestMetaSyncData(t *testing.T) {
+// TestMetasyncData is the driver for metasync data tests.
+func TestMetasyncData(t *testing.T) {
 	// data stores the data comes from the http sync call and an error
 	type data struct {
 		payload msPayload
@@ -527,7 +535,7 @@ func TestMetaSyncData(t *testing.T) {
 	}
 
 	// newServer simulates a proxy or a target for metasync's data tests
-	newServer := func(primary *proxyrunner, s *metaSyncServer, ch chan<- data) *httptest.Server {
+	newServer := func(primary *proxy, s *metaSyncServer, ch chan<- data) *httptest.Server {
 		cnt := 0
 		id := s.id
 		failCnt := s.failCnt
@@ -553,9 +561,9 @@ func TestMetaSyncData(t *testing.T) {
 		addrInfo := serverTCPAddr(ts.URL)
 		clone := primary.owner.smap.get().clone()
 		if s.isProxy {
-			clone.Pmap[id] = cluster.NewSnode(id, cmn.Proxy, addrInfo, addrInfo, addrInfo)
+			clone.Pmap[id] = meta.NewSnode(id, apc.Proxy, addrInfo, addrInfo, addrInfo)
 		} else {
-			clone.Tmap[id] = cluster.NewSnode(id, cmn.Target, addrInfo, addrInfo, addrInfo)
+			clone.Tmap[id] = meta.NewSnode(id, apc.Target, addrInfo, addrInfo, addrInfo)
 		}
 		clone.Version++
 		primary.owner.smap.put(clone)
@@ -594,7 +602,7 @@ func TestMetaSyncData(t *testing.T) {
 
 	emptyAisMsg, err := jsoniter.Marshal(aisMsg{})
 	if err != nil {
-		t.Fatal("Failed to marshal empty cmn.ActionMsg, err =", err)
+		t.Fatal("Failed to marshal empty apc.ActMsg, err =", err)
 	}
 
 	var wg sync.WaitGroup
@@ -623,12 +631,12 @@ func TestMetaSyncData(t *testing.T) {
 	match(t, expRetry, ch, 1)
 
 	// sync bucketmd, fail target and retry
-	bmd.add(cluster.NewBck("bucket1", cmn.ProviderAIS, cmn.NsGlobal), &cmn.BucketProps{
+	bmd.add(meta.NewBck("bucket1", apc.AIS, cmn.NsGlobal), &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
 			Type: cos.ChecksumXXHash,
 		},
 	})
-	bmd.add(cluster.NewBck("bucket2", cmn.ProviderAIS, cmn.NsGlobal), &cmn.BucketProps{
+	bmd.add(meta.NewBck("bucket2", apc.AIS, cmn.NsGlobal), &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
 			Type: cos.ChecksumXXHash,
 		},
@@ -652,7 +660,7 @@ func TestMetaSyncData(t *testing.T) {
 		Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash},
 		LRU:   cmn.GCO.Get().LRU,
 	}
-	bmd.add(cluster.NewBck("bucket3", cmn.ProviderAIS, cmn.NsGlobal), bprops)
+	bmd.add(meta.NewBck("bucket3", apc.AIS, cmn.NsGlobal), bprops)
 	primary.owner.bmd.putPersist(bmd, nil)
 	bmdBody = bmd.marshal()
 
@@ -661,8 +669,8 @@ func TestMetaSyncData(t *testing.T) {
 	syncer.sync(revsPair{bmd, msg})
 }
 
-// TestMetaSyncMembership tests metasync's logic when accessing proxy's smap directly
-func TestMetaSyncMembership(t *testing.T) {
+// TestMetasyncMembership tests metasync's logic when accessing proxy's smap directly
+func TestMetasyncMembership(t *testing.T) {
 	{
 		// pending server dropped without sync
 		primary := newPrimary()
@@ -686,7 +694,7 @@ func TestMetaSyncMembership(t *testing.T) {
 		id := "t"
 		addrInfo := serverTCPAddr(s.URL)
 		clone := primary.owner.smap.get().clone()
-		clone.addTarget(cluster.NewSnode(id, cmn.Target, addrInfo, addrInfo, addrInfo))
+		clone.addTarget(meta.NewSnode(id, apc.Target, addrInfo, addrInfo, addrInfo))
 		primary.owner.smap.put(clone)
 		msg := primary.newAmsgStr("", nil)
 		wg1 := syncer.sync(revsPair{clone, msg})
@@ -730,7 +738,7 @@ func TestMetaSyncMembership(t *testing.T) {
 
 		id := "t1111"
 		addrInfo := serverTCPAddr(s1.URL)
-		di := cluster.NewSnode(id, cmn.Target, addrInfo, addrInfo, addrInfo)
+		di := meta.NewSnode(id, apc.Target, addrInfo, addrInfo, addrInfo)
 		clone := primary.owner.smap.get().clone()
 		clone.addTarget(di)
 		primary.owner.smap.put(clone)
@@ -756,7 +764,7 @@ func TestMetaSyncMembership(t *testing.T) {
 
 		id := "t22222"
 		addrInfo := serverTCPAddr(s2.URL)
-		di := cluster.NewSnode(id, cmn.Target, addrInfo, addrInfo, addrInfo)
+		di := meta.NewSnode(id, apc.Target, addrInfo, addrInfo, addrInfo)
 		clone := primary.owner.smap.get().clone()
 		clone.addTarget(di)
 		primary.owner.smap.put(clone)
@@ -776,8 +784,8 @@ func TestMetaSyncMembership(t *testing.T) {
 	}
 }
 
-// TestMetaSyncReceive tests extracting received sync data.
-func TestMetaSyncReceive(t *testing.T) {
+// TestMetasyncReceive tests extracting received sync data.
+func TestMetasyncReceive(t *testing.T) {
 	{
 		emptyAisMsg := func(a *aisMsg) {
 			if a.Action != "" || a.Name != "" || a.Value != nil {
@@ -821,13 +829,13 @@ func TestMetaSyncReceive(t *testing.T) {
 		defer s.Close()
 		addrInfo := serverTCPAddr(s.URL)
 		clone := primary.owner.smap.get().clone()
-		clone.addProxy(cluster.NewSnode("p1", cmn.Proxy, addrInfo, addrInfo, addrInfo))
+		clone.addProxy(meta.NewSnode("p1", apc.Proxy, addrInfo, addrInfo, addrInfo))
 		primary.owner.smap.put(clone)
 
 		proxy1 := newSecondary("p1")
 
 		// empty payload
-		newSMap, msg, err := proxy1.extractSmap(make(msPayload), "")
+		newSMap, msg, err := proxy1.extractSmap(make(msPayload), "", false /*skip validation*/)
 		if newSMap != nil || msg != nil || err != nil {
 			t.Fatal("Extract smap from empty payload returned data")
 		}
@@ -836,21 +844,21 @@ func TestMetaSyncReceive(t *testing.T) {
 		wg1.Wait()
 		payload := <-chProxy
 
-		newSMap, msg, err = proxy1.extractSmap(payload, "")
+		newSMap, msg, err = proxy1.extractSmap(payload, "", false /*skip validation*/)
 		tassert.CheckFatal(t, err)
 		emptyAisMsg(msg)
 		matchSMap(primary.owner.smap.get(), newSMap)
 		proxy1.owner.smap.put(newSMap)
 
 		// same version of smap received
-		newSMap, msg, err = proxy1.extractSmap(payload, "")
+		newSMap, msg, err = proxy1.extractSmap(payload, "", false /*skip validation*/)
 		tassert.CheckFatal(t, err)
 		emptyAisMsg(msg)
 		nilSMap(newSMap)
 	}
 }
 
-func testSyncer(p *proxyrunner) (syncer *metasyncer) {
+func testSyncer(p *proxy) (syncer *metasyncer) {
 	syncer = newMetasyncer(p)
 	return
 }

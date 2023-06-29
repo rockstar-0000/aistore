@@ -1,12 +1,12 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 
 // AIS loader (aisloader) is a tool to measure storage performance. It's a load
-// generator that has been developed (and is currently used) to benchmark and
-// stress-test AIStore(tm) but can be easily extended for any S3-compatible backend.
-// For usage, run: `aisloader` or `aisloader usage` or `aisloader --help`.
+// generator that has been developed to benchmark and stress-test AIStore
+// but can be easily extended to benchmark any S3-compatible backend.
+// For usage, run: `aisloader`, or `aisloader usage`, or `aisloader --help`.
 
 // Examples:
 // 1. Destroy existing ais bucket:
@@ -53,16 +53,24 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/authn"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/bench/aisloader/namegetter"
 	"github.com/NVIDIA/aistore/bench/aisloader/stats"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/devtools/readers"
-	"github.com/NVIDIA/aistore/devtools/tetl"
+	"github.com/NVIDIA/aistore/ext/etl"
+	"github.com/NVIDIA/aistore/hk"
+	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats/statsd"
+	"github.com/NVIDIA/aistore/tools/readers"
+	"github.com/NVIDIA/aistore/tools/tetl"
+	"github.com/NVIDIA/aistore/xact"
 	"github.com/OneOfOne/xxhash"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -74,6 +82,11 @@ const (
 
 	myName           = "loader"
 	randomObjNameLen = 32
+
+	wo2FreeSize  = 4096
+	wo2FreeDelay = 3*time.Second + time.Millisecond
+
+	ua = "aisloader"
 )
 
 type (
@@ -88,6 +101,7 @@ type (
 		end       time.Time
 		latencies httpLatencies
 		cksumType string
+		sgl       *memsys.SGL
 	}
 
 	params struct {
@@ -100,11 +114,23 @@ type (
 		loaderCnt         uint64
 		maxputs           uint64
 		putShards         uint64
+		statsdPort        int
+		statsShowInterval int
+		putPct            int // % of puts, rest are gets
+		numWorkers        int
+		batchSize         int // batch is used for bootstraping(list) and delete
+		loaderIDHashLen   uint
+		numEpochs         uint
+
+		duration DurationExt // stop after the run for at least that much
+
+		bp api.BaseParams
+
+		bck    cmn.Bck
+		bProps cmn.BucketProps
 
 		loaderID             string // used with multiple loader instances generating objects in parallel
 		proxyURL             string
-		bp                   api.BaseParams
-		bck                  cmn.Bck
 		readerType           string
 		tmpDir               string // used only when usingFile
 		statsOutput          string
@@ -117,34 +143,23 @@ type (
 		readOffStr           string // read offset
 		readLenStr           string // read length
 		subDir               string
-		duration             cos.DurationExt // stop after the run for at least that much
-		cleanUp              cos.BoolExt
+		tokenFile            string
 
-		bProps cmn.BucketProps
+		etlName     string // name of a ETL to apply to each object. Omitted when etlSpecPath specified.
+		etlSpecPath string // Path to a ETL spec to apply to each object.
 
-		statsdPort        int
-		statsdProbe       bool
-		statsShowInterval int
-		putPct            int // % of puts, rest are gets
-		numWorkers        int
-		batchSize         int // batch is used for bootstraping(list) and delete
-		loaderIDHashLen   uint
-		numEpochs         uint
+		cleanUp BoolExt // cleanup i.e. remove and destroy everything created during bench
 
+		statsdProbe   bool
 		getLoaderID   bool
 		randomObjName bool
 		uniqueGETs    bool
 		verifyHash    bool // verify xxhash during get
-		usingSG       bool
-		usingFile     bool
 		getConfig     bool // true: load control plane (read proxy config)
 		jsonFormat    bool
 		stoppable     bool // true: terminate by Ctrl-C
 		dryRun        bool // true: print configuration and parameters that aisloader will use at runtime
 		traceHTTP     bool // true: trace http latencies as per httpLatencies & https://golang.org/pkg/net/http/httptrace
-
-		etlName     string // name of a ETL to apply to each object. Omitted when etlSpecPath specified.
-		etlSpecPath string // Path to a ETL spec to apply to each object.
 	}
 
 	// sts records accumulated puts/gets information.
@@ -173,6 +188,7 @@ var (
 	rnd              *rand.Rand
 	workOrders       chan *workOrder
 	workOrderResults chan *workOrder
+	wo2Free          []*workOrder
 	intervalStats    sts
 	accumulatedStats sts
 	bucketObjsNames  namegetter.ObjectNameGetter
@@ -185,8 +201,8 @@ var (
 	flagUsage   bool
 	flagVersion bool
 
-	etlSpec []byte
-	etlID   string
+	etlInitSpec *etl.InitSpecMsg
+	etlName     string
 
 	useRandomObjName bool
 	objNameCnt       atomic.Uint64
@@ -196,13 +212,18 @@ var (
 
 	numGets atomic.Int64
 
+	gmm      *memsys.MMSA
+	stopping atomic.Bool
+
 	ip          string
 	port        string
 	aisEndpoint string
-	envEndpoint = os.Getenv(cmn.EnvVars.Endpoint)
+	envEndpoint string
+
+	loggedUserToken string
 )
 
-var _version, _build, _buildtime string
+var _version, _buildtime string
 
 func (wo *workOrder) String() string {
 	var errstr, opName string
@@ -242,12 +263,12 @@ func parseCmdLine() (params, error) {
 	f.DurationVar(&transportArgs.Timeout, "timeout", 10*time.Minute, "Client HTTP timeout - used in LIST/GET/PUT/DELETE")
 	f.IntVar(&p.statsShowInterval, "statsinterval", 10, "Interval in seconds to print performance counters; 0 - disabled")
 	f.StringVar(&p.bck.Name, "bucket", "", "Bucket name or bucket URI. If empty, a bucket with random name will be created")
-	f.StringVar(&p.bck.Provider, "provider", cmn.ProviderAIS,
+	f.StringVar(&p.bck.Provider, "provider", apc.AIS,
 		"ais - for AIS bucket, \"aws\", \"azure\", \"gcp\", \"hdfs\"  for Azure, Amazon, Google, and HDFS clouds respectively")
 	f.StringVar(&ip, "ip", "localhost", "AIS proxy/gateway IP address or hostname")
 	f.StringVar(&port, "port", "8080", "AIS proxy/gateway port")
 
-	cos.DurationExtVar(f, &p.duration, "duration", time.Minute,
+	DurationExtVar(f, &p.duration, "duration", time.Minute,
 		"Benchmark duration (0 - run forever or until Ctrl-C). Note that if both duration and totalputsize are 0 (zeros), aisloader will have nothing to do.\n"+
 			"If not specified and totalputsize > 0, aisloader runs until totalputsize reached. Otherwise aisloader runs until first of duration and "+
 			"totalputsize reached")
@@ -257,7 +278,7 @@ func parseCmdLine() (params, error) {
 	f.StringVar(&p.tmpDir, "tmpdir", "/tmp/ais", "Local directory to store temporary files")
 	f.StringVar(&p.putSizeUpperBoundStr, "totalputsize", "0",
 		"Stop PUT workload once cumulative PUT size reaches or exceeds this value (can contain standard multiplicative suffix K, MB, GiB, etc.; 0 - unlimited")
-	cos.BoolExtVar(f, &p.cleanUp, "cleanup", "true: remove bucket upon benchmark termination (mandatory: must be specified)")
+	BoolExtVar(f, &p.cleanUp, "cleanup", "true: remove bucket upon benchmark termination (mandatory: must be specified)")
 	f.BoolVar(&p.verifyHash, "verifyhash", false,
 		"true: checksum-validate GET: recompute object checksums and validate it against the one received with the GET metadata")
 	f.StringVar(&p.minSizeStr, "minsize", "", "Minimum object size (with or without multiplicative suffix K, MB, GiB, etc.)")
@@ -266,6 +287,7 @@ func parseCmdLine() (params, error) {
 		fmt.Sprintf("Type of reader: %s(default) | %s | %s | %s", readers.ReaderTypeSG, readers.ReaderTypeFile, readers.ReaderTypeRand, readers.ReaderTypeTar))
 	f.StringVar(&p.loaderID, "loaderid", "0", "ID to identify a loader among multiple concurrent instances")
 	f.StringVar(&p.statsdIP, "statsdip", "localhost", "StatsD IP address or hostname")
+	f.StringVar(&p.tokenFile, "tokenfile", "", "authentication token (FQN)") // see also: AIS_AUTHN_TOKEN_FILE
 	f.IntVar(&p.statsdPort, "statsdport", 8125, "StatsD UDP port")
 	f.BoolVar(&p.statsdProbe, "test-probe StatsD server prior to benchmarks", false, "when enabled probes StatsD server prior to running")
 	f.IntVar(&p.batchSize, "batchsize", 100, "Batch size to list and delete")
@@ -323,7 +345,7 @@ func parseCmdLine() (params, error) {
 		os.Exit(0)
 	}
 	if flagVersion || f.NArg() != 0 && f.Arg(0) == "version" {
-		fmt.Printf("version %s, build %s (build-time: %s)\n", _version, _build, _buildtime)
+		fmt.Printf("version %s (build %s)\n", _version, _buildtime)
 		os.Exit(0)
 	}
 	if !p.cleanUp.IsSet && p.bck.Name != "" {
@@ -332,22 +354,19 @@ func parseCmdLine() (params, error) {
 		os.Exit(1)
 	}
 
-	p.usingSG = p.readerType == readers.ReaderTypeSG
-	p.usingFile = p.readerType == readers.ReaderTypeFile
-
 	if p.seed == 0 {
 		p.seed = mono.NanoTime()
 	}
 	rnd = rand.New(rand.NewSource(p.seed))
 
 	if p.putSizeUpperBoundStr != "" {
-		if p.putSizeUpperBound, err = cos.S2B(p.putSizeUpperBoundStr); err != nil {
+		if p.putSizeUpperBound, err = cos.ParseSize(p.putSizeUpperBoundStr, cos.UnitsIEC); err != nil {
 			return params{}, fmt.Errorf("failed to parse total PUT size %s: %v", p.putSizeUpperBoundStr, err)
 		}
 	}
 
 	if p.minSizeStr != "" {
-		if p.minSize, err = cos.S2B(p.minSizeStr); err != nil {
+		if p.minSize, err = cos.ParseSize(p.minSizeStr, cos.UnitsIEC); err != nil {
 			return params{}, fmt.Errorf("failed to parse min size %s: %v", p.minSizeStr, err)
 		}
 	} else {
@@ -355,7 +374,7 @@ func parseCmdLine() (params, error) {
 	}
 
 	if p.maxSizeStr != "" {
-		if p.maxSize, err = cos.S2B(p.maxSizeStr); err != nil {
+		if p.maxSize, err = cos.ParseSize(p.maxSizeStr, cos.UnitsIEC); err != nil {
 			return params{}, fmt.Errorf("failed to parse max size %s: %v", p.maxSizeStr, err)
 		}
 	} else {
@@ -386,12 +405,12 @@ func parseCmdLine() (params, error) {
 	}
 
 	if p.readOffStr != "" {
-		if p.readOff, err = cos.S2B(p.readOffStr); err != nil {
+		if p.readOff, err = cos.ParseSize(p.readOffStr, cos.UnitsIEC); err != nil {
 			return params{}, fmt.Errorf("failed to parse read offset %s: %v", p.readOffStr, err)
 		}
 	}
 	if p.readLenStr != "" {
-		if p.readLen, err = cos.S2B(p.readLenStr); err != nil {
+		if p.readLen, err = cos.ParseSize(p.readLenStr, cos.UnitsIEC); err != nil {
 			return params{}, fmt.Errorf("failed to parse read length %s: %v", p.readLenStr, err)
 		}
 	}
@@ -465,15 +484,23 @@ func parseCmdLine() (params, error) {
 		if err != nil {
 			return params{}, err
 		}
-		etlSpec, err = io.ReadAll(fh)
+		etlSpec, err := io.ReadAll(fh)
 		fh.Close()
+		if err != nil {
+			return params{}, err
+		}
+		etlInitSpec, err = tetl.SpecToInitMsg(etlSpec)
 		if err != nil {
 			return params{}, err
 		}
 	}
 
 	if p.etlName != "" {
-		etlSpec, err = tetl.GetTransformYaml(p.etlName)
+		etlSpec, err := tetl.GetTransformYaml(p.etlName)
+		if err != nil {
+			return params{}, err
+		}
+		etlInitSpec, err = tetl.SpecToInitMsg(etlSpec)
 		if err != nil {
 			return params{}, err
 		}
@@ -514,8 +541,8 @@ func parseCmdLine() (params, error) {
 
 		if p.bProps.Mirror.Enabled {
 			// fill mirror default properties
-			if p.bProps.Mirror.UtilThresh == 0 {
-				p.bProps.Mirror.UtilThresh = 5
+			if p.bProps.Mirror.Burst == 0 {
+				p.bProps.Mirror.Burst = 512
 			}
 			if p.bProps.Mirror.Copies == 0 {
 				p.bProps.Mirror.Copies = 2
@@ -529,13 +556,14 @@ func parseCmdLine() (params, error) {
 	}
 
 	aisEndpoint = "http://" + ip + ":" + port
+	envEndpoint = os.Getenv(env.AIS.Endpoint)
 	if envEndpoint != "" {
 		aisEndpoint = envEndpoint
 	}
 
 	traceHTTPSig.Store(p.traceHTTP)
 
-	scheme, address := cos.ParseURLScheme(aisEndpoint)
+	scheme, address := cmn.ParseURLScheme(aisEndpoint)
 	if scheme == "" {
 		scheme = "http"
 	}
@@ -546,13 +574,10 @@ func parseCmdLine() (params, error) {
 	p.proxyURL = scheme + "://" + address
 
 	transportArgs.UseHTTPS = scheme == "https"
-	// if the primary proxy uses HTTPS, create a secure HTTP client with
-	// disabled certificate check.
 	httpClient = cmn.NewClient(transportArgs)
-	p.bp = api.BaseParams{
-		Client: httpClient,
-		URL:    p.proxyURL,
-	}
+
+	// NOTE: auth token is assigned below when we execute the very first API call
+	p.bp = api.BaseParams{Client: httpClient, URL: p.proxyURL}
 
 	// Don't print arguments when just getting loaderID
 	if !p.getLoaderID {
@@ -600,43 +625,34 @@ func (s *sts) aggregate(other sts) {
 }
 
 func setupBucket(runParams *params) error {
-	if runParams.bck.Provider != cmn.ProviderAIS || runParams.getConfig {
+	if runParams.bck.Provider != apc.AIS || runParams.getConfig {
 		return nil
 	}
-
 	if runParams.bck.Name == "" {
-		runParams.bck.Name = cos.RandString(8)
+		runParams.bck.Name = cos.CryptoRandS(8)
 		fmt.Printf("New bucket name %q\n", runParams.bck.Name)
-	} else if bck, objName, err := cmn.ParseBckObjectURI(runParams.bck.Name, cmn.ParseURIOpts{}); err == nil {
+	} else if nbck, objName, err := cmn.ParseBckObjectURI(runParams.bck.Name, cmn.ParseURIOpts{}); err == nil {
 		if objName != "" {
 			return fmt.Errorf("expecting bucket name or a bucket URI with no object name in it: %s => [%v, %s]",
-				runParams.bck, bck, objName)
+				runParams.bck, nbck, objName)
 		}
-		if runParams.bck.Provider != "" && runParams.bck.Provider != bck.Provider {
-			fmt.Printf("Warning: redundant provider via both parsed bucket URI %v and the command line %s\n",
-				bck, runParams.bck.Provider)
-		}
-		runParams.bck = bck
+		runParams.bck = nbck
 	}
-
-	exists, err := api.DoesBucketExist(runParams.bp, cmn.QueryBcks(runParams.bck))
+	exists, err := api.QueryBuckets(runParams.bp, cmn.QueryBcks(runParams.bck), apc.FltExists)
 	if err != nil {
-		return fmt.Errorf("failed to get ais bucket lists to check for %s, err = %v", runParams.bck, err)
+		return fmt.Errorf("%s not found: %v", runParams.bck, err)
 	}
-
 	if !exists {
 		if err := api.CreateBucket(runParams.bp, runParams.bck, nil); err != nil {
-			return fmt.Errorf("failed to create ais bucket %s, err = %s", runParams.bck, err)
+			return fmt.Errorf("failed to create %s: %v", runParams.bck, err)
 		}
 	}
-
 	if runParams.bPropsStr == "" {
 		return nil
 	}
-
 	propsToUpdate := cmn.BucketPropsToUpdate{}
 	// update bucket props if bPropsStr is set
-	oldProps, err := api.HeadBucket(runParams.bp, runParams.bck)
+	oldProps, err := api.HeadBucket(runParams.bp, runParams.bck, true /* don't add */)
 	if err != nil {
 		return fmt.Errorf("failed to read bucket %s properties: %v", runParams.bck, err)
 	}
@@ -652,9 +668,9 @@ func setupBucket(runParams *params) error {
 	}
 	if runParams.bProps.Mirror.Enabled != oldProps.Mirror.Enabled {
 		propsToUpdate.Mirror = &cmn.MirrorConfToUpdate{
-			Enabled:    api.Bool(runParams.bProps.Mirror.Enabled),
-			Copies:     api.Int64(runParams.bProps.Mirror.Copies),
-			UtilThresh: api.Int64(runParams.bProps.Mirror.UtilThresh),
+			Enabled: api.Bool(runParams.bProps.Mirror.Enabled),
+			Copies:  api.Int64(runParams.bProps.Mirror.Copies),
+			Burst:   api.Int(runParams.bProps.Mirror.Burst),
 		}
 		change = true
 	}
@@ -674,12 +690,9 @@ func getIDFromString(val string, hashLen uint) uint64 {
 	return hash
 }
 
-func Start(version, build, buildtime string) error {
-	var (
-		wg  = &sync.WaitGroup{}
-		err error
-	)
-	_version, _build, _buildtime = version, build, buildtime
+func Start(version, buildtime string) (err error) {
+	wg := &sync.WaitGroup{}
+	_version, _buildtime = version, buildtime
 	runParams, err = parseCmdLine()
 	if err != nil {
 		return err
@@ -707,12 +720,15 @@ func Start(version, build, buildtime string) error {
 		runParams.duration.Val = time.Duration(math.MaxInt64)
 	}
 
-	if runParams.usingFile {
+	if runParams.readerType == readers.ReaderTypeFile {
 		if err := cos.CreateDir(runParams.tmpDir + "/" + myName); err != nil {
 			return fmt.Errorf("failed to create local test directory %q, err = %s", runParams.tmpDir, err.Error())
 		}
 	}
 
+	loggedUserToken = authn.LoadToken(runParams.tokenFile)
+	runParams.bp.Token = loggedUserToken
+	runParams.bp.UA = ua
 	if err := setupBucket(&runParams); err != nil {
 		return err
 	}
@@ -736,7 +752,7 @@ func Start(version, build, buildtime string) error {
 	}
 
 	if runParams.cleanUp.Val {
-		fmt.Printf("BEWARE: cleanup is enabled, bucket %s will be destroyed upon termination!\n\n", runParams.bck)
+		fmt.Printf("BEWARE: cleanup is enabled, bucket %s will be destroyed upon termination!\n", runParams.bck)
 		time.Sleep(time.Second)
 	}
 
@@ -752,9 +768,22 @@ func Start(version, build, buildtime string) error {
 	}
 	defer statsdC.Close()
 
-	if etlSpec != nil {
+	// init housekeeper and memsys;
+	// empty config to use memsys constants;
+	// alternatively: "memsys": { "min_free": "2gb", ... }
+	hk.Init(&stopping)
+	go hk.DefaultHK.Run()
+	hk.WaitStarted()
+
+	config := &cmn.Config{}
+	config.Log.Level = "3"
+	memsys.Init(prefixC, prefixC, config)
+	gmm = memsys.PageMM()
+	gmm.RegWithHK()
+
+	if etlInitSpec != nil {
 		fmt.Println(prettyTimestamp() + " Waiting for an ETL to start...")
-		etlID, err = api.ETLInitSpec(runParams.bp, etlSpec)
+		etlName, err = api.ETLInit(runParams.bp, etlInitSpec)
 		if err != nil {
 			return fmt.Errorf("failed to initialize ETL: %v", err)
 		}
@@ -762,7 +791,7 @@ func Start(version, build, buildtime string) error {
 
 		defer func() {
 			fmt.Println(prettyTimestamp() + " Stopping the ETL...")
-			if err := api.ETLStop(runParams.bp, etlID); err != nil {
+			if err := api.ETLStop(runParams.bp, etlName); err != nil {
 				fmt.Printf("%s Failed to stop the ETL: %v\n", prettyTimestamp(), err)
 				return
 			}
@@ -775,6 +804,9 @@ func Start(version, build, buildtime string) error {
 	for i := 0; i < runParams.numWorkers; i++ {
 		wg.Add(1)
 		go worker(workOrders, workOrderResults, wg, &numGets)
+	}
+	if runParams.putPct != 0 {
+		wo2Free = make([]*workOrder, 0, wo2FreeSize)
 	}
 
 	timer := time.NewTimer(runParams.duration.Val)
@@ -835,43 +867,38 @@ MainLoop:
 		}
 
 		// Prioritize showing stats otherwise we will dropping the stats intervals.
-		if runParams.statsShowInterval > 0 {
-			select {
-			case <-statsTicker.C:
-				accumulatedStats.aggregate(intervalStats)
-				writeStats(statsWriter, runParams.jsonFormat, false /* final */, intervalStats, accumulatedStats)
-				sendStatsdStats(&intervalStats)
-				intervalStats = newStats(time.Now())
-			default:
-				break
-			}
+		select {
+		case <-statsTicker.C:
+			accumulatedStats.aggregate(intervalStats)
+			writeStats(statsWriter, runParams.jsonFormat, false /* final */, intervalStats, accumulatedStats)
+			sendStatsdStats(&intervalStats)
+			intervalStats = newStats(time.Now())
+		default:
+			break
 		}
 
 		select {
 		case <-timer.C:
 			break MainLoop
 		case wo := <-workOrderResults:
-			completeWorkOrder(wo)
+			completeWorkOrder(wo, false)
 			if runParams.statsShowInterval == 0 && runParams.putSizeUpperBound != 0 {
 				accumulatedStats.aggregate(intervalStats)
 				intervalStats = newStats(time.Now())
 			}
-
 			if err := postNewWorkOrder(); err != nil {
 				_, _ = fmt.Fprint(os.Stderr, err.Error())
 				break MainLoop
 			}
 		case <-statsTicker.C:
-			if runParams.statsShowInterval > 0 {
-				accumulatedStats.aggregate(intervalStats)
-				writeStats(statsWriter, runParams.jsonFormat, false /* final */, intervalStats, accumulatedStats)
-				sendStatsdStats(&intervalStats)
-				intervalStats = newStats(time.Now())
-			}
+			accumulatedStats.aggregate(intervalStats)
+			writeStats(statsWriter, runParams.jsonFormat, false /* final */, intervalStats, accumulatedStats)
+			sendStatsdStats(&intervalStats)
+			intervalStats = newStats(time.Now())
 		case sig := <-osSigChan:
 			switch sig {
 			case syscall.SIGHUP:
-				msg := "Collecting detailed latency info is "
+				msg := "Detailed latency info is "
 				if traceHTTPSig.Toggle() {
 					msg += "disabled"
 				} else {
@@ -890,19 +917,21 @@ Done:
 	timer.Stop()
 	statsTicker.Stop()
 	close(workOrders)
-	wg.Wait() // wait until all workers are done (notified by closing work order channel)
+	wg.Wait() // wait until all workers complete their work
 
 	// Process left over work orders
 	close(workOrderResults)
 	for wo := range workOrderResults {
-		completeWorkOrder(wo)
+		completeWorkOrder(wo, true)
 	}
 
-	fmt.Printf("\nActual run duration: %v\n", time.Since(tsStart))
 	finalizeStats(statsWriter)
+	fmt.Printf("Stats written to %s\n", statsWriter.Name())
 	if runParams.cleanUp.Val {
 		cleanup()
 	}
+
+	fmt.Printf("\nActual run duration: %v\n", time.Since(tsStart))
 
 	return err
 }
@@ -916,14 +945,10 @@ func newPutWorkOrder() (*workOrder, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var size int64
-	if runParams.maxSize == runParams.minSize {
-		size = runParams.minSize
-	} else {
+	size := runParams.minSize
+	if runParams.maxSize != runParams.minSize {
 		size = rnd.Int63n(runParams.maxSize-runParams.minSize) + runParams.minSize
 	}
-
 	putPending++
 	return &workOrder{
 		proxyURL:  runParams.proxyURL,
@@ -991,25 +1016,23 @@ func newGetConfigWorkOrder() *workOrder {
 }
 
 func postNewWorkOrder() (err error) {
-	var wo *workOrder
-
 	if runParams.getConfig {
-		wo = newGetConfigWorkOrder()
-	} else {
-		if rnd.Intn(99) < runParams.putPct {
-			if wo, err = newPutWorkOrder(); err != nil {
-				return err
-			}
-		} else {
-			if wo, err = newGetWorkOrder(); err != nil {
-				return err
-			}
-		}
+		workOrders <- newGetConfigWorkOrder()
+		return
 	}
 
-	cos.Assert(wo != nil)
+	var wo *workOrder
+	if rnd.Intn(99) < runParams.putPct {
+		if wo, err = newPutWorkOrder(); err != nil {
+			return err
+		}
+	} else {
+		if wo, err = newGetWorkOrder(); err != nil {
+			return err
+		}
+	}
 	workOrders <- wo
-	return nil
+	return
 }
 
 func validateWorkOrder(wo *workOrder, delta time.Duration) error {
@@ -1021,7 +1044,7 @@ func validateWorkOrder(wo *workOrder, delta time.Duration) error {
 	return nil
 }
 
-func completeWorkOrder(wo *workOrder) {
+func completeWorkOrder(wo *workOrder, terminating bool) {
 	delta := timeDelta(wo.end, wo.start)
 
 	if wo.err == nil && traceHTTPSig.Load() {
@@ -1076,6 +1099,33 @@ func completeWorkOrder(wo *workOrder) {
 			intervalStats.put.AddErr()
 			intervalStats.statsd.Put.AddErr()
 		}
+		if wo.sgl == nil || terminating {
+			return
+		}
+
+		now, l := time.Now(), len(wo2Free)
+		debug.Assert(!wo.end.IsZero())
+		// free previously executed PUT SGLs
+		for i := 0; i < l; i++ {
+			if terminating {
+				return
+			}
+			w := wo2Free[i]
+			// delaying freeing sgl for `wo2FreeDelay`
+			// (background at https://github.com/golang/go/issues/30597)
+			if now.Sub(w.end) < wo2FreeDelay {
+				break
+			}
+			if w.sgl != nil && !w.sgl.IsNil() {
+				w.sgl.Free()
+				copy(wo2Free[i:], wo2Free[i+1:])
+				i--
+				l--
+				wo2Free = wo2Free[:l]
+			}
+		}
+		// append to free later
+		wo2Free = append(wo2Free, wo)
 	case opConfig:
 		if wo.err == nil {
 			intervalStats.getConfig.Add(1, delta)
@@ -1085,11 +1135,13 @@ func completeWorkOrder(wo *workOrder) {
 			intervalStats.getConfig.AddErr()
 		}
 	default:
-		// Should not be here
+		debug.Assert(false) // Should never be here
 	}
 }
 
 func cleanup() {
+	stopping.Store(true)
+	time.Sleep(time.Second)
 	fmt.Println(prettyTimestamp() + " Cleaning up...")
 	if bucketObjsNames != nil {
 		// `bucketObjsNames` has been actually assigned to/initialized.
@@ -1130,29 +1182,29 @@ func cleanupObjs(objs []string, wg *sync.WaitGroup) {
 		b := cos.Min(t, runParams.batchSize)
 		n := t / b
 		for i := 0; i < n; i++ {
-			xactID, err := api.DeleteList(runParams.bp, runParams.bck, objs[i*b:(i+1)*b])
+			xid, err := api.DeleteList(runParams.bp, runParams.bck, objs[i*b:(i+1)*b])
 			if err != nil {
 				fmt.Println("delete err ", err)
 			}
-			args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDeleteObjects}
-			if _, err = api.WaitForXaction(runParams.bp, args); err != nil {
+			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
+			if _, err = api.WaitForXactionIC(runParams.bp, args); err != nil {
 				fmt.Println("wait for xaction err ", err)
 			}
 		}
 
 		if t%b != 0 {
-			xactID, err := api.DeleteList(runParams.bp, runParams.bck, objs[n*b:])
+			xid, err := api.DeleteList(runParams.bp, runParams.bck, objs[n*b:])
 			if err != nil {
 				fmt.Println("delete err ", err)
 			}
-			args := api.XactReqArgs{ID: xactID, Kind: cmn.ActDeleteObjects}
-			if _, err = api.WaitForXaction(runParams.bp, args); err != nil {
+			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
+			if _, err = api.WaitForXactionIC(runParams.bp, args); err != nil {
 				fmt.Println("wait for xaction err ", err)
 			}
 		}
 	}
 
-	if runParams.usingFile {
+	if runParams.readerType == readers.ReaderTypeFile {
 		for _, obj := range objs {
 			if err := os.Remove(runParams.tmpDir + "/" + obj); err != nil {
 				fmt.Println("delete local file err ", err)

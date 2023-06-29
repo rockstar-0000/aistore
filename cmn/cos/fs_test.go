@@ -8,11 +8,14 @@ import (
 	"math"
 	"testing"
 
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 	jsoniter "github.com/json-iterator/go"
 )
 
 func TestFsIDMarshal(t *testing.T) {
+	if testing.Short() {
+		t.Skipf("skipping %s in short mode", t.Name())
+	}
 	tests := []struct {
 		fsID FsID
 	}{

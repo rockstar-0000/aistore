@@ -1,6 +1,6 @@
 // Package fs implements an AIStore file system.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -11,7 +11,7 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestFS(t *testing.T) {
+func TestAISFS(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "fuse/fs suite")
+	RunSpecs(t, t.Name())
 }

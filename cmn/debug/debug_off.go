@@ -1,8 +1,8 @@
-// +build !debug
+//go:build !debug
 
 // Package provides debug utilities
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package debug
 
@@ -11,20 +11,19 @@ import (
 	"sync"
 )
 
-func NewExpvar(_ uint8)                    {}
-func SetExpvar(_ uint8, _ string, _ int64) {}
+func ON() bool { return false }
 
-func Errorln(_ ...interface{})          {}
-func Errorf(_ string, _ ...interface{}) {}
-func Infof(_ string, _ ...interface{})  {}
+func Infof(_ string, _ ...any) {}
 
 func Func(_ func()) {}
 
-func Assert(_ bool, _ ...interface{})            {}
-func AssertFunc(_ func() bool, _ ...interface{}) {}
-func AssertMsg(_ bool, _ string)                 {}
-func AssertNoErr(_ error)                        {}
-func Assertf(_ bool, _ string, _ ...interface{}) {}
+func Assert(_ bool, _ ...any)            {}
+func AssertFunc(_ func() bool, _ ...any) {}
+func AssertNoErr(_ error)                {}
+func Assertf(_ bool, _ string, _ ...any) {}
+
+func AssertNotPstr(any) {}
+func FailTypeCast(any)  {}
 
 func AssertMutexLocked(_ *sync.Mutex)      {}
 func AssertRWMutexLocked(_ *sync.RWMutex)  {}

@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/OneOfOne/xxhash"
@@ -19,19 +20,19 @@ const MDVersionLast = 1 // current version of metadata
 
 // Metadata - EC information stored in metafiles for every encoded object
 type Metadata struct {
-	Size        int64            // obj size (after EC'ing sum size of slices differs from the original)
-	Generation  int64            // Timestamp when the object was EC'ed
-	ObjCksum    string           // checksum of the original object
-	ObjVersion  string           // object version
-	CksumType   string           // slice checksum type
-	CksumValue  string           // slice checksum of the slice if EC is used
-	FullReplica string           // daemon ID where full(main) replica is
-	Daemons     cos.MapStrUint16 // Locations of all slices: DaemonID <-> SliceID
-	Data        int              // the number of data slices
-	Parity      int              // the number of parity slices
-	SliceID     int              // 0 for full replica, 1 to N for slices
-	MDVersion   uint32           // Metadata format version
-	IsCopy      bool             // object is replicated(true) or encoded(false)
+	Size        int64            `json:"obj_size"`      // obj size (after EC'ing sum size of slices differs from the original)
+	Generation  int64            `json:"generation"`    // Timestamp when the object was EC'ed
+	ObjCksum    string           `json:"obj_cksum"`     // checksum of the original object
+	ObjVersion  string           `json:"obj_version"`   // object version
+	CksumType   string           `json:"cksum_type"`    // slice checksum type
+	CksumValue  string           `json:"slice_cksum"`   // slice checksum of the slice if EC is used
+	FullReplica string           `json:"replica_node"`  // daemon ID where full(main) replica is
+	Daemons     cos.MapStrUint16 `json:"nodes"`         // Locations of all slices: DaemonID <-> SliceID
+	Data        int              `json:"data_slices"`   // the number of data slices
+	Parity      int              `json:"parity_slices"` // the number of parity slices
+	SliceID     int              `json:"slice_id"`      // 0 for full replica, 1 to N for slices
+	MDVersion   uint32           `json:"md_version"`    // Metadata format version
+	IsCopy      bool             `json:"is_copy"`       // object is replicated(true) or encoded(false)
 }
 
 // interface guard
@@ -73,14 +74,14 @@ func MetaFromReader(reader io.Reader) (*Metadata, error) {
 
 // RemoteTargets returns list of Snodes that contain a slice or replica.
 // This target(`t`) is removed from the list.
-func (md *Metadata) RemoteTargets(t cluster.Target) []*cluster.Snode {
+func (md *Metadata) RemoteTargets(t cluster.Target) []*meta.Snode {
 	if len(md.Daemons) == 0 {
 		return nil
 	}
-	nodes := make([]*cluster.Snode, 0, len(md.Daemons))
+	nodes := make([]*meta.Snode, 0, len(md.Daemons))
 	smap := t.Sowner().Get()
 	for tid := range md.Daemons {
-		if tid == t.Snode().ID() {
+		if tid == t.SID() {
 			continue
 		}
 		tsi := smap.GetTarget(tid)
@@ -111,8 +112,8 @@ func (md *Metadata) Clone() *Metadata {
 }
 
 // ObjectMetadata returns metadata for an object or its slice if any exists
-func ObjectMetadata(bck *cluster.Bck, objName string) (*Metadata, error) {
-	fqn, _, err := cluster.HrwFQN(bck, fs.ECMetaType, objName)
+func ObjectMetadata(bck *meta.Bck, objName string) (*Metadata, error) {
+	fqn, _, err := cluster.HrwFQN(bck.Bucket(), fs.ECMetaType, objName)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +142,7 @@ func (md *Metadata) Unpack(unpacker *cos.ByteUnpack) (err error) {
 	b := unpacker.Bytes()
 	calcCksum := xxhash.Checksum64S(b[:len(b)-cos.SizeofI64], cos.MLCG32)
 	if cksum != calcCksum {
-		err = cos.NewBadMetaCksumError(cksum, calcCksum, "EC metadata")
+		err = cos.NewErrMetaCksum(cksum, calcCksum, "EC metadata")
 	}
 	return err
 }

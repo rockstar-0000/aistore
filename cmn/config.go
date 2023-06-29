@@ -1,14 +1,13 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
 import (
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"net"
 	"net/url"
@@ -17,131 +16,120 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"unsafe"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	jsoniter "github.com/json-iterator/go"
 )
 
-const (
-	KeepaliveHeartbeatType = "heartbeat"
-	KeepaliveAverageType   = "average"
-)
-
-const (
-	ThrottleMin = time.Millisecond
-	ThrottleAvg = time.Millisecond * 10
-	ThrottleMax = time.Millisecond * 100
-
-	// EC
-	MinSliceCount = 1  // minimum number of data or parity slices
-	MaxSliceCount = 32 // maximum number of data or parity slices
-)
-
-const (
-	IgnoreReaction = "ignore"
-	WarnReaction   = "warn"
-	AbortReaction  = "abort"
-)
-
-const (
-	// L4
-	tcpProto = "tcp"
-
-	// L7
-	httpProto  = "http"
-	httpsProto = "https"
-)
-
-// FeatureFlags
-const (
-	FeatureDirectAccess = 1 << iota
-)
-
 type (
-	ValidationArgs struct {
-		Provider  string // For ExtraProps.
-		TargetCnt int    // For EC.
-	}
-
 	Validator interface {
 		Validate() error
 	}
 	PropsValidator interface {
-		ValidateAsProps(args *ValidationArgs) error
-	}
-	FeatureFlags uint64
-)
-
-type (
-	globalConfigOwner struct {
-		mtx      sync.Mutex     // mutex for protecting updates of config
-		c        atomic.Pointer // pointer to `Config` (cluster + local + override config)
-		oc       atomic.Pointer // pointer to `ConfigToUpdate`, override configuration on node
-		confPath atomic.Pointer
+		ValidateAsProps(arg ...any) error
 	}
 )
 
-//
-// global configuration
-//
-
-// TODO: try to remove duplication *Conf v/s *ToUpdate structs
 type (
-	// Config encapsulates all configuration values used by a given daemon.
-	//
-	// Naming convention for setting/getting the particular fields is defined as
-	// joining the json tags with dot. Eg. when referring to `EC.Enabled` field
-	// one would need to write `ec.enabled`. For more info refer to `IterFields`.
+	// Config contains all configuration values used by a given ais daemon.
+	// Naming convention for setting/getting specific values is defined as follows:
+	//              (parent json tag . child json tag)
+	// E.g., to set/get `EC.Enabled` use `ec.enabled`. And so on.
+	// For details, see `IterFields`.
 	Config struct {
 		role          string `list:"omit"` // Proxy or Target
 		ClusterConfig `json:",inline"`
 		LocalConfig   `json:",inline"`
 	}
 
+	// global configuration
 	ClusterConfig struct {
-		Backend     BackendConf     `json:"backend" allow:"cluster"`
-		Mirror      MirrorConf      `json:"mirror" allow:"cluster"`
-		EC          ECConf          `json:"ec" allow:"cluster"`
-		Log         LogConf         `json:"log"`
-		Periodic    PeriodConf      `json:"periodic"`
-		Timeout     TimeoutConf     `json:"timeout"`
-		Client      ClientConf      `json:"client"`
-		Proxy       ProxyConf       `json:"proxy" allow:"cluster"`
-		LRU         LRUConf         `json:"lru"`
-		Disk        DiskConf        `json:"disk"`
-		Rebalance   RebalanceConf   `json:"rebalance" allow:"cluster"`
-		Resilver    ResilverConf    `json:"resilver"`
-		Cksum       CksumConf       `json:"checksum"`
-		Versioning  VersionConf     `json:"versioning" allow:"cluster"`
-		Net         NetConf         `json:"net"`
-		FSHC        FSHCConf        `json:"fshc"`
-		Auth        AuthConf        `json:"auth"`
-		Keepalive   KeepaliveConf   `json:"keepalivetracker"`
-		Downloader  DownloaderConf  `json:"downloader"`
-		DSort       DSortConf       `json:"distributed_sort"`
-		Compression CompressionConf `json:"compression"`
-		MDWrite     MDWritePolicy   `json:"md_write"`
-		LastUpdated string          `json:"lastupdate_time"`
-		UUID        string          `json:"uuid"`                  // immutable
-		Version     int64           `json:"config_version,string"` // version
-		Ext         interface{}     `json:"ext,omitempty"`         // within meta-version extensions
-		// obsolete
-		Replication ReplicationConf `json:"replication"`
+		Ext        any            `json:"ext,omitempty"` // within meta-version extensions
+		Backend    BackendConf    `json:"backend" allow:"cluster"`
+		Mirror     MirrorConf     `json:"mirror" allow:"cluster"`
+		EC         ECConf         `json:"ec" allow:"cluster"`
+		Log        LogConf        `json:"log"`
+		Periodic   PeriodConf     `json:"periodic"`
+		Timeout    TimeoutConf    `json:"timeout"`
+		Client     ClientConf     `json:"client"`
+		Proxy      ProxyConf      `json:"proxy" allow:"cluster"`
+		Space      SpaceConf      `json:"space"`
+		LRU        LRUConf        `json:"lru"`
+		Disk       DiskConf       `json:"disk"`
+		Rebalance  RebalanceConf  `json:"rebalance" allow:"cluster"`
+		Resilver   ResilverConf   `json:"resilver"`
+		Cksum      CksumConf      `json:"checksum"`
+		Versioning VersionConf    `json:"versioning" allow:"cluster"`
+		Net        NetConf        `json:"net"`
+		FSHC       FSHCConf       `json:"fshc"`
+		Auth       AuthConf       `json:"auth"`
+		Keepalive  KeepaliveConf  `json:"keepalivetracker"`
+		Downloader DownloaderConf `json:"downloader"`
+		DSort      DSortConf      `json:"distributed_sort"`
+		Transport  TransportConf  `json:"transport"`
+		Memsys     MemsysConf     `json:"memsys"`
+
+		// Transform (offline) or Copy src Bucket => dst bucket
+		TCB TCBConf `json:"tcb"`
+
+		// metadata write policy: (immediate | delayed | never)
+		WritePolicy WritePolicyConf `json:"write_policy"`
+
+		// standalone enumerated features that can be configured
+		// to flip assorted global defaults (see cmn/feat/feat.go)
+		Features feat.Flags `json:"features,string" allow:"cluster"`
+
+		// read-only
+		LastUpdated string `json:"lastupdate_time"`       // timestamp
+		UUID        string `json:"uuid"`                  // UUID
+		Version     int64  `json:"config_version,string"` // version
+	}
+	ConfigToUpdate struct {
+		// ClusterConfig
+		Backend     *BackendConf             `json:"backend,omitempty"`
+		Mirror      *MirrorConfToUpdate      `json:"mirror,omitempty"`
+		EC          *ECConfToUpdate          `json:"ec,omitempty"`
+		Log         *LogConfToUpdate         `json:"log,omitempty"`
+		Periodic    *PeriodConfToUpdate      `json:"periodic,omitempty"`
+		Timeout     *TimeoutConfToUpdate     `json:"timeout,omitempty"`
+		Client      *ClientConfToUpdate      `json:"client,omitempty"`
+		Space       *SpaceConfToUpdate       `json:"space,omitempty"`
+		LRU         *LRUConfToUpdate         `json:"lru,omitempty"`
+		Disk        *DiskConfToUpdate        `json:"disk,omitempty"`
+		Rebalance   *RebalanceConfToUpdate   `json:"rebalance,omitempty"`
+		Resilver    *ResilverConfToUpdate    `json:"resilver,omitempty"`
+		Cksum       *CksumConfToUpdate       `json:"checksum,omitempty"`
+		Versioning  *VersionConfToUpdate     `json:"versioning,omitempty"`
+		Net         *NetConfToUpdate         `json:"net,omitempty"`
+		FSHC        *FSHCConfToUpdate        `json:"fshc,omitempty"`
+		Auth        *AuthConfToUpdate        `json:"auth,omitempty"`
+		Keepalive   *KeepaliveConfToUpdate   `json:"keepalivetracker,omitempty"`
+		Downloader  *DownloaderConfToUpdate  `json:"downloader,omitempty"`
+		DSort       *DSortConfToUpdate       `json:"distributed_sort,omitempty"`
+		Transport   *TransportConfToUpdate   `json:"transport,omitempty"`
+		Memsys      *MemsysConfToUpdate      `json:"memsys,omitempty"`
+		TCB         *TCBConfToUpdate         `json:"tcb,omitempty"`
+		WritePolicy *WritePolicyConfToUpdate `json:"write_policy,omitempty"`
+		Proxy       *ProxyConfToUpdate       `json:"proxy,omitempty"`
+		Features    *feat.Flags              `json:"features,string,omitempty"`
+
+		// LocalConfig
+		FSP *FSPConf `json:"fspaths,omitempty"`
 	}
 
 	LocalConfig struct {
 		ConfigDir string         `json:"confdir"`
 		LogDir    string         `json:"log_dir"`
 		HostNet   LocalNetConfig `json:"host_net"`
-		FSpaths   FSPathsConf    `json:"fspaths"`
-		TestFSP   TestfspathConf `json:"test_fspaths"`
+		FSP       FSPConf        `json:"fspaths"`
+		TestFSP   TestFSPConf    `json:"test_fspaths"`
 	}
 
 	// Network config specific to node
@@ -157,109 +145,69 @@ type (
 		UseIntraData    bool `json:"-"`
 	}
 
-	ConfigToUpdate struct {
-		Backend     *BackendConf             `json:"backend,omitempty"`
-		Mirror      *MirrorConfToUpdate      `json:"mirror,omitempty"`
-		EC          *ECConfToUpdate          `json:"ec,omitempty"`
-		Log         *LogConfToUpdate         `json:"log,omitempty"`
-		Periodic    *PeriodConfToUpdate      `json:"periodic,omitempty"`
-		Timeout     *TimeoutConfToUpdate     `json:"timeout,omitempty"`
-		Client      *ClientConfToUpdate      `json:"client,omitempty"`
-		LRU         *LRUConfToUpdate         `json:"lru,omitempty"`
-		Disk        *DiskConfToUpdate        `json:"disk,omitempty"`
-		Rebalance   *RebalanceConfToUpdate   `json:"rebalance,omitempty"`
-		Resilver    *ResilverConfToUpdate    `json:"resilver,omitempty"`
-		Cksum       *CksumConfToUpdate       `json:"checksum,omitempty"`
-		Versioning  *VersionConfToUpdate     `json:"versioning,omitempty"`
-		Net         *NetConfToUpdate         `json:"net,omitempty"`
-		FSHC        *FSHCConfToUpdate        `json:"fshc,omitempty"`
-		Auth        *AuthConfToUpdate        `json:"auth,omitempty"`
-		Keepalive   *KeepaliveConfToUpdate   `json:"keepalivetracker,omitempty"`
-		Downloader  *DownloaderConfToUpdate  `json:"downloader,omitempty"`
-		DSort       *DSortConfToUpdate       `json:"distributed_sort,omitempty"`
-		Compression *CompressionConfToUpdate `json:"compression,omitempty"`
-		MDWrite     *MDWritePolicy           `json:"md_write,omitempty"`
-		Proxy       *ProxyConfToUpdate       `json:"proxy,omitempty"`
-
-		// Logging
-		LogLevel *string `json:"log_level,omitempty" copy:"skip"`
-		Vmodule  *string `json:"vmodule,omitempty" copy:"skip"`
-	}
-
 	BackendConf struct {
-		Conf map[string]interface{} `json:"conf,omitempty"` // implementation depends on backend provider
-
+		// provider implementation-dependent
+		Conf map[string]any `json:"conf,omitempty"`
 		// 3rd party Cloud(s) -- set during validation
 		Providers map[string]Ns `json:"-"`
 	}
-	RemoteAISInfo struct {
-		URL     string `json:"url"`
-		Alias   string `json:"alias"`
-		Primary string `json:"primary"`
-		Smap    int64  `json:"smap"`
-		Targets int32  `json:"targets"`
-		Online  bool   `json:"online"`
-	}
-
-	BackendConfAIS map[string][]string // cluster alias -> [urls...]
-	BackendInfoAIS map[string]*RemoteAISInfo
-
 	BackendConfHDFS struct {
 		Addresses           []string `json:"addresses"`
 		User                string   `json:"user"`
 		UseDatanodeHostname bool     `json:"use_datanode_hostname"`
 	}
+	BackendConfAIS map[string][]string // cluster alias -> [urls...]
 
 	MirrorConf struct {
-		Copies      int64 `json:"copies"`       // num local copies
-		UtilThresh  int64 `json:"util_thresh"`  // considered equivalent when below threshold
-		Burst       int   `json:"burst_buffer"` // channel buffer size
-		OptimizePUT bool  `json:"optimize_put"` // optimization objective
-		Enabled     bool  `json:"enabled"`      // will only generate local copies when set to true
+		Copies  int64 `json:"copies"`       // num copies
+		Burst   int   `json:"burst_buffer"` // xaction channel (buffer) size
+		Enabled bool  `json:"enabled"`      // enabled (to generate copies)
 	}
 	MirrorConfToUpdate struct {
-		Copies      *int64 `json:"copies,omitempty"`
-		Burst       *int   `json:"burst_buffer,omitempty"`
-		UtilThresh  *int64 `json:"util_thresh,omitempty"`
-		OptimizePUT *bool  `json:"optimize_put,omitempty"`
-		Enabled     *bool  `json:"enabled,omitempty"`
+		Copies  *int64 `json:"copies,omitempty"`
+		Burst   *int   `json:"burst_buffer,omitempty"`
+		Enabled *bool  `json:"enabled,omitempty"`
 	}
 
 	ECConf struct {
-		ObjSizeLimit int64  `json:"objsize_limit"` // objects below this size are replicated instead of EC'ed
-		Compression  string `json:"compression"`   // see CompressAlways, etc. enum
-		DataSlices   int    `json:"data_slices"`   // number of data slices
-		ParitySlices int    `json:"parity_slices"` // number of parity slices/replicas
-		BatchSize    int    `json:"batch_size"`    // Batch size for EC rebalance
-		Enabled      bool   `json:"enabled"`       // EC is enabled
-		DiskOnly     bool   `json:"disk_only"`     // if true, EC does not use SGL - data goes directly to drives
+		ObjSizeLimit int64  `json:"objsize_limit"`     // objects below this size are replicated instead of EC'ed
+		Compression  string `json:"compression"`       // enum { CompressAlways, ... } in api/apc/compression.go
+		SbundleMult  int    `json:"bundle_multiplier"` // stream-bundle multiplier: num streams to destination
+		DataSlices   int    `json:"data_slices"`       // number of data slices
+		ParitySlices int    `json:"parity_slices"`     // number of parity slices/replicas
+		Enabled      bool   `json:"enabled"`           // EC is enabled
+		DiskOnly     bool   `json:"disk_only"`         // if true, EC does not use SGL - data goes directly to drives
 	}
 	ECConfToUpdate struct {
-		Enabled      *bool   `json:"enabled,omitempty"`
 		ObjSizeLimit *int64  `json:"objsize_limit,omitempty"`
-		DataSlices   *int    `json:"data_slices,omitempty"`
-		BatchSize    *int    `json:"batch_size,omitempty"`
-		ParitySlices *int    `json:"parity_slices,omitempty"`
 		Compression  *string `json:"compression,omitempty"`
+		SbundleMult  *int    `json:"bundle_multiplier,omitempty"`
+		DataSlices   *int    `json:"data_slices,omitempty"`
+		ParitySlices *int    `json:"parity_slices,omitempty"`
+		Enabled      *bool   `json:"enabled,omitempty"`
 		DiskOnly     *bool   `json:"disk_only,omitempty"`
 	}
 
 	LogConf struct {
-		Level    string `json:"level"`     // log level aka verbosity
-		MaxSize  uint64 `json:"max_size"`  // size that triggers log rotation
-		MaxTotal uint64 `json:"max_total"` // max total size of all the logs in the log directory
+		Level     cos.LogLevel `json:"level"`      // log level (aka verbosity)
+		MaxSize   cos.SizeIEC  `json:"max_size"`   // exceeding this size triggers log rotation
+		MaxTotal  cos.SizeIEC  `json:"max_total"`  // (sum individual log sizes); exceeding this number triggers cleanup
+		FlushTime cos.Duration `json:"flush_time"` // log flush interval
+		StatsTime cos.Duration `json:"stats_time"` // log stats interval (must be a multiple of `PeriodConf.StatsTime`)
 	}
 	LogConfToUpdate struct {
-		Dir      *string `json:"dir,omitempty"`       // log directory
-		Level    *string `json:"level,omitempty"`     // log level aka verbosity
-		MaxSize  *uint64 `json:"max_size,omitempty"`  // size that triggers log rotation
-		MaxTotal *uint64 `json:"max_total,omitempty"` // max total size of all the logs in the log directory
+		Level     *cos.LogLevel `json:"level,omitempty"`
+		MaxSize   *cos.SizeIEC  `json:"max_size,omitempty"`
+		MaxTotal  *cos.SizeIEC  `json:"max_total,omitempty"`
+		FlushTime *cos.Duration `json:"flush_time,omitempty"`
+		StatsTime *cos.Duration `json:"stats_time,omitempty"`
 	}
 
+	// NOTE: StatsTime is a one important timer
 	PeriodConf struct {
-		StatsTime     cos.Duration `json:"stats_time"`
-		RetrySyncTime cos.Duration `json:"retry_sync_time"`
-		NotifTime     cos.Duration `json:"notif_time"`
+		StatsTime     cos.Duration `json:"stats_time"`      // collect and publish stats; other house-keeping
+		RetrySyncTime cos.Duration `json:"retry_sync_time"` // metasync retry
+		NotifTime     cos.Duration `json:"notif_time"`      // (IC notifications)
 	}
 	PeriodConfToUpdate struct {
 		StatsTime     *cos.Duration `json:"stats_time,omitempty"`
@@ -269,10 +217,11 @@ type (
 
 	// maximum intra-cluster latencies (in the increasing order)
 	TimeoutConf struct {
-		CplaneOperation cos.Duration `json:"cplane_operation"`
-		MaxKeepalive    cos.Duration `json:"max_keepalive"`
+		CplaneOperation cos.Duration `json:"cplane_operation"` // readonly - change requires restart
+		MaxKeepalive    cos.Duration `json:"max_keepalive"`    // ditto (see `timeout struct` below)
 		MaxHostBusy     cos.Duration `json:"max_host_busy"`
 		Startup         cos.Duration `json:"startup_time"`
+		JoinAtStartup   cos.Duration `json:"join_startup_time"` // (join cluster at startup) timeout
 		SendFile        cos.Duration `json:"send_file_time"`
 	}
 	TimeoutConfToUpdate struct {
@@ -280,20 +229,19 @@ type (
 		MaxKeepalive    *cos.Duration `json:"max_keepalive,omitempty"`
 		MaxHostBusy     *cos.Duration `json:"max_host_busy,omitempty"`
 		Startup         *cos.Duration `json:"startup_time,omitempty"`
+		JoinAtStartup   *cos.Duration `json:"join_startup_time,omitempty"`
 		SendFile        *cos.Duration `json:"send_file_time,omitempty"`
 	}
 
 	ClientConf struct {
-		Timeout     cos.Duration `json:"client_timeout"`
-		TimeoutLong cos.Duration `json:"client_long_timeout"`
-		ListObjects cos.Duration `json:"list_timeout"`
-		Features    FeatureFlags `json:"features,string"`
+		Timeout        cos.Duration `json:"client_timeout"`
+		TimeoutLong    cos.Duration `json:"client_long_timeout"`
+		ListObjTimeout cos.Duration `json:"list_timeout"`
 	}
 	ClientConfToUpdate struct {
-		Timeout     *cos.Duration `json:"client_timeout,omitempty"`
-		TimeoutLong *cos.Duration `json:"client_long_timeout,omitempty"`
-		ListObjects *cos.Duration `json:"list_timeout,omitempty"`
-		Features    *FeatureFlags `json:"features,string,omitempty"`
+		Timeout        *cos.Duration `json:"client_timeout,omitempty"` // readonly as far as intra-cluster
+		TimeoutLong    *cos.Duration `json:"client_long_timeout,omitempty"`
+		ListObjTimeout *cos.Duration `json:"list_timeout,omitempty"`
 	}
 
 	ProxyConf struct {
@@ -309,7 +257,11 @@ type (
 		NonElectable *bool   `json:"non_electable,omitempty"`
 	}
 
-	LRUConf struct {
+	SpaceConf struct {
+		// Storage Cleanup watermark: used capacity (%) that triggers cleanup
+		// (deleted objects and buckets, extra copies, etc.)
+		CleanupWM int64 `json:"cleanupwm"`
+
 		// LowWM: used capacity low-watermark (% of total local storage capacity)
 		LowWM int64 `json:"lowwm"`
 
@@ -322,7 +274,15 @@ type (
 		// Out-of-Space: if exceeded, the target starts failing new PUTs and keeps
 		// failing them until its local used-cap gets back below HighWM (see above)
 		OOS int64 `json:"out_of_space"`
+	}
+	SpaceConfToUpdate struct {
+		CleanupWM *int64 `json:"cleanupwm,omitempty"`
+		LowWM     *int64 `json:"lowwm,omitempty"`
+		HighWM    *int64 `json:"highwm,omitempty"`
+		OOS       *int64 `json:"out_of_space,omitempty"`
+	}
 
+	LRUConf struct {
 		// DontEvictTimeStr denotes the period of time during which eviction of an object
 		// is forbidden [atime, atime + DontEvictTime]
 		DontEvictTime cos.Duration `json:"dont_evict_time"`
@@ -334,9 +294,6 @@ type (
 		Enabled bool `json:"enabled"`
 	}
 	LRUConfToUpdate struct {
-		LowWM           *int64        `json:"lowwm,omitempty"`
-		HighWM          *int64        `json:"highwm,omitempty"`
-		OOS             *int64        `json:"out_of_space,omitempty"`
 		DontEvictTime   *cos.Duration `json:"dont_evict_time,omitempty"`
 		CapacityUpdTime *cos.Duration `json:"capacity_upd_time,omitempty"`
 		Enabled         *bool         `json:"enabled,omitempty"`
@@ -358,17 +315,15 @@ type (
 	}
 
 	RebalanceConf struct {
-		DestRetryTime cos.Duration `json:"dest_retry_time"` // max wait for ACKs & neighbors to complete
-		Quiesce       cos.Duration `json:"quiescent"`       // max wait for no-obj before next stage/batch
-		Compression   string       `json:"compression"`     // see CompressAlways, etc. enum
-		Multiplier    uint8        `json:"multiplier"`      // stream-bundle-and-jogger multiplier
-		Enabled       bool         `json:"enabled"`         // true=auto-rebalance | manual rebalancing
+		Compression   string       `json:"compression"`       // enum { CompressAlways, ... } in api/apc/compression.go
+		DestRetryTime cos.Duration `json:"dest_retry_time"`   // max wait for ACKs & neighbors to complete
+		SbundleMult   int          `json:"bundle_multiplier"` // stream-bundle multiplier: num streams to destination
+		Enabled       bool         `json:"enabled"`           // true=auto-rebalance | manual rebalancing
 	}
 	RebalanceConfToUpdate struct {
 		DestRetryTime *cos.Duration `json:"dest_retry_time,omitempty"`
-		Quiesce       *cos.Duration `json:"quiescent,omitempty"`
 		Compression   *string       `json:"compression,omitempty"`
-		Multiplier    *uint8        `json:"multiplier,omitempty"`
+		SbundleMult   *int          `json:"bundle_multiplier"`
 		Enabled       *bool         `json:"enabled,omitempty"`
 	}
 
@@ -376,24 +331,26 @@ type (
 		Enabled bool `json:"enabled"` // true=auto-resilver | manual resilvering
 	}
 	ResilverConfToUpdate struct {
-		Enabled *bool `json:"enabled,omitempty"` // true=auto-resilver | manual resilvering
+		Enabled *bool `json:"enabled,omitempty"`
 	}
 
 	CksumConf struct {
-		// Object checksum; ChecksumNone ("none") disables checksumming.
+		// (note that `ChecksumNone` ("none") disables checksumming)
 		Type string `json:"type"`
 
-		// ValidateColdGet determines whether or not the checksum of received object
-		// is checked after downloading it from remote (cloud) buckets.
+		// validate the checksum of the object that we cold-GET
+		// or download from remote location (e.g., cloud bucket)
 		ValidateColdGet bool `json:"validate_cold_get"`
 
-		// ValidateWarmGet: if enabled, the object's version (if exists) and checksum are checked.
-		// If either value fail to match, the object is removed from local storage.
+		// validate object's version (if exists and provided) and its checksum -
+		// if either value fail to match, the object is removed from ais.
+		//
 		// NOTE: object versioning is backend-specific and is may _not_ be supported by a given
-		//      (supported) backends - see docs for details.
+		// (supported) backends - see docs for details.
 		ValidateWarmGet bool `json:"validate_warm_get"`
 
-		// ValidateObjMove determines if migrated objects should have their checksum validated.
+		// determines whether to validate checksums of objects
+		// migrated or replicated within the cluster
 		ValidateObjMove bool `json:"validate_obj_move"`
 
 		// EnableReadRange: Return read range checksum otherwise return entire object checksum.
@@ -419,7 +376,7 @@ type (
 		ValidateWarmGet *bool `json:"validate_warm_get,omitempty"`
 	}
 
-	TestfspathConf struct {
+	TestFSPConf struct {
 		Root     string `json:"root"`
 		Count    int    `json:"count"`
 		Instance int    `json:"instance"`
@@ -446,16 +403,16 @@ type (
 		ReadBufferSize  int    `json:"read_buffer_size"`  // http.Transport.ReadBufferSize; ditto
 		UseHTTPS        bool   `json:"use_https"`         // use HTTPS instead of HTTP
 		SkipVerify      bool   `json:"skip_verify"`       // skip HTTPS cert verification (used with self-signed certs)
-		Chunked         bool   `json:"chunked_transfer"`  // https://tools.ietf.org/html/rfc7230#page-36
+		Chunked         bool   `json:"chunked_transfer"`  // NOTE: not used Feb 2023
 	}
 	HTTPConfToUpdate struct {
 		Certificate     *string `json:"server_crt,omitempty"`
 		Key             *string `json:"server_key,omitempty"`
-		WriteBufferSize *int    `json:"write_buffer_size,omitempty"`
-		ReadBufferSize  *int    `json:"read_buffer_size,omitempty"`
+		WriteBufferSize *int    `json:"write_buffer_size,omitempty" list:"readonly"`
+		ReadBufferSize  *int    `json:"read_buffer_size,omitempty" list:"readonly"`
 		UseHTTPS        *bool   `json:"use_https,omitempty"`
 		SkipVerify      *bool   `json:"skip_verify,omitempty"`
-		Chunked         *bool   `json:"chunked_transfer,omitempty"`
+		Chunked         *bool   `json:"chunked_transfer,omitempty"` // https://tools.ietf.org/html/rfc7230#page-36
 	}
 
 	FSHCConf struct {
@@ -481,27 +438,25 @@ type (
 	// config for one keepalive tracker
 	// all type of trackers share the same struct, not all fields are used by all trackers
 	KeepaliveTrackerConf struct {
-		Interval cos.Duration `json:"interval"` // keepalive interval
 		Name     string       `json:"name"`     // "heartbeat", "average"
+		Interval cos.Duration `json:"interval"` // keepalive interval
 		Factor   uint8        `json:"factor"`   // only average
 	}
 	KeepaliveTrackerConfToUpdate struct {
 		Interval *cos.Duration `json:"interval,omitempty"`
-		Name     *string       `json:"name,omitempty"`
+		Name     *string       `json:"name,omitempty" list:"readonly"`
 		Factor   *uint8        `json:"factor,omitempty"`
 	}
 
 	KeepaliveConf struct {
-		Proxy         KeepaliveTrackerConf `json:"proxy"`  // how proxy tracks target keepalives
-		Target        KeepaliveTrackerConf `json:"target"` // how target tracks primary proxies keepalives
-		RetryFactor   uint8                `json:"retry_factor"`
-		TimeoutFactor uint8                `json:"timeout_factor"`
+		Proxy       KeepaliveTrackerConf `json:"proxy"`  // how proxy tracks target keepalives
+		Target      KeepaliveTrackerConf `json:"target"` // how target tracks primary proxies keepalives
+		RetryFactor uint8                `json:"retry_factor"`
 	}
 	KeepaliveConfToUpdate struct {
-		Proxy         *KeepaliveTrackerConfToUpdate `json:"proxy,omitempty"`
-		Target        *KeepaliveTrackerConfToUpdate `json:"target,omitempty"`
-		RetryFactor   *uint8                        `json:"retry_factor,omitempty"`
-		TimeoutFactor *uint8                        `json:"timeout_factor,omitempty"`
+		Proxy       *KeepaliveTrackerConfToUpdate `json:"proxy,omitempty"`
+		Target      *KeepaliveTrackerConfToUpdate `json:"target,omitempty"`
+		RetryFactor *uint8                        `json:"retry_factor,omitempty"`
 	}
 
 	DownloaderConf struct {
@@ -518,8 +473,9 @@ type (
 		EKMMissingKey       string       `json:"ekm_missing_key"`
 		DefaultMaxMemUsage  string       `json:"default_max_mem_usage"`
 		CallTimeout         cos.Duration `json:"call_timeout"`
-		Compression         string       `json:"compression"` // enum { CompressAlways, ... }
 		DSorterMemThreshold string       `json:"dsorter_mem_threshold"`
+		Compression         string       `json:"compression"`       // {CompressAlways,...} in api/apc/compression.go
+		SbundleMult         int          `json:"bundle_multiplier"` // stream-bundle multiplier: num to destination
 	}
 	DSortConfToUpdate struct {
 		DuplicatedRecords   *string       `json:"duplicated_records,omitempty"`
@@ -528,37 +484,105 @@ type (
 		EKMMissingKey       *string       `json:"ekm_missing_key,omitempty"`
 		DefaultMaxMemUsage  *string       `json:"default_max_mem_usage,omitempty"`
 		CallTimeout         *cos.Duration `json:"call_timeout,omitempty"`
-		Compression         *string       `json:"compression,omitempty"`
 		DSorterMemThreshold *string       `json:"dsorter_mem_threshold,omitempty"`
+		Compression         *string       `json:"compression,omitempty"`
+		SbundleMult         *int          `json:"bundle_multiplier,omitempty"`
 	}
 
-	FSPathsConf struct {
-		Paths cos.StringSet `json:"paths,omitempty"`
+	FSPConf struct {
+		Paths cos.StrSet `json:"paths,omitempty" list:"readonly"`
 	}
 
-	// lz4 block and frame formats: http://fastcompression.blogspot.com/2013/04/lz4-streaming-format-final.html
-	CompressionConf struct {
-		BlockMaxSize int  `json:"block_size"` // *uncompressed* block max size
-		Checksum     bool `json:"checksum"`   // true: checksum lz4 frames
+	TransportConf struct {
+		MaxHeaderSize int `json:"max_header"`   // max transport header buffer (default=4K)
+		Burst         int `json:"burst_buffer"` // num sends with no back pressure; see also AIS_STREAM_BURST_NUM
+		// two no-new-transmissions durations:
+		// * IdleTeardown: sender terminates the connection (to reestablish it upon the very first/next PDU)
+		// * QuiesceTime:  safe to terminate or transition to the next (in re: rebalance) stage
+		IdleTeardown cos.Duration `json:"idle_teardown"`
+		QuiesceTime  cos.Duration `json:"quiescent"`
+		// lz4
+		// max uncompressed block size, one of [64K, 256K(*), 1M, 4M]
+		// fastcompression.blogspot.com/2013/04/lz4-streaming-format-final.html
+		LZ4BlockMaxSize  cos.SizeIEC `json:"lz4_block"`
+		LZ4FrameChecksum bool        `json:"lz4_frame_checksum"`
 	}
-	CompressionConfToUpdate struct {
-		BlockMaxSize *int  `json:"block_size,omitempty"`
-		Checksum     *bool `json:"checksum,omitempty"`
+	TransportConfToUpdate struct {
+		MaxHeaderSize    *int          `json:"max_header,omitempty" list:"readonly"`
+		Burst            *int          `json:"burst_buffer,omitempty" list:"readonly"`
+		IdleTeardown     *cos.Duration `json:"idle_teardown,omitempty"`
+		QuiesceTime      *cos.Duration `json:"quiescent,omitempty"`
+		LZ4BlockMaxSize  *cos.SizeIEC  `json:"lz4_block,omitempty"`
+		LZ4FrameChecksum *bool         `json:"lz4_frame_checksum,omitempty"`
 	}
 
-	// obsolete; TODO: remove with the next meta-version update
-	ReplicationConf struct {
-		OnColdGet     bool `json:"on_cold_get"`
-		OnPut         bool `json:"on_put"`
-		OnLRUEviction bool `json:"on_lru_eviction"`
+	MemsysConf struct {
+		MinFree        cos.SizeIEC  `json:"min_free"`
+		DefaultBufSize cos.SizeIEC  `json:"default_buf"`
+		SizeToGC       cos.SizeIEC  `json:"to_gc"`
+		HousekeepTime  cos.Duration `json:"hk_time"`
+		MinPctTotal    int          `json:"min_pct_total"`
+		MinPctFree     int          `json:"min_pct_free"`
+	}
+	MemsysConfToUpdate struct {
+		MinFree        *cos.SizeIEC  `json:"min_free,omitempty"`
+		DefaultBufSize *cos.SizeIEC  `json:"default_buf,omitempty"`
+		SizeToGC       *cos.SizeIEC  `json:"to_gc,omitempty"`
+		HousekeepTime  *cos.Duration `json:"hk_time,omitempty"`
+		MinPctTotal    *int          `json:"min_pct_total,omitempty"`
+		MinPctFree     *int          `json:"min_pct_free,omitempty"`
+	}
+
+	TCBConf struct {
+		Compression string `json:"compression"`       // enum { CompressAlways, ... } in api/apc/compression.go
+		SbundleMult int    `json:"bundle_multiplier"` // stream-bundle multiplier: num streams to destination
+	}
+	TCBConfToUpdate struct {
+		Compression *string `json:"compression,omitempty"`
+		SbundleMult *int    `json:"bundle_multiplier,omitempty"`
+	}
+
+	WritePolicyConf struct {
+		Data apc.WritePolicy `json:"data"`
+		MD   apc.WritePolicy `json:"md"`
+	}
+	WritePolicyConfToUpdate struct {
+		Data *apc.WritePolicy `json:"data,omitempty" list:"readonly"` // NOTE: NIY
+		MD   *apc.WritePolicy `json:"md,omitempty"`
 	}
 )
 
-////////////////////////////////////////////
-// config meta-versioning & serialization //
-////////////////////////////////////////////
+// read-mostly and most often used timeouts: assign at startup to reduce the number of GCO.Get() calls
+// updating is done on a best-effort basis (but always upon receiving/updating cluster config)
+type timeout struct {
+	cplane    time.Duration // Config.Timeout.CplaneOperation
+	keepalive time.Duration // ditto MaxKeepalive
+}
 
-// interface guards
+var Timeout = &timeout{
+	cplane:    time.Second + time.Millisecond,
+	keepalive: 2*time.Second + time.Millisecond,
+}
+
+// read-mostly feature flags (ditto)
+var Features feat.Flags
+
+// assorted named fields that require (cluster | node) restart for changes to make an effect
+var ConfigRestartRequired = []string{"auth", "memsys", "net"}
+
+// dsort
+const (
+	IgnoreReaction = "ignore"
+	WarnReaction   = "warn"
+	AbortReaction  = "abort"
+)
+
+var SupportedReactions = []string{IgnoreReaction, WarnReaction, AbortReaction}
+
+//
+// config meta-versioning & serialization
+//
+
 var (
 	_ jsp.Opts = (*ClusterConfig)(nil)
 	_ jsp.Opts = (*LocalConfig)(nil)
@@ -571,122 +595,13 @@ func (*ClusterConfig) JspOpts() jsp.Options  { return configJspOpts }
 func (*LocalConfig) JspOpts() jsp.Options    { return jsp.Plain() }
 func (*ConfigToUpdate) JspOpts() jsp.Options { return configJspOpts }
 
-///////////////////////
-// globalConfigOwner //
-///////////////////////
-
-// GCO (Global Config Owner) is responsible for updating and notifying
-// listeners about any changes in the config. Global Config is loaded
-// at startup and then can be accessed/updated by other services.
-var GCO *globalConfigOwner
-
-func SetConfigInMem(toUpdate *ConfigToUpdate, config *Config, asType string) (err error) {
-	if toUpdate.Vmodule != nil {
-		if err := SetGLogVModule(*toUpdate.Vmodule); err != nil {
-			return fmt.Errorf("failed to set vmodule = %s, err: %v", *toUpdate.Vmodule, err)
-		}
-	}
-	if toUpdate.LogLevel != nil {
-		if err := SetLogLevel(config, *toUpdate.LogLevel); err != nil {
-			return fmt.Errorf("failed to set log level = %s, err: %v", *toUpdate.LogLevel, err)
-		}
-	}
-	err = config.Apply(*toUpdate, asType)
-	return
-}
-
-var clientFeatureList = []struct {
-	name  string
-	value FeatureFlags
-}{
-	{name: "DirectAccess", value: FeatureDirectAccess},
-}
-
-func (gco *globalConfigOwner) Get() *Config {
-	return (*Config)(gco.c.Load())
-}
-
-func (gco *globalConfigOwner) Put(config *Config) {
-	gco.c.Store(unsafe.Pointer(config))
-}
-
-func (gco *globalConfigOwner) GetOverrideConfig() *ConfigToUpdate {
-	return (*ConfigToUpdate)(gco.oc.Load())
-}
-
-func (gco *globalConfigOwner) PutOverrideConfig(config *ConfigToUpdate) {
-	gco.oc.Store(unsafe.Pointer(config))
-}
-
-// NOTE: CopyStruct is a shallow copy which is OK because Config has mostly values with read-only
-//       FSPaths and BackendConf being the only exceptions. May need a *proper* deep copy in the future.
-// NOTE: Cloning a large (and growing) structure may adversely affect performance.
-func (gco *globalConfigOwner) Clone() *Config {
-	config := &Config{}
-
-	cos.CopyStruct(config, gco.Get())
-	return config
-}
-
-// When updating we need to make sure that the update is transaction and no
-// other update can happen when other transaction is in progress. Therefore,
-// we introduce locking mechanism which targets this problem.
-//
-// NOTE: BeginUpdate must be followed by CommitUpdate.
-// NOTE: `ais` package must use config-owner to modify config.
-func (gco *globalConfigOwner) BeginUpdate() *Config {
-	gco.mtx.Lock()
-	return gco.Clone()
-}
-
-// CommitUpdate finalizes config update and notifies listeners.
-// NOTE: `ais` package must use config-owner to modify config.
-func (gco *globalConfigOwner) CommitUpdate(config *Config) {
-	gco.c.Store(unsafe.Pointer(config))
-	gco.mtx.Unlock()
-}
-
-// DiscardUpdate discards commit updates.
-// NOTE: `ais` package must use config-owner to modify config
-func (gco *globalConfigOwner) DiscardUpdate() {
-	gco.mtx.Unlock()
-}
-
-func (gco *globalConfigOwner) SetGlobalConfigPath(path string) {
-	gco.confPath.Store(unsafe.Pointer(&path))
-}
-
-func (gco *globalConfigOwner) GetGlobalConfigPath() (s string) {
-	return *(*string)(gco.confPath.Load())
-}
-
-func (gco *globalConfigOwner) Update(cluConfig *ClusterConfig) (err error) {
-	config := gco.Clone()
-	config.ClusterConfig = *cluConfig
-	override := gco.GetOverrideConfig()
-	if override != nil {
-		err = config.Apply(*override, Daemon)
-	} else {
-		err = config.Validate()
-	}
-	if err != nil {
-		return
-	}
-	gco.Put(config)
-	return
-}
-
-var (
-	SupportedReactions = []string{IgnoreReaction, WarnReaction, AbortReaction}
-	supportedL4Protos  = []string{tcpProto}
-)
-
-// NOTE: new validators must be run via Config.Validate() - see below
 // interface guard
 var (
 	_ Validator = (*BackendConf)(nil)
 	_ Validator = (*CksumConf)(nil)
+	_ Validator = (*LogConf)(nil)
 	_ Validator = (*LRUConf)(nil)
+	_ Validator = (*SpaceConf)(nil)
 	_ Validator = (*MirrorConf)(nil)
 	_ Validator = (*ECConf)(nil)
 	_ Validator = (*VersionConf)(nil)
@@ -699,23 +614,28 @@ var (
 	_ Validator = (*NetConf)(nil)
 	_ Validator = (*DownloaderConf)(nil)
 	_ Validator = (*DSortConf)(nil)
-	_ Validator = (*CompressionConf)(nil)
+	_ Validator = (*TransportConf)(nil)
+	_ Validator = (*MemsysConf)(nil)
+	_ Validator = (*TCBConf)(nil)
+	_ Validator = (*WritePolicyConf)(nil)
 
 	_ PropsValidator = (*CksumConf)(nil)
-	_ PropsValidator = (*LRUConf)(nil)
+	_ PropsValidator = (*SpaceConf)(nil)
 	_ PropsValidator = (*MirrorConf)(nil)
 	_ PropsValidator = (*ECConf)(nil)
+	_ PropsValidator = (*WritePolicyConf)(nil)
 
 	_ json.Marshaler   = (*BackendConf)(nil)
 	_ json.Unmarshaler = (*BackendConf)(nil)
-	_ json.Marshaler   = (*FSPathsConf)(nil)
-	_ json.Unmarshaler = (*FSPathsConf)(nil)
+	_ json.Marshaler   = (*FSPConf)(nil)
+	_ json.Unmarshaler = (*FSPConf)(nil)
 )
 
-/////////////////////////////////
-// Config and its nested *Conf //
-/////////////////////////////////
+/////////////////////////////////////////////
+// Config and its nested (Cluster | Local) //
+/////////////////////////////////////////////
 
+// main config validator
 func (c *Config) Validate() error {
 	if c.ConfigDir == "" {
 		return errors.New("invalid confdir value (must be non-empty)")
@@ -729,7 +649,7 @@ func (c *Config) Validate() error {
 	if err := c.LocalConfig.HostNet.Validate(c); err != nil {
 		return err
 	}
-	if err := c.LocalConfig.FSpaths.Validate(c); err != nil {
+	if err := c.LocalConfig.FSP.Validate(c); err != nil {
 		return err
 	}
 	if err := c.LocalConfig.TestFSP.Validate(c); err != nil {
@@ -737,22 +657,24 @@ func (c *Config) Validate() error {
 	}
 
 	opts := IterOpts{VisitAll: true}
-	return IterFields(c, func(tag string, field IterField) (err error, b bool) {
-		if v, ok := field.Value().(Validator); ok {
-			if err := v.Validate(); err != nil {
-				return err, false
-			}
+	return IterFields(c, vdate, opts)
+}
+
+func vdate(_ string, field IterField) (error, bool) {
+	if v, ok := field.Value().(Validator); ok {
+		if err := v.Validate(); err != nil {
+			return err, false
 		}
-		return nil, false
-	}, opts)
+	}
+	return nil, false
 }
 
 func (c *Config) SetRole(role string) {
-	debug.Assert(role == Target || role == Proxy)
+	debug.Assert(role == apc.Target || role == apc.Proxy)
 	c.role = role
 }
 
-func (c *Config) Apply(updateConf ConfigToUpdate, asType string) (err error) {
+func (c *Config) UpdateClusterConfig(updateConf *ConfigToUpdate, asType string) (err error) {
 	err = c.ClusterConfig.Apply(updateConf, asType)
 	if err != nil {
 		return
@@ -760,7 +682,20 @@ func (c *Config) Apply(updateConf ConfigToUpdate, asType string) (err error) {
 	return c.Validate()
 }
 
-func (c *ClusterConfig) Apply(updateConf ConfigToUpdate, asType string) error {
+// TestingEnv returns true if config is set to a development environment
+// where a single local filesystem is partitioned between all (locally running)
+// targets and is used for both local and Cloud buckets
+func (c *Config) TestingEnv() bool {
+	return c.LocalConfig.TestingEnv()
+}
+
+func (c *Config) FastV(verbosity, fl int) bool { return c.Log.Level.FastV(verbosity, fl) }
+
+///////////////////
+// ClusterConfig //
+///////////////////
+
+func (c *ClusterConfig) Apply(updateConf *ConfigToUpdate, asType string) error {
 	return copyProps(updateConf, c, asType)
 }
 
@@ -771,16 +706,96 @@ func (c *ClusterConfig) String() string {
 	return fmt.Sprintf("Conf v%d[%s]", c.Version, c.UUID)
 }
 
-// TestingEnv returns true if config is set to a development environment
-// where a single local filesystem is partitioned between all (locally running)
-// targets and is used for both local and Cloud buckets
-func (c *Config) TestingEnv() bool {
+/////////////////
+// LocalConfig //
+/////////////////
+
+func (c *LocalConfig) TestingEnv() bool {
 	return c.TestFSP.Count > 0
 }
 
-// validKeepaliveType returns true if the keepalive type is supported.
-func validKeepaliveType(t string) bool {
-	return t == KeepaliveHeartbeatType || t == KeepaliveAverageType
+func (c *LocalConfig) AddPath(mpath string) {
+	debug.Assert(!c.TestingEnv())
+	c.FSP.Paths.Set(mpath)
+}
+
+func (c *LocalConfig) DelPath(mpath string) {
+	debug.Assert(!c.TestingEnv())
+	c.FSP.Paths.Delete(mpath)
+}
+
+////////////////
+// PeriodConf //
+////////////////
+
+func (c *PeriodConf) Validate() error {
+	if c.StatsTime.D() < time.Second || c.StatsTime.D() > time.Minute {
+		return fmt.Errorf("invalid periodic.stats_time=%s (expected range [1s, 1m])",
+			c.StatsTime)
+	}
+	if c.RetrySyncTime.D() < 10*time.Millisecond || c.RetrySyncTime.D() > 10*time.Second {
+		return fmt.Errorf("invalid periodic.retry_sync_time=%s (expected range [10ms, 10s])",
+			c.StatsTime)
+	}
+	if c.NotifTime.D() < time.Second || c.NotifTime.D() > time.Minute {
+		return fmt.Errorf("invalid periodic.notif_time=%s (expected range [1s, 1m])",
+			c.StatsTime)
+	}
+	return nil
+}
+
+/////////////
+// LogConf //
+/////////////
+
+func (c *LogConf) Validate() error {
+	if err := c.Level.Validate(); err != nil {
+		return err
+	}
+	if c.MaxSize < cos.KiB || c.MaxSize > cos.GiB {
+		return fmt.Errorf("invalid log.max_size=%s (expected range [1KB, 1GB])", c.MaxSize)
+	}
+	if c.MaxTotal < cos.MiB || c.MaxTotal > 10*cos.GiB {
+		return fmt.Errorf("invalid log.max_total=%s (expected range [1MB, 10GB])", c.MaxTotal)
+	}
+	if c.MaxSize > c.MaxTotal/2 {
+		return fmt.Errorf("invalid log.max_total=%s, must be >= 2*(log.max_size=%s)", c.MaxTotal, c.MaxSize)
+	}
+	if c.FlushTime.D() > time.Hour {
+		return fmt.Errorf("invalid log.flush_time=%s (expected range [0, 1h)", c.FlushTime)
+	}
+	if c.StatsTime.D() > 10*time.Minute {
+		return fmt.Errorf("invalid log.stats_time=%s (expected range [log.stats_time, 10m])", c.StatsTime)
+	}
+	return nil
+}
+
+////////////////
+// ClientConf //
+////////////////
+
+func (c *ClientConf) Validate() error {
+	if j := c.Timeout.D(); j < time.Second || j > 2*time.Minute {
+		return fmt.Errorf("invalid client.client_timeout=%s (expected range [1s, 2m])", j)
+	}
+	if j := c.TimeoutLong.D(); j < 30*time.Second || j < c.Timeout.D() || j > 30*time.Minute {
+		return fmt.Errorf("invalid client.client_long_timeout=%s (expected range [30s, 30m])", j)
+	}
+	if j := c.ListObjTimeout.D(); j < 2*time.Second || j > 15*time.Minute {
+		return fmt.Errorf("invalid client.list_timeout=%s (expected range [2s, 15m])", j)
+	}
+	return nil
+}
+
+/////////////////
+// BackendConf //
+/////////////////
+
+func (c *BackendConf) keys() (v []string) {
+	for k := range c.Conf {
+		v = append(v, k)
+	}
+	return
 }
 
 func (c *BackendConf) UnmarshalJSON(data []byte) error {
@@ -795,7 +810,7 @@ func (c *BackendConf) Validate() (err error) {
 	for provider := range c.Conf {
 		b := cos.MustMarshal(c.Conf[provider])
 		switch provider {
-		case ProviderAIS:
+		case apc.AIS:
 			var aisConf BackendConfAIS
 			if err := jsoniter.Unmarshal(b, &aisConf); err != nil {
 				return fmt.Errorf("invalid cloud specification: %v", err)
@@ -804,10 +819,9 @@ func (c *BackendConf) Validate() (err error) {
 				if len(urls) == 0 {
 					return fmt.Errorf("no URL(s) to connect to remote AIS cluster %q", alias)
 				}
-				break
 			}
 			c.Conf[provider] = aisConf
-		case ProviderHDFS:
+		case apc.HDFS:
 			var hdfsConf BackendConfHDFS
 			if err := jsoniter.Unmarshal(b, &hdfsConf); err != nil {
 				return fmt.Errorf("invalid cloud specification: %v", err)
@@ -821,7 +835,7 @@ func (c *BackendConf) Validate() (err error) {
 			for _, address := range hdfsConf.Addresses {
 				conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 				if err != nil {
-					glog.Warningf(
+					nlog.Warningf(
 						"Failed to dial %q HDFS address, check connectivity to the HDFS cluster, err: %v",
 						address, err,
 					)
@@ -851,10 +865,10 @@ func (c *BackendConf) Validate() (err error) {
 func (c *BackendConf) setProvider(provider string) {
 	var ns Ns
 	switch provider {
-	case ProviderAmazon, ProviderAzure, ProviderGoogle, ProviderHDFS:
+	case apc.AWS, apc.Azure, apc.GCP, apc.HDFS:
 		ns = NsGlobal
 	default:
-		cos.AssertMsg(false, "unknown backend provider "+provider)
+		debug.Assert(false, "unknown backend provider "+provider)
 	}
 	if c.Providers == nil {
 		c.Providers = map[string]Ns{}
@@ -862,12 +876,15 @@ func (c *BackendConf) setProvider(provider string) {
 	c.Providers[provider] = ns
 }
 
-func (c *BackendConf) ProviderConf(provider string, newConf ...interface{}) (conf interface{}, ok bool) {
-	if len(newConf) > 0 {
-		c.Conf[provider] = newConf[0]
+func (c *BackendConf) Get(provider string) (conf any) {
+	if c, ok := c.Conf[provider]; ok {
+		conf = c
 	}
-	conf, ok = c.Conf[provider]
 	return
+}
+
+func (c *BackendConf) Set(provider string, newConf any) {
+	c.Conf[provider] = newConf
 }
 
 func (c *BackendConf) EqualClouds(o *BackendConf) bool {
@@ -882,10 +899,10 @@ func (c *BackendConf) EqualClouds(o *BackendConf) bool {
 	return true
 }
 
-func (c *BackendConf) EqualRemAIS(o *BackendConf) bool {
+func (c *BackendConf) EqualRemAIS(o *BackendConf, sname string) bool {
 	var oldRemotes, newRemotes BackendConfAIS
-	oais, oko := o.Conf[ProviderAIS]
-	nais, okn := c.Conf[ProviderAIS]
+	oais, oko := o.Conf[apc.AIS]
+	nais, okn := c.Conf[apc.AIS]
 	if !oko && !okn {
 		return true
 	}
@@ -895,8 +912,9 @@ func (c *BackendConf) EqualRemAIS(o *BackendConf) bool {
 	erro := cos.MorphMarshal(oais, &oldRemotes)
 	errn := cos.MorphMarshal(nais, &newRemotes)
 	if erro != nil || errn != nil {
-		glog.Errorf("Failed to compare remote AIS backends: %v, %v", erro, errn)
-		return errn != nil // equal since cannot make use
+		nlog.Errorf("%s: failed to unmarshal remote AIS backends: %v, %v", sname, erro, errn)
+		debug.AssertNoErr(errn)
+		return errn != nil // "equal" when cannot make use
 	}
 	if len(oldRemotes) != len(newRemotes) {
 		return false
@@ -908,6 +926,20 @@ func (c *BackendConf) EqualRemAIS(o *BackendConf) bool {
 	}
 	return true
 }
+
+func (c BackendConfAIS) String() (s string) {
+	for a, urls := range c {
+		if len(s) > 0 {
+			s += "; "
+		}
+		s += fmt.Sprintf("[%s => %v]", a, urls)
+	}
+	return
+}
+
+//////////////
+// DiskConf //
+//////////////
 
 func (c *DiskConf) Validate() (err error) {
 	lwm, hwm, maxwm := c.DiskUtilLowWM, c.DiskUtilHighWM, c.DiskUtilMaxWM
@@ -927,32 +959,81 @@ func (c *DiskConf) Validate() (err error) {
 	return nil
 }
 
-func (c *LRUConf) Validate() (err error) {
-	lwm, hwm, oos := c.LowWM, c.HighWM, c.OOS
-	if lwm <= 0 || hwm < lwm || oos < hwm || oos > 100 {
-		err = fmt.Errorf("invalid lru (lwm, hwm, oos) configuration (%d, %d, %d)", lwm, hwm, oos)
+///////////////
+// SpaceConf //
+///////////////
+
+func (c *SpaceConf) Validate() (err error) {
+	if c.CleanupWM <= 0 || c.LowWM < c.CleanupWM || c.HighWM < c.LowWM || c.OOS < c.HighWM || c.OOS > 100 {
+		err = fmt.Errorf("invalid %s (expecting: 0 < cleanup < low < high < OOS < 100)", c)
 	}
 	return
 }
 
-func (c *LRUConf) ValidateAsProps(_ *ValidationArgs) (err error) {
-	if !c.Enabled {
-		return nil
-	}
-	return c.Validate()
+func (c *SpaceConf) ValidateAsProps(...any) error { return c.Validate() }
+
+func (c *SpaceConf) String() string {
+	return fmt.Sprintf("space config: cleanup=%d%%, low=%d%%, high=%d%%, OOS=%d%%",
+		c.CleanupWM, c.LowWM, c.HighWM, c.OOS)
 }
+
+/////////////
+// LRUConf //
+/////////////
+
+func (c *LRUConf) String() string {
+	if !c.Enabled {
+		return "Disabled"
+	}
+	return fmt.Sprintf("lru.dont_evict_time=%v, lru.capacity_upd_time=%v", c.DontEvictTime, c.CapacityUpdTime)
+}
+
+func (c *LRUConf) Validate() (err error) {
+	if c.CapacityUpdTime.D() < 10*time.Second {
+		err = fmt.Errorf("invalid %s (expecting: lru.capacity_upd_time >= 10s)", c)
+	}
+	return
+}
+
+///////////////
+// CksumConf //
+///////////////
 
 func (c *CksumConf) Validate() (err error) {
 	return cos.ValidateCksumType(c.Type)
 }
 
-func (c *CksumConf) ValidateAsProps(_ *ValidationArgs) (err error) {
+func (c *CksumConf) ValidateAsProps(...any) (err error) {
 	return c.Validate()
 }
 
-func (c *CksumConf) ShouldValidate() bool {
-	return c.ValidateColdGet || c.ValidateObjMove || c.ValidateWarmGet
+func (c *CksumConf) String() string {
+	if c.Type == cos.ChecksumNone {
+		return "Disabled"
+	}
+
+	toValidate := make([]string, 0)
+	add := func(val bool, name string) {
+		if val {
+			toValidate = append(toValidate, name)
+		}
+	}
+	add(c.ValidateColdGet, "ColdGET")
+	add(c.ValidateWarmGet, "WarmGET")
+	add(c.ValidateObjMove, "ObjectMove")
+	add(c.EnableReadRange, "ReadRange")
+
+	toValidateStr := "Nothing"
+	if len(toValidate) > 0 {
+		toValidateStr = strings.Join(toValidate, ",")
+	}
+
+	return fmt.Sprintf("Type: %s | Validate: %s", c.Type, toValidateStr)
 }
+
+/////////////////
+// VersionConf //
+/////////////////
 
 func (c *VersionConf) Validate() error {
 	if !c.Enabled && c.ValidateWarmGet {
@@ -961,13 +1042,28 @@ func (c *VersionConf) Validate() error {
 	return nil
 }
 
-func (c *MirrorConf) Validate() error {
-	if c.UtilThresh < 0 || c.UtilThresh > 100 {
-		return fmt.Errorf("invalid mirror.util_thresh: %v (expected value in range [0, 100])",
-			c.UtilThresh)
+func (c *VersionConf) String() string {
+	if !c.Enabled {
+		return "Disabled"
 	}
+
+	text := "Enabled | Validate on WarmGET: "
+	if c.ValidateWarmGet {
+		text += "yes"
+	} else {
+		text += "no"
+	}
+
+	return text
+}
+
+////////////////
+// MirrorConf //
+////////////////
+
+func (c *MirrorConf) Validate() error {
 	if c.Burst < 0 {
-		return fmt.Errorf("invalid mirror.burst: %v (expected >0)", c.UtilThresh)
+		return fmt.Errorf("invalid mirror.burst_buffer: %v (expected >0)", c.Burst)
 	}
 	if c.Copies < 2 || c.Copies > 32 {
 		return fmt.Errorf("invalid mirror.copies: %d (expected value in range [2, 32])", c.Copies)
@@ -975,21 +1071,29 @@ func (c *MirrorConf) Validate() error {
 	return nil
 }
 
-func (c *MirrorConf) ValidateAsProps(_ *ValidationArgs) error {
+func (c *MirrorConf) ValidateAsProps(...any) error {
 	if !c.Enabled {
 		return nil
 	}
 	return c.Validate()
 }
 
-func (c MDWritePolicy) Validate() (err error) {
-	if c.IsImmediate() || c == WriteDelayed || c == WriteNever {
-		return
+func (c *MirrorConf) String() string {
+	if !c.Enabled {
+		return "Disabled"
 	}
-	return fmt.Errorf("invalid md_write policy %q", c)
+
+	return fmt.Sprintf("%d copies", c.Copies)
 }
 
-func (c MDWritePolicy) ValidateAsProps(_ *ValidationArgs) (err error) { return c.Validate() }
+////////////
+// ECConf //
+////////////
+
+const (
+	MinSliceCount = 1  // minimum number of data or parity slices
+	MaxSliceCount = 32 // maximum --/--
+)
 
 func (c *ECConf) Validate() error {
 	if c.ObjSizeLimit < 0 {
@@ -999,44 +1103,86 @@ func (c *ECConf) Validate() error {
 		return fmt.Errorf("invalid ec.data_slices: %d (expected value in range [%d, %d])",
 			c.DataSlices, MinSliceCount, MaxSliceCount)
 	}
-	// TODO: warn about performance if number is OK but large?
 	if c.ParitySlices < MinSliceCount || c.ParitySlices > MaxSliceCount {
 		return fmt.Errorf("invalid ec.parity_slices: %d (expected value in range [%d, %d])",
 			c.ParitySlices, MinSliceCount, MaxSliceCount)
 	}
-	if c.BatchSize == 0 {
-		c.BatchSize = 64
+	if c.SbundleMult < 0 || c.SbundleMult > 16 {
+		return fmt.Errorf("invalid ec.bundle_multiplier: %v (expected range [0, 16])", c.SbundleMult)
 	}
-	if c.BatchSize < 4 || c.BatchSize > 128 {
-		return fmt.Errorf("invalid ec.batch_size: %d (must be in the range 4..128)", c.ObjSizeLimit)
+	if !apc.IsValidCompression(c.Compression) {
+		return fmt.Errorf("invalid ec.compression: %q (expecting one of: %v)", c.Compression, apc.SupportedCompression)
 	}
 	return nil
 }
 
-func (c *ECConf) ValidateAsProps(args *ValidationArgs) error {
-	const insufficientNodes = "EC config (%d data, %d parity) slices requires at least %d targets (have %d)"
+func (c *ECConf) ValidateAsProps(arg ...any) (err error) {
 	if !c.Enabled {
-		return nil
+		return
 	}
-	if err := c.Validate(); err != nil {
-		return err
+	if err = c.Validate(); err != nil {
+		return
 	}
+	targetCnt, ok := arg[0].(int)
+	debug.Assert(ok)
 	required := c.RequiredEncodeTargets()
-	if c.ParitySlices > args.TargetCnt {
-		return fmt.Errorf(insufficientNodes, c.DataSlices, c.ParitySlices, required, args.TargetCnt)
+	if required <= targetCnt {
+		return
 	}
-	if args.TargetCnt < required {
-		return NewSoftError(fmt.Sprintf(insufficientNodes, c.DataSlices, c.ParitySlices, required, args.TargetCnt))
+	err = fmt.Errorf("%v: EC configuration (d=%d, p=%d slices) requires at least %d targets (have %d)",
+		ErrNotEnoughTargets, c.DataSlices, c.ParitySlices, required, targetCnt)
+	if c.ParitySlices > targetCnt {
+		return
 	}
-	return nil
+	return NewErrSoft(err.Error())
 }
 
-func (*TimeoutConf) Validate() error    { return nil }
-func (*ClientConf) Validate() error     { return nil }
-func (*RebalanceConf) Validate() error  { return nil }
-func (*ResilverConf) Validate() error   { return nil }
-func (*PeriodConf) Validate() error     { return nil }
-func (*DownloaderConf) Validate() error { return nil }
+func (c *ECConf) String() string {
+	if !c.Enabled {
+		return "Disabled"
+	}
+	objSizeLimit := c.ObjSizeLimit
+	return fmt.Sprintf("%d:%d (%s)", c.DataSlices, c.ParitySlices, cos.ToSizeIEC(objSizeLimit, 0))
+}
+
+func (c *ECConf) RequiredEncodeTargets() int {
+	// data slices + parity slices + 1 target for original object
+	return c.DataSlices + c.ParitySlices + 1
+}
+
+func (c *ECConf) RequiredRestoreTargets() int {
+	return c.DataSlices
+}
+
+/////////////////////
+// WritePolicyConf //
+/////////////////////
+
+func (c *WritePolicyConf) Validate() (err error) {
+	err = c.Data.Validate()
+	if err == nil {
+		if !c.Data.IsImmediate() {
+			return fmt.Errorf("invalid write policy for data: %q not implemented yet", c.Data)
+		}
+		err = c.MD.Validate()
+	}
+	return
+}
+
+func (c *WritePolicyConf) ValidateAsProps(...any) error { return c.Validate() }
+
+///////////////////
+// KeepaliveConf //
+///////////////////
+
+const (
+	KeepaliveHeartbeatType = "heartbeat"
+	KeepaliveAverageType   = "average"
+)
+
+func validKeepaliveType(t string) bool {
+	return t == KeepaliveHeartbeatType || t == KeepaliveAverageType
+}
 
 func (c *KeepaliveConf) Validate() (err error) {
 	if !validKeepaliveType(c.Proxy.Name) {
@@ -1048,12 +1194,30 @@ func (c *KeepaliveConf) Validate() (err error) {
 	return nil
 }
 
-func (c *NetConf) Validate() (err error) {
-	if !cos.StringInSlice(c.L4.Proto, supportedL4Protos) {
-		return fmt.Errorf("l4 proto is not recognized %s, expected one of: %s",
-			c.L4.Proto, supportedL4Protos)
+func KeepaliveRetryDuration(cs ...*Config) time.Duration {
+	var c *Config
+	if len(cs) != 0 {
+		c = cs[0]
+	} else {
+		c = GCO.Get()
 	}
+	return c.Timeout.CplaneOperation.D() * time.Duration(c.Keepalive.RetryFactor)
+}
 
+/////////////
+// NetConf //
+/////////////
+
+const (
+	tcpProto   = "tcp"
+	httpProto  = "http"
+	httpsProto = "https"
+)
+
+func (c *NetConf) Validate() (err error) {
+	if c.L4.Proto != tcpProto {
+		return fmt.Errorf("l4 proto %q is not recognized (expecting %s)", c.L4.Proto, tcpProto)
+	}
 	c.HTTP.Proto = httpProto // not validating: read-only, and can take only two values
 	if c.HTTP.UseHTTPS {
 		c.HTTP.Proto = httpsProto
@@ -1061,40 +1225,44 @@ func (c *NetConf) Validate() (err error) {
 	return nil
 }
 
+////////////////////
+// LocalNetConfig //
+////////////////////
+
 func (c *LocalNetConfig) Validate(contextConfig *Config) (err error) {
 	c.Hostname = strings.ReplaceAll(c.Hostname, " ", "")
 	c.HostnameIntraControl = strings.ReplaceAll(c.HostnameIntraControl, " ", "")
 	c.HostnameIntraData = strings.ReplaceAll(c.HostnameIntraData, " ", "")
 
-	if overlap, addr := hostnameListsOverlap(c.Hostname, c.HostnameIntraControl); overlap {
+	if overlap, addr := hostnamesOverlap(c.Hostname, c.HostnameIntraControl); overlap {
 		return fmt.Errorf("public (%s) and intra-cluster control (%s) Hostname lists overlap: %s",
 			c.Hostname, c.HostnameIntraControl, addr)
 	}
-	if overlap, addr := hostnameListsOverlap(c.Hostname, c.HostnameIntraData); overlap {
+	if overlap, addr := hostnamesOverlap(c.Hostname, c.HostnameIntraData); overlap {
 		return fmt.Errorf("public (%s) and intra-cluster data (%s) Hostname lists overlap: %s",
 			c.Hostname, c.HostnameIntraData, addr)
 	}
-	if overlap, addr := hostnameListsOverlap(c.HostnameIntraControl, c.HostnameIntraData); overlap {
+	if overlap, addr := hostnamesOverlap(c.HostnameIntraControl, c.HostnameIntraData); overlap {
 		if ipv4ListsEqual(c.HostnameIntraControl, c.HostnameIntraData) {
-			glog.Warningf("control and data share one intra-cluster network (%s)", c.HostnameIntraData)
+			nlog.Warningf("control and data share one intra-cluster network (%s)", c.HostnameIntraData)
 		} else {
-			glog.Warningf("intra-cluster control (%s) and data (%s) Hostname lists overlap: %s",
+			nlog.Warningf("intra-cluster control (%s) and data (%s) Hostname lists overlap: %s",
 				c.HostnameIntraControl, c.HostnameIntraData, addr)
 		}
 	}
 
 	// Parse ports
 	if _, err := ValidatePort(c.Port); err != nil {
-		return fmt.Errorf("invalid %s port specified: %v", NetworkPublic, err)
+		return fmt.Errorf("invalid %s port specified: %v", NetPublic, err)
 	}
 	if c.PortIntraControl != 0 {
 		if _, err := ValidatePort(c.PortIntraControl); err != nil {
-			return fmt.Errorf("invalid %s port specified: %v", NetworkIntraControl, err)
+			return fmt.Errorf("invalid %s port specified: %v", NetIntraControl, err)
 		}
 	}
 	if c.PortIntraData != 0 {
 		if _, err := ValidatePort(c.PortIntraData); err != nil {
-			return fmt.Errorf("invalid %s port specified: %v", NetworkIntraData, err)
+			return fmt.Errorf("invalid %s port specified: %v", NetIntraData, err)
 		}
 	}
 
@@ -1111,7 +1279,18 @@ func (c *LocalNetConfig) Validate(contextConfig *Config) (err error) {
 	return
 }
 
+///////////////
+// DSortConf //
+///////////////
+
 func (c *DSortConf) Validate() (err error) {
+	if c.SbundleMult < 0 || c.SbundleMult > 16 {
+		return fmt.Errorf("invalid distributed_sort.bundle_multiplier: %v (expected range [0, 16])", c.SbundleMult)
+	}
+	if !apc.IsValidCompression(c.Compression) {
+		return fmt.Errorf("invalid distributed_sort.compression: %q (expecting one of: %v)",
+			c.Compression, apc.SupportedCompression)
+	}
 	return c.ValidateWithOpts(false)
 }
 
@@ -1142,15 +1321,19 @@ func (c *DSortConf) ValidateWithOpts(allowEmpty bool) (err error) {
 				c.DefaultMaxMemUsage, err)
 		}
 	}
-	if _, err := cos.S2B(c.DSorterMemThreshold); err != nil && (!allowEmpty || c.DSorterMemThreshold != "") {
+	if _, err := cos.ParseSize(c.DSorterMemThreshold, cos.UnitsIEC); err != nil && (!allowEmpty || c.DSorterMemThreshold != "") {
 		return fmt.Errorf("invalid distributed_sort.dsorter_mem_threshold: %s (err: %s)",
 			c.DSorterMemThreshold, err)
 	}
 	return nil
 }
 
-func (c *FSPathsConf) UnmarshalJSON(data []byte) (err error) {
-	m := cos.NewStringSet()
+/////////////
+// FSPConf //
+/////////////
+
+func (c *FSPConf) UnmarshalJSON(data []byte) (err error) {
+	m := cos.NewStrSet()
 	err = jsoniter.Unmarshal(data, &m)
 	if err != nil {
 		return
@@ -1159,37 +1342,68 @@ func (c *FSPathsConf) UnmarshalJSON(data []byte) (err error) {
 	return
 }
 
-func (c *FSPathsConf) MarshalJSON() (data []byte, err error) {
+func (c *FSPConf) MarshalJSON() (data []byte, err error) {
 	return cos.MustMarshal(c.Paths), nil
 }
 
-func (c *FSPathsConf) Validate(contextConfig *Config) (err error) {
-	debug.Assertf(cos.StringInSlice(contextConfig.role, []string{Proxy, Target}),
+func (c *FSPConf) Validate(contextConfig *Config) error {
+	debug.Assertf(cos.StringInSlice(contextConfig.role, []string{apc.Proxy, apc.Target}),
 		"unexpected role: %q", contextConfig.role)
 
 	// Don't validate in testing environment.
-	if contextConfig.TestingEnv() || contextConfig.role != Target {
+	if contextConfig.TestingEnv() || contextConfig.role != apc.Target {
 		return nil
 	}
 	if len(c.Paths) == 0 {
-		return fmt.Errorf("expected at least one mountpath in fspaths config")
+		return NewErrInvalidFSPathsConf(ErrNoMountpaths)
 	}
-	cleanMpaths := make(map[string]struct{})
 
-	for k := range c.Paths {
-		cleanMpath, err := ValidateMpath(k)
+	cleanMpaths := make(map[string]struct{})
+	for fspath := range c.Paths {
+		mpath, err := ValidateMpath(fspath)
 		if err != nil {
 			return err
 		}
-		cleanMpaths[cleanMpath] = struct{}{}
+		l := len(mpath)
+		// disallow mountpath nesting
+		for mpath2 := range cleanMpaths {
+			if mpath2 == mpath {
+				err := fmt.Errorf("%q (%q) is duplicated", mpath, fspath)
+				return NewErrInvalidFSPathsConf(err)
+			}
+			if err := IsNestedMpath(mpath, l, mpath2); err != nil {
+				return NewErrInvalidFSPathsConf(err)
+			}
+		}
+		cleanMpaths[mpath] = struct{}{}
 	}
 	c.Paths = cleanMpaths
 	return nil
 }
 
-func (c *TestfspathConf) Validate(contextConfig *Config) (err error) {
+func IsNestedMpath(a string, la int, b string) (err error) {
+	const fmterr = "mountpath nesting is not permitted: %q contains %q"
+	lb := len(b)
+	if la > lb {
+		if a[0:lb] == b && a[lb] == filepath.Separator {
+			err = fmt.Errorf(fmterr, a, b)
+		}
+	} else if la < lb {
+		if b[0:la] == a && b[la] == filepath.Separator {
+			err = fmt.Errorf(fmterr, b, a)
+		}
+	}
+	return
+}
+
+/////////////////
+// TestFSPConf //
+/////////////////
+
+// validate root and (NOTE: testing only) generate and fill-in counted FSP.Paths
+func (c *TestFSPConf) Validate(contextConfig *Config) (err error) {
 	// Don't validate in production environment.
-	if !contextConfig.TestingEnv() || contextConfig.role != Target {
+	if !contextConfig.TestingEnv() || contextConfig.role != apc.Target {
 		return nil
 	}
 
@@ -1199,93 +1413,214 @@ func (c *TestfspathConf) Validate(contextConfig *Config) (err error) {
 	}
 	c.Root = cleanMpath
 
-	// Configure `FSpaths.Paths` as all components, on load, refer to it.
-	contextConfig.FSpaths.Paths = make(cos.StringSet, c.Count)
+	contextConfig.FSP.Paths = make(cos.StrSet, c.Count)
 	for i := 0; i < c.Count; i++ {
 		mpath := filepath.Join(c.Root, fmt.Sprintf("mp%d", i+1))
 		if c.Instance > 0 {
 			mpath = filepath.Join(mpath, strconv.Itoa(c.Instance))
 		}
-		contextConfig.FSpaths.Paths.Add(mpath)
+		contextConfig.FSP.Paths.Set(mpath)
 	}
 	return nil
 }
 
+func (c *TestFSPConf) ValidateMpath(p string) (err error) {
+	debug.Assert(c.Count > 0)
+	for i := 0; i < c.Count; i++ {
+		mpath := filepath.Join(c.Root, fmt.Sprintf("mp%d", i+1))
+		if c.Instance > 0 {
+			mpath = filepath.Join(mpath, strconv.Itoa(c.Instance))
+		}
+		if strings.HasPrefix(p, mpath) {
+			return
+		}
+	}
+	err = fmt.Errorf("%q does not appear to be a valid testing mountpath, where (root=%q, count=%d)",
+		p, c.Root, c.Count)
+	return
+}
+
+// common mountpath validation (NOTE: calls filepath.Clean() every time)
 func ValidateMpath(mpath string) (string, error) {
 	cleanMpath := filepath.Clean(mpath)
 
 	if cleanMpath[0] != filepath.Separator {
-		return mpath, NewInvalidaMountpathError(mpath, "mountpath must be an absolute path")
+		return mpath, NewErrInvalidaMountpath(mpath, "mountpath must be an absolute path")
 	}
 	if cleanMpath == string(filepath.Separator) {
-		return "", NewInvalidaMountpathError(mpath, "root directory is not a valid mountpath")
+		return "", NewErrInvalidaMountpath(mpath, "root directory is not a valid mountpath")
 	}
 	return cleanMpath, nil
 }
 
-// NOTE: uncompressed block sizes - the enum currently supported by the github.com/pierrec/lz4
-func (c *CompressionConf) Validate() (err error) {
-	if c.BlockMaxSize != 64*cos.KiB && c.BlockMaxSize != 256*cos.KiB &&
-		c.BlockMaxSize != cos.MiB && c.BlockMaxSize != 4*cos.MiB {
-		return fmt.Errorf("invalid compression.block_size %d", c.BlockMaxSize)
+////////////////
+// MemsysConf //
+////////////////
+
+func (c *MemsysConf) Validate() (err error) {
+	if c.MinFree > 0 && c.MinFree < 100*cos.MiB {
+		return fmt.Errorf("invalid memsys.min_free %s (cannot be less than 100MB, optimally at least 2GB)", c.MinFree)
+	}
+	if c.DefaultBufSize > 128*cos.KiB {
+		return fmt.Errorf("invalid memsys.default_buf %s (must be a multiple of 4KB in range [4KB, 128KB]", c.DefaultBufSize)
+	}
+	if c.DefaultBufSize%(4*cos.KiB) != 0 {
+		return fmt.Errorf("memsys.default_buf %s must a multiple of 4KB", c.DefaultBufSize)
+	}
+	if c.SizeToGC > cos.TiB {
+		return fmt.Errorf("invalid memsys.to_gc %s (expected range [0, 1TB))", c.SizeToGC)
+	}
+	if c.HousekeepTime.D() > time.Hour {
+		return fmt.Errorf("invalid memsys.hk_time %s (expected range [0, 1h))", c.HousekeepTime)
+	}
+	if c.MinPctTotal < 0 || c.MinPctTotal > 95 {
+		return fmt.Errorf("invalid memsys.min_pct_total %d%%", c.MinPctTotal)
+	}
+	if c.MinPctFree < 0 || c.MinPctFree > 95 {
+		return fmt.Errorf("invalid memsys.min_pct_free %d%%", c.MinPctFree)
 	}
 	return nil
 }
 
-func KeepaliveRetryDuration(cs ...*Config) time.Duration {
-	var c *Config
-	if len(cs) != 0 {
-		c = cs[0]
-	} else {
-		c = GCO.Get()
+///////////////////
+// TransportConf //
+///////////////////
+
+// NOTE: uncompressed block sizes - the enum currently supported by the github.com/pierrec/lz4
+func (c *TransportConf) Validate() (err error) {
+	if c.LZ4BlockMaxSize != 64*cos.KiB && c.LZ4BlockMaxSize != 256*cos.KiB &&
+		c.LZ4BlockMaxSize != cos.MiB && c.LZ4BlockMaxSize != 4*cos.MiB {
+		return fmt.Errorf("invalid transport.block_size %s (expected one of: [64K, 256K, 1MB, 4MB])",
+			c.LZ4BlockMaxSize)
 	}
-	return c.Timeout.CplaneOperation.D() * time.Duration(c.Keepalive.RetryFactor)
+	if c.Burst < 0 {
+		return fmt.Errorf("invalid transport.burst_buffer: %v (expected >0)", c.Burst)
+	}
+	if c.MaxHeaderSize < 0 {
+		return fmt.Errorf("invalid transport.max_header: %v (expected >0)", c.MaxHeaderSize)
+	}
+	if c.IdleTeardown.D() < time.Second {
+		return fmt.Errorf("invalid transport.idle_teardown: %v (expected >= 1s)", c.IdleTeardown)
+	}
+	if c.QuiesceTime.D() < 8*time.Second {
+		return fmt.Errorf("invalid transport.quiescent: %v (expected >= 8s)", c.QuiesceTime)
+	}
+	if c.MaxHeaderSize > 0 && c.MaxHeaderSize < 512 {
+		return fmt.Errorf("invalid transport.max_header: %v (expected >= 512)", c.MaxHeaderSize)
+	}
+	return nil
+}
+
+/////////////
+// TCBConf //
+/////////////
+
+func (c *TCBConf) Validate() error {
+	if c.SbundleMult < 0 || c.SbundleMult > 16 {
+		return fmt.Errorf("invalid tcb.bundle_multiplier: %v (expected range [0, 16])", c.SbundleMult)
+	}
+	if !apc.IsValidCompression(c.Compression) {
+		return fmt.Errorf("invalid tcb.compression: %q (expecting one of: %v)",
+			c.Compression, apc.SupportedCompression)
+	}
+	return nil
+}
+
+/////////////////
+// TimeoutConf //
+/////////////////
+
+func (c *TimeoutConf) Validate() error {
+	if c.CplaneOperation.D() < 10*time.Millisecond {
+		return fmt.Errorf("invalid timeout.cplane_operation=%s", c.CplaneOperation)
+	}
+	if c.MaxKeepalive < 2*c.CplaneOperation {
+		return fmt.Errorf("invalid timeout.max_keepalive=%s, must be >= 2*(cplane_operation=%s)",
+			c.MaxKeepalive, c.CplaneOperation)
+	}
+	if c.MaxHostBusy.D() < 10*time.Second {
+		return fmt.Errorf("invalid timeout.max_host_busy=%s (cannot be less than 10s)", c.MaxHostBusy)
+	}
+	if c.Startup.D() < 30*time.Second {
+		return fmt.Errorf("invalid timeout.startup_time=%s (cannot be less than 30s)", c.Startup)
+	}
+	if c.JoinAtStartup != 0 && c.JoinAtStartup < 2*c.Startup {
+		return fmt.Errorf("invalid timeout.join_startup_time=%s, must be >= 2*(timeout.startup_time=%s)",
+			c.JoinAtStartup, c.Startup)
+	}
+	if c.SendFile.D() < time.Minute {
+		return fmt.Errorf("invalid timeout.send_file_time=%s (cannot be less than 1m)", c.SendFile)
+	}
+	return nil
+}
+
+// once upon startup
+func (d *timeout) Set(cluconf *ClusterConfig) {
+	d.cplane = cluconf.Timeout.CplaneOperation.D()
+	d.keepalive = cluconf.Timeout.MaxKeepalive.D()
+}
+
+func (d *timeout) CplaneOperation() time.Duration { debug.Assert(d.cplane > 0); return d.cplane }
+func (d *timeout) MaxKeepalive() time.Duration    { debug.Assert(d.keepalive > 0); return d.keepalive }
+
+////////////////////
+// DownloaderConf //
+////////////////////
+
+func (c *DownloaderConf) Validate() error {
+	if j := c.Timeout.D(); j < time.Second || j > time.Hour {
+		return fmt.Errorf("invalid downloader.timeout=%s (expected range [1s, 1h])", j)
+	}
+	return nil
 }
 
 ///////////////////
-// feature flags //
+// RebalanceConf //
 ///////////////////
 
-func (cflags FeatureFlags) IsSet(flag FeatureFlags) bool {
-	return cflags&flag == flag
-}
-
-func (cflags FeatureFlags) String() string {
-	return "0x" + strconv.FormatUint(uint64(cflags), 16)
-}
-
-func (cflags FeatureFlags) Describe() string {
-	s := ""
-	for _, flag := range clientFeatureList {
-		if cflags&flag.value != flag.value {
-			continue
-		}
-		if s != "" {
-			s += ","
-		}
-		s += flag.name
+func (c *RebalanceConf) Validate() error {
+	if j := c.DestRetryTime.D(); j < time.Second || j > 10*time.Minute {
+		return fmt.Errorf("invalid rebalance.dest_retry_time=%s (expected range [1s, 10m])", j)
 	}
-	return s
+	if c.SbundleMult < 0 || c.SbundleMult > 16 {
+		return fmt.Errorf("invalid rebalance.bundle_multiplier: %v (expected range [0, 16])", c.SbundleMult)
+	}
+	if !apc.IsValidCompression(c.Compression) {
+		return fmt.Errorf("invalid rebalance.compression: %q (expecting one of: %v)",
+			c.Compression, apc.SupportedCompression)
+	}
+	return nil
 }
 
-///////////////////////////
-//    ConfigToUpdate     //
-//////////////////////////
+func (c *RebalanceConf) String() string {
+	if c.Enabled {
+		return "Enabled"
+	}
+	return "Disabled"
+}
+
+func (*ResilverConf) Validate() error { return nil }
+
+func (c *ResilverConf) String() string {
+	if c.Enabled {
+		return "Enabled"
+	}
+	return "Disabled"
+}
+
+////////////////////
+// ConfigToUpdate //
+////////////////////
 
 // FillFromQuery populates ConfigToUpdate from URL query values
 func (ctu *ConfigToUpdate) FillFromQuery(query url.Values) error {
 	var anyExists bool
 	for key := range query {
-		if key == ActTransient {
+		if key == apc.ActTransient {
 			continue
 		}
 		anyExists = true
 		name, value := strings.ToLower(key), query.Get(key)
-		if name == "log.level" {
-			ctu.LogLevel = &value
-			continue
-		}
-
 		if err := UpdateFieldValue(ctu, name, value); err != nil {
 			return err
 		}
@@ -1321,52 +1656,11 @@ func (ctu *ConfigToUpdate) FillFromKVS(kvs []string) (err error) {
 // misc config utils
 //
 
-func SetLogLevel(config *Config, loglevel string) (err error) {
-	v := flag.Lookup("v").Value
-	if v == nil {
-		return fmt.Errorf("nil -v Value")
-	}
-	err = v.Set(loglevel)
-	if err == nil {
-		config.Log.Level = loglevel
-	}
-	return
-}
+// (rather, use config instance if available)
+func FastV(verbosity, fl int) bool { return GCO.Get().FastV(verbosity, fl) }
 
-// setGLogVModule sets glog's vmodule flag
-// sets 'v' as is, no verificaton is done here
-// syntax for v: target=5,proxy=1, p*=3, etc
-func SetGLogVModule(v string) error {
-	f := flag.Lookup("vmodule")
-	if f == nil {
-		return nil
-	}
-
-	err := f.Value.Set(v)
-	if err == nil {
-		glog.Info("log level vmodule changed to ", v)
-	}
-
-	return err
-}
-
-func ConfigPropList(scopes ...string) []string {
-	scope := Cluster
-	if len(scopes) > 0 {
-		scope = scopes[0]
-	}
-	propList := []string{"vmodule", "log_level", "log.level"}
-	err := IterFields(Config{}, func(tag string, _ IterField) (err error, b bool) {
-		propList = append(propList, tag)
-		return
-	}, IterOpts{Allowed: scope})
-	debug.AssertNoErr(err)
-	return propList
-}
-
-// hostnameListsOverlap checks if two comma-separated ipv4 address lists
-// contain at least one common ipv4 address
-func hostnameListsOverlap(alist, blist string) (overlap bool, addr string) {
+// checks if the two comma-separated IPv4 address lists contain at least one common IPv4
+func hostnamesOverlap(alist, blist string) (overlap bool, addr string) {
 	if alist == "" || blist == "" {
 		return
 	}
@@ -1405,99 +1699,124 @@ func ipv4ListsEqual(alist, blist string) bool {
 	return cos.StrSlicesEqual(al, bl)
 }
 
-/////////
-// jsp //
-/////////
+// is called at startup
+func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) error {
+	debug.Assert(globalConfPath != "" && localConfPath != "")
+	GCO.SetInitialGconfPath(globalConfPath)
 
-func LoadConfig(confPath, localConfPath, daeRole string, config *Config) (err error) {
-	var (
-		overrideConfig *ConfigToUpdate
-		initial        bool
-	)
-	debug.Assert(confPath != "" && localConfPath != "")
-	GCO.SetGlobalConfigPath(confPath)
+	// first, local config
+	if _, err := jsp.LoadMeta(localConfPath, &config.LocalConfig); err != nil {
+		return fmt.Errorf("failed to load plain-text local config %q: %v", localConfPath, err)
+	}
+	nlog.SetLogDirRole(config.LogDir, daeRole)
 
-	// Load local config as plain-text
-	_, err = jsp.Load(localConfPath, &config.LocalConfig, jsp.Plain())
-	if err != nil {
-		return fmt.Errorf("failed to load local config %q, err: %v", localConfPath, err)
-	}
-	glog.SetLogDir(config.LogDir)
+	// Global (aka Cluster) config
+	// Normally, when the node is being deployed the very first time the last updated version
+	// of the config doesn't exist.
+	// In this case, we load the initial plain-text global config from the command-line/environment
+	// specified `globalConfPath`.
+	// Once started, the node then always relies on the last updated version stored in a binary
+	// form (in accordance with the associated ClusterConfig.JspOpts()).
+	globalFpath := filepath.Join(config.ConfigDir, fname.GlobalConfig)
+	if _, err := jsp.LoadMeta(globalFpath, &config.ClusterConfig); err != nil {
+		if !os.IsNotExist(err) {
+			if _, ok := err.(*jsp.ErrUnsupportedMetaVersion); ok {
+				nlog.Errorf(FmtErrBackwardCompat, err)
+			}
+			return fmt.Errorf("failed to load global config %q: %v", globalConfPath, err)
+		}
 
-	// NOTE: If last updated version of config doesn't exist in the configured location,
-	//       global config from `confPath` is loaded as plain-text
-	//       and is only used when the node starts up;
-	//       once started, the node always relies on the last
-	//       updated version of the (global|local) config from the configured location
-	globalFpath := filepath.Join(config.ConfigDir, GlobalConfigFname)
-	_, err = jsp.LoadMeta(globalFpath, &config.ClusterConfig)
-	if os.IsNotExist(err) {
-		glog.Warningf("loading plain-text (initial) global config from %q", confPath)
-		_, err = jsp.Load(confPath, &config.ClusterConfig, jsp.Plain())
-		initial = true
+		// initial plain-text
+		const itxt = "load initial global config"
+		nlog.Warningf("%s %q", itxt, globalConfPath)
+		_, err = jsp.Load(globalConfPath, &config.ClusterConfig, jsp.Plain())
+		if err != nil {
+			return fmt.Errorf("failed to %s %q: %v", itxt, globalConfPath, err)
+		}
+		debug.Assert(config.Version == 0)
+		globalFpath = globalConfPath
+	} else {
+		debug.Assert(config.Version > 0 && config.UUID != "")
 	}
-	if err != nil {
-		return fmt.Errorf("failed to load global config %q, err: %v", confPath, err)
-	}
-	debug.Assert(initial && config.Version == 0 || !initial && config.Version > 0)
+
+	// readonly config which can be updated but
+	// for the change to take an effect the cluster (or the node) must be restarted
+	Features = config.Features
+	Timeout.Set(&config.ClusterConfig)
 
 	config.SetRole(daeRole)
-	overrideConfig, err = loadOverrideConfig(config.ConfigDir)
-	if err != nil {
-		return
+
+	// override config - locally updated global defaults
+	if err := handleOverrideConfig(config); err != nil {
+		return err
 	}
 
-	if overrideConfig != nil {
-		GCO.PutOverrideConfig(overrideConfig)
-		err = config.Apply(*overrideConfig, Daemon)
-	} else {
-		err = config.Validate()
+	// create dirs
+	if err := cos.CreateDir(config.LogDir); err != nil {
+		return fmt.Errorf("failed to create log dir %q: %v", config.LogDir, err)
 	}
-	if err != nil {
-		return
-	}
-
-	if err = cos.CreateDir(config.LogDir); err != nil {
-		return fmt.Errorf("failed to create log dir %q, err: %v", config.LogDir, err)
-	}
-
-	if config.TestingEnv() && daeRole == Target {
-		// Creating directories which were filled in `config.Validate()`.
-		debug.Assert(config.TestFSP.Count == len(config.FSpaths.Paths))
-		for mpath := range config.FSpaths.Paths {
-			// If the `mpath` already exists (eg. it was not removed after kill)
-			// this call will be no-op.
+	if config.TestingEnv() && daeRole == apc.Target {
+		debug.Assert(config.TestFSP.Count == len(config.FSP.Paths))
+		for mpath := range config.FSP.Paths {
 			if err := cos.CreateDir(mpath); err != nil {
-				return fmt.Errorf("failed to create %s mountpath in testing env, err: %v", mpath, err)
+				return fmt.Errorf("failed to create %s mountpath in testing env: %v", mpath, err)
 			}
 		}
 	}
 
-	// glog rotate
-	glog.MaxSize = config.Log.MaxSize
-	if glog.MaxSize > cos.GiB {
-		glog.Warningf("log.max_size %d exceeded 1GB, setting the default 1MB", glog.MaxSize)
-		glog.MaxSize = cos.MiB
+	// rotate log
+	nlog.MaxSize = int64(config.Log.MaxSize)
+	if nlog.MaxSize > cos.GiB {
+		nlog.Warningf("log.max_size %d exceeds 1GB, setting log.max_size=4MB", nlog.MaxSize)
+		nlog.MaxSize = 4 * cos.MiB
+	}
+	// log header
+	nlog.Infof("log.dir: %q; l4.proto: %s; pub port: %d; verbosity: %s",
+		config.LogDir, config.Net.L4.Proto, config.HostNet.Port, config.Log.Level.String())
+	nlog.Infof("config: %q; stats_time: %v; authentication: %t; backends: %v",
+		globalFpath, config.Periodic.StatsTime, config.Auth.Enabled, config.Backend.keys())
+	return nil
+}
+
+func handleOverrideConfig(config *Config) error {
+	overrideConfig, err := loadOverrideConfig(config.ConfigDir)
+	if err != nil {
+		return err
+	}
+	if overrideConfig == nil {
+		return config.Validate() // always validate
 	}
 
-	if err = SetLogLevel(config, config.Log.Level); err != nil {
-		return fmt.Errorf("failed to set log level %q, err: %s", config.Log.Level, err)
+	// update config with locally-stored 'OverrideConfigFname' and validate the result
+	GCO.PutOverrideConfig(overrideConfig)
+	if overrideConfig.FSP != nil {
+		config.LocalConfig.FSP = *overrideConfig.FSP // override local config's fspaths
+		overrideConfig.FSP = nil
 	}
-	glog.Infof("log.dir: %q; l4.proto: %s; port: %d; verbosity: %s",
-		config.LogDir, config.Net.L4.Proto, config.HostNet.Port, config.Log.Level)
-	glog.Infof("config_file: %q periodic.stats_time: %v", confPath, config.Periodic.StatsTime)
+	return config.UpdateClusterConfig(overrideConfig, apc.Daemon)
+}
+
+func SaveOverrideConfig(configDir string, toUpdate *ConfigToUpdate) error {
+	return jsp.SaveMeta(path.Join(configDir, fname.OverrideConfig), toUpdate, nil)
+}
+
+func loadOverrideConfig(configDir string) (toUpdate *ConfigToUpdate, err error) {
+	toUpdate = &ConfigToUpdate{}
+	_, err = jsp.LoadMeta(path.Join(configDir, fname.OverrideConfig), toUpdate)
+	if os.IsNotExist(err) {
+		err = nil
+	}
 	return
 }
 
-func SaveOverrideConfig(configDir string, config *ConfigToUpdate) error {
-	return jsp.SaveMeta(path.Join(configDir, OverrideConfigFname), config, nil)
-}
-
-func loadOverrideConfig(configDir string) (config *ConfigToUpdate, err error) {
-	config = &ConfigToUpdate{}
-	_, err = jsp.LoadMeta(path.Join(configDir, OverrideConfigFname), config)
-	if os.IsNotExist(err) {
-		err = nil
+func ValidateRemAlias(alias string) (err error) {
+	if alias == apc.QparamWhat {
+		return fmt.Errorf("cannot use %q as an alias", apc.QparamWhat)
+	}
+	if len(alias) < 2 {
+		err = fmt.Errorf("alias %q is too short: must have at least 2 letters", alias)
+	} else if !cos.IsAlphaPlus(alias) {
+		err = fmt.Errorf("alias %q is invalid: use only letters, numbers, dashes (-), and underscores (_)", alias)
 	}
 	return
 }

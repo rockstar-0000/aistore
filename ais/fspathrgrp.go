@@ -1,107 +1,75 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"fmt"
+	"sync"
+
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/volume"
+	"github.com/NVIDIA/aistore/xact/xreg"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
-const (
-	addMpathAct     = "Added"
-	enableMpathAct  = "Enabled"
-	removeMpathAct  = "Removed"
-	disableMpathAct = "Disabled"
-)
+type fsprungroup struct {
+	t      *target
+	newVol bool
+}
 
-type (
-	fsprungroup struct {
-		t *targetrunner
-	}
-)
-
-func (g *fsprungroup) init(t *targetrunner) {
+func (g *fsprungroup) init(t *target, newVol bool) {
 	g.t = t
+	g.newVol = newVol
 }
 
-// enableMountpath enables mountpath and notifies necessary runners about the
+//
+// add | re-enable
+//
+
+// enableMpath enables mountpath and notifies necessary runners about the
 // change if mountpath actually was disabled.
-func (g *fsprungroup) enableMountpath(mpath string) (enabledMi *fs.MountpathInfo, err error) {
-	gfnActive := g.t.gfn.local.Activate()
-	enabledMi, err = fs.EnableMpath(mpath, g.t.si.ID(), g.redistributeMD)
+func (g *fsprungroup) enableMpath(mpath string) (enabledMi *fs.Mountpath, err error) {
+	enabledMi, err = fs.EnableMpath(mpath, g.t.SID(), g.redistributeMD)
 	if err != nil || enabledMi == nil {
-		if !gfnActive {
-			g.t.gfn.local.Deactivate()
-		}
 		return
 	}
-
-	g._postaddmi(enableMpathAct, enabledMi)
+	g._postAdd(apc.ActMountpathEnable, enabledMi)
 	return
 }
 
-// disableMountpath disables mountpath and notifies necessary runners about the
-// change if mountpath actually was disabled.
-func (g *fsprungroup) disableMountpath(mpath string) (disabledMi *fs.MountpathInfo, err error) {
-	gfnActive := g.t.gfn.local.Activate()
-	disabledMi, err = fs.Disable(mpath, g.redistributeMD)
-	if err != nil || disabledMi == nil {
-		if !gfnActive {
-			g.t.gfn.local.Deactivate()
-		}
-		return
-	}
-
-	g._postdelmi(disableMpathAct, disabledMi)
-	return
-}
-
-// addMountpath adds mountpath and notifies necessary runners about the change
+// attachMpath adds mountpath and notifies necessary runners about the change
 // if the mountpath was actually added.
-func (g *fsprungroup) addMountpath(mpath string) (addedMi *fs.MountpathInfo, err error) {
-	gfnActive := g.t.gfn.local.Activate()
-	addedMi, err = fs.AddMpath(mpath, g.t.si.ID(), g.redistributeMD)
+func (g *fsprungroup) attachMpath(mpath string, force bool) (addedMi *fs.Mountpath, err error) {
+	addedMi, err = fs.AddMpath(mpath, g.t.SID(), g.redistributeMD, force)
 	if err != nil || addedMi == nil {
-		if !gfnActive {
-			g.t.gfn.local.Deactivate()
-		}
 		return
 	}
 
-	g._postaddmi(addMpathAct, addedMi)
+	g._postAdd(apc.ActMountpathAttach, addedMi)
 	return
 }
 
-// removeMountpath removes mountpath and notifies necessary runners about the
-// change if the mountpath was actually removed.
-func (g *fsprungroup) removeMountpath(mpath string) (removedMi *fs.MountpathInfo, err error) {
-	gfnActive := g.t.gfn.local.Activate()
-	removedMi, err = fs.Remove(mpath, g.redistributeMD)
-	if err != nil || removedMi == nil {
-		if !gfnActive {
-			g.t.gfn.local.Deactivate()
-		}
-		return
-	}
+func (g *fsprungroup) _postAdd(action string, mi *fs.Mountpath) {
+	// TODO 1: Currently, dSort doesn't handle adding/enabling mountpaths at runtime
+	// TODO 2: Integrate with xreg.LimitedCoexistence
+	dsort.Managers.AbortAll(fmt.Errorf("%q %s", action, mi))
 
-	g._postdelmi(removeMpathAct, removedMi)
-	return
-}
-
-func (g *fsprungroup) _postaddmi(action string, mi *fs.MountpathInfo) {
-	xreg.AbortAllMountpathsXactions()
+	fspathsConfigAddDel(mi.Path, true /*add*/)
 	go func() {
 		if cmn.GCO.Get().Resilver.Enabled {
-			g.t.runResilver("" /*uuid*/, nil /*wg*/, false /*skipGlobMisplaced*/)
+			g.t.runResilver(res.Args{}, nil /*wg*/)
 		}
-		xreg.RenewMakeNCopies(g.t, cos.GenUUID(), "add-mp")
+		xreg.RenewMakeNCopies(g.t, cos.GenUUID(), action)
 	}()
 
 	g.checkEnable(action, mi.Path)
@@ -112,20 +80,159 @@ func (g *fsprungroup) _postaddmi(action string, mi *fs.MountpathInfo) {
 	}
 }
 
-func (g *fsprungroup) _postdelmi(action string, mi *fs.MountpathInfo) {
-	xreg.AbortAllMountpathsXactions()
+//
+// remove | disable
+//
 
-	go mi.EvictLomCache()
-	if g.checkZeroMountpaths(action) {
+// disableMpath disables mountpath and notifies necessary runners about the
+// change if mountpath actually was disabled.
+func (g *fsprungroup) disableMpath(mpath string, dontResilver bool) (*fs.Mountpath, error) {
+	return g.doDD(apc.ActMountpathDisable, fs.FlagBeingDisabled, mpath, dontResilver)
+}
+
+// detachMpath removes mountpath and notifies necessary runners about the
+// change if the mountpath was actually removed.
+func (g *fsprungroup) detachMpath(mpath string, dontResilver bool) (*fs.Mountpath, error) {
+	return g.doDD(apc.ActMountpathDetach, fs.FlagBeingDetached, mpath, dontResilver)
+}
+
+func (g *fsprungroup) doDD(action string, flags uint64, mpath string, dontResilver bool) (*fs.Mountpath, error) {
+	rmi, numAvail, noResil, err := fs.BeginDD(action, flags, mpath)
+	if err != nil || rmi == nil {
+		return nil, err
+	}
+
+	// TODO 1: Currently, dSort doesn't handle detaching/disabling mountpaths at runtime
+	// TODO 2: Integrate with xreg.LimitedCoexistence
+	dsort.Managers.AbortAll(fmt.Errorf("%q %s", action, rmi))
+
+	if numAvail == 0 {
+		s := fmt.Sprintf("%s: lost (via %q) the last available mountpath %q", g.t.si, action, rmi)
+		g.postDD(rmi, action, nil /*xaction*/, nil /*error*/) // go ahead to disable/detach
+		g.t.disable(s)
+		return rmi, nil
+	}
+
+	rmi.EvictLomCache()
+
+	if noResil || dontResilver || !cmn.GCO.Get().Resilver.Enabled {
+		nlog.Infof("%s: %q %s: no resilvering (%t, %t, %t)", g.t, action, rmi,
+			noResil, !dontResilver, cmn.GCO.Get().Resilver.Enabled)
+		g.postDD(rmi, action, nil /*xaction*/, nil /*error*/) // ditto (compare with the one below)
+		return rmi, nil
+	}
+
+	prevActive := g.t.res.IsActive(1 /*interval-of-inactivity multiplier*/)
+	if prevActive {
+		nlog.Infof("%s: %q %s: starting to resilver when previous (resilvering) is active", g.t, action, rmi)
+	} else {
+		nlog.Infof("%s: %q %s: starting to resilver", g.t, action, rmi)
+	}
+	args := res.Args{
+		Rmi:             rmi,
+		Action:          action,
+		PostDD:          g.postDD,    // callback when done
+		SingleRmiJogger: !prevActive, // NOTE: optimization for the special/common case
+	}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go g.t.runResilver(args, wg)
+	wg.Wait()
+
+	return rmi, nil
+}
+
+func (g *fsprungroup) postDD(rmi *fs.Mountpath, action string, xres *xs.Resilver, err error) {
+	// 1. handle error
+	if err == nil && xres != nil {
+		err = xres.AbortErr()
+	}
+	if err != nil {
+		if errCause := cmn.AsErrAborted(err); errCause != nil {
+			err = errCause
+		}
+		if err == cmn.ErrXactUserAbort {
+			nlog.Errorf("[post-dd interrupted - clearing the state] %s: %q %s %s: %v",
+				g.t.si, action, rmi, xres, err)
+			rmi.ClearDD()
+		} else {
+			nlog.Errorf("[post-dd interrupted - keeping the state] %s: %q %s %s: %v",
+				g.t.si, action, rmi, xres, err)
+		}
 		return
 	}
 
-	go func() {
-		if cmn.GCO.Get().Resilver.Enabled {
-			g.t.runResilver("" /*uuid*/, nil /*wg*/, false /*skipGlobMisplaced*/)
+	// 2. this action
+	if action == apc.ActMountpathDetach {
+		_, err = fs.Remove(rmi.Path, g.redistributeMD)
+	} else {
+		debug.Assert(action == apc.ActMountpathDisable)
+		_, err = fs.Disable(rmi.Path, g.redistributeMD)
+	}
+	if err != nil {
+		nlog.Errorln(err)
+		return
+	}
+	fspathsConfigAddDel(rmi.Path, false /*add*/)
+	nlog.Infof("%s: %s %q %s done", g.t, rmi, action, xres)
+
+	// 3. the case of multiple overlapping detach _or_ disable operations
+	//    (ie., commit previously aborted xs.Resilver, if any)
+	availablePaths := fs.GetAvail()
+	for _, mi := range availablePaths {
+		if !mi.IsAnySet(fs.FlagWaitingDD) {
+			continue
 		}
-		xreg.RenewMakeNCopies(g.t, cos.GenUUID(), "del-mp")
-	}()
+		// TODO: assumption that `action` is the same for all
+		if action == apc.ActMountpathDetach {
+			_, err = fs.Remove(mi.Path, g.redistributeMD)
+		} else {
+			debug.Assert(action == apc.ActMountpathDisable)
+			_, err = fs.Disable(mi.Path, g.redistributeMD)
+		}
+		if err != nil {
+			nlog.Errorln(err)
+			return
+		}
+		fspathsConfigAddDel(mi.Path, false /*add*/)
+		nlog.Infof("%s: %s %s %s was previously aborted and now done", g.t, action, mi, xres)
+	}
+}
+
+// store updated fspaths locally as part of the 'OverrideConfigFname'
+// and commit new version of the config
+func fspathsConfigAddDel(mpath string, add bool) {
+	config := cmn.GCO.Get()
+	if config.TestingEnv() { // since testing fspaths are counted, not enumerated
+		return
+	}
+	config = cmn.GCO.BeginUpdate()
+	localConfig := &config.LocalConfig
+	if add {
+		localConfig.AddPath(mpath)
+	} else {
+		localConfig.DelPath(mpath)
+	}
+	if err := localConfig.FSP.Validate(config); err != nil {
+		debug.AssertNoErr(err)
+		cmn.GCO.DiscardUpdate()
+		nlog.Errorln(err)
+		return
+	}
+	// do
+	fspathsSave(config)
+}
+
+func fspathsSave(config *cmn.Config) {
+	toUpdate := &cmn.ConfigToUpdate{FSP: &config.LocalConfig.FSP}
+	overrideConfig := cmn.GCO.SetLocalFSPaths(toUpdate)
+	if err := cmn.SaveOverrideConfig(config.ConfigDir, overrideConfig); err != nil {
+		debug.AssertNoErr(err)
+		cmn.GCO.DiscardUpdate()
+		nlog.Errorln(err)
+		return
+	}
+	cmn.GCO.CommitUpdate(config)
 }
 
 // NOTE: executes under mfs lock
@@ -133,39 +240,30 @@ func (g *fsprungroup) redistributeMD() {
 	if !hasEnoughBMDCopies() {
 		bo := g.t.owner.bmd
 		if err := bo.persist(bo.get(), nil); err != nil {
-			debug.AssertNoErr(err)
-			cos.ExitLogf("%v", err)
+			cos.ExitLog(err)
 		}
 	}
-	if _, err := fs.CreateNewVMD(g.t.si.ID()); err != nil {
-		debug.AssertNoErr(err)
-		cos.ExitLogf("%v", err)
-	}
-}
 
-// Check for no mountpaths and unregister(disable) the target if detected.
-func (g *fsprungroup) checkZeroMountpaths(action string) (disabled bool) {
-	availablePaths, _ := fs.Get()
-	if len(availablePaths) > 0 {
-		return false
+	if !hasEnoughEtlMDCopies() {
+		eo := g.t.owner.etl
+		if err := eo.persist(eo.get(), nil); err != nil {
+			cos.ExitLog(err)
+		}
 	}
-	if err := g.t.disable(); err != nil {
-		glog.Errorf("%s the last available mountpath, failed to unregister target %s (self), err: %v",
-			action, g.t.si, err)
-	} else {
-		glog.Errorf("%s the last available mountpath and unregistered target %s (self)", action, g.t.si)
+
+	if _, err := volume.NewFromMPI(g.t.SID()); err != nil {
+		cos.ExitLog(err)
 	}
-	return true
 }
 
 func (g *fsprungroup) checkEnable(action, mpath string) {
-	availablePaths, _ := fs.Get()
+	availablePaths := fs.GetAvail()
 	if len(availablePaths) > 1 {
-		glog.Infof("%s mountpath %s", action, mpath)
+		nlog.Infof("%s mountpath %s", action, mpath)
 	} else {
-		glog.Infof("%s the first mountpath %s", action, mpath)
+		nlog.Infof("%s the first mountpath %s", action, mpath)
 		if err := g.t.enable(); err != nil {
-			glog.Errorf("Failed to re-register %s (self), err: %v", g.t.si, err)
+			nlog.Errorf("Failed to re-join %s (self), err: %v", g.t, err)
 		}
 	}
 }

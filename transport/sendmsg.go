@@ -1,7 +1,7 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -9,10 +9,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 // message stream & private types
@@ -32,16 +30,23 @@ type (
 // interface guard
 var _ streamer = (*MsgStream)(nil)
 
-func (s *MsgStream) terminate() {
+func (s *MsgStream) terminate(err error, reason string) (actReason string, actErr error) {
+	ok := s.term.done.CAS(false, true)
+	debug.Assert(ok, s.String())
+
 	s.term.mu.Lock()
-	debug.Assert(!s.term.terminated)
-	s.term.terminated = true
-
+	if s.term.err == nil {
+		s.term.err = err
+	}
+	if s.term.reason == "" {
+		s.term.reason = reason
+	}
 	s.Stop()
-
+	actReason, actErr = s.term.reason, s.term.err
 	s.term.mu.Unlock()
 
 	gc.remove(&s.streamBase)
+	return
 }
 
 func (*MsgStream) abortPending(error, bool) {}
@@ -59,7 +64,7 @@ func (s *MsgStream) Read(b []byte) (n int, err error) {
 	if s.inSend() {
 		msg := &s.msgoff.msg
 		n, err = s.send(b)
-		if msg.IsLast() {
+		if msg.isFin() {
 			err = io.EOF
 		}
 		return
@@ -69,23 +74,23 @@ repeat:
 	case msg, ok := <-s.workCh:
 		if !ok {
 			err = fmt.Errorf("%s closed prior to stopping", s)
-			glog.Warning(err)
+			nlog.Warningln(err)
 			return
 		}
 		s.msgoff.msg = *msg
-		if s.msgoff.msg.IsIdleTick() {
+		if s.msgoff.msg.isIdleTick() {
 			if len(s.workCh) > 0 {
 				goto repeat
 			}
 			return s.deactivate()
 		}
-		l := insMsg(s.maxheader, &s.msgoff.msg)
-		s.header = s.maxheader[:l]
+		l := insMsg(s.maxhdr, &s.msgoff.msg)
+		s.header = s.maxhdr[:l]
 		s.msgoff.ins = inHdr
 		return s.send(b)
 	case <-s.stopCh.Listen():
 		num := s.stats.Num.Load()
-		glog.Infof("%s: stopped (%d/%d)", s, s.Numcur, num)
+		nlog.Infof("%s: stopped (%d/%d)", s, s.Numcur, num)
 		err = io.EOF
 	}
 	return
@@ -99,13 +104,13 @@ func (s *MsgStream) send(b []byte) (n int, err error) {
 		s.stats.Offset.Add(int64(s.msgoff.off))
 		if verbose {
 			num := s.stats.Num.Load()
-			glog.Infof("%s: hlen=%d (%d/%d)", s, s.msgoff.off, s.Numcur, num)
+			nlog.Infof("%s: hlen=%d (%d/%d)", s, s.msgoff.off, s.Numcur, num)
 		}
 		s.msgoff.ins = inEOB
 		s.msgoff.off = 0
-		if s.msgoff.msg.IsLast() {
+		if s.msgoff.msg.isFin() {
 			if verbose {
-				glog.Infof("%s: sent last", s)
+				nlog.Infof("%s: sent last", s)
 			}
 			err = io.EOF
 			s.lastCh.Close()
@@ -119,8 +124,8 @@ func (s *MsgStream) inSend() bool { return s.msgoff.ins == inHdr }
 func (s *MsgStream) dryrun() {
 	var (
 		body = io.NopCloser(s)
-		h    = &handler{trname: s.trname, mm: memsys.DefaultSmallMM()}
-		it   = iterator{handler: h, body: body, hbuf: make([]byte, maxHeaderSize)}
+		h    = &handler{trname: s.trname}
+		it   = iterator{handler: h, body: body, hbuf: make([]byte, dfltMaxHdr)}
 	)
 	for {
 		hlen, flags, err := it.nextProtoHdr(s.String())
@@ -128,7 +133,7 @@ func (s *MsgStream) dryrun() {
 			break
 		}
 		debug.AssertNoErr(err)
-		debug.Assert(flags&msgFlag != 0)
+		debug.Assert(flags&msgFl != 0)
 		_, _ = it.nextMsg(s.String(), hlen)
 		if err != nil {
 			break
@@ -137,7 +142,7 @@ func (s *MsgStream) dryrun() {
 }
 
 // gc: drain terminated stream
-func (s *MsgStream) drain() {
+func (s *MsgStream) drain(error) {
 	for {
 		select {
 		case <-s.workCh:
@@ -151,34 +156,15 @@ func (s *MsgStream) drain() {
 func (s *MsgStream) closeAndFree() {
 	close(s.workCh)
 
-	s.mm.Free(s.maxheader)
+	s.mm.Free(s.maxhdr)
 }
 
 // gc: post idle tick if idle
 func (s *MsgStream) idleTick() {
 	if len(s.workCh) == 0 && s.sessST.CAS(active, inactive) {
-		s.workCh <- &Msg{Flags: tickMarker}
+		s.workCh <- &Msg{Opcode: opcIdleTick}
 		if verbose {
-			glog.Infof("%s: active => inactive", s)
+			nlog.Infof("%s: active => inactive", s)
 		}
 	}
-}
-
-////////////////////
-// Msg and MsgHdr //
-////////////////////
-
-func (msg *Msg) IsLast() bool     { return msg.Flags == lastMarker }
-func (msg *Msg) IsIdleTick() bool { return msg.Flags == tickMarker }
-func (*Msg) IsHeaderOnly() bool   { return true }
-
-func (msg *Msg) String() string {
-	if msg.IsLast() {
-		return "smsg-last"
-	}
-	if msg.IsIdleTick() {
-		return "smsg-tick"
-	}
-	l := cos.Min(len(msg.Body), 16)
-	return fmt.Sprintf("smsg-[%s](len=%d)", msg.Body[:l], l)
 }

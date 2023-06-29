@@ -1,26 +1,24 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
-	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/k8s"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 const (
@@ -41,27 +39,6 @@ func (na netAccess) isSet(flag netAccess) bool {
 	return na&flag == flag
 }
 
-func isIntraPut(hdr http.Header) bool { return hdr != nil && hdr.Get(cmn.HdrPutterID) != "" }
-
-func isRedirect(q url.Values) (ptime string) {
-	if len(q) == 0 || q.Get(cmn.URLParamProxyID) == "" {
-		return
-	}
-	return q.Get(cmn.URLParamUnixTime)
-}
-
-func ptLatency(started time.Time, ptime string) (delta int64) {
-	pts, err := cos.S2UnixNano(ptime)
-	if err != nil {
-		return
-	}
-	delta = started.UnixNano() - pts
-	if delta < 0 && -delta < int64(clusterClockDrift) {
-		delta = 0
-	}
-	return
-}
-
 //
 // IPV4
 //
@@ -77,12 +54,12 @@ func getLocalIPv4List() (addrlist []*localIPv4Info, err error) {
 	addrlist = make([]*localIPv4Info, 0, 4)
 	addrs, e := net.InterfaceAddrs()
 	if e != nil {
-		err = fmt.Errorf("failed to get host unicast IPs, err: %v", e)
+		err = fmt.Errorf("failed to get host unicast IPs, err: %w", e)
 		return
 	}
 	iflist, e := net.Interfaces()
 	if e != nil {
-		err = fmt.Errorf("failed to get interface list: %v", e)
+		err = fmt.Errorf("failed to get interface list: %w", e)
 		return
 	}
 
@@ -132,17 +109,17 @@ func getLocalIPv4List() (addrlist []*localIPv4Info, err error) {
 // selectConfiguredHostname returns the first Hostname from a preconfigured Hostname list that
 // matches any local unicast IPv4
 func selectConfiguredHostname(addrlist []*localIPv4Info, configuredList []string) (hostname string, err error) {
-	glog.Infof("Selecting one of the configured IPv4 addresses: %s...", configuredList)
+	nlog.Infof("Selecting one of the configured IPv4 addresses: %s...", configuredList)
 
 	var localList, ipv4 string
 	for i, host := range configuredList {
 		if net.ParseIP(host) != nil {
 			ipv4 = strings.TrimSpace(host)
 		} else {
-			glog.Warningf("failed to parse IP for hostname %q", host)
+			nlog.Warningf("failed to parse IP for hostname %q", host)
 			ip, err := resolveHostIPv4(host)
 			if err != nil {
-				glog.Errorf("failed to get IPv4 for host=%q; err %v", host, err)
+				nlog.Errorf("failed to get IPv4 for host=%q; err %v", host, err)
 				continue
 			}
 			ipv4 = ip.String()
@@ -152,35 +129,37 @@ func selectConfiguredHostname(addrlist []*localIPv4Info, configuredList []string
 				localList += " " + localaddr.ipv4
 			}
 			if localaddr.ipv4 == ipv4 {
-				glog.Warningf("Selected IPv4 %s from the configuration file", ipv4)
+				nlog.Warningf("Selected IPv4 %s from the configuration file", ipv4)
 				return host, nil
 			}
 		}
 	}
 
-	glog.Errorf("Configured Hostname does not match any local one.\nLocal IPv4 list:%s; Configured ip: %s",
+	nlog.Errorf("Configured Hostname does not match any local one.\nLocal IPv4 list:%s; Configured ip: %s",
 		localList, configuredList)
 	return "", fmt.Errorf("configured Hostname does not match any local one")
 }
 
 // detectLocalIPv4 takes a list of local IPv4s and returns the best fit for a daemon to listen on it
-func detectLocalIPv4(addrList []*localIPv4Info) (ip net.IP, err error) {
+func detectLocalIPv4(config *cmn.Config, addrList []*localIPv4Info) (ip net.IP, err error) {
 	if len(addrList) == 0 {
 		return nil, fmt.Errorf("no addresses to choose from")
-	} else if len(addrList) == 1 {
-		glog.Infof("Found only one IPv4: %s, MTU %d", addrList[0].ipv4, addrList[0].mtu)
+	}
+	if len(addrList) == 1 {
+		nlog.Infof("Found only one IPv4: %s, MTU %d", addrList[0].ipv4, addrList[0].mtu)
 		if addrList[0].mtu <= 1500 {
-			glog.Warningf("IPv4 %s MTU size is small: %d\n", addrList[0].ipv4, addrList[0].mtu)
+			nlog.Warningf("IPv4 %s MTU size is small: %d\n", addrList[0].ipv4, addrList[0].mtu)
 		}
 		if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
 			return nil, fmt.Errorf("failed to parse IP address: %s", addrList[0].ipv4)
 		}
 		return ip, nil
 	}
-
-	glog.Warningf("%d IPv4s available", len(addrList))
-	for _, addr := range addrList {
-		glog.Warningf("    %#v\n", *addr)
+	if config.FastV(4, cos.SmoduleAIS) {
+		nlog.Infof("%d IPv4s:", len(addrList))
+		for _, addr := range addrList {
+			nlog.Infof("    %#v\n", *addr)
+		}
 	}
 	if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
 		return nil, fmt.Errorf("failed to parse IP address: %s", addrList[0].ipv4)
@@ -191,14 +170,14 @@ func detectLocalIPv4(addrList []*localIPv4Info) (ip net.IP, err error) {
 // getNetInfo returns an Hostname for proxy/target to listen on it.
 // 1. If there is an Hostname in config - it tries to use it
 // 2. If config does not contain Hostname - it chooses one of local IPv4s
-func getNetInfo(addrList []*localIPv4Info, proto, configuredIPv4s, port string) (netInfo cluster.NetInfo, err error) {
+func getNetInfo(config *cmn.Config, addrList []*localIPv4Info, proto, configuredIPv4s, port string) (netInfo meta.NetInfo, err error) {
 	var ip net.IP
 	if configuredIPv4s == "" {
-		ip, err = detectLocalIPv4(addrList)
+		ip, err = detectLocalIPv4(config, addrList)
 		if err != nil {
 			return netInfo, err
 		}
-		netInfo = *cluster.NewNetInfo(proto, ip.String(), port)
+		netInfo = *meta.NewNetInfo(proto, ip.String(), port)
 		return
 	}
 
@@ -208,7 +187,7 @@ func getNetInfo(addrList []*localIPv4Info, proto, configuredIPv4s, port string) 
 		return netInfo, err
 	}
 
-	netInfo = *cluster.NewNetInfo(proto, selHostname, port)
+	netInfo = *meta.NewNetInfo(proto, selHostname, port)
 	return
 }
 
@@ -233,92 +212,130 @@ func validateHostname(hostname string) (err error) {
 	return
 }
 
-/////////////
-// helpers //
-/////////////
+// HTTP Range (aka Read Range)
+type (
+	htrange struct {
+		Start, Length int64
+	}
+	errRangeNoOverlap struct {
+		ranges []string // RFC 7233
+		size   int64    // [0, size)
+	}
+)
 
-func reMirror(bprops, nprops *cmn.BucketProps) bool {
-	if !bprops.Mirror.Enabled && nprops.Mirror.Enabled {
-		return true
-	}
-	if bprops.Mirror.Enabled && nprops.Mirror.Enabled {
-		return bprops.Mirror.Copies != nprops.Mirror.Copies
-	}
-	return false
+func (r htrange) contentRange(size int64) string {
+	return fmt.Sprintf("%s%d-%d/%d", cos.HdrContentRangeValPrefix, r.Start, r.Start+r.Length-1, size)
 }
 
-func reEC(bprops, nprops *cmn.BucketProps, bck *cluster.Bck) bool {
-	// TODO: xaction to remove all data generated by EC encoder.
-	// For now, do nothing if EC is disabled.
-	if !nprops.EC.Enabled {
-		if bprops.EC.Enabled {
-			// kill running ec-encode xact if it is active
-			xreg.DoAbort(cmn.ActECEncode, bck)
+// ErrNoOverlap is returned by serveContent's parseRange if first-byte-pos of
+// all of the byte-range-spec values is greater than the content size.
+func (e *errRangeNoOverlap) Error() string {
+	msg := fmt.Sprintf("overlap with the content [0, %d)", e.size)
+	if len(e.ranges) == 1 {
+		return fmt.Sprintf("range %q does not %s", e.ranges[0], msg)
+	}
+	return fmt.Sprintf("none of the ranges %v %s", e.ranges, msg)
+}
+
+// ParseMultiRange parses a Range Header string as per RFC 7233.
+// ErrNoOverlap is returned if none of the ranges overlap with the [0, size) content.
+func parseMultiRange(s string, size int64) (ranges []htrange, err error) {
+	var noOverlap bool
+	if !strings.HasPrefix(s, cos.HdrRangeValPrefix) {
+		return nil, fmt.Errorf("read range %q is invalid (prefix)", s)
+	}
+	allRanges := strings.Split(s[len(cos.HdrRangeValPrefix):], ",")
+	for _, ra := range allRanges {
+		ra = strings.TrimSpace(ra)
+		if ra == "" {
+			continue
 		}
-		return false
+		i := strings.Index(ra, "-")
+		if i < 0 {
+			return nil, fmt.Errorf("read range %q is invalid (-)", s)
+		}
+		var (
+			r     htrange
+			start = strings.TrimSpace(ra[:i])
+			end   = strings.TrimSpace(ra[i+1:])
+		)
+		if start == "" {
+			// If no start is specified, end specifies the range start relative
+			// to the end of the file, and we are dealing with <suffix-length>
+			// which has to be a non-negative integer as per RFC 7233 Section 2.1 "Byte-Ranges".
+			if end == "" || end[0] == '-' {
+				return nil, fmt.Errorf("read range %q is invalid as per RFC 7233 Section 2.1", ra)
+			}
+			i, err := strconv.ParseInt(end, 10, 64)
+			if i < 0 || err != nil {
+				return nil, fmt.Errorf("read range %q is invalid (see RFC 7233 Section 2.1)", ra)
+			}
+			if i > size {
+				i = size
+			}
+			r.Start = size - i
+			r.Length = size - r.Start
+		} else {
+			i, err := strconv.ParseInt(start, 10, 64)
+			if err != nil || i < 0 {
+				return nil, fmt.Errorf("read range %q is invalid (start)", ra)
+			}
+			if i >= size {
+				// If the range begins after the size of the content it does not overlap.
+				noOverlap = true
+				continue
+			}
+			r.Start = i
+			if end == "" {
+				// If no end is specified, range extends to the end of the file.
+				r.Length = size - r.Start
+			} else {
+				i, err := strconv.ParseInt(end, 10, 64)
+				if err != nil || r.Start > i {
+					return nil, fmt.Errorf("read range %q is invalid (end)", ra)
+				}
+				if i >= size {
+					i = size - 1
+				}
+				r.Length = i - r.Start + 1
+			}
+		}
+		ranges = append(ranges, r)
 	}
-	if !bprops.EC.Enabled {
-		return true
+
+	if noOverlap && len(ranges) == 0 {
+		return nil, &errRangeNoOverlap{allRanges, size}
 	}
-	return bprops.EC.DataSlices != nprops.EC.DataSlices ||
-		bprops.EC.ParitySlices != nprops.EC.ParitySlices
+	return ranges, nil
 }
 
-func withRetry(cond func() bool) (ok bool) {
-	if ok = cond(); !ok {
-		time.Sleep(time.Second)
-		ok = cond()
-	}
-	return
-}
-
-// TODO: !4455 comment
-func isETLRequest(query url.Values) bool {
-	return query.Get(cmn.URLParamUUID) != ""
-}
+//
+// misc. helpers
+//
 
 func deploymentType() string {
 	if k8s.Detect() == nil {
-		if k8s.AllowOneNodeManyETLs {
-			return "K8s dev"
-		}
-		return "K8s"
+		return apc.DeploymentK8s
 	} else if cmn.GCO.Get().TestingEnv() {
-		return "dev"
+		return apc.DeploymentDev
 	}
 	return runtime.GOOS
 }
 
-func cleanupConfigDir() (err error) {
+// for AIS metadata filenames (constants), see `cmn/fname` package
+func cleanupConfigDir(name string, keepInitialConfig bool) {
+	if !keepInitialConfig {
+		// remove plain-text (initial) config
+		cos.RemoveFile(daemon.cli.globalConfigPath)
+		cos.RemoveFile(daemon.cli.localConfigPath)
+	}
 	config := cmn.GCO.Get()
-	return filepath.Walk(config.ConfigDir, func(path string, info os.FileInfo, err error) error {
-		if !strings.HasPrefix(info.Name(), ".ais") || info.IsDir() {
-			return nil
+	filepath.Walk(config.ConfigDir, func(path string, finfo os.FileInfo, err error) error {
+		if strings.HasPrefix(finfo.Name(), ".ais.") {
+			if err := cos.RemoveFile(path); err != nil {
+				nlog.Errorf("%s: failed to cleanup %q, err: %v", name, path, err)
+			}
 		}
-		return cos.RemoveFile(path)
+		return nil
 	})
-}
-
-func writeShutdownMarker() {
-	markerDir := os.Getenv(cmn.EnvVars.ShutdownMarkerPath)
-	if markerDir == "" {
-		if k8s.Detect() == nil {
-			glog.Warningf("marker directory not specified, skipping writing shutdown marker")
-		}
-		return
-	}
-	f, err := cos.CreateFile(filepath.Join(markerDir, cmn.ShutdownMarker))
-	if err != nil {
-		glog.Errorf("failed to create shutdown marker, %v", err)
-	}
-	if f != nil {
-		f.Close()
-	}
-}
-
-func deleteShutdownMarker() {
-	markerDir := os.Getenv(cmn.EnvVars.ShutdownMarkerPath)
-	if markerDir != "" {
-		cos.RemoveFile(filepath.Join(markerDir, cmn.ShutdownMarker))
-	}
 }

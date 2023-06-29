@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -156,7 +156,8 @@ func DivCeil(a, b int64) int64 {
 	return d
 }
 
-func DivRound(a, b int64) int64 { return (a + b/2) / b }
+func DivRound(a, b int64) int64      { return (a + b/2) / b }
+func DivRoundU64(a, b uint64) uint64 { return (a + b/2) / b }
 
 // CeilAlign returns smallest number bigger or equal to val, which is divisible by align
 func CeilAlign(val, align uint) uint {

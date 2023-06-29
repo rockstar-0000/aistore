@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -13,12 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
+	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/readers"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tools/readers"
 )
 
 const (
@@ -27,7 +29,7 @@ const (
 )
 
 var (
-	t *targetrunner
+	t *target
 
 	// interface guard
 	_ http.ResponseWriter = (*discardRW)(nil)
@@ -55,27 +57,28 @@ func TestMain(m *testing.M) {
 	// file system
 	cos.CreateDir(testMountpath)
 	defer os.RemoveAll(testMountpath)
-	fs.Init()
-	fs.DisableFsIDCheck()
-	_ = fs.CSM.RegisterContentType(fs.ObjectType, &fs.ObjectContentResolver{})
-	_ = fs.CSM.RegisterContentType(fs.WorkfileType, &fs.WorkfileContentResolver{})
+	fs.TestNew(nil)
+	fs.TestDisableValidation()
+	_ = fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
+	_ = fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
 
 	// target
 	config := cmn.GCO.Get()
+	config.Log.Level = "3"
 	co := newConfigOwner(config)
 	t = newTarget(co)
-	t.name = cmn.Target
 	t.initNetworks()
-	t.si.Init(initTID(config), cmn.Target)
+	tid, _ := initTID(config)
+	t.si.Init(tid, apc.Target)
 
-	fs.Add(testMountpath, t.si.ID())
+	fs.Add(testMountpath, t.SID())
 
-	t.httprunner.init(config)
+	t.htrun.init(config)
 
-	t.statsT = stats.NewTrackerMock()
+	t.statsT = mock.NewStatsTracker()
 	cluster.Init(t)
 
-	bck := cluster.NewBck(testBucket, cmn.ProviderAIS, cmn.NsGlobal)
+	bck := meta.NewBck(testBucket, apc.AIS, cmn.NsGlobal)
 	bmd := newBucketMD()
 	bmd.add(bck, &cmn.BucketProps{
 		Cksum: cmn.CksumConf{
@@ -83,7 +86,7 @@ func TestMain(m *testing.M) {
 		},
 	})
 	t.owner.bmd.putPersist(bmd, nil)
-	fs.CreateBucket("test", bck.Bck, false /*nilbmd*/)
+	fs.CreateBucket(bck.Bucket(), false /*nilbmd*/)
 
 	m.Run()
 }
@@ -100,12 +103,11 @@ func BenchmarkObjPut(b *testing.B) {
 		{8 * cos.MiB},
 		{16 * cos.MiB},
 	}
-
 	for _, bench := range benches {
-		b.Run(cos.B2S(bench.fileSize, 2), func(b *testing.B) {
+		b.Run(cos.ToSizeIEC(bench.fileSize, 2), func(b *testing.B) {
 			lom := cluster.AllocLOM("objname")
 			defer cluster.FreeLOM(lom)
-			err := lom.Init(cmn.Bck{Name: testBucket, Provider: cmn.ProviderAIS, Ns: cmn.NsGlobal})
+			err := lom.InitBck(&cmn.Bck{Name: testBucket, Provider: apc.AIS, Ns: cmn.NsGlobal})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -114,8 +116,8 @@ func BenchmarkObjPut(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				r, _ := readers.NewRandReader(bench.fileSize, cos.ChecksumNone)
-				poi := &putObjInfo{
-					started: time.Now(),
+				poi := &putOI{
+					atime:   time.Now().UnixNano(),
 					t:       t,
 					lom:     lom,
 					r:       r,
@@ -149,42 +151,42 @@ func BenchmarkObjAppend(b *testing.B) {
 	}
 
 	for _, bench := range benches {
-		b.Run(cos.B2S(bench.fileSize, 2), func(b *testing.B) {
+		b.Run(cos.ToSizeIEC(bench.fileSize, 2), func(b *testing.B) {
 			lom := cluster.AllocLOM("objname")
 			defer cluster.FreeLOM(lom)
-			err := lom.Init(cmn.Bck{Name: testBucket, Provider: cmn.ProviderAIS, Ns: cmn.NsGlobal})
+			err := lom.InitBck(&cmn.Bck{Name: testBucket, Provider: apc.AIS, Ns: cmn.NsGlobal})
 			if err != nil {
 				b.Fatal(err)
 			}
 
-			var hi handleInfo
+			var hdl aoHdl
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				r, _ := readers.NewRandReader(bench.fileSize, cos.ChecksumNone)
-				aoi := &appendObjInfo{
+				aoi := &apndOI{
 					started: time.Now(),
 					t:       t,
 					lom:     lom,
 					r:       r,
-					op:      cmn.AppendOp,
-					hi:      hi,
+					op:      apc.AppendOp,
+					hdl:     hdl,
 				}
 				os.Remove(lom.FQN)
 				b.StartTimer()
 
-				newHandle, _, err := aoi.appendObject()
+				newHandle, _, err := aoi.do()
 				if err != nil {
 					b.Fatal(err)
 				}
-				hi, err = parseAppendHandle(newHandle)
+				hdl, err = parseAppendHandle(newHandle)
 				if err != nil {
 					b.Fatal(err)
 				}
 			}
 			b.StopTimer()
 			os.Remove(lom.FQN)
-			os.Remove(hi.filePath)
+			os.Remove(hdl.filePath)
 		})
 	}
 }
@@ -210,21 +212,21 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 	}
 
 	for _, bench := range benches {
-		benchName := cos.B2S(bench.fileSize, 2)
+		benchName := cos.ToSizeIEC(bench.fileSize, 2)
 		if bench.chunked {
 			benchName += "-chunked"
 		}
 		b.Run(benchName, func(b *testing.B) {
 			lom := cluster.AllocLOM("objname")
 			defer cluster.FreeLOM(lom)
-			err := lom.Init(cmn.Bck{Name: testBucket, Provider: cmn.ProviderAIS, Ns: cmn.NsGlobal})
+			err := lom.InitBck(&cmn.Bck{Name: testBucket, Provider: apc.AIS, Ns: cmn.NsGlobal})
 			if err != nil {
 				b.Fatal(err)
 			}
 
 			r, _ := readers.NewRandReader(bench.fileSize, cos.ChecksumNone)
-			poi := &putObjInfo{
-				started: time.Now(),
+			poi := &putOI{
+				atime:   time.Now().UnixNano(),
 				t:       t,
 				lom:     lom,
 				r:       r,
@@ -239,13 +241,9 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 				b.Fatal(err)
 			}
 
-			w := io.Discard
-			if !bench.chunked {
-				w = newDiscardRW()
-			}
-
-			goi := &getObjInfo{
-				started: time.Now(),
+			w := newDiscardRW()
+			goi := &getOI{
+				atime:   time.Now().UnixNano(),
 				t:       t,
 				lom:     lom,
 				w:       w,

@@ -1,113 +1,114 @@
 // Package notifications provides interfaces for AIStore notifications
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package nl
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	jsoniter "github.com/json-iterator/go"
 )
 
-type NotifListener interface {
-	Callback(nl NotifListener, ts int64)
-	UnmarshalStats(rawMsg []byte) (interface{}, bool, bool, error)
+type Listener interface {
+	Callback(nl Listener, ts int64)
+	UnmarshalStats(rawMsg []byte) (any, bool, bool, error)
 	Lock()
 	Unlock()
 	RLock()
 	RUnlock()
-	Notifiers() cluster.NodeMap
-	ActiveNotifiers() cluster.NodeMap
+	Notifiers() meta.NodeMap
 	Kind() string
-	Bcks() []cmn.Bck
-	SetErr(error)
+	Bcks() []*cmn.Bck
+	AddErr(error)
 	Err() error
+	ErrCnt() int
 	UUID() string
 	SetAborted()
 	Aborted() bool
-	Status() *NotifStatus
-	SetStats(daeID string, stats interface{})
+	Status() *Status
+	SetStats(daeID string, stats any)
 	NodeStats() *NodeStats
-	QueryArgs() cmn.ReqArgs
-	AbortArgs() cmn.ReqArgs
+	QueryArgs() cmn.HreqArgs
 	EndTime() int64
-	HasFinished(node *cluster.Snode) bool
-	MarkFinished(node *cluster.Snode)
 	SetAddedTime()
 	AddedTime() int64
-	AllFinished() bool
-	FinCount() int
-	ActiveCount() int
 	Finished() bool
 	String() string
 	GetOwner() string
 	SetOwner(string)
-	SetHrwOwner(smap *cluster.Smap)
-	LastUpdated(si *cluster.Snode) int64
+	LastUpdated(si *meta.Snode) int64
 	ProgressInterval() time.Duration
-	NodesTardy(durs ...time.Duration) (nodes cluster.NodeMap, tardy bool)
+
+	// detailed ref-counting
+	ActiveNotifiers() meta.NodeMap
+	FinCount() int
+	ActiveCount() int
+	HasFinished(node *meta.Snode) bool
+	MarkFinished(node *meta.Snode)
+	NodesTardy(periodicNotifTime time.Duration) (nodes meta.NodeMap, tardy bool)
 }
 
 type (
-	NotifCallback func(n NotifListener)
+	Callback func(n Listener)
 
 	NodeStats struct {
 		sync.RWMutex
-		stats map[string]interface{} // daeID => Stats (e.g. cmn.BaseXactStatsExt)
+		stats map[string]any // daeID => Stats (e.g. cmn.SnapExt)
 	}
 
-	NotifListenerBase struct {
-		sync.RWMutex
+	ListenerBase struct {
+		mu     sync.RWMutex
 		Common struct {
-			UUID   string
-			Action string // async operation kind (see cmn/api_const.go)
-
-			// ownership
+			UUID        string
+			Action      string // async operation kind (see cmn/api_const.go)
 			Owned       string // "": not owned | equalIC: IC | otherwise, pid + IC
 			SmapVersion int64  // smap version in which NL is added
-
-			Bck []cmn.Bck
+			Bck         []*cmn.Bck
 		}
+		// construction
+		Srcs        meta.NodeMap     // all notifiers
+		ActiveSrcs  meta.NodeMap     // running notifiers
+		F           Callback         `json:"-"` // optional listening-side callback
+		Stats       *NodeStats       // [daeID => Stats (e.g. cmn.SnapExt)]
+		lastUpdated map[string]int64 // [daeID => last update time(nanoseconds)]
+		progress    time.Duration    // time interval to monitor the progress
+		addedTime   atomic.Int64     // Time when `nl` is added
 
-		Srcs              cluster.NodeMap  // expected Notifiers
-		ActiveSrcs        cluster.NodeMap  // Notifiers still running
-		F                 NotifCallback    `json:"-"` // optional listening-side callback
-		Stats             *NodeStats       // [daeID => Stats (e.g. cmn.BaseXactStatsExt)]
-		lastUpdated       map[string]int64 // [daeID => last update time(nanoseconds)]
-		ProgressIntervalX time.Duration    // time interval to monitor the progress
-		addedTime         atomic.Int64     // Time when `nl` is added
-
-		ErrMsg   string        // ErrMsg
-		FinTime  atomic.Int64  // timestamp when finished
-		AbortedX atomic.Bool   // sets if the xaction is Aborted
-		ErrCount atomic.Uint32 // number of error encountered
+		// runtime
+		EndTimeX atomic.Int64 // timestamp when finished
+		AbortedX atomic.Bool  // sets if the xaction is Aborted
+		Errs     cos.Errs     // reported error and count
 	}
 
-	NotifStatus struct {
-		UUID     string `json:"uuid"` // UUID of the xaction
-		ErrMsg   string `json:"err"`
-		FinTime  int64  `json:"end_time"` // time when xaction ended
-		AbortedX bool   `json:"aborted"`
+	Status struct {
+		Kind     string `json:"kind"`     // xaction kind
+		UUID     string `json:"uuid"`     // xaction UUID
+		ErrMsg   string `json:"err"`      // error
+		EndTimeX int64  `json:"end_time"` // time xaction ended
+		AbortedX bool   `json:"aborted"`  // true if aborted
 	}
+	StatusVec []Status
 )
 
-func NewNLB(uuid string, action string, smap *cluster.Smap, srcs cluster.NodeMap, progressInterval time.Duration,
-	bck ...cmn.Bck) *NotifListenerBase {
-	nlb := &NotifListenerBase{
-		Srcs:              srcs,
-		Stats:             NewNodeStats(len(srcs)),
-		ProgressIntervalX: progressInterval,
-		lastUpdated:       make(map[string]int64, len(srcs)),
+//////////////////
+// ListenerBase //
+//////////////////
+
+func NewNLB(uuid, action string, smap *meta.Smap, srcs meta.NodeMap, progress time.Duration, bck ...*cmn.Bck) *ListenerBase {
+	nlb := &ListenerBase{
+		Srcs:        srcs,
+		Stats:       NewNodeStats(len(srcs)),
+		progress:    progress,
+		lastUpdated: make(map[string]int64, len(srcs)),
 	}
 	nlb.Common.UUID = uuid
 	nlb.Common.Action = action
@@ -117,67 +118,63 @@ func NewNLB(uuid string, action string, smap *cluster.Smap, srcs cluster.NodeMap
 	return nlb
 }
 
-///////////////////////
-// notifListenerBase //
-///////////////////////
+func (nlb *ListenerBase) Lock()    { nlb.mu.Lock() }
+func (nlb *ListenerBase) Unlock()  { nlb.mu.Unlock() }
+func (nlb *ListenerBase) RLock()   { nlb.mu.RLock() }
+func (nlb *ListenerBase) RUnlock() { nlb.mu.RUnlock() }
 
-func (nlb *NotifListenerBase) Notifiers() cluster.NodeMap       { return nlb.Srcs }
-func (nlb *NotifListenerBase) ActiveNotifiers() cluster.NodeMap { return nlb.ActiveSrcs }
-func (nlb *NotifListenerBase) UUID() string                     { return nlb.Common.UUID }
-func (nlb *NotifListenerBase) Aborted() bool                    { return nlb.AbortedX.Load() }
-func (nlb *NotifListenerBase) SetAborted()                      { nlb.AbortedX.CAS(false, true) }
-func (nlb *NotifListenerBase) EndTime() int64                   { return nlb.FinTime.Load() }
-func (nlb *NotifListenerBase) Finished() bool                   { return nlb.EndTime() > 0 }
-func (nlb *NotifListenerBase) ProgressInterval() time.Duration  { return nlb.ProgressIntervalX }
-func (nlb *NotifListenerBase) NodeStats() *NodeStats            { return nlb.Stats }
-func (nlb *NotifListenerBase) GetOwner() string                 { return nlb.Common.Owned }
-func (nlb *NotifListenerBase) SetOwner(o string)                { nlb.Common.Owned = o }
-func (nlb *NotifListenerBase) Kind() string                     { return nlb.Common.Action }
-func (nlb *NotifListenerBase) Bcks() []cmn.Bck                  { return nlb.Common.Bck }
-func (nlb *NotifListenerBase) AddedTime() int64                 { return nlb.addedTime.Load() }
-func (nlb *NotifListenerBase) SetAddedTime()                    { nlb.addedTime.Store(mono.NanoTime()) }
-func (nlb *NotifListenerBase) FinCount() int                    { return len(nlb.Srcs) - len(nlb.ActiveSrcs) }
-func (nlb *NotifListenerBase) ActiveCount() int                 { return len(nlb.ActiveSrcs) }
-func (nlb *NotifListenerBase) MarkFinished(node *cluster.Snode) { delete(nlb.ActiveSrcs, node.ID()) }
-func (nlb *NotifListenerBase) AllFinished() bool                { return len(nlb.ActiveSrcs) == 0 }
-func (nlb *NotifListenerBase) HasFinished(node *cluster.Snode) bool {
+func (nlb *ListenerBase) Notifiers() meta.NodeMap         { return nlb.Srcs }
+func (nlb *ListenerBase) UUID() string                    { return nlb.Common.UUID }
+func (nlb *ListenerBase) Aborted() bool                   { return nlb.AbortedX.Load() }
+func (nlb *ListenerBase) SetAborted()                     { nlb.AbortedX.CAS(false, true) }
+func (nlb *ListenerBase) EndTime() int64                  { return nlb.EndTimeX.Load() }
+func (nlb *ListenerBase) Finished() bool                  { return nlb.EndTime() > 0 }
+func (nlb *ListenerBase) ProgressInterval() time.Duration { return nlb.progress }
+func (nlb *ListenerBase) NodeStats() *NodeStats           { return nlb.Stats }
+func (nlb *ListenerBase) GetOwner() string                { return nlb.Common.Owned }
+func (nlb *ListenerBase) SetOwner(o string)               { nlb.Common.Owned = o }
+func (nlb *ListenerBase) Kind() string                    { return nlb.Common.Action }
+func (nlb *ListenerBase) Bcks() []*cmn.Bck                { return nlb.Common.Bck }
+func (nlb *ListenerBase) AddedTime() int64                { return nlb.addedTime.Load() }
+func (nlb *ListenerBase) SetAddedTime()                   { nlb.addedTime.Store(mono.NanoTime()) }
+
+func (nlb *ListenerBase) ActiveNotifiers() meta.NodeMap { return nlb.ActiveSrcs }
+func (nlb *ListenerBase) ActiveCount() int              { return len(nlb.ActiveSrcs) }
+func (nlb *ListenerBase) FinCount() int                 { return len(nlb.Srcs) - nlb.ActiveCount() }
+
+func (nlb *ListenerBase) MarkFinished(node *meta.Snode) {
+	delete(nlb.ActiveSrcs, node.ID())
+}
+
+func (nlb *ListenerBase) HasFinished(node *meta.Snode) bool {
 	return !nlb.ActiveSrcs.Contains(node.ID())
 }
 
 // is called after all Notifiers will have notified OR on failure (err != nil)
-func (nlb *NotifListenerBase) Callback(nl NotifListener, ts int64) {
-	if nlb.FinTime.CAS(0, 1) {
-		nlb.FinTime.Store(ts)
+func (nlb *ListenerBase) Callback(nl Listener, ts int64) {
+	if nlb.EndTimeX.CAS(0, 1) {
+		nlb.EndTimeX.Store(ts)
 		if nlb.F != nil {
 			nlb.F(nl)
 		}
 	}
 }
 
-func (nlb *NotifListenerBase) SetErr(err error) {
-	if nlb.ErrCount.Inc() == 1 {
-		nlb.ErrMsg = err.Error()
-	}
-}
+func (nlb *ListenerBase) AddErr(err error) { nlb.Errs.Add(err) }
+func (nlb *ListenerBase) ErrCnt() int      { return nlb.Errs.Cnt() }
 
-// NOTE: always rlocks
-func (nlb *NotifListenerBase) Err() error {
-	nlb.RLock()
-	defer nlb.RUnlock()
-	if nlb.ErrMsg == "" {
+func (nlb *ListenerBase) Err() error {
+	if nlb.ErrCnt() == 0 {
 		return nil
 	}
-	if l := nlb.ErrCount.Load(); l > 1 {
-		return fmt.Errorf("%s... (error-count=%d)", nlb.ErrMsg, l)
-	}
-	return errors.New(nlb.ErrMsg)
+	return &nlb.Errs
 }
 
-func (nlb *NotifListenerBase) SetStats(daeID string, stats interface{}) {
-	debug.AssertRWMutexLocked(&nlb.RWMutex)
+func (nlb *ListenerBase) SetStats(daeID string, stats any) {
+	debug.AssertRWMutexLocked(&nlb.mu)
 
 	_, ok := nlb.Srcs[daeID]
-	cos.Assert(ok)
+	debug.Assert(ok)
 	nlb.Stats.Store(daeID, stats)
 	if nlb.lastUpdated == nil {
 		nlb.lastUpdated = make(map[string]int64, len(nlb.Srcs))
@@ -185,27 +182,24 @@ func (nlb *NotifListenerBase) SetStats(daeID string, stats interface{}) {
 	nlb.lastUpdated[daeID] = mono.NanoTime()
 }
 
-func (nlb *NotifListenerBase) LastUpdated(si *cluster.Snode) int64 {
+func (nlb *ListenerBase) LastUpdated(si *meta.Snode) int64 {
 	if nlb.lastUpdated == nil {
 		return 0
 	}
-	return nlb.lastUpdated[si.DaemonID]
+	return nlb.lastUpdated[si.ID()]
 }
 
-func (nlb *NotifListenerBase) NodesTardy(durs ...time.Duration) (nodes cluster.NodeMap, tardy bool) {
-	dur := cmn.GCO.Get().Periodic.NotifTime.D()
-	if len(durs) > 0 {
-		dur = durs[0]
-	} else if nlb.ProgressInterval() != 0 {
-		dur = nlb.ProgressInterval()
+// under rlock
+func (nlb *ListenerBase) NodesTardy(periodicNotifTime time.Duration) (nodes meta.NodeMap, tardy bool) {
+	if nlb.ProgressInterval() != 0 {
+		periodicNotifTime = nlb.ProgressInterval()
 	}
-
-	nodes = make(cluster.NodeMap, len(nlb.ActiveNotifiers()))
+	nodes = make(meta.NodeMap, nlb.ActiveCount())
 	now := mono.NanoTime()
-	for _, si := range nlb.ActiveNotifiers() {
+	for _, si := range nlb.ActiveSrcs {
 		ts := nlb.LastUpdated(si)
 		diff := time.Duration(now - ts)
-		if _, ok := nlb.Stats.Load(si.ID()); ok && diff < dur {
+		if _, ok := nlb.Stats.Load(si.ID()); ok && diff < periodicNotifTime {
 			continue
 		}
 		nodes.Add(si)
@@ -214,24 +208,30 @@ func (nlb *NotifListenerBase) NodesTardy(durs ...time.Duration) (nodes cluster.N
 	return
 }
 
-func (nlb *NotifListenerBase) Status() *NotifStatus {
-	return &NotifStatus{UUID: nlb.UUID(), FinTime: nlb.FinTime.Load(), AbortedX: nlb.Aborted()}
+func (nlb *ListenerBase) Status() *Status {
+	return &Status{Kind: nlb.Kind(), UUID: nlb.UUID(), EndTimeX: nlb.EndTimeX.Load(), AbortedX: nlb.Aborted()}
 }
 
-// NOTE: Results in non-critical DATA RACE when used outside `nlb.Lock()`
-func (nlb *NotifListenerBase) String() string {
+func (nlb *ListenerBase) String() string {
 	var (
 		tm, res  string
 		hdr      = fmt.Sprintf("nl-%s[%s]", nlb.Kind(), nlb.UUID())
 		finCount = nlb.FinCount()
 	)
-	if tfin := nlb.FinTime.Load(); tfin > 0 {
-		if l := nlb.ErrCount.Load(); l > 0 {
-			res = fmt.Sprintf("-fail(#errs=%d)", l)
+	if bcks := nlb.Bcks(); len(bcks) > 0 {
+		if len(bcks) == 1 {
+			hdr += "-" + bcks[0].String()
+		} else {
+			hdr += "-" + bcks[0].String() + "-" + bcks[1].String()
+		}
+	}
+	if tfin := nlb.EndTimeX.Load(); tfin > 0 {
+		if cnt := nlb.ErrCnt(); cnt > 0 {
+			res = "-" + nlb.Err().Error()
 		} else {
 			res = "-done"
 		}
-		tm = cos.FormatTimestamp(time.Unix(0, tfin))
+		tm = cos.FormatNanoTime(tfin, cos.StampMicro)
 		return fmt.Sprintf("%s-%s%s", hdr, tm, res)
 	}
 	if finCount > 0 {
@@ -240,26 +240,38 @@ func (nlb *NotifListenerBase) String() string {
 	return hdr
 }
 
-// effectively, cache owner
-func (nlb *NotifListenerBase) SetHrwOwner(smap *cluster.Smap) {
-	psiOwner, err := cluster.HrwIC(smap, nlb.UUID())
-	if err != nil {
-		debug.AssertNoErr(err)
-		return
+////////////
+// Status //
+////////////
+
+func (ns *Status) Finished() bool { return ns.EndTimeX > 0 }
+func (ns *Status) Aborted() bool  { return ns.AbortedX }
+
+func (ns *Status) String() (s string) {
+	s = ns.Kind + "[" + ns.UUID + "]"
+	switch {
+	case ns.Aborted():
+		s += "-abrt"
+	case ns.Finished():
+		if ns.ErrMsg != "" {
+			s += "-" + ns.ErrMsg
+		} else {
+			s += "-done"
+		}
 	}
-	nlb.SetOwner(psiOwner.ID())
+	return
 }
 
-/////////////////
-// NotifStatus //
-/////////////////
+func (nsv StatusVec) String() (s string) {
+	for _, ns := range nsv {
+		s += ns.String() + ", "
+	}
+	return s[:cos.Max(0, len(s)-2)]
+}
 
-func (xs *NotifStatus) Finished() bool { return xs.FinTime > 0 }
-func (xs *NotifStatus) Aborted() bool  { return xs.AbortedX }
-
-/////////////////
-//  NodeStats  //
-/////////////////
+///////////////
+// NodeStats //
+///////////////
 
 func NewNodeStats(sizes ...int) *NodeStats {
 	size := 0
@@ -267,20 +279,20 @@ func NewNodeStats(sizes ...int) *NodeStats {
 		size = sizes[0]
 	}
 	return &NodeStats{
-		stats: make(map[string]interface{}, size),
+		stats: make(map[string]any, size),
 	}
 }
 
-func (ns *NodeStats) Store(key string, stats interface{}) {
+func (ns *NodeStats) Store(key string, stats any) {
 	ns.Lock()
 	if ns.stats == nil {
-		ns.stats = make(map[string]interface{})
+		ns.stats = make(map[string]any)
 	}
 	ns.stats[key] = stats
 	ns.Unlock()
 }
 
-func (ns *NodeStats) Range(f func(string, interface{}) bool) {
+func (ns *NodeStats) Range(f func(string, any) bool) {
 	ns.RLock()
 	defer ns.RUnlock()
 
@@ -291,7 +303,7 @@ func (ns *NodeStats) Range(f func(string, interface{}) bool) {
 	}
 }
 
-func (ns *NodeStats) Load(key string) (val interface{}, ok bool) {
+func (ns *NodeStats) Load(key string) (val any, ok bool) {
 	ns.RLock()
 	val, ok = ns.stats[key]
 	ns.RUnlock()

@@ -1,7 +1,7 @@
 // Package hk provides mechanism for registering cleanup
 // functions which are invoked at specified intervals.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package hk_test
 
@@ -10,7 +10,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/hk"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -22,7 +22,7 @@ var _ = Describe("Housekeeper", func() {
 		hk.Reg("foo", func() time.Duration {
 			fired = true
 			return time.Second
-		})
+		}, 0)
 		defer hk.Unreg("foo")
 		time.Sleep(20 * time.Millisecond)
 		Expect(fired).To(BeTrue()) // callback should be fired at the start
@@ -55,12 +55,12 @@ var _ = Describe("Housekeeper", func() {
 		hk.Reg("foo", func() time.Duration {
 			fired[0] = true
 			return 2 * time.Second
-		})
+		}, 0)
 		defer hk.Unreg("foo")
 		hk.Reg("bar", func() time.Duration {
 			fired[1] = true
 			return time.Second + 500*time.Millisecond
-		})
+		}, 0)
 		defer hk.Unreg("bar")
 
 		time.Sleep(20 * time.Millisecond)

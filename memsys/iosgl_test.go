@@ -2,27 +2,27 @@
 // with io.Reader and io.Writer interfaces on top of a scatter-gather lists
 // (of reusable buffers)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
 import (
 	"bytes"
 	"io"
-	"math/rand"
 	"testing/iotest"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/tools/cryptorand"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("SGL", func() {
-	mm := DefaultPageMM()
+	mm := PageMM()
 
 	randReader := func(size int64) ([]byte, io.Reader) {
 		buf := make([]byte, size)
-		rand.Read(buf)
+		cryptorand.Read(buf)
 		return buf, bytes.NewBuffer(buf)
 	}
 
@@ -44,8 +44,7 @@ var _ = Describe("SGL", func() {
 			err := sgl.WriteByte(buf[i])
 			Expect(err).ToNot(HaveOccurred())
 		}
-		b, err := sgl.ReadAll()
-		Expect(err).ToNot(HaveOccurred())
+		b := sgl.ReadAll()
 		Expect(b).To(HaveLen(int(size)))
 		Expect(b).To(BeEquivalentTo(buf))
 	})
@@ -61,8 +60,7 @@ var _ = Describe("SGL", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(n).To(Equal(size))
 
-			b, err := sgl.ReadAll()
-			Expect(err).ToNot(HaveOccurred())
+			b := sgl.ReadAll()
 			Expect(b).To(HaveLen(int(size)))
 			Expect(b).To(BeEquivalentTo(buf))
 		})
@@ -77,8 +75,7 @@ var _ = Describe("SGL", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(n).To(Equal(size))
 
-			b, err := sgl.ReadAll()
-			Expect(err).ToNot(HaveOccurred())
+			b := sgl.ReadAll()
 			Expect(b).To(HaveLen(int(size)))
 			Expect(b).To(BeEquivalentTo(buf))
 		})
@@ -93,8 +90,7 @@ var _ = Describe("SGL", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(n).To(Equal(size))
 
-			b, err := sgl.ReadAll()
-			Expect(err).ToNot(HaveOccurred())
+			b := sgl.ReadAll()
 			Expect(b).To(HaveLen(int(size)))
 			Expect(b).To(BeEquivalentTo(buf))
 		})
@@ -113,8 +109,7 @@ var _ = Describe("SGL", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(n).To(Equal(size))
 
-			b, err := sgl.ReadAll()
-			Expect(err).ToNot(HaveOccurred())
+			b := sgl.ReadAll()
 			Expect(b).To(HaveLen(2 * int(size)))
 		})
 	})

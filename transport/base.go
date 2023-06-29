@@ -1,14 +1,13 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
 import (
 	"fmt"
 	"io"
-	"math"
 	"net/url"
 	"os"
 	"path"
@@ -16,19 +15,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
-)
-
-// transport defaults
-const (
-	maxHeaderSize  = memsys.PageSize
-	burstNum       = 32 // default max num objects that can be posted for sending without any back-pressure
-	defaultIdleOut = time.Second * 2
-	tickUnit       = time.Second
 )
 
 // stream TCP/HTTP session: inactive <=> active transitions
@@ -45,25 +38,23 @@ const (
 	inEOB
 )
 
-// send-side markers
-const (
-	lastMarker = math.MaxInt64              // end of stream: send and receive
-	tickMarker = math.MaxInt64 ^ 0xa5a5a5a5 // idle tick - send side only
-)
+const maxInReadRetries = 64 // Tx: lz4 stream read; Rx: partial object header
 
 // termination: reasons
 const (
-	reasonUnknown = "unknown"
 	reasonError   = "error"
 	endOfStream   = "end-of-stream"
 	reasonStopped = "stopped"
+
+	connErrWait = time.Second // ECONNREFUSED | ECONNRESET | EPIPE
+	termErrWait = time.Second
 )
 
 type (
 	streamer interface {
 		compressed() bool
 		dryrun()
-		terminate()
+		terminate(error, string) (string, error)
 		doRequest() error
 		inSend() bool
 		abortPending(error, bool)
@@ -71,41 +62,41 @@ type (
 		resetCompression()
 		// gc
 		closeAndFree()
-		drain()
+		drain(err error)
 		idleTick()
 	}
 	streamBase struct {
 		streamer streamer
-		client   Client // http client this send-stream will use
-
-		// user-defined & queryable
-		toURL, trname   string       // http endpoint
-		sessID          int64        // stream session ID
-		sessST          atomic.Int64 // state of the TCP/HTTP session: active (connected) | inactive (disconnected)
-		stats           Stats        // stream stats
-		Numcur, Sizecur int64        // gets reset to zero upon each timeout
-		// internals
-		lid    string        // log prefix
-		lastCh *cos.StopCh   // end of stream
-		stopCh *cos.StopCh   // stop/abort stream
-		postCh chan struct{} // to indicate that workCh has work
-		time   struct {
-			idleOut time.Duration // idle timeout
-			inSend  atomic.Bool   // true upon Send() or Read() - info for Collector to delay cleanup
-			ticks   int           // num 1s ticks until idle timeout
-			index   int           // heap stuff
+		client   Client     // stream's http client
+		stopCh   cos.StopCh // stop/abort stream
+		lastCh   cos.StopCh // end-of-stream
+		pdu      *spdu      // PDU buffer
+		mm       *memsys.MMSA
+		postCh   chan struct{} // to indicate that workCh has work
+		trname   string        // http endpoint: (trname, dstURL, dstID)
+		dstURL   string
+		dstID    string
+		lid      string // log prefix
+		maxhdr   []byte // header buf must be large enough to accommodate max-size for this stream
+		header   []byte // object header (slice of the maxhdr with bucket/objName, etc. fields packed/serialized)
+		term     struct {
+			err    error
+			reason string
+			mu     sync.Mutex
+			done   atomic.Bool
 		}
-		wg        sync.WaitGroup
-		mm        *memsys.MMSA
-		pdu       *spdu  // PDU buffer
-		maxheader []byte // max header buffer
-		header    []byte // object header - slice of the maxheader with bucket/objName, etc. fields
-		term      struct {
-			mu         sync.RWMutex
-			err        error
-			reason     *string
-			terminated bool
+		stats Stats // stream stats
+		time  struct {
+			idleTeardown time.Duration // idle timeout
+			inSend       atomic.Bool   // true upon Send() or Read() - info for Collector to delay cleanup
+			ticks        int           // num 1s ticks until idle timeout
+			index        int           // heap stuff
 		}
+		wg      sync.WaitGroup
+		sessST  atomic.Int64 // state of the TCP/HTTP session: active (connected) | inactive (disconnected)
+		sessID  int64        // stream session ID
+		Numcur  int64        // gets reset to zero upon each timeout
+		Sizecur int64        // ditto
 	}
 )
 
@@ -113,88 +104,103 @@ type (
 // streamBase //
 ////////////////
 
-func newStreamBase(client Client, toURL string, extra *Extra) (s *streamBase) {
-	u, err := url.Parse(toURL)
+func newBase(client Client, dstURL, dstID string, extra *Extra) (s *streamBase) {
+	var sid string
+	u, err := url.Parse(dstURL)
 	cos.AssertNoErr(err)
 
-	s = &streamBase{client: client, toURL: toURL}
+	s = &streamBase{client: client, dstURL: dstURL, dstID: dstID}
 
-	s.sessID = nextSID.Inc()
+	s.sessID = nextSessionID.Inc()
 	s.trname = path.Base(u.Path)
-	s.lid = fmt.Sprintf("%s[%d]", s.trname, s.sessID)
 
-	s.lastCh = cos.NewStopCh()
-	s.stopCh = cos.NewStopCh()
+	s.lastCh.Init()
+	s.stopCh.Init()
 	s.postCh = make(chan struct{}, 1)
 
-	s.mm = memsys.DefaultPageMM()
-	s.time.idleOut = defaultIdleOut
+	s.mm = memsys.PageMM()
 
-	// NOTE: default overrides
-	if extra != nil {
-		if extra.IdleTimeout > 0 {
-			s.time.idleOut = extra.IdleTimeout
+	// default overrides
+	if extra.SenderID != "" {
+		sid = "-" + extra.SenderID
+	}
+	if extra.MMSA != nil {
+		s.mm = extra.MMSA
+	}
+	// NOTE: PDU-based traffic - a MUST-have for "unsized" transmissions
+	if extra.UsePDU() {
+		if extra.SizePDU > maxSizePDU {
+			debug.Assert(false)
+			extra.SizePDU = maxSizePDU
 		}
-		if extra.MMSA != nil {
-			s.mm = extra.MMSA
-		}
-		// NOTE: PDU-based traffic (must-have for unsized)
-		if extra.SizePDU > 0 {
-			if extra.SizePDU > MaxSizePDU {
-				debug.Assert(false)
-				extra.SizePDU = MaxSizePDU
-			}
-			buf, _ := s.mm.AllocSize(int64(extra.SizePDU))
-			s.pdu = newSendPDU(buf)
+		buf, _ := s.mm.AllocSize(int64(extra.SizePDU))
+		s.pdu = newSendPDU(buf)
+	}
+	if extra.IdleTeardown > 0 {
+		s.time.idleTeardown = extra.IdleTeardown
+	} else {
+		s.time.idleTeardown = extra.Config.Transport.IdleTeardown.D()
+		if s.time.idleTeardown == 0 {
+			s.time.idleTeardown = dfltIdleTeardown
 		}
 	}
+	debug.Assertf(s.time.idleTeardown >= dfltTick, "%v vs. %v", s.time.idleTeardown, dfltTick)
+	s.time.ticks = int(s.time.idleTeardown / dfltTick)
 
-	if s.time.idleOut < tickUnit {
-		s.time.idleOut = tickUnit
+	s.lid = fmt.Sprintf("s-%s%s[%d]=>%s", s.trname, sid, s.sessID, dstID)
+
+	if extra.MaxHdrSize == 0 {
+		s.maxhdr, _ = s.mm.AllocSize(dfltMaxHdr)
+	} else {
+		s.maxhdr, _ = s.mm.AllocSize(int64(extra.MaxHdrSize))
+		cos.AssertMsg(extra.MaxHdrSize <= 0xffff, "the field is uint16") // same comment in header.go
 	}
-	s.time.ticks = int(s.time.idleOut / tickUnit)
-	s.maxheader, _ = s.mm.AllocSize(maxHeaderSize) // NOTE: must be large enough to accommodate max-size
-	s.sessST.Store(inactive)                       // NOTE: initiate HTTP session upon the first arrival
-
-	s.term.reason = new(string)
+	s.sessST.Store(inactive) // initiate HTTP session upon the first arrival
 	return
 }
 
 func (s *streamBase) startSend(streamable fmt.Stringer) (err error) {
 	s.time.inSend.Store(true) // StreamCollector to postpone cleanups
-	if s.Terminated() {
-		err = fmt.Errorf("%s terminated(%s, %v), dropping %s", s, *s.term.reason, s.term.err, streamable)
-		glog.Error(err)
+
+	if s.IsTerminated() {
+		// slow path
+		reason, errT := s.TermInfo()
+		err = cmn.NewErrStreamTerminated(s.String(), errT, reason, "dropping "+streamable.String())
+		nlog.Errorln(err)
 		return
 	}
+
 	if s.sessST.CAS(inactive, active) {
 		s.postCh <- struct{}{}
 		if verbose {
-			glog.Infof("%s: inactive => active", s)
+			nlog.Infof("%s: inactive => active", s)
 		}
 	}
 	return
 }
 
 func (s *streamBase) Stop()               { s.stopCh.Close() }
-func (s *streamBase) URL() string         { return s.toURL }
+func (s *streamBase) URL() string         { return s.dstURL }
 func (s *streamBase) ID() (string, int64) { return s.trname, s.sessID }
 func (s *streamBase) String() string      { return s.lid }
-func (s *streamBase) Terminated() (terminated bool) {
-	s.term.mu.Lock()
-	terminated = s.term.terminated
-	s.term.mu.Unlock()
-	return
-}
 
-func (s *streamBase) TermInfo() (string, error) {
-	if s.Terminated() && *s.term.reason == "" {
-		if s.term.err == nil {
-			s.term.err = fmt.Errorf(reasonUnknown)
+func (s *streamBase) Abort() { s.Stop() } // (DM =>) SB => s.Abort() sequence (e.g. usage see otherXreb.Abort())
+
+func (s *streamBase) IsTerminated() bool { return s.term.done.Load() }
+
+func (s *streamBase) TermInfo() (reason string, err error) {
+	// to account for an unlikely delay between done.CAS() and mu.Lock - see terminate()
+	sleep := cos.ProbingFrequency(termErrWait)
+	for elapsed := time.Duration(0); elapsed < termErrWait; elapsed += sleep {
+		s.term.mu.Lock()
+		reason, err = s.term.reason, s.term.err
+		s.term.mu.Unlock()
+		if reason != "" {
+			break
 		}
-		*s.term.reason = reasonUnknown
+		time.Sleep(sleep)
 	}
-	return *s.term.reason, s.term.err
+	return
 }
 
 func (s *streamBase) GetStats() (stats Stats) {
@@ -206,26 +212,25 @@ func (s *streamBase) GetStats() (stats Stats) {
 	return
 }
 
-func (s *streamBase) isNextReq() (next bool) {
+func (s *streamBase) isNextReq() (reason string) {
 	for {
 		select {
 		case <-s.lastCh.Listen():
 			if verbose {
-				glog.Infof("%s: end-of-stream", s)
+				nlog.Infof("%s: end-of-stream", s)
 			}
-			*s.term.reason = endOfStream
+			reason = endOfStream
 			return
 		case <-s.stopCh.Listen():
 			if verbose {
-				glog.Infof("stream %s stopped", s)
+				nlog.Infof("%s: stopped", s)
 			}
-			*s.term.reason = reasonStopped
+			reason = reasonStopped
 			return
 		case <-s.postCh:
 			s.sessST.Store(active)
-			next = true // initiate new HTTP/TCP session
 			if verbose {
-				glog.Infof("%s: active <- posted", s)
+				nlog.Infof("%s: active <- posted", s)
 			}
 			return
 		}
@@ -236,78 +241,77 @@ func (s *streamBase) deactivate() (n int, err error) {
 	err = io.EOF
 	if verbose {
 		num := s.stats.Num.Load()
-		glog.Infof("%s: connection teardown (%d/%d)", s, s.Numcur, num)
+		nlog.Infof("%s: connection teardown (%d/%d)", s, s.Numcur, num)
 	}
 	return
 }
 
 func (s *streamBase) sendLoop(dryrun bool) {
+	var (
+		err     error
+		reason  string
+		retried bool
+	)
 	for {
 		if s.sessST.Load() == active {
 			if dryrun {
 				s.streamer.dryrun()
-			} else if err := s.streamer.doRequest(); err != nil {
-				*s.term.reason = reasonError
-				s.term.err = err
-				s.streamer.errCmpl(err)
-				break
+			} else if errR := s.streamer.doRequest(); errR != nil {
+				if !cos.IsRetriableConnErr(err) || retried {
+					reason = reasonError
+					err = errR
+					s.streamer.errCmpl(err)
+					break
+				}
+				retried = true
+				nlog.Errorf("%s: %v - retrying...", s, errR)
+				time.Sleep(connErrWait)
 			}
 		}
-		if !s.isNextReq() {
+		if reason = s.isNextReq(); reason != "" {
 			break
 		}
 	}
 
-	s.streamer.terminate()
+	reason, err = s.streamer.terminate(err, reason)
 	s.wg.Done()
 
-	// handle termination caused by anything other than Fin()
-	if *s.term.reason != endOfStream {
-		var (
-			err    error
-			reason string
-		)
-		s.term.mu.RLock()
-		err = s.term.err
-		reason = *s.term.reason
-		s.term.mu.RUnlock()
-		if reason == reasonStopped {
-			if verbose {
-				glog.Infof("%s: stopped", s)
-			}
-		} else {
-			glog.Errorf("%s: terminating (%s, %v)", s, reason, err)
-		}
-		// wait for the SCQ/cmplCh to empty
-		s.wg.Wait()
-
-		// cleanup
-		s.streamer.abortPending(err, false /*completions*/)
+	if reason == endOfStream {
+		return
 	}
+
+	// termination is caused by anything other than Fin()
+	// (reasonStopped is, effectively, abort via Stop() - totally legit)
+	if reason != reasonStopped {
+		nlog.Errorf("%s: terminating (%s, %v)", s, reason, err)
+	}
+
+	// wait for the SCQ/cmplCh to empty
+	s.wg.Wait()
+
+	// cleanup
+	s.streamer.abortPending(err, false /*completions*/)
 }
 
-//////////////////
-// misc helpers //
-//////////////////
+///////////
+// Extra //
+///////////
 
-func burst() (burst int) {
-	burst = burstNum
-	if a := os.Getenv("AIS_STREAM_BURST_NUM"); a != "" {
-		if burst64, err := strconv.ParseInt(a, 10, 0); err != nil {
-			glog.Error(err)
-			burst = burstNum
-		} else {
-			burst = int(burst64)
-		}
-	}
-	return
+func (extra *Extra) UsePDU() bool { return extra.SizePDU > 0 }
+
+func (extra *Extra) Compressed() bool {
+	return extra.Compression != "" && extra.Compression != apc.CompressNever
 }
+
+//
+// misc
+//
 
 func dryrun() (dryrun bool) {
 	var err error
 	if a := os.Getenv("AIS_STREAM_DRY_RUN"); a != "" {
 		if dryrun, err = strconv.ParseBool(a); err != nil {
-			glog.Error(err)
+			nlog.Errorln(err)
 		}
 	}
 	return

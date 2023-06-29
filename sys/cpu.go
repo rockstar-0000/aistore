@@ -1,6 +1,6 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
@@ -8,7 +8,7 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 const maxProcsEnvVar = "GOMAXPROCS"
@@ -28,10 +28,9 @@ func init() {
 		if c, err := containerNumCPU(); err == nil {
 			contCPUs = c
 		} else {
-			glog.Error(err)
+			nlog.Errorln(err)
 		}
 	}
-	cache = &procCache{procs: make(map[int]*ProcStats, 1)}
 }
 
 func Containerized() bool { return containerized }
@@ -40,14 +39,13 @@ func NumCPU() int         { return contCPUs }
 // SetMaxProcs sets GOMAXPROCS = NumCPU unless already overridden via Go environment
 func SetMaxProcs() {
 	if val, exists := os.LookupEnv(maxProcsEnvVar); exists {
-		glog.Infof("GOMAXPROCS is already set via Go environment: %q", val)
+		nlog.Warningf("GOMAXPROCS is set via Go environment %q: %q", maxProcsEnvVar, val)
 		return
 	}
 	maxprocs := runtime.GOMAXPROCS(0)
 	ncpu := NumCPU()
-	glog.Infof("GOMAXPROCS %d, num CPUs %d", maxprocs, ncpu)
 	if maxprocs > ncpu {
-		glog.Infof("Reducing GOMAXPROCS to %d (num CPUs)", ncpu)
+		nlog.Warningf("Reducing GOMAXPROCS (%d) to %d (num CPUs)", maxprocs, ncpu)
 		runtime.GOMAXPROCS(ncpu)
 	}
 }

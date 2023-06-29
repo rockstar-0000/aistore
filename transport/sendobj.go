@@ -1,7 +1,7 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -10,11 +10,10 @@ import (
 	"io"
 	"runtime"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/pierrec/lz4/v3"
 )
@@ -41,9 +40,9 @@ type (
 		off int64
 		ins int // in-send enum
 	}
-	cmpl struct { // send completions => SCQ
-		obj Obj
+	cmpl struct {
 		err error
+		obj Obj
 	}
 )
 
@@ -54,15 +53,21 @@ var _ streamer = (*Stream)(nil)
 // object stream //
 ///////////////////
 
-func (s *Stream) terminate() {
+func (s *Stream) terminate(err error, reason string) (actReason string, actErr error) {
+	ok := s.term.done.CAS(false, true)
+	debug.Assert(ok, s.String())
+
 	s.term.mu.Lock()
-	debug.Assert(!s.term.terminated)
-	s.term.terminated = true
-
+	if s.term.err == nil {
+		s.term.err = err
+	}
+	if s.term.reason == "" {
+		s.term.reason = reason
+	}
 	s.Stop()
-
-	obj := Obj{Hdr: ObjHdr{ObjAttrs: cmn.ObjAttrs{Size: lastMarker}}}
-	s.cmplCh <- cmpl{obj, s.term.err}
+	err = s.term.err
+	actReason, actErr = s.term.reason, s.term.err
+	s.cmplCh <- cmpl{err, Obj{Hdr: ObjHdr{Opcode: opcFin}}}
 	s.term.mu.Unlock()
 
 	// Remove stream after lock because we could deadlock between `do()`
@@ -76,27 +81,23 @@ func (s *Stream) terminate() {
 			s.lz4s.zw.Reset(nil)
 		}
 	}
+	return
 }
 
 func (s *Stream) initCompression(extra *Extra) {
-	config := extra.Config
-	if config == nil {
-		config = cmn.GCO.Get()
-	}
 	s.lz4s.s = s
-	s.lz4s.blockMaxSize = config.Compression.BlockMaxSize
-	s.lz4s.frameChecksum = config.Compression.Checksum
+	s.lz4s.blockMaxSize = int(extra.Config.Transport.LZ4BlockMaxSize)
+	s.lz4s.frameChecksum = extra.Config.Transport.LZ4FrameChecksum
 	mem := extra.MMSA
 	if mem == nil {
-		mem = memsys.DefaultPageMM()
+		mem = memsys.PageMM()
 	}
 	if s.lz4s.blockMaxSize >= memsys.MaxPageSlabSize {
 		s.lz4s.sgl = mem.NewSGL(memsys.MaxPageSlabSize, memsys.MaxPageSlabSize)
 	} else {
 		s.lz4s.sgl = mem.NewSGL(cos.KiB*64, cos.KiB*64)
 	}
-
-	s.lid = fmt.Sprintf("%s[%d[%s]]", s.trname, s.sessID, cos.B2S(int64(s.lz4s.blockMaxSize), 0))
+	s.lid = fmt.Sprintf("%s[%d[%s]]", s.trname, s.sessID, cos.ToSizeIEC(int64(s.lz4s.blockMaxSize), 0))
 }
 
 func (s *Stream) compressed() bool { return s.lz4s.s == s }
@@ -111,7 +112,7 @@ func (s *Stream) cmplLoop() {
 	for {
 		cmpl, ok := <-s.cmplCh
 		obj := &cmpl.obj
-		if !ok || obj.IsLast() {
+		if !ok || obj.Hdr.isFin() {
 			break
 		}
 		s.doCmpl(&cmpl.obj, cmpl.err)
@@ -126,7 +127,7 @@ func (s *Stream) abortPending(err error, completions bool) {
 	}
 	if completions {
 		for cmpl := range s.cmplCh {
-			if !cmpl.obj.IsLast() {
+			if !cmpl.obj.Hdr.isFin() {
 				s.doCmpl(&cmpl.obj, cmpl.err)
 			}
 		}
@@ -142,7 +143,11 @@ func (s *Stream) doCmpl(obj *Obj, err error) {
 		debug.Assert(rc >= 0)
 	}
 	if obj.Reader != nil {
-		cos.Close(obj.Reader) // NOTE: always closing
+		if err != nil && cmn.IsFileAlreadyClosed(err) {
+			nlog.Errorf("%s %s: %v", s, obj, err)
+		} else {
+			cos.Close(obj.Reader) // otherwise, always closing
+		}
 	}
 	// SCQ completion callback
 	if rc == 0 {
@@ -185,7 +190,7 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 		if !obj.IsHeaderOnly() {
 			return s.sendData(b)
 		}
-		if obj.IsLast() {
+		if obj.Hdr.isFin() {
 			err = io.EOF
 			return
 		}
@@ -217,25 +222,25 @@ repeat:
 	case obj, ok := <-s.workCh: // next object OR idle tick
 		if !ok {
 			err = fmt.Errorf("%s closed prior to stopping", s)
-			glog.Warning(err)
+			nlog.Warningln(err)
 			return
 		}
 		s.sendoff.obj = *obj
 		obj = &s.sendoff.obj
-		if obj.IsIdleTick() {
+		if obj.Hdr.isIdleTick() {
 			if len(s.workCh) > 0 {
 				goto repeat
 			}
 			return s.deactivate()
 		}
-		l := insObjHeader(s.maxheader, &obj.Hdr, s.usePDU())
-		s.header = s.maxheader[:l]
+		l := insObjHeader(s.maxhdr, &obj.Hdr, s.usePDU())
+		s.header = s.maxhdr[:l]
 		s.sendoff.ins = inHdr
 		return s.sendHdr(b)
 	case <-s.stopCh.Listen():
 		num := s.stats.Num.Load()
 		if verbose {
-			glog.Infof("%s: stopped (%d/%d)", s, s.Numcur, num)
+			nlog.Infof("%s: stopped (%d/%d)", s, s.Numcur, num)
 		}
 		err = io.EOF
 		return
@@ -252,7 +257,7 @@ func (s *Stream) sendHdr(b []byte) (n int, err error) {
 	s.stats.Offset.Add(s.sendoff.off)
 	if verbose {
 		num := s.stats.Num.Load()
-		glog.Infof("%s: hlen=%d (%d/%d)", s, s.sendoff.off, s.Numcur, num)
+		nlog.Infof("%s: hlen=%d (%d/%d)", s, s.sendoff.off, s.Numcur, num)
 	}
 	obj := &s.sendoff.obj
 	if s.usePDU() && !obj.IsHeaderOnly() {
@@ -261,9 +266,9 @@ func (s *Stream) sendHdr(b []byte) (n int, err error) {
 		s.sendoff.ins = inData
 	}
 	s.sendoff.off = 0
-	if obj.IsLast() {
+	if obj.Hdr.isFin() {
 		if verbose {
-			glog.Infof("%s: sent last", s)
+			nlog.Infof("%s: sent last", s)
 		}
 		err = io.EOF
 		s.lastCh.Close()
@@ -297,8 +302,10 @@ func (s *Stream) sendPDU(b []byte) (n int) {
 	return
 }
 
-// end-of-object updates stats, reset idle timeout, and post completion
-// NOTE: reader.Close() is done by the completion handling code doCmpl
+// end-of-object:
+// - update stats, reset idle timeout, and post completion
+// - note that reader.Close() is done by `doCmpl`
+// TODO: ideally, there's a way to flush buffered data to the underlying connection :NOTE
 func (s *Stream) eoObj(err error) {
 	obj := &s.sendoff.obj
 	objSize := obj.Size()
@@ -314,19 +321,23 @@ func (s *Stream) eoObj(err error) {
 		err = fmt.Errorf("%s: %s offset %d != size", s, obj, s.sendoff.off)
 		goto exit
 	}
+	// this stream stats
 	s.stats.Size.Add(objSize)
 	s.Numcur++
 	s.stats.Num.Inc()
 	if verbose {
-		glog.Infof("%s: sent %s (%d/%d)", s, obj, s.Numcur, s.stats.Num.Load())
+		nlog.Infof("%s: sent %s (%d/%d)", s, obj, s.Numcur, s.stats.Num.Load())
 	}
+	// target stats
+	statsTracker.Inc(OutObjCount)
+	statsTracker.Add(OutObjSize, objSize)
 exit:
 	if err != nil {
-		glog.Errorln(err)
+		nlog.Errorln(err)
 	}
 
 	// next completion => SCQ
-	s.cmplCh <- cmpl{s.sendoff.obj, err}
+	s.cmplCh <- cmpl{err, s.sendoff.obj}
 	s.sendoff = sendoff{ins: inEOB}
 }
 
@@ -335,8 +346,8 @@ func (s *Stream) inSend() bool { return s.sendoff.ins >= inHdr || s.sendoff.ins 
 func (s *Stream) dryrun() {
 	var (
 		body = io.NopCloser(s)
-		h    = &handler{trname: s.trname, mm: memsys.DefaultPageMM()}
-		it   = iterator{handler: h, body: body, hbuf: make([]byte, maxHeaderSize)}
+		h    = &handler{trname: s.trname}
+		it   = iterator{handler: h, body: body, hbuf: make([]byte, dfltMaxHdr)}
 	)
 	for {
 		hlen, flags, err := it.nextProtoHdr(s.String())
@@ -344,7 +355,7 @@ func (s *Stream) dryrun() {
 			break
 		}
 		debug.AssertNoErr(err)
-		debug.Assert(flags&msgFlag == 0)
+		debug.Assert(flags&msgFl == 0)
 		obj, err := it.nextObj(s.String(), hlen)
 		if obj != nil {
 			cos.DrainReader(obj) // TODO: recycle `objReader` here
@@ -358,16 +369,16 @@ func (s *Stream) dryrun() {
 
 func (s *Stream) errCmpl(err error) {
 	if s.inSend() {
-		s.cmplCh <- cmpl{s.sendoff.obj, err}
+		s.cmplCh <- cmpl{err, s.sendoff.obj}
 	}
 }
 
 // gc: drain terminated stream
-func (s *Stream) drain() {
+func (s *Stream) drain(err error) {
 	for {
 		select {
 		case obj := <-s.workCh:
-			s.doCmpl(obj, s.term.err)
+			s.doCmpl(obj, err)
 		default:
 			return
 		}
@@ -379,7 +390,7 @@ func (s *Stream) closeAndFree() {
 	close(s.workCh)
 	close(s.cmplCh)
 
-	s.mm.Free(s.maxheader)
+	s.mm.Free(s.maxhdr)
 	if s.pdu != nil {
 		s.pdu.free(s.mm)
 	}
@@ -388,40 +399,12 @@ func (s *Stream) closeAndFree() {
 // gc: post idle tick if idle
 func (s *Stream) idleTick() {
 	if len(s.workCh) == 0 && s.sessST.CAS(active, inactive) {
-		s.workCh <- &Obj{Hdr: ObjHdr{ObjAttrs: cmn.ObjAttrs{Size: tickMarker}}}
+		s.workCh <- &Obj{Hdr: ObjHdr{Opcode: opcIdleTick}}
 		if verbose {
-			glog.Infof("%s: active => inactive", s)
+			nlog.Infof("%s: active => inactive", s)
 		}
 	}
 }
-
-////////////////////
-// Obj and ObjHdr //
-////////////////////
-
-func (obj *Obj) IsLast() bool       { return obj.Hdr.IsLast() }
-func (obj *Obj) IsIdleTick() bool   { return obj.Hdr.ObjAttrs.Size == tickMarker }
-func (obj *Obj) IsHeaderOnly() bool { return obj.Hdr.IsHeaderOnly() }
-func (obj *Obj) IsUnsized() bool    { return obj.Hdr.IsUnsized() }
-
-func (obj *Obj) Size() int64 { return obj.Hdr.ObjSize() }
-
-func (obj *Obj) String() string {
-	s := fmt.Sprintf("sobj-%s", obj.Hdr.FullName())
-	if obj.IsHeaderOnly() {
-		return s
-	}
-	return fmt.Sprintf("%s(size=%d)", s, obj.Hdr.ObjAttrs.Size)
-}
-
-func (obj *Obj) SetPrc(n int) {
-	obj.prc = atomic.NewInt64(int64(n))
-}
-
-func (hdr *ObjHdr) IsLast() bool       { return hdr.ObjAttrs.Size == lastMarker }
-func (hdr *ObjHdr) IsUnsized() bool    { return hdr.ObjAttrs.Size == SizeUnknown }
-func (hdr *ObjHdr) IsHeaderOnly() bool { return hdr.ObjAttrs.Size == 0 || hdr.IsLast() }
-func (hdr *ObjHdr) ObjSize() int64     { return hdr.ObjAttrs.Size }
 
 ///////////
 // Stats //
@@ -440,8 +423,8 @@ func (stats *Stats) CompressionRatio() float64 {
 func (lz4s *lz4Stream) Read(b []byte) (n int, err error) {
 	var (
 		sendoff = &lz4s.s.sendoff
-		last    = sendoff.obj.IsLast()
-		retry   = 64 // insist on returning n > 0 (note that lz4 compresses /blocks/)
+		last    = sendoff.obj.Hdr.isFin()
+		retry   = maxInReadRetries // insist on returning n > 0 (note that lz4 compresses /blocks/)
 	)
 	if lz4s.sgl.Len() > 0 {
 		lz4s.zw.Flush()
@@ -480,12 +463,4 @@ ex:
 		err = io.EOF
 	}
 	return
-}
-
-///////////
-// Extra //
-///////////
-
-func (extra *Extra) Compressed() bool {
-	return extra.Compression != "" && extra.Compression != cmn.CompressNever
 }

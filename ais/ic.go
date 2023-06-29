@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -10,24 +10,29 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/nl"
-	"github.com/NVIDIA/aistore/xaction"
+	"github.com/NVIDIA/aistore/xact"
 	jsoniter "github.com/json-iterator/go"
 )
 
 // Information Center (IC) is a group of proxies that take care of ownership of
-// jtx (Job, Task, eXtended action) entities. It manages the lifecycle of an entity (uuid),
-// and monitors its status (metadata). When an entity is created, it is registered with the
-// members of IC. The IC members monitor all the entities (by uuid) registered to them,
-// and act as information sources for those entities. Non-IC proxies redirect entity related
-// requests to one of the IC members.
+// (Job, Task, eXtended action) entities. IC manages their lifecycle and monitors
+// status. When a job, task or xaction is created, it gets registered with all IC
+// members. Henceforth, IC acts as information source as far as status (running,
+// aborted, finished), progress, and statistics.
+//
+// Non-IC AIS proxies, on the other hand, redirect all corresponding requests to
+// one (anyone) of the IC (proxy) members.
 
 const (
 	// Implies equal ownership by all IC members and applies to all async ops
@@ -38,10 +43,10 @@ const (
 
 type (
 	regIC struct {
-		nl    nl.NotifListener
+		nl    nl.Listener
 		smap  *smapX
 		query url.Values
-		msg   interface{}
+		msg   any
 	}
 
 	xactRegMsg struct {
@@ -56,32 +61,34 @@ type (
 	}
 
 	ic struct {
-		p *proxyrunner
+		p *proxy
 	}
 )
 
-func (ic *ic) init(p *proxyrunner) {
+func (ic *ic) init(p *proxy) {
 	ic.p = p
 }
 
-func (ic *ic) reverseToOwner(w http.ResponseWriter, r *http.Request, uuid string, msg interface{}) (reversedOrFailed bool) {
+func (ic *ic) reverseToOwner(w http.ResponseWriter, r *http.Request, uuid string, msg any) (reversedOrFailed bool) {
 	retry := true
 begin:
 	var (
 		smap          = ic.p.owner.smap.get()
 		selfIC        = smap.IsIC(ic.p.si)
 		owner, exists = ic.p.notifs.getOwner(uuid)
-		psi           *cluster.Snode
+		psi           *meta.Snode
 	)
 	if exists {
 		goto outer
 	}
 	if selfIC {
 		if !exists && !retry {
-			ic.p.writeErrStatusf(w, r, http.StatusNotFound, "%q not found (%s)", uuid, smap.StrIC(ic.p.si))
+			err := fmt.Errorf("x-[%s] not found (%s)", uuid, smap.StrIC(ic.p.si))
+			ic.p.writeErr(w, r, err, http.StatusNotFound, Silent)
 			return true
-		} else if retry {
-			withRetry(func() bool {
+		}
+		if retry {
+			withRetry(cmn.Timeout.CplaneOperation(), func() bool {
 				owner, exists = ic.p.notifs.getOwner(uuid)
 				return exists
 			})
@@ -105,7 +112,7 @@ outer:
 		return
 	case equalIC:
 		if selfIC {
-			owner = ic.p.si.ID()
+			owner = ic.p.SID()
 		} else {
 			for pid, si := range smap.Pmap {
 				if !smap.IsIC(psi) {
@@ -125,72 +132,95 @@ outer:
 				return true
 			}
 		}
-		cos.Assertf(smap.IsIC(psi), "%s, %s", psi, smap.StrIC(ic.p.si))
+		debug.Assertf(smap.IsIC(psi), "%s, %s", psi, smap.StrIC(ic.p.si))
 	}
-	if owner == ic.p.si.ID() {
+	if owner == ic.p.SID() {
 		return
 	}
 	// otherwise, hand it over
 	if msg != nil {
 		body := cos.MustMarshal(msg)
+		r.ContentLength = int64(len(body))
 		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	ic.p.reverseNodeRequest(w, r, psi)
 	return true
 }
 
-// TODO: add more functionality similar to reverseToOwner
 func (ic *ic) redirectToIC(w http.ResponseWriter, r *http.Request) bool {
 	smap := ic.p.owner.smap.get()
-	if !smap.IsIC(ic.p.si) {
-		var node *cluster.Snode
-		for _, psi := range smap.Pmap {
-			if smap.IsIC(psi) {
-				node = psi
-				break
-			}
+	if smap.IsIC(ic.p.si) {
+		return false
+	}
+
+	var node *meta.Snode
+	for _, psi := range smap.Pmap {
+		if smap.IsIC(psi) {
+			node = psi
+			break
 		}
-		redirectURL := ic.p.redirectURL(r, node, time.Now(), cmn.NetworkIntraControl)
-		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
-		return true
 	}
-	return false
+	redirectURL := ic.p.redirectURL(r, node, time.Now(), cmn.NetIntraControl)
+	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+	return true
 }
 
-func (ic *ic) checkEntry(w http.ResponseWriter, r *http.Request, uuid string) (nl nl.NotifListener, ok bool) {
-	nl, exists := ic.p.notifs.entry(uuid)
-	if !exists {
-		smap := ic.p.owner.smap.get()
-		ic.p.writeErrStatusf(w, r, http.StatusNotFound, "%q not found (%s)", uuid, smap.StrIC(ic.p.si))
+func (ic *ic) xstatusAll(w http.ResponseWriter, r *http.Request, query url.Values) {
+	msg := &xact.QueryMsg{}
+	if err := cmn.ReadJSON(w, r, msg); err != nil {
 		return
 	}
-	if nl.Finished() {
-		// TODO: Maybe we should just return empty response and `http.StatusNoContent`?
-		smap := ic.p.owner.smap.get()
-		ic.p.writeErrStatusf(w, r, http.StatusGone, "%q finished (%s)", uuid, smap.StrIC(ic.p.si))
-		return
+	flt := nlFilter{ID: msg.ID, Kind: msg.Kind, Bck: (*meta.Bck)(&msg.Bck), OnlyRunning: msg.OnlyRunning}
+	if !msg.Bck.IsEmpty() {
+		flt.Bck = (*meta.Bck)(&msg.Bck)
 	}
-	return nl, true
+	nls := ic.p.notifs.findAll(flt)
+
+	var vec nl.StatusVec
+
+	if cos.IsParseBool(query.Get(apc.QparamForce)) {
+		// (force just-in-time)
+		// for each args-selected xaction:
+		// check if any of the targets delayed updating the corresponding status,
+		// and query those targets directly
+		var (
+			config   = cmn.GCO.Get()
+			interval = config.Periodic.NotifTime.D()
+		)
+		for _, nl := range nls {
+			ic.p.notifs.bcastGetStats(nl, interval)
+			status := nl.Status()
+			if err := nl.Err(); err != nil {
+				status.ErrMsg = err.Error()
+			}
+			vec = append(vec, *status)
+		}
+	} else {
+		for _, nl := range nls {
+			vec = append(vec, *nl.Status())
+		}
+	}
+	b := cos.MustMarshal(vec)
+	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(b)))
+	w.Write(b)
 }
 
-func (ic *ic) writeStatus(w http.ResponseWriter, r *http.Request) {
+func (ic *ic) xstatusOne(w http.ResponseWriter, r *http.Request) {
 	var (
-		msg      = &xaction.XactReqMsg{}
-		bck      *cluster.Bck
-		nl       nl.NotifListener
-		config   = cmn.GCO.Get()
-		interval = config.Periodic.NotifTime.D()
-		exists   bool
+		nl  nl.Listener
+		bck *meta.Bck
+		msg = &xact.QueryMsg{}
 	)
 	if err := cmn.ReadJSON(w, r, msg); err != nil {
 		return
 	}
+	msg.Kind, _ = xact.GetKindName(msg.Kind) // display name => kind
 	if msg.ID == "" && msg.Kind == "" {
 		ic.p.writeErrStatusf(w, r, http.StatusBadRequest, "invalid %s", msg)
 		return
 	}
 
-	// for queries of type {Kind: cmn.ActRebalance}
+	// for queries of the type {Kind: apc.ActRebalance}
 	if msg.ID == "" && ic.redirectToIC(w, r) {
 		return
 	}
@@ -199,20 +229,21 @@ func (ic *ic) writeStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if msg.Bck.Name != "" {
-		bck = cluster.NewBckEmbed(msg.Bck)
+		bck = meta.CloneBck(&msg.Bck)
 		if err := bck.Init(ic.p.owner.bmd); err != nil {
-			ic.p.writeErrSilent(w, r, err, http.StatusNotFound)
+			ic.p.writeErr(w, r, err, http.StatusNotFound, Silent)
 			return
 		}
 	}
 	flt := nlFilter{ID: msg.ID, Kind: msg.Kind, Bck: bck, OnlyRunning: msg.OnlyRunning}
-	withRetry(func() bool {
-		nl, exists = ic.p.notifs.find(flt)
-		return exists
+	withRetry(cmn.Timeout.CplaneOperation(), func() bool {
+		nl = ic.p.notifs.find(flt)
+		return nl != nil
 	})
-	if !exists {
+	if nl == nil {
 		smap := ic.p.owner.smap.get()
-		ic.p.writeErrStatusSilentf(w, r, http.StatusNotFound, "%s, %s", smap.StrIC(ic.p.si), msg)
+		err := fmt.Errorf("nl not found: %s, %s", smap.StrIC(ic.p.si), msg)
+		ic.p.writeErr(w, r, err, http.StatusNotFound, Silent)
 		return
 	}
 
@@ -221,7 +252,12 @@ func (ic *ic) writeStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ic.p.notifs.syncStats(nl, interval)
+	// refresh NotifStatus
+	var (
+		config   = cmn.GCO.Get()
+		interval = config.Periodic.NotifTime.D()
+	)
+	ic.p.notifs.bcastGetStats(nl, interval)
 
 	status := nl.Status()
 	if err := nl.Err(); err != nil {
@@ -231,7 +267,9 @@ func (ic *ic) writeStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	w.Write(cos.MustMarshal(status)) // TODO: include stats, e.g., progress when ready
+	b := cos.MustMarshal(status) // TODO: include stats, e.g., progress when ready
+	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(b)))
+	w.Write(b)
 }
 
 // verb /v1/ic
@@ -242,7 +280,7 @@ func (ic *ic) handler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		ic.handlePost(w, r)
 	default:
-		cos.Assert(false)
+		debug.Assert(false)
 	}
 }
 
@@ -250,7 +288,7 @@ func (ic *ic) handler(w http.ResponseWriter, r *http.Request) {
 func (ic *ic) handleGet(w http.ResponseWriter, r *http.Request) {
 	var (
 		smap = ic.p.owner.smap.get()
-		what = r.URL.Query().Get(cmn.URLParamWhat)
+		what = r.URL.Query().Get(apc.QparamWhat)
 	)
 	if !smap.IsIC(ic.p.si) {
 		ic.p.writeErrf(w, r, "%s: not an IC member", ic.p.si)
@@ -258,7 +296,7 @@ func (ic *ic) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch what {
-	case cmn.GetWhatICBundle:
+	case apc.WhatICBundle:
 		bundle := icBundle{Smap: smap, OwnershipTbl: cos.MustMarshal(&ic.p.notifs)}
 		ic.p.writeJSON(w, r, bundle, what)
 	default:
@@ -276,7 +314,7 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !smap.IsIC(ic.p.si) {
-		if !withRetry(func() bool {
+		if !withRetry(cmn.Timeout.CplaneOperation(), func() bool {
 			smap = ic.p.owner.smap.get()
 			return smap.IsIC(ic.p.si)
 		}) {
@@ -286,12 +324,12 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch msg.Action {
-	case cmn.ActMergeOwnershipTbl:
+	case apc.ActMergeOwnershipTbl:
 		if err := cos.MorphMarshal(msg.Value, &ic.p.notifs); err != nil {
 			ic.p.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, ic.p.si, msg.Action, msg.Value, err)
 			return
 		}
-	case cmn.ActListenToNotif:
+	case apc.ActListenToNotif:
 		nlMsg := &notifListenMsg{}
 		if err := cos.MorphMarshal(msg.Value, nlMsg); err != nil {
 			ic.p.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, ic.p.si, msg.Action, msg.Value, err)
@@ -301,11 +339,11 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 			ic.p.writeErr(w, r, err)
 			return
 		}
-	case cmn.ActRegGlobalXaction:
+	case apc.ActRegGlobalXaction:
 		var (
 			regMsg     = &xactRegMsg{}
-			tmap       cluster.NodeMap
-			callerSver = r.Header.Get(cmn.HdrCallerSmapVersion)
+			tmap       meta.NodeMap
+			callerSver = r.Header.Get(apc.HdrCallerSmapVersion)
 			err        error
 		)
 		if err = cos.MorphMarshal(msg.Value, regMsg); err != nil {
@@ -313,16 +351,16 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		debug.Assert(len(regMsg.Srcs) != 0)
-		withRetry(func() bool {
+		withRetry(cmn.Timeout.CplaneOperation(), func() bool {
 			smap = ic.p.owner.smap.get()
 			tmap, err = smap.NewTmap(regMsg.Srcs)
 			return err == nil && callerSver == smap.vstr
 		})
 		if err != nil {
-			ic.p.writeErrStatusf(w, r, http.StatusNotFound, "%s: failed to %q: %v", ic.p.si, msg.Action, err)
+			ic.p.writeErrStatusf(w, r, http.StatusNotFound, "%s: failed to %q: %v", ic.p, msg.Action, err)
 			return
 		}
-		nl := xaction.NewXactNL(regMsg.UUID, regMsg.Kind, &smap.Smap, tmap)
+		nl := xact.NewXactNL(regMsg.UUID, regMsg.Kind, &smap.Smap, tmap)
 		if err = ic.p.notifs.add(nl); err != nil {
 			ic.p.writeErr(w, r, err)
 			return
@@ -334,48 +372,45 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 
 func (ic *ic) registerEqual(a regIC) {
 	if a.query != nil {
-		a.query.Set(cmn.URLParamNotifyMe, equalIC)
+		a.query.Set(apc.QparamNotifyMe, equalIC)
 	}
 	if a.smap.IsIC(ic.p.si) {
 		err := ic.p.notifs.add(a.nl)
-		cos.AssertNoErr(err)
+		debug.AssertNoErr(err)
 	}
 	if a.smap.ICCount() > 1 {
 		ic.bcastListenIC(a.nl)
 	}
 }
 
-func (ic *ic) bcastListenIC(nl nl.NotifListener) {
+func (ic *ic) bcastListenIC(nl nl.Listener) {
 	var (
-		actMsg = cmn.ActionMsg{Action: cmn.ActListenToNotif, Value: newNLMsg(nl)}
+		actMsg = apc.ActMsg{Action: apc.ActListenToNotif, Value: newNLMsg(nl)}
 		msg    = ic.p.newAmsg(&actMsg, nil)
 	)
-	cos.Assert(nl.ActiveCount() > 0)
 	ic.p.bcastAsyncIC(msg)
 }
 
-func (ic *ic) sendOwnershipTbl(si *cluster.Snode) error {
+func (ic *ic) sendOwnershipTbl(si *meta.Snode) error {
 	if ic.p.notifs.size() == 0 {
-		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Infof("%s: ownership table empty, skipping sending to %s", ic.p.si, si)
+		if cmn.FastV(4, cos.SmoduleAIS) {
+			nlog.Infof("%s: notifs empty, not sending to %s", ic.p, si)
 		}
 		return nil
 	}
-	config := cmn.GCO.Get()
-	msg := ic.p.newAmsgActVal(cmn.ActMergeOwnershipTbl, &ic.p.notifs)
-	result := ic.p.call(callArgs{
-		si: si,
-		req: cmn.ReqArgs{
-			Method: http.MethodPost,
-			Path:   cmn.URLPathIC.S,
-			Body:   cos.MustMarshal(msg),
-		}, timeout: config.Timeout.CplaneOperation.D(),
-	},
-	)
-	return result.err
+	msg := ic.p.newAmsgActVal(apc.ActMergeOwnershipTbl, &ic.p.notifs)
+	cargs := allocCargs()
+	{
+		cargs.si = si
+		cargs.req = cmn.HreqArgs{Method: http.MethodPost, Path: apc.URLPathIC.S, Body: cos.MustMarshal(msg)}
+		cargs.timeout = cmn.Timeout.CplaneOperation()
+	}
+	res := ic.p.call(cargs)
+	freeCargs(cargs)
+	return res.err
 }
 
-// sync ownership table
+// sync ownership table; TODO: review control flows and revisit impl.
 func (ic *ic) syncICBundle() error {
 	smap := ic.p.owner.smap.get()
 	si := ic.p.si
@@ -389,43 +424,40 @@ func (ic *ic) syncICBundle() error {
 	if si.Equals(ic.p.si) {
 		return nil
 	}
-	config := cmn.GCO.Get()
-	result := ic.p.call(callArgs{
-		si: si,
-		req: cmn.ReqArgs{
+	cargs := allocCargs()
+	{
+		cargs.si = si
+		cargs.req = cmn.HreqArgs{
 			Method: http.MethodGet,
-			Path:   cmn.URLPathIC.S,
-			Query:  url.Values{cmn.URLParamWhat: []string{cmn.GetWhatICBundle}},
-		},
-		timeout: config.Timeout.CplaneOperation.D(),
-	})
-	if result.err != nil {
-		// TODO: Handle error. Should try calling another IC member maybe.
-		glog.Errorf("%s: failed to get ownership table from %s, err: %v", ic.p.si, si, result.err)
-		return result.err
+			Path:   apc.URLPathIC.S,
+			Query:  url.Values{apc.QparamWhat: []string{apc.WhatICBundle}},
+		}
+		cargs.timeout = cmn.Timeout.CplaneOperation()
+		cargs.cresv = cresIC{} // -> icBundle
+	}
+	res := ic.p.call(cargs)
+	freeCargs(cargs)
+	if res.err != nil {
+		return res.err
 	}
 
-	bundle := &icBundle{}
-	if err := jsoniter.Unmarshal(result.bytes, bundle); err != nil {
-		return fmt.Errorf(cmn.FmtErrUnmarshal, ic.p.si, "IC bundle", cmn.BytesHead(result.bytes), err)
-	}
+	bundle := res.v.(*icBundle)
+	debug.Assertf(smap.UUID == bundle.Smap.UUID, "%s vs %s", smap.StringEx(), bundle.Smap.StringEx())
 
-	cos.Assertf(smap.UUID == bundle.Smap.UUID, "%s vs %s", smap.StringEx(), bundle.Smap.StringEx())
-
-	if err := ic.p.owner.smap.synchronize(ic.p.si, bundle.Smap, nil /*ms payload*/); err != nil {
+	if err := ic.p.owner.smap.synchronize(ic.p.si, bundle.Smap, nil /*ms payload*/, ic.p.htrun.smapUpdatedCB); err != nil {
 		if !isErrDowngrade(err) {
-			glog.Errorf(cmn.FmtErrFailed, ic.p.si, "sync", bundle.Smap, err)
+			nlog.Errorln(cmn.NewErrFailedTo(ic.p, "sync", bundle.Smap, err))
 		}
 	} else {
 		smap = ic.p.owner.smap.get()
-		glog.Infof("%s: synch %s", ic.p.si, smap)
+		nlog.Infof("%s: synch %s", ic.p, smap)
 	}
 
 	if !smap.IsIC(ic.p.si) {
 		return nil
 	}
 	if err := jsoniter.Unmarshal(bundle.OwnershipTbl, &ic.p.notifs); err != nil {
-		return fmt.Errorf(cmn.FmtErrUnmarshal, ic.p.si, "ownership table", cmn.BytesHead(bundle.OwnershipTbl), err)
+		return fmt.Errorf(cmn.FmtErrUnmarshal, ic.p, "ownership table", cos.BHead(bundle.OwnershipTbl), err)
 	}
 	return nil
 }

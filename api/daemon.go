@@ -1,106 +1,142 @@
 // Package api provides AIStore API over HTTP(S)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
-)
-
-const (
-	StatusOnline   = "online"
-	StatusOffline  = "offline"
-	StatusTimedOut = "timed out"
 )
 
 type GetLogInput struct {
 	Writer   io.Writer
 	Severity string // one of: {cmn.LogInfo, ...}
+	Offset   int64
 }
 
-// GetMountpaths given the direct public URL of the target, returns its
-// mountpaths or error.
-func GetMountpaths(baseParams BaseParams, node *cluster.Snode) (mpl *cmn.MountpathList, err error) {
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.S,
-		Query:      url.Values{cmn.URLParamWhat: []string{cmn.GetWhatMountpaths}},
-		Header: http.Header{
-			cmn.HdrNodeID:  []string{node.ID()},
-			cmn.HdrNodeURL: []string{node.URL(cmn.NetworkPublic)},
-		},
-	}, &mpl)
+// GetMountpaths given the direct public URL of the target, returns the target's mountpaths or error.
+func GetMountpaths(bp BaseParams, node *meta.Snode) (mpl *apc.MountpathList, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatMountpaths}}
+		reqParams.Header = http.Header{
+			apc.HdrNodeID:  []string{node.ID()},
+			apc.HdrNodeURL: []string{node.URL(cmn.NetPublic)},
+		}
+	}
+	_, err = reqParams.DoReqAny(&mpl)
+	FreeRp(reqParams)
 	return mpl, err
 }
 
-func AddMountpath(baseParams BaseParams, node *cluster.Snode, mountpath string) error {
-	baseParams.Method = http.MethodPut
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.Join(cmn.Mountpaths),
-		Body:       cos.MustMarshal(cmn.ActionMsg{Action: cmn.ActMountpathAdd, Value: mountpath}),
-		Header: http.Header{
-			cmn.HdrNodeID:  []string{node.ID()},
-			cmn.HdrNodeURL: []string{node.URL(cmn.NetworkPublic)},
-		},
-	})
+// TODO: rewrite tests that come here with `force`
+func AttachMountpath(bp BaseParams, node *meta.Snode, mountpath string, force bool) error {
+	bp.Method = http.MethodPut
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.Join(apc.Mountpaths)
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActMountpathAttach, Value: mountpath})
+		reqParams.Header = http.Header{
+			apc.HdrNodeID:      []string{node.ID()},
+			apc.HdrNodeURL:     []string{node.URL(cmn.NetPublic)},
+			cos.HdrContentType: []string{cos.ContentJSON},
+		}
+		reqParams.Query = url.Values{apc.QparamForce: []string{strconv.FormatBool(force)}}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func RemoveMountpath(baseParams BaseParams, nodeID, mountpath string) error {
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.Join(cmn.Mountpaths),
-		Body:       cos.MustMarshal(cmn.ActionMsg{Action: cmn.ActMountpathRemove, Value: mountpath}),
-		Header:     http.Header{cmn.HdrNodeID: []string{nodeID}},
-	})
+func EnableMountpath(bp BaseParams, node *meta.Snode, mountpath string) error {
+	bp.Method = http.MethodPost
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.Join(apc.Mountpaths)
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActMountpathEnable, Value: mountpath})
+		reqParams.Header = http.Header{
+			apc.HdrNodeID:      []string{node.ID()},
+			apc.HdrNodeURL:     []string{node.URL(cmn.NetPublic)},
+			cos.HdrContentType: []string{cos.ContentJSON},
+		}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func EnableMountpath(baseParams BaseParams, node *cluster.Snode, mountpath string) error {
-	baseParams.Method = http.MethodPost
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.Join(cmn.Mountpaths),
-		Body:       cos.MustMarshal(cmn.ActionMsg{Action: cmn.ActMountpathEnable, Value: mountpath}),
-		Header: http.Header{
-			cmn.HdrNodeID:  []string{node.ID()},
-			cmn.HdrNodeURL: []string{node.URL(cmn.NetworkPublic)},
-		},
-	})
+func DetachMountpath(bp BaseParams, node *meta.Snode, mountpath string, dontResilver bool) error {
+	var q url.Values
+	if dontResilver {
+		q = url.Values{apc.QparamDontResilver: []string{"true"}}
+	}
+	bp.Method = http.MethodDelete
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.Join(apc.Mountpaths)
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActMountpathDetach, Value: mountpath})
+		reqParams.Header = http.Header{
+			apc.HdrNodeID:      []string{node.ID()},
+			cos.HdrContentType: []string{cos.ContentJSON},
+		}
+		reqParams.Query = q
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func DisableMountpath(baseParams BaseParams, nodeID, mountpath string) error {
-	baseParams.Method = http.MethodPost
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.Join(cmn.Mountpaths),
-		Body:       cos.MustMarshal(cmn.ActionMsg{Action: cmn.ActMountpathDisable, Value: mountpath}),
-		Header:     http.Header{cmn.HdrNodeID: []string{nodeID}},
-	})
+func DisableMountpath(bp BaseParams, node *meta.Snode, mountpath string, dontResilver bool) error {
+	var q url.Values
+	if dontResilver {
+		q = url.Values{apc.QparamDontResilver: []string{"true"}}
+	}
+	bp.Method = http.MethodPost
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.Join(apc.Mountpaths)
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActMountpathDisable, Value: mountpath})
+		reqParams.Header = http.Header{
+			apc.HdrNodeID:      []string{node.ID()},
+			cos.HdrContentType: []string{cos.ContentJSON},
+		}
+		reqParams.Query = q
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
 // GetDaemonConfig returns the configuration of a specific daemon in a cluster.
-func GetDaemonConfig(baseParams BaseParams, node *cluster.Snode) (config *cmn.Config, err error) {
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.S,
-		Query:      url.Values{cmn.URLParamWhat: []string{cmn.GetWhatConfig}},
-		Header:     http.Header{cmn.HdrNodeID: []string{node.ID()}},
-	}, &config)
+// (compare with `api.GetClusterConfig`)
+func GetDaemonConfig(bp BaseParams, node *meta.Snode) (config *cmn.Config, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatNodeConfig}}
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
+	}
+	_, err = reqParams.DoReqAny(&config)
+	FreeRp(reqParams)
 	if err != nil {
 		return nil, err
 	}
@@ -112,71 +148,158 @@ func GetDaemonConfig(baseParams BaseParams, node *cluster.Snode) (config *cmn.Co
 	return config, nil
 }
 
-// GetDaemonLog returns log of a specific daemon in a cluster.
-func GetDaemonLog(baseParams BaseParams, node *cluster.Snode, args GetLogInput) (err error) {
-	w := args.Writer
-	q := url.Values{}
-	q.Set(cmn.URLParamWhat, cmn.GetWhatLog)
-	if args.Severity != "" {
-		q.Set(cmn.URLParamSev, args.Severity)
+// names _and_ kinds, i.e. (name, kind) pairs
+func GetMetricNames(bp BaseParams, node *meta.Snode) (kvs cos.StrKVs, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatMetricNames}}
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
 	}
-	baseParams.Method = http.MethodGet
-	_, err = doHTTPRequestGetResp(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.S,
-		Query:      q,
-		Header:     http.Header{cmn.HdrNodeID: []string{node.ID()}},
-	}, w)
+	_, err = reqParams.DoReqAny(&kvs)
+	FreeRp(reqParams)
 	return
 }
 
-// GetDaemonStatus returns information about specific node in a cluster.
-func GetDaemonStatus(baseParams BaseParams, node *cluster.Snode) (daeInfo *stats.DaemonStatus, err error) {
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.S,
-		Query:      url.Values{cmn.URLParamWhat: []string{cmn.GetWhatDaemonStatus}},
-		Header:     http.Header{cmn.HdrNodeID: []string{node.ID()}},
-	}, &daeInfo)
-	if err == nil {
-		daeInfo.Status = StatusOnline
-	} else {
-		daeInfo = &stats.DaemonStatus{Snode: node, Status: StatusOffline}
-		if errors.Is(err, context.DeadlineExceeded) {
-			daeInfo.Status = StatusTimedOut
-		} else if httpErr := cmn.Err2HTTPErr(err); httpErr != nil {
-			daeInfo.Status = fmt.Sprintf("error: %d", httpErr.Status)
-		}
+// How to compute throughputs:
+//
+// - AIS supports several enumerated metric "kinds", including `KindThroughput`
+// (for complete enumeration, see stats/api.go)
+// - By convention, metrics that have `KindThroughput` kind are named with ".bps"
+// ("bytes per second") suffix.
+// - ".bps" metrics reported by the API are, in fact, cumulative byte numbers.
+// - It is the client's responsibility to compute the actual throughputs
+// as only the client knows _when_ exactly the same ".bps" metric was queried
+// the previous time.
+//
+// See also:
+// - api.GetClusterStats
+// - api.GetStatsAndStatus (below)
+// - stats/api.go
+func GetDaemonStats(bp BaseParams, node *meta.Snode) (ds *stats.Node, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatNodeStats}}
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
 	}
-	return daeInfo, err
+	_, err = reqParams.DoReqAny(&ds)
+	FreeRp(reqParams)
+	return ds, err
+}
+
+// see also: ResetClusterStats
+func ResetDaemonStats(bp BaseParams, node *meta.Snode, errorsOnly bool) (err error) {
+	bp.Method = http.MethodPut
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActResetStats, Value: errorsOnly})
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
+	}
+	err = reqParams.DoRequest()
+	FreeRp(reqParams)
+	return
+}
+
+func GetDiskStats(bp BaseParams, tid string) (res ios.AllDiskStats, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatDiskStats}}
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{tid}}
+	}
+	_, err = reqParams.DoReqAny(&res)
+	FreeRp(reqParams)
+	return
+}
+
+// Returns both node's stats and extended status
+func GetStatsAndStatus(bp BaseParams, node *meta.Snode) (daeStatus *stats.NodeStatus, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatNodeStatsAndStatus}}
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
+	}
+	_, err = reqParams.DoReqAny(&daeStatus)
+	FreeRp(reqParams)
+	return daeStatus, err
+}
+
+// Returns log of a specific node in a cluster.
+func GetDaemonLog(bp BaseParams, node *meta.Snode, args GetLogInput) (int64, error) {
+	w := args.Writer
+	q := make(url.Values, 3)
+	q.Set(apc.QparamWhat, apc.WhatLog)
+	if args.Severity != "" {
+		q.Set(apc.QparamLogSev, args.Severity)
+	}
+	if args.Offset != 0 {
+		q.Set(apc.QparamLogOff, strconv.FormatInt(args.Offset, 10))
+	}
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Query = q
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
+	}
+	wrap, err := reqParams.doWriter(w)
+	FreeRp(reqParams)
+	if err == nil {
+		return wrap.n, nil
+	}
+	return 0, err
 }
 
 // SetDaemonConfig, given key value pairs, sets the configuration accordingly for a specific node.
-func SetDaemonConfig(baseParams BaseParams, nodeID string, nvs cos.SimpleKVs, transient ...bool) error {
-	baseParams.Method = http.MethodPut
+func SetDaemonConfig(bp BaseParams, nodeID string, nvs cos.StrKVs, transient ...bool) error {
+	bp.Method = http.MethodPut
 	query := url.Values{}
 	for key, val := range nvs {
 		query.Add(key, val)
 	}
 	if len(transient) > 0 {
-		query.Add(cmn.ActTransient, strconv.FormatBool(transient[0]))
+		query.Add(apc.ActTransient, strconv.FormatBool(transient[0]))
 	}
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.Join(cmn.ActSetConfig),
-		Query:      query,
-		Header:     http.Header{cmn.HdrNodeID: []string{nodeID}},
-	})
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.Join(apc.ActSetConfig)
+		reqParams.Query = query
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{nodeID}}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
 // ResetDaemonConfig resets the configuration for a specific node to the cluster configuration.
-func ResetDaemonConfig(baseParams BaseParams, nodeID string) error {
-	baseParams.Method = http.MethodPut
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathReverseDaemon.S,
-		Body:       cos.MustMarshal(cmn.ActionMsg{Action: cmn.ActResetConfig}),
-		Header:     http.Header{cmn.HdrNodeID: []string{nodeID}},
-	})
+// TODO: revisit access control
+func ResetDaemonConfig(bp BaseParams, nodeID string) error {
+	bp.Method = http.MethodPut
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActResetConfig})
+		reqParams.Header = http.Header{
+			apc.HdrNodeID:      []string{nodeID},
+			cos.HdrContentType: []string{cos.ContentJSON},
+		}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }

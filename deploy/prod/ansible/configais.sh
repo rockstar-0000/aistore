@@ -13,9 +13,8 @@ export PROXY=$(cat ./inventory/proxy.txt)
 export AIS_PRIMARY_URL='http://'$PROXY':8081'
 export GRAPHITE_SERVER=$(cat ./inventory/graphana.txt)
 
-export IOSTAT_TIME_LONG=1s
-export IOSTAT_TIME_SHORT=100ms
-export MIRROR_UTIL_THRESH=15
+export AIS_IOSTAT_TIME_LONG=1s
+export AIS_IOSTAT_TIME_SHORT=100ms
 FSP=
 for disk in "$@"; do
     if [ -z "$FSP" ]; then

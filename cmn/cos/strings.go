@@ -1,12 +1,12 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import "strings"
 
-// based on wikipedia article: https://en.wikipedia.org/wiki/Damerau–Levenshtein_distance
+// based on Wikipedia https://en.wikipedia.org/wiki/Damerau–Levenshtein_distance
 func DamerauLevenstheinDistance(s, t string) int {
 	distances := make([][]int, len(s)+1)
 	for i := range distances {
@@ -48,17 +48,26 @@ func CapitalizeString(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-func NounEnding(count int) string {
-	if count == 1 {
-		return ""
-	}
-	return "s"
-}
-
 // Either returns either lhs or rhs depending on which one is non-empty
 func Either(lhs, rhs string) string {
 	if lhs != "" {
 		return lhs
 	}
 	return rhs
+}
+
+const maxl = 16
+
+func BHead(b []byte) string {
+	if len(b) > maxl {
+		return string(b[:maxl]) + "..."
+	}
+	return string(b)
+}
+
+func SHead(s string) string {
+	if len(s) > maxl {
+		return s[:maxl] + "..."
+	}
+	return s
 }

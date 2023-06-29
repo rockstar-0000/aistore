@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
-* Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -9,20 +9,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 type (
 	putFactory struct {
 		xreg.RenewBase
-		xact *XactPut
+		xctn *XactPut
 	}
 	// Erasure coding runner: accepts requests and dispatches them to
 	// a correct mountpath runner. Runner uses dedicated to EC memory manager
@@ -32,24 +34,24 @@ type (
 		xactReqBase
 		putJoggers map[string]*putJogger // mountpath joggers for PUT/DEL
 	}
-	// Runtime EC statistics for PUT xaction
+	// extended x-ec-put statistics
 	ExtECPutStats struct {
-		AvgEncodeTime  cos.Duration `json:"ec.encode.time"`
-		AvgDeleteTime  cos.Duration `json:"ec.delete.time"`
+		AvgEncodeTime  cos.Duration `json:"ec.encode.ns"`
+		AvgDeleteTime  cos.Duration `json:"ec.delete.ns"`
 		EncodeCount    int64        `json:"ec.encode.n,string"`
 		DeleteCount    int64        `json:"ec.delete.n,string"`
 		EncodeSize     int64        `json:"ec.encode.size,string"`
 		EncodeErrCount int64        `json:"ec.encode.err.n,string"`
 		DeleteErrCount int64        `json:"ec.delete.err.n,string"`
-		AvgObjTime     cos.Duration `json:"ec.obj.process.time"`
-		AvgQueueLen    float64      `json:"ec.queue.len.n"`
+		AvgObjTime     cos.Duration `json:"ec.obj.process.ns"`
+		AvgQueueLen    float64      `json:"ec.queue.len.f"`
 		IsIdle         bool         `json:"is_idle"`
 	}
 )
 
 // interface guard
 var (
-	_ xaction.Demand = (*XactPut)(nil)
+	_ xact.Demand    = (*XactPut)(nil)
 	_ xreg.Renewable = (*putFactory)(nil)
 )
 
@@ -57,21 +59,21 @@ var (
 // putFactory //
 ////////////////
 
-func (*putFactory) New(_ xreg.Args, bck *cluster.Bck) xreg.Renewable {
+func (*putFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 	p := &putFactory{RenewBase: xreg.RenewBase{Bck: bck}}
 	return p
 }
 
 func (p *putFactory) Start() error {
-	xec := ECM.NewPutXact(p.Bck.Bck)
+	xec := ECM.NewPutXact(p.Bck.Bucket())
 	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
-	p.xact = xec
+	p.xctn = xec
 	go xec.Run(nil)
 	return nil
 }
 
-func (*putFactory) Kind() string        { return cmn.ActECPut }
-func (p *putFactory) Get() cluster.Xact { return p.xact }
+func (*putFactory) Kind() string        { return apc.ActECPut }
+func (p *putFactory) Get() cluster.Xact { return p.xctn }
 
 func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	debug.Assertf(false, "%s vs %s", p.Str(p.Kind()), xprev) // xreg.usePrev() must've returned true
@@ -82,13 +84,16 @@ func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 // XactPut //
 /////////////
 
-func NewPutXact(t cluster.Target, bck cmn.Bck, mgr *Manager) *XactPut {
-	availablePaths, disabledPaths := fs.Get()
-	totalPaths := len(availablePaths) + len(disabledPaths)
-	smap, si := t.Sowner(), t.Snode()
+func NewPutXact(t cluster.Target, bck *cmn.Bck, mgr *Manager) *XactPut {
+	var (
+		availablePaths, disabledPaths = fs.Get()
+		totalPaths                    = len(availablePaths) + len(disabledPaths)
+		smap, si                      = t.Sowner(), t.Snode()
+		config                        = cmn.GCO.Get()
+	)
 	runner := &XactPut{
 		putJoggers:  make(map[string]*putJogger, totalPaths),
-		xactECBase:  newXactECBase(t, smap, si, bck, mgr),
+		xactECBase:  newXactECBase(t, smap, si, config, bck, mgr),
 		xactReqBase: newXactReqECBase(),
 	}
 
@@ -106,18 +111,19 @@ func NewPutXact(t cluster.Target, bck cmn.Bck, mgr *Manager) *XactPut {
 }
 
 func (r *XactPut) newPutJogger(mpath string) *putJogger {
-	return &putJogger{
+	j := &putJogger{
 		parent: r,
 		mpath:  mpath,
 		putCh:  make(chan *request, requestBufSizeFS),
 		xactCh: make(chan *request, requestBufSizeEncode),
-		stopCh: cos.NewStopCh(),
 	}
+	j.stopCh.Init()
+	return j
 }
 
 func (r *XactPut) dispatchRequest(req *request, lom *cluster.LOM) error {
-	debug.AssertMsg(req.Action == ActDelete || req.Action == ActSplit, req.Action)
-	debug.AssertMsg(req.ErrCh == nil, "ecput does not support ErrCh")
+	debug.Assert(req.Action == ActDelete || req.Action == ActSplit, req.Action)
+	debug.Assert(req.ErrCh == nil, "ec-put does not support ErrCh")
 	if !r.ecRequestsEnabled() {
 		return ErrorECDisabled
 	}
@@ -130,10 +136,12 @@ func (r *XactPut) dispatchRequest(req *request, lom *cluster.LOM) error {
 		return fmt.Errorf("invalid request's action %s for putxaction", req.Action)
 	}
 
-	jogger, ok := r.putJoggers[lom.MpathInfo().Path]
-	cos.AssertMsg(ok, "Invalid mountpath given in EC request")
-	if glog.FastV(4, glog.SmoduleEC) {
-		glog.Infof("ECPUT (bg queue = %d): dispatching object %s....", len(jogger.putCh), lom)
+	jogger, ok := r.putJoggers[lom.Mountpath().Path]
+	if !ok {
+		debug.Assert(false, "invalid "+lom.Mountpath().String())
+	}
+	if r.config.FastV(4, cos.SmoduleEC) {
+		nlog.Infof("ECPUT (bg queue = %d): dispatching object %s....", len(jogger.putCh), lom)
 	}
 	if req.rebuild {
 		jogger.xactCh <- req
@@ -145,7 +153,7 @@ func (r *XactPut) dispatchRequest(req *request, lom *cluster.LOM) error {
 }
 
 func (r *XactPut) Run(*sync.WaitGroup) {
-	glog.Infoln(r.String())
+	nlog.Infoln(r.Name())
 
 	var wg sync.WaitGroup
 	for _, jog := range r.putJoggers {
@@ -153,30 +161,26 @@ func (r *XactPut) Run(*sync.WaitGroup) {
 		go jog.run(&wg)
 	}
 
-	r.mainLoop()
+	ticker := time.NewTicker(r.config.Periodic.StatsTime.D())
+	r.mainLoop(ticker)
+	ticker.Stop()
 	wg.Wait()
-	// Don't close bundles, they are shared between different EC xactions
-	r.Finish(nil)
+	// not closing stream bundles as they are shared across EC xactions
+	r.Finish()
 }
 
-func (r *XactPut) mainLoop() {
-	var (
-		cfg    = cmn.GCO.Get()
-		ticker = time.NewTicker(cfg.Periodic.StatsTime.D())
-	)
-	defer ticker.Stop()
-
-	// as of now all requests are equal. Some may get throttling later
+// all requests are equal, throttle TODO
+func (r *XactPut) mainLoop(ticker *time.Ticker) {
 	for {
 		select {
 		case <-ticker.C:
-			if glog.FastV(4, glog.SmoduleEC) {
-				if s := fmt.Sprintf("%v", r.Stats()); s != "" {
-					glog.Info(s)
+			if r.config.FastV(4, cos.SmoduleEC) {
+				if s := fmt.Sprintf("%v", r.Snap()); s != "" {
+					nlog.Infoln(s)
 				}
 			}
 		case <-r.IdleTimer():
-			// It's OK not to notify ecmanager, it'll just have stopped xact in a map.
+			// It's OK not to notify ecmanager, it'll just have stopped xctn in a map.
 			r.stop()
 			return
 		case msg := <-r.controlCh:
@@ -184,7 +188,7 @@ func (r *XactPut) mainLoop() {
 				r.setEcRequestsEnabled()
 				break
 			}
-			cos.Assert(msg.Action == ActClearRequests)
+			debug.Assert(msg.Action == ActClearRequests, msg.Action)
 
 			r.setEcRequestsDisabled()
 			r.stop()
@@ -196,13 +200,16 @@ func (r *XactPut) mainLoop() {
 	}
 }
 
-func (r *XactPut) Stop(error) { r.Abort() }
+func (r *XactPut) Stop(err error) { r.Abort(err) }
 
 func (r *XactPut) stop() {
 	r.DemandBase.Stop()
 	for _, jog := range r.putJoggers {
 		jog.stop()
 	}
+
+	// Don't close bundles, they are shared between bucket's EC actions
+	r.Finish()
 }
 
 // Encode schedules FQN for erasure coding process
@@ -210,7 +217,7 @@ func (r *XactPut) encode(req *request, lom *cluster.LOM) {
 	req.putTime = time.Now()
 	req.tm = time.Now()
 	if err := r.dispatchRequest(req, lom); err != nil {
-		glog.Errorf("Failed to encode %s: %v", lom, err)
+		nlog.Errorf("Failed to encode %s: %v", lom, err)
 		freeReq(req)
 	}
 }
@@ -221,15 +228,15 @@ func (r *XactPut) cleanup(req *request, lom *cluster.LOM) {
 	req.tm = time.Now()
 
 	if err := r.dispatchRequest(req, lom); err != nil {
-		glog.Errorf("Failed to cleanup %s: %v", lom, err)
+		nlog.Errorf("Failed to cleanup %s: %v", lom, err)
 		freeReq(req)
 	}
 }
 
-func (r *XactPut) Stats() cluster.XactStats {
-	baseStats := r.DemandBase.ExtStats()
+func (r *XactPut) Snap() (snap *cluster.Snap) {
+	snap = r.baseSnap()
 	st := r.stats.stats()
-	baseStats.Ext = &ExtECPutStats{
+	snap.Ext = &ExtECPutStats{
 		AvgEncodeTime:  cos.Duration(st.EncodeTime),
 		EncodeSize:     st.EncodeSize,
 		EncodeCount:    st.PutReq,
@@ -242,7 +249,7 @@ func (r *XactPut) Stats() cluster.XactStats {
 		IsIdle:         r.Pending() == 0,
 	}
 
-	baseStats.ObjCountX = st.PutReq + st.DelReq
-	baseStats.BytesCountX = st.EncodeSize
-	return baseStats
+	snap.Stats.Objs = st.PutReq + st.DelReq // TODO: support in and out
+	snap.Stats.Bytes = st.EncodeSize
+	return
 }

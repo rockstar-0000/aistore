@@ -1,20 +1,24 @@
 // Package mpather provides per-mountpath concepts.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package mpather
 
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"golang.org/x/sync/errgroup"
@@ -33,51 +37,52 @@ const (
 	LoadLock
 )
 
+const (
+	ThrottleMinDur = time.Millisecond
+	ThrottleAvgDur = time.Millisecond * 10
+	ThrottleMaxDur = time.Millisecond * 100
+)
+
 type (
-	JoggerGroupOpts struct {
-		T        cluster.Target
-		Bck      cmn.Bck
-		CTs      []string
-		VisitObj func(lom *cluster.LOM, buf []byte) error
-		VisitCT  func(ct *cluster.CT, buf []byte) error
-		Slab     *memsys.Slab
-
-		DoLoad   LoadType // Loads the LOM and if specified takes requested lock.
-		Parallel int      // How many parallel calls each jogger should execute.
-
-		// Additional function which should be set by JoggerGroup and called
-		// by each of the jogger if they finish.
-		onFinish func()
-
-		IncludeCopy           bool // Traverses LOMs that are copies.
-		SkipGloballyMisplaced bool // Skips content types that are globally misplaced.
-		Throttle              bool // Determines if the jogger should throttle itself.
+	JgroupOpts struct {
+		T                     cluster.Target
+		onFinish              func()
+		VisitObj              func(lom *cluster.LOM, buf []byte) error
+		VisitCT               func(ct *cluster.CT, buf []byte) error
+		Slab                  *memsys.Slab
+		Bck                   cmn.Bck
+		Prefix                string
+		CTs                   []string
+		DoLoad                LoadType // if specified, lom.Load(lock type)
+		Parallel              int      // num parallel calls
+		IncludeCopy           bool     // visit copies (aka replicas)
+		SkipGloballyMisplaced bool     // skip globally misplaced
+		Throttle              bool     // true: pace itself depending on disk utilization
 	}
 
-	// JoggerGroup runs jogger per mountpath which walk the entire bucket and
+	// Jgroup runs jogger per mountpath which walk the entire bucket and
 	// call callback on each of the encountered object. When jogger encounters
 	// error it stops and informs other joggers about the error (so they stop too).
-	JoggerGroup struct {
-		wg      *errgroup.Group
-		joggers map[string]*jogger
-
+	Jgroup struct {
+		wg          *errgroup.Group
+		joggers     map[string]*jogger
+		finishedCh  cos.StopCh // when all joggers are done
 		finishedCnt atomic.Uint32
-		finishedCh  *cos.StopCh // Informs when all joggers have finished.
 	}
 
 	// jogger is being run on each mountpath and executes fs.Walk which call
 	// provided callback.
 	jogger struct {
-		bufs [][]byte
-
 		ctx       context.Context
-		opts      *JoggerGroupOpts
-		mpathInfo *fs.MountpathInfo
-		config    *cmn.Config
-		stopCh    *cos.StopCh
 		syncGroup *joggerSyncGroup
-
-		num int64
+		opts      *JgroupOpts
+		mi        *fs.Mountpath
+		bdir      string // mi.MakePath(bck)
+		objPrefix string // fully-qualified prefix, as in: join(bdir, opts.Prefix)
+		config    *cmn.Config
+		stopCh    cos.StopCh
+		bufs      [][]byte
+		num       int64
 	}
 
 	joggerSyncGroup struct {
@@ -87,52 +92,70 @@ type (
 	}
 )
 
-func NewJoggerGroup(opts *JoggerGroupOpts) *JoggerGroup {
-	cos.Assert(!opts.IncludeCopy || (opts.IncludeCopy && opts.DoLoad > noLoad))
-
+func NewJoggerGroup(opts *JgroupOpts, selectedMpaths ...string) *Jgroup {
 	var (
-		mpaths, _ = fs.Get()
-		wg, ctx   = errgroup.WithContext(context.Background())
-		joggers   = make(map[string]*jogger, len(mpaths))
+		joggers             map[string]*jogger
+		available, disabled = fs.Get()
+		wg, ctx             = errgroup.WithContext(context.Background())
+		l                   = len(selectedMpaths)
 	)
+	debug.Assert(!opts.IncludeCopy || (opts.IncludeCopy && opts.DoLoad > noLoad))
 
-	for _, mpathInfo := range mpaths {
-		joggers[mpathInfo.Path] = newJogger(ctx, opts, mpathInfo)
+	if l == 0 {
+		joggers = make(map[string]*jogger, len(available))
+	} else {
+		joggers = make(map[string]*jogger, l)
 	}
-
-	jg := &JoggerGroup{
-		wg:         wg,
-		joggers:    joggers,
-		finishedCh: cos.NewStopCh(),
+	for _, mi := range available {
+		if l == 0 {
+			joggers[mi.Path] = newJogger(ctx, opts, mi)
+			continue
+		}
+		for _, mpath := range selectedMpaths {
+			if mi, ok := available[mpath]; ok {
+				joggers[mi.Path] = newJogger(ctx, opts, mi)
+			}
+		}
 	}
+	jg := &Jgroup{wg: wg, joggers: joggers}
+	jg.finishedCh.Init()
 	opts.onFinish = jg.markFinished
+
+	// NOTE: this jogger group is a no-op
+	if len(joggers) == 0 {
+		nlog.Errorf("%v: avail=%v, disabled=%v, selected=%v",
+			cmn.ErrNoMountpaths, available, disabled, selectedMpaths)
+		jg.finishedCh.Close()
+	}
 	return jg
 }
 
-func (jg *JoggerGroup) Run() {
+func (jg *Jgroup) Num() int { return len(jg.joggers) }
+
+func (jg *Jgroup) Run() {
 	for _, jogger := range jg.joggers {
 		jg.wg.Go(jogger.run)
 	}
 }
 
-func (jg *JoggerGroup) Stop() error {
+func (jg *Jgroup) Stop() error {
 	for _, jogger := range jg.joggers {
 		jogger.abort()
 	}
 	return jg.wg.Wait()
 }
 
-func (jg *JoggerGroup) ListenFinished() <-chan struct{} {
+func (jg *Jgroup) ListenFinished() <-chan struct{} {
 	return jg.finishedCh.Listen()
 }
 
-func (jg *JoggerGroup) markFinished() {
+func (jg *Jgroup) markFinished() {
 	if n := jg.finishedCnt.Inc(); n == uint32(len(jg.joggers)) {
 		jg.finishedCh.Close()
 	}
 }
 
-func newJogger(ctx context.Context, opts *JoggerGroupOpts, mpathInfo *fs.MountpathInfo) *jogger {
+func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath) (j *jogger) {
 	var syncGroup *joggerSyncGroup
 	if opts.Parallel > 1 {
 		var (
@@ -150,22 +173,23 @@ func newJogger(ctx context.Context, opts *JoggerGroupOpts, mpathInfo *fs.Mountpa
 			syncGroup.sema <- i
 		}
 	}
-
-	return &jogger{
+	j = &jogger{
 		ctx:       ctx,
 		opts:      opts,
-		mpathInfo: mpathInfo,
+		mi:        mi,
 		config:    cmn.GCO.Get(),
-		stopCh:    cos.NewStopCh(),
 		syncGroup: syncGroup,
 	}
+	if opts.Prefix != "" {
+		j.bdir = mi.MakePathCT(&j.opts.Bck, fs.ObjectType) // this mountpath's bucket dir that contains objects
+		j.objPrefix = filepath.Join(j.bdir, opts.Prefix)
+	}
+	j.stopCh.Init()
+	return
 }
 
 func (j *jogger) run() error {
 	defer j.opts.onFinish()
-
-	glog.Infof("%s started", j)
-
 	if j.opts.Slab != nil {
 		if j.opts.Parallel <= 1 {
 			j.bufs = [][]byte{j.opts.Slab.Alloc()}
@@ -187,27 +211,28 @@ func (j *jogger) run() error {
 		aborted bool
 		err     error
 	)
-
-	// In case the bucket is not specified, walk in bucket-by-bucket fashion.
+	// walk all buckets, one at a time
 	if j.opts.Bck.IsEmpty() {
-		j.opts.T.Bowner().Get().Range(nil, nil, func(bck *cluster.Bck) bool {
-			aborted, err = j.runBck(bck.Bck)
+		bmd := j.opts.T.Bowner().Get()
+		bmd.Range(nil, nil, func(bck *meta.Bck) bool {
+			aborted, err = j.runBck(bck.Bucket())
 			return err != nil || aborted
 		})
 		return err
 	}
-	_, err = j.runBck(j.opts.Bck)
+	// walk the specified bucket
+	_, err = j.runBck(&j.opts.Bck)
 	return err
 }
 
-func (j *jogger) runBck(bck cmn.Bck) (aborted bool, err error) {
-	opts := &fs.Options{
-		Mpath:    j.mpathInfo,
-		Bck:      bck,
+func (j *jogger) runBck(bck *cmn.Bck) (aborted bool, err error) {
+	opts := &fs.WalkOpts{
+		Mi:       j.mi,
 		CTs:      j.opts.CTs,
 		Callback: j.jog,
 		Sorted:   false,
 	}
+	opts.Bck.Copy(bck)
 
 	err = fs.Walk(opts)
 	if j.syncGroup != nil {
@@ -222,7 +247,7 @@ func (j *jogger) runBck(bck cmn.Bck) (aborted bool, err error) {
 
 	if err != nil {
 		if cmn.IsErrAborted(err) {
-			glog.Infof("%s stopping traversal: %v", j, err)
+			nlog.Infof("%s stopping traversal: %v", j, err)
 			return true, nil
 		}
 		return false, err
@@ -231,8 +256,15 @@ func (j *jogger) runBck(bck cmn.Bck) (aborted bool, err error) {
 }
 
 func (j *jogger) jog(fqn string, de fs.DirEntry) error {
-	var bufPosition int
-
+	if j.objPrefix != "" && strings.HasPrefix(fqn, j.bdir) {
+		if de.IsDir() {
+			if !cmn.DirHasOrIsPrefix(fqn, j.objPrefix) {
+				return filepath.SkipDir
+			}
+		} else if !strings.HasPrefix(fqn, j.objPrefix) {
+			return nil
+		}
+	}
 	if de.IsDir() {
 		return nil
 	}
@@ -241,6 +273,7 @@ func (j *jogger) jog(fqn string, de fs.DirEntry) error {
 		return err
 	}
 
+	var bufPosition int
 	if j.syncGroup == nil {
 		if err := j.visitFQN(fqn, j.getBuf(0)); err != nil {
 			return err
@@ -281,22 +314,20 @@ func (j *jogger) visitFQN(fqn string, buf []byte) error {
 
 	if j.opts.SkipGloballyMisplaced {
 		uname := ct.Bck().MakeUname(ct.ObjectName())
-		tsi, err := cluster.HrwTarget(uname, j.opts.T.Sowner().Get()) // TODO: should we get smap once?
+		tsi, err := cluster.HrwTarget(uname, j.opts.T.Sowner().Get())
 		if err != nil {
 			return err
 		}
-		if tsi.ID() != j.opts.T.Snode().ID() {
+		if tsi.ID() != j.opts.T.SID() {
 			return nil
 		}
 	}
 
 	switch ct.ContentType() {
 	case fs.ObjectType:
-		lom := cluster.AllocLOMbyFQN(fqn)
-		err := lom.Init(j.opts.Bck)
-		if err == nil {
-			err = j.visitObj(lom, buf)
-		}
+		lom := cluster.AllocLOM("")
+		lom.InitCT(ct)
+		err := j.visitObj(lom, buf)
 		// NOTE: j.visitObj() callback impl-s must either finish the entire
 		//       operation synchronously OR pass lom.LIF to other gorouine(s)
 		cluster.FreeLOM(lom)
@@ -345,7 +376,7 @@ func (j *jogger) checkStopped() error {
 	case <-j.ctx.Done(): // Some other worker has exited with error and canceled context.
 		return j.ctx.Err()
 	case <-j.stopCh.Listen(): // Worker has been aborted.
-		return cmn.NewAbortedError(j.String())
+		return cmn.NewErrAborted(j.String(), "mpath-jog", nil)
 	default:
 		return nil
 	}
@@ -361,11 +392,11 @@ func (sg *joggerSyncGroup) abortAsyncTasks() error {
 }
 
 func (j *jogger) throttle() {
-	curUtil := fs.GetMpathUtil(j.mpathInfo.Path)
+	curUtil := fs.GetMpathUtil(j.mi.Path)
 	if curUtil >= j.config.Disk.DiskUtilHighWM {
-		time.Sleep(cmn.ThrottleMin)
+		time.Sleep(ThrottleMinDur)
 	}
 }
 
 func (j *jogger) abort()         { j.stopCh.Close() }
-func (j *jogger) String() string { return fmt.Sprintf("jogger [%s/%s]", j.mpathInfo, j.opts.Bck) }
+func (j *jogger) String() string { return fmt.Sprintf("jogger [%s/%s]", j.mi, j.opts.Bck) }

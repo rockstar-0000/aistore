@@ -9,6 +9,10 @@ redirect_from:
 
 ## Introduction
 
+Terminology first:
+
+**Backend Provider** is a designed-in [abstraction](https://github.com/NVIDIA/aistore/blob/master/cluster/target.go) and, simultaneously, an API-supported option that allows to delineate between "remote" and "local" buckets with respect to a given AIS cluster.
+
 AIStore natively integrates with multiple backend providers:
 
 | Backend | Schema(s) | Description |
@@ -20,6 +24,22 @@ AIStore natively integrates with multiple backend providers:
 | `hdfs` | `hdfs://` | [Hadoop Distributed File System](#hdfs-provider) |
 | `ht` | `ht://` | [HTTP(S) based dataset](#https-based-dataset) |
 
+**Native integration**, in turn, implies:
+* utilizing vendor's SDK libraries to operate on the respective remote backends;
+* providing unified namespace (where, e.g., two same-name buckets from different backends can co-exist with no conflicts);
+* on-the-fly populating AIS own bucket metadata with the properties of remote buckets.
+
+The last bullet deserves a little more explanation. First, there's a piece of cluster-wide metadata that we call BMD. Like every other type of metadata, BMD is versioned, checksummed, and replicated - the process that is carried out by the currently elected *primary*.
+
+BMD contains all bucket definitions and per-bucket configurable management policies - local and remote.
+
+Here's what happens upon the very first (read or write or list, etc.) access to a remote bucket that is *not* yet in the BMD:
+1. Behind the scenes, AIS will try to confirm the bucket's existence and accessibility.
+2. If confirmed, AIS will atomically add the bucket to the BMD (along with its remote properties).
+3. Once all of the above is set and done, AIS will go ahead to perform that original (read or write or list, etc.) operation
+
+> There are advanced-usage type options to skip Steps 1. and 2. above - see e.g. [`LisObjsMsg flags`](https://github.com/NVIDIA/aistore/blob/master/api/apc/lsmsg.go#L15-L56)
+
 The full taxonomy of the supported backends is shown below (and note that AIS supports itself on the back as well):
 
 ![Supported Backends](images/supported-backends.png)
@@ -28,22 +48,29 @@ Further:
 
 * For additional information on working with buckets, please refer to [bucket readme](bucket.md).
 * For API reference, see [the RESTful API reference and examples](http_api.md).
-* For AIS command-line management, see [CLI](/docs/cli.md).
+* For AIS command-line management, see [CLI](cli.md).
 
 ## Remote AIS cluster
 
-In addition to the listed above 3rd party Cloud storages and non-Cloud HTTP(S) based datasets, AIS *integrates with itself* via its own RESTful API.
-In other words, one AIS cluster can be *attached* to another (to transparently access and replicate each other's distributed storage).
+In addition to the listed above 3rd party Cloud storages and non-Cloud HTTP(S) and HDFS-based backends, any given pair of AIS clusters can be organized in a way where one cluster would be providing fully-accessible *backend* to another.
 
-Between two AIS clusters A and B the same exact rules apply: as soon as B gets attached to A, any read access to (remote) objects and datasets from B will have the side effect of cluster A persistently caching those objects and datasets on its own clustered servers (aka storage targets), subject to the rules and policies configured on the corresponding A's buckets.
-By *attaching* AIS clusters we are, effectively and ad-hoc, forming a unified global namespace of all individually hosted datasets.
+Terminology:
+
+| Term | Comment |
+|--- | --- |
+| `attach` remote cluster | Allow one cluster to see remote datasets, cache those datasets on demand, copy remote buckets, list, create, and destroy remote buckets, read and write remote buckets, etc. |
+| `detach` remote cluster | Operation that (as the name implies) removes the corresponding *attachment* |
+| `alias` | An optional user-friendly alias that can be assigned at *attachment* time and be further used in all subsequent operations instead of the remote cluster's UUID |
+| `global namespace` | Refers to the capability to unambiguously indicate and access any dataset in an arbitrary network (or DAG, to be precise) of AIS clusters whereby some clusters are `attached` to another ones. By *attaching* AIS clusters we are, effectively and ad-hoc, forming a unified global namespace of all individually hosted datasets. |
+
+> Example working with remote AIS cluster (as well as easy-to-use scripts) can be found in the [README for developers](development.md).
 
 ### Unified Global Namespace
 
 Examples first. The following two commands attach and then show remote cluster at the address`my.remote.ais:51080`:
 
 ```console
-$ ais cluster attach alias111=http://my.remote.ais:51080
+$ ais cluster remote-attach alias111=http://my.remote.ais:51080
 Remote cluster (alias111=http://my.remote.ais:51080) successfully attached
 $ ais show remote-cluster
 UUID      URL                     Alias     Primary         Smap  Targets  Online
@@ -67,7 +94,7 @@ Notice the difference between the first and the second lines in the printout abo
 To `detach` any of the previously configured association, simply run:
 
 ```console
-$ ais cluster detach alias111
+$ ais cluster remote-detach alias111
 $ ais show remote-cluster
 UUID        URL                       Alias     Primary         Smap  Targets  Online
 <alias222>  <other.remote.ais:51080>            n/a             n/a   n/a      no
@@ -103,12 +130,16 @@ Configuration-wise, the following two examples specify a single-URL and multi-UR
 > Multiple remote URLs can be provided for the same typical reasons that include fault tolerance.
 > However, once connected we will rely on the remote cluster map to retry upon connection errors and load balance.
 
-For more usage examples, please see [working with remote AIS bucket](bucket.md#cli-example-working-with-remote-ais-bucket).
+For more usage examples, please see:
 
-And one final comment:
+* [working with remote AIS cluster](bucket.md#cli-working-with-remote-ais-cluster)
+* [example: minimal remote cluster](development.md#example-minimal-remote-cluster)
 
-You can run `ais remote attach` and/or `ais show remote-cluster` CLI to *refresh* remote configuration: check availability and reload cluster maps.
-In other words, repeating the same `ais cluster attach` command will have the side effect of refreshing all the currently configured attachments.
+And one more comment:
+
+You can run `ais cluster remote-attach` and/or `ais show remote-cluster` CLI to *refresh* remote configuration: **check availability** and **reload** remote cluster maps.
+
+In other words, repeating the same `ais cluster remote-attach` command will have the side effect of refreshing all the currently configured attachments.
 Or, use `ais show remote-cluster` CLI for the same exact purpose.
 
 ## Cloud object storage
@@ -160,21 +191,21 @@ Example of HDFS provider configuration:
 
 After the HDFS is set up, and the binary is built with HDFS provider, we can see everything in action.
 ```console
-$ ais bucket create hdfs://yt8m --bucket-props="extra.hdfs.ref_directory=/part1/video"
+$ ais create hdfs://yt8m --props="extra.hdfs.ref_directory=/part1/video"
 "hdfs://yt8m" bucket created
-$ ais bucket ls hdfs://
+$ ais ls hdfs://
 HDFS Buckets (1)
   hdfs://yt8m
-$ ais object put 1.mp4 hdfs://yt8m/1.mp4
+$ ais put 1.mp4 hdfs://yt8m/1.mp4
 PUT "1.mp4" into bucket "hdfs://yt8m"
-$ ais bucket ls hdfs://yt8m
+$ ais ls hdfs://yt8m
 NAME	 SIZE
 1.mp4	 76.31KiB
-$ ais object get hdfs://yt8m/1.mp4 video.mp4
+$ ais get hdfs://yt8m/1.mp4 video.mp4
 GET "1.mp4" from bucket "hdfs://yt8m" as "video.mp4" [76.31KiB]
 ```
 
-The first thing to notice is `--bucket-props="extra.hdfs.ref_directory=/part1/video"`.
+The first thing to notice is `--props="extra.hdfs.ref_directory=/part1/video"`.
 Here we specify the **required** path the `hdfs://yt8m` bucket will refer to (the directory must exist on bucket creation).
 It means that when accessing object `hdfs://yt8m/1.mp4` the path will be resolved to `/part1/video/1.mp4` (`/part1/video` + `1.mp4`).
 

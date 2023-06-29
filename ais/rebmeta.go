@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -11,13 +11,18 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/xact"
 )
 
 // Rebalance metadata is distributed to start rebalance. We must do it:
@@ -35,16 +40,30 @@ type (
 	// rebMD is revs (see metasync) which is distributed by primary proxy to
 	// the targets. It is distributed when some kind of rebalance is required.
 	rebMD struct {
-		cluster.RMD
+		meta.RMD
 	}
 
 	// rmdOwner is used to keep the information about the rebalances. Currently
 	// it keeps the Version of the latest rebalance.
 	rmdOwner struct {
 		sync.Mutex
-		rmd       atomic.Pointer
-		rebalance atomic.Bool // whether to resume interrupted rebalance
-		startup   atomic.Bool // true when starting up
+		rmd atomic.Pointer
+		// global local atomic state
+		interrupted atomic.Bool // when joining target reports interrupted rebalance
+		starting    atomic.Bool // when starting up
+	}
+
+	rmdModifier struct {
+		pre   func(ctx *rmdModifier, clone *rebMD)
+		final func(ctx *rmdModifier, clone *rebMD)
+
+		prev  *rebMD // pre-modification rmd
+		cur   *rebMD // the cloned and modified `prev`
+		rebID string // cluster-wide UUID
+
+		p       *proxy
+		smapCtx *smapModifier
+		wait    bool
 	}
 )
 
@@ -52,11 +71,11 @@ type (
 var _ revs = (*rebMD)(nil)
 
 // as revs
-func (*rebMD) tag() string             { return revsRMDTag }
-func (r *rebMD) version() int64        { return r.Version }
-func (r *rebMD) marshal() []byte       { return cos.MustMarshal(r) }
-func (*rebMD) jit(p *proxyrunner) revs { return p.owner.rmd.get() }
-func (*rebMD) sgl() *memsys.SGL        { return nil }
+func (*rebMD) tag() string       { return revsRMDTag }
+func (r *rebMD) version() int64  { return r.Version }
+func (r *rebMD) marshal() []byte { return cos.MustMarshal(r) }
+func (*rebMD) jit(p *proxy) revs { return p.owner.rmd.get() }
+func (*rebMD) sgl() *memsys.SGL  { return nil }
 
 func (r *rebMD) inc() { r.Version++ }
 
@@ -86,41 +105,107 @@ func newRMDOwner() *rmdOwner {
 }
 
 func (*rmdOwner) persist(rmd *rebMD) error {
-	rmdPathName := filepath.Join(cmn.GCO.Get().ConfigDir, cmn.RmdFname)
+	rmdPathName := filepath.Join(cmn.GCO.Get().ConfigDir, fname.Rmd)
 	return jsp.SaveMeta(rmdPathName, rmd, nil /*wto*/)
 }
 
 func (r *rmdOwner) load() {
 	rmd := &rebMD{}
-	_, err := jsp.LoadMeta(filepath.Join(cmn.GCO.Get().ConfigDir, cmn.RmdFname), rmd)
+	_, err := jsp.LoadMeta(filepath.Join(cmn.GCO.Get().ConfigDir, fname.Rmd), rmd)
 	if err == nil {
 		r.put(rmd)
 		return
 	}
 	if !os.IsNotExist(err) {
-		glog.Errorf("failed to load rmd: %v", err)
+		nlog.Errorf("failed to load rmd: %v", err)
 	}
 }
 
 func (r *rmdOwner) put(rmd *rebMD) { r.rmd.Store(unsafe.Pointer(rmd)) }
 func (r *rmdOwner) get() *rebMD    { return (*rebMD)(r.rmd.Load()) }
-func (r *rmdOwner) _runPre(ctx *rmdModifier) (clone *rebMD, err error) {
-	r.Lock()
-	defer r.Unlock()
-	clone = r.get().clone()
-	clone.TargetIDs = nil
-	clone.Resilver = ""
-	ctx.pre(ctx, clone)
-	if err = r.persist(clone); err == nil {
-		r.put(clone)
-	}
-	return
-}
 
 func (r *rmdOwner) modify(ctx *rmdModifier) (clone *rebMD, err error) {
-	clone, err = r._runPre(ctx)
+	r.Lock()
+	clone, err = r.do(ctx)
+	r.Unlock()
 	if err == nil && ctx.final != nil {
 		ctx.final(ctx, clone)
 	}
 	return
+}
+
+func (r *rmdOwner) do(ctx *rmdModifier) (clone *rebMD, err error) {
+	ctx.prev = r.get()
+	clone = ctx.prev.clone()
+	clone.TargetIDs = nil
+	clone.Resilver = ""
+	ctx.pre(ctx, clone) // `pre` callback
+
+	if err = r.persist(clone); err == nil {
+		r.put(clone)
+	}
+	ctx.cur = clone
+	ctx.rebID = xact.RebID2S(clone.Version) // new rebID
+	return
+}
+
+/////////////////
+// rmdModifier //
+/////////////////
+
+func rmdInc(_ *rmdModifier, clone *rebMD) { clone.inc() }
+
+// via `rmdModifier.final`
+func rmdSync(m *rmdModifier, clone *rebMD) {
+	debug.Assert(m.cur == clone)
+	m.listen(nil)
+	msg := &aisMsg{ActMsg: apc.ActMsg{Action: apc.ActRebalance}, UUID: m.rebID} // user-requested rebalance
+	wg := m.p.metasyncer.sync(revsPair{m.cur, msg})
+	if m.wait {
+		wg.Wait()
+	}
+}
+
+// see `receiveRMD` (upon termination, notify IC)
+func (m *rmdModifier) listen(cb func(nl nl.Listener)) {
+	nl := xact.NewXactNL(m.rebID, apc.ActRebalance, &m.smapCtx.smap.Smap, nil)
+	nl.SetOwner(equalIC)
+
+	nl.F = m.log
+	if cb != nil {
+		nl.F = cb
+	}
+	err := m.p.notifs.add(nl)
+	debug.AssertNoErr(err)
+}
+
+// default
+func (m *rmdModifier) log(nl nl.Listener) {
+	debug.Assert(nl.UUID() == m.rebID)
+	var (
+		err  = nl.Err()
+		abrt = nl.Aborted()
+		name = "rebalance[" + nl.UUID() + "] "
+	)
+	switch {
+	case err == nil && !abrt:
+		nlog.Infoln(name + "done")
+	case abrt:
+		nlog.Warningln(name + "aborted")
+	default:
+		nlog.Errorf("%s failed: %v", name, err)
+	}
+}
+
+// deactivate or remove node from the cluster (as per msg.Action)
+func (m *rmdModifier) rmNode(nl nl.Listener) {
+	m.log(nl)
+	if cnt, abrt := nl.ErrCnt(), nl.Aborted(); cnt > 0 || abrt {
+		return
+	}
+	si := m.smapCtx.smap.GetNode(m.smapCtx.sid)
+	debug.Assert(si.IsTarget())
+	if _, err := m.p.rmNodeFinal(m.smapCtx.msg, si, m.smapCtx); err != nil {
+		nlog.Errorln(err)
+	}
 }

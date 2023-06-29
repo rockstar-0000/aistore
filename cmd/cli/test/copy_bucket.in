@@ -1,3 +1,4 @@
+ais wait rebalance // IGNORE
 ais bucket create ais://$BUCKET_1 ais://$BUCKET_2 | awk '{print $1 " " $2}'
 
 for d1 in {0..4}; do for d2 in {0..100}; do mkdir -p /tmp/rdir/test$d1/$d2 && echo -n $RANDOM > /tmp/rdir/test$d1/$d2/test.txt; done; done
@@ -5,11 +6,11 @@ ais object put "/tmp/rdir/test{0..4}/{0..100}/test.txt" ais://$BUCKET_1 -y // IG
 
 ais bucket cp aiss://$BUCKET_1/ ais://$BUCKET_2/ // FAIL "invalid backend provider "aiss""
 ais bucket cp ais://$BUCKET_1/ aiss://$BUCKET_2/ // FAIL "invalid backend provider "aiss""
-ais bucket cp ais://$BUCKET_1 ais://$BUCKET_2
+ais bucket cp ais://$BUCKET_1 ais://$BUCKET_2 --force
 
-ais job wait xaction copybck ais://$BUCKET_2
-ais show job xaction copybck ais://$BUCKET_1
-ais show job xaction copybck
-ais show job xaction copybck ais://$BUCKET_3 // FAIL "bucket "ais://$BUCKET_3" does not exist"
+ais job wait copy-bck ais://$BUCKET_2
+ais show job copy-bck ais://$BUCKET_1 --all
+ais show job copy-bck
+ais show job copy-bck ais://$BUCKET_3 // FAIL ais://$BUCKET_3
 
 rm -rf /tmp/rdir // IGNORE

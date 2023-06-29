@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -23,17 +23,23 @@ import "github.com/NVIDIA/aistore/cmn/jsp"
 //   has a certain meta-version that corresponds to the specific way
 //   `jsp` formats its *signature* and other implementation details.
 
-const AIStoreSoftwareVersion = "3.6"
+const (
+	VersionAIStore = "3.17"
+	VersionCLI     = "1.2"
+	VersionLoader  = "1.6"
+	VersionAuthN   = "1.0"
+)
 
 const (
-	MetaverSmap = 1 // Smap (cluster map) formatting version (jsp)
-	MetaverBMD  = 1 // BMD (bucket metadata) --/-- (jsp)
-	MetaverRMD  = 1 // Rebalance MD (jsp)
-	MetaverVMD  = 1 // Volume MD (jsp)
+	MetaverSmap  = 1 // Smap (cluster map) formatting version (jsp)
+	MetaverBMD   = 2 // BMD (bucket metadata) --/-- (jsp)
+	MetaverRMD   = 1 // Rebalance MD (jsp)
+	MetaverVMD   = 1 // Volume MD (jsp)
+	MetaverEtlMD = 1 // ETL MD (jsp)
 
 	MetaverLOM = 1 // LOM
 
-	MetaverConfig      = 1 // Global Configuration (jsp)
+	MetaverConfig      = 2 // Global Configuration (jsp)
 	MetaverAuthNConfig = 1 // Authn config (jsp) // ditto
 	MetaverAuthTokens  = 1 // Authn tokens (jsp) // ditto
 

@@ -1,6 +1,6 @@
 // Package main for the AIS node executable.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/ais"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 var (
@@ -48,7 +49,8 @@ func run() int {
 		defer pprof.StopCPUProfile()
 	}
 
-	exitCode := ais.Run(cmn.AIStoreSoftwareVersion+"."+build, buildtime)
+	exitCode := ais.Run(cmn.VersionAIStore+"."+build, buildtime)
+	nlog.FlushExit()
 
 	if s := *memProfile; s != "" {
 		*memProfile = s + "." + strconv.Itoa(syscall.Getpid())

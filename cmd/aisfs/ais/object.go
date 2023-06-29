@@ -1,6 +1,6 @@
 // Package ais implements an AIStore client.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -39,13 +39,13 @@ func NewObject(objName string, bucket Bucket, sizes ...int64) *Object {
 func (obj *Object) Bck() cmn.Bck { return obj.bck }
 
 func (obj *Object) Put(r cos.ReadOpenCloser) (err error) {
-	putArgs := api.PutObjectArgs{
+	putArgs := api.PutArgs{
 		BaseParams: obj.apiParams,
 		Bck:        obj.bck,
-		Object:     obj.Name,
+		ObjName:    obj.Name,
 		Reader:     r,
 	}
-	err = api.PutObject(putArgs)
+	_, err = api.PutObject(putArgs)
 	if err != nil {
 		err = newObjectIOError(err, "Put", obj.Name)
 	}
@@ -53,16 +53,16 @@ func (obj *Object) Put(r cos.ReadOpenCloser) (err error) {
 }
 
 func (obj *Object) GetChunk(w io.Writer, offset, length int64) (n int64, err error) {
-	hdr := cmn.RangeHdr(offset, length)
-	objArgs := api.GetObjectInput{
-		Writer: w,
-		Header: hdr,
-	}
-
-	n, err = api.GetObject(obj.apiParams, obj.bck, obj.Name, objArgs)
+	var (
+		oah     api.ObjAttrs
+		hdr     = cmn.MakeRangeHdr(offset, length)
+		getArgs = api.GetArgs{Writer: w, Header: hdr}
+	)
+	oah, err = api.GetObject(obj.apiParams, obj.bck, obj.Name, &getArgs)
 	if err != nil {
 		return 0, newObjectIOError(err, "GetChunk", obj.Name)
 	}
+	n = oah.Size()
 	return
 }
 

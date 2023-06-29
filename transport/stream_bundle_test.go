@@ -1,7 +1,7 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
@@ -13,14 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/devtools/tassert"
-	"github.com/NVIDIA/aistore/devtools/tlog"
-	"github.com/NVIDIA/aistore/devtools/tutils"
+	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools/tassert"
+	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
 )
@@ -31,56 +32,64 @@ type (
 )
 
 var (
-	smap      cluster.Smap
+	smap      meta.Smap
 	listeners slisteners
 )
 
-func (*sowner) Get() *cluster.Smap               { return &smap }
-func (*sowner) Listeners() cluster.SmapListeners { return &listeners }
+func (*sowner) Get() *meta.Smap               { return &smap }
+func (*sowner) Listeners() meta.SmapListeners { return &listeners }
 
-func (*slisteners) Reg(cluster.Slistener)   {}
-func (*slisteners) Unreg(cluster.Slistener) {}
+func (*slisteners) Reg(meta.Slistener)   {}
+func (*slisteners) Unreg(meta.Slistener) {}
 
 func Test_Bundle(t *testing.T) {
 	tests := []struct {
 		name string
-		nvs  cos.SimpleKVs
+		nvs  cos.StrKVs
 	}{
 		{
 			name: "not-compressed",
-			nvs: cos.SimpleKVs{
-				"compression": cmn.CompressNever,
+			nvs: cos.StrKVs{
+				"compression": apc.CompressNever,
 			},
 		},
 		{
 			name: "not-compressed-unsized",
-			nvs: cos.SimpleKVs{
-				"compression": cmn.CompressNever,
+			nvs: cos.StrKVs{
+				"compression": apc.CompressNever,
 				"unsized":     "yes",
 			},
 		},
-		{
-			name: "compress-block-1M",
-			nvs: cos.SimpleKVs{
-				"compression": cmn.CompressAlways,
-				"block":       "1MiB",
+	}
+	if !testing.Short() {
+		testsLong := []struct {
+			name string
+			nvs  cos.StrKVs
+		}{
+			{
+				name: "compress-block-1M",
+				nvs: cos.StrKVs{
+					"compression": apc.CompressAlways,
+					"block":       "1MiB",
+				},
 			},
-		},
-		{
-			name: "compress-block-256K",
-			nvs: cos.SimpleKVs{
-				"compression": cmn.CompressAlways,
-				"block":       "256KiB",
+			{
+				name: "compress-block-256K",
+				nvs: cos.StrKVs{
+					"compression": apc.CompressAlways,
+					"block":       "256KiB",
+				},
 			},
-		},
-		{
-			name: "compress-block-256K-unsized",
-			nvs: cos.SimpleKVs{
-				"compression": cmn.CompressAlways,
-				"block":       "256KiB",
-				"unsized":     "yes",
+			{
+				name: "compress-block-256K-unsized",
+				nvs: cos.StrKVs{
+					"compression": apc.CompressAlways,
+					"block":       "256KiB",
+					"unsized":     "yes",
+				},
 			},
-		},
+		}
+		tests = append(tests, testsLong...)
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -90,15 +99,17 @@ func Test_Bundle(t *testing.T) {
 	}
 }
 
-func testBundle(t *testing.T, nvs cos.SimpleKVs) {
+func testBundle(t *testing.T, nvs cos.StrKVs) {
 	var (
 		numCompleted atomic.Int64
-		MMSA         = tutils.MMSA
-		network      = cmn.NetworkIntraData
+		mmsa, _      = memsys.NewMMSA("bundle")
+		network      = cmn.NetIntraData
 		trname       = "bundle" + nvs["block"]
 		tss          = make([]*httptest.Server, 0, 32)
+		lsnode       = meta.Snode{DaeID: "local"}
 	)
-	smap.Tmap = make(cluster.NodeMap, 100)
+	smap.Tmap = make(meta.NodeMap, 100)
+	smap.Tmap[lsnode.ID()] = &lsnode
 	for i := 0; i < 10; i++ {
 		ts := httptest.NewServer(objmux)
 		tss = append(tss, ts)
@@ -108,51 +119,52 @@ func testBundle(t *testing.T, nvs cos.SimpleKVs) {
 		for _, ts := range tss {
 			ts.Close()
 		}
+		mmsa.Terminate(false)
 	}()
 	smap.Version = 1
 
-	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) {
+	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 		if err != nil && !cos.IsEOF(err) {
 			tassert.CheckFatal(t, err)
 		}
 		written, _ := io.Copy(io.Discard, objReader)
 		cos.Assert(written == hdr.ObjAttrs.Size || hdr.IsUnsized())
+		return nil
 	}
-	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ interface{}, _ error) {
+	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
 		numCompleted.Inc()
 	}
 
-	err := transport.HandleObjStream(trname, receive) // DirectURL = /v1/transport/10G
+	err := transport.HandleObjStream(trname, receive) // URL = /v1/transport/10G
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 
 	var (
 		httpclient     = transport.NewIntraDataClient()
 		sowner         = &sowner{}
-		lsnode         = cluster.Snode{DaemonID: "local"}
 		random         = newRand(mono.NanoTime())
-		wbuf, slab     = MMSA.Alloc()
-		extra          = &transport.Extra{Compression: nvs["compression"], MMSA: MMSA}
+		wbuf, slab     = mmsa.Alloc()
+		extra          = &transport.Extra{Compression: nvs["compression"], MMSA: mmsa}
 		size, prevsize int64
 		multiplier     = int(random.Int63()%13) + 4
 		num            int
 		usePDU         bool
 	)
-	if nvs["compression"] != cmn.CompressNever {
-		v, _ := cos.S2B(nvs["block"])
-		cos.Assert(v == cos.MiB || v == cos.KiB*256 || v == cos.KiB*64)
+	if nvs["compression"] != apc.CompressNever {
+		v, _ := cos.ParseSize(nvs["block"], cos.UnitsIEC)
+		cos.Assert(v == cos.MiB*4 || v == cos.MiB || v == cos.KiB*256 || v == cos.KiB*64)
 		config := cmn.GCO.BeginUpdate()
-		config.Compression.BlockMaxSize = int(v)
+		config.Transport.LZ4BlockMaxSize = cos.SizeIEC(v)
 		cmn.GCO.CommitUpdate(config)
-		if err := config.Compression.Validate(); err != nil {
+		if err := config.Transport.Validate(); err != nil {
 			tassert.CheckFatal(t, err)
 		}
 	}
 	if _, usePDU = nvs["unsized"]; usePDU {
-		extra.SizePDU = transport.DefaultSizePDU
+		extra.SizePDU = memsys.DefaultBufSize
 	}
 	_, _ = random.Read(wbuf)
-	sb := bundle.NewStreams(sowner, &lsnode, httpclient,
+	sb := bundle.New(sowner, &lsnode, httpclient,
 		bundle.Args{Net: network, Trname: trname, Multiplier: multiplier, Extra: extra})
 	var numGs int64 = 6
 	if testing.Short() {
@@ -188,7 +200,7 @@ func testBundle(t *testing.T, nvs cos.SimpleKVs) {
 
 	slab.Free(wbuf)
 
-	if nvs["compression"] != cmn.CompressNever {
+	if nvs["compression"] != apc.CompressNever {
 		for id, tstat := range stats {
 			fmt.Printf("send$ %s/%s: offset=%d, num=%d(%d), compression-ratio=%.2f\n",
 				id, trname, tstat.Offset.Load(), tstat.Num.Load(), num, tstat.CompressionRatio())
@@ -202,8 +214,8 @@ func testBundle(t *testing.T, nvs cos.SimpleKVs) {
 	fmt.Printf("send$: num-sent=%d, num-completed=%d\n", num, numCompleted.Load())
 }
 
-func addTarget(smap *cluster.Smap, ts *httptest.Server, i int) {
-	netinfo := cluster.NetInfo{DirectURL: ts.URL}
+func addTarget(smap *meta.Smap, ts *httptest.Server, i int) {
+	netinfo := meta.NetInfo{URL: ts.URL}
 	tid := "t_" + strconv.FormatInt(int64(i), 10)
-	smap.Tmap[tid] = &cluster.Snode{PublicNet: netinfo, IntraControlNet: netinfo, IntraDataNet: netinfo}
+	smap.Tmap[tid] = &meta.Snode{PubNet: netinfo, ControlNet: netinfo, DataNet: netinfo}
 }

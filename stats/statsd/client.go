@@ -1,7 +1,6 @@
 // Package statsd provides a client to send basic statd metrics (timer, counter and gauge) to listening UDP StatsD server.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
- *
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package statsd
 
@@ -11,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
@@ -27,12 +26,12 @@ const (
 	Counter
 	// Gauge is StatsD's gauge type
 	Gauge
-	// PersistentCounter is StatsD's gauge type which is increased every time by the value
+	// PersistentCounter is StatsD's gauge type which is increased every time by its value
 	PersistentCounter
 )
 
 const (
-	numErrsLog    = 100 // inc num errors to glog error
+	numErrsLog    = 100 // log one every so many
 	numTestProbes = 10  // num UDP probes at startup (optional)
 )
 
@@ -49,7 +48,7 @@ type (
 	Metric struct {
 		Type  MetricType // time, counter or gauge
 		Name  string     // Name for this particular metric
-		Value interface{}
+		Value any
 	}
 )
 
@@ -71,7 +70,7 @@ func New(ip string, port int, prefix string, probe bool) (*Client, error) {
 		conn.Close()
 		return &Client{}, err
 	}
-	smm = memsys.DefaultSmallMM()
+	smm = memsys.ByteMM()
 	client := &Client{conn, server, prefix, true /*opened*/}
 	if !probe {
 		return client, nil
@@ -159,7 +158,7 @@ func (c Client) write(bytes []byte, l int) {
 	if err != nil || n < l {
 		errcnt++
 		if errcnt%numErrsLog == 0 {
-			glog.Errorf("StatsD: %v(%d/%d) %d", err, n, l, errcnt)
+			nlog.Errorf("StatsD: %v(%d/%d) %d", err, n, l, errcnt)
 		}
 	}
 }

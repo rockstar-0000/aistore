@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package fs_test
 
@@ -11,19 +11,19 @@ import (
 	"reflect"
 	"sort"
 	"testing"
-	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
-	"github.com/NVIDIA/aistore/devtools/tutils"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 func TestWalkBck(t *testing.T) {
 	var (
-		bck   = cmn.Bck{Name: "name", Provider: cmn.ProviderAIS}
+		bck   = cmn.Bck{Name: "name", Provider: apc.AIS}
 		tests = []struct {
 			name     string
 			mpathCnt int
@@ -36,9 +36,9 @@ func TestWalkBck(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fs.Init(ios.NewIOStaterMock())
-			fs.DisableFsIDCheck()
-			_ = fs.CSM.RegisterContentType(fs.ObjectType, &fs.ObjectContentResolver{})
+			fs.TestNew(mock.NewIOS())
+			fs.TestDisableValidation()
+			_ = fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
 
 			mpaths := make([]string, 0, test.mpathCnt)
 			defer func() {
@@ -63,11 +63,11 @@ func TestWalkBck(t *testing.T) {
 			avail, _ := fs.Get()
 			var fileNames []string
 			for _, mpath := range avail {
-				dir := mpath.MakePathCT(bck, fs.ObjectType)
+				dir := mpath.MakePathCT(&bck, fs.ObjectType)
 				err := cos.CreateDir(dir)
 				tassert.CheckFatal(t, err)
 
-				_, names := tutils.PrepareDirTree(t, tutils.DirTreeDesc{
+				_, names := tools.PrepareDirTree(t, tools.DirTreeDesc{
 					InitDir: dir,
 					Dirs:    rand.Int()%100 + 1,
 					Files:   rand.Int()%100 + 1,
@@ -81,11 +81,10 @@ func TestWalkBck(t *testing.T) {
 				objs = make([]string, 0, 100)
 				fqns = make([]string, 0, 100)
 			)
-			err := fs.WalkBck(&fs.WalkBckOptions{
-				Options: fs.Options{
-					Bck:         bck,
-					CTs:         []string{fs.ObjectType},
-					ErrCallback: nil,
+			err := fs.WalkBck(&fs.WalkBckOpts{
+				WalkOpts: fs.WalkOpts{
+					Bck: bck,
+					CTs: []string{fs.ObjectType},
 					Callback: func(fqn string, de fs.DirEntry) error {
 						parsedFQN, err := fs.ParseFQN(fqn)
 						tassert.CheckError(t, err)
@@ -109,7 +108,7 @@ func TestWalkBck(t *testing.T) {
 }
 
 func TestWalkBckSkipDir(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
+	rnd := cos.NowRand()
 	type (
 		mpathMeta struct {
 			total int
@@ -118,15 +117,15 @@ func TestWalkBckSkipDir(t *testing.T) {
 	)
 
 	var (
-		bck           = cmn.Bck{Name: "name", Provider: cmn.ProviderAIS}
-		mpathCnt      = 5 + rand.Int()%5
+		bck           = cmn.Bck{Name: "name", Provider: apc.AIS}
+		mpathCnt      = 5 + rnd.Int()%5
 		minObjectsCnt = 10
 		mpaths        = make(map[string]*mpathMeta)
 	)
 
-	fs.Init(ios.NewIOStaterMock())
-	fs.DisableFsIDCheck()
-	_ = fs.CSM.RegisterContentType(fs.ObjectType, &fs.ObjectContentResolver{})
+	fs.TestNew(mock.NewIOS())
+	fs.TestDisableValidation()
+	_ = fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
 
 	defer func() {
 		for mpath := range mpaths {
@@ -148,7 +147,7 @@ func TestWalkBckSkipDir(t *testing.T) {
 
 	avail, _ := fs.Get()
 	for _, mpath := range avail {
-		dir := mpath.MakePathCT(bck, fs.ObjectType)
+		dir := mpath.MakePathCT(&bck, fs.ObjectType)
 		err := cos.CreateDir(dir)
 		tassert.CheckFatal(t, err)
 
@@ -161,11 +160,10 @@ func TestWalkBckSkipDir(t *testing.T) {
 	}
 
 	fqns := make([]string, 0, 100)
-	err := fs.WalkBck(&fs.WalkBckOptions{
-		Options: fs.Options{
-			Bck:         bck,
-			CTs:         []string{fs.ObjectType},
-			ErrCallback: nil,
+	err := fs.WalkBck(&fs.WalkBckOpts{
+		WalkOpts: fs.WalkOpts{
+			Bck: bck,
+			CTs: []string{fs.ObjectType},
 			Callback: func(fqn string, de fs.DirEntry) error {
 				fqns = append(fqns, fqn)
 				return nil
@@ -178,12 +176,12 @@ func TestWalkBckSkipDir(t *testing.T) {
 			}
 			parsedFQN, err := fs.ParseFQN(fqn)
 			tassert.CheckError(t, err)
-			cos.Assert(!mpaths[parsedFQN.MpathInfo.Path].done)
+			cos.Assert(!mpaths[parsedFQN.Mountpath.Path].done)
 			if rand.Int()%10 == 0 {
-				mpaths[parsedFQN.MpathInfo.Path].done = true
+				mpaths[parsedFQN.Mountpath.Path].done = true
 				return filepath.SkipDir
 			}
-			mpaths[parsedFQN.MpathInfo.Path].total++
+			mpaths[parsedFQN.Mountpath.Path].total++
 			return nil
 		},
 	})

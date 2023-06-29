@@ -9,18 +9,20 @@ redirect_from:
 
 ## Introduction
 
-AIStore tracks, logs, and reports a large and growing number of counters, latencies and throughputs including (but not limited to) metrics that reflect cluster recovery and global rebalancing, all [extended long-running operations](/xaction/README.md), and, of course, the basic read, write, list transactions, and more.
+AIStore tracks, logs, and reports a large and growing number of counters, latencies and throughputs including (but not limited to) metrics that reflect cluster recovery and global rebalancing, all [extended long-running operations](/xact/README.md), and, of course, the basic read, write, list transactions, and more.
 
 Viewership is equally supported via:
 
 1. System logs
-2. [CLI](/docs/cli.md)
+2. [CLI](/docs/cli.md) and, in particular, [`ais show cluster stats`](/docs/cli/cluster.md) command
 3. [Prometheus](/docs/prometheus.md)
 4. Any [StatsD](https://github.com/etsy/statsd) compliant [backend](https://github.com/statsd/statsd/blob/master/docs/backend.md#supported-backends) including Graphite/Grafana
 
 > For general information on AIS metrics, see [Statistics, Collected Metrics, Visualization](/docs/metrics.md).
 
-> AIStore includes `aisloader` - a powerful tool that we use to simulate a variety of AI workloads. For numerous command-line options and usage examples, please see [Load Generator](/docs/aisloader.md) and [How To Benchmark AIStore](/docs/howto_benchmark.md). Or, just run the tool and see its online help. Note as well that `aisloader` is fully StatsD-enabled.
+> AIStore includes `aisloader` - a powerful tool that we use to simulate a variety of AI workloads. For numerous command-line options and usage examples, please see [`aisloader`](/docs/aisloader.md) and [How To Benchmark AIStore](/docs/howto_benchmark.md).
+
+> Or, just run `make aisloader; aisloader` and see its detailed online help. Note as well that `aisloader` is fully StatsD-enabled and supports detailed protocol-level tracing with runtime on and off switching.
 
 ## Table of Contents
 - [StatsD and Prometheus](#statsd-and-prometheus)

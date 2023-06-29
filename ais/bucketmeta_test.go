@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -34,19 +37,25 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 		config := cmn.GCO.BeginUpdate()
 		config.ConfigDir = mpath
 		config.Cksum.Type = cos.ChecksumXXHash
+		config.Space = cmn.SpaceConf{
+			LowWM: 75, HighWM: 90, OOS: 95,
+		}
+		config.LRU = cmn.LRUConf{
+			DontEvictTime: cos.Duration(time.Second), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
+		}
 		cmn.GCO.CommitUpdate(config)
 		cfg = cmn.GCO.Get()
 
 		bmd = newBucketMD()
-		for _, provider := range []string{cmn.ProviderAIS, cmn.ProviderAmazon} {
+		for _, provider := range []string{apc.AIS, apc.AWS} {
 			for i := 0; i < 10; i++ {
 				var hdr http.Header
-				if provider != cmn.ProviderAIS {
-					hdr = http.Header{cmn.HdrBackendProvider: []string{provider}}
+				if provider != apc.AIS {
+					hdr = http.Header{apc.HdrBackendProvider: []string{provider}}
 				}
 
 				var (
-					bck   = cluster.NewBck(fmt.Sprintf("bucket_%d", i), provider, cmn.NsGlobal)
+					bck   = meta.NewBck(fmt.Sprintf("bucket_%d", i), provider, cmn.NsGlobal)
 					props = defaultBckProps(bckPropsArgs{bck: bck, hdr: hdr})
 				)
 				bmd.add(bck, props)
@@ -54,13 +63,13 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 		}
 	})
 
-	for _, node := range []string{cmn.Target, cmn.Proxy} {
+	for _, node := range []string{apc.Target, apc.Proxy} {
 		makeBMDOwner := func() bmdOwner {
 			var bowner bmdOwner
 			switch node {
-			case cmn.Target:
+			case apc.Target:
 				bowner = newBMDOwnerTgt()
-			case cmn.Proxy:
+			case apc.Proxy:
 				bowner = newBMDOwnerPrx(cfg)
 			}
 			return bowner
@@ -91,7 +100,7 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 								Signature: signature,
 							}
 							clone := bmd.clone()
-							bck := cluster.NewBck("abc"+cos.GenTie(), cmn.ProviderAIS, cmn.NsGlobal)
+							bck := meta.NewBck("abc"+cos.GenTie(), apc.AIS, cmn.NsGlobal)
 
 							// Add bucket and save.
 							clone.add(bck, defaultBckProps(bckPropsArgs{bck: bck}))
@@ -112,7 +121,7 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 			})
 
 			It(fmt.Sprintf("should correctly detect bmd corruption %s", node), func() {
-				bmdFullPath := filepath.Join(mpath, cmn.BmdFname)
+				bmdFullPath := filepath.Join(mpath, fname.Bmd)
 				f, err := os.OpenFile(bmdFullPath, os.O_RDWR, 0)
 				Expect(err).NotTo(HaveOccurred())
 				_, err = f.WriteAt([]byte("xxxxxxxxxxxx"), 10)

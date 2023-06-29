@@ -1,36 +1,38 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"bytes"
-	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
 type (
 	globalConfig struct {
+		_sgl *memsys.SGL
 		cmn.ClusterConfig
-		_sgl *memsys.SGL // jsp-formatted
 	}
 	configOwner struct {
-		sync.Mutex
-		immSize     int64
 		globalFpath string
+		immSize     int64
+		sync.Mutex
 	}
 
 	configModifier struct {
@@ -39,8 +41,9 @@ type (
 
 		oldConfig *cmn.Config
 		toUpdate  *cmn.ConfigToUpdate
-		msg       *cmn.ActionMsg
+		msg       *apc.ActMsg
 		query     url.Values
+		hdr       http.Header
 		wait      bool
 	}
 )
@@ -49,10 +52,16 @@ type (
 var _ revs = (*globalConfig)(nil)
 
 // as revs
-func (*globalConfig) tag() string             { return revsConfTag }
-func (config *globalConfig) version() int64   { return config.Version }
-func (*globalConfig) jit(p *proxyrunner) revs { g, _ := p.owner.config.get(); return g }
-func (config *globalConfig) sgl() *memsys.SGL { return config._sgl }
+func (*globalConfig) tag() string           { return revsConfTag }
+func (config *globalConfig) version() int64 { return config.Version }
+func (*globalConfig) jit(p *proxy) revs     { g, _ := p.owner.config.get(); return g }
+
+func (config *globalConfig) sgl() *memsys.SGL {
+	if config._sgl.IsNil() {
+		return nil
+	}
+	return config._sgl
+}
 
 func (config *globalConfig) marshal() []byte {
 	config._sgl = config._encode(0)
@@ -60,7 +69,7 @@ func (config *globalConfig) marshal() []byte {
 }
 
 func (config *globalConfig) _encode(immSize int64) (sgl *memsys.SGL) {
-	sgl = memsys.DefaultPageMM().NewSGL(immSize)
+	sgl = memsys.PageMM().NewSGL(immSize)
 	err := jsp.Encode(sgl, config, config.JspOpts())
 	debug.AssertNoErr(err)
 	return
@@ -72,11 +81,17 @@ func (config *globalConfig) _encode(immSize int64) (sgl *memsys.SGL) {
 
 func newConfigOwner(config *cmn.Config) (co *configOwner) {
 	co = &configOwner{}
-	co.globalFpath = filepath.Join(config.ConfigDir, cmn.GlobalConfigFname)
+	co.globalFpath = filepath.Join(config.ConfigDir, fname.GlobalConfig)
 	return
 }
 
-// NOTE: loading every time - not keeping global replicated config in memory
+// NOTE:
+// iff user ever executed transient config updates this loaded
+// from disk version will differ from in-memory cmn.GCO.Get()
+// (with respect to those in-memory only updated values)
+// See also:
+// - api.SetClusterConfig
+// - apc.ActTransient
 func (co *configOwner) get() (clone *globalConfig, err error) {
 	clone = &globalConfig{}
 	if _, err = jsp.LoadMeta(co.globalFpath, clone); err == nil {
@@ -86,7 +101,7 @@ func (co *configOwner) get() (clone *globalConfig, err error) {
 	if os.IsNotExist(err) {
 		err = nil
 	} else {
-		glog.Errorf("failed to load global config from %s: %v", co.globalFpath, err)
+		nlog.Errorf("failed to load global config from %s: %v", co.globalFpath, err)
 	}
 	return
 }
@@ -100,11 +115,10 @@ func (co *configOwner) runPre(ctx *configModifier) (clone *globalConfig, err err
 	if err != nil {
 		return
 	}
-	// NOTE: config `nil` implies missing cluster config - use the config provided through CLI
-	//       to initiate one.
+	// NOTE: nil config == missing config
 	if clone == nil {
 		clone = &globalConfig{}
-		_, err = jsp.Load(cmn.GCO.GetGlobalConfigPath(), clone, jsp.Plain())
+		_, err = jsp.Load(cmn.GCO.GetInitialGconfPath(), clone, jsp.Plain())
 		if err != nil {
 			return
 		}
@@ -127,8 +141,7 @@ func (co *configOwner) runPre(ctx *configModifier) (clone *globalConfig, err err
 	if err := co.persist(clone, nil); err != nil {
 		clone._sgl.Free()
 		clone._sgl = nil
-		err = fmt.Errorf("FATAL: failed to persist %s: %v", clone, err)
-		return nil, err
+		return nil, cmn.NewErrFailedTo(nil, "persist", clone, err)
 	}
 	return
 }
@@ -180,7 +193,7 @@ func (*configOwner) persistBytes(payload msPayload, globalFpath string) (done bo
 func (co *configOwner) setDaemonConfig(toUpdate *cmn.ConfigToUpdate, transient bool) (err error) {
 	co.Lock()
 	clone := cmn.GCO.Clone()
-	err = cmn.SetConfigInMem(toUpdate, clone, cmn.Daemon)
+	err = setConfigInMem(toUpdate, clone, apc.Daemon)
 	if err != nil {
 		co.Unlock()
 		return
@@ -206,16 +219,22 @@ func (co *configOwner) setDaemonConfig(toUpdate *cmn.ConfigToUpdate, transient b
 	return
 }
 
+func setConfigInMem(toUpdate *cmn.ConfigToUpdate, config *cmn.Config, asType string) (err error) {
+	err = config.UpdateClusterConfig(toUpdate, asType)
+	return
+}
+
 func (co *configOwner) resetDaemonConfig() (err error) {
 	co.Lock()
 	oldConfig := cmn.GCO.Get()
 	config, err := co.get()
-	if err != nil {
+	if err != nil || config == nil {
 		co.Unlock()
+		nlog.Infof("Warning: reset config %s: %v", oldConfig, err)
 		return err
 	}
 	cmn.GCO.PutOverrideConfig(nil)
-	err = cos.RemoveFile(filepath.Join(oldConfig.ConfigDir, cmn.OverrideConfigFname))
+	err = cos.RemoveFile(filepath.Join(oldConfig.ConfigDir, fname.OverrideConfig))
 	if err != nil {
 		co.Unlock()
 		return

@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
@@ -10,39 +10,42 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
+// sparse logging
 const (
-	logNumProcessed = 256 // unit of house-keeping
+	logPending = 256
 )
 
 type (
 	putFactory struct {
 		xreg.RenewBase
-		xact *XactPut
+		xctn *XactPut
 		lom  *cluster.LOM
 	}
 	XactPut struct {
 		// implements cluster.Xact interface
-		xaction.DemandBase
+		xact.DemandBase
 		// runtime
 		workers *mpather.WorkerGroup
 		workCh  chan cluster.LIF
 		// init
-		mirror  cmn.MirrorConf
-		total   atomic.Int64
-		dropped int64
+		mirror cmn.MirrorConf
+		total  atomic.Int64
+		config *cmn.Config
 	}
 )
 
@@ -56,25 +59,25 @@ var (
 // putFactory //
 ////////////////
 
-func (*putFactory) New(args xreg.Args, bck *cluster.Bck) xreg.Renewable {
+func (*putFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	p := &putFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, lom: args.Custom.(*cluster.LOM)}
 	return p
 }
 
 func (p *putFactory) Start() error {
-	slab, err := p.T.MMSA().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
-	cos.AssertNoErr(err)
-	xact, err := runXactPut(p.lom, slab, p.T)
+	slab, err := p.T.PageMM().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
+	debug.AssertNoErr(err)
+	xctn, err := runXactPut(p.lom, slab, p.T)
 	if err != nil {
-		glog.Error(err)
+		nlog.Errorln(err)
 		return err
 	}
-	p.xact = xact
+	p.xctn = xctn
 	return nil
 }
 
-func (*putFactory) Kind() string        { return cmn.ActPutCopies }
-func (p *putFactory) Get() cluster.Xact { return p.xact }
+func (*putFactory) Kind() string        { return apc.ActPutCopies }
+func (p *putFactory) Get() cluster.Xact { return p.xctn }
 
 func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	debug.Assertf(false, "%s vs %s", p.Str(p.Kind()), xprev) // xreg.usePrev() must've returned true
@@ -87,14 +90,15 @@ func runXactPut(lom *cluster.LOM, slab *memsys.Slab, t cluster.Target) (r *XactP
 	if !mirror.Enabled {
 		return nil, errors.New("mirroring disabled, nothing to do")
 	}
-	if err = fs.ValidateNCopies(t.Sname(), int(mirror.Copies)); err != nil {
+	tname := t.String()
+	if err = fs.ValidateNCopies(tname, int(mirror.Copies)); err != nil {
 		return
 	}
 	bck := lom.Bck()
 	r = &XactPut{mirror: mirror, workCh: make(chan cluster.LIF, mirror.Burst)}
-	r.DemandBase.Init(cos.GenUUID(), cmn.ActPutCopies, bck, 0 /*use default*/)
+	r.DemandBase.Init(cos.GenUUID(), apc.ActPutCopies, bck, 0 /*use default*/)
 	r.workers = mpather.NewWorkerGroup(&mpather.WorkerGroupOpts{
-		Callback:  r.workCb,
+		Callback:  r.do,
 		Slab:      slab,
 		QueueSize: mirror.Burst,
 	})
@@ -107,13 +111,21 @@ func runXactPut(lom *cluster.LOM, slab *memsys.Slab, t cluster.Target) (r *XactP
 // XactPut //
 /////////////
 
-// mpather/worker callback (one worker per mountpath)
-func (r *XactPut) workCb(lom *cluster.LOM, buf []byte) {
+// (one worker per mountpath)
+func (r *XactPut) do(lom *cluster.LOM, buf []byte) {
 	copies := int(lom.Bprops().Mirror.Copies)
-	if _, err := addCopies(lom, copies, buf); err != nil {
-		glog.Error(err)
+
+	lom.Lock(true)
+	size, err := addCopies(lom, copies, buf)
+	lom.Unlock(true)
+
+	if err != nil {
+		r.AddErr(err)
+		if r.config.FastV(5, cos.SmoduleMirror) {
+			nlog.Infof("Error: %v", err)
+		}
 	} else {
-		r.ObjectsAdd(int64(copies))
+		r.ObjsAdd(1, size)
 	}
 	r.DecPending() // to support action renewal on-demand
 	cluster.FreeLOM(lom)
@@ -122,42 +134,33 @@ func (r *XactPut) workCb(lom *cluster.LOM, buf []byte) {
 // control logic: stop and idle timer
 // (LOMs get dispatched directly to workers)
 func (r *XactPut) Run(*sync.WaitGroup) {
-	glog.Infoln(r.String())
+	var err error
+	nlog.Infoln(r.Name())
+	r.config = cmn.GCO.Get()
 	r.workers.Run()
+loop:
 	for {
 		select {
 		case <-r.IdleTimer():
-			err := r.stop()
-			r.Finish(err)
-			return
+			break loop
 		case <-r.ChanAbort():
-			if err := r.stop(); err != nil {
-				r.Finish(err)
-			} else {
-				r.Finish(cmn.NewAbortedError(r.String()))
-			}
-			return
+			break loop
 		}
 	}
+
+	err = r.stop()
+	r.AddErr(err)
+	r.Finish()
 }
 
 // main method: replicate onto a given (and different) mountpath
 func (r *XactPut) Repl(lom *cluster.LOM) {
-	debug.AssertMsg(!r.Finished(), r.String())
-	r.total.Inc()
+	debug.Assert(!r.Finished(), r.String())
+	total := r.total.Inc()
 
-	// [throttle]
-	// when the optimization objective is write perf,
-	// we start dropping requests to make sure callers don't block
 	pending, max := int(r.Pending()), r.mirror.Burst
-	if r.mirror.OptimizePUT {
-		if pending > 1 && pending >= max {
-			r.dropped++
-			if (r.dropped % logNumProcessed) == 0 {
-				glog.Errorf("%s: pending=%d, total=%d, dropped=%d", r, pending, r.total.Load(), r.dropped)
-			}
-			return
-		}
+	if pending > 1 && pending >= max && (total%logPending) == 0 {
+		nlog.Warningf("%s: pending=%d exceeded %d=burst (total=%d)", r, pending, max, total)
 	}
 	r.IncPending() // ref-count via base to support on-demand action
 
@@ -173,7 +176,7 @@ func (r *XactPut) Repl(lom *cluster.LOM) {
 		// increase the chances for the burst of PUTs to subside
 		// but only to a point
 		if pending > max/2 && pending < max-max/8 {
-			time.Sleep(cmn.ThrottleAvg)
+			time.Sleep(mpather.ThrottleAvgDur)
 		}
 	}
 }
@@ -186,9 +189,15 @@ func (r *XactPut) stop() (err error) {
 	}
 	if n > 0 {
 		r.SubPending(n)
-		err = fmt.Errorf("%s: dropped %d object(s)", r, n)
+		err = fmt.Errorf("%s: dropped %d object%s", r, n, cos.Plural(n))
 	}
-	return err
+	return
 }
 
-func (r *XactPut) Stats() cluster.XactStats { return r.DemandBase.ExtStats() }
+func (r *XactPut) Snap() (snap *cluster.Snap) {
+	snap = &cluster.Snap{}
+	r.ToSnap(snap)
+
+	snap.IdleX = r.IsIdle()
+	return
+}

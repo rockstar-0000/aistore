@@ -1,6 +1,6 @@
 // Package main for the `aisloader` executable.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -9,16 +9,16 @@ import (
 	"os"
 
 	"github.com/NVIDIA/aistore/bench/aisloader"
+	"github.com/NVIDIA/aistore/cmn"
 )
 
 var (
-	version   = "1.2"
 	build     string
 	buildtime string
 )
 
 func main() {
-	if err := aisloader.Start(version, build, buildtime); err != nil {
+	if err := aisloader.Start(cmn.VersionLoader+"."+build, buildtime); err != nil {
 		fmt.Fprintf(os.Stderr, "aisloader exited with error: %v\n", err)
 		os.Exit(1)
 	}

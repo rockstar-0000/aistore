@@ -1,7 +1,7 @@
 // Package http2 puts a given number of files with a given size into AIStore.
 // See /bench/http2/README.md for more info.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package main
@@ -13,8 +13,8 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/readers"
-	"github.com/NVIDIA/aistore/devtools/tutils"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/readers"
 )
 
 const (
@@ -79,7 +79,7 @@ func putSpecificFiles(fileSize uint64, numPuts int, bck cmn.Bck, pool chan func(
 		wg.Add(1)
 		pool <- func() {
 			defer wg.Done()
-			tutils.Put(url, bck, "__bench/"+fname, r, errCh)
+			tools.Put(url, bck, "__bench/"+fname, r, errCh)
 		}
 	}
 	close(pool)

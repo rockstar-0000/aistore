@@ -1,6 +1,6 @@
 // Package fs implements an AIStore file system.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -11,8 +11,8 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
 	"github.com/NVIDIA/aistore/cmd/aisfs/ais"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/OneOfOne/xxhash"
 	"github.com/jacobsa/fuse/fuseops"
@@ -182,7 +182,7 @@ func (c *namespaceCache) remove(p string) {
 		wg.Add(1)
 		go func(i int) {
 			m := c.getCacheByIdx(i)
-			m.Range(func(k, v interface{}) bool {
+			m.Range(func(k, v any) bool {
 				name := k.(string)
 				if strings.HasPrefix(name, p) {
 					m.Delete(k)
@@ -226,7 +226,7 @@ func (c *namespaceCache) listEntries(p string, cb func(nsEntry)) {
 		wg.Add(1)
 		go func(i int) {
 			m := c.getCacheByIdx(i)
-			m.Range(func(k, v interface{}) bool {
+			m.Range(func(k, v any) bool {
 				name := k.(string)
 				if !strings.HasPrefix(name, p) {
 					return true

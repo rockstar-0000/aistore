@@ -1,17 +1,19 @@
 // Package test provides tests of aisloader package
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package test
 
 import (
+	"flag"
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 
 	"github.com/NVIDIA/aistore/bench/aisloader/namegetter"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 // Running these benchmarks with different objNamesSize returns different results
@@ -24,11 +26,17 @@ const (
 
 var objNames []string
 
-func init() {
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() {
+		fmt.Println("skipping bench/aisloader/namegetter in short mode")
+		os.Exit(0)
+	}
 	objNames = make([]string, objNamesSize)
 	for i := 0; i < objNamesSize; i++ {
 		objNames[i] = fmt.Sprintf("test-%d", i)
 	}
+	m.Run()
 }
 
 func BenchmarkRandomUniqueNameGetter(b *testing.B) {

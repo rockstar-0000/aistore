@@ -1,6 +1,6 @@
 // Package main
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -164,25 +164,25 @@ type LsBlk struct {
 	BlockDevices []BlockDevice `json:"blockdevices"`
 }
 
-func lsblkOutput2disks(lsblkOutputBytes []byte) (disks cos.StringSet) {
-	disks = make(cos.StringSet)
+func lsblkOutput2disks(lsblkOutputBytes []byte) (disks cos.StrSet) {
+	disks = make(cos.StrSet)
 	var lsBlkOutput LsBlk
 	err := jsoniter.Unmarshal(lsblkOutputBytes, &lsBlkOutput)
 	if err != nil {
-		glog.Errorf("Unable to unmarshal lsblk output [%s]. Error: [%v]", string(lsblkOutputBytes), err)
+		nlog.Errorf("Unable to unmarshal lsblk output [%s]. Error: [%v]", string(lsblkOutputBytes), err)
 		return
 	}
 
-	findDevDisks(lsBlkOutput.BlockDevices, disks)
+	findDevs(lsBlkOutput.BlockDevices, disks)
 
 	return disks
 }
 
-func findDevDisks(devList []BlockDevice, disks cos.StringSet) {
+func findDevs(devList []BlockDevice, disks cos.StrSet) {
 	for _, bd := range devList {
 		if !strings.HasPrefix(bd.Name, "loop") {
 			disks[bd.Name] = struct{}{}
-			findDevDisks(bd.BlockDevices, disks)
+			findDevs(bd.BlockDevices, disks)
 		}
 	}
 }

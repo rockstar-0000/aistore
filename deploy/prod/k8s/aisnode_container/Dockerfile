@@ -2,7 +2,7 @@
 # Dockerfile to build an aisnode Docker image
 #
 
-FROM golang:1.16 AS builder
+FROM golang:1.20 AS builder
 
 ARG mode
 ARG providers
@@ -17,12 +17,22 @@ COPY . .
 
 RUN MODE=${mode} AIS_BACKEND_PROVIDERS=${providers:-"aws gcp"} make node cli xmeta
 
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 RUN apt-get update -yq && apt-get dist-upgrade -y
-RUN apt-get install -y wget sysstat curl nodejs git iputils-ping netcat make coreutils net-tools iproute2 tcptrack
+RUN apt-get install -y --no-install-recommends \
+	sysstat \
+	attr \
+	git \
+	make \
+	coreutils \
+	lsof \
+	util-linux \
+	bash \
+	ca-certificates \
+	curl
 
-RUN cd /opt && git clone git://github.com/etsy/statsd.git
+RUN cd /opt && git clone https://github.com/etsy/statsd.git
 
 RUN mkdir -p /usr/local/bin
 ENV PATH="/usr/local/bin:${PATH}"

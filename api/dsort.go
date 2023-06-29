@@ -1,6 +1,6 @@
 // Package api provides AIStore API over HTTP(S)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -8,57 +8,78 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/dsort"
+	"github.com/NVIDIA/aistore/ext/dsort"
 )
 
-func StartDSort(baseParams BaseParams, rs dsort.RequestSpec) (string, error) {
-	baseParams.Method = http.MethodPost
-	var id string
-	err := DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathdSort.S,
-		Body:       cos.MustMarshal(rs),
-	}, &id)
-	return id, err
+func StartDSort(bp BaseParams, rs dsort.RequestSpec) (id string, err error) {
+	bp.Method = http.MethodPost
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathdSort.S
+		reqParams.Body = cos.MustMarshal(rs)
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
+	}
+	_, err = reqParams.doReqStr(&id)
+	FreeRp(reqParams)
+	return
 }
 
-func AbortDSort(baseParams BaseParams, managerUUID string) error {
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathdSortAbort.S,
-		Query:      url.Values{cmn.URLParamUUID: []string{managerUUID}},
-	})
+func AbortDSort(bp BaseParams, managerUUID string) error {
+	bp.Method = http.MethodDelete
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathdSortAbort.S
+		reqParams.Query = url.Values{apc.QparamUUID: []string{managerUUID}}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func MetricsDSort(baseParams BaseParams, managerUUID string) (metrics map[string]*dsort.Metrics, err error) {
-	baseParams.Method = http.MethodGet
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathdSort.S,
-		Query:      url.Values{cmn.URLParamUUID: []string{managerUUID}},
-	}, &metrics)
+func MetricsDSort(bp BaseParams, managerUUID string) (metrics map[string]*dsort.Metrics, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathdSort.S
+		reqParams.Query = url.Values{apc.QparamUUID: []string{managerUUID}}
+	}
+	_, err = reqParams.DoReqAny(&metrics)
+	FreeRp(reqParams)
 	return metrics, err
 }
 
-func RemoveDSort(baseParams BaseParams, managerUUID string) error {
-	baseParams.Method = http.MethodDelete
-	return DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathdSort.S,
-		Query:      url.Values{cmn.URLParamUUID: []string{managerUUID}},
-	})
+func RemoveDSort(bp BaseParams, managerUUID string) error {
+	bp.Method = http.MethodDelete
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathdSort.S
+		reqParams.Query = url.Values{apc.QparamUUID: []string{managerUUID}}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
 }
 
-func ListDSort(baseParams BaseParams, regex string) (jobsInfos []*dsort.JobInfo, err error) {
-	baseParams.Method = http.MethodGet
-
-	err = DoHTTPRequest(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathdSort.S,
-		Query:      url.Values{cmn.URLParamRegex: []string{regex}},
-	}, &jobsInfos)
-	return jobsInfos, err
+func ListDSort(bp BaseParams, regex string, onlyActive bool) (jobInfos []*dsort.JobInfo, err error) {
+	q := make(url.Values, 2)
+	q.Set(apc.QparamRegex, regex)
+	if onlyActive {
+		q.Set(apc.QparamOnlyActive, "true")
+	}
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathdSort.S
+		reqParams.Query = q
+	}
+	_, err = reqParams.DoReqAny(&jobInfos)
+	FreeRp(reqParams)
+	return
 }

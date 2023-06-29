@@ -74,7 +74,7 @@ When the space required to cache the entire directory hierarchy and file names i
 * Linux
 * `fuse.ko` FUSE kernel module
 * `fusermount` mount CLI utility
-* [Go 1.16 or later](https://golang.org/dl/)
+* [Go 1.20 or later](https://golang.org/dl/)
 * Running [AIStore](/README.md) cluster
 
 Depending on your Linux distribution, you may or may not already have `fuse.ko`
@@ -127,8 +127,8 @@ Using [AIS CLI](/docs/cli.md) create an ais bucket, download several objects
 and place them into the bucket:
 
 ```console
-$ ais bucket create mybucket
-$ ais job start download "gs://lpr-vision/imagenet/imagenet_train-{000000..000010}.tgz" ais://mybucket/
+$ ais create mybucket
+$ ais start download "gs://lpr-vision/imagenet/imagenet_train-{000000..000010}.tgz" ais://mybucket/
 Ys78ND09g
 $ ais show job download Ys78ND09g --progress # wait for download to finish
 ```
@@ -162,15 +162,20 @@ $ rmdir localdir
 
 ### Configuration
 
-Some parameters of AISFS can be tuned through a JSON configuration file
-that is loaded at startup. Only one JSON configuration will be loaded,
-but multiple JSON files named `<bucket>_mount.json` can exist, allowing
-separate configuration of each bucket mount. If the corresponding
-JSON file is not found during startup, one will be generated with
-default parameter values. By default, configuration files will be
-placed in `$HOME/.config/aisfs`, but if `XDG_CONFIG_HOME` environment
-variable is set, the location of these files will instead be
-`$XDG_CONFIG_HOME/aisfs`.
+Assorted AISFS parameters are configurable and can be tuned via JSON configuration file
+that is loaded at startup. Only one JSON configuration will be loaded
+but multiple JSON files named `<bucket>.aisfs.mount.json` can be present, thus
+allowing for multiple buckets to be mounted with different configurations.
+
+If the corresponding JSON file is not found during startup, one will be generated with
+the default parameter values.
+
+Notice the default **configuration location**: `$HOME/.config/ais/aisfs`.
+
+There in the `$HOME/.config/ais/aisfs` directory you will find all the `<bucket>.aisfs.mount.json` files
+as well as:
+* other AIS apps' configs (e.g., CLI)
+* the current (logged-in) user authentication token.
 
 An example of one configuration file:
 

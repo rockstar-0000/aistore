@@ -1,6 +1,6 @@
 // Package cluster provides common interfaces and local access to cluster-level metadata
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cluster
 
@@ -13,11 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/OneOfOne/xxhash"
 )
@@ -43,8 +45,9 @@ import (
 const mdCksumTyXXHash = 1
 
 const (
-	XattrLOM     = "user.ais.lom" // on-disk xattr name
-	xattrMaxSize = memsys.MaxSmallSlabSize
+	XattrLOM      = "user.ais.lom" // on-disk xattr name
+	xattrMaxSize  = memsys.MaxSmallSlabSize
+	DumpLomEnvVar = "AIS_DUMP_LOM"
 )
 
 // packing format internal attrs
@@ -67,39 +70,62 @@ const (
 
 const prefLen = 10 // 10B prefix [ version = 1 | checksum-type | 64-bit xxhash ]
 
-// Custom metadata stored under `lomCustomMD` key.
-const (
-	SourceObjMD       = "source"
-	SourceAmazonObjMD = cmn.ProviderAmazon
-	SourceAzureObjMD  = cmn.ProviderAzure
-	SourceGoogleObjMD = cmn.ProviderGoogle
-	SourceHDFSObjMD   = cmn.ProviderHDFS
-	SourceHTTPObjMD   = cmn.ProviderHTTP
-	SourceWebObjMD    = "web"
+const getxattr = "getxattr" // syscall
 
-	VersionObjMD = "v"
-	CRC32CObjMD  = cos.ChecksumCRC32C
-	MD5ObjMD     = cos.ChecksumMD5
-
-	OrigURLObjMD = "orig_url"
-)
+// used in tests
+func (lom *LOM) AcquireAtimefs() error {
+	_, atime, err := ios.FinfoAtime(lom.FQN)
+	if err != nil {
+		return err
+	}
+	lom.md.Atime = atime
+	lom.md.atimefs = uint64(atime)
+	return nil
+}
 
 // NOTE: used in tests, ignores `dirty`
-func (lom *LOM) LoadMetaFromFS() error { _, err := lom.lmfs(true); return err }
+func (lom *LOM) LoadMetaFromFS() error {
+	_, atime, err := ios.FinfoAtime(lom.FQN)
+	if err != nil {
+		return err
+	}
+	if _, err := lom.lmfs(true); err != nil {
+		return err
+	}
+	lom.md.Atime = atime
+	lom.md.atimefs = uint64(atime)
+	return nil
+}
+
+func whingeLmeta(err error) (*lmeta, error) {
+	if cos.IsErrXattrNotFound(err) {
+		return nil, cmn.NewErrLmetaNotFound(err)
+	}
+	return nil, os.NewSyscallError(getxattr, err)
+}
+
+func (lom *LOM) lmfsReload(populate bool) (md *lmeta, err error) {
+	saved := lom.md.pushrt()
+	md, err = lom.lmfs(populate)
+	if err == nil {
+		md.poprt(saved)
+	}
+	return
+}
 
 func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 	var (
 		size      int64
 		read      []byte
 		mdSize    = maxLmeta.Load()
-		mm        = T.SmallMMSA()
+		mm        = T.ByteMM()
 		buf, slab = mm.AllocSize(mdSize)
 	)
 	read, err = fs.GetXattrBuf(lom.FQN, XattrLOM, buf)
 	if err != nil {
 		slab.Free(buf)
 		if err != syscall.ERANGE {
-			return
+			return whingeLmeta(err)
 		}
 		debug.Assert(mdSize < xattrMaxSize)
 		// 2nd attempt: max-size
@@ -107,13 +133,13 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 		read, err = fs.GetXattrBuf(lom.FQN, XattrLOM, buf)
 		if err != nil {
 			slab.Free(buf)
-			return
+			return whingeLmeta(err)
 		}
 	}
 	size = int64(len(read))
 	if size == 0 {
-		glog.Errorf("%s[%s]: ENOENT", lom, lom.FQN)
-		err = syscall.ENOENT
+		nlog.Errorf("%s[%s]: ENOENT", lom, lom.FQN)
+		err = os.NewSyscallError(getxattr, syscall.ENOENT)
 		slab.Free(buf)
 		return
 	}
@@ -124,29 +150,62 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 	err = md.unmarshal(read)
 	if err == nil {
 		_recomputeMdSize(size, mdSize)
+	} else {
+		err = cmn.NewErrLmetaCorrupted(err)
 	}
 	slab.Free(buf)
 	return
 }
 
-// NOTE (beware): not checking lom.loaded()
-func (lom *LOM) Persist(stores ...bool) (err error) {
-	if !lom.WritePolicy().IsImmediate() {
+func (lom *LOM) PersistMain() (err error) {
+	atime := lom.AtimeUnix()
+	debug.Assert(cos.IsValidAtime(atime))
+	if atime < 0 /*prefetch*/ || !lom.WritePolicy().IsImmediate() /*write-never, write-delayed*/ {
 		lom.md.makeDirty()
-		lom.ReCache(true)
+		lom.Recache()
 		return
 	}
+	// write-immediate (default)
 	buf, mm := lom.marshal()
 	if err = fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
+		lom.Uncache(true /*delDirty*/)
 		T.FSHC(err, lom.FQN)
 	} else {
-		var store bool
-		if len(stores) > 0 {
-			store = stores[0]
-		}
 		lom.md.clearDirty()
-		lom.ReCache(store)
-		lom.md.bckID = lom.Bprops().BID
+		lom.Recache()
+	}
+	mm.Free(buf)
+	return
+}
+
+// (caller must set atime; compare with the above)
+func (lom *LOM) Persist() (err error) {
+	atime := lom.AtimeUnix()
+	debug.Assert(cos.IsValidAtime(atime), atime)
+
+	if atime < 0 || !lom.WritePolicy().IsImmediate() {
+		lom.md.makeDirty()
+		if lom.Bprops() != nil {
+			if !lom.IsCopy() {
+				lom.Recache()
+			}
+			lom.md.bckID = lom.Bprops().BID
+		}
+		return
+	}
+
+	buf, mm := lom.marshal()
+	if err = fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
+		lom.Uncache(true /*delDirty*/)
+		T.FSHC(err, lom.FQN)
+	} else {
+		lom.md.clearDirty()
+		if lom.Bprops() != nil {
+			if !lom.IsCopy() {
+				lom.Recache()
+			}
+			lom.md.bckID = lom.Bprops().BID
+		}
 	}
 	mm.Free(buf)
 	return
@@ -169,12 +228,10 @@ func (lom *LOM) persistMdOnCopies() (copyFQN string, err error) {
 
 // NOTE: not clearing dirty flag as the caller will uncache anyway
 func (lom *LOM) flushCold(md *lmeta, atime time.Time) {
-	lom.Lock(true)
-	defer lom.Unlock(true)
 	if err := lom.flushAtime(atime); err != nil {
 		return
 	}
-	if !md.isDirty() || lom.WritePolicy() == cmn.WriteNever {
+	if !md.isDirty() || lom.WritePolicy() == apc.WriteNever {
 		return
 	}
 	lom.md = *md
@@ -188,22 +245,18 @@ func (lom *LOM) flushCold(md *lmeta, atime time.Time) {
 	mm.Free(buf)
 }
 
-func (lom *LOM) flushAtime(atime time.Time) (err error) {
-	var finfo os.FileInfo
-	finfo, err = os.Stat(lom.FQN)
+func (lom *LOM) flushAtime(atime time.Time) error {
+	finfo, err := os.Stat(lom.FQN)
 	if err != nil {
-		return
+		return err
 	}
 	mtime := finfo.ModTime()
-	if err = os.Chtimes(lom.FQN, atime, mtime); err != nil {
-		glog.Errorf("%s: flush atime err: %v", lom, err)
-	}
-	return
+	return os.Chtimes(lom.FQN, atime, mtime)
 }
 
 func (lom *LOM) marshal() (buf []byte, mm *memsys.MMSA) {
 	lmsize := maxLmeta.Load()
-	mm = T.SmallMMSA()
+	mm = T.ByteMM()
 	buf = lom.md.marshal(mm, lmsize)
 	size := int64(len(buf))
 	debug.Assert(size <= xattrMaxSize)
@@ -231,7 +284,15 @@ func (md *lmeta) makeDirty()    { md.atimefs |= lomDirtyMask }
 func (md *lmeta) clearDirty()   { md.atimefs &= ^lomDirtyMask }
 func (md *lmeta) isDirty() bool { return md.atimefs&lomDirtyMask == lomDirtyMask }
 
-func (md *lmeta) unmarshal(buf []byte) (err error) {
+func (md *lmeta) pushrt() []uint64 {
+	return []uint64{uint64(md.Atime), md.atimefs, md.bckID}
+}
+
+func (md *lmeta) poprt(saved []uint64) {
+	md.Atime, md.atimefs, md.bckID = int64(saved[0]), saved[1], saved[2]
+}
+
+func (md *lmeta) unmarshal(buf []byte) error {
 	const invalid = "invalid lmeta"
 	var (
 		payload                           string
@@ -254,8 +315,7 @@ func (md *lmeta) unmarshal(buf []byte) (err error) {
 	actualCksum = xxhash.Checksum64S(buf[prefLen:], cos.MLCG32)
 	expectedCksum = binary.BigEndian.Uint64(buf[2:])
 	if expectedCksum != actualCksum {
-		s := fmt.Sprintf("%v", md)
-		return cos.NewBadMetaCksumError(expectedCksum, actualCksum, s)
+		return cos.NewErrMetaCksum(expectedCksum, actualCksum, md.String())
 	}
 
 	for off := 0; !last; {
@@ -309,11 +369,15 @@ func (md *lmeta) unmarshal(buf []byte) (err error) {
 					return errors.New(invalid + " #5.1")
 				}
 
-				mpathInfo, _, err := fs.ParseMpathInfo(copyFQN)
+				mpathInfo, _, err := fs.FQN2Mpath(copyFQN)
 				if err != nil {
 					// Mountpath with the copy is missing.
-					if glog.V(4) {
-						glog.Warning(err)
+					if cmn.FastV(4, cos.SmoduleCluster) {
+						nlog.Warningln(err)
+					}
+					// For utilities and tests: fill the map with mpath names always
+					if os.Getenv(DumpLomEnvVar) != "" {
+						md.copies[copyFQN] = nil
 					}
 					continue
 				}
@@ -321,10 +385,11 @@ func (md *lmeta) unmarshal(buf []byte) (err error) {
 			}
 		case lomCustomMD:
 			entries := strings.Split(val, customMDSepa)
-			md.AddMD = make(cos.SimpleKVs, len(entries)/2)
+			custom := make(cos.StrKVs, len(entries)/2)
 			for i := 0; i < len(entries); i += 2 {
-				md.AddMD[entries[i]] = entries[i+1]
+				custom[entries[i]] = entries[i+1]
 			}
+			md.SetCustomMD(custom)
 		default:
 			return errors.New(invalid + " #6")
 		}
@@ -336,7 +401,7 @@ func (md *lmeta) unmarshal(buf []byte) (err error) {
 	if !haveSize {
 		return errors.New(invalid + " #8")
 	}
-	return
+	return nil
 }
 
 func (md *lmeta) marshal(mm *memsys.MMSA, mdSize int64) (buf []byte) {
@@ -360,10 +425,10 @@ func (md *lmeta) marshal(mm *memsys.MMSA, mdSize int64) (buf []byte) {
 		buf = _marshRecord(mm, buf, lomObjCopies, "", false)
 		buf = _marshCopies(mm, buf, md.copies)
 	}
-	if len(md.AddMD) > 0 {
+	if custom := md.GetCustomMD(); len(custom) > 0 {
 		buf = mm.Append(buf, recordSepa)
 		buf = _marshRecord(mm, buf, lomCustomMD, "", false)
-		buf = _marshCustomMD(mm, buf, md.AddMD)
+		buf = _marshCustomMD(mm, buf, custom)
 	}
 
 	// checksum, prepend, and return
@@ -401,7 +466,7 @@ func _marshCopies(mm *memsys.MMSA, buf []byte, copies fs.MPI) []byte {
 	return buf
 }
 
-func _marshCustomMD(mm *memsys.MMSA, buf []byte, md cos.SimpleKVs) []byte {
+func _marshCustomMD(mm *memsys.MMSA, buf []byte, md cos.StrKVs) []byte {
 	var (
 		i   int
 		num = len(md)
@@ -417,4 +482,13 @@ func _marshCustomMD(mm *memsys.MMSA, buf []byte, md cos.SimpleKVs) []byte {
 		}
 	}
 	return buf
+}
+
+func (md *lmeta) cpAtime(from *lmeta) {
+	if !cos.IsValidAtime(from.Atime) {
+		return
+	}
+	if !cos.IsValidAtime(md.Atime) || (md.Atime > 0 && md.Atime < from.Atime) {
+		md.Atime = from.Atime
+	}
 }

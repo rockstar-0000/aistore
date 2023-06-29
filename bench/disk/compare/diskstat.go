@@ -1,6 +1,6 @@
 // Package main
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 type DiskStat struct {
@@ -42,7 +42,7 @@ func GetDiskstats() (output map[string]DiskStat) {
 
 	file, err := os.Open("/proc/diskstats")
 	if err != nil {
-		glog.Error(err)
+		nlog.Errorln(err)
 		return
 	}
 
@@ -61,27 +61,27 @@ func GetDiskstats() (output map[string]DiskStat) {
 
 		deviceName := fields[2]
 		output[deviceName] = DiskStat{
-			extractI64(fields[3]),
-			extractI64(fields[4]),
-			extractI64(fields[5]),
-			extractI64(fields[6]),
-			extractI64(fields[7]),
-			extractI64(fields[8]),
-			extractI64(fields[9]),
-			extractI64(fields[10]),
-			extractI64(fields[11]),
-			extractI64(fields[12]),
-			extractI64(fields[13]),
+			_exI64(fields[3]),
+			_exI64(fields[4]),
+			_exI64(fields[5]),
+			_exI64(fields[6]),
+			_exI64(fields[7]),
+			_exI64(fields[8]),
+			_exI64(fields[9]),
+			_exI64(fields[10]),
+			_exI64(fields[11]),
+			_exI64(fields[12]),
+			_exI64(fields[13]),
 		}
 	}
 
 	return output
 }
 
-func extractI64(field string) int64 {
+func _exI64(field string) int64 {
 	val, err := strconv.ParseInt(field, 10, 64)
 	if err != nil {
-		glog.Errorf("Failed to convert field value %q to int: %v \n",
+		nlog.Errorf("Failed to convert field value %q to int: %v \n",
 			field, err)
 		return 0
 	}

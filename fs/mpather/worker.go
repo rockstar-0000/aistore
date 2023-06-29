@@ -1,13 +1,12 @@
 // Package mpather provides per-mountpath concepts.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package mpather
 
 import (
 	"fmt"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -31,21 +30,21 @@ type (
 		workers map[string]*worker
 	}
 	worker struct {
-		opts      *WorkerGroupOpts
-		mpathInfo *fs.MountpathInfo
-		workCh    chan cluster.LIF
-		stopCh    *cos.StopCh
+		opts   *WorkerGroupOpts
+		mi     *fs.Mountpath
+		workCh chan cluster.LIF
+		stopCh cos.StopCh
 	}
 )
 
 func NewWorkerGroup(opts *WorkerGroupOpts) *WorkerGroup {
 	var (
-		mpaths, _ = fs.Get()
-		workers   = make(map[string]*worker, len(mpaths))
+		mpaths  = fs.GetAvail()
+		workers = make(map[string]*worker, len(mpaths))
 	)
 	debug.Assert(opts.QueueSize > 0) // expect buffered channels
-	for _, mpathInfo := range mpaths {
-		workers[mpathInfo.Path] = newWorker(opts, mpathInfo)
+	for _, mi := range mpaths {
+		workers[mi.Path] = newWorker(opts, mi)
 	}
 	return &WorkerGroup{
 		wg:      &errgroup.Group{},
@@ -60,7 +59,7 @@ func (wg *WorkerGroup) Run() {
 }
 
 func (wg *WorkerGroup) Do(lom *cluster.LOM) bool {
-	worker, ok := wg.workers[lom.MpathInfo().Path]
+	worker, ok := wg.workers[lom.Mountpath().Path]
 	if ok {
 		worker.workCh <- lom.LIF()
 	}
@@ -77,18 +76,18 @@ func (wg *WorkerGroup) Stop() (n int) {
 	return
 }
 
-func newWorker(opts *WorkerGroupOpts, mpathInfo *fs.MountpathInfo) *worker {
-	return &worker{
-		opts:      opts,
-		mpathInfo: mpathInfo,
-		workCh:    make(chan cluster.LIF, opts.QueueSize),
-		stopCh:    cos.NewStopCh(),
+func newWorker(opts *WorkerGroupOpts, mi *fs.Mountpath) (w *worker) {
+	w = &worker{
+		opts:   opts,
+		mi:     mi,
+		workCh: make(chan cluster.LIF, opts.QueueSize),
 	}
+	w.stopCh.Init()
+	return
 }
 
 func (w *worker) work() error {
 	var buf []byte
-	glog.Infof("%s started", w)
 	if w.opts.Slab != nil {
 		buf = w.opts.Slab.Alloc()
 		defer w.opts.Slab.Free(buf)
@@ -97,23 +96,22 @@ func (w *worker) work() error {
 		select {
 		case lif := <-w.workCh:
 			lom, err := lif.LOM()
-			if err == nil {
-				err = lom.Load(false /*cache it*/, false)
+			if err != nil {
+				break
 			}
-			if err == nil {
+			if err = lom.Load(false /*cache it*/, false); err == nil {
 				w.opts.Callback(lom, buf)
 			} else {
 				cluster.FreeLOM(lom)
 			}
-		case <-w.stopCh.Listen(): // Worker has been aborted.
+		case <-w.stopCh.Listen(): // ABORT
 			close(w.workCh)
 
-			// Make sure there is nothing in the `workCh` once we aborted.
-			// In case there is, this means that workers were not aborted correctly.
+			// `workCh` must be empty (if it is not, workers were not aborted correctly!)
 			_, ok := <-w.workCh
-			cos.Assert(!ok)
+			debug.Assert(!ok)
 
-			return cmn.NewAbortedError(w.String())
+			return cmn.NewErrAborted(w.String(), "mpath-work", nil)
 		}
 	}
 }
@@ -124,7 +122,7 @@ func (w *worker) abort() int {
 	return n
 }
 
-func (w *worker) String() string { return fmt.Sprintf("worker %q", w.mpathInfo.Path) }
+func (w *worker) String() string { return fmt.Sprintf("worker %q", w.mi.Path) }
 
 func drainWorkCh(workCh chan cluster.LIF) (n int) {
 	for {

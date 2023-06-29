@@ -1,6 +1,6 @@
 // Package aisfs - command-line mounting utility for aisfs.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -75,7 +75,7 @@ func runDaemon(mountPath string, errorSink io.Writer) (err error) {
 	//
 	// 2) Executable working directory might not be the same as
 	//    the current working directory, so it's important to
-	//    pass an absolute path of the mountpoint directory.
+	//    pass an absolute path of the mountpath directory.
 	executableArgs = append([]string{"--wait"}, os.Args[1:len(os.Args)-1]...)
 	executableArgs = append(executableArgs, mountPath)
 
@@ -142,7 +142,6 @@ func newApp() *cli.App {
 		},
 
 		Flags: []cli.Flag{
-
 			cli.VersionFlag,
 
 			// Add global -h,--help flag, otherwise it will remain hidden.

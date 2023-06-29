@@ -1,6 +1,6 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
@@ -10,18 +10,18 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 type discardEntriesTestCase struct {
-	entries []*cmn.BucketEntry
+	entries cmn.LsoEntries
 	size    int
 }
 
-func generateEntries(size int) []*cmn.BucketEntry {
-	result := make([]*cmn.BucketEntry, 0, size)
+func generateEntries(size int) cmn.LsoEntries {
+	result := make(cmn.LsoEntries, 0, size)
 	for i := 0; i < size; i++ {
-		result = append(result, &cmn.BucketEntry{Name: fmt.Sprintf("%d", i)})
+		result = append(result, &cmn.LsoEntry{Name: fmt.Sprintf("%d", i)})
 	}
 	return result
 }
@@ -40,12 +40,31 @@ func TestDiscardFirstEntries(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Logf("testcase %d/%d", len(tc.entries), tc.size)
-		original := append([]*cmn.BucketEntry(nil), tc.entries...)
-		entries := cmn.DiscardFirstEntries(tc.entries, tc.size)
+		original := append(cmn.LsoEntries(nil), tc.entries...)
+		entries := discardFirstEntries(tc.entries, tc.size)
 		expSize := cos.Max(0, len(original)-tc.size)
 		tassert.Errorf(t, len(entries) == expSize, "incorrect size. expected %d; got %d", expSize, len(entries))
 		if len(entries) > 0 {
-			tassert.Errorf(t, entries[0] == original[tc.size], "incorrect elements. expected %s, got %s", entries[0].Name, original[tc.size].Name)
+			tassert.Errorf(t, entries[0] == original[tc.size],
+				"incorrect elements. expected %s, got %s", entries[0].Name, original[tc.size].Name)
 		}
 	}
+}
+
+func discardFirstEntries(entries cmn.LsoEntries, n int) cmn.LsoEntries {
+	if n == 0 {
+		return entries
+	}
+	if n >= len(entries) {
+		return entries[:0]
+	}
+
+	toDiscard := cos.Min(len(entries), n)
+
+	copy(entries, entries[toDiscard:])
+	for i := len(entries) - toDiscard; i < len(entries); i++ {
+		entries[i] = nil
+	}
+
+	return entries[:len(entries)-toDiscard]
 }

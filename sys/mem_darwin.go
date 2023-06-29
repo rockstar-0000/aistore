@@ -1,13 +1,13 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
 /*
 #include <mach/mach_host.h>
 */
-import "C" // nolint:gocritic // super weird case
+import "C" //nolint:gci,gocritic // super weird case
 
 import (
 	"bytes"
@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"syscall"
-	"unsafe" // nolint:gocritic // super weird case
+	"unsafe" //nolint:gci,gocritic // super weird case
 )
 
 type (
@@ -26,7 +26,7 @@ type (
 	}
 )
 
-func readSysctl(name string, data interface{}) (err error) {
+func readSysctl(name string, data any) (err error) {
 	value, err := syscall.Sysctl(name)
 	if err != nil {
 		return err
@@ -66,16 +66,15 @@ func readVMStat(vmstat *C.vm_statistics_data_t) error {
 	return nil
 }
 
-// HostMem returns memory and swap stats for a host OS
-func HostMem() (MemStat, error) {
+func (mem *MemStat) host() error {
 	totalMem, err := readTotalMemory()
 	if err != nil {
-		return MemStat{}, err
+		return err
 	}
 
 	var vmstat C.vm_statistics_data_t
 	if err := readVMStat(&vmstat); err != nil {
-		return MemStat{}, err
+		return err
 	}
 
 	var (
@@ -85,24 +84,19 @@ func HostMem() (MemStat, error) {
 		kern     = uint64(vmstat.inactive_count) * pageSize
 	)
 	if err := readSysctl("vm.swapusage", &sstats); err != nil {
-		return MemStat{}, err
+		return err
 	}
-
-	return MemStat{
-		Total:      totalMem,
-		Free:       freeMem,
-		Used:       totalMem - freeMem,
-		ActualFree: freeMem + kern,
-		ActualUsed: totalMem - freeMem - kern,
-
-		SwapTotal: sstats.Total,
-		SwapFree:  sstats.Free,
-		SwapUsed:  sstats.Used,
-	}, nil
+	{
+		mem.Total = totalMem
+		mem.Free = freeMem
+		mem.Used = totalMem - freeMem
+		mem.ActualFree = freeMem + kern
+		mem.ActualUsed = totalMem - freeMem - kern
+		mem.SwapTotal = sstats.Total
+		mem.SwapFree = sstats.Free
+		mem.SwapUsed = sstats.Used
+	}
+	return nil
 }
 
-// ContainerMem returns memory stats for container and swap stats for a host OS.
-// If memory is not restricted for a container, the function returns host OS stats.
-func ContainerMem() (MemStat, error) {
-	return MemStat{}, errors.New("cannot get container memory stats")
-}
+func (*MemStat) container() error { return errors.New("Darwin: cannot get container memory stats") }

@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -9,7 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
+	"github.com/NVIDIA/aistore/cmn/atomic"
+	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
 const (
@@ -30,15 +31,15 @@ type (
 	// designed for that and bugs can be expected, especially when previous
 	// group was not called with successful (without timeout) WaitTimeout.
 	TimeoutGroup struct {
-		jobsLeft  atomic.Int32 // counter for jobs left to be done
-		postedFin atomic.Int32 // determines if we have already posted fin signal
 		fin       chan struct{}
+		pending   atomic.Int32
+		postedFin atomic.Int32
 	}
 
 	// StopCh is specialized channel for stopping things.
 	StopCh struct {
-		once sync.Once
-		ch   chan struct{}
+		ch      chan struct{}
+		stopped atomic.Bool
 	}
 
 	// Semaphore implements sempahore which is just a nice wrapper on `chan struct{}`.
@@ -48,9 +49,9 @@ type (
 
 	// DynSemaphore implements sempahore which can change its size during usage.
 	DynSemaphore struct {
+		c    *sync.Cond
 		size int
 		cur  int
-		c    *sync.Cond
 		mu   sync.Mutex
 	}
 
@@ -71,6 +72,8 @@ type (
 	MultiSyncMap struct {
 		M [MultiSyncMapCount]sync.Map
 	}
+
+	NopLocker struct{}
 )
 
 // interface guard
@@ -78,6 +81,13 @@ var (
 	_ WG = (*LimitedWaitGroup)(nil)
 	_ WG = (*TimeoutGroup)(nil)
 )
+
+///////////////
+// NopLocker //
+///////////////
+
+func (NopLocker) Lock()   {}
+func (NopLocker) Unlock() {}
 
 //////////////////
 // TimeoutGroup //
@@ -89,35 +99,30 @@ func NewTimeoutGroup() *TimeoutGroup {
 	}
 }
 
-func (tg *TimeoutGroup) Add(delta int) {
-	tg.jobsLeft.Add(int32(delta))
+func (twg *TimeoutGroup) Add(n int) {
+	twg.pending.Add(int32(n))
 }
 
-// Wait waits until jobs are finished.
-//
-// NOTE: Wait can be only invoked after all Adds!
-func (tg *TimeoutGroup) Wait() {
-	tg.WaitTimeoutWithStop(24*time.Hour, nil)
+// Wait waits until the Added pending count goes to zero.
+// NOTE: must be invoked after _all_ Adds.
+func (twg *TimeoutGroup) Wait() {
+	twg.WaitTimeoutWithStop(24*time.Hour, nil)
 }
 
-// WaitTimeout waits until jobs are finished or timed out.
-// In case of timeout it returns true.
-//
-// NOTE: WaitTimeout can be only invoked after all Adds!
-func (tg *TimeoutGroup) WaitTimeout(timeout time.Duration) bool {
-	timed, _ := tg.WaitTimeoutWithStop(timeout, nil)
+// Wait waits until the Added pending count goes to zero _or_ timeout.
+// NOTE: must be invoked after _all_ Adds.
+func (twg *TimeoutGroup) WaitTimeout(timeout time.Duration) bool {
+	timed, _ := twg.WaitTimeoutWithStop(timeout, nil)
 	return timed
 }
 
-// WaitTimeoutWithStop waits until jobs are finished, timed out, or received
-// signal on stop channel. When channel is nil it is equivalent to WaitTimeout.
-//
-// NOTE: WaitTimeoutWithStop can be only invoked after all Adds!
-func (tg *TimeoutGroup) WaitTimeoutWithStop(timeout time.Duration, stop <-chan struct{}) (timed, stopped bool) {
+// Wait waits until the Added pending count goes to zero _or_ timeout _or_ stop.
+// NOTE: must be invoked after _all_ Adds.
+func (twg *TimeoutGroup) WaitTimeoutWithStop(timeout time.Duration, stop <-chan struct{}) (timed, stopped bool) {
 	t := time.NewTimer(timeout)
 	select {
-	case <-tg.fin:
-		tg.postedFin.Store(0)
+	case <-twg.fin:
+		twg.postedFin.Store(0)
 		timed, stopped = false, false
 	case <-t.C:
 		timed, stopped = true, false
@@ -130,13 +135,13 @@ func (tg *TimeoutGroup) WaitTimeoutWithStop(timeout time.Duration, stop <-chan s
 
 // Done decrements number of jobs left to do. Panics if the number jobs left is
 // less than 0.
-func (tg *TimeoutGroup) Done() {
-	if left := tg.jobsLeft.Dec(); left == 0 {
-		if posted := tg.postedFin.Swap(1); posted == 0 {
-			tg.fin <- struct{}{}
+func (twg *TimeoutGroup) Done() {
+	if n := twg.pending.Dec(); n == 0 {
+		if posted := twg.postedFin.Swap(1); posted == 0 {
+			twg.fin <- struct{}{}
 		}
-	} else if left < 0 {
-		AssertMsg(false, fmt.Sprintf("jobs left is below zero: %d", left))
+	} else if n < 0 {
+		AssertMsg(false, fmt.Sprintf("invalid num pending %d", n))
 	}
 }
 
@@ -145,19 +150,22 @@ func (tg *TimeoutGroup) Done() {
 ////////////
 
 func NewStopCh() *StopCh {
-	return &StopCh{
-		ch: make(chan struct{}, 1),
+	return &StopCh{ch: make(chan struct{}, 1)}
+}
+
+func (sch *StopCh) Init() {
+	debug.Assert(sch.ch == nil && !sch.stopped.Load())
+	sch.ch = make(chan struct{}, 1)
+}
+
+func (sch *StopCh) Listen() <-chan struct{} {
+	return sch.ch
+}
+
+func (sch *StopCh) Close() {
+	if sch.stopped.CAS(false, true) {
+		close(sch.ch)
 	}
-}
-
-func (sc *StopCh) Listen() <-chan struct{} {
-	return sc.ch
-}
-
-func (sc *StopCh) Close() {
-	sc.once.Do(func() {
-		close(sc.ch)
-	})
 }
 
 ///////////////
@@ -176,9 +184,7 @@ func (s *Semaphore) Acquire()                    { <-s.TryAcquire() }
 func (s *Semaphore) Release()                    { s.s <- struct{}{} }
 
 func NewDynSemaphore(n int) *DynSemaphore {
-	sema := &DynSemaphore{
-		size: n,
-	}
+	sema := &DynSemaphore{size: n}
 	sema.c = sync.NewCond(&sema.mu)
 	return sema
 }
@@ -238,26 +244,26 @@ func (s *DynSemaphore) Release(cnts ...int) {
 // LimitedWaitGroup //
 //////////////////////
 
-func NewLimitedWaitGroup(n int /*max*/, have ...int) WG {
-	if len(have) == 0 || n < have[0] {
-		// e.g. usage: no more than n goroutines in parallel
-		return &LimitedWaitGroup{wg: &sync.WaitGroup{}, sema: NewDynSemaphore(n)}
+// usage: no more than `limit` goroutines in parallel
+func NewLimitedWaitGroup(limit, have int) WG {
+	if have == 0 || have > limit {
+		return &LimitedWaitGroup{wg: &sync.WaitGroup{}, sema: NewDynSemaphore(limit)}
 	}
 	return &sync.WaitGroup{}
 }
 
-func (wg *LimitedWaitGroup) Add(n int) {
-	wg.sema.Acquire(n)
-	wg.wg.Add(n)
+func (lwg *LimitedWaitGroup) Add(n int) {
+	lwg.sema.Acquire(n)
+	lwg.wg.Add(n)
 }
 
-func (wg *LimitedWaitGroup) Done() {
-	wg.sema.Release()
-	wg.wg.Done()
+func (lwg *LimitedWaitGroup) Done() {
+	lwg.sema.Release()
+	lwg.wg.Done()
 }
 
-func (wg *LimitedWaitGroup) Wait() {
-	wg.wg.Wait()
+func (lwg *LimitedWaitGroup) Wait() {
+	lwg.wg.Wait()
 }
 
 //////////////////

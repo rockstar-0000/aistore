@@ -1,7 +1,7 @@
 // Package hk provides mechanism for registering cleanup
 // functions which are invoked at specified intervals.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package hk
 
@@ -13,15 +13,18 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
+
+const NameSuffix = ".gc" // reg name suffix
 
 const (
 	DayInterval   = 24 * time.Hour
-	UnregInterval = 365 * DayInterval
+	UnregInterval = 365 * DayInterval // to unregister upon return from the callback
 )
 
 type (
@@ -30,24 +33,26 @@ type (
 		Housekeep() time.Duration
 	}
 	request struct {
-		name            string
 		f               CleanupFunc
+		name            string
 		initialInterval time.Duration
 		registering     bool
 	}
 	timedAction struct {
-		name       string
 		f          CleanupFunc
+		name       string
 		updateTime int64
 	}
 	timedActions []timedAction
 
 	housekeeper struct {
-		stopCh  *cos.StopCh
-		sigCh   chan os.Signal
-		actions *timedActions
-		timer   *time.Timer
-		workCh  chan request
+		stopCh   cos.StopCh
+		sigCh    chan os.Signal
+		actions  *timedActions
+		timer    *time.Timer
+		workCh   chan request
+		stopping *atomic.Bool
+		running  atomic.Bool
 	}
 
 	CleanupFunc = func() time.Duration
@@ -58,12 +63,27 @@ var DefaultHK *housekeeper
 // interface guard
 var _ cos.Runner = (*housekeeper)(nil)
 
-func init() {
+func TestInit() {
+	_init(false)
+	DefaultHK.stopping = &atomic.Bool{} // dummy
+}
+
+func Init(stopping *atomic.Bool) {
+	_init(true)
+	DefaultHK.stopping = stopping
+}
+
+func _init(mustRun bool) {
 	DefaultHK = &housekeeper{
 		workCh:  make(chan request, 512),
-		stopCh:  cos.NewStopCh(),
 		sigCh:   make(chan os.Signal, 1),
 		actions: &timedActions{},
+	}
+	DefaultHK.stopCh.Init()
+	if mustRun {
+		DefaultHK.running.Store(false)
+	} else {
+		DefaultHK.running.Store(true) // tests only
 	}
 	heap.Init(DefaultHK.actions)
 }
@@ -72,13 +92,13 @@ func init() {
 // timedActions //
 //////////////////
 
-func (tc timedActions) Len() int            { return len(tc) }
-func (tc timedActions) Less(i, j int) bool  { return tc[i].updateTime < tc[j].updateTime }
-func (tc timedActions) Swap(i, j int)       { tc[i], tc[j] = tc[j], tc[i] }
-func (tc timedActions) Peek() *timedAction  { return &tc[0] }
-func (tc *timedActions) Push(x interface{}) { *tc = append(*tc, x.(timedAction)) }
+func (tc timedActions) Len() int           { return len(tc) }
+func (tc timedActions) Less(i, j int) bool { return tc[i].updateTime < tc[j].updateTime }
+func (tc timedActions) Swap(i, j int)      { tc[i], tc[j] = tc[j], tc[i] }
+func (tc timedActions) Peek() *timedAction { return &tc[0] }
+func (tc *timedActions) Push(x any)        { *tc = append(*tc, x.(timedAction)) }
 
-func (tc *timedActions) Pop() interface{} {
+func (tc *timedActions) Pop() any {
 	old := *tc
 	n := len(old)
 	item := old[n-1]
@@ -90,11 +110,14 @@ func (tc *timedActions) Pop() interface{} {
 // housekeeper //
 /////////////////
 
-func Reg(name string, f CleanupFunc, initialInterval ...time.Duration) {
-	var interval time.Duration
-	if len(initialInterval) > 0 {
-		interval = initialInterval[0]
+func WaitStarted() {
+	for !DefaultHK.running.Load() {
+		time.Sleep(time.Second)
 	}
+}
+
+func Reg(name string, f CleanupFunc, interval time.Duration) {
+	debug.Assert(DefaultHK.stopping.Load() || DefaultHK.running.Load())
 	DefaultHK.workCh <- request{
 		registering:     true,
 		name:            name,
@@ -104,6 +127,7 @@ func Reg(name string, f CleanupFunc, initialInterval ...time.Duration) {
 }
 
 func Unreg(name string) {
+	debug.Assert(DefaultHK.stopping.Load() || DefaultHK.running.Load())
 	DefaultHK.workCh <- request{
 		registering: false,
 		name:        name,
@@ -111,6 +135,11 @@ func Unreg(name string) {
 }
 
 func (*housekeeper) Name() string { return "housekeeper" }
+
+func (hk *housekeeper) terminate() {
+	hk.timer.Stop()
+	hk.running.Store(false)
+}
 
 func (hk *housekeeper) Run() (err error) {
 	signal.Notify(hk.sigCh,
@@ -120,12 +149,17 @@ func (hk *housekeeper) Run() (err error) {
 		syscall.SIGQUIT, // kill -SIGQUIT XXXX
 	)
 	hk.timer = time.NewTimer(time.Hour)
-	defer hk.timer.Stop()
+	hk.running.Store(true)
+	err = hk._run()
+	hk.terminate()
+	return
+}
 
+func (hk *housekeeper) _run() error {
 	for {
 		select {
 		case <-hk.stopCh.Listen():
-			return
+			return nil
 		case <-hk.timer.C:
 			if hk.actions.Len() == 0 {
 				break
@@ -142,10 +176,13 @@ func (hk *housekeeper) Run() (err error) {
 			hk.updateTimer()
 		case req := <-hk.workCh:
 			if req.registering {
-				debug.AssertMsg(req.f != nil, req.name)
-				debug.AssertMsg(req.initialInterval != UnregInterval, req.name) // cannot reg w/unreg
-				debug.AssertMsg(hk.byName(req.name) == -1, req.name)            // duplicate name
-
+				// duplicate name
+				if hk.byName(req.name) != -1 {
+					nlog.Errorln(req.name + " is (still) registered - rescheduling...")
+					time.Sleep(time.Second)
+					hk.workCh <- req
+					break
+				}
 				initialInterval := req.initialInterval
 				if req.initialInterval == 0 {
 					initialInterval = req.f()
@@ -157,7 +194,8 @@ func (hk *housekeeper) Run() (err error) {
 				if idx >= 0 {
 					heap.Remove(hk.actions, idx)
 				} else {
-					glog.Warningln(req.name, "already removed")
+					debug.Assert(false, req.name)
+					nlog.Warningln(req.name, "already removed")
 				}
 			}
 			hk.updateTimer()

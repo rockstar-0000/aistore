@@ -1,6 +1,6 @@
 // Package ais implements an AIStore client.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 )
 
@@ -30,7 +31,7 @@ type (
 
 func NewBucket(name string, apiParams api.BaseParams) (bck Bucket, err error) {
 	b := cmn.Bck{Name: name}
-	b.Props, err = api.HeadBucket(apiParams, b)
+	b.Props, err = api.HeadBucket(apiParams, b, false /*don't add*/)
 	if err != nil {
 		return &bucketAPI{bck: b, apiParams: apiParams}, err
 	}
@@ -42,9 +43,9 @@ func (bck *bucketAPI) Bck() cmn.Bck              { return bck.bck }
 func (bck *bucketAPI) APIParams() api.BaseParams { return bck.apiParams }
 
 func (bck *bucketAPI) HeadObject(objName string) (obj *Object, exists bool, err error) {
-	objProps, err := api.HeadObject(bck.apiParams, bck.Bck(), objName)
+	objProps, err := api.HeadObject(bck.apiParams, bck.Bck(), objName, 0 /*fltPresence*/)
 	if err != nil {
-		if httpErr := cmn.Err2HTTPErr(err); httpErr != nil && httpErr.Status == http.StatusNotFound {
+		if herr := cmn.Err2HTTPErr(err); herr != nil && herr.Status == http.StatusNotFound {
 			return nil, false, nil
 		}
 		return nil, false, newBucketIOError(err, "HeadObject")
@@ -60,13 +61,13 @@ func (bck *bucketAPI) HeadObject(objName string) (obj *Object, exists bool, err 
 }
 
 func (bck *bucketAPI) ListObjects(prefix, token string, pageSize uint) (objs []*Object, nextToken string, err error) {
-	selectMsg := &cmn.SelectMsg{
+	selectMsg := &apc.LsoMsg{
 		Prefix:            prefix,
-		Props:             cmn.GetPropsSize,
+		Props:             apc.GetPropsSize,
 		PageSize:          pageSize,
 		ContinuationToken: token,
 	}
-	listResult, err := api.ListObjects(bck.apiParams, bck.Bck(), selectMsg, 0)
+	listResult, err := api.ListObjects(bck.apiParams, bck.Bck(), selectMsg, api.ListArgs{})
 	if err != nil {
 		return nil, "", newBucketIOError(err, "ListObjects")
 	}

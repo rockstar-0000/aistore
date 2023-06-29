@@ -1,30 +1,33 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
 import (
 	"fmt"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"sync"
 	"testing"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/devtools/tassert"
-	"github.com/NVIDIA/aistore/devtools/tlog"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/tassert"
+	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/transport"
 )
 
 func Example_msg() {
-	receive := func(msg transport.Msg, err error) {
-		fmt.Printf("%s...\n", string(msg.Body[:16]))
+	receive := func(msg transport.Msg, err error) error {
+		if !transport.ReservedOpcode(msg.Opcode) {
+			fmt.Printf("%s...\n", string(msg.Body[:16]))
+		}
+		return nil
 	}
 
 	ts := httptest.NewServer(msgmux)
@@ -38,7 +41,7 @@ func Example_msg() {
 	}
 	httpclient := transport.NewIntraDataClient()
 	url := ts.URL + transport.MsgURLPath(trname)
-	stream := transport.NewMsgStream(httpclient, url)
+	stream := transport.NewMsgStream(httpclient, url, cos.GenTie())
 
 	stream.Send(&transport.Msg{Body: []byte(lorem)})
 	stream.Send(&transport.Msg{Body: []byte(duis)})
@@ -55,13 +58,12 @@ func Example_msg() {
 }
 
 func Test_MsgDryRun(t *testing.T) {
-	err := os.Setenv("AIS_STREAM_DRY_RUN", "true")
-	defer os.Unsetenv("AIS_STREAM_DRY_RUN")
-	tassert.CheckFatal(t, err)
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	t.Setenv("AIS_STREAM_DRY_RUN", "true")
 
 	// fill in common shared read-only bug
 	random := newRand(mono.NanoTime())
-	buf, slab := MMSA.AllocSize(cos.MiB)
+	buf, slab := memsys.PageMM().AllocSize(cos.MiB)
 	defer slab.Free(buf)
 	random.Read(buf)
 
@@ -77,21 +79,21 @@ func Test_MsgDryRun(t *testing.T) {
 			if testing.Short() {
 				total = cos.GiB
 			}
-			stream := transport.NewMsgStream(nil, "dry-msg"+strconv.Itoa(idx))
+			stream := transport.NewMsgStream(nil, "dry-msg"+strconv.Itoa(idx), cos.GenTie())
 			for tsize < total {
-				msize := myrand.Intn(memsys.PageSize - 64) // <= s.maxheader, zero-length OK
+				msize := myrand.Intn(memsys.PageSize - 64) // <= s.maxhdr, zero-length OK
 				if off+msize > len(buf) {
 					off = 0
 				}
 				msg := &transport.Msg{Body: buf[off : off+msize]}
 				off += msize
-				err = stream.Send(msg)
+				err := stream.Send(msg)
 				tassert.CheckFatal(t, err)
 				num.Inc()
 				tsize += int64(msize)
 				if tsize-prevsize > total/2 {
 					prevsize = tsize
-					tlog.Logf("%s: %s\n", stream, cos.B2S(tsize, 0))
+					tlog.Logf("%s: %s\n", stream, cos.ToSizeIEC(tsize, 0))
 				}
 			}
 			stream.Fin()

@@ -1,7 +1,7 @@
 #
 # Dockerfile to build an AIS admin Docker image
 #
-FROM golang:1.16 AS builder
+FROM golang:1.20 AS builder
 
 ENV GOPATH="/go"
 ENV PATH="${GOPATH}/bin:${PATH}"
@@ -11,10 +11,12 @@ RUN git clone https://github.com/NVIDIA/aistore.git && cd aistore && \
     mv cmd/cli/autocomplete /tmp/autocomplete && \
     cd .. && rm -rf aistore
 
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 RUN apt-get update -yq
-RUN apt-get install -y wget sysstat curl git iputils-ping netcat make coreutils net-tools iproute2 tcptrack vim
+RUN apt-get install -y wget sysstat curl git iputils-ping netcat make coreutils net-tools iproute2 tcptrack vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/local/bin
 ENV PATH="/usr/local/bin:${PATH}"

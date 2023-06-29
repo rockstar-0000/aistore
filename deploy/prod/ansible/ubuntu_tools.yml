@@ -1,6 +1,6 @@
 ---
 - name: Add test tools
-  hosts: all 
+  hosts: all
   become: true
   tasks:
     - name: install fio
@@ -28,6 +28,11 @@
         name: sysstat
         state: present
         update_cache: yes
+    - name: install lsof
+      apt:
+        name: lsof
+        state: present
+        update_cache: yes
     - name: install nodejs
       apt:
         name: nodejs
@@ -49,7 +54,7 @@
         state: present
         update_cache: yes
     - name: Git clone statsd
-      shell: cd /opt; git clone git://github.com/etsy/statsd.git
+      shell: cd /opt; git clone https://github.com/etsy/statsd.git
 
 
 ...

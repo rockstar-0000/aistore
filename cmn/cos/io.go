@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -11,31 +11,30 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
+)
+
+// POSIX permissions
+const (
+	PermRWR   os.FileMode = 0o640
+	PermRWRR  os.FileMode = 0o644 // (archived)
+	PermRWXRX os.FileMode = 0o750
+
+	configDirMode = PermRWXRX | os.ModeDir
 )
 
 const ContentLengthUnknown = -1
 
+// readers
 type (
-	nopReader struct {
-		size   int
-		offset int
-	}
-	ReadReaderAt interface {
-		io.Reader
-		io.ReaderAt
-	}
 	ReadOpenCloser interface {
 		io.ReadCloser
 		Open() (ReadOpenCloser, error)
-	}
-	WriterAt interface {
-		io.Writer
-		io.WriterAt
 	}
 	// ReadSizer is the interface that adds Size method to io.Reader.
 	ReadSizer interface {
@@ -56,17 +55,24 @@ type (
 		io.Reader
 		size int64
 	}
+
+	// implementations
+
+	nopReader struct {
+		size   int
+		offset int
+	}
+	ReadReaderAt interface {
+		io.Reader
+		io.ReaderAt
+	}
 	sizedRC struct {
 		io.ReadCloser
 		size int64
 	}
 	deferRCS struct {
 		ReadCloseSizer
-		c func()
-	}
-	deferROC struct {
-		ReadOpenCloser
-		c func()
+		cb func()
 	}
 	CallbackROC struct {
 		roc          ReadOpenCloser
@@ -80,13 +86,18 @@ type (
 	}
 	ReaderArgs struct {
 		R       io.Reader
-		Size    int64
 		ReadCb  func(int, error)
 		DeferCb func()
+		Size    int64
 	}
 	ReaderWithArgs struct {
 		args ReaderArgs
 	}
+	nopOpener struct{ io.ReadCloser }
+)
+
+// handles (and more readers)
+type (
 	FileHandle struct {
 		*os.File
 		fqn string
@@ -110,11 +121,22 @@ type (
 	// ByteHandle is a byte buffer(made from []byte) that implements
 	// ReadOpenCloser interface
 	ByteHandle struct {
-		b []byte
 		*bytes.Reader
+		b []byte
+	}
+)
+
+// writers
+type (
+	WriterAt interface {
+		io.Writer
+		io.WriterAt
+	}
+	WriteSizer interface {
+		io.Writer
+		Size() int64
 	}
 
-	nopOpener   struct{ io.ReadCloser }
 	WriterMulti struct{ writers []io.Writer }
 
 	// WriterOnly is helper struct to hide `io.ReaderFrom` implementation which
@@ -135,9 +157,11 @@ var (
 	_ ReadOpenCloser = (*ByteHandle)(nil)
 )
 
-// EOF (to accommodate unsized streaming)
+// including "unexpecting EOF" to accommodate unsized streaming and
+// early termination of the other side (prior to sending the first byte)
 func IsEOF(err error) bool {
-	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
+	return err == io.EOF || err == io.ErrUnexpectedEOF ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
 
 ///////////////
@@ -166,7 +190,7 @@ func (r *nopReader) Read(b []byte) (int, error) {
 // ByteHandle //
 ////////////////
 
-func NewByteHandle(bt []byte) *ByteHandle           { return &ByteHandle{bt, bytes.NewReader(bt)} }
+func NewByteHandle(bt []byte) *ByteHandle           { return &ByteHandle{bytes.NewReader(bt), bt} }
 func (*ByteHandle) Close() error                    { return nil }
 func (b *ByteHandle) Open() (ReadOpenCloser, error) { return NewByteHandle(b.b), nil }
 
@@ -186,7 +210,6 @@ func NewFileHandle(fqn string) (*FileHandle, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return &FileHandle{file, fqn}, nil
 }
 
@@ -204,34 +227,21 @@ func (f *sizedReader) Size() int64                     { return f.size }
 func NewSizedRC(r io.ReadCloser, size int64) ReadCloseSizer { return &sizedRC{r, size} }
 func (f *sizedRC) Size() int64                              { return f.size }
 
-////////////
-// Defer* //
-////////////
+//////////////
+// deferRCS //
+//////////////
 
-func NewDeferROC(r ReadOpenCloser, c func()) ReadOpenCloser {
-	if c == nil {
+func NewDeferRCS(r ReadCloseSizer, cb func()) ReadCloseSizer {
+	if cb == nil {
 		return r
 	}
-	return &deferROC{r, c}
+	return &deferRCS{r, cb}
 }
 
-func (r *deferROC) Close() error {
-	err := r.ReadOpenCloser.Close()
-	r.c()
-	return err
-}
-
-func NewDeferRCS(r ReadCloseSizer, c func()) ReadCloseSizer {
-	if c == nil {
-		return r
-	}
-	return &deferRCS{r, c}
-}
-
-func (r *deferRCS) Close() error {
-	err := r.ReadCloseSizer.Close()
-	r.c()
-	return err
+func (r *deferRCS) Close() (err error) {
+	err = r.ReadCloseSizer.Close()
+	r.cb()
+	return
 }
 
 /////////////////
@@ -402,6 +412,23 @@ func (mw *WriterMulti) Write(b []byte) (n int, err error) {
 // misc file and dir //
 ///////////////////////
 
+// ExpandPath replaces common abbreviations in file path (eg. `~` with absolute
+// path to the current user home directory) and cleans the path.
+func ExpandPath(path string) string {
+	if path == "" || path[0] != '~' {
+		return filepath.Clean(path)
+	}
+	if len(path) > 1 && path[1] != '/' {
+		return filepath.Clean(path)
+	}
+
+	currentUser, err := user.Current()
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(filepath.Join(currentUser.HomeDir, path[1:]))
+}
+
 // CreateDir creates directory if does not exist. Does not return error when
 // directory already exists.
 func CreateDir(dir string) error {
@@ -418,30 +445,27 @@ func CreateFile(fqn string) (*os.File, error) {
 	return os.OpenFile(fqn, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, PermRWR)
 }
 
-// Rename renames file ensuring that the parent's directory of dst exists. Creates
-// destination directory when it does not exist.
-// NOTE: Rename should not be used to move objects across different disks, see: fs.MvFile.
-func Rename(src, dst string) error {
-	if err := os.Rename(src, dst); err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-
-		// Retry with created directory - slow path.
-		if err := CreateDir(filepath.Dir(dst)); err != nil {
-			return err
-		}
-		return os.Rename(src, dst)
+// (creates destination directory if doesn't exist)
+func Rename(src, dst string) (err error) {
+	err = os.Rename(src, dst)
+	if err == nil || !os.IsNotExist(err) {
+		return
 	}
-	return nil
+	// create and retry (slow path)
+	err = CreateDir(filepath.Dir(dst))
+	if err == nil {
+		err = os.Rename(src, dst)
+	}
+	return
 }
 
-// RemoveFile removes object from path and ignores if the path no longer exists.
-func RemoveFile(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+// RemoveFile removes path; returns nil upon success or if the path does not exist.
+func RemoveFile(path string) (err error) {
+	err = os.Remove(path)
+	if os.IsNotExist(err) {
+		err = nil
 	}
-	return nil
+	return
 }
 
 // and computes checksum if requested
@@ -451,7 +475,7 @@ func CopyFile(src, dst string, buf []byte, cksumType string) (written int64, cks
 		return
 	}
 	if dstFile, err = CreateFile(dst); err != nil {
-		glog.Errorf("Failed to create %s: %v", dst, err)
+		nlog.Errorf("Failed to create %s: %v", dst, err)
 		Close(srcFile)
 		return
 	}
@@ -462,29 +486,33 @@ func CopyFile(src, dst string, buf []byte, cksumType string) (written int64, cks
 			return
 		}
 		if nestedErr := RemoveFile(dst); nestedErr != nil {
-			glog.Errorf("Nested (%v): failed to remove %s, err: %v", err, dst, nestedErr)
+			nlog.Errorf("Nested (%v): failed to remove %s, err: %v", err, dst, nestedErr)
 		}
 	}()
 	if err != nil {
-		glog.Errorf("Failed to copy %s => %s: %v", src, dst, err)
+		nlog.Errorf("Failed to copy %s => %s: %v", src, dst, err)
 		Close(dstFile)
 		return
 	}
 	if err = FlushClose(dstFile); err != nil {
-		glog.Errorf("Failed to flush and close %s: %v", dst, err)
+		nlog.Errorf("Failed to flush and close %s: %v", dst, err)
 	}
 	return
 }
 
-// Saves the reader directly to a local file, xxhash-checksums if requested
-func SaveReader(fqn string, reader io.Reader, buf []byte, cksumType string,
-	size int64, dirMustExist string) (cksum *CksumHash, err error) {
-	Assert(fqn != "")
-	if dirMustExist != "" {
-		if _, err := os.Stat(dirMustExist); err != nil {
-			return nil, fmt.Errorf("failed to save-safe %s: directory %s %w", fqn, dirMustExist, err)
-		}
+func SaveReaderSafe(tmpfqn, fqn string, reader io.Reader, buf []byte, cksumType string, size int64) (cksum *CksumHash,
+	err error) {
+	if cksum, err = SaveReader(tmpfqn, reader, buf, cksumType, size); err != nil {
+		return
 	}
+	if err = Rename(tmpfqn, fqn); err != nil {
+		os.Remove(tmpfqn)
+	}
+	return
+}
+
+// Saves the reader directly to `fqn`, checksums if requested
+func SaveReader(fqn string, reader io.Reader, buf []byte, cksumType string, size int64) (cksum *CksumHash, err error) {
 	var (
 		written   int64
 		file, erc = CreateFile(fqn)
@@ -518,19 +546,6 @@ func SaveReader(fqn string, reader io.Reader, buf []byte, cksumType string,
 		return
 	}
 	return
-}
-
-// same as above, plus rename
-func SaveReaderSafe(tmpfqn, fqn string, reader io.Reader, buf []byte, cksumType string,
-	size int64, dirMustExist string) (cksum *CksumHash, err error) {
-	if cksum, err = SaveReader(tmpfqn, reader, buf, cksumType, size, dirMustExist); err != nil {
-		return nil, err
-	}
-	if err := Rename(tmpfqn, fqn); err != nil {
-		os.Remove(tmpfqn)
-		return nil, err
-	}
-	return cksum, nil
 }
 
 // Read only the first line of a file.
@@ -597,12 +612,15 @@ func ReadLines(filename string, cb func(string) error) error {
 	return nil
 }
 
-// CopyAndChecksum reads io.Reader and writes io.Writer; returns bytes written, checksum, and error
+// CopyAndChecksum reads from `r` and writes to `w`; returns num bytes copied and checksum, or error
 func CopyAndChecksum(w io.Writer, r io.Reader, buf []byte, cksumType string) (n int64, cksum *CksumHash, err error) {
+	debug.Assert(w != io.Discard || buf == nil) // io.Discard is io.ReaderFrom
+
 	if cksumType == ChecksumNone || cksumType == "" {
 		n, err = io.CopyBuffer(w, r, buf)
 		return
 	}
+
 	cksum = NewCksumHash(cksumType)
 	var mw io.Writer = cksum.H
 	if w != io.Discard {

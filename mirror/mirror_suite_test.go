@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
@@ -13,5 +13,5 @@ import (
 
 func TestMirror(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Mirror Suite")
+	RunSpecs(t, t.Name())
 }

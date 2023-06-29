@@ -1,7 +1,7 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -16,42 +16,45 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/OneOfOne/xxhash"
 	"github.com/pierrec/lz4/v3"
 )
 
+const sessionIsOld = time.Hour
+
 // private types
 type (
 	iterator struct {
-		handler *handler
 		body    io.Reader
-		hbuf    []byte
+		handler *handler
 		pdu     *rpdu
 		stats   *Stats
+		hbuf    []byte
 	}
 	objReader struct {
 		body   io.Reader
-		off    int64
-		hdr    ObjHdr
 		pdu    *rpdu
 		loghdr string
+		hdr    ObjHdr
+		off    int64
 	}
 	handler struct {
+		rxObj       RecvObj
+		rxMsg       RecvMsg
+		sessions    sync.Map
+		oldSessions sync.Map
+		hkName      string
 		trname      string
-		rxObj       ReceiveObj
-		rxMsg       ReceiveMsg
-		sessions    sync.Map // map[uint64]*Stats
-		oldSessions sync.Map // map[uint64]time.Time
-		hkName      string   // house-keeping name
-		mm          *memsys.MMSA
+		now         int64
 	}
 
 	ErrDuplicateTrname struct {
@@ -59,21 +62,11 @@ type (
 	}
 )
 
-const cleanupInterval = time.Minute * 10
-
 var (
-	nextSID  atomic.Int64        // next unique session ID
-	handlers map[string]*handler // by trname
-	mu       *sync.RWMutex       // ptotect handlers
-	verbose  bool
+	nextSessionID atomic.Int64        // next unique session ID
+	handlers      map[string]*handler // by trname
+	mu            *sync.RWMutex       // ptotect handlers
 )
-
-func init() {
-	nextSID.Store(100)
-	handlers = make(map[string]*handler, 16)
-	mu = &sync.RWMutex{}
-	verbose = bool(glog.FastV(4, glog.SmoduleTransport))
-}
 
 // main Rx objects
 func RxAnyStream(w http.ResponseWriter, r *http.Request) {
@@ -86,19 +79,24 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 	h, ok := handlers[trname]
 	if !ok {
 		mu.RUnlock()
-		cmn.WriteErr(w, r, fmt.Errorf(cmn.FmtErrUnknown, "transport", "endpoint", trname))
+		err := cos.NewErrNotFound("unknown transport endpoint %q", trname)
+		if verbose {
+			cmn.WriteErr(w, r, err, 0)
+		} else {
+			cmn.WriteErr(w, r, err, 0, 1 /*silent*/)
+		}
 		return
 	}
 	mu.RUnlock()
 	// compression
-	if compressionType := r.Header.Get(cmn.HdrCompress); compressionType != "" {
-		debug.Assert(compressionType == cmn.LZ4Compression)
+	if compressionType := r.Header.Get(apc.HdrCompress); compressionType != "" {
+		debug.Assert(compressionType == apc.LZ4Compression)
 		lz4Reader = lz4.NewReader(r.Body)
 		reader = lz4Reader
 	}
 
 	// session
-	sessID, err := strconv.ParseInt(r.Header.Get(cmn.HdrSessID), 10, 64)
+	sessID, err := strconv.ParseInt(r.Header.Get(apc.HdrSessID), 10, 64)
 	if err != nil || sessID == 0 {
 		cmn.WriteErr(w, r, fmt.Errorf("%s[:%d]: invalid session ID, err %v", trname, sessID, err))
 		return
@@ -108,39 +106,34 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 	xxh, _ := UID2SessID(uid)
 	loghdr := fmt.Sprintf("%s[%d:%d]", trname, xxh, sessID)
 	if verbose {
-		glog.Infof("%s: start-of-stream from %s", loghdr, r.RemoteAddr)
+		nlog.Infof("%s: start-of-stream from %s", loghdr, r.RemoteAddr)
 	}
 	stats := statsif.(*Stats)
 
 	// receive loop
-	hbuf, _ := h.mm.AllocSize(maxHeaderSize)
-	it := &iterator{handler: h, body: reader, hbuf: hbuf, stats: stats}
-	err = it.rxloop(uid, loghdr)
+	mm := memsys.PageMM()
+	it := &iterator{handler: h, body: reader, stats: stats}
+	it.hbuf, _ = mm.AllocSize(dfltMaxHdr)
+	err = it.rxloop(uid, loghdr, mm)
 
 	// cleanup
 	if lz4Reader != nil {
 		lz4Reader.Reset(nil)
 	}
 	if it.pdu != nil {
-		it.pdu.free(h.mm)
+		it.pdu.free(mm)
 	}
-	h.mm.Free(hbuf)
+	mm.Free(it.hbuf)
 
-	if err != io.EOF {
+	// if err != io.EOF {
+	if !cos.IsEOF(err) {
 		cmn.WriteErr(w, r, err)
 	}
 }
 
-////////////////////////
-// ErrDuplicateTrname //
-////////////////////////
-
-func (e *ErrDuplicateTrname) Error() string { return fmt.Sprintf("duplicate trname %q", e.trname) }
-func IsErrDuplicateTrname(e error) bool     { _, ok := e.(*ErrDuplicateTrname); return ok }
-
-/////////////
-// handler //
-/////////////
+////////////////
+// Rx handler //
+////////////////
 
 func (h *handler) handle() error {
 	mu.Lock()
@@ -150,37 +143,35 @@ func (h *handler) handle() error {
 	}
 	handlers[h.trname] = h
 	mu.Unlock()
-	hk.Reg(h.hkName, h.cleanupOldSessions)
+	hk.Reg(h.hkName+hk.NameSuffix, h.cleanup, sessionIsOld)
 	return nil
 }
 
-func (h *handler) cleanupOldSessions() time.Duration {
-	now := mono.NanoTime()
-	f := func(key, value interface{}) bool {
-		uid := key.(uint64)
-		timeClosed := value.(int64)
-		if time.Duration(now-timeClosed) > cleanupInterval {
-			h.oldSessions.Delete(uid)
-			h.sessions.Delete(uid)
-		}
-		return true
-	}
-	h.oldSessions.Range(f)
-	return cleanupInterval
+func (h *handler) cleanup() time.Duration {
+	h.now = mono.NanoTime()
+	h.oldSessions.Range(h.cl)
+	return sessionIsOld
 }
 
-//////////////
-// iterator //
-//////////////
+func (h *handler) cl(key, value any) bool {
+	timeClosed := value.(int64)
+	if time.Duration(h.now-timeClosed) > sessionIsOld {
+		uid := key.(uint64)
+		h.oldSessions.Delete(uid)
+		h.sessions.Delete(uid)
+	}
+	return true
+}
+
+//////////////////////////////////
+// next(obj, msg, pdu) iterator //
+//////////////////////////////////
 
 func (it *iterator) Read(p []byte) (n int, err error) { return it.body.Read(p) }
 
-func (it *iterator) rxloop(uid uint64, loghdr string) (err error) {
-	h := it.handler
+func (it *iterator) rxloop(uid uint64, loghdr string, mm *memsys.MMSA) (err error) {
 	for err == nil {
 		var (
-			obj   *objReader
-			msg   Msg
 			flags uint64
 			hlen  int
 		)
@@ -188,38 +179,77 @@ func (it *iterator) rxloop(uid uint64, loghdr string) (err error) {
 		if err != nil {
 			break
 		}
-		if lh := len(it.hbuf); hlen > lh {
-			err = fmt.Errorf("sbr1 %s: hlen %d exceeds buflen=%d", loghdr, hlen, lh)
-			break
+		if hlen > cap(it.hbuf) {
+			if hlen > maxSizeHeader {
+				err = fmt.Errorf("sbr1 %s: hlen %d exceeds maximum %d", loghdr, hlen, maxSizeHeader)
+				break
+			}
+			// grow
+			nlog.Warningf("%s: header length %d exceeds the current buffer %d", loghdr, hlen, cap(it.hbuf))
+			mm.Free(it.hbuf)
+			it.hbuf, _ = mm.AllocSize(cos.MinI64(int64(hlen)<<1, maxSizeHeader))
 		}
 		_ = it.stats.Offset.Add(int64(hlen + sizeProtoHdr))
-		if flags&msgFlag == 0 {
-			obj, err = it.nextObj(loghdr, hlen)
-			if obj != nil {
-				if flags&firstPDU != 0 && !obj.hdr.IsHeaderOnly() {
-					if it.pdu == nil {
-						buf, _ := h.mm.AllocSize(MaxSizePDU)
-						it.pdu = newRecvPDU(it.body, buf)
-					}
-					obj.pdu = it.pdu
-					obj.pdu.reset()
+		if flags&msgFl == 0 {
+			if flags&pduStreamFl != 0 {
+				if it.pdu == nil {
+					pbuf, _ := mm.AllocSize(maxSizePDU)
+					it.pdu = newRecvPDU(it.body, pbuf)
+				} else {
+					it.pdu.reset()
 				}
-				err = eofOK(err)
-				h.rxObj(obj.hdr, obj, err)
-				it.stats.Num.Inc()
-			} else if err != nil && err != io.EOF {
-				h.rxObj(ObjHdr{}, nil, err)
 			}
+			err = it.rxObj(loghdr, hlen)
 		} else {
-			msg, err = it.nextMsg(loghdr, hlen)
-			if err == nil {
-				h.rxMsg(msg, nil)
-			} else if err != io.EOF {
-				h.rxMsg(Msg{}, err)
-			}
+			err = it.rxMsg(loghdr, hlen)
 		}
 	}
+	h := it.handler
 	h.oldSessions.Store(uid, mono.NanoTime())
+	return
+}
+
+func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
+	var obj *objReader
+	h := it.handler
+	obj, err = it.nextObj(loghdr, hlen)
+	if obj != nil {
+		if !obj.hdr.IsHeaderOnly() {
+			obj.pdu = it.pdu
+		}
+		err = eofOK(err)
+		size, off := obj.hdr.ObjAttrs.Size, obj.off
+		if errCb := h.rxObj(obj.hdr, obj, err); errCb != nil {
+			err = errCb
+		}
+		// stats
+		if err == nil {
+			it.stats.Num.Inc()           // this stream stats
+			statsTracker.Inc(InObjCount) // stats/target_stats.go
+			if size >= 0 {
+				statsTracker.Add(InObjSize, size)
+			} else {
+				debug.Assert(size == SizeUnknown)
+				statsTracker.Add(InObjSize, obj.off-off)
+			}
+		}
+	} else if err != nil && err != io.EOF {
+		if errCb := h.rxObj(ObjHdr{}, nil, err); errCb != nil {
+			err = errCb
+		}
+	}
+	return
+}
+
+func (it *iterator) rxMsg(loghdr string, hlen int) (err error) {
+	var msg Msg
+	h := it.handler
+	msg, err = it.nextMsg(loghdr, hlen)
+	if err == nil {
+		err = h.rxMsg(msg, nil)
+	} else if err != io.EOF {
+		err = h.rxMsg(Msg{}, err)
+	}
 	return
 }
 
@@ -251,12 +281,27 @@ func (it *iterator) nextObj(loghdr string, hlen int) (obj *objReader, err error)
 	n, err = it.Read(it.hbuf[:hlen])
 	if n < hlen {
 		if err == nil {
-			err = fmt.Errorf("sbr4 %s: failed to receive obj hdr (%d < %d)", loghdr, n, hlen)
+			// [retry] insist on receiving the full length
+			var m int
+			for i := 0; i < maxInReadRetries; i++ {
+				runtime.Gosched()
+				m, err = it.Read(it.hbuf[n:hlen])
+				if err != nil {
+					break
+				}
+				n += m
+				if n == hlen {
+					break
+				}
+			}
 		}
-		return
+		if n < hlen {
+			err = fmt.Errorf("sbr4 %s: failed to receive obj hdr (%d < %d)", loghdr, n, hlen)
+			return
+		}
 	}
 	hdr := ExtObjHeader(it.hbuf, hlen)
-	if hdr.IsLast() {
+	if hdr.isFin() {
 		err = io.EOF
 		return
 	}
@@ -276,7 +321,7 @@ func (it *iterator) nextMsg(loghdr string, hlen int) (msg Msg, err error) {
 	}
 	debug.Assertf(n == hlen, "%d != %d", n, hlen)
 	msg = ExtMsg(it.hbuf, hlen)
-	if msg.IsLast() {
+	if msg.isFin() {
 		err = io.EOF
 	}
 	return
@@ -296,7 +341,7 @@ func (obj *objReader) Read(b []byte) (n int, err error) {
 		b = b[:int(rem)]
 	}
 	n, err = obj.body.Read(b)
-	obj.off += int64(n) // NOTE: `GORACE` here can be safely ignored, see above
+	obj.off += int64(n) // NOTE: `GORACE` complaining here can be safely ignored
 	switch err {
 	case nil:
 		if obj.off >= obj.Size() {
@@ -313,7 +358,7 @@ func (obj *objReader) Read(b []byte) (n int, err error) {
 }
 
 func (obj *objReader) String() string {
-	return fmt.Sprintf("%s(size=%d)", obj.hdr.FullName(), obj.Size())
+	return fmt.Sprintf("%s(size=%d)", obj.hdr.Cname(), obj.Size())
 }
 
 func (obj *objReader) Size() int64     { return obj.hdr.ObjSize() }
@@ -353,13 +398,26 @@ func (obj *objReader) readPDU(b []byte) (n int, err error) {
 			if obj.IsUnsized() {
 				obj.hdr.ObjAttrs.Size = obj.off
 			} else if obj.Size() != obj.off {
-				glog.Errorf("sbr9 %s: off %d != %s", obj.loghdr, obj.off, obj)
+				nlog.Errorf("sbr9 %s: off %d != %s", obj.loghdr, obj.off, obj)
 			}
 		} else {
 			pdu.reset()
 		}
 	}
 	return
+}
+
+////////////////////////
+// ErrDuplicateTrname //
+////////////////////////
+
+func (e *ErrDuplicateTrname) Error() string {
+	return fmt.Sprintf("duplicate trname %q", e.trname)
+}
+
+func IsErrDuplicateTrname(e error) bool {
+	_, ok := e.(*ErrDuplicateTrname)
+	return ok
 }
 
 //
@@ -374,4 +432,21 @@ func uniqueID(r *http.Request, sessID int64) uint64 {
 func UID2SessID(uid uint64) (xxh, sessID uint64) {
 	xxh, sessID = uid>>32, uid&math.MaxUint32
 	return
+}
+
+// DrainAndFreeReader:
+// 1) reads and discards all the data from `r` - the `objReader`;
+// 2) frees this objReader back to the `recvPool`.
+// As such, this function is intended for usage only and exclusively by
+// `transport.RecvObj` implementations.
+func DrainAndFreeReader(r io.Reader) {
+	if r == nil {
+		return
+	}
+	obj, ok := r.(*objReader)
+	debug.Assert(ok)
+	if obj.body != nil && !obj.hdr.IsHeaderOnly() {
+		cos.DrainReader(obj)
+	}
+	FreeRecv(obj)
 }

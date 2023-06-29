@@ -1,6 +1,6 @@
 // Package integration contains AIS integration tests.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
-	"github.com/NVIDIA/aistore/devtools/tlog"
-	"github.com/NVIDIA/aistore/devtools/tutils"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/tassert"
+	"github.com/NVIDIA/aistore/tools/tlog"
+	"github.com/NVIDIA/aistore/xact"
 )
 
 const (
@@ -42,7 +44,7 @@ var (
 
 func fillBucket(tb testing.TB, proxyURL string, bck cmn.Bck, objSize uint64, objCount int) {
 	tlog.Logf("PUT %d objects of size %d into bucket %s...\n", objCount, objSize, bck)
-	_, _, err := tutils.PutRandObjs(tutils.PutObjectsArgs{
+	_, _, err := tools.PutRandObjs(tools.PutObjectsArgs{
 		ProxyURL:  proxyURL,
 		Bck:       bck,
 		ObjCnt:    objCount,
@@ -58,8 +60,8 @@ func BenchmarkECEncode(b *testing.B) {
 		bckSize = cos.GiB
 	)
 	var (
-		proxyURL   = tutils.RandomProxyURL()
-		baseParams = tutils.BaseAPIParams(proxyURL)
+		proxyURL   = tools.RandomProxyURL()
+		baseParams = tools.BaseAPIParams(proxyURL)
 	)
 
 	for ecIdx, test := range ecTests {
@@ -67,9 +69,9 @@ func BenchmarkECEncode(b *testing.B) {
 			objCount := int(bckSize/size) + 1
 			bck := cmn.Bck{
 				Name:     fmt.Sprintf("bench-ec-enc-%d", len(objSizes)*ecIdx+szIdx),
-				Provider: cmn.ProviderAIS,
+				Provider: apc.AIS,
 			}
-			tutils.CreateFreshBucket(b, proxyURL, bck, nil)
+			tools.CreateBucketWithCleanup(b, proxyURL, bck, nil)
 			fillBucket(b, proxyURL, bck, uint64(size), objCount)
 
 			b.Run(test.name, func(b *testing.B) {
@@ -84,8 +86,8 @@ func BenchmarkECEncode(b *testing.B) {
 				_, err := api.SetBucketProps(baseParams, bck, bckProps)
 				tassert.CheckFatal(b, err)
 
-				reqArgs := api.XactReqArgs{Kind: cmn.ActECEncode, Bck: bck, Timeout: ecTime}
-				_, err = api.WaitForXaction(baseParams, reqArgs)
+				reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck, Timeout: ecTime}
+				_, err = api.WaitForXactionIC(baseParams, reqArgs)
 				tassert.CheckFatal(b, err)
 			})
 		}
@@ -97,8 +99,8 @@ func BenchmarkECRebalance(b *testing.B) {
 		bckSize = 256 * cos.MiB
 	)
 	var (
-		proxyURL   = tutils.RandomProxyURL()
-		baseParams = tutils.BaseAPIParams(proxyURL)
+		proxyURL   = tools.RandomProxyURL()
+		baseParams = tools.BaseAPIParams(proxyURL)
 	)
 
 	for ecIdx, test := range ecTests {
@@ -109,16 +111,16 @@ func BenchmarkECRebalance(b *testing.B) {
 			objCount := int(bckSize/size) + 1
 			bck := cmn.Bck{
 				Name:     fmt.Sprintf("bench-reb-%d", len(objSizes)*ecIdx+szIdx),
-				Provider: cmn.ProviderAIS,
+				Provider: apc.AIS,
 			}
-			tutils.CreateFreshBucket(b, proxyURL, bck, nil)
+			tools.CreateBucketWithCleanup(b, proxyURL, bck, nil)
 
 			smap, err := api.GetClusterMap(baseParams)
 			tassert.CheckFatal(b, err)
 			tgtLost, err := smap.GetRandTarget()
 			tassert.CheckFatal(b, err)
 
-			args := &cmn.ActValRmNode{DaemonID: tgtLost.ID(), SkipRebalance: true}
+			args := &apc.ActValRmNode{DaemonID: tgtLost.ID(), SkipRebalance: true}
 			_, err = api.StartMaintenance(baseParams, args)
 			tassert.CheckFatal(b, err)
 			fillBucket(b, proxyURL, bck, uint64(size), objCount)
@@ -135,14 +137,14 @@ func BenchmarkECRebalance(b *testing.B) {
 				_, err := api.SetBucketProps(baseParams, bck, bckProps)
 				tassert.CheckFatal(b, err)
 
-				reqArgs := api.XactReqArgs{Kind: cmn.ActECEncode, Bck: bck, Timeout: ecTime}
-				_, err = api.WaitForXaction(baseParams, reqArgs)
+				reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck, Timeout: ecTime}
+				_, err = api.WaitForXactionIC(baseParams, reqArgs)
 				tassert.CheckFatal(b, err)
 
-				args := &cmn.ActValRmNode{DaemonID: tgtLost.ID()}
+				args := &apc.ActValRmNode{DaemonID: tgtLost.ID()}
 				_, err = api.StopMaintenance(baseParams, args)
 				tassert.CheckError(b, err)
-				tutils.WaitForRebalanceToComplete(b, baseParams, rebalanceTime)
+				tools.WaitForRebalAndResil(b, baseParams, rebalanceTime)
 			})
 		}
 	}
@@ -153,33 +155,33 @@ func BenchmarkRebalance(b *testing.B) {
 		bckSize = cos.GiB
 	)
 	var (
-		proxyURL   = tutils.RandomProxyURL()
-		baseParams = tutils.BaseAPIParams(proxyURL)
+		proxyURL   = tools.RandomProxyURL()
+		baseParams = tools.BaseAPIParams(proxyURL)
 		bck        = cmn.Bck{
 			Name:     "bench-reb",
-			Provider: cmn.ProviderAIS,
+			Provider: apc.AIS,
 		}
 	)
 
 	for _, size := range objSizes {
 		objCount := int(bckSize/size) + 1
-		tutils.CreateFreshBucket(b, proxyURL, bck, nil)
+		tools.CreateBucketWithCleanup(b, proxyURL, bck, nil)
 
 		smap, err := api.GetClusterMap(baseParams)
 		tassert.CheckFatal(b, err)
 		tgtLost, err := smap.GetRandTarget()
 		tassert.CheckFatal(b, err)
 
-		args := &cmn.ActValRmNode{DaemonID: tgtLost.ID(), SkipRebalance: true}
+		args := &apc.ActValRmNode{DaemonID: tgtLost.ID(), SkipRebalance: true}
 		_, err = api.StartMaintenance(baseParams, args)
 		tassert.CheckFatal(b, err)
 		fillBucket(b, proxyURL, bck, uint64(size), objCount)
 
 		b.Run("rebalance", func(b *testing.B) {
-			args := &cmn.ActValRmNode{DaemonID: tgtLost.ID()}
+			args := &apc.ActValRmNode{DaemonID: tgtLost.ID()}
 			_, err := api.StopMaintenance(baseParams, args)
 			tassert.CheckError(b, err)
-			tutils.WaitForRebalanceToComplete(b, baseParams, rebalanceTime)
+			tools.WaitForRebalAndResil(b, baseParams, rebalanceTime)
 		})
 	}
 }

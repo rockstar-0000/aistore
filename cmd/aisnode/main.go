@@ -1,6 +1,6 @@
 // Package main for the AIS node executable.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -10,6 +10,7 @@ import (
 	"github.com/NVIDIA/aistore/ais"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 var (
@@ -18,7 +19,8 @@ var (
 )
 
 func main() {
-	debug.AssertMsg(build != "", "missing build")
-	debug.AssertMsg(buildtime != "", "missing build time")
-	os.Exit(ais.Run(cmn.AIStoreSoftwareVersion+"."+build, buildtime))
+	debug.Assert(build != "", "missing build")
+	ecode := ais.Run(cmn.VersionAIStore+"."+build, buildtime)
+	nlog.FlushExit()
+	os.Exit(ecode)
 }

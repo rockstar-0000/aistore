@@ -2,16 +2,11 @@
 // with io.Reader and io.Writer interfaces on top of a scatter-gather lists
 // (of reusable buffers)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys_test
 
-// E.g. running this specific test:
-//
-// go test -v -run=SGLS -verbose=true -logtostderr=true
-//
-// For more examples, see the README in this directory
-//
+// to run: go test -v -run=SGLS -verbose=true
 
 import (
 	"bytes"
@@ -19,9 +14,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/NVIDIA/aistore/devtools/tassert"
-	"github.com/NVIDIA/aistore/devtools/tlog"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools/tassert"
+	"github.com/NVIDIA/aistore/tools/tlog"
 )
 
 const (
@@ -32,12 +27,9 @@ const (
 
 // creates 2 SGL, put some data to one of them and them copy from SGL to SGL
 func TestSGLStressN(t *testing.T) {
-	mem := &memsys.MMSA{MinPctFree: 50, Name: "cmem"}
-	err := mem.Init(true /*panic on error*/)
-	defer mem.Terminate()
-	if err != nil {
-		t.Fatal(err)
-	}
+	mem := &memsys.MMSA{Name: "cmem", MinPctFree: 50}
+	mem.Init(0)
+	defer mem.Terminate(false)
 	num := objects
 	if testing.Short() {
 		num = objects / 10

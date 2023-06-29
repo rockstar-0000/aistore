@@ -1,15 +1,15 @@
 // Package memsys_test contains the corresponding micro-benchmarks.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys_test
 
 import (
-	"crypto/rand"
 	"testing"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/tools/cryptorand"
 )
 
 // 1. Run with all defaults:
@@ -30,22 +30,19 @@ func BenchmarkWRF(b *testing.B) {
 		{128},
 	}
 	for _, test := range tests {
-		name := cos.B2S(test.payloadSz, 0)
+		name := cos.ToSizeIEC(test.payloadSz, 0)
 		b.Run(name, func(b *testing.B) { wrf(b, test.payloadSz) })
 	}
 }
 
 func wrf(b *testing.B, payloadSz int64) {
 	// 1. init default MMSAs
-	gmm := memsys.DefaultPageMM()
-	defer gmm.Terminate()
-	smm := memsys.DefaultSmallMM()
-	defer smm.Terminate()
+	gmm := memsys.PageMM()
 
 	// 2. equalize initial conditions
 	cos.FreeMemToOS()
 	buf := make([]byte, cos.KiB*128)
-	n, _ := rand.Read(buf)
+	n, _ := cryptorand.Read(buf)
 	cos.Assert(n == cos.KiB*128)
 
 	// 3. select MMSA & slab for the specified payload size

@@ -1,7 +1,7 @@
 // Package jsp (JSON persistence) provides utilities to store and load arbitrary
 // JSON-encoded structures with optional checksumming and compression.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package jsp
 
@@ -11,9 +11,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 const (
@@ -35,7 +35,7 @@ func SaveMeta(filepath string, meta Opts, wto io.WriterTo) error {
 	return Save(filepath, meta, meta.JspOpts(), wto)
 }
 
-func Save(filepath string, v interface{}, opts Options, wto io.WriterTo) (err error) {
+func Save(filepath string, v any, opts Options, wto io.WriterTo) (err error) {
 	var (
 		file *os.File
 		tmp  = filepath + ".tmp." + cos.GenTie()
@@ -48,7 +48,7 @@ func Save(filepath string, v interface{}, opts Options, wto io.WriterTo) (err er
 			return
 		}
 		if nestedErr := cos.RemoveFile(tmp); nestedErr != nil {
-			glog.Errorf("Nested (%v): failed to remove %s, err: %v", err, tmp, nestedErr)
+			nlog.Errorf("Nested (%v): failed to remove %s, err: %v", err, tmp, nestedErr)
 		}
 	}()
 	if wto != nil {
@@ -58,12 +58,12 @@ func Save(filepath string, v interface{}, opts Options, wto io.WriterTo) (err er
 		err = Encode(file, v, opts)
 	}
 	if err != nil {
-		glog.Errorf("Failed to encode %s: %v", filepath, err)
+		nlog.Errorf("Failed to encode %s: %v", filepath, err)
 		cos.Close(file)
 		return
 	}
 	if err = cos.FlushClose(file); err != nil {
-		glog.Errorf("Failed to flush and close %s: %v", tmp, err)
+		nlog.Errorf("Failed to flush and close %s: %v", tmp, err)
 		return
 	}
 	err = os.Rename(tmp, filepath)
@@ -74,22 +74,24 @@ func LoadMeta(filepath string, meta Opts) (*cos.Cksum, error) {
 	return Load(filepath, meta, meta.JspOpts())
 }
 
-func Load(filepath string, v interface{}, opts Options) (checksum *cos.Cksum, err error) {
+func Load(filepath string, v any, opts Options) (checksum *cos.Cksum, err error) {
 	var file *os.File
 	file, err = os.Open(filepath)
 	if err != nil {
 		return
 	}
 	checksum, err = Decode(file, v, opts, filepath)
-	if err != nil && errors.Is(err, &cos.ErrBadCksum{}) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, &cos.ErrBadCksum{}) {
 		if errRm := os.Remove(filepath); errRm == nil {
 			if flag.Parsed() {
-				glog.Errorf("bad checksum: removing %s", filepath)
+				nlog.Errorf("bad checksum: removing %s", filepath)
 			}
 		} else if flag.Parsed() {
-			glog.Errorf("bad checksum: failed to remove %s: %v", filepath, errRm)
+			nlog.Errorf("bad checksum: failed to remove %s: %v", filepath, errRm)
 		}
-		return
 	}
 	return
 }

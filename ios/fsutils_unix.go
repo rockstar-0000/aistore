@@ -1,7 +1,7 @@
 // Package ios is a collection of interfaces to the local storage subsystem;
 // the package includes OS-dependent implementations for those interfaces.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package ios
 
@@ -11,55 +11,83 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
-	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"golang.org/x/sys/unix"
 )
 
 func getFSStats(path string) (fsStats unix.Statfs_t, err error) {
 	if err = unix.Statfs(path, &fsStats); err != nil {
-		glog.Errorf("failed to statfs %q, err: %v", path, err)
+		nlog.Errorf("failed to statfs %q, err: %v", path, err)
 	}
 	return
 }
 
-func GetFSUsedPercentage(path string) (usedPercentage int64, ok bool) {
-	totalBlocks, blocksAvailable, _, err := GetFSStats(path)
+// - on-disk size is sometimes referred to as "apparent size"
+// - `withNonDirPrefix` is allowed to match nothing
+// - TODO: carefully differentiate FATAL err-s: access perm-s, invalid command-line, executable missing
+func executeDU(cmd *exec.Cmd, dirPath string, withNonDirPrefix bool, outputBlockSize uint64) (uint64, error) {
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return
+		switch {
+		case len(out) == 0:
+			return 0, fmt.Errorf("du %s: combined output empty, err: %v", dirPath, err)
+		default:
+			return 0, fmt.Errorf("failed to du %s: %v (%s)", dirPath, err, string(out))
+		}
 	}
-	usedBlocks := totalBlocks - blocksAvailable
-	return int64(usedBlocks * 100 / totalBlocks), true
+
+	lines := strings.Split(string(out), "\n") // on Windows, use instead strings.FieldsFunc('\n' and '\r'), here and elsewhere
+	if n := len(lines); n > 8 {
+		lines = lines[n-8:]
+	}
+	// e.g.: "12345   total"
+	for i := len(lines) - 1; i >= 0; i-- {
+		s := lines[i]
+		if strings.HasSuffix(s, "total") && s[0] > '0' && s[0] <= '9' {
+			return uint64(_parseTotal(s)) * outputBlockSize, nil
+		}
+	}
+	if !withNonDirPrefix {
+		err = fmt.Errorf("failed to parse 'du %s': ...%v", dirPath, lines)
+	}
+	return 0, err
 }
 
-func GetDirSize(dirPath string) (uint64, error) {
-	// NOTE: we ignore the error since the `du` will exit with status 1 code
-	// in case there was a file that could not be accessed (not enough permissions).
-	outputBytes, _ := exec.Command("du", "-sh", dirPath, "2>/dev/null").Output()
-	out := string(outputBytes)
-	if out == "" {
-		return 0, fmt.Errorf("failed to get the total size of the directory %q", dirPath)
+func _parseTotal(s string) (size int64) {
+	var err error
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			size, err = strconv.ParseInt(s[:i], 10, 64)
+			debug.AssertNoErr(err)
+			break
+		}
 	}
-	idx := strings.Index(out, "\t")
-	if idx == -1 {
-		return 0, fmt.Errorf("invalid output format from 'du' command")
-	}
-	out = out[:idx]
-	// `du` can return ',' as float separator what cannot be parsed properly.
-	out = strings.ReplaceAll(out, ",", ".")
-	size, err := cos.S2B(out)
-	if err != nil || size < 0 {
-		return 0, fmt.Errorf("invalid output format from 'du' command, err: %v", err)
-	}
-	return uint64(size), nil
+	return
 }
 
-func GetFileCount(dirPath string) (int, error) {
-	outputBytes, err := exec.Command("bash", "-c", fmt.Sprintf("find %s -type f | wc -l", dirPath)).Output()
+func DirFileCount(dirPath string) (int, error) {
+	cmd := fmt.Sprintf("find %s -type f | wc -l", dirPath)
+	outputBytes, err := exec.Command("/bin/sh", "-c", cmd).Output()
 	out := string(outputBytes)
 	if err != nil || out == "" {
-		return 0, fmt.Errorf("failed to get the number of files in the directory %q, err: %v", dirPath, err)
+		return 0, fmt.Errorf("failed to count the number of files in %q: %v", dirPath, err)
 	}
 	out = strings.TrimSpace(out)
 	return strconv.Atoi(out)
+}
+
+func DirSumFileSizes(dirPath string) (uint64, error) {
+	cmd := fmt.Sprintf("find %s -type f | xargs wc -c | tail -1", dirPath)
+	outputBytes, err := exec.Command("/bin/sh", "-c", cmd).Output()
+	out := string(outputBytes)
+	if err != nil || out == "" {
+		return 0, fmt.Errorf("failed to correctly sum file sizes in %q: %v", dirPath, err)
+	}
+	i := strings.IndexByte(out, ' ')
+	if i < 0 {
+		debug.Assertf(out[0] == '0', "failed to sum file sizes in %q: [%s]", dirPath, out)
+		return 0, nil
+	}
+	return strconv.ParseUint(out[:i], 10, 0)
 }

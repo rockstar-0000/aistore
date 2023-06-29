@@ -15,7 +15,7 @@ For types of supported buckets (AIS, Cloud, backend, etc.) and many more example
 - [Create bucket](#create-bucket)
 - [Delete bucket](#delete-bucket)
 - [List buckets](#list-buckets)
-- [List object names](#list-object-names)
+- [List objects](#list-objects)
 - [Evict remote bucket](#evict-remote-bucket)
 - [Move or Rename a bucket](#move-or-rename-a-bucket)
 - [Copy bucket](#copy-bucket)
@@ -29,7 +29,7 @@ For types of supported buckets (AIS, Cloud, backend, etc.) and many more example
 
 ## Create bucket
 
-`ais bucket create BUCKET [BUCKET...]`
+`ais create BUCKET [BUCKET...]`
 
 Create bucket(s).
 
@@ -40,7 +40,7 @@ Create bucket(s).
 Create buckets `bucket_name1` and `bucket_name2`, both with AIS provider.
 
 ```console
-$ ais bucket create ais://bucket_name1 ais://bucket_name2
+$ ais create ais://bucket_name1 ais://bucket_name2
 "ais://bucket_name1" bucket created
 "ais://bucket_name2" bucket created
 ```
@@ -50,7 +50,7 @@ $ ais bucket create ais://bucket_name1 ais://bucket_name2
 Create bucket `bucket_name` in `ml` namespace.
 
 ```console
-$ ais bucket create ais://#ml/bucket_name
+$ ais create ais://#ml/bucket_name
 "ais://#ml/bucket_name" bucket created
 ```
 
@@ -59,14 +59,14 @@ $ ais bucket create ais://#ml/bucket_name
 Create bucket `bucket_name` in global namespace of AIS remote cluster with `Bghort1l` UUID.
 
 ```console
-$ ais bucket create ais://@Bghort1l/bucket_name
+$ ais create ais://@Bghort1l/bucket_name
 "ais://@Bghort1l/bucket_name" bucket created
 ```
 
 Create bucket `bucket_name` in `ml` namespace of AIS remote cluster with `Bghort1l` UUID.
 
 ```console
-$ ais bucket create ais://@Bghort1l#ml/bucket_name
+$ ais create ais://@Bghort1l#ml/bucket_name
 "ais://@Bghort1l#ml/bucket_name" bucket created
 ```
 
@@ -76,11 +76,11 @@ Create bucket `bucket_name` with custom properties specified.
 
 ```console
 $ # Key-value format
-$ ais bucket create ais://@Bghort1l/bucket_name --bucket-props="mirror.enabled=true mirror.copies=2"
+$ ais create ais://@Bghort1l/bucket_name --props="mirror.enabled=true mirror.copies=2"
 "ais://@Bghort1l/bucket_name" bucket created
 $
 $ # JSON format
-$ ais bucket create ais://@Bghort1l/bucket_name --bucket-props='{"versioning": {"enabled": true, "validate_warm_get": true}}'
+$ ais create ais://@Bghort1l/bucket_name --props='{"versioning": {"enabled": true, "validate_warm_get": true}}'
 "ais://@Bghort1l/bucket_name" bucket created
 ```
 
@@ -90,7 +90,7 @@ Create bucket `bucket_name` in HDFS backend with bucket pointing to `/yt8m` dire
 More info about HDFS buckets can be found [here](/docs/providers.md#hdfs-provider).
 
 ```console
-$ ais bucket create hdfs://bucket_name --bucket-props="extra.hdfs.ref_directory=/yt8m"
+$ ais create hdfs://bucket_name --props="extra.hdfs.ref_directory=/yt8m"
 "hdfs://bucket_name" bucket created
 ```
 
@@ -98,7 +98,7 @@ $ ais bucket create hdfs://bucket_name --bucket-props="extra.hdfs.ref_directory=
 #### Incorrect buckets creation
 
 ```console
-$ ais bucket create aws://bucket_name
+$ ais create aws://bucket_name
 Create bucket "aws://bucket_name" failed: creating a bucket for any of the cloud or HTTP providers is not supported
 ```
 
@@ -151,96 +151,277 @@ Removing remote buckets is not supported.
 
 ```console
 $ ais bucket rm aws://bucket_name
-Operation "destroy_bck" is not supported by "aws://bucket_name"
+Operation "destroy-bck" is not supported by "aws://bucket_name"
 ```
 
 ## List buckets
 
-`ais bucket ls`
+`ais ls [command options] PROVIDER:[//BUCKET_NAME]`
 
-List all buckets.
+Notice the optional `[//BUCKET_NAME]`. When there's no bucket, `ais ls` will list buckets. Otherwise, it'll list objects.
 
-`ais bucket ls --regex "ngn*"`
+## Usage
+
+```console
+$ ais ls --help
+NAME:
+   ais ls - (alias for "bucket ls") list buckets, objects in buckets, and files in (.tar, .tgz or .tar.gz, .zip, .tar.lz4)-formatted objects,
+   e.g.:
+     * ais ls                                              - list all buckets in a cluster (all providers);
+     * ais ls ais://abc -props name,size,copies,location   - list all objects from a given bucket, include only the (4) specified properties;
+     * ais ls ais://abc -props all                         - same as above but include all properties;
+     * ais ls ais://abc --page-size 20 --refresh 3s        - list a very large bucket (20 items in each page), report progress every 3s;
+     * ais ls ais                                          - list all ais buckets;
+     * ais ls s3                                           - list all s3 buckets that are present in the cluster;
+   with template, regex, and/or prefix:
+     * ais ls gs: --regex "^abc" --all                        - list all accessible GCP buckets with names starting with "abc";
+     * ais ls ais://abc --regex ".md" --props size,checksum   - list *.md objects with their respective sizes and checksums;
+     * ais ls gs://abc --template images/                     - list all objects from the virtual subdirectory called "images";
+     * ais ls gs://abc --prefix images/                       - same as above (for more examples, see '--template' below);
+   and more:
+     * ais ls s3 --summary         - for each s3 bucket in the cluster: print object numbers and total size(s);
+     * ais ls s3 --summary --all   - generate summary report for all s3 buckets; include remote objects and buckets that are _not present_
+```
+
+## Command-line options
+
+The options are numerous. Here's a non-exhaustive list (for the most recent update, run `ais ls --help`)
+
+```console
+OPTIONS:
+   --all                depending on the context:
+                        - all objects in a given bucket, including misplaced and copies, or
+                        - all buckets, including accessible (visible) remote buckets that are _not present_ in the cluster
+   --cached             list only those objects from a remote bucket that are present ("cached")
+   --name-only          faster request to retrieve only the names of objects (if defined, '--props' flag will be ignored)
+   --props value        comma-separated list of object properties including name, size, version, copies, and more; e.g.:
+                        --props all
+                        --props name,size,cached
+                        --props "ec, copies, custom, location"
+   --regex value        regular expression; use it to match either bucket names or objects in a given bucket, e.g.:
+                        ais ls --regex "(m|n)"         - match buckets such as ais://nnn, s3://mmm, etc.;
+                        ais ls ais://nnn --regex "^A"  - match object names starting with letter A
+   --template value     template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                        (with optional steps and gaps), e.g.:
+                        --template "" # (an empty or '*' template matches eveything)
+                        --template 'dir/subdir/'
+                        --template 'shard-{1000..9999}.tar'
+                        --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                        and similarly, when specifying files and directories:
+                        --template '/home/dir/subdir/'
+                        --template "/abc/prefix-{0010..9999..2}-suffix"
+   --prefix value       list objects that start with the specified prefix, e.g.:
+                        '--prefix a/b/c' - list virtual directory a/b/c and/or objects from the virtual directory
+                        a/b that have their names (relative to this directory) starting with the letter c
+   --page-size value    maximum number of names per page (0 - the maximum is defined by the corresponding backend) (default: 0)
+   --paged              list objects page by page, one page at a time (see also '--page-size' and '--limit')
+   --limit value        limit object name count (0 - unlimited) (default: 0)
+   --show-unmatched     list objects that were not matched by regex and template
+   --max-pages value    display up to this number pages of bucket objects (default: 0)
+   --summary            show object numbers, bucket sizes, and used capacity; applies _only_ to buckets and objects that are _present_ in the cluster
+   --anonymous          list public-access Cloud buckets that may disallow certain operations (e.g., 'HEAD(bucket)')
+   --archive            list archived content (see docs/archive.md for details)
+   --units value        show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                        si  - SI (metric) format, e.g.: KB, MB, GB
+                        raw - do not convert to (or from) human-readable format
+   --no-headers, -H     display tables without headers
+   --no-footers         display tables without footers
+```
+
+### `ais ls --regex "ngn*"`
 
 List all buckets matching the `ngn*` regex expression.
 
-`ais bucket ls aws://` or `ais bucket ls ais://`
+### `ais ls aws:` or (same) `ais ls s3`
 
-List all buckets for the specific provider.
+List all _existing_ buckets for the specific provider.
 
-`ais bucket ls ais://#name`
+### `ais ls aws --all` or (same) `ais ls s3: --all`
+
+List absolutely all buckets that cluster can "see" inclduing those that are not necessarily **present** in the cluster.
+
+### `ais ls ais://` or (same) `ais ls ais`
+
+List all AIS buckets.
+
+### `ais ls ais://#name`
 
 List all buckets for the `ais` provider and `name` namespace.
 
-`ais bucket ls ais://@uuid#namespace`
+### `ais ls ais://@uuid#namespace`
 
-List all buckets for the `ais` provider and `uuid#namespace` namespace.
-`uuid` should be equal to remote cluster UUID and `namespace` is optional name of the remote namespace (if `namespace` not provided the global namespace will be used).
+List all remote AIS buckets that have `uuid#namespace` namespace. Note that:
 
-### Options
+* the `uuid` must be the remote cluster UUID (or its alias)
+* while the `namespace` is optional name of the remote namespace
 
-| Name | Type | Description | Default |
-| --- | --- | --- | --- |
-| `--regex` | `string` | Pattern for matching bucket names | `""` |
-| `--no-headers` | `bool` | Display tables without headers | `false` |
-
-## List object names
-
-`ais bucket ls BUCKET`
-
-List all objects contained in `BUCKET` bucket.
+As a rule, when a (logical) `#namespace` in the bucket's name is omitted we use the global namespace that always exists.
 
 ### Options
 
+```console
+$ ais ls --help
+NAME:
+   ais ls - (alias for "bucket ls") list buckets, objects in buckets, and files in objects formatted as archives
+
+USAGE:
+   ais ls [command options] PROVIDER:[//BUCKET_NAME]
+
+OPTIONS:
+   --all                depending on the context:
+                        - all objects in a given bucket, including misplaced and copies, or
+                        - all buckets, including accessible (visible) remote buckets that are _not present_ in the cluster
+   --cached             list only those objects from a remote bucket that are present ("cached")
+   --props value        comma-separated list of object properties including name, size, version, copies, and more; e.g.:
+                        --props all
+                        --props name,size,cached
+                        --props "ec, copies, custom, location"
+   --regex value        regular expression; use it to match either bucket names or objects in a given bucket, e.g.:
+                        ais ls --regex "(m|n)"         - match buckets such as ais://nnn, s3://mmm, etc.;
+                        ais ls ais://nnn --regex "^A"  - match object names starting with letter A
+   --no-headers, -H     display tables without headers
+   --no-footers         display tables without footers
+   --summary            show bucket sizes and used capacity; applies _only_ to buckets and objects that are _present_ in the cluster
+   --anonymous          list public-access Cloud buckets that may disallow certain operations (e.g., 'HEAD(bucket)')
+   --units value        show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                        si  - SI (metric) format, e.g.: KB, MB, GB
+                        raw - do not convert to (or from) human-readable format
+   --help, -h           show help
+```
+
+
+## List objects
+
+`ais ls` is one of those commands that only keeps growing, in terms of supported options and capabilities.
+
+The command:
+
+`ais ls [command options] PROVIDER:[//BUCKET_NAME]`
+
+can conveniently list buckets (with or without "summarizing" them - see `--summary`) amd objects.
+
+Notice the optional `[//BUCKET_NAME]`. When there's no bucket, `ais ls` will list buckets. Otherwise, naturally it'll list objects.
+
+
+```console
+$ ais ls --help
+NAME:
+   ais ls - (alias for "bucket ls") list buckets, objects in buckets, and files in objects formatted as archives
+
+USAGE:
+   ais ls [command options] PROVIDER:[//BUCKET_NAME]
+
+OPTIONS:
+   --all                depending on the context:
+                        - all objects in a given bucket, including misplaced and copies, or
+                        - all buckets, including accessible (visible) remote buckets that are _not present_ in the cluster
+   --cached             list only those objects from a remote bucket that are present ("cached")
+   --name-only          faster request to retrieve only the names of objects (if defined, '--props' flag will be ignored)
+   --props value        comma-separated list of object properties including name, size, version, copies, and more; e.g.:
+                        --props all
+                        --props name,size,cached
+                        --props "ec, copies, custom, location"
+   --regex value        regular expression; use it to match either bucket names or objects in a given bucket, e.g.:
+                        ais ls --regex "(m|n)"         - match buckets such as ais://nnn, s3://mmm, etc.;
+                        ais ls ais://nnn --regex "^A"  - match object names starting with letter A
+   --template value     template to match object names; may contain prefix with zero or more ranges (with optional steps and gaps), e.g.:
+                        --template 'dir/subdir/'
+                        --template 'shard-{1000..9999}.tar'
+                        --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                        --template "prefix-{0010..9999..2}-suffix"
+   --prefix value       list objects that start with the specified prefix, e.g.:
+                        '--prefix a/b/c' - list virtual directory a/b/c and/or objects from the virtual directory
+                        a/b that have their names (relative to this directory) starting with the letter c
+   --page-size value    maximum number of names per page (0 - the maximum is defined by the corresponding backend) (default: 0)
+   --paged              list objects page by page, one page at a time (see also '--page-size' and '--limit')
+   --limit value        limit object name count (0 - unlimited) (default: 0)
+   --show-unmatched     list objects that were not matched by regex and template
+   --no-headers, -H     display tables without headers
+   --no-footers         display tables without footers
+   --max-pages value    display up to this number pages of bucket objects (default: 0)
+   --start-after value  list bucket's content alphabetically starting with the first name _after_ the specified
+   --summary            show bucket sizes and used capacity; applies _only_ to buckets and objects that are _present_ in the cluster
+   --anonymous          list public-access Cloud buckets that may disallow certain operations (e.g., 'HEAD(bucket)')
+   --archive            list archived content (see docs/archive.md for details)
+   --units value        show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                        si  - SI (metric) format, e.g.: KB, MB, GB
+                        raw - do not convert to (or from) human-readable format
+   --help, -h           show help
+```
+
+### Options
+
+comma-separated list of object properties including name, size, version, ##copies, EC data and parity info, custom props (default: "name,size")
+
 | Name | Type | Description | Default |
 | --- | --- | --- | --- |
-| `--regex` | `string` | Pattern for matching object names | `""` |
-| `--template` | `string` | Template for matching object names | `""` |
-| `--prefix` | `string` | Prefix for matching object names | `""` |
-| `--paged` | `bool` | Fetch and print objects page by page | `false` |
-| `--max-pages` | `int` | Max. number of pages to list | `0` |
-| `--page-size` | `int` | Max. number of object names per page | `1000` |
-| `--props` | `string` | Comma-separated properties to return with object names | `"size,version"`
-| `--limit` | `int` | Max. number of object names to list | `0` |
-| `--show-unmatched` | `bool` | List objects unmatched by regex and template as well, after the matched ones | `false` |
-| `--all` | `bool` | Show all objects, including misplaced, duplicated, etc. | `false` |
-| `--marker` | `string` | Start listing objects starting from the object that follows the marker alphabetically | `""` |
-| `--no-headers` | `bool` | Display tables without headers | `false` |
-| `--cached` | `bool` | For a remote bucket, shows only objects that have already been downloaded and are cached on local drives (ignored for ais buckets) | `false` |
-| `--use-cache` | `bool` | Use proxy cache to speed up list object request | `false` |
+| `--regex` | `string` | regular expression to match and select items in question | `""` |
+| `--template` | `string` | template for matching object names, e.g.: 'shard-{900..999}.tar' | `""` |
+| `--prefix` | `string` | list objects matching a given prefix | `""` |
+| `--page-size` | `int` | maximum number of names per page (0 - the maximum is defined by the corresponding backend) | `0` |
+| `--props` | `string` | comma-separated list of object properties including name, size, version, copies, EC data and parity info, custom metadata, location, and more; to include all properties, type '--props all' (default: "name,size") | `"name,size"` |
+| `--limit` | `int` | limit object name count (0 - unlimited) | `0` |
+| `--show-unmatched` | `bool` | list objects that were not matched by regex and/or template | `false` |
+| `--all` | `bool` | depending on context: all objects (including misplaced ones and copies) _or_ all buckets (including remote buckets that are not present in the cluster) | `false` |
+| -no-headers, -H | `bool` | display tables without headers | `false` |
+| --no-footers | `bool` | display tables without footers | `false` |
+| `--paged` | `bool` | list objects page by page, one page at a time (see also '--page-size' and '--limit') | `false` |
+| `--max-pages` | `int` | display up to this number pages of bucket objects (default: 0) | `0` |
+| `--marker` | `string` | list bucket's content alphabetically starting with the first name _after_ the specified | `""` |
 | `--start-after` | `string` | Object name (marker) after which the listing should start | `""` |
-| `--list-archive` | `bool` | List contents of archives (ie., objects formatted as TAR, TGZ, ZIP archives) | `false` |
+| `--cached` | `bool` | list only those objects from a remote bucket that are present ("cached") | `false` |
+| `--anonymous` | `bool` | list public-access Cloud buckets that may disallow certain operations (e.g., `HEAD(bucket)`) | `false` |
+| `--archive` | `bool` | list archived content | `false` |
+| `--summary` | `bool` | show bucket sizes and used capacity; by default, applies only to the buckets that are _present_ in the cluster (use '--all' option to override) | `false` |
+| `--bytes` | `bool` | show sizes in bytes (ie., do not convert to KiB, MiB, GiB, etc.) | `false` |
+| `--name-only` | `bool` | fast request to retrieve only the names of objects in the bucket; if defined, all comma-separated fields in the `--props` flag will be ignored with only two exceptions: `name` and `status` | `false` |
 
 ### Examples
 
-#### From the specific bucket
+#### List AIS and Cloud buckets with all defaults
 
 List objects in the AIS bucket `bucket_name`.
 
 ```console
-$ ais bucket ls ais://bucket_name
-NAME		SIZE		VERSION
-shard-0.tar	16.00KiB	1
-shard-1.tar	16.00KiB	1
+$ ais ls ais://bucket_name
+NAME		SIZE
+shard-0.tar	16.00KiB
+shard-1.tar	16.00KiB
 ...
 ```
 
 List objects in the remote bucket `bucket_name`.
 
 ```console
-ais bucket ls aws://bucket_name
-NAME		SIZE		VERSION
-shard-0.tar	16.00KiB	1
-shard-1.tar	16.00KiB	1
+ais ls aws://bucket_name
+NAME		SIZE
+shard-0.tar	16.00KiB
+shard-1.tar	16.00KiB
 ...
 ```
 
-#### From AIS remote cluster with specific namespace
+#### Include all properties
+
+```console
+# ais ls gs://webdataset-abc --anonymous --props all
+NAME                             SIZE          CHECKSUM                           ATIME   VERSION                 CACHED  TARGET URL            STATUS  COPIES
+coco-train2014-seg-000000.tar    958.48MiB     bdb89d1b854040b6050319e80ef44dde           1657297128665686        no      http://aistore:8081   ok      0
+coco-train2014-seg-000001.tar    958.47MiB     8b94939b7d166114498e794859fb472c           1657297129387272        no      http://aistore:8081   ok      0
+coco-train2014-seg-000002.tar    958.47MiB     142a8e81f965f9bcafc8b04eda65a0ce           1657297129904067        no      http://aistore:8081   ok      0
+coco-train2014-seg-000003.tar    958.22MiB     113024d5def81365cbb6c404c908efb1           1657297130555590        no      http://aistore:8081   ok      0
+...
+```
+
+
+#### List bucket from AIS remote cluster
 
 List objects in the bucket `bucket_name` and `ml` namespace contained on AIS remote cluster with `Bghort1l` UUID.
 
 ```console
-$ ais bucket ls ais://@Bghort1l#ml/bucket_name
+$ ais ls ais://@Bghort1l#ml/bucket_name
 NAME		SIZE		VERSION
 shard-0.tar	16.00KiB	1
 shard-1.tar	16.00KiB	1
@@ -252,7 +433,7 @@ shard-1.tar	16.00KiB	1
 List objects which match given prefix.
 
 ```console
-$ ais bucket ls ais://bucket_name --prefix "shard-1"
+$ ais ls ais://bucket_name --prefix "shard-1"
 NAME		SIZE		VERSION
 shard-1.tar	16.00KiB	1
 shard-10.tar	16.00KiB	1
@@ -277,16 +458,17 @@ log.tar.gz                                       3.11KiB
     log2.tar.gz/t_2021-07-27_14-15-15.log        1.90KiB
 ```
 
-#### [experimental] Using proxy cache
-
-Experimental support for the proxy's cache can be enabled with `--use-cache` option.
-In such case the proxy will cache list object request, so the subsequent calls will be faster.
+#### List anonymously (i.e., list public-access Cloud bucket)
 
 ```console
-$ ais bucket ls ais://bucket_name --use-cache
-NAME		SIZE		VERSION
-shard-0.tar	16.00KiB	1
-shard-1.tar	16.00KiB	1
+$ ais ls gs://webdataset-abc --anonymous
+NAME                             SIZE
+coco-train2014-seg-000000.tar    958.48MiB
+coco-train2014-seg-000001.tar    958.47MiB
+coco-train2014-seg-000002.tar    958.47MiB
+coco-train2014-seg-000003.tar    958.22MiB
+coco-train2014-seg-000004.tar    958.56MiB
+coco-train2014-seg-000005.tar    958.19MiB
 ...
 ```
 
@@ -321,7 +503,7 @@ TDXBNBEZNl.tar   8.50KiB
 qFpwOOifUe.tar   8.50KiB
 thmdpZXetG.tar   8.50KiB
 
-$ ais object get gcp://wrQkliptRt/qFpwOOifUe.tar /tmp/qFpwOOifUe.tar
+$ ais get gcp://wrQkliptRt/qFpwOOifUe.tar /tmp/qFpwOOifUe.tar
 GET "qFpwOOifUe.tar" from bucket "gcp://wrQkliptRt" as "/tmp/qFpwOOifUe.tar" [8.50KiB]
 
 $ ais ls gs://wrQkliptRt --props all
@@ -366,24 +548,51 @@ To check the status, run: ais show job xaction mvlb ais://new_bucket_name
 
 ## Copy bucket
 
-`ais bucket cp SRC_BUCKET DST_BUCKET`
+`ais cp SRC_BUCKET DST_BUCKET`
 
 Copy an existing bucket to a new bucket.
-The destination bucket must exist when:
 
-- the destination bucket is a cloud one
-- a multi-object operation is requested (either flag `--list` or `--template` is set)
+When the destination bucket is in the Cloud it must exist (and be writeable, of course).
+
+For AIS (and remote AIS) buckets, on the other hand, the existence is optional. They get created on the fly, their properties copied from the source (`SRC_BUCKET`).
 
 ### Options
-| Name | Type | Description | Default |
-| --- | --- | --- | --- |
-| `--dry-run` | `bool` | Don't actually copy bucket, only include stats what would happen | `false` |
-| `--prefix` | `string` | Prefix added to every new object's name | `""` |
-| `--wait` | `bool` | Wait until copying of a bucket is finished | `false` |
-| `--list` | `string` | Comma-separated list of objects to copy | `""` |
-| `--template` | `string` | Copy only objects which names match the pattern | `""` |
 
-Flags `--list` and `--template` are mutually exclusive.
+```console
+$ ais cp --help
+NAME:
+   ais cp - (alias for "bucket cp") copy entire bucket or selected objects (to select, use '--list' or '--template')
+
+USAGE:
+   ais cp [command options] SRC_BUCKET DST_BUCKET
+
+OPTIONS:
+   --all             copy all objects from a remote bucket including those that are not present (not "cached") in the cluster
+   --cont-on-err     keep running archiving xaction in presence of errors in a any given multi-object transaction
+   --force, -f       force an action
+   --dry-run         show total size of new objects without really creating them
+   --prepend value   prefix to prepend to every copied object name, e.g.:
+                     --prepend=abc   - prefix all copied object names with "abc"
+                     --prepend=abc/  - copy objects into a virtual directory "abc" (note trailing filepath separator)
+   --prefix value    copy objects that start with the specified prefix, e.g.:
+                     '--prefix a/b/c' - copy virtual directory a/b/c and/or objects from the virtual directory
+                     a/b that have their names (relative to this directory) starting with the letter c
+   --list value      comma-separated list of object names, e.g.:
+                     --list 'o1,o2,o3'
+                     --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+   --template value  template to match object names; may contain prefix with zero or more ranges (with optional steps and gaps), e.g.:
+                     --template 'dir/subdir/'
+                     --template 'shard-{1000..9999}.tar'
+                     --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                     --template "prefix-{0010..9999..2}-suffix"
+   --progress        show progress bar(s) and progress of execution in real time
+   --refresh value   interval for continuous monitoring;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --wait            wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value   maximum time to wait for a job to finish; if omitted wait forever or Ctrl-C;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --help, -h        show help
+```
 
 ### Examples
 
@@ -392,9 +601,9 @@ Flags `--list` and `--template` are mutually exclusive.
 Copy AIS bucket `src_bucket` to AIS bucket `dst_bucket`.
 
 ```console
-$ ais bucket cp ais://src_bucket ais://dst_bucket
+$ ais cp ais://src_bucket ais://dst_bucket
 Copying bucket "ais://bucket_name" to "ais://dst_bucket" in progress.
-To check the status, run: ais show job xaction copybck ais://dst_bucket
+To check the status, run: ais show job xaction copy-bck ais://dst_bucket
 ```
 
 #### Copy AIS bucket and wait until finish
@@ -402,7 +611,7 @@ To check the status, run: ais show job xaction copybck ais://dst_bucket
 The same as above, but wait until copying is finished.
 
 ```console
-$ ais bucket cp ais://src_bucket ais://dst_bucket --wait
+$ ais cp ais://src_bucket ais://dst_bucket --wait
 ```
 
 #### Copy cloud bucket to another cloud bucket
@@ -411,13 +620,13 @@ Copy AWS bucket `src_bucket` to AWS bucket `dst_bucket`.
 
 ```console
 # Make sure that both buckets exist.
-$ ais bucket ls aws://
+$ ais ls aws://
 AWS Buckets (2)
   aws://src_bucket
   aws://dst_bucket
-$ ais bucket cp aws://src_bucket aws://dst_bucket
+$ ais cp aws://src_bucket aws://dst_bucket
 Copying bucket "aws://src_bucket" to "aws://dst_bucket" in progress.
-To check the status, run: ais show job xaction copybck aws://dst_bucket
+To check the status, run: ais show job xaction copy-bck aws://dst_bucket
 ```
 
 #### Copy only selected objects
@@ -425,7 +634,7 @@ To check the status, run: ais show job xaction copybck aws://dst_bucket
 Copy objects `obj1.tar` and `obj1.info` from bucket `ais://bck1` to `ais://bck2`, and wait until the operation finishes.
 
 ```console
-$ ais bucket cp ais://bck1 ais://bck2 --list obj1.tar,obj1.info --wait
+$ ais cp ais://bck1 ais://bck2 --list obj1.tar,obj1.info --wait
 copying objects operation ("ais://bck1" => "ais://bck2") is in progress...
 copying objects operation succeeded.
 ```
@@ -434,41 +643,99 @@ Copy object with pattern matching: copy `obj2`, `obj3`, and `obj4` from `ais://b
 Do not wait for the operation is done.
 
 ```console
-$ ais bucket cp ais://bck1 ais://bck2 --template "obj{2..4}"
+$ ais cp ais://bck1 ais://bck2 --template "obj{2..4}"
 copying objects operation ("ais://bck1" => "ais://bck2") is in progress...
-To check the status, run: ais show job xaction copybck ais://bck2
+To check the status, run: ais show job xaction copy-bck ais://bck2
 ```
 
 ## Show bucket summary
 
-`ais bucket summary [BUCKET]`
+`ais storage summary [command options] PROVIDER:[//BUCKET_NAME] - show bucket sizes and the respective percentages of used capacity on a per-bucket basis
 
-Show summary information on a per bucket basis. If `BUCKET` is specified in the command line, the output gets narrowed down to this specific bucket.
+### Options
 
-Depending on the command line options (listed below), per-bucket information includes total number of objects, size of the bucket in bytes or megabytes, and percentage of the total capacity used by the bucket.
+```console
+NAME:
+   ais storage summary - show bucket sizes and %% of used capacity on a per-bucket basis
 
-A recently added `--validate` option is intended to analyze integrity of the stored distributed content. The questions that we ask at validation time "cover" location of stored objects and their replicas, the number of replicas (and whether this number agrees with the bucket configuration), etc.
+USAGE:
+   ais storage summary [command options] PROVIDER:[//BUCKET_NAME]
 
-In particular, location of each objects stored in the cluster must at any point in time correspond to the current cluster map and, within each storage target, to the target's *mountpaths* (disks).  A failure to abide by location rules is called "misplacement"; misplaced objects - if any - must be migrated to their proper locations via automated processes called `global rebalance` and `resilver`:
+OPTIONS:
+   --refresh value   interval for continuous monitoring;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --count value     used together with '--refresh' to limit the number of generated reports (default: 0)
+   --prefix value    for each bucket, select only those objects (names) that start with the specified prefix, e.g.:
+                     '--prefix a/b/c' - sum-up sizes of the virtual directory a/b/c and objects from the virtual directory
+                     a/b that have names (relative to this directory) starting with the letter c
+   --cached          list only those objects from a remote bucket that are present ("cached")
+   --all             all buckets, including accessible remote buckets that are not present in the cluster
+   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                     si  - SI (metric) format, e.g.: KB, MB, GB
+                     raw - do not convert to (or from) human-readable format
+   --verbose, -v     verbose
+   --timeout value   maximum time to wait for a job to finish; if omitted wait forever or Ctrl-C;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --no-headers, -H  display tables without headers
+   --help, -h        show help
+```
+
+If `BUCKET` is omitted, the command *applies* to all [AIS buckets](/docs/bucket.md#ais-bucket).
+
+The output includes the total number of objects in a bucket, the bucket's size (bytes, megabytes, etc.), and the percentage of the total capacity used by the bucket.
+
+A few additional words must be said about `--validate`. The option is provided to run integrity checks, namely: locations of objects, replicas, and EC slices in the bucket, the number of replicas (and whether this number agrees with the bucket configuration), and more.
+
+> Location of each stored object must at any point in time correspond to the current cluster map and, within each storage target, to the target's [mountpaths](/docs/overview.md#terminology). A failure to abide by location rules is called *misplacement*; misplaced objects - if any - must be migrated to their proper locations via automated processes called `global rebalance` and `resilver`:
 
 * [global rebalance and reslver](/docs/rebalance.md)
 * [resilvering selected targets: advanced usage](/docs/resourcesvanced.md)
 
-As far as the option `--validate` a non-zero *misplaced* objects in its output would be a direct indication that the cluster requires rebalancing.
+### Notes
 
-Note that `--validate` may take considerable time to execute, depending, of course, on sizes of the datasets and capabilities of the underlying hardware.
+1. `--validate` may take considerable time to execute (depending, of course, on sizes of the datasets in question and the capabilities of the underlying hardware);
+2. non-zero *misplaced* objects in the (validated) output is a direct indication that the cluster requires rebalancing and/or resilvering;
+3. `--fast=false` is another command line option that may also significantly increase execution time;
+4. by default, `--fast` is set to `true`, which also means that bucket summary executes a *faster* logic (that may have a certain minor speed/accuracy trade-off);
+5. to obtain the most precise results, run the command with `--fast=false` - and prepare to wait.
 
-### Options
+### Examples
 
-| Flag | Type | Description | Default |
-| --- | --- | --- | --- |
-| `--fast` | `bool` | The option is designed primarily for internal usage. The output may not accurately reflect user-accessible content. | `false` |
-| `--validate` | `bool` | Check objects for errors: misplacement, insufficient number of copies | `false` |
-| `--cached` | `bool` | For buckets that have remote [backends](/docs/providers.md), list only objects stored in the AIS cluster | `false` |
+```console
+# 1. show summary for a specific bucket
+$ ais bucket summary ais://abc
+NAME             OBJECTS         SIZE ON DISK    USAGE(%)
+ais://abc        10902           5.38GiB         1%
+
+For min/avg/max object sizes, use `--fast=false`.
+```
+
+```console
+# 2. "summarize" all buckets(*)
+$ ais bucket summary
+NAME             OBJECTS         SIZE ON DISK    USAGE(%)
+ais://abc        10902           5.38GiB         1%
+ais://nnn        49873           200.00MiB       0%
+```
+
+```console
+# 3. summarize ais://abc to show min/avg/max object sizes and _apparent_ bucket sizes
+###
+###   Apparent bucket size is the sum(sizes of all objects in the bucket) - will
+###   always be smaller than the actual disk usage. The difference will be even more
+###   pronounced in presence of mirroring and/or erasure coding.
+###   E.g., in a mirrored bucket configured for 3 replicas, the sum of all object
+###   sizes will be more than 3 times smaller than the size on disk.
+###
+$ ais bucket summary ais://abc --fast=false
+NAME             OBJECTS         OBJECT SIZE (min, avg, max)             SIZE (sum object sizes)   USAGE(%)
+ais://abc        10902           1.07KiB    515.01KiB  1023.51KiB        5.35GiB                   1%
+```
 
 ## Start N-way Mirroring
 
-`ais job start mirror BUCKET --copies <value>`
+`ais start mirror BUCKET --copies <value>`
 
 Start an extended action to bring a given bucket to a certain redundancy level (`value` copies). Read more about this feature [here](/docs/storage_svcs.md#n-way-mirror).
 
@@ -497,16 +764,22 @@ All options are required and must be greater than `0`.
 
 ## Show bucket properties
 
-`ais bucket props show BUCKET [PROP_PREFIX]`
+Overall, the topic called "bucket properties" is rather involved and includes sub-topics "bucket property inhertance" and "cluster-wide global defaults". For background, please first see:
 
-List [properties](/docs/bucket.md#properties-and-options) of the bucket.
-By default, condensed form of bucket props sections is presented.
+* [Default Bucket Properties](/docs/bucket.md#default-bucket-properties)
+* [Inherited Bucket Properties and LRU](/docs/bucket.md#inherited-bucket-properties-and-lru)
+* [Backend Provider](/docs/bucket.md#backend-provider)
+* [Global cluster-wide configuration](/docs/configuration.md#cluster-and-node-configuration).
+
+Now, as far as CLI, run the following to list [properties](/docs/bucket.md#properties-and-options) of the specified bucket.
+By default, a certain compact form of bucket props sections is presented.
+
+`ais bucket props show BUCKET [PROP_PREFIX]`
 
 When `PROP_PREFIX` is set, only props that start with `PROP_PREFIX` will be displayed.
 Useful `PROP_PREFIX` are: `access, checksum, ec, lru, mirror, provider, versioning`.
 
-> Note: Like many other `ais show` commands, `ais show bucket` is aliased to `ais bucket show` for ease of use.
-> Both of these commands are used interchangeably throughout the documentation.
+> `ais bucket show` is an alias for `ais show bucket` - both can be used interchangeably.
 
 ### Options
 
@@ -591,6 +864,54 @@ Bucket props successfully updated
 "access" set to:"GET,HEAD-OBJECT,HEAD-BUCKET,LIST-OBJECTS" (was:"<PREV_ACCESS_LIST>")
 ```
 
+#### Configure custom AWS S3 endpoint
+
+When a bucket is hosted by an S3 compliant backend (such as, e.g., minio), we may want to specify an alternative S3 endpoint,
+so that AIS nodes use it when reading, writing, listing, and generally, performing all operations on remote S3 bucket(s).
+
+Globally, S3 endpoint can be overridden for _all_ S3 buckets via "S3_ENDPOINT" environment.
+If you decide to make the change, you may need to restart AIS cluster while making sure that "S3_ENDPOINT" is available for the AIS nodes
+when they are starting up.
+
+But it can be also be done - and will take precedence over the global setting - on a per-bucket basis.
+
+Here are some examples:
+
+```console
+# Let's say, there exists a bucket called s3://abc:
+$ ais ls s3://abc
+NAME             SIZE
+README.md        8.96KiB
+
+# First, we override empty the endpoint property in the bucket's configuration.
+# To see that a non-empty value *applies* and works, we will use the default AWS S3 endpoint: https://s3.amazonaws.com
+$ ais bucket props set s3://abc extra.aws.endpoint=s3.amazonaws.com
+Bucket "aws://abc": property "extra.aws.endpoint=s3.amazonaws.com", nothing to do
+$ ais ls s3://abc
+NAME             SIZE
+README.md        8.96KiB
+
+# Second, set the endpoint=foo (or, it could be any other invalid value), and observe that the bucket becomes unreachable:
+$ ais bucket props set s3://abc extra.aws.endpoint=foo
+Bucket props successfully updated
+"extra.aws.endpoint" set to: "foo" (was: "s3.amazonaws.com")
+$ ais ls s3://abc
+RequestError: send request failed: dial tcp: lookup abc.foo: no such host
+
+# Finally, revert the endpoint back to empty, and check that the bucket is visible again:
+$ ais bucket props set s3://abc extra.aws.endpoint=""
+Bucket props successfully updated
+"extra.aws.endpoint" set to: "" (was: "foo")
+$ ais ls s3://abc
+NAME             SIZE
+README.md        8.96KiB
+```
+
+> Global `export S3_ENDPOINT=...` override is static and readonly. Use it with extreme caution as it applies to all buckets.
+
+> On the other hand, for any given `s3://bucket` its S3 endpoint can be set, unset, and otherwise changed at any time - at runtime. As shown above.
+
+
 #### Connect/Disconnect AIS bucket to/from cloud bucket
 
 Set backend bucket for AIS bucket `bucket_name` to the GCP cloud bucket `cloud_bucket`.
@@ -627,10 +948,10 @@ In examples a cluster with 6 targets is used:
 
 ```console
 $ # Creating a bucket
-$ ais bucket create ais://bck --bucket-props "ec.enabled=true ec.data_slices=6 ec.parity_slices=4"
+$ ais create ais://bck --props "ec.enabled=true ec.data_slices=6 ec.parity_slices=4"
 Create bucket "ais://bck" failed: EC config (6 data, 4 parity) slices requires at least 11 targets (have 6)
 $
-$ ais bucket create ais://bck --bucket-props "ec.enabled=true ec.data_slices=6 ec.parity_slices=4" --force
+$ ais create ais://bck --props "ec.enabled=true ec.data_slices=6 ec.parity_slices=4" --force
 "ais://bck" bucket created
 $
 $ # If the number of targets is less than or equal to ec.parity_slices even `--force` does not help
@@ -696,10 +1017,8 @@ $ ais bucket props set ais://bucket_name '{
       "enabled": true
     },
     "mirror": {
-      "copies": 0,
-      "burst_buffer": 0,
-      "util_thresh": 0,
-      "optimize_put": false,
+      "copies": 2,
+      "burst_buffer": 512,
       "enabled": false
     },
     "ec": {

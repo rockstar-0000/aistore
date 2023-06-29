@@ -1,6 +1,6 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
@@ -9,9 +9,10 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/jsp"
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 func TestConfigTestEnv(t *testing.T) {
@@ -24,7 +25,7 @@ func TestConfigTestEnv(t *testing.T) {
 	confPath := filepath.Join(thisFileDir(t), "configs", "config.json")
 	localConfPath := filepath.Join(thisFileDir(t), "configs", "confignet.json")
 	newConfig := cmn.Config{}
-	err := cmn.LoadConfig(confPath, localConfPath, cmn.Proxy, &newConfig)
+	err := cmn.LoadConfig(confPath, localConfPath, apc.Proxy, &newConfig)
 	tassert.CheckFatal(t, err)
 }
 
@@ -43,13 +44,13 @@ func TestConfigFSPaths(t *testing.T) {
 	_, err := jsp.LoadMeta(localConfPath, &localConf)
 	tassert.CheckFatal(t, err)
 	newConfig := cmn.Config{}
-	err = cmn.LoadConfig(confPath, localConfPath, cmn.Target, &newConfig)
+	err = cmn.LoadConfig(confPath, localConfPath, apc.Target, &newConfig)
 	tassert.CheckFatal(t, err)
 
-	mpaths := localConf.FSpaths.Paths
-	tassert.Fatalf(t, len(newConfig.FSpaths.Paths) == len(mpaths), "mountpath count %v != %v", len(newConfig.FSpaths.Paths), len(mpaths))
+	mpaths := localConf.FSP.Paths
+	tassert.Fatalf(t, len(newConfig.FSP.Paths) == len(mpaths), "mountpath count %v != %v", len(newConfig.FSP.Paths), len(mpaths))
 	for p := range mpaths {
-		tassert.Fatalf(t, newConfig.FSpaths.Paths.Contains(p), "%q not in config FSpaths", p)
+		tassert.Fatalf(t, newConfig.FSP.Paths.Contains(p), "%q not in config FSP", p)
 	}
 }
 

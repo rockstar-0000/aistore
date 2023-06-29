@@ -1,22 +1,20 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
 import (
 	"fmt"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 )
 
+// is under lock
 func delCopies(lom *cluster.LOM, copies int) (size int64, err error) {
-	lom.Lock(true)
-	defer lom.Unlock(true)
-
-	// Reload metadata, it is necessary to have it fresh.
+	// force reloading metadata
 	lom.Uncache(false /*delDirty*/)
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
 		return 0, err
@@ -47,11 +45,9 @@ func delCopies(lom *cluster.LOM, copies int) (size int64, err error) {
 	return
 }
 
+// under LOM's w-lock => TODO: a finer-grade mechanism to write-protect
+// metadata only, md.copies in this case
 func addCopies(lom *cluster.LOM, copies int, buf []byte) (size int64, err error) {
-	// TODO: finer-grade mechanism to write-protect metadata only (md.copies in this case)
-	lom.Lock(true)
-	defer lom.Unlock(true)
-
 	// Reload metadata, it is necessary to have it fresh.
 	lom.Uncache(false /*delDirty*/)
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
@@ -66,22 +62,16 @@ func addCopies(lom *cluster.LOM, copies int, buf []byte) (size int64, err error)
 	//  While copying we may find out that some copies do not exist -
 	//  these copies will be removed and `NumCopies()` will decrease.
 	for lom.NumCopies() < copies {
-		var (
-			mi    *fs.MountpathInfo
-			clone *cluster.LOM
-		)
-		if mi = lom.BestMpath(); mi == nil {
+		var mi *fs.Mountpath
+		if mi = lom.LeastUtilNoCopy(); mi == nil {
 			err = fmt.Errorf("%s (copies=%d): cannot find dst mountpath", lom, lom.NumCopies())
 			return
 		}
-		copyFQN := mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
-		if clone, err = lom.CopyObject(copyFQN, buf); err != nil {
-			glog.Errorln(err)
-			cluster.FreeLOM(clone)
+		if err = lom.Copy(mi, buf); err != nil {
+			nlog.Errorln(err)
 			return
 		}
 		size += lom.SizeBytes()
-		cluster.FreeLOM(clone)
 	}
 	return
 }

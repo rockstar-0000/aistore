@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
@@ -10,44 +10,46 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
-)
-
-const (
-	doneSendingOpcode = 27182
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 type (
 	tcbFactory struct {
 		xreg.RenewBase
-		xact  *XactTCB
+		xctn  *XactTCB
 		kind  string
 		phase string // (see "transition")
 		args  *xreg.TCBArgs
 	}
 	XactTCB struct {
-		xaction.XactBckJog
+		xact.BckJog
 		t    cluster.Target
 		dm   *bundle.DataMover
 		args xreg.TCBArgs
 		// starting up
 		wg sync.WaitGroup
 		// finishing
-		refc atomic.Int32
+		rxlast atomic.Int64
+		refc   atomic.Int32
 	}
 )
+
+const OpcTxnDone = 27182
 
 const etlBucketParallelCnt = 2
 
@@ -57,33 +59,11 @@ var (
 	_ xreg.Renewable = (*tcbFactory)(nil)
 )
 
-///////////////////////////////////
-// cluster.CopyObjectParams pool //
-///////////////////////////////////
-
-var (
-	cpObjPool sync.Pool
-	cpObj0    cluster.CopyObjectParams
-)
-
-func allocCpObjParams() (a *cluster.CopyObjectParams) {
-	if v := cpObjPool.Get(); v != nil {
-		a = v.(*cluster.CopyObjectParams)
-		return
-	}
-	return &cluster.CopyObjectParams{}
-}
-
-func freeCpObjParams(a *cluster.CopyObjectParams) {
-	*a = cpObj0
-	cpObjPool.Put(a)
-}
-
 ////////////////
 // tcbFactory //
 ////////////////
 
-func (e *tcbFactory) New(args xreg.Args, bck *cluster.Bck) xreg.Renewable {
+func (e *tcbFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	custom := args.Custom.(*xreg.TCBArgs)
 	p := &tcbFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, kind: e.kind, phase: custom.Phase, args: custom}
 	return p
@@ -92,55 +72,61 @@ func (e *tcbFactory) New(args xreg.Args, bck *cluster.Bck) xreg.Renewable {
 func (e *tcbFactory) Start() error {
 	var (
 		config    = cmn.GCO.Get()
-		sizePDU   int32
-		slab, err = e.T.MMSA().GetSlab(memsys.MaxPageSlabSize)
+		slab, err = e.T.PageMM().GetSlab(memsys.MaxPageSlabSize) // TODO: estimate
 	)
-	cos.AssertNoErr(err)
-	e.xact = newXactTCB(e, slab)
-	if e.kind == cmn.ActETLBck {
+	debug.AssertNoErr(err)
+	e.xctn = newXactTCB(e, slab, config)
+
+	// refcount OpcTxnDone; this target must ve active (ref: ignoreMaintenance)
+	smap := e.T.Sowner().Get()
+	if err := e.xctn.InMaintOrDecomm(smap, e.T.Snode()); err != nil {
+		return err
+	}
+	nat := smap.CountActiveTs()
+	e.xctn.refc.Store(int32(nat - 1))
+	e.xctn.wg.Add(1)
+
+	var sizePDU int32
+	if e.kind == apc.ActETLBck {
 		sizePDU = memsys.DefaultBufSize
 	}
-
-	// NOTE: to refcount doneSendingOpcode
-	smap := e.T.Sowner().Get()
-	e.xact.refc.Store(int32(smap.CountTargets() - 1))
-	e.xact.wg.Add(1)
-
-	return e.newDM(&config.Rebalance, e.UUID(), sizePDU)
+	err = e.newDM(config, e.UUID(), sizePDU)
+	return err
 }
 
-func (e *tcbFactory) newDM(rebcfg *cmn.RebalanceConf, uuid string, sizePDU int32) error {
-	const trname = "transcpy" // copy&transform transport endpoint prefix
+func (e *tcbFactory) newDM(config *cmn.Config, uuid string, sizePDU int32) error {
+	const trname = "tcb"
 	dmExtra := bundle.Extra{
-		RecvAck:     nil,                    // NOTE: no ACKs
-		Compression: rebcfg.Compression,     // TODO: define separately
-		Multiplier:  int(rebcfg.Multiplier), // ditto
+		RecvAck:     nil, // no ACKs
+		Compression: config.TCB.Compression,
+		Multiplier:  config.TCB.SbundleMult,
+		SizePDU:     sizePDU,
 	}
-	dmExtra.SizePDU = sizePDU
-	dm, err := bundle.NewDataMover(e.T, trname+"_"+uuid, e.xact.recv, cluster.RegularPut, dmExtra)
+	dm, err := bundle.NewDataMover(e.T, trname+"-"+uuid, e.xctn.recv, cmn.OwtPut, dmExtra)
 	if err != nil {
 		return err
 	}
 	if err := dm.RegRecv(); err != nil {
 		return err
 	}
-	e.xact.dm = dm
+	dm.SetXact(e.xctn)
+	e.xctn.dm = dm
 	return nil
 }
 
 func (e *tcbFactory) Kind() string      { return e.kind }
-func (e *tcbFactory) Get() cluster.Xact { return e.xact }
+func (e *tcbFactory) Get() cluster.Xact { return e.xctn }
 
 func (e *tcbFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, err error) {
 	prev := prevEntry.(*tcbFactory)
 	if e.UUID() != prev.UUID() {
-		err = fmt.Errorf("%s is currently running - not starting new %q", prevEntry.Get(), e.Str(e.Kind()))
+		err = cmn.NewErrXactUsePrev(prevEntry.Get().String())
 		return
 	}
 	bckEq := prev.args.BckFrom.Equal(e.args.BckFrom, true /*same BID*/, true /* same backend */)
 	debug.Assert(bckEq)
-	debug.Assert(prev.phase == cmn.ActBegin && e.phase == cmn.ActCommit)
-	prev.args.Phase = cmn.ActCommit // transition
+	debug.Assert(prev.phase == apc.ActBegin && e.phase == apc.ActCommit)
+	prev.args.Phase = apc.ActCommit // transition
 	wpr = xreg.WprUse
 	return
 }
@@ -149,43 +135,35 @@ func (e *tcbFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, 
 // XactTCB //
 /////////////
 
-func (r *XactTCB) Args() *xreg.TCBArgs { return &r.args }
-
-func (r *XactTCB) String() string {
-	return fmt.Sprintf("%s <= %s", r.XactBase.String(), r.args.BckFrom)
-}
-
 // limited pre-run abort
-func (r *XactTCB) TxnAbort() {
-	err := cmn.NewAbortedError(r.String())
-	if r.dm.IsOpen() {
-		r.dm.Close(err)
-	}
+func (r *XactTCB) TxnAbort(err error) {
+	err = cmn.NewErrAborted(r.Name(), "tcb: txn-abort", err)
+	r.dm.CloseIf(err)
 	r.dm.UnregRecv()
-	r.XactBase.Finish(err)
+	r.AddErr(err)
+	r.Base.Finish()
 }
 
-//
 // XactTCB copies one bucket _into_ another with or without transformation.
 // args.DP.Reader() is the reader to receive transformed bytes; when nil we do a plain bucket copy.
-//
-func newXactTCB(e *tcbFactory, slab *memsys.Slab) (r *XactTCB) {
+func newXactTCB(e *tcbFactory, slab *memsys.Slab, config *cmn.Config) (r *XactTCB) {
 	var parallel int
 	r = &XactTCB{t: e.T, args: *e.args}
-	if e.kind == cmn.ActETLBck {
+	if e.kind == apc.ActETLBck {
 		parallel = etlBucketParallelCnt // TODO: optimize with respect to disk bw and transforming computation
 	}
-	mpopts := &mpather.JoggerGroupOpts{
-		Bck:      e.args.BckFrom.Bck,
+	mpopts := &mpather.JgroupOpts{
 		T:        e.T,
 		CTs:      []string{fs.ObjectType},
 		VisitObj: r.copyObject,
+		Prefix:   e.args.Msg.Prefix,
 		Slab:     slab,
 		Parallel: parallel,
 		DoLoad:   mpather.Load,
-		Throttle: true,
+		Throttle: true, // NOTE: always trottling
 	}
-	r.XactBckJog.Init(e.UUID(), e.kind, e.args.BckTo, mpopts)
+	mpopts.Bck.Copy(e.args.BckFrom.Bucket())
+	r.BckJog.Init(e.UUID(), e.kind, e.args.BckTo, mpopts, config)
 	return
 }
 
@@ -198,108 +176,157 @@ func (r *XactTCB) Run(wg *sync.WaitGroup) {
 
 	r.wg.Done()
 
-	r.XactBckJog.Run()
-	glog.Infoln(r.String(), r.args.BckFrom.Bck, "=>", r.args.BckTo.Bck)
+	r.BckJog.Run()
+	nlog.Infoln(r.Name())
 
-	err := r.XactBckJog.Wait()
+	err := r.BckJog.Wait()
 
 	o := transport.AllocSend()
-	o.Hdr.Opcode = doneSendingOpcode
-	r.dm.Bcast(o)
+	o.Hdr.Opcode = OpcTxnDone
+	r.dm.Bcast(o, nil)
 
-	// NOTE: ref-counted quiescence, fairly short (optimal) waiting
-	config := cmn.GCO.Get()
-	optTime, maxTime := config.Timeout.MaxKeepalive.D(), config.Timeout.SendFile.D()/2
-	q := r.Quiesce(optTime, func(tot time.Duration) cluster.QuiRes { return xaction.RefcntQuiCB(&r.refc, maxTime, tot) })
-	if err == nil {
-		if q == cluster.QuiAborted {
-			err = cmn.NewAbortedError(r.String())
-		} else if q == cluster.QuiTimeout {
-			err = fmt.Errorf("%s: %v", r, cmn.ErrQuiesceTimeout)
-		}
+	q := r.Quiesce(cmn.Timeout.CplaneOperation(), r.qcb)
+	if q == cluster.QuiTimeout {
+		r.AddErr(fmt.Errorf("%s: %v", r, cmn.ErrQuiesceTimeout))
 	}
 
 	// close
 	r.dm.Close(err)
 	r.dm.UnregRecv()
 
-	r.Finish(err)
+	r.Finish()
+}
+
+func (r *XactTCB) qcb(tot time.Duration) cluster.QuiRes {
+	// TODO -- FIXME =======================
+	if cnt := r.ErrCnt(); cnt > 0 {
+		// to break quiescence - the waiter will look at r.Err() first anyway
+		return cluster.QuiTimeout
+	}
+
+	since := mono.Since(r.rxlast.Load())
+	if r.refc.Load() > 0 {
+		if since > cmn.Timeout.MaxKeepalive() {
+			// idle on the Rx side despite having some (refc > 0) senders
+			if tot > r.BckJog.Config.Timeout.SendFile.D() {
+				return cluster.QuiTimeout
+			}
+		}
+		return cluster.QuiActive
+	}
+	if since > cmn.Timeout.CplaneOperation() {
+		return cluster.QuiDone
+	}
+	return cluster.QuiInactiveCB
 }
 
 func (r *XactTCB) copyObject(lom *cluster.LOM, buf []byte) (err error) {
-	var size int64
 	objNameTo := r.args.Msg.ToName(lom.ObjName)
-	params := allocCpObjParams()
+	if r.BckJog.Config.FastV(5, cos.SmoduleMirror) {
+		nlog.Infof("%s: %s => %s", r.Base.Name(), lom.Cname(), r.args.BckTo.Cname(objNameTo))
+	}
+	params := cluster.AllocCpObjParams()
 	{
 		params.BckTo = r.args.BckTo
 		params.ObjNameTo = objNameTo
 		params.Buf = buf
 		params.DM = r.dm
 		params.DP = r.args.DP
-		params.DryRun = r.args.Msg.DryRun
+		params.Xact = r
 	}
-	size, err = r.Target().CopyObject(lom, params, false /*localOnly*/)
+	_, err = r.T.CopyObject(lom, params, r.args.Msg.DryRun)
 	if err != nil {
 		if cos.IsErrOOS(err) {
-			what := fmt.Sprintf("%s(%q)", r.Kind(), r.ID())
-			err = cmn.NewAbortedError(what, err.Error())
+			// TODO: call r.Abort() instead
+			err = cmn.NewErrAborted(r.Name(), "tcb", err)
 		}
-		goto ret
+		r.AddErr(err)
+		if r.BckJog.Config.FastV(5, cos.SmoduleMirror) {
+			nlog.Infof("Error: %v", err)
+		}
 	}
-	r.ObjectsInc()
-
-	// TODO: Add precise post-transform byte count
-	// (under ETL, sizes of transformed objects are unknown until after the transformation)
-	if size == cos.ContentLengthUnknown {
-		size = lom.SizeBytes()
-	}
-	r.BytesAdd(size)
-
-	// keep checking remaining capacity
-	if cs := fs.GetCapStatus(); cs.Err != nil {
-		what := fmt.Sprintf("%s(%q)", r.Kind(), r.ID())
-		err = cmn.NewAbortedError(what, cs.Err.Error())
-	}
-ret:
-	freeCpObjParams(params)
+	cluster.FreeCpObjParams(params)
 	return
 }
 
-func (r *XactTCB) recv(hdr transport.ObjHdr, objReader io.Reader, err error) {
-	defer transport.FreeRecv(objReader)
+// NOTE: strict(est) error handling: abort on any of the errors below
+func (r *XactTCB) recv(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 	if err != nil && !cos.IsEOF(err) {
-		glog.Error(err)
-		return
+		nlog.Errorln(err)
+		return err
 	}
-	// NOTE: best-effort via ref-counting
-	if hdr.Opcode == doneSendingOpcode {
+	// ref-count done-senders
+	if hdr.Opcode == OpcTxnDone {
 		refc := r.refc.Dec()
 		debug.Assert(refc >= 0)
-		return
+		return nil
 	}
+
 	debug.Assert(hdr.Opcode == 0)
-
-	defer cos.DrainReader(objReader)
 	lom := cluster.AllocLOM(hdr.ObjName)
-	defer cluster.FreeLOM(lom)
-	if err := lom.Init(hdr.Bck); err != nil {
-		glog.Error(err)
-		return
-	}
+	err = r._recv(hdr, objReader, lom)
+	cluster.FreeLOM(lom)
+	transport.DrainAndFreeReader(objReader)
+	return err
+}
 
+func (r *XactTCB) _recv(hdr transport.ObjHdr, objReader io.Reader, lom *cluster.LOM) error {
+	if err := lom.InitBck(&hdr.Bck); err != nil {
+		r.AddErr(err)
+		nlog.Errorln(err)
+		return err
+	}
 	lom.CopyAttrs(&hdr.ObjAttrs, true /*skip cksum*/)
-	params := cluster.PutObjectParams{
-		Tag:    fs.WorkfilePut,
-		Reader: io.NopCloser(objReader),
+	params := cluster.AllocPutObjParams()
+	{
+		params.WorkTag = fs.WorkfilePut
+		params.Reader = io.NopCloser(objReader)
+		params.Cksum = hdr.ObjAttrs.Cksum
+		params.Xact = r
+
 		// Transaction is used only by CopyBucket and ETL. In both cases new objects
-		// are created at the destination. Setting `RegularPut` type informs `c.t.PutObject`
-		// that it must PUT the object to the Cloud as well after the local data are
-		// finalized in case of destination is Cloud.
-		RecvType: cluster.RegularPut,
-		Cksum:    hdr.ObjAttrs.Cksum,
-		Started:  time.Now(),
+		// are created at the destination. Setting `OwtPut` type informs `t.PutObject()`
+		// that it must PUT the object to the remote backend as well
+		// (but only after the local transaction is done and finalized).
+		params.OWT = cmn.OwtPut
 	}
-	if err := r.t.PutObject(lom, params); err != nil {
-		glog.Error(err)
+	if lom.AtimeUnix() == 0 {
+		// TODO: sender must be setting it, remove this `if` when fixed
+		lom.SetAtimeUnix(time.Now().UnixNano())
 	}
+	params.Atime = lom.Atime()
+
+	erp := r.t.PutObject(lom, params)
+	cluster.FreePutObjParams(params)
+	if erp != nil {
+		r.AddErr(erp)
+		nlog.Errorln(erp)
+		return erp // NOTE: non-nil signals transport to terminate
+	}
+	r.rxlast.Store(mono.NanoTime())
+	return nil
+}
+
+func (r *XactTCB) Args() *xreg.TCBArgs { return &r.args }
+
+func (r *XactTCB) String() string {
+	return fmt.Sprintf("%s <= %s", r.Base.String(), r.args.BckFrom)
+}
+
+func (r *XactTCB) Name() string {
+	return fmt.Sprintf("%s <= %s", r.Base.Name(), r.args.BckFrom)
+}
+
+func (r *XactTCB) FromTo() (*meta.Bck, *meta.Bck) {
+	return r.args.BckFrom, r.args.BckTo
+}
+
+func (r *XactTCB) Snap() (snap *cluster.Snap) {
+	snap = &cluster.Snap{}
+	r.ToSnap(snap)
+
+	snap.IdleX = r.IsIdle()
+	f, t := r.FromTo()
+	snap.SrcBck, snap.DstBck = f.Clone(), t.Clone()
+	return
 }

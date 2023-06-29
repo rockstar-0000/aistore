@@ -1,6 +1,6 @@
 PROPERTY         VALUE
 ^atime(.*)$
-checksum         05967d5390ac53b0
+checksum         xxhash[05967d5390ac53b0]
 name             ais://$BUCKET_1/object_1.txt
 size             11B
 PROPERTY         VALUE
@@ -8,11 +8,21 @@ size             11B
 version          1
 PROPERTY         VALUE
 ^atime(.*)$
-cached           yes
-checksum         05967d5390ac53b0
-copies           1
-custom           []
+checksum         xxhash[05967d5390ac53b0]
+^copies\s*1(.*)$
+custom           -
 ec               -
+^location(t.+:mp.+)$
+name             ais://$BUCKET_1/object_1.txt
+size             11B
+version          1
+PROPERTY         VALUE
+^atime(.*)$
+checksum         xxhash[05967d5390ac53b0]
+^copies\s*1(.*)$
+custom           map[key1:val1 key222:val222]
+ec               -
+^location(t.+:mp.+)$
 name             ais://$BUCKET_1/object_1.txt
 size             11B
 version          1

@@ -7,12 +7,13 @@ run_tests() {
     re="-run=${RE}"
   fi
 
-  tests_dir="${AISTORE_DIR}/..."
+  tests_dir="${AISTORE_PATH}/..."
   if [[ -n "${TESTS_DIR}" ]]; then
-    tests_dir="${AISTORE_DIR}/${TESTS_DIR}"
+    tests_dir="${AISTORE_PATH}/${TESTS_DIR}"
   fi
 
-  timeout="-timeout=2h"
+  timeout="-timeout=3h"
+  shuffle="-shuffle=on"
   if [[ -n "${SHORT}" ]]; then
     short="-short"
     timeout="-timeout=30m"
@@ -20,7 +21,7 @@ run_tests() {
 
   failed_tests=$(
     BUCKET="${BUCKET}" AIS_ENDPOINT="${AIS_ENDPOINT}" \
-      go test -v -p 1 -tags debug -parallel 4 -count 1 ${timeout} ${short} ${re} "${tests_dir}" 2>&1 \
+      go test -v -p 1 -tags debug -parallel 4 -count 1 ${timeout} ${short} ${shuffle} ${re} "${tests_dir}" 2>&1 \
     | tee -a /dev/stderr \
     | grep -ae "^---FAIL: Bench\|^--- FAIL: Test\|^FAIL[[:space:]]github.com/NVIDIA/.*$"; \
     exit ${PIPESTATUS[0]} # Exit with the status of the first command in the pipe(line).
@@ -35,17 +36,16 @@ run_tests() {
   fi
 }
 
-AISTORE_DIR="$(cd "$(dirname "$0")/../../"; pwd -P)"
-YAPF_STYLE="$(dirname ${0})/config/.style.yapf"
+AISTORE_PATH="$(cd "$(dirname "$0")/../../"; pwd -P)"
 PYLINT_STYLE="$(dirname ${0})/config/.pylintrc"
 EXTERNAL_SRC_REGEX=".*\(venv\|build\|3rdparty\|dist\|.idea\|.vscode\)/.*"
 # This script is used by Makefile to run commands.
-source ${AISTORE_DIR}/deploy/scripts/utils.sh
+source ${AISTORE_PATH}/deploy/scripts/utils.sh
 
 case $1 in
 lint)
   echo "Running lint..." >&2
-  ${GOPATH}/bin/golangci-lint run $(list_all_go_dirs)
+  golangci-lint run $(list_all_go_dirs)
   exit $?
   ;;
 
@@ -55,18 +55,13 @@ fmt)
   --fix)
     echo "Running style fixing..." >&2
 
-    gofumpt -s -w ${AISTORE_DIR}
-    python_yapf_fix
+    echo ${AISTORE_PATH}
+
+    gofmt -s -w ${AISTORE_PATH}
+    python_black_fix
     ;;
   *)
     echo "Running style check..." >&2
-
-    out=$(gofmt -l -e ${AISTORE_DIR})
-
-    if [[ -n ${out} ]]; then
-      echo ${out} >&2
-      exit 1
-    fi
 
     check_gomod
     check_imports
@@ -81,10 +76,10 @@ spell)
   echo "Running spell check..." >&2
   case $2 in
   --fix)
-    ${GOPATH}/bin/misspell -i "importas" -w -locale=US ${AISTORE_DIR}
+    ${GOPATH}/bin/misspell -i "importas" -w -locale=US ${AISTORE_PATH}
     ;;
   *)
-    ${GOPATH}/bin/misspell -i "importas" -error -locale=US ${AISTORE_DIR}
+    ${GOPATH}/bin/misspell -i "importas" -error -locale=US ${AISTORE_PATH}
     ;;
   esac
   ;;
@@ -150,25 +145,25 @@ test-docker)
 
   echo "Running test in Docker..." >&2
   branch=$(git branch | grep \* | cut -d ' ' -f2)
-  errs=$("${AISTORE_DIR}/deploy/test/docker/test.sh" --name=${branch} 2>&1 | tee -a /dev/stderr | grep -e "^--- FAIL: Bench\|^--- FAIL: Test"  )
+  errs=$("${AISTORE_PATH}/deploy/test-in-docker/test.sh" --name=${branch} 2>&1 | tee -a /dev/stderr | grep -e "^--- FAIL: Bench\|^--- FAIL: Test"  )
   perror $1 "${errs}"
   ;;
 
 
 test-bench)
   echo "Running benchmark tests..." >&2
-  SCRIPT_ROOT=${AISTORE_DIR}/deploy/scripts
-  . ${SCRIPT_ROOT}/bench.sh cmp --dir "${AISTORE_DIR}" --verbose --post-checkout "${SCRIPT_ROOT}/clean_deploy.sh --dir ${AISTORE_DIR}"
+  SCRIPT_ROOT=${AISTORE_PATH}/deploy/scripts
+  . ${SCRIPT_ROOT}/bench.sh cmp --dir "${AISTORE_PATH}" --verbose --post-checkout "${SCRIPT_ROOT}/clean_deploy.sh --dir ${AISTORE_PATH}"
   ;;
 
 bench)
   shift
-  . ${AISTORE_DIR}/deploy/scripts/bench.sh
+  . ${AISTORE_PATH}/deploy/scripts/bench.sh
   ;;
 
 clean-deploy)
   shift
-  . ${AISTORE_DIR}/deploy/scripts/clean_deploy.sh
+  . ${AISTORE_PATH}/deploy/scripts/clean_deploy.sh
   ;;
 
 dev-init)

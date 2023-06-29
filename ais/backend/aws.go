@@ -1,8 +1,8 @@
-// +build aws
+//go:build aws
 
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -12,15 +12,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -31,13 +35,15 @@ import (
 )
 
 const (
-	awsChecksumType = "x-amz-meta-ais-cksum-type"
-	awsChecksumVal  = "x-amz-meta-ais-cksum-val"
+	// environment variable to globally override the default 'https://s3.amazonaws.com' endpoint
+	// NOTE: the same can be done on a per-bucket basis, via bucket prop `Extra.AWS.Endpoint`
+	// (bucket override will always take precedence)
+	awsEnvS3Endpoint = "S3_ENDPOINT"
 )
 
 type (
 	awsProvider struct {
-		t cluster.Target
+		t cluster.TargetPut
 	}
 	sessConf struct {
 		bck    *cmn.Bck
@@ -46,46 +52,48 @@ type (
 )
 
 var (
-	// one client per AWS region
-	clients map[string]*s3.S3
-	cmu     sync.RWMutex
-
-	// interface guard
-	_ cluster.BackendProvider = (*awsProvider)(nil)
+	clients    map[string]map[string]*s3.S3 // one client per (region, endpoint)
+	cmu        sync.RWMutex
+	s3Endpoint string
 )
 
-func NewAWS(t cluster.Target) (cluster.BackendProvider, error) {
-	clients = make(map[string]*s3.S3, 2)
+// interface guard
+var _ cluster.BackendProvider = (*awsProvider)(nil)
+
+func NewAWS(t cluster.TargetPut) (cluster.BackendProvider, error) {
+	clients = make(map[string]map[string]*s3.S3, 2)
+	s3Endpoint = os.Getenv(awsEnvS3Endpoint)
 	return &awsProvider{t: t}, nil
 }
 
-func (*awsProvider) Provider() string { return cmn.ProviderAmazon }
+func (*awsProvider) Provider() string { return apc.AWS }
 
 // https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-serverside
-func (*awsProvider) MaxPageSize() uint { return 1000 }
+func (*awsProvider) MaxPageSize() uint { return apc.DefaultPageSizeCloud }
 
 ///////////////////
 // CREATE BUCKET //
 ///////////////////
 
-func (awsp *awsProvider) CreateBucket(_ *cluster.Bck) (errCode int, err error) {
-	return creatingBucketNotSupportedErr(awsp.Provider())
+func (*awsProvider) CreateBucket(_ *meta.Bck) (int, error) {
+	return http.StatusNotImplemented, cmn.NewErrNotImpl("create", "s3:// bucket")
 }
 
 /////////////////
 // HEAD BUCKET //
 /////////////////
 
-func (*awsProvider) HeadBucket(_ context.Context, bck *cluster.Bck) (bckProps cos.SimpleKVs, errCode int, err error) {
+func (*awsProvider) HeadBucket(_ ctx, bck *meta.Bck) (bckProps cos.StrKVs, errCode int, err error) {
 	var (
 		svc      *s3.S3
 		region   string
+		errC     error
 		cloudBck = bck.RemoteBck()
 	)
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[head_bucket] %s", cloudBck.Name)
+	svc, region, errC = newClient(sessConf{bck: cloudBck}, "")
+	if superVerbose {
+		nlog.Infof("[head_bucket] %s (%v)", cloudBck.Name, errC)
 	}
-	svc, region, _ = newClient(sessConf{bck: cloudBck}, "") // nolint:errcheck // on purpose
 	if region == "" {
 		// AWS bucket may not yet exist in the BMD -
 		// get the region manually and recreate S3 client.
@@ -102,18 +110,20 @@ func (*awsProvider) HeadBucket(_ context.Context, bck *cluster.Bck) (bckProps co
 	region = *svc.Config.Region
 	debug.Assert(region != "")
 
-	inputVersion := &s3.GetBucketVersioningInput{Bucket: aws.String(cloudBck.Name)}
-	result, err := svc.GetBucketVersioning(inputVersion)
-	if err != nil {
-		errCode, err = awsErrorToAISError(err, cloudBck)
+	// NOTE: return a few assorted fields, specifically to fill-in vendor-specific `cmn.ExtraProps`
+	bckProps = make(cos.StrKVs, 4)
+	bckProps[apc.HdrBackendProvider] = apc.AWS
+	bckProps[apc.HdrS3Region] = region
+	bckProps[apc.HdrS3Endpoint] = ""
+	if bck.Props != nil {
+		bckProps[apc.HdrS3Endpoint] = bck.Props.Extra.AWS.Endpoint
+	}
+	versioned, errV := getBucketVersioning(svc, cloudBck)
+	if errV != nil {
+		errCode, err = awsErrorToAISError(errV, cloudBck)
 		return
 	}
-	bckProps = make(cos.SimpleKVs, 3)
-	bckProps[cmn.HdrBackendProvider] = cmn.ProviderAmazon
-	bckProps[cmn.HdrCloudRegion] = region
-	bckProps[cmn.HdrBucketVerEnabled] = strconv.FormatBool(
-		result.Status != nil && *result.Status == s3.BucketVersioningStatusEnabled,
-	)
+	bckProps[apc.HdrBucketVerEnabled] = strconv.FormatBool(versioned)
 	return
 }
 
@@ -121,22 +131,19 @@ func (*awsProvider) HeadBucket(_ context.Context, bck *cluster.Bck) (bckProps co
 // LIST OBJECTS //
 //////////////////
 
-func (awsp *awsProvider) ListObjects(bck *cluster.Bck, msg *cmn.SelectMsg) (bckList *cmn.BucketList,
-	errCode int, err error) {
-	msg.PageSize = calcPageSize(msg.PageSize, awsp.MaxPageSize())
+// NOTE: obtaining versioning info is extremely slow - to avoid timeouts, imposing a hard limit on the page size
+const versionedPageSize = 20
 
+func (awsp *awsProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (errCode int, err error) {
 	var (
-		svc      *s3.S3
-		h        = cmn.BackendHelpers.Amazon
-		cloudBck = bck.RemoteBck()
+		svc        *s3.S3
+		h          = cmn.BackendHelpers.Amazon
+		cloudBck   = bck.RemoteBck()
+		versioning bool
 	)
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("list_objects %s", cloudBck.Name)
-	}
-
 	svc, _, err = newClient(sessConf{bck: cloudBck}, "[list_objects]")
-	if err != nil {
-		glog.Warning(err)
+	if err != nil && verbose {
+		nlog.Warningln(err)
 	}
 
 	params := &s3.ListObjectsV2Input{Bucket: aws.String(cloudBck.Name)}
@@ -146,88 +153,83 @@ func (awsp *awsProvider) ListObjects(bck *cluster.Bck, msg *cmn.SelectMsg) (bckL
 	if msg.ContinuationToken != "" {
 		params.ContinuationToken = aws.String(msg.ContinuationToken)
 	}
+
+	versioning = bck.Props.Versioning.Enabled && msg.WantProp(apc.GetPropsVersion)
+	msg.PageSize = calcPageSize(msg.PageSize, awsp.MaxPageSize())
+	if versioning {
+		msg.PageSize = cos.MinUint(versionedPageSize, msg.PageSize)
+	}
 	params.MaxKeys = aws.Int64(int64(msg.PageSize))
 
 	resp, err := svc.ListObjectsV2(params)
 	if err != nil {
+		if verbose {
+			nlog.Infof("list_objects %s: %v", cloudBck.Name, err)
+		}
 		errCode, err = awsErrorToAISError(err, cloudBck)
 		return
 	}
 
-	bckList = &cmn.BucketList{Entries: make([]*cmn.BucketEntry, 0, len(resp.Contents))}
-	for _, key := range resp.Contents {
-		entry := &cmn.BucketEntry{Name: *key.Key}
-		if msg.WantProp(cmn.GetPropsSize) {
-			entry.Size = *key.Size
-		}
-		if msg.WantProp(cmn.GetPropsChecksum) {
-			if v, ok := h.EncodeCksum(key.ETag); ok {
-				entry.Checksum = v
-			}
-		}
-
-		bckList.Entries = append(bckList.Entries, entry)
+	l := len(resp.Contents)
+	for i := len(lst.Entries); i < l; i++ {
+		lst.Entries = append(lst.Entries, &cmn.LsoEntry{})
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[list_bucket] count %d", len(bckList.Entries))
+	var custom = cos.StrKVs{}
+	for i, key := range resp.Contents {
+		entry := lst.Entries[i]
+		entry.Name = *key.Key
+		entry.Size = *key.Size
+		if v, ok := h.EncodeCksum(key.ETag); ok {
+			entry.Checksum = v
+		}
+		if msg.WantProp(apc.GetPropsCustom) {
+			custom[cmn.ETag] = entry.Checksum
+			mtime := *(key.LastModified)
+			custom[cmn.LastModified] = fmtTime(mtime)
+			entry.Custom = cmn.CustomMD2S(custom)
+		}
 	}
+	lst.Entries = lst.Entries[:l]
 
 	if *resp.IsTruncated {
-		bckList.ContinuationToken = *resp.NextContinuationToken
+		lst.ContinuationToken = *resp.NextContinuationToken
 	}
 
-	if len(bckList.Entries) == 0 {
+	if len(lst.Entries) == 0 || !versioning {
+		if verbose {
+			nlog.Infof("[list_objects] count %d", len(lst.Entries))
+		}
 		return
 	}
 
-	// If version is requested, read versions page by page and stop when there
-	// is nothing to read or the version page marker is greater than object page marker.
-	// Page is limited with 500+ items, so reading them is slow.
-	if msg.WantProp(cmn.GetPropsVersion) {
-		var (
-			versions   = make(map[string]string, len(bckList.Entries))
-			keyMarker  = ""
-			lastMarker = bckList.Entries[len(bckList.Entries)-1].Name
-		)
-
-		verParams := &s3.ListObjectVersionsInput{Bucket: aws.String(cloudBck.Name)}
-		if msg.Prefix != "" {
-			verParams.Prefix = aws.String(msg.Prefix)
+	// [slow path] for each already listed object:
+	// - set the `ListObjectVersionsInput.Prefix` to the object's full name
+	// - get the versions and lookup the latest one
+	var (
+		verParams = &s3.ListObjectVersionsInput{Bucket: aws.String(cloudBck.Name)}
+		num       int
+	)
+	for _, entry := range lst.Entries {
+		verParams.Prefix = aws.String(entry.Name)
+		verResp, err := svc.ListObjectVersions(verParams)
+		if err != nil {
+			return awsErrorToAISError(err, cloudBck)
 		}
-
-		for keyMarker <= lastMarker {
-			if keyMarker != "" {
-				verParams.KeyMarker = aws.String(keyMarker)
+		for _, vers := range verResp.Versions {
+			if latest := *(vers.IsLatest); !latest {
+				continue
 			}
-
-			verResp, err := svc.ListObjectVersions(verParams)
-			if err != nil {
-				errCode, err := awsErrorToAISError(err, cloudBck)
-				return nil, errCode, err
-			}
-
-			for _, vers := range verResp.Versions {
-				if *(vers.IsLatest) {
-					if v, ok := h.EncodeVersion(vers.VersionId); ok {
-						versions[*(vers.Key)] = v
-					}
-				}
-			}
-
-			if !(*verResp.IsTruncated) {
-				break
-			}
-
-			keyMarker = *verResp.NextKeyMarker
-		}
-
-		for _, entry := range bckList.Entries {
-			if version, ok := versions[entry.Name]; ok {
-				entry.Version = version
+			if key := *(vers.Key); key == entry.Name {
+				v, ok := h.EncodeVersion(vers.VersionId)
+				debug.Assert(ok, entry.Name+": "+*(vers.VersionId))
+				entry.Version = v
+				num++
 			}
 		}
 	}
-
+	if verbose {
+		nlog.Infof("[list_objects] count %d/%d", len(lst.Entries), num)
+	}
 	return
 }
 
@@ -238,23 +240,23 @@ func (awsp *awsProvider) ListObjects(bck *cluster.Bck, msg *cmn.SelectMsg) (bckL
 func (*awsProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
 	svc, _, err := newClient(sessConf{}, "")
 	if err != nil {
-		errCode, err = awsErrorToAISError(err, &cmn.Bck{Provider: cmn.ProviderAmazon})
+		errCode, err = awsErrorToAISError(err, &cmn.Bck{Provider: apc.AWS})
 		return
 	}
 	result, err := svc.ListBuckets(&s3.ListBucketsInput{})
 	if err != nil {
-		errCode, err = awsErrorToAISError(err, &cmn.Bck{Provider: cmn.ProviderAmazon})
+		errCode, err = awsErrorToAISError(err, &cmn.Bck{Provider: apc.AWS})
 		return
 	}
 
 	bcks = make(cmn.Bcks, len(result.Buckets))
 	for idx, bck := range result.Buckets {
-		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Infof("[bucket_names] %s: created %v", aws.StringValue(bck.Name), *bck.CreationDate)
+		if verbose {
+			nlog.Infof("[bucket_names] %s: created %v", aws.StringValue(bck.Name), *bck.CreationDate)
 		}
 		bcks[idx] = cmn.Bck{
 			Name:     aws.StringValue(bck.Name),
-			Provider: cmn.ProviderAmazon,
+			Provider: apc.AWS,
 		}
 	}
 	return
@@ -264,18 +266,18 @@ func (*awsProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err 
 // HEAD OBJECT //
 /////////////////
 
-func (*awsProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objMeta cos.SimpleKVs, errCode int, err error) {
+func (*awsProvider) HeadObj(_ ctx, lom *cluster.LOM) (oa *cmn.ObjAttrs, errCode int, err error) {
 	var (
-		svc      *s3.S3
-		h        = cmn.BackendHelpers.Amazon
-		cloudBck = lom.Bck().RemoteBck()
+		headOutput *s3.HeadObjectOutput
+		svc        *s3.S3
+		h          = cmn.BackendHelpers.Amazon
+		cloudBck   = lom.Bck().RemoteBck()
 	)
 	svc, _, err = newClient(sessConf{bck: cloudBck}, "[head_object]")
-	if err != nil {
-		glog.Warning(err)
+	if err != nil && verbose {
+		nlog.Warningln(err)
 	}
-
-	headOutput, err := svc.HeadObject(&s3.HeadObjectInput{
+	headOutput, err = svc.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(cloudBck.Name),
 		Key:    aws.String(lom.ObjName),
 	})
@@ -283,18 +285,35 @@ func (*awsProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objMeta cos.Si
 		errCode, err = awsErrorToAISError(err, cloudBck)
 		return
 	}
-	objMeta = make(cos.SimpleKVs, 3)
-	objMeta[cmn.HdrBackendProvider] = cmn.ProviderAmazon
-	objMeta[cmn.HdrObjSize] = strconv.FormatInt(*headOutput.ContentLength, 10)
+	oa = &cmn.ObjAttrs{}
+	oa.SetCustomKey(cmn.SourceObjMD, apc.AWS)
+	oa.Size = *headOutput.ContentLength
 	if v, ok := h.EncodeVersion(headOutput.VersionId); ok {
-		objMeta[cmn.HdrObjVersion] = v
+		lom.SetCustomKey(cmn.VersionObjMD, v)
+		oa.Ver = v
 	}
 	if v, ok := h.EncodeCksum(headOutput.ETag); ok {
-		objMeta[cluster.MD5ObjMD] = v
+		oa.SetCustomKey(cmn.ETag, v)
+		// assuming SSE-S3 or plaintext encryption - see
+		// https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html
+		if !strings.Contains(v, cmn.AwsMultipartDelim) {
+			oa.SetCustomKey(cmn.MD5ObjMD, v)
+		}
 	}
-
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[head_object] %s/%s", cloudBck, lom.ObjName)
+	// unlike other custom attrs, "Content-Type" is not getting stored w/ LOM
+	// - only shown via list-objects and HEAD when not present
+	if v := headOutput.ContentType; v != nil {
+		oa.SetCustomKey(cos.HdrContentType, *v)
+	}
+	if v := headOutput.LastModified; v != nil {
+		mtime := *(headOutput.LastModified)
+		if oa.Atime == 0 {
+			oa.Atime = mtime.UnixNano()
+		}
+		oa.SetCustomKey(cmn.LastModified, fmtTime(mtime))
+	}
+	if superVerbose {
+		nlog.Infof("[head_object] %s", cloudBck.Cname(lom.ObjName))
 	}
 	return
 }
@@ -303,23 +322,26 @@ func (*awsProvider) HeadObj(_ context.Context, lom *cluster.LOM) (objMeta cos.Si
 // GET OBJECT //
 ////////////////
 
-func (awsp *awsProvider) GetObj(ctx context.Context, lom *cluster.LOM) (errCode int, err error) {
-	r, cksumToUse, errCode, err := awsp.GetObjReader(ctx, lom)
-	if err != nil {
-		return errCode, err
-	}
-	params := cluster.PutObjectParams{
-		Tag:      fs.WorkfileColdget,
-		Reader:   r,
-		RecvType: cluster.ColdGet,
-		Cksum:    cksumToUse,
-	}
-	err = awsp.t.PutObject(lom, params)
+func (awsp *awsProvider) GetObj(ctx context.Context, lom *cluster.LOM, owt cmn.OWT) (errCode int, err error) {
+	var (
+		r        io.ReadCloser
+		expCksum *cos.Cksum
+	)
+	r, expCksum, errCode, err = awsp.GetObjReader(ctx, lom)
 	if err != nil {
 		return
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[get_object] %s", lom)
+	params := cluster.AllocPutObjParams()
+	{
+		params.WorkTag = fs.WorkfileColdget
+		params.Reader = r
+		params.OWT = owt
+		params.Cksum = expCksum
+		params.Atime = time.Now()
+	}
+	err = awsp.t.PutObject(lom, params)
+	if superVerbose {
+		nlog.Infof("[get_object] %s: %v", lom, err)
 	}
 	return
 }
@@ -328,19 +350,18 @@ func (awsp *awsProvider) GetObj(ctx context.Context, lom *cluster.LOM) (errCode 
 // GET OBJ READER //
 ////////////////////
 
-func (*awsProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r io.ReadCloser, expectedCksm *cos.Cksum,
+func (*awsProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r io.ReadCloser, expCksum *cos.Cksum,
 	errCode int, err error) {
 	var (
+		obj      *s3.GetObjectOutput
 		svc      *s3.S3
-		cksum    *cos.Cksum
-		h        = cmn.BackendHelpers.Amazon
 		cloudBck = lom.Bck().RemoteBck()
 	)
 	svc, _, err = newClient(sessConf{bck: cloudBck}, "[get_object]")
-	if err != nil {
-		glog.Warning(err)
+	if err != nil && superVerbose {
+		nlog.Warningln(err)
 	}
-	obj, err := svc.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	obj, err = svc.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(cloudBck.Name),
 		Key:    aws.String(lom.ObjName),
 	})
@@ -349,34 +370,41 @@ func (*awsProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r io.Re
 		return
 	}
 
-	// Check if have custom metadata.
-	if cksumType, ok := obj.Metadata[awsChecksumType]; ok {
-		if cksumValue, ok := obj.Metadata[awsChecksumVal]; ok {
-			cksum = cos.NewCksum(*cksumType, *cksumValue)
+	// custom metadata
+	lom.SetCustomKey(cmn.SourceObjMD, apc.AWS)
+	if cksumType, ok := obj.Metadata[cos.S3MetadataChecksumType]; ok {
+		if cksumValue, ok := obj.Metadata[cos.S3MetadataChecksumVal]; ok {
+			lom.SetCksum(cos.NewCksum(*cksumType, *cksumValue))
 		}
 	}
-	customMD := cos.SimpleKVs{
-		cluster.SourceObjMD: cluster.SourceAmazonObjMD,
-	}
+
+	expCksum = getobjCustom(lom, obj)
+
+	setSize(ctx, *obj.ContentLength)
+	return wrapReader(ctx, obj.Body), expCksum, 0, nil
+}
+
+func getobjCustom(lom *cluster.LOM, obj *s3.GetObjectOutput) (expCksum *cos.Cksum) {
+	h := cmn.BackendHelpers.Amazon
 	if v, ok := h.EncodeVersion(obj.VersionId); ok {
 		lom.SetVersion(v)
-		customMD[cluster.VersionObjMD] = v
+		lom.SetCustomKey(cmn.VersionObjMD, v)
 	}
-	if v, ok := h.EncodeCksum(obj.ETag); ok {
-		expectedCksm = cos.NewCksum(cos.ChecksumMD5, v)
-		customMD[cluster.MD5ObjMD] = v
+	// see ETag/MD5 NOTE above
+	if v, ok := h.EncodeCksum(obj.ETag); ok && !strings.Contains(v, cmn.AwsMultipartDelim) {
+		expCksum = cos.NewCksum(cos.ChecksumMD5, v)
+		lom.SetCustomKey(cmn.MD5ObjMD, v)
 	}
-	lom.SetCksum(cksum)
-	lom.SetCustom(customMD)
-	setSize(ctx, *obj.ContentLength)
-	return wrapReader(ctx, obj.Body), expectedCksm, 0, nil
+	mtime := *(obj.LastModified)
+	lom.SetCustomKey(cmn.LastModified, fmtTime(mtime))
+	return
 }
 
 ////////////////
 // PUT OBJECT //
 ////////////////
 
-func (*awsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (version string, errCode int, err error) {
+func (*awsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (errCode int, err error) {
 	var (
 		svc                   *s3.S3
 		uploadOutput          *s3manager.UploadOutput
@@ -388,12 +416,12 @@ func (*awsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (version string, e
 	defer cos.Close(r)
 
 	svc, _, err = newClient(sessConf{bck: cloudBck}, "[put_object]")
-	if err != nil {
-		glog.Warning(err)
+	if err != nil && superVerbose {
+		nlog.Warningln(err)
 	}
 
-	md[awsChecksumType] = aws.String(cksumType)
-	md[awsChecksumVal] = aws.String(cksumValue)
+	md[cos.S3MetadataChecksumType] = aws.String(cksumType)
+	md[cos.S3MetadataChecksumVal] = aws.String(cksumValue)
 
 	uploader := s3manager.NewUploaderWithClient(svc)
 	uploadOutput, err = uploader.Upload(&s3manager.UploadInput{
@@ -406,11 +434,20 @@ func (*awsProvider) PutObj(r io.ReadCloser, lom *cluster.LOM) (version string, e
 		errCode, err = awsErrorToAISError(err, cloudBck)
 		return
 	}
+	// compare with setCustomS3() above
 	if v, ok := h.EncodeVersion(uploadOutput.VersionID); ok {
-		version = v
+		lom.SetCustomKey(cmn.VersionObjMD, v)
+		lom.SetVersion(v)
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[put_object] %s, version %s", lom, version)
+	if v, ok := h.EncodeCksum(uploadOutput.ETag); ok {
+		lom.SetCustomKey(cmn.ETag, v)
+		// see ETag/MD5 NOTE above
+		if !strings.Contains(v, cmn.AwsMultipartDelim) {
+			lom.SetCustomKey(cmn.MD5ObjMD, v)
+		}
+	}
+	if superVerbose {
+		nlog.Infof("[put_object] %s", lom)
 	}
 	return
 }
@@ -425,8 +462,8 @@ func (*awsProvider) DeleteObj(lom *cluster.LOM) (errCode int, err error) {
 		cloudBck = lom.Bck().RemoteBck()
 	)
 	svc, _, err = newClient(sessConf{bck: cloudBck}, "[delete_object]")
-	if err != nil {
-		glog.Warning(err)
+	if err != nil && verbose {
+		nlog.Warningln(err)
 	}
 	_, err = svc.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(cloudBck.Name),
@@ -436,8 +473,8 @@ func (*awsProvider) DeleteObj(lom *cluster.LOM) (errCode int, err error) {
 		errCode, err = awsErrorToAISError(err, cloudBck)
 		return
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[delete_object] %s", lom)
+	if superVerbose {
+		nlog.Infof("[delete_object] %s", lom)
 	}
 	return
 }
@@ -446,21 +483,29 @@ func (*awsProvider) DeleteObj(lom *cluster.LOM) (errCode int, err error) {
 // static helpers
 //
 
-// newClient creates new S3 client that can be used to make requests. It is
-// guaranteed that the client is initialized even in case of errors.
+// newClient creates new S3 client on a per-region basis or, more precisely,
+// per (region, endpoint) pair - and note that s3 endpoint is per-bucket configurable.
+// If the client already exists newClient simply returns it.
 //
-// Quoting S3 SDK:
-//     "S3 methods are safe to use concurrently. It is not safe to
-//      modify mutate any of the struct's properties though."
+// From S3 SDK:
+// "S3 methods are safe to use concurrently. It is not safe to modify mutate
+// any of the struct's properties though."
 func newClient(conf sessConf, tag string) (svc *s3.S3, region string, err error) {
+	endpoint := s3Endpoint
 	region = conf.region
-	if region == "" && conf.bck != nil && conf.bck.Props != nil {
-		region = conf.bck.Props.Extra.AWS.CloudRegion
+	if conf.bck != nil && conf.bck.Props != nil {
+		if region == "" {
+			region = conf.bck.Props.Extra.AWS.CloudRegion
+		}
+		if conf.bck.Props.Extra.AWS.Endpoint != "" {
+			endpoint = conf.bck.Props.Extra.AWS.Endpoint
+		}
 	}
+
 	// reuse
 	if region != "" {
 		cmu.RLock()
-		svc = clients[region]
+		svc = clients[region][endpoint]
 		cmu.RUnlock()
 		if svc != nil {
 			return
@@ -468,7 +513,7 @@ func newClient(conf sessConf, tag string) (svc *s3.S3, region string, err error)
 	}
 	// create
 	var (
-		sess    = _session()
+		sess    = _session(endpoint)
 		awsConf = &aws.Config{}
 	)
 	if region == "" {
@@ -484,18 +529,34 @@ func newClient(conf sessConf, tag string) (svc *s3.S3, region string, err error)
 	debug.Assertf(region == *svc.Config.Region, "%s != %s", region, *svc.Config.Region)
 
 	cmu.Lock()
-	clients[region] = svc
+	eps := clients[region]
+	if eps == nil {
+		eps = make(map[string]*s3.S3, 1)
+		clients[region] = eps
+	}
+	eps[endpoint] = svc
 	cmu.Unlock()
 	return
 }
 
 // Create session using default creds from ~/.aws/credentials and environment variables.
-func _session() *session.Session {
-	// TODO: avoid creating sessions for each request
+func _session(endpoint string) *session.Session {
+	config := aws.Config{HTTPClient: cmn.NewClient(cmn.TransportArgs{})}
+	config.WithEndpoint(endpoint) // normally empty but could also be `Props.Extra.AWS.Endpoint` or `os.Getenv(awsEnvS3Endpoint)`
 	return session.Must(session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
-		Config:            aws.Config{HTTPClient: cmn.NewClient(cmn.TransportArgs{})},
+		Config:            config,
 	}))
+}
+
+func getBucketVersioning(svc *s3.S3, bck *cmn.Bck) (enabled bool, errV error) {
+	input := &s3.GetBucketVersioningInput{Bucket: aws.String(bck.Name)}
+	result, err := svc.GetBucketVersioning(input)
+	if err != nil {
+		return false, err
+	}
+	enabled = result.Status != nil && *result.Status == s3.BucketVersioningStatusEnabled
+	return
 }
 
 func getBucketLocation(svc *s3.S3, bckName string) (region string, err error) {
@@ -517,32 +578,32 @@ func getBucketLocation(svc *s3.S3, bckName string) (region string, err error) {
 func awsErrorToAISError(awsError error, bck *cmn.Bck) (int, error) {
 	if reqErr, ok := awsError.(awserr.RequestFailure); ok {
 		if reqErr.Code() == s3.ErrCodeNoSuchBucket {
-			return reqErr.StatusCode(), cmn.NewErrRemoteBckNotFound(*bck)
+			return reqErr.StatusCode(), cmn.NewErrRemoteBckNotFound(bck)
 		}
-		return reqErr.StatusCode(), _clearErr(awsError)
+		return reqErr.StatusCode(), cleanError(awsError)
 	}
 
-	return http.StatusInternalServerError, _clearErr(awsError)
+	return http.StatusInternalServerError, cleanError(awsError)
 }
 
 // Original AWS error contains extra information that a caller does not need:
-//     status code: 400, request id: D918CB, host id: RJtDP0q8
+// status code: 400, request id: D918CB, host id: RJtDP0q8
 // The extra information starts from the new line (`\n`) and tab (`\t`) of the message.
 // At the same time we want to preserve original error which starts with `\ncaused by:`.
 // See more `aws-sdk-go/aws/awserr/types.go:12` (`SprintError`).
-func _clearErr(awsError error) error {
+func cleanError(awsError error) error {
 	var (
-		msg    string
-		errMsg = awsError.Error()
+		msg        = awsError.Error()
+		origErrMsg = awsError.Error()
 	)
 	// Strip extra information...
-	if idx := strings.Index(errMsg, "\n\t"); idx > 0 {
-		msg = errMsg[:idx]
+	if idx := strings.Index(msg, "\n\t"); idx > 0 {
+		msg = msg[:idx]
 	}
 	// ...but preserve original error information.
-	if idx := strings.Index(errMsg, "\ncaused"); idx > 0 {
+	if idx := strings.Index(origErrMsg, "\ncaused"); idx > 0 {
 		// `idx+1` because we want to remove `\n`.
-		msg += " (" + errMsg[idx+1:] + ")"
+		msg += " (" + origErrMsg[idx+1:] + ")"
 	}
-	return errors.New(msg)
+	return errors.New("aws-error[" + msg + "]")
 }

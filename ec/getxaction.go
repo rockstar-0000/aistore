@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
-* Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -10,21 +10,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 type (
 	getFactory struct {
 		xreg.RenewBase
-		xact *XactGet
+		xctn *XactGet
 	}
 
 	// Erasure coding runner: accepts requests and dispatches them to
@@ -36,19 +38,19 @@ type (
 		getJoggers map[string]*getJogger // mountpath joggers for GET
 	}
 
-	// Runtime EC statistics for restore xaction
+	// extended x-ec-get statistics
 	ExtECGetStats struct {
-		AvgTime     cos.Duration `json:"ec.decode.time"`
+		AvgTime     cos.Duration `json:"ec.decode.ns"`
 		ErrCount    int64        `json:"ec.decode.err.n,string"`
-		AvgObjTime  cos.Duration `json:"ec.obj.process.time"`
-		AvgQueueLen float64      `json:"ec.queue.len.n"`
+		AvgObjTime  cos.Duration `json:"ec.obj.process.ns"`
+		AvgQueueLen float64      `json:"ec.queue.len.f"`
 		IsIdle      bool         `json:"is_idle"`
 	}
 )
 
 // interface guard
 var (
-	_ xaction.Demand = (*XactGet)(nil)
+	_ xact.Demand    = (*XactGet)(nil)
 	_ xreg.Renewable = (*getFactory)(nil)
 )
 
@@ -56,20 +58,20 @@ var (
 // getFactory //
 ////////////////
 
-func (*getFactory) New(_ xreg.Args, bck *cluster.Bck) xreg.Renewable {
+func (*getFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 	p := &getFactory{RenewBase: xreg.RenewBase{Bck: bck}}
 	return p
 }
 
 func (p *getFactory) Start() error {
-	xec := ECM.NewGetXact(p.Bck.Bck)
+	xec := ECM.NewGetXact(p.Bck.Bucket())
 	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
-	p.xact = xec
+	p.xctn = xec
 	go xec.Run(nil)
 	return nil
 }
-func (*getFactory) Kind() string        { return cmn.ActECGet }
-func (p *getFactory) Get() cluster.Xact { return p.xact }
+func (*getFactory) Kind() string        { return apc.ActECGet }
+func (p *getFactory) Get() cluster.Xact { return p.xctn }
 
 func (p *getFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	debug.Assertf(false, "%s vs %s", p.Str(p.Kind()), xprev) // xreg.usePrev() must've returned true
@@ -80,14 +82,14 @@ func (p *getFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 // XactGet //
 /////////////
 
-func NewGetXact(t cluster.Target, bck cmn.Bck, mgr *Manager) *XactGet {
+func NewGetXact(t cluster.Target, bck *cmn.Bck, mgr *Manager) *XactGet {
 	availablePaths, disabledPaths := fs.Get()
 	totalPaths := len(availablePaths) + len(disabledPaths)
 	smap, si := t.Sowner(), t.Snode()
-
+	config := cmn.GCO.Get()
 	runner := &XactGet{
 		getJoggers:  make(map[string]*getJogger, totalPaths),
-		xactECBase:  newXactECBase(t, smap, si, bck, mgr),
+		xactECBase:  newXactECBase(t, smap, si, config, bck, mgr),
 		xactReqBase: newXactReqECBase(),
 	}
 
@@ -104,51 +106,54 @@ func NewGetXact(t cluster.Target, bck cmn.Bck, mgr *Manager) *XactGet {
 	return runner
 }
 
-func (r *XactGet) DispatchResp(iReq intraReq, hdr *transport.ObjHdr, bck *cluster.Bck, reader io.Reader) {
+func (r *XactGet) DispatchResp(iReq intraReq, hdr *transport.ObjHdr, bck *meta.Bck, reader io.Reader) {
 	objName, objAttrs := hdr.ObjName, hdr.ObjAttrs
 	uname := unique(hdr.SID, bck, objName)
 	switch hdr.Opcode {
 	// It is response to slice/replica request by an object
-	// restoration process. In this case there should exists
-	// a slice waiting for the data to come(registered with `regWriter`.
+	// restoration process. In this case, there should exists
+	// a slice "waiting" for the data to arrive (registered with `regWriter`.
 	// Read the data into the slice writer and notify the slice when
-	// the transfer is completed
+	// the transfer is complete
 	case respPut:
-		if glog.V(4) {
-			glog.Infof("Response from %s, %s", hdr.SID, uname)
+		if r.config.FastV(4, cos.SmoduleEC) {
+			nlog.Infof("Response from %s, %s", hdr.SID, uname)
 		}
 		r.dOwner.mtx.Lock()
 		writer, ok := r.dOwner.slices[uname]
 		r.dOwner.mtx.Unlock()
 
 		if !ok {
-			glog.Errorf("No writer for %s/%s", bck.Name, objName)
+			err := fmt.Errorf("%s: no slice writer for %s (uname %s)", r.t, bck.Cname(objName), uname)
+			nlog.Errorln(err)
+			r.AddErr(err)
 			return
 		}
-
 		if err := _writerReceive(writer, iReq.exists, objAttrs, reader); err != nil {
-			glog.Errorf("Failed to read replica: %v", err)
+			err = fmt.Errorf("%s: failed to read %s replica: %w (uname %s)", r.t, bck.Cname(objName), err, uname)
+			nlog.Errorln(err)
+			r.AddErr(err)
 		}
 	default:
-		// should be unreachable
-		glog.Errorf("Invalid request: %d", hdr.Opcode)
+		debug.Assert(false, "opcode", hdr.Opcode)
+		nlog.Errorf("Invalid request: %d", hdr.Opcode)
 	}
 }
 
 func (r *XactGet) newGetJogger(mpath string) *getJogger {
-	config := cmn.GCO.Get()
 	client := cmn.NewClient(cmn.TransportArgs{
-		Timeout:    config.Client.Timeout.D(),
-		UseHTTPS:   config.Net.HTTP.UseHTTPS,
-		SkipVerify: config.Net.HTTP.SkipVerify,
+		Timeout:    r.config.Client.Timeout.D(),
+		UseHTTPS:   r.config.Net.HTTP.UseHTTPS,
+		SkipVerify: r.config.Net.HTTP.SkipVerify,
 	})
-	return &getJogger{
+	j := &getJogger{
 		parent: r,
 		mpath:  mpath,
 		client: client,
 		workCh: make(chan *request, requestBufSizeFS),
-		stopCh: cos.NewStopCh(),
 	}
+	j.stopCh.Init()
+	return j
 }
 
 func (r *XactGet) dispatchRequest(req *request, lom *cluster.LOM) error {
@@ -162,44 +167,42 @@ func (r *XactGet) dispatchRequest(req *request, lom *cluster.LOM) error {
 
 	debug.Assert(req.Action == ActRestore)
 
-	jogger, ok := r.getJoggers[lom.MpathInfo().Path]
-	cos.AssertMsg(ok, "Invalid mountpath given in EC request")
+	jogger, ok := r.getJoggers[lom.Mountpath().Path]
+	if !ok {
+		debug.Assert(false, "invalid "+lom.Mountpath().String())
+	}
 	r.stats.updateQueue(len(jogger.workCh))
 	jogger.workCh <- req
 	return nil
 }
 
 func (r *XactGet) Run(*sync.WaitGroup) {
-	glog.Infoln(r.String())
-
+	nlog.Infoln(r.Name())
 	for _, jog := range r.getJoggers {
 		go jog.run()
 	}
 
-	var (
-		cfg    = cmn.GCO.Get()
-		ticker = time.NewTicker(cfg.Periodic.StatsTime.D())
-	)
+	ticker := time.NewTicker(r.config.Periodic.StatsTime.D())
 	defer ticker.Stop()
 
 	// as of now all requests are equal. Some may get throttling later
 	for {
 		select {
 		case <-ticker.C:
-			if glog.FastV(4, glog.SmoduleEC) {
-				if s := fmt.Sprintf("%v", r.ECStats()); s != "" {
-					glog.Info(s)
+			if r.config.FastV(4, cos.SmoduleEC) {
+				if s := r.ECStats().String(); s != "" {
+					nlog.Infoln(s)
 				}
 			}
 		case mpathRequest := <-r.mpathReqCh:
 			switch mpathRequest.action {
-			case cmn.ActMountpathAdd:
+			case apc.ActMountpathAttach:
 				r.addMpath(mpathRequest.mpath)
-			case cmn.ActMountpathRemove:
+			case apc.ActMountpathDetach:
 				r.removeMpath(mpathRequest.mpath)
 			}
 		case <-r.IdleTimer():
-			// It's OK not to notify ecmanager, it'll just have stopped xact in a map.
+			// It's OK not to notify ecmanager, it'll just have stopped xctn in a map.
 			r.stop()
 			return
 		case msg := <-r.controlCh:
@@ -219,7 +222,7 @@ func (r *XactGet) Run(*sync.WaitGroup) {
 	}
 }
 
-func (r *XactGet) Stop(error) { r.Abort() }
+func (r *XactGet) Stop(err error) { r.Abort(err) }
 
 func (r *XactGet) stop() {
 	r.DemandBase.Stop()
@@ -228,7 +231,7 @@ func (r *XactGet) stop() {
 	}
 
 	// Don't close bundles, they are shared between bucket's EC actions
-	r.Finish(nil)
+	r.Finish()
 }
 
 // Decode schedules an object to be restored from existing slices.
@@ -238,13 +241,13 @@ func (r *XactGet) stop() {
 // a nil value from channel but ecrunner keeps working - it reuploads all missing
 // slices or copies
 func (r *XactGet) decode(req *request, lom *cluster.LOM) {
-	debug.AssertMsg(req.Action == ActRestore, "invalid action for restore: "+req.Action)
+	debug.Assert(req.Action == ActRestore, "invalid action for restore: "+req.Action)
 	r.stats.updateDecode()
 	req.putTime = time.Now()
 	req.tm = time.Now()
 
 	if err := r.dispatchRequest(req, lom); err != nil {
-		glog.Errorf("Failed to restore %s: %v", lom, err)
+		nlog.Errorf("Failed to restore %s: %v", lom, err)
 		freeReq(req)
 	}
 }
@@ -271,10 +274,11 @@ func (r *XactGet) EnableRequests() {
 //
 // fsprunner methods
 //
+
 func (r *XactGet) addMpath(mpath string) {
 	jogger, ok := r.getJoggers[mpath]
 	if ok && jogger != nil {
-		glog.Warningf("Attempted to add already existing mountpath: %s", mpath)
+		nlog.Warningf("Attempted to add already existing mountpath: %s", mpath)
 		return
 	}
 	getJog := r.newGetJogger(mpath)
@@ -284,21 +288,23 @@ func (r *XactGet) addMpath(mpath string) {
 
 func (r *XactGet) removeMpath(mpath string) {
 	getJog, ok := r.getJoggers[mpath]
-	cos.AssertMsg(ok, "Mountpath unregister handler for EC called with invalid mountpath")
+	if !ok {
+		debug.Assert(false, "invalid mountpath: "+mpath)
+	}
 	getJog.stop()
 	delete(r.getJoggers, mpath)
 }
 
-func (r *XactGet) Stats() cluster.XactStats {
-	baseStats := r.DemandBase.ExtStats()
+func (r *XactGet) Snap() (snap *cluster.Snap) {
+	snap = r.baseSnap()
 	st := r.stats.stats()
-	baseStats.Ext = &ExtECGetStats{
+	snap.Ext = &ExtECGetStats{
 		AvgTime:     cos.Duration(st.DecodeTime),
 		ErrCount:    st.DecodeErr,
 		AvgObjTime:  cos.Duration(st.ObjTime),
 		AvgQueueLen: st.QueueLen,
 		IsIdle:      r.Pending() == 0,
 	}
-	baseStats.ObjCountX = st.GetReq
-	return baseStats
+	snap.Stats.Objs = st.GetReq
+	return
 }

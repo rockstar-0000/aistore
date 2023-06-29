@@ -1,32 +1,33 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 type (
 	rspFactory struct {
 		xreg.RenewBase
-		xact *XactRespond
+		xctn *XactRespond
 	}
 	// Xaction responsible for responding to EC requests of other targets.
 	// Should not be stopped if number of known targets is small.
@@ -37,7 +38,7 @@ type (
 
 // interface guard
 var (
-	_ xaction.Demand = (*XactRespond)(nil)
+	_ xact.Demand    = (*XactRespond)(nil)
 	_ xreg.Renewable = (*rspFactory)(nil)
 )
 
@@ -45,13 +46,13 @@ var (
 // rspFactory //
 ////////////////
 
-func (*rspFactory) New(_ xreg.Args, bck *cluster.Bck) xreg.Renewable {
+func (*rspFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 	p := &rspFactory{RenewBase: xreg.RenewBase{Bck: bck}}
 	return p
 }
 
-func (*rspFactory) Kind() string        { return cmn.ActECRespond }
-func (p *rspFactory) Get() cluster.Xact { return p.xact }
+func (*rspFactory) Kind() string        { return apc.ActECRespond }
+func (p *rspFactory) Get() cluster.Xact { return p.xctn }
 
 func (p *rspFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	debug.Assertf(false, "%s vs %s", p.Str(p.Kind()), xprev) // xreg.usePrev() must've returned true
@@ -59,9 +60,9 @@ func (p *rspFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 }
 
 func (p *rspFactory) Start() error {
-	xec := ECM.NewRespondXact(p.Bck.Bck)
+	xec := ECM.NewRespondXact(p.Bck.Bucket())
 	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
-	p.xact = xec
+	p.xctn = xec
 	go xec.Run(nil)
 	return nil
 }
@@ -70,30 +71,26 @@ func (p *rspFactory) Start() error {
 // XactRespond //
 /////////////////
 
-func NewRespondXact(t cluster.Target, bck cmn.Bck, mgr *Manager) *XactRespond {
-	smap, si := t.Sowner(), t.Snode()
-	runner := &XactRespond{
-		xactECBase: newXactECBase(t, smap, si, bck, mgr),
-	}
-
-	return runner
+func NewRespondXact(t cluster.Target, bck *cmn.Bck, mgr *Manager) *XactRespond {
+	var (
+		config   = cmn.GCO.Get()
+		smap, si = t.Sowner(), t.Snode()
+	)
+	return &XactRespond{xactECBase: newXactECBase(t, smap, si, config, bck, mgr)}
 }
 
 func (r *XactRespond) Run(*sync.WaitGroup) {
-	glog.Infoln(r.String())
+	nlog.Infoln(r.Name())
 
-	var (
-		cfg    = cmn.GCO.Get()
-		ticker = time.NewTicker(cfg.Periodic.StatsTime.D())
-	)
+	ticker := time.NewTicker(r.config.Periodic.StatsTime.D())
 	defer ticker.Stop()
 
-	// as of now all requests are equal. Some may get throttling later
+	// as of now all requests are equal (TODO: throttle)
 	for {
 		select {
 		case <-ticker.C:
-			if s := fmt.Sprintf("%v", r.stats.stats()); s != "" {
-				glog.Info(s)
+			if s := r.stats.stats().String(); s != "" {
+				nlog.Infoln(s)
 			}
 		case <-r.IdleTimer():
 			r.stop()
@@ -107,12 +104,12 @@ func (r *XactRespond) Run(*sync.WaitGroup) {
 
 // Utility function to cleanup both object/slice and its meta on the local node
 // Used when processing object deletion request
-func (r *XactRespond) removeObjAndMeta(bck *cluster.Bck, objName string) error {
-	if glog.FastV(4, glog.SmoduleEC) {
-		glog.Infof("Delete request for %s/%s", bck.Name, objName)
+func (r *XactRespond) removeObjAndMeta(bck *meta.Bck, objName string) error {
+	if r.config.FastV(4, cos.SmoduleEC) {
+		nlog.Infof("Delete request for %s", bck.Cname(objName))
 	}
 
-	ct, err := cluster.NewCTFromBO(bck.Bck, objName, r.t.Bowner(), fs.ECSliceType)
+	ct, err := cluster.NewCTFromBO(bck.Bucket(), objName, r.t.Bowner(), fs.ECSliceType)
 	if err != nil {
 		return err
 	}
@@ -126,11 +123,11 @@ func (r *XactRespond) removeObjAndMeta(bck *cluster.Bck, objName string) error {
 	// metafile that makes remained slices/replicas outdated and can be cleaned
 	// up later by LRU or other runner
 	for _, tp := range []string{fs.ECMetaType, fs.ObjectType, fs.ECSliceType} {
-		fqnMeta, _, err := cluster.HrwFQN(bck, tp, objName)
+		fqnMeta, _, err := cluster.HrwFQN(bck.Bucket(), tp, objName)
 		if err != nil {
 			return err
 		}
-		if err := os.RemoveAll(fqnMeta); err != nil {
+		if err := os.Remove(fqnMeta); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("error removing %s %q: %w", tp, fqnMeta, err)
 		}
 	}
@@ -138,17 +135,17 @@ func (r *XactRespond) removeObjAndMeta(bck *cluster.Bck, objName string) error {
 	return nil
 }
 
-func (r *XactRespond) trySendCT(iReq intraReq, hdr *transport.ObjHdr, bck *cluster.Bck) error {
+func (r *XactRespond) trySendCT(iReq intraReq, hdr *transport.ObjHdr, bck *meta.Bck) error {
 	var (
 		fqn, metaFQN string
 		md           *Metadata
 		objName      = hdr.ObjName
 	)
-	if glog.FastV(4, glog.SmoduleEC) {
-		glog.Infof("Received request for slice %d of %s", iReq.meta.SliceID, objName)
+	if r.config.FastV(4, cos.SmoduleEC) {
+		nlog.Infof("Received request for slice %d of %s", iReq.meta.SliceID, objName)
 	}
 	if iReq.isSlice {
-		ct, err := cluster.NewCTFromBO(bck.Bck, objName, r.t.Bowner(), fs.ECSliceType)
+		ct, err := cluster.NewCTFromBO(bck.Bucket(), objName, r.t.Bowner(), fs.ECSliceType)
 		if err != nil {
 			return err
 		}
@@ -165,21 +162,24 @@ func (r *XactRespond) trySendCT(iReq intraReq, hdr *transport.ObjHdr, bck *clust
 }
 
 // DispatchReq is responsible for handling request from other targets
-func (r *XactRespond) DispatchReq(iReq intraReq, hdr *transport.ObjHdr, bck *cluster.Bck) {
+func (r *XactRespond) DispatchReq(iReq intraReq, hdr *transport.ObjHdr, bck *meta.Bck) {
 	switch hdr.Opcode {
 	case reqDel:
 		// object cleanup request: delete replicas, slices and metafiles
 		if err := r.removeObjAndMeta(bck, hdr.ObjName); err != nil {
-			glog.Errorf("%s failed to delete %s/%s: %v", r.t.Snode(), bck.Name, hdr.ObjName, err)
+			err = fmt.Errorf("%s: failed to delete %s: %w", r.t, bck.Cname(hdr.ObjName), err)
+			nlog.Errorln(err)
+			r.AddErr(err)
 		}
 	case reqGet:
 		err := r.trySendCT(iReq, hdr, bck)
 		if err != nil {
-			glog.Error(err)
+			r.AddErr(err)
+			nlog.Errorln(err)
 		}
 	default:
-		// invalid request detected
-		glog.Errorf("Invalid request type %d", hdr.Opcode)
+		debug.Assert(false, "opcode", hdr.Opcode)
+		nlog.Errorf("Invalid request type %d", hdr.Opcode)
 	}
 }
 
@@ -198,18 +198,17 @@ func (r *XactRespond) DispatchResp(iReq intraReq, hdr *transport.ObjHdr, object 
 			meta = iReq.meta
 		)
 		if meta == nil {
-			cos.DrainReader(object)
-			glog.Errorf("%s: no metadata for %s", r.t.Snode(), hdr.FullName())
+			nlog.Errorf("%s: no metadata for %s", r.t, hdr.Cname())
 			return
 		}
 
-		if glog.FastV(4, glog.SmoduleEC) {
-			glog.Infof("Got slice=%t from %s (#%d of %s) v%s, cksum: %s", iReq.isSlice, hdr.SID,
-				iReq.meta.SliceID, hdr.FullName(), meta.ObjVersion, meta.CksumValue)
+		if r.config.FastV(4, cos.SmoduleEC) {
+			nlog.Infof("Got slice=%t from %s (#%d of %s) v%s, cksum: %s", iReq.isSlice, hdr.SID,
+				iReq.meta.SliceID, hdr.Cname(), meta.ObjVersion, meta.CksumValue)
 		}
 		md := meta.NewPack()
 		if iReq.isSlice {
-			args := &WriteArgs{Reader: object, MD: md, BID: iReq.bid, Generation: meta.Generation}
+			args := &WriteArgs{Reader: object, MD: md, BID: iReq.bid, Generation: meta.Generation, Xact: r}
 			err = WriteSliceAndMeta(r.t, hdr, args)
 		} else {
 			var lom *cluster.LOM
@@ -221,31 +220,30 @@ func (r *XactRespond) DispatchResp(iReq intraReq, hdr *transport.ObjHdr, object 
 					Cksum:      hdr.ObjAttrs.Cksum,
 					BID:        iReq.bid,
 					Generation: meta.Generation,
+					Xact:       r,
 				}
 				err = WriteReplicaAndMeta(r.t, lom, args)
 			}
 			cluster.FreeLOM(lom)
 		}
 		if err != nil {
-			if !errors.Is(err, io.ErrUnexpectedEOF) {
-				cos.DrainReader(object)
-			}
-			glog.Error(err)
+			r.AddErr(err)
+			nlog.Errorln(err)
 			return
 		}
-		r.ObjectsInc()
-		r.BytesAdd(hdr.ObjAttrs.Size)
+		r.ObjsAdd(1, hdr.ObjAttrs.Size)
 	default:
-		// should be unreachable
-		glog.Errorf("Invalid request type: %d", hdr.Opcode)
+		debug.Assert(false, "opcode", hdr.Opcode)
+		nlog.Errorf("Invalid request type: %d", hdr.Opcode)
 	}
 }
 
-func (r *XactRespond) Stop(error) { r.Abort() }
+func (r *XactRespond) Stop(err error) { r.Abort(err) }
 
 func (r *XactRespond) stop() {
 	r.DemandBase.Stop()
-	r.Finish(nil)
+	r.Finish()
 }
 
-func (r *XactRespond) Stats() cluster.XactStats { return r.DemandBase.ExtStats() }
+// (compare w/ XactGet/Put)
+func (r *XactRespond) Snap() *cluster.Snap { return r.baseSnap() }

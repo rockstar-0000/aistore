@@ -7,16 +7,65 @@ redirect_from:
  - /docs/cli/storage.md/
 ---
 
-# Mountpath (disk) management
+`ais storage` commands supports the following subcommands:
 
-> A *mountpath* is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS utilizes to store user data and AIS metadata. A mountpath can be disabled and (re)enabled, automatically or administratively, at any point during runtime. In a given cluster, a total number of mountpaths would normally compute as a direct product of (number of storage targets) x (number of disks in each target).
+```console
+$ ais storage <TAB-TAB>
+cleanup     disk        mountpath   summary     validate
+```
+
+Alternatively (or in addition), run with `--help` to view subcommands and short descriptions, both:
+
+```console
+$ ais storage --help
+NAME:
+   ais storage - monitor and manage clustered storage
+
+USAGE:
+   ais storage command [command options] [arguments...]
+
+COMMANDS:
+   show       show storage usage and utilization, disks and mountpaths
+   summary    show bucket sizes and %% of used capacity on a per-bucket basis
+   validate   check buckets for misplaced objects and objects that have insufficient numbers of copies or EC slices
+   mountpath  show and attach/detach target mountpaths
+   disk       show disk utilization and read/write statistics
+   cleanup    perform storage cleanup: remove deleted objects and old/obsolete workfiles
+
+OPTIONS:
+   --help, -h  show help
+```
+
+As always, each subcommand (above) will have its own help and usage examples - the latter possibly spread across multiple markdowns.
+
+> You can easily look up examples and descriptions of any keyword via a simple `find`, for instance:
+
+```console
+$ find . -type f -name "*.md" | xargs grep "ais.*mountpath"
+```
 
 ## Table of Contents
+- [Storage cleanup](#storage-cleanup)
 - [Show capacity usage](#show-capacity-usage)
 - [Validate buckets](#validate-buckets)
+- [Mountpath (and disk) management](#mountpath-and-disk-management)
 - [Show mountpaths](#show-mountpaths)
 - [Attach mountpath](#attach-mountpath)
 - [Detach mountpath](#detach-mountpath)
+
+## Storage cleanup
+
+As all other supported batch operations (aka `xactions`), cleanup runs asynchronously and can be monitored during its run, e.g.:
+
+```console
+# ais storage cleanup
+Started storage cleanup "BlpmlObF8", use 'ais job show xaction BlpmlObF8' to monitor the progress
+```
+
+Further references:
+
+* [Batch operations](/docs/batch.md)
+* [`ais show job`](/docs/cli/job.md)
 
 ## Show capacity usage
 
@@ -44,6 +93,9 @@ When `--fast` option is used the summary will include (internal-usage) details s
 | `--fast` | `bool` | The option is designed primarily for internal usage. The output may not accurately reflect user-accessible content. | `false` |
 | `--validate` | `bool` | Check objects for errors: misplaced, insufficient number of copies etc | `false` |
 | `--cached` | `bool` | For buckets that have remote backend, list only objects stored in the cluster | `false` |
+| `--count` | `int` | Can be used in combination with `--refresh` option to limit the number of generated reports | `1` |
+| `--refresh` | `duration` | Refresh interval - time duration between reports. The usual unit suffixes are supported and include `m` (for minutes), `s` (seconds), `ms` (milliseconds) | ` ` |
+
 
 ### Example
 
@@ -92,19 +144,74 @@ ais://bck2        3               1               0
 The bucket `ais://bck2` has 3 objects and one of them is misplaced, i.e. it is inaccessible by a client.
 It results in `ais ls ais://bck2` returns only 2 objects.
 
+## Mountpath (and disk) management
+
+There are two related commands:
+
+* `ais storage disk`
+* `ais storage mountpath`
+
+where `mountpath` is a higher-level abstraction that typically "utilizes" a single undivided disk. More exactly:
+
+> A *mountpath* is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS utilizes to store user data and AIS metadata. A mountpath can be disabled and (re)enabled, automatically or administratively, at any point during runtime. In a given cluster, a total number of mountpaths would normally compute as a direct product of (number of storage targets) x (number of disks in each target).
+
+You can manage and monitor (i.e., `show`) disks and mountpaths using `ais storage` command.
+
+> For strictly monitoring purposes, you can universally use `ais show` command, e.g.: `ais show storage disk`, etc.
+
+## Show disks
+
+`ais storage disk show [TARGET_ID]`
+
+or, same:
+
+`ais show storage disk [TARGET_ID]`
+
 ## Show mountpaths
 
-`ais storage mountpath show [DAEMON_ID]`
+As the name implies, the syntax:
+
+`ais show storage mountpath [TARGET_ID]`
+
+for example:
+
+```console
+$ ais show storage mountpath t[TqPtghbiRw]
+
+TqPtghbiRw
+        Used Capacity (all disks): avg 15% max 18%
+                                                /ais/mp1/2 /dev/nvme0n1(xfs)
+                                                /ais/mp2/2 /dev/nvme1n1(xfs)
+                                                /ais/mp3/2 /dev/nvme2n1(xfs)
+                                                /ais/mp4/2 /dev/nvme3n1(xfs)
+```
+
+As always, `--help` will also list supported options. Note in particular the option to run continuously and periodically:
+
+```console
+$ ais show storage mountpath --help
+NAME:
+   ais show storage mountpath - show target mountpaths
+
+USAGE:
+   ais show storage mountpath [command options] [TARGET_ID]
+
+OPTIONS:
+   --refresh value  interval for continuous monitoring;
+                    valid time units: ns, us (or µs), ms, s (default), m, h
+   --count value    used together with '--refresh' to limit the number of generated reports (default: 0)
+   --json, -j       json input/output
+   --help, -h       show help
+```
 
 Show mountpaths for a given target or all targets.
 
-> Note: Like many other `ais show` commands, `ais show mountpath` is aliased to `ais storage mountpath show` for ease of use.
-> Both of these commands are used interchangeably throughout the documentation.
+> **Ease of Usage** notice: like all other `ais show` commands, `ais show storage mountpath` is an alias (or a shortcut) - in this specific case - for `ais storage mountpath show`.
 
-### Examples
+### Examples (_slightly outdated_)
 
 ```console
-$ ais storage mountpath show 12367t8085
+$ ais storage mountpath show 12356t8085
 247389t8085
         Available:
 			/tmp/ais/5/3
@@ -113,7 +220,7 @@ $ ais storage mountpath show 12367t8085
 			/tmp/ais/5/2
 
 $ ais storage mountpath show
-247389t8085
+12356t8085
         Available:
 			/tmp/ais/5/3
 			/tmp/ais/5/1
@@ -125,12 +232,12 @@ $ ais storage mountpath show
 			/tmp/ais/4/1
 			/tmp/ais/4/2
 426988t8086
-		No mountpaths
+	No mountpaths
 ```
 
 ## Attach mountpath
 
-`ais storage mountpath attach DAEMON_ID=MOUNTPATH [DAEMONID=MOUNTPATH...]`
+`ais storage mountpath attach TARGET_ID=MOUNTPATH [DAEMONID=MOUNTPATH...]`
 
 Attach a mountpath on a specified target to AIS storage.
 
@@ -142,7 +249,7 @@ $ ais storage mountpath attach 12367t8080=/data/dir
 
 ## Detach mountpath
 
-`ais storage mountpath detach DAEMON_ID=MOUNTPATH [DAEMONID=MOUNTPATH...]`
+`ais storage mountpath detach TARGET_ID=MOUNTPATH [DAEMONID=MOUNTPATH...]`
 
 Detach a mountpath on a specified target from AIS storage.
 

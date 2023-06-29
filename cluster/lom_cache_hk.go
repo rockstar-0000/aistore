@@ -1,14 +1,16 @@
 // Package cluster provides common interfaces and local access to cluster-level metadata
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cluster
 
 import (
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/cmn/atomic"
+	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 )
@@ -29,10 +31,11 @@ type lcHK struct {
 
 var lchk lcHK
 
-func initLomCacheHK(mm *memsys.MMSA, t Target) {
-	lchk.mm, lchk.t = mm, t
+func RegLomCacheWithHK(t Target) {
+	lchk.t = t
+	lchk.mm = t.PageMM()
 	lchk.running.Store(false)
-	hk.Reg("lom-cache.gc", lchk.housekeep, iniEvictAtime)
+	hk.Reg("lom-cache"+hk.NameSuffix, lchk.housekeep, iniEvictAtime)
 }
 
 func (lchk *lcHK) housekeep() (d time.Duration) {
@@ -40,7 +43,7 @@ func (lchk *lcHK) housekeep() (d time.Duration) {
 	d, tag = lchk.mp()
 	if !lchk.running.CAS(false, true) {
 		if tag != "" {
-			glog.Infof("running now: memory pressure %q, next sched %v", tag, d)
+			nlog.Infof("running now: memory pressure %q, next sched %v", tag, d)
 		}
 		return
 	}
@@ -49,14 +52,15 @@ func (lchk *lcHK) housekeep() (d time.Duration) {
 }
 
 func (lchk *lcHK) mp() (d time.Duration, tag string) {
-	switch p := lchk.mm.MemPressure(); p {
+	p := lchk.mm.Pressure()
+	switch p {
 	case memsys.OOM:
 		d = oomEvictAtime
 		tag = "OOM"
-	case memsys.MemPressureExtreme:
+	case memsys.PressureExtreme:
 		d = mpeEvictAtime
 		tag = "extreme"
-	case memsys.MemPressureHigh:
+	case memsys.PressureHigh:
 		d = mphEvictAtime
 		tag = "high"
 	default:
@@ -75,7 +79,7 @@ func (lchk *lcHK) evictAll(d time.Duration) {
 
 	// one cache at a time (TODO: throttle via mountpath.IsIdle())
 	for _, cache := range caches {
-		f := func(hkey, value interface{}) bool {
+		f := func(hkey, value any) bool {
 			md := value.(*lmeta)
 			mdTime := md.Atime
 			if mdTime < 0 {
@@ -88,12 +92,15 @@ func (lchk *lcHK) evictAll(d time.Duration) {
 			}
 			atimefs := md.atimefs & ^lomDirtyMask
 			if md.Atime > 0 && atimefs != uint64(md.Atime) {
-				lif := LIF{md.uname, md.bckID}
+				debug.Assert(cos.IsValidAtime(md.Atime), md.Atime)
+				lif := LIF{Uname: md.uname, BID: md.bckID}
 				lom, err := lif.LOM()
 				if err == nil {
+					lom.Lock(true)
 					lom.flushCold(md, atime)
+					lom.Unlock(true)
+					FreeLOM(lom)
 				}
-				FreeLOM(lom)
 			}
 			cache.Delete(hkey)
 			evictedCnt++
@@ -102,6 +109,6 @@ func (lchk *lcHK) evictAll(d time.Duration) {
 		cache.Range(f)
 	}
 	if _, tag := lchk.mp(); tag != "" {
-		glog.Infof("memory pressure %q, total %d, evicted %d", tag, totalCnt, evictedCnt)
+		nlog.Infof("memory pressure %q, total %d, evicted %d", tag, totalCnt, evictedCnt)
 	}
 }

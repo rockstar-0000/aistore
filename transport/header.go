@@ -1,15 +1,17 @@
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/xoshiro256"
@@ -18,12 +20,13 @@ import (
 // proto header
 const (
 	// flags
-	msgFlag  = uint64(1 << (63 - iota)) // message vs object demux
-	pduFlag                             // PDU
-	lastPDU                             // last PDU in a given obj/msg
-	firstPDU                            // first --/--
+	msgFl       = uint64(1 << (63 - iota)) // message vs object demux
+	pduFl                                  // is PDU
+	pduLastFl                              // is last PDU
+	pduStreamFl                            // PDU-based stream
 
-	allFlags = msgFlag | pduFlag | lastPDU | firstPDU // NOTE: update when adding flags
+	// NOTE: update when adding/changing flags :NOTE
+	allFlags = msgFl | pduFl | pduLastFl | pduStreamFl
 
 	// all 3 headers
 	sizeProtoHdr = cos.SizeofI64 * 2
@@ -34,12 +37,7 @@ const (
 ////////////////////////////////
 
 func insObjHeader(hbuf []byte, hdr *ObjHdr, usePDU bool) (off int) {
-	var flags uint64
-	if usePDU {
-		flags = firstPDU
-	} else {
-		debug.Assert(!hdr.IsUnsized())
-	}
+	debug.Assert(usePDU || !hdr.IsUnsized())
 	off = sizeProtoHdr
 	off = insString(off, hbuf, hdr.SID)
 	off = insUint16(off, hbuf, hdr.Opcode)
@@ -50,7 +48,10 @@ func insObjHeader(hbuf []byte, hdr *ObjHdr, usePDU bool) (off int) {
 	off = insString(off, hbuf, hdr.ObjName)
 	off = insBytes(off, hbuf, hdr.Opaque)
 	off = insAttrs(off, hbuf, &hdr.ObjAttrs)
-	word1 := uint64(off-sizeProtoHdr) | flags
+	word1 := uint64(off - sizeProtoHdr)
+	if usePDU {
+		word1 |= pduStreamFl
+	}
 	insUint64(0, hbuf, word1)
 	checksum := xoshiro256.Hash(word1)
 	insUint64(cos.SizeofI64, hbuf, checksum)
@@ -59,9 +60,10 @@ func insObjHeader(hbuf []byte, hdr *ObjHdr, usePDU bool) (off int) {
 
 func insMsg(hbuf []byte, msg *Msg) (off int) {
 	off = sizeProtoHdr
-	off = insInt64(off, hbuf, msg.Flags)
+	off = insString(off, hbuf, msg.SID)
+	off = insUint16(off, hbuf, msg.Opcode)
 	off = insBytes(off, hbuf, msg.Body)
-	word1 := uint64(off-sizeProtoHdr) | msgFlag
+	word1 := uint64(off-sizeProtoHdr) | msgFl
 	insUint64(0, hbuf, word1)
 	checksum := xoshiro256.Hash(word1)
 	insUint64(cos.SizeofI64, hbuf, checksum)
@@ -70,9 +72,9 @@ func insMsg(hbuf []byte, msg *Msg) (off int) {
 
 func (pdu *spdu) insHeader() {
 	buf, plen := pdu.buf, pdu.plength()
-	word1 := uint64(plen) | pduFlag
+	word1 := uint64(plen) | pduFl
 	if pdu.last {
-		word1 |= lastPDU
+		word1 |= pduLastFl
 	}
 	insUint64(0, buf, word1)
 	checksum := xoshiro256.Hash(word1)
@@ -86,7 +88,7 @@ func insString(off int, to []byte, str string) int {
 
 func insBytes(off int, to, b []byte) int {
 	l := len(b)
-	debug.Assert(l < 65536)
+	debug.Assert(l <= 65535, "the field is uint16")
 	binary.BigEndian.PutUint16(to[off:], uint16(l))
 	off += cos.SizeofI16
 	n := copy(to[off:], b)
@@ -95,7 +97,7 @@ func insBytes(off int, to, b []byte) int {
 }
 
 func insUint16(off int, to []byte, i int) int {
-	debug.Assert(i >= 0 && i < 32768)
+	debug.Assert(i >= 0 && i < math.MaxUint16)
 	binary.BigEndian.PutUint16(to[off:], uint16(i))
 	return off + cos.SizeofI16
 }
@@ -120,7 +122,8 @@ func insAttrs(off int, to []byte, attr *cmn.ObjAttrs) int {
 		off = insString(off, to, cksum.Val())
 	}
 	off = insString(off, to, attr.Ver)
-	for k, v := range attr.Custom() {
+	custom := attr.GetCustomMD()
+	for k, v := range custom {
 		debug.Assert(k != "")
 		off = insString(off, to, k)
 		off = insString(off, to, v)
@@ -163,7 +166,8 @@ func ExtObjHeader(body []byte, hlen int) (hdr ObjHdr) {
 
 func ExtMsg(body []byte, hlen int) (msg Msg) {
 	var off int
-	off, msg.Flags = extInt64(0, body)
+	off, msg.SID = extString(0, body)
+	off, msg.Opcode = extUint16(off, body)
 	off, msg.Body = extBytes(off, body)
 	debug.Assertf(off == hlen, "off %d, hlen %d", off, hlen)
 	return
@@ -211,7 +215,59 @@ func extAttrs(off int, from []byte) (n int, attr cmn.ObjAttrs) {
 			break
 		}
 		off, v = extString(off, from)
-		attr.SetCustom(k, v)
+		attr.SetCustomKey(k, v)
 	}
 	return off, attr
 }
+
+////////////////////
+// Obj and ObjHdr //
+////////////////////
+
+func (obj *Obj) IsHeaderOnly() bool { return obj.Hdr.IsHeaderOnly() }
+func (obj *Obj) IsUnsized() bool    { return obj.Hdr.IsUnsized() }
+
+func (obj *Obj) Size() int64 { return obj.Hdr.ObjSize() }
+
+func (obj *Obj) String() string {
+	s := fmt.Sprintf("sobj-%s", obj.Hdr.Cname())
+	if obj.IsHeaderOnly() {
+		return s
+	}
+	return fmt.Sprintf("%s(size=%d)", s, obj.Hdr.ObjAttrs.Size)
+}
+
+func (obj *Obj) SetPrc(n int) {
+	obj.prc = atomic.NewInt64(int64(n))
+}
+
+func (hdr *ObjHdr) Cname() string { return hdr.Bck.Cname(hdr.ObjName) } // see also: lom.Cname()
+
+func (hdr *ObjHdr) IsUnsized() bool    { return hdr.ObjAttrs.Size == SizeUnknown }
+func (hdr *ObjHdr) IsHeaderOnly() bool { return hdr.ObjAttrs.Size == 0 }
+func (hdr *ObjHdr) ObjSize() int64     { return hdr.ObjAttrs.Size }
+
+// reserved opcodes
+func (hdr *ObjHdr) isFin() bool      { return hdr.Opcode == opcFin }
+func (hdr *ObjHdr) isIdleTick() bool { return hdr.Opcode == opcIdleTick }
+
+////////////////////
+// Msg and MsgHdr //
+////////////////////
+
+func (*Msg) IsHeaderOnly() bool { return true }
+
+func (msg *Msg) String() string {
+	if msg.isFin() {
+		return "smsg-last"
+	}
+	if msg.isIdleTick() {
+		return "smsg-tick"
+	}
+	l := cos.Min(len(msg.Body), 16)
+	return fmt.Sprintf("smsg-[%s](len=%d)", msg.Body[:l], l)
+}
+
+// reserved opcodes
+func (msg *Msg) isFin() bool      { return msg.Opcode == opcFin }
+func (msg *Msg) isIdleTick() bool { return msg.Opcode == opcIdleTick }

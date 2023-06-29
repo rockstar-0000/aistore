@@ -1,34 +1,31 @@
 // Package test provides E2E tests of AIS CLI
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package test
 
 import (
-	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/devtools/tutils"
+	"github.com/NVIDIA/aistore/tools"
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/config"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 )
 
-var authnURL string
-
 func TestAuthE2E(t *testing.T) {
-	tutils.InitLocalCluster()
+	tools.InitLocalCluster()
 	cmd := exec.Command("which", "ais")
 	if err := cmd.Run(); err != nil {
-		t.Skip("'ais' binary not found")
+		t.Skipf("skipping %s: 'ais' binary not found", t.Name())
 	}
-	authnURL = os.Getenv("AUTHN_URL")
-	if authnURL == "" {
-		t.Skip("AuthN URL is undefined")
+	cluConfig := tools.GetClusterConfig(t)
+	if !cluConfig.Auth.Enabled {
+		t.Skipf("skipping %s: AuthN is not enabled", t.Name())
 	}
 
 	config.DefaultReporterConfig.SlowSpecThreshold = 15 * time.Second.Seconds()
@@ -40,7 +37,7 @@ var _ = Describe("E2E AuthN Tests", func() {
 	var (
 		entries []TableEntry
 
-		f        = &tutils.E2EFramework{}
+		f        = &tools.E2EFramework{}
 		files, _ = filepath.Glob("./*.in")
 	)
 

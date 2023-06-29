@@ -1,6 +1,6 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/tools"
 )
 
 func TestTimeoutGroupSmoke(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	wg := cos.NewTimeoutGroup()
 	wg.Add(1)
 	wg.Done()
@@ -22,7 +24,8 @@ func TestTimeoutGroupSmoke(t *testing.T) {
 	}
 }
 
-func TestTimeoutGroupWait(*testing.T) {
+func TestTimeoutGroupWait(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	wg := cos.NewTimeoutGroup()
 	wg.Add(2)
 	wg.Done()
@@ -31,6 +34,7 @@ func TestTimeoutGroupWait(*testing.T) {
 }
 
 func TestTimeoutGroupGoroutines(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	wg := cos.NewTimeoutGroup()
 
 	for i := 0; i < 100000; i++ {
@@ -47,6 +51,7 @@ func TestTimeoutGroupGoroutines(t *testing.T) {
 }
 
 func TestTimeoutGroupTimeout(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	wg := cos.NewTimeoutGroup()
 	wg.Add(1)
 
@@ -65,6 +70,7 @@ func TestTimeoutGroupTimeout(t *testing.T) {
 }
 
 func TestTimeoutGroupStop(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	wg := cos.NewTimeoutGroup()
 	wg.Add(1)
 
@@ -95,6 +101,7 @@ func TestTimeoutGroupStop(t *testing.T) {
 }
 
 func TestTimeoutGroupStopAndTimeout(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	wg := cos.NewTimeoutGroup()
 	wg.Add(1)
 
@@ -119,6 +126,7 @@ func TestTimeoutGroupStopAndTimeout(t *testing.T) {
 }
 
 func TestSemaphore(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	sema := cos.NewSemaphore(2)
 	sema.Acquire()
 	sema.Acquire()
@@ -140,6 +148,7 @@ func TestSemaphore(t *testing.T) {
 }
 
 func TestDynSemaphore(t *testing.T) {
+	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	limit := 10
 
 	sema := cos.NewDynSemaphore(limit)

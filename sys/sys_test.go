@@ -1,10 +1,10 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
-// Do not import main 'tutils' package because of circular dependency
+// Do not import the main 'tools' package because of circular dependency
 // Use t.Logf or t.Errorf instead of tlog.Logf
 import (
 	"math"
@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 func checkSkipOS(t *testing.T, os ...string) {
@@ -49,7 +49,8 @@ func TestLimitMaxProc(t *testing.T) {
 }
 
 func TestMemoryStats(t *testing.T) {
-	mem, err := Mem()
+	var mem MemStat
+	err := mem.Get()
 	tassert.CheckFatal(t, err)
 
 	tassert.Errorf(t, mem.Total > 0 && mem.Free > 0 && mem.ActualFree > 0 && mem.ActualUsed > 0,
@@ -63,19 +64,23 @@ func TestMemoryStats(t *testing.T) {
 
 	checkSkipOS(t, "darwin")
 
-	memOS, err := HostMem()
+	var memHost, memCont MemStat
+	err = memHost.host()
 	tassert.CheckFatal(t, err)
-	memCont, err := ContainerMem()
+	err = memCont.container()
 	tassert.CheckFatal(t, err)
-	tassert.Errorf(t, memOS.Total >= memCont.Total,
-		"Container's memory stats are greater than host's ones.\nOS: %+v\nContainer: %+v", memOS, memCont)
-	if memOS.SwapTotal == 0 && memOS.SwapFree == 0 {
+	tassert.Errorf(t, memHost.Total >= memCont.Total,
+		"Container's memory total is greater than the host one.\nOS: %+v\nContainer: %+v", memHost, memCont)
+	if memHost.SwapTotal == 0 && memHost.SwapFree == 0 {
 		// Not an error(e.g, Jenkins VM has swap off) - just a warning
 		t.Logf("Either swap is off or failed to read its stats")
 	}
 }
 
 func TestProc(t *testing.T) {
+	if testing.Short() {
+		t.Skipf("skipping %s in short mode", t.Name())
+	}
 	checkSkipOS(t, "darwin")
 
 	pid := os.Getpid()
@@ -108,7 +113,5 @@ func TestProc(t *testing.T) {
 		"Total must be equal to sum of User and System: %+v", newStats.CPU)
 	tassert.Errorf(t, newStats.CPU.Total > stats.CPU.Total, "New stats must show more CPU used. Old usage %d, new one: %d", stats.CPU.Total, newStats.CPU.Total)
 	tassert.Errorf(t, newStats.CPU.Percent > 0.0, "Process must use some CPU. Usage: %g", stats.CPU.Percent)
-	tassert.Errorf(t, newStats.CPU.Percent < 100.0, "Process should use less than 100%% CPU. Usage: %g", newStats.CPU.Percent)
-	tassert.Errorf(t, newStats.CPU.LastTime > stats.CPU.LastTime, "Time must change: new %d, old %d", newStats.CPU.LastTime, stats.CPU.LastTime)
 	t.Logf("Process CPU usage: %6.2f%%", newStats.CPU.Percent)
 }

@@ -1,6 +1,6 @@
 // Package test provides tests for command-line mounting utility for aisfs.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package test
 
@@ -13,9 +13,10 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tutils"
+	"github.com/NVIDIA/aistore/tools"
+	"github.com/NVIDIA/aistore/tools/trand"
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/config"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -23,7 +24,7 @@ import (
 )
 
 func TestE2E(t *testing.T) {
-	tutils.InitLocalCluster()
+	tools.InitLocalCluster()
 	cmd := exec.Command("which", "aisfs")
 	if err := cmd.Run(); err != nil {
 		t.Skip("'aisfs' binary not found")
@@ -36,12 +37,12 @@ func TestE2E(t *testing.T) {
 
 	config.DefaultReporterConfig.SlowSpecThreshold = 10 * time.Second.Seconds()
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "E2E")
+	RunSpecs(t, t.Name())
 }
 
 var _ = Describe("E2E FUSE Tests", func() {
 	var (
-		f          *tutils.E2EFramework
+		f          *tools.E2EFramework
 		fuseDir    string
 		bck        cmn.Bck
 		entries    []TableEntry
@@ -58,11 +59,11 @@ var _ = Describe("E2E FUSE Tests", func() {
 	BeforeEach(func() {
 		var err error
 
-		proxyURL := tutils.GetPrimaryURL()
-		baseParams = tutils.BaseAPIParams(proxyURL)
+		proxyURL := tools.GetPrimaryURL()
+		baseParams = tools.BaseAPIParams(proxyURL)
 		bck = cmn.Bck{
-			Name:     cos.RandString(10),
-			Provider: cmn.ProviderAIS,
+			Name:     trand.String(10),
+			Provider: apc.AIS,
 		}
 		fuseDir, err = os.MkdirTemp("/tmp", "")
 		Expect(err).NotTo(HaveOccurred())
@@ -88,7 +89,7 @@ var _ = Describe("E2E FUSE Tests", func() {
 		}
 		Expect(err).NotTo(HaveOccurred(), "'aisfs' is not running after being started")
 
-		f = &tutils.E2EFramework{Dir: fuseDir}
+		f = &tools.E2EFramework{Dir: fuseDir}
 	})
 
 	AfterEach(func() {
@@ -96,7 +97,7 @@ var _ = Describe("E2E FUSE Tests", func() {
 		exec.Command("fusermount", "-u", fuseDir).Run()
 		os.RemoveAll(fuseDir)
 
-		exists, err := api.DoesBucketExist(baseParams, cmn.QueryBcks(bck))
+		exists, err := api.QueryBuckets(baseParams, cmn.QueryBcks(bck), 0 /*fltPresence*/)
 		Expect(err).NotTo(HaveOccurred())
 		if exists {
 			err = api.DestroyBucket(baseParams, bck)

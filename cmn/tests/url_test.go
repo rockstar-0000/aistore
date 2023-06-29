@@ -1,6 +1,6 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
@@ -10,9 +10,10 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 func TestParseURLScheme(t *testing.T) {
@@ -23,7 +24,7 @@ func TestParseURLScheme(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		scheme, address := cos.ParseURLScheme(tc.url)
+		scheme, address := cmn.ParseURLScheme(tc.url)
 		tassert.Errorf(t, scheme == tc.expectedScheme, "expected scheme %s, got %s", tc.expectedScheme, scheme)
 		tassert.Errorf(t, address == tc.expectedAddress, "expected address %s, got %s", tc.expectedAddress, address)
 	}
@@ -39,7 +40,7 @@ func TestReparseQuery(t *testing.T) {
 	r := &http.Request{
 		Method: http.MethodGet,
 		URL: &url.URL{
-			Path: fmt.Sprintf("%s?%s=%s", basePath, cmn.URLParamUUID, uuid),
+			Path: fmt.Sprintf("%s?%s=%s", basePath, apc.QparamUUID, uuid),
 		},
 	}
 	q := url.Values{}
@@ -47,8 +48,8 @@ func TestReparseQuery(t *testing.T) {
 	r.URL.RawQuery = q.Encode()
 
 	cos.ReparseQuery(r)
-	actualVersionID, actualUUID := r.URL.Query().Get("versionID"), r.URL.Query().Get(cmn.URLParamUUID)
+	actualVersionID, actualUUID := r.URL.Query().Get("versionID"), r.URL.Query().Get(apc.QparamUUID)
 	tassert.Errorf(t, actualVersionID == versionID, "expected versionID to be %q, got %q", versionID, actualVersionID)
-	tassert.Errorf(t, actualUUID == uuid, "expected %s to be %q, got %q", cmn.URLParamUUID, uuid, actualUUID)
+	tassert.Errorf(t, actualUUID == uuid, "expected %s to be %q, got %q", apc.QparamUUID, uuid, actualUUID)
 	tassert.Errorf(t, r.URL.Path == basePath, "expected path to be %q, got %q", basePath, r.URL.Path)
 }

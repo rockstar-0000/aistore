@@ -1,6 +1,6 @@
 // Package main
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -80,7 +80,7 @@ var (
 	delList  [][]int
 )
 
-//=================sync.Map===================
+// =================sync.Map===================
 func newSyncMap() *syncMap {
 	return &syncMap{}
 }
@@ -105,7 +105,7 @@ func (*syncMap) mapType() string {
 	return "Sync.Map"
 }
 
-//=================Regular Map===================
+// =================Regular Map===================
 func newRegMap() *regMap {
 	return &regMap{make(map[int]int), sync.RWMutex{}}
 }

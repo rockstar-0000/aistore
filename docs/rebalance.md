@@ -96,12 +96,12 @@ DaemonID     RebID   ObjRcv  SizeRcv  ObjSent  SizeSent  StartTime       EndTime
 911875t8085  1       0       0B       1020     1.22MiB   04-28 16:05:35  04-28 16:05:53  false
 ```
 
-4. Since global rebalance is an [extended action (xaction)](/xaction/README.md), it can be also monitored via generic `show xaction` API:
+4. Since global rebalance is an [extended action (xaction)](/xact/README.md), it can be also monitored via generic `show xaction` API:
 
 ```console
 $ ais show job xaction rebalance
-NODE             ID      KIND            BUCKET  OBJECTS         BYTES           START           END     ABORTED
-181883t8089      g2      rebalance       -       1058            1.27MiB         04-28 16:10:14  -       false
+NODE             ID      KIND            BUCKET  OBJECTS         BYTES           START           END     STATE
+181883t8089      g2      rebalance       -       1058            1.27MiB         04-28 16:10:14  -       Running
 ...
 ```
 
@@ -109,7 +109,7 @@ NODE             ID      KIND            BUCKET  OBJECTS         BYTES          
 
 
 ```console
-$ ais job start rebalance
+$ ais start rebalance
 ```
 
 ## Automated Resilvering
@@ -135,10 +135,10 @@ Examples:
 
 ```console
 $ ais advanced resilver # all targets will be resilvered
-Started resilver "NGxmOthtE", use 'ais show job xaction NGxmOthtE' to monitor progress
+Started resilver "NGxmOthtE", use 'ais show job xaction NGxmOthtE' to monitor the progress
 
 $ ais advanced resilver BUQOt8086  # resilver a single node
-Started resilver "NGxmOthtE", use 'ais show job xaction NGxmOthtE' to monitor progress
+Started resilver "NGxmOthtE", use 'ais show job xaction NGxmOthtE' to monitor the progress
 ```
 
 Automated resilvering can also be disabled. Just like with `rebalance`, the resulting config can be viewed through the CLI:

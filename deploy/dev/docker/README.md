@@ -15,7 +15,7 @@ If you don't have Docker and Docker-Compose installed, please see [Getting start
 1. To quick-start AIStore, run:
 
     ```console
-    $ ./deploy_docker -qs
+    $ ./deploy_docker.sh -qs
     ```
 
     > The first build may take some time, but subsequent builds will be much faster.
@@ -23,10 +23,9 @@ If you don't have Docker and Docker-Compose installed, please see [Getting start
 2. Once it finishes building, you should be inside the AIS container. Run:
 
     ```console
-    $ make deploy
+    $ make deploy cli
+    root@0459b601dcc7$ ais show cluster
     ```
-
-Type `1` for all options to create a very basic AIStore cluster.
 
 ### Quick-start Example
 
@@ -65,7 +64,7 @@ Use the `./stop_docker.sh` script to stop the AIStore cluster(s) that were deplo
 
 > Install Docker and Docker-Compose prior to deploying a cluster. For setting up Docker services please read [Getting started with Docker.](/docs/docker_main.md)
 
-[`$GOPATH`](https://golang.org/doc/code.html#GOPATH) environment variable must be defined before starting cluster deployment. Docker uses the `$GOPATH/src` directory as a bind mount for the container. The container at start builds new binaries from the current sources.
+[`$GOPATH`](https://go.dev/doc/gopath_code#GOPATH) environment variable must be defined before starting cluster deployment. Docker uses the `$GOPATH/src` directory as a bind mount for the container. The container at start builds new binaries from the current sources.
 
 For the *i*th cluster, AIStore creates three networks: ais${i}\_public, ais${i}\_internal\_control, and ais${i}\_internal\_data. The latter two are used only if the cluster is deployed with multiple networks (`-m` argument must be passed to the deploy script). It is expected that only AIStore cluster *i* is attached to each these networks. In a multi-cluster configuration, proxy containers of one cluster are connected to the Docker public networks of other clusters to allow for multi-tiering and replication.  In multi-cluster configuration, target containers of one cluster are connected to the Docker public and replication networks of other clusters to allow for multi-tiering and replication.
 

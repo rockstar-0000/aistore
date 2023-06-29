@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -8,132 +8,145 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/downloader"
+	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/nl"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact/xreg"
 	jsoniter "github.com/json-iterator/go"
 )
 
-// NOTE: This request is internal so we can have asserts there.
 // [METHOD] /v1/download
-func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
+func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	var (
-		response   interface{}
+		response   any
 		respErr    error
 		statusCode int
 	)
 	if !t.ensureIntraControl(w, r, false /* from primary */) {
 		return
 	}
-	rns := xreg.RenewDownloader(t, t.statsT)
-	if rns.Err != nil {
-		t.writeErr(w, r, rns.Err, http.StatusInternalServerError)
-		return
-	}
-	xact := rns.Entry.Get()
-	downloaderXact := xact.(*downloader.Downloader)
+
 	switch r.Method {
 	case http.MethodPost:
-		if _, err := t.checkRESTItems(w, r, 0, false, cmn.URLPathDownload.L); err != nil {
+		if _, err := t.parseURL(w, r, 0, false, apc.URLPathDownload.L); err != nil {
 			return
 		}
 		var (
-			uuid             = r.URL.Query().Get(cmn.URLParamUUID)
-			dlb              = downloader.DlBody{}
-			progressInterval = downloader.DownloadProgressInterval
+			query            = r.URL.Query()
+			xid              = query.Get(apc.QparamUUID)
+			jobID            = query.Get(apc.QparamJobID)
+			dlb              = dload.Body{}
+			progressInterval = dload.DownloadProgressInterval
 		)
-		if uuid == "" {
-			debug.Assert(false)
-			t.writeErrMsg(w, r, "missing UUID in query")
-			return
-		}
+		debug.Assertf(cos.IsValidUUID(xid) && cos.IsValidUUID(jobID), "%q, %q", xid, jobID)
 		if err := cmn.ReadJSON(w, r, &dlb); err != nil {
 			return
 		}
 
-		dlBodyBase := downloader.DlBase{}
+		dlBodyBase := dload.Base{}
 		if err := jsoniter.Unmarshal(dlb.RawMessage, &dlBodyBase); err != nil {
-			err = fmt.Errorf(cmn.FmtErrUnmarshal, t.si, "download message", cmn.BytesHead(dlb.RawMessage), err)
+			err = fmt.Errorf(cmn.FmtErrUnmarshal, t, "download message", cos.BHead(dlb.RawMessage), err)
 			t.writeErr(w, r, err)
 			return
 		}
 
 		if dlBodyBase.ProgressInterval != "" {
-			if dur, err := time.ParseDuration(dlBodyBase.ProgressInterval); err == nil {
-				progressInterval = dur
-			} else {
-				t.writeErrf(w, r, "%s: invalid progress interval %q, err: %v",
-					t.si, dlBodyBase.ProgressInterval, err)
+			dur, err := time.ParseDuration(dlBodyBase.ProgressInterval)
+			if err != nil {
+				t.writeErrf(w, r, "%s: invalid progress interval %q: %v", t, dlBodyBase.ProgressInterval, err)
 				return
 			}
+			progressInterval = dur
 		}
 
-		bck := cluster.NewBckEmbed(dlBodyBase.Bck)
+		bck := meta.CloneBck(&dlBodyBase.Bck)
 		if err := bck.Init(t.Bowner()); err != nil {
 			t.writeErr(w, r, err)
 			return
 		}
-		dlJob, err := downloader.ParseStartDownloadRequest(t, bck, uuid, dlb, downloaderXact)
+
+		xdl, err := t.renewdl(xid)
+		if err != nil {
+			t.writeErr(w, r, err, http.StatusInternalServerError)
+			return
+		}
+		dljob, err := dload.ParseStartRequest(t, bck, jobID, dlb, xdl)
 		if err != nil {
 			t.writeErr(w, r, err)
 			return
 		}
-		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Infof("Downloading: %s", dlJob.ID())
+		if cmn.FastV(4, cos.SmoduleAIS) {
+			nlog.Infoln("Downloading: " + dljob.ID())
 		}
 
-		dlJob.AddNotif(&downloader.NotifDownload{
-			NotifBase: nl.NotifBase{
+		dljob.AddNotif(&dload.NotifDownload{
+			Base: nl.Base{
 				When:     cluster.UponProgress,
 				Interval: progressInterval,
 				Dsts:     []string{equalIC},
-				F:        t.callerNotifyFin,
-				P:        t.callerNotifyProgress,
+				F:        t.notifyTerm,
+				P:        t.notifyProgress,
 			},
-		}, dlJob)
-		response, statusCode, respErr = downloaderXact.Download(dlJob)
+		}, dljob)
+		response, statusCode, respErr = xdl.Download(dljob)
+
 	case http.MethodGet:
-		if _, err := t.checkRESTItems(w, r, 0, false, cmn.URLPathDownload.L); err != nil {
+		if _, err := t.parseURL(w, r, 0, false, apc.URLPathDownload.L); err != nil {
 			return
 		}
-		payload := &downloader.DlAdminBody{}
-		if err := cmn.ReadJSON(w, r, payload); err != nil {
+		msg := &dload.AdminBody{}
+		if err := cmn.ReadJSON(w, r, msg); err != nil {
 			return
 		}
-		if err := payload.Validate(false /*requireID*/); err != nil {
+		if err := msg.Validate(false /*requireID*/); err != nil {
 			debug.Assert(false)
 			t.writeErr(w, r, err)
 			return
 		}
-		if payload.ID != "" {
-			response, statusCode, respErr =
-				downloaderXact.JobStatus(payload.ID, payload.OnlyActiveTasks)
+
+		if msg.ID != "" {
+			xid := r.URL.Query().Get(apc.QparamUUID)
+			debug.Assert(cos.IsValidUUID(xid))
+			xdl, err := t.renewdl(xid)
+			if err != nil {
+				t.writeErr(w, r, err, http.StatusInternalServerError)
+				return
+			}
+			response, statusCode, respErr = xdl.JobStatus(msg.ID, msg.OnlyActive)
 		} else {
-			var (
-				regex *regexp.Regexp
-				err   error
-			)
-			if payload.Regex != "" {
-				if regex, err = regexp.CompilePOSIX(payload.Regex); err != nil {
+			var regex *regexp.Regexp
+			if msg.Regex != "" {
+				rgx, err := regexp.CompilePOSIX(msg.Regex)
+				if err != nil {
 					t.writeErr(w, r, err)
 					return
 				}
+				regex = rgx
 			}
-			response, statusCode, respErr = downloaderXact.ListJobs(regex)
+			response, statusCode, respErr = dload.ListJobs(regex, msg.OnlyActive)
 		}
+
 	case http.MethodDelete:
-		items, err := t.checkRESTItems(w, r, 1, false, cmn.URLPathDownload.L)
+		items, err := t.parseURL(w, r, 1, false, apc.URLPathDownload.L)
 		if err != nil {
 			return
 		}
-		payload := &downloader.DlAdminBody{}
+		actdelete := items[0]
+		if actdelete != apc.Abort && actdelete != apc.Remove {
+			t.writeErrAct(w, r, actdelete)
+			return
+		}
+
+		payload := &dload.AdminBody{}
 		if err = cmn.ReadJSON(w, r, payload); err != nil {
 			return
 		}
@@ -143,14 +156,17 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		switch items[0] {
-		case cmn.Abort:
-			response, statusCode, respErr = downloaderXact.AbortJob(payload.ID)
-		case cmn.Remove:
-			response, statusCode, respErr = downloaderXact.RemoveJob(payload.ID)
-		default:
-			t.writeErrAct(w, r, items[0])
+		xid := r.URL.Query().Get(apc.QparamUUID)
+		debug.Assertf(cos.IsValidUUID(xid), "%q", xid)
+		xdl, err := t.renewdl(xid)
+		if err != nil {
+			t.writeErr(w, r, err, http.StatusInternalServerError)
 			return
+		}
+		if actdelete == apc.Abort {
+			response, statusCode, respErr = xdl.AbortJob(payload.ID)
+		} else { // apc.Remove
+			response, statusCode, respErr = xdl.RemoveJob(payload.ID)
 		}
 	default:
 		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost)
@@ -161,11 +177,19 @@ func (t *targetrunner) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		t.writeErr(w, r, respErr, statusCode)
 		return
 	}
-
 	if response != nil {
 		b := cos.MustMarshal(response)
-		if _, err := w.Write(b); err != nil {
-			glog.Errorf("Failed to write to HTTP response, err: %v", err)
-		}
+		w.Header().Set(cos.HdrContentType, cos.ContentJSON)
+		w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(b)))
+		w.Write(b)
 	}
+}
+
+func (t *target) renewdl(xid string) (*dload.Xact, error) {
+	rns := xreg.RenewDownloader(t, t.statsT, xid)
+	if rns.Err != nil {
+		return nil, rns.Err
+	}
+	xctn := rns.Entry.Get()
+	return xctn.(*dload.Xact), nil
 }

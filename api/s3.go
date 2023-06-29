@@ -1,6 +1,6 @@
 // Package api provides AIStore API over HTTP(S)
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -9,29 +9,33 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 )
 
 // s3/<bucket-name>/<object-name>
-func GetObjectS3(baseParams BaseParams, bck cmn.Bck, objectName string, options ...GetObjectInput) (n int64, err error) {
+func GetObjectS3(bp BaseParams, bck cmn.Bck, objectName string, args ...GetArgs) (int64, error) {
 	var (
-		w   = io.Discard
 		q   url.Values
 		hdr http.Header
+		w   = io.Discard
 	)
-	if len(options) != 0 {
-		w, q, hdr = getObjectOptParams(options[0])
+	if len(args) != 0 {
+		w, q, hdr = args[0].ret()
 	}
-	q = cmn.AddBckToQuery(q, bck)
-	baseParams.Method = http.MethodGet
-	resp, err := doHTTPRequestGetResp(ReqParams{
-		BaseParams: baseParams,
-		Path:       cmn.URLPathS3.Join(bck.Name, objectName),
-		Query:      q,
-		Header:     hdr,
-	}, w)
+	q = bck.AddToQuery(q)
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathS3.Join(bck.Name, objectName)
+		reqParams.Query = q
+		reqParams.Header = hdr
+	}
+	wresp, err := reqParams.doWriter(w)
+	FreeRp(reqParams)
 	if err != nil {
 		return 0, err
 	}
-	return resp.n, nil
+	return wresp.n, nil
 }

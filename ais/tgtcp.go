@@ -1,13 +1,12 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,58 +14,39 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/ais/backend"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/dsort"
+	"github.com/NVIDIA/aistore/cmn/fname"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/ec"
+	"github.com/NVIDIA/aistore/ext/dsort"
+	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
+	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/sys"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 	jsoniter "github.com/json-iterator/go"
 )
 
-func (t *targetrunner) initHostIP() {
-	var hostIP string
-	if hostIP = os.Getenv("AIS_HOST_IP"); hostIP == "" {
-		return
-	}
-	var (
-		config  = cmn.GCO.Get()
-		port    = config.HostNet.Port
-		extAddr = net.ParseIP(hostIP)
-		extPort = port
-	)
-	if portStr := os.Getenv("AIS_HOST_PORT"); portStr != "" {
-		portNum, err := cmn.ParsePort(portStr)
-		cos.AssertNoErr(err)
-		extPort = portNum
-	}
-	t.si.PublicNet.NodeHostname = extAddr.String()
-	t.si.PublicNet.DaemonPort = strconv.Itoa(extPort)
-	t.si.PublicNet.DirectURL = fmt.Sprintf("%s://%s:%d", config.Net.HTTP.Proto, extAddr.String(), extPort)
-	glog.Infof("AIS_HOST_IP=%s; PubNetwork=%s", hostIP, t.si.URL(cmn.NetworkPublic))
+const (
+	bmdFixup = "fixup"
+	bmdRecv  = "receive"
+	bmdReg   = "register"
+)
 
-	// applies to intra-cluster networks unless separately defined
-	if !config.HostNet.UseIntraControl {
-		t.si.IntraControlNet = t.si.PublicNet
-	}
-	if !config.HostNet.UseIntraData {
-		t.si.IntraDataNet = t.si.PublicNet
-	}
-}
-
-func (t *targetrunner) joinCluster(_ ...string) (status int, err error) {
-	res := t.join(nil)
-	defer _freeCallRes(res)
+func (t *target) joinCluster(action string, primaryURLs ...string) (status int, err error) {
+	res := t.join(nil, t, primaryURLs...)
+	defer freeCR(res)
 	if res.err != nil {
 		status, err = res.status, res.err
 		return
@@ -75,30 +55,31 @@ func (t *targetrunner) joinCluster(_ ...string) (status int, err error) {
 	if len(res.bytes) == 0 {
 		return
 	}
-	err = t.applyRegMeta(res.bytes, "")
+	err = t.recvCluMetaBytes(action, res.bytes, "")
 	return
 }
 
-func (t *targetrunner) applyRegMeta(body []byte, caller string) (err error) {
-	var regMeta cluMeta
-	err = jsoniter.Unmarshal(body, &regMeta)
-	if err != nil {
-		err = fmt.Errorf(cmn.FmtErrUnmarshal, t.si, "reg-meta", cmn.BytesHead(body), err)
-		return
+// TODO: unify w/ p.recvCluMeta
+// do not receive RMD: `receiveRMD` runs extra jobs and checks specific for metasync.
+func (t *target) recvCluMetaBytes(action string, body []byte, caller string) error {
+	var (
+		cm   cluMeta
+		errs []error
+	)
+	if err := jsoniter.Unmarshal(body, &cm); err != nil {
+		return fmt.Errorf(cmn.FmtErrUnmarshal, t, "clumeta", cos.BHead(body), err)
 	}
-	msg := t.newAmsgStr(cmn.ActRegTarget, regMeta.BMD)
+	msg := t.newAmsgStr(action, cm.BMD)
 
 	// Config
-	debug.Assert(regMeta.Config != nil)
-	if err = t.receiveConfig(regMeta.Config, msg, nil, caller); err != nil {
-		if isErrDowngrade(err) {
-			err = nil
-		} else {
-			glog.Error(err)
+	debug.Assert(cm.Config != nil)
+	if err := t.receiveConfig(cm.Config, msg, nil, caller); err != nil {
+		if !isErrDowngrade(err) {
+			errs = append(errs, err)
+			nlog.Errorln(err)
 		}
-		// Received outdated/invalid config in regMeta, ignore by setting to `nil`.
-		regMeta.Config = nil
-		// fall through
+	} else {
+		nlog.Infof("%s: recv-clumeta %s %s", t, action, cm.Config)
 	}
 
 	// There's a window of time between:
@@ -106,32 +87,40 @@ func (t *targetrunner) applyRegMeta(body []byte, caller string) (err error) {
 	// The latter is driven by regMetasync (see regMetasync.go) distributing updated cluster map.
 	// To handle incoming GETs within this window (which would typically take a few seconds or less)
 	// we need to have the current cluster-wide regMetadata and the temporary gfn state:
-	t.gfn.global.activateTimed()
+	reb.OnTimedGFN()
 
 	// BMD
-	if err = t.receiveBMD(regMeta.BMD, msg, nil /*ms payload */, bucketMDRegister, caller, true /*silent*/); err != nil {
-		if isErrDowngrade(err) {
-			err = nil
-		} else {
-			glog.Error(err)
-		}
-	}
-	// Smap
-	if err = t.receiveSmap(regMeta.Smap, msg, nil /*ms payload*/, caller, nil); err != nil {
-		if isErrDowngrade(err) {
-			err = nil
-		} else {
-			glog.Errorf(cmn.FmtErrFailed, t.si, "sync", regMeta.Smap, err)
+	if err := t.receiveBMD(cm.BMD, msg, nil /*ms payload */, bmdReg, caller, true /*silent*/); err != nil {
+		if !isErrDowngrade(err) {
+			errs = append(errs, err)
+			nlog.Errorln(err)
 		}
 	} else {
-		glog.Infof("%s: synch %s", t.si, t.owner.smap.get())
+		nlog.Infof("%s: recv-clumeta %s %s", t, action, cm.BMD)
 	}
-	return
-	// Do not receive RMD: `receiveRMD` runs extra jobs and checks specific for metasync.
+	// Smap
+	if err := t.receiveSmap(cm.Smap, msg, nil /*ms payload*/, caller, t.htrun.smapUpdatedCB); err != nil {
+		if !isErrDowngrade(err) {
+			errs = append(errs, err)
+			nlog.Errorln(cmn.NewErrFailedTo(t, "sync", cm.Smap, err))
+		}
+	} else if cm.Smap != nil {
+		nlog.Infof("%s: recv-clumeta %s %s", t, action, cm.Smap)
+	}
+
+	switch {
+	case errs == nil:
+		return nil
+	case len(errs) == 1:
+		return errs[0]
+	default:
+		s := fmt.Sprintf("%v", errs)
+		return cmn.NewErrFailedTo(t, action, "clumeta", errors.New(s))
+	}
 }
 
 // [METHOD] /v1/daemon
-func (t *targetrunner) daemonHandler(w http.ResponseWriter, r *http.Request) {
+func (t *target) daemonHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		t.httpdaeget(w, r)
@@ -146,8 +135,8 @@ func (t *targetrunner) daemonHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *targetrunner) httpdaeput(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.checkRESTItems(w, r, 0, true, cmn.URLPathDaemon.L)
+func (t *target) httpdaeput(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathDae.L)
 	if err != nil {
 		return
 	}
@@ -158,50 +147,86 @@ func (t *targetrunner) httpdaeput(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *targetrunner) daeputJSON(w http.ResponseWriter, r *http.Request) {
-	var msg cmn.ActionMsg
-	if cmn.ReadJSON(w, r, &msg) != nil {
+func (t *target) daeputJSON(w http.ResponseWriter, r *http.Request) {
+	msg, err := t.readActionMsg(w, r)
+	if err != nil {
 		return
 	}
 	switch msg.Action {
-	case cmn.ActSetConfig: // setconfig #2 - via action message
-		t.setDaemonConfigMsg(w, r, &msg)
-	case cmn.ActResetConfig:
+	case apc.ActSetConfig: // set-config #2 - via action message
+		t.setDaemonConfigMsg(w, r, msg, r.URL.Query())
+	case apc.ActResetConfig:
 		if err := t.owner.config.resetDaemonConfig(); err != nil {
 			t.writeErr(w, r, err)
 		}
-	case cmn.ActShutdown, cmn.ActDecommission:
+	case apc.ActResetStats:
+		errorsOnly := msg.Value.(bool)
+		t.statsT.ResetStats(errorsOnly)
+
+	case apc.ActStartMaintenance:
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
 			return
 		}
-		t.unreg(msg.Action, msg.Action == cmn.ActDecommission /* clean data */)
+		t.termKaliveX(msg.Action)
+	case apc.ActShutdownCluster, apc.ActShutdownNode:
+		if !t.ensureIntraControl(w, r, true /* from primary */) {
+			return
+		}
+		t.termKaliveX(msg.Action)
+		t.shutdown(msg.Action)
+	case apc.ActRmNodeUnsafe:
+		if !t.ensureIntraControl(w, r, true /* from primary */) {
+			return
+		}
+		t.termKaliveX(msg.Action)
+	case apc.ActDecommissionCluster, apc.ActDecommissionNode:
+		if !t.ensureIntraControl(w, r, true /* from primary */) {
+			return
+		}
+		var opts apc.ActValRmNode
+		if err := cos.MorphMarshal(msg.Value, &opts); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		t.termKaliveX(msg.Action)
+		t.decommission(msg.Action, &opts)
+	case apc.ActCleanupMarkers:
+		if !t.ensureIntraControl(w, r, true /* from primary */) {
+			return
+		}
+		var ctx cleanmark
+		if err := cos.MorphMarshal(msg.Value, &ctx); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		t.cleanupMark(&ctx)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
 }
 
-func (t *targetrunner) daeputQuery(w http.ResponseWriter, r *http.Request, apiItems []string) {
+func (t *target) daeputQuery(w http.ResponseWriter, r *http.Request, apiItems []string) {
 	switch apiItems[0] {
-	case cmn.Proxy:
+	case apc.Proxy:
 		// PUT /v1/daemon/proxy/newprimaryproxyid
 		t.daeSetPrimary(w, r, apiItems)
-	case cmn.SyncSmap:
+	case apc.SyncSmap:
 		newsmap := &smapX{}
 		if cmn.ReadJSON(w, r, newsmap) != nil {
 			return
 		}
-		if err := t.owner.smap.synchronize(t.si, newsmap, nil /*ms payload*/); err != nil {
-			t.writeErrf(w, r, cmn.FmtErrFailed, t.si, "sync", newsmap, err)
+		if err := t.owner.smap.synchronize(t.si, newsmap, nil /*ms payload*/, t.htrun.smapUpdatedCB); err != nil {
+			t.writeErr(w, r, cmn.NewErrFailedTo(t, "synchronize", newsmap, err))
 		}
-		glog.Infof("%s: %s %s done", t.si, cmn.SyncSmap, newsmap)
-	case cmn.Mountpaths:
+		nlog.Infof("%s: %s %s done", t, apc.SyncSmap, newsmap)
+	case apc.Mountpaths:
 		t.handleMountpathReq(w, r)
-	case cmn.ActSetConfig: // setconfig #1 - via query parameters and "?n1=v1&n2=v2..."
+	case apc.ActSetConfig: // set-config #1 - via query parameters and "?n1=v1&n2=v2..."
 		t.setDaemonConfigQuery(w, r)
 	}
 }
 
-func (t *targetrunner) daeSetPrimary(w http.ResponseWriter, r *http.Request, apiItems []string) {
+func (t *target) daeSetPrimary(w http.ResponseWriter, r *http.Request, apiItems []string) {
 	var (
 		err     error
 		prepare bool
@@ -213,15 +238,15 @@ func (t *targetrunner) daeSetPrimary(w http.ResponseWriter, r *http.Request, api
 
 	proxyID := apiItems[1]
 	query := r.URL.Query()
-	preparestr := query.Get(cmn.URLParamPrepare)
+	preparestr := query.Get(apc.QparamPrepare)
 	if prepare, err = cos.ParseBool(preparestr); err != nil {
-		t.writeErrf(w, r, "Failed to parse %s URL Parameter: %v", cmn.URLParamPrepare, err)
+		t.writeErrf(w, r, "Failed to parse %s URL Parameter: %v", apc.QparamPrepare, err)
 		return
 	}
 
 	if prepare {
-		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Info("Preparation step: do nothing")
+		if cmn.FastV(4, cos.SmoduleAIS) {
+			nlog.Infoln("Preparation step: do nothing")
 		}
 		return
 	}
@@ -232,7 +257,7 @@ func (t *targetrunner) daeSetPrimary(w http.ResponseWriter, r *http.Request, api
 	}
 }
 
-func (t *targetrunner) _setPrim(ctx *smapModifier, clone *smapX) (err error) {
+func (t *target) _setPrim(ctx *smapModifier, clone *smapX) (err error) {
 	if clone.Primary.ID() == ctx.sid {
 		return
 	}
@@ -244,234 +269,198 @@ func (t *targetrunner) _setPrim(ctx *smapModifier, clone *smapX) (err error) {
 	return
 }
 
-func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
-	getWhat := r.URL.Query().Get(cmn.URLParamWhat)
-	httpdaeWhat := "httpdaeget-" + getWhat
+func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
+	var (
+		query       = r.URL.Query()
+		getWhat     = query.Get(apc.QparamWhat)
+		httpdaeWhat = "httpdaeget-" + getWhat
+	)
 	switch getWhat {
-	case cmn.GetWhatConfig, cmn.GetWhatSmap, cmn.GetWhatBMD, cmn.GetWhatSmapVote, cmn.GetWhatSnode, cmn.GetWhatLog:
-		t.httprunner.httpdaeget(w, r)
-	case cmn.GetWhatSysInfo:
-		tsysinfo := cmn.TSysInfo{
-			SysInfo:      sys.FetchSysInfo(),
-			CapacityInfo: fs.CapStatusAux(),
-		}
+	case apc.WhatNodeConfig, apc.WhatSmap, apc.WhatBMD, apc.WhatSmapVote,
+		apc.WhatSnode, apc.WhatLog, apc.WhatNodeStats, apc.WhatMetricNames:
+		t.htrun.httpdaeget(w, r, query, t /*htext*/)
+	case apc.WhatSysInfo:
+		tsysinfo := apc.TSysInfo{MemCPUInfo: apc.GetMemCPU(), CapacityInfo: fs.CapStatusGetWhat()}
 		t.writeJSON(w, r, tsysinfo, httpdaeWhat)
-	case cmn.GetWhatStats:
-		ws := t.statsT.GetWhatStats()
-		t.writeJSON(w, r, ws, httpdaeWhat)
-	case cmn.GetWhatMountpaths:
-		mpList := cmn.MountpathList{}
-		availablePaths, disabledPaths := fs.Get()
-		mpList.Available = make([]string, len(availablePaths))
-		mpList.Disabled = make([]string, len(disabledPaths))
-
-		idx := 0
-		for mpath := range availablePaths {
-			mpList.Available[idx] = mpath
-			idx++
-		}
-		idx = 0
-		for mpath := range disabledPaths {
-			mpList.Disabled[idx] = mpath
-			idx++
-		}
-		t.writeJSON(w, r, &mpList, httpdaeWhat)
-	case cmn.GetWhatDaemonStatus:
-		var rebStats *stats.RebalanceTargetStats
-		if entry := xreg.GetLatest(xreg.XactFilter{Kind: cmn.ActRebalance}); entry != nil {
-			var ok bool
-			if xact := entry.Get(); xact != nil {
-				rebStats, ok = xact.Stats().(*stats.RebalanceTargetStats)
-				debug.Assert(ok)
+	case apc.WhatMountpaths:
+		t.writeJSON(w, r, fs.MountpathsToLists(), httpdaeWhat)
+	case apc.WhatNodeStatsAndStatus:
+		var rebSnap *cluster.Snap
+		if entry := xreg.GetLatest(xreg.Flt{Kind: apc.ActRebalance}); entry != nil {
+			if xctn := entry.Get(); xctn != nil {
+				rebSnap = xctn.Snap()
 			}
 		}
-		msg := &stats.DaemonStatus{
-			Snode:       t.httprunner.si,
-			SmapVersion: t.owner.smap.get().Version,
-			SysInfo:     sys.FetchSysInfo(),
-			Stats:       t.statsT.CoreStats(),
-			TStatus:     &stats.TargetStatus{RebalanceStats: rebStats},
-			DeployedOn:  deploymentType(),
-			Version:     daemon.version,
-			BuildTime:   daemon.buildTime,
+		smap := t.owner.smap.get()
+		msg := &stats.NodeStatus{
+			Node: stats.Node{
+				Snode: t.htrun.si,
+			},
+			SmapVersion:    smap.Version,
+			MemCPUInfo:     apc.GetMemCPU(),
+			RebSnap:        rebSnap,
+			DeploymentType: deploymentType(),
+			Version:        daemon.version,
+			BuildTime:      daemon.buildTime,
+			K8sPodName:     os.Getenv(env.AIS.K8sPod),
+			Status:         t._status(smap),
 		}
-		// capacity
-		tstats := t.statsT.(*stats.Trunner)
-		msg.Capacity = tstats.MPCap
+		// stats and capacity
+		daeStats := t.statsT.GetStats()
+		msg.Tracker = daeStats.Tracker
+		msg.TargetCDF = daeStats.TargetCDF
+
 		t.writeJSON(w, r, msg, httpdaeWhat)
-	case cmn.GetWhatDiskStats:
+	case apc.WhatDiskStats:
 		diskStats := make(ios.AllDiskStats)
 		fs.FillDiskStats(diskStats)
 		t.writeJSON(w, r, diskStats, httpdaeWhat)
-	case cmn.GetWhatRemoteAIS:
-		conf, ok := cmn.GCO.Get().Backend.ProviderConf(cmn.ProviderAIS)
-		if !ok {
-			t.writeJSON(w, r, cmn.BackendInfoAIS{}, httpdaeWhat)
+	case apc.WhatRemoteAIS:
+		var (
+			aisBackend = t.aisBackend()
+			refresh    = cos.IsParseBool(query.Get(apc.QparamClusterInfo))
+		)
+		if !refresh {
+			t.writeJSON(w, r, aisBackend.GetInfoInternal(), httpdaeWhat)
 			return
 		}
-		clusterConf, ok := conf.(cmn.BackendConfAIS)
-		cos.Assert(ok)
-		aisCloud := t.backend[cmn.ProviderAIS].(*backend.AISBackendProvider)
-		t.writeJSON(w, r, aisCloud.GetInfo(clusterConf), httpdaeWhat)
+
+		anyConf := cmn.GCO.Get().Backend.Get(apc.AIS)
+		if anyConf == nil {
+			t.writeJSON(w, r, cluster.Remotes{}, httpdaeWhat)
+			return
+		}
+		aisConf, ok := anyConf.(cmn.BackendConfAIS)
+		debug.Assert(ok)
+
+		t.writeJSON(w, r, aisBackend.GetInfo(aisConf), httpdaeWhat)
 	default:
-		t.httprunner.httpdaeget(w, r)
+		t.htrun.httpdaeget(w, r, query, t /*htext*/)
 	}
 }
 
-// register target
-// enable/disable mountpath
-func (t *targetrunner) httpdaepost(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.checkRESTItems(w, r, 0, true, cmn.URLPathDaemon.L)
+// admin-join target | enable/disable mountpath
+func (t *target) httpdaepost(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathDae.L)
 	if err != nil {
 		return
 	}
-
-	if len(apiItems) > 0 {
-		switch apiItems[0] {
-		case cmn.UserRegister:
-			t.keepalive.send(kaRegisterMsg)
-			body, err := cmn.ReadBytes(r)
-			if err != nil {
-				t.writeErr(w, r, err)
-				return
-			}
-
-			caller := r.Header.Get(cmn.HdrCallerName)
-			if err := t.applyRegMeta(body, caller); err != nil {
-				t.writeErr(w, r, err)
-			}
-			return
-		case cmn.Mountpaths:
-			t.handleMountpathReq(w, r)
-			return
-		default:
-			t.writeErrURL(w, r)
-			return
-		}
-	}
-
-	if status, err := t.joinCluster(); err != nil {
-		t.writeErrf(w, r, "%s: failed to register, status %d, err: %v", t.si, status, err)
-		return
-	}
-
-	if glog.FastV(3, glog.SmoduleAIS) {
-		glog.Infof("Registered %s(self)", t.si)
-	}
-}
-
-func (t *targetrunner) httpdaedelete(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.checkRESTItems(w, r, 1, false, cmn.URLPathDaemon.L)
-	if err != nil {
-		return
-	}
-
-	switch apiItems[0] {
-	case cmn.Mountpaths:
-		t.handleMountpathReq(w, r)
-		return
-	case cmn.Unregister:
-		t.handleUnregisterReq(w, r)
-		return
-	default:
+	if len(apiItems) == 0 {
 		t.writeErrURL(w, r)
 		return
 	}
+	apiOp := apiItems[0]
+	if apiOp == apc.Mountpaths {
+		t.handleMountpathReq(w, r)
+		return
+	}
+	if apiOp != apc.AdminJoin {
+		t.writeErrURL(w, r)
+		return
+	}
+
+	// user request to join cluster (compare with `apc.SelfJoin`)
+	if !t.regstate.disabled.Load() {
+		if t.keepalive.paused() {
+			t.keepalive.ctrl(kaResumeMsg)
+		} else {
+			nlog.Warningf("%s already joined (\"enabled\")- nothing to do", t)
+		}
+		return
+	}
+	if daemon.cli.target.standby {
+		nlog.Infof("%s: transitioning standby => join", t)
+	}
+	t.keepalive.ctrl(kaResumeMsg)
+	body, err := cmn.ReadBytes(r)
+	if err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+
+	caller := r.Header.Get(apc.HdrCallerName)
+	if err := t.recvCluMetaBytes(apc.ActAdminJoinTarget, body, caller); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	if daemon.cli.target.standby {
+		if err := t.endStartupStandby(); err != nil {
+			nlog.Warningf("%s: err %v ending standby...", t, err)
+		}
+	}
 }
 
-func (t *targetrunner) handleUnregisterReq(w http.ResponseWriter, r *http.Request) {
-	if glog.V(3) {
-		glog.Infoln("sending unregister on target keepalive control channel")
-	}
-
-	opts, action, err := t.parseUnregMsg(w, r)
+func (t *target) httpdaedelete(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.parseURL(w, r, 1, false, apc.URLPathDae.L)
 	if err != nil {
-		cmn.WriteErr(w, r, err)
 		return
 	}
-	t.unreg(action, opts != nil && opts.CleanData)
+	switch apiItems[0] {
+	case apc.Mountpaths:
+		t.handleMountpathReq(w, r)
+	default:
+		t.writeErrURL(w, r)
+	}
 }
 
-func (t *targetrunner) unreg(action string, cleanupData bool) {
-	// Stop keepaliving
-	t.keepalive.send(kaUnregisterMsg)
-
-	// Abort all dSort jobs
-	dsort.Managers.AbortAll(errors.New("target was removed from the cluster"))
-
-	// Stop all xactions
-	xreg.AbortAll()
-
-	// In case of maintenance, we only stop the keepalive daemon,
-	// the HTTPServer is still active and accepts requests.
-	if action == cmn.ActStartMaintenance || action == testInitiatedRm {
+// called by p.cleanupMark
+func (t *target) cleanupMark(ctx *cleanmark) {
+	smap := t.owner.smap.get()
+	if smap.version() > ctx.NewVer {
+		nlog.Warningf("%s: %s is newer - ignoring (and dropping) %v", t, smap, ctx)
 		return
 	}
-
-	// NOTE: vs metasync
-	t.regstate.Lock()
-	daemon.stopping.Store(true)
-	t.regstate.Unlock()
-
-	writeShutdownMarker()
-	if action == cmn.ActShutdown {
-		t.Stop(&errNoUnregister{action})
-		return
+	if ctx.Interrupted {
+		if err := fs.RemoveMarker(fname.RebalanceMarker); err == nil {
+			nlog.Infof("%s: cleanmark 'rebalance', %s", t, smap)
+		} else {
+			nlog.Errorf("%s: failed to cleanmark 'rebalance': %v, %s", t, err, smap)
+		}
 	}
-
-	// When action is decommission, cleanup all the (meta)data
-	// before stopping the targetrunner.
-	mdOnly := !cleanupData
-	glog.Infof("%s: decommissioning, removing user data: %t", t.si, cleanupData)
-	fs.Decommission(mdOnly)
-
-	err := cleanupConfigDir()
-	if err != nil {
-		glog.Errorf("%s: failed to cleanup config dir, err: %v", t.si, err)
+	if ctx.Restarted {
+		if err := fs.RemoveMarker(fname.NodeRestartedPrev); err == nil {
+			nlog.Infof("%s: cleanmark 'restarted', %s", t, smap)
+		} else {
+			nlog.Errorf("%s: failed to cleanmark 'restarted': %v, %s", t, err, smap)
+		}
 	}
-	// Delete DB file.
-	err = cos.RemoveFile(filepath.Join(cmn.GCO.Get().ConfigDir, dbName))
-	if err != nil {
-		glog.Errorf("failed to delete database, err: %v", err)
-	}
-	t.Stop(&errNoUnregister{action})
 }
 
-func (t *targetrunner) handleMountpathReq(w http.ResponseWriter, r *http.Request) {
-	msg := cmn.ActionMsg{}
-	if cmn.ReadJSON(w, r, &msg) != nil {
+func (t *target) handleMountpathReq(w http.ResponseWriter, r *http.Request) {
+	msg, err := t.readActionMsg(w, r)
+	if err != nil {
 		return
 	}
-	mountpath, ok := msg.Value.(string)
+	mpath, ok := msg.Value.(string)
 	if !ok {
 		t.writeErrMsg(w, r, "invalid mountpath value in request")
 		return
 	}
-	if mountpath == "" {
+	if mpath == "" {
 		t.writeErrMsg(w, r, "mountpath is not defined")
 		return
 	}
 	switch msg.Action {
-	case cmn.ActMountpathEnable:
-		t.handleEnableMountpathReq(w, r, mountpath)
-	case cmn.ActMountpathDisable:
-		t.handleDisableMountpathReq(w, r, mountpath)
-	case cmn.ActMountpathAdd:
-		t.handleAddMountpathReq(w, r, mountpath)
-	case cmn.ActMountpathRemove:
-		t.handleRemoveMountpathReq(w, r, mountpath)
+	case apc.ActMountpathEnable:
+		t.enableMpath(w, r, mpath)
+	case apc.ActMountpathAttach:
+		t.attachMpath(w, r, mpath)
+	case apc.ActMountpathDisable:
+		t.disableMpath(w, r, mpath)
+	case apc.ActMountpathDetach:
+		t.detachMpath(w, r, mpath)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
 }
 
-func (t *targetrunner) handleEnableMountpathReq(w http.ResponseWriter, r *http.Request, mpath string) {
-	enabledMi, err := t.fsprg.enableMountpath(mpath)
+func (t *target) enableMpath(w http.ResponseWriter, r *http.Request, mpath string) {
+	enabledMi, err := t.fsprg.enableMpath(mpath)
 	if err != nil {
-		if _, ok := err.(*cmn.ErrNoMountpath); ok {
+		if cmn.IsErrMountpathNotFound(err) {
 			t.writeErr(w, r, err, http.StatusNotFound)
 		} else {
-			// cmn.InvalidMountpathError
+			// cmn.ErrInvalidMountpath
 			t.writeErr(w, r, err)
 		}
 		return
@@ -483,38 +472,19 @@ func (t *targetrunner) handleEnableMountpathReq(w http.ResponseWriter, r *http.R
 
 	// create missing buckets dirs
 	bmd := t.owner.bmd.get()
-	bmd.Range(nil, nil, func(bck *cluster.Bck) bool {
-		err = enabledMi.CreateMissingBckDirs(bck.Bck)
+	bmd.Range(nil, nil, func(bck *meta.Bck) bool {
+		err = enabledMi.CreateMissingBckDirs(bck.Bucket())
 		return err != nil // break on error
 	})
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-	// TODO: Currently, dSort doesn't handle adding/enabling mountpaths at runtime
-	dsort.Managers.AbortAll(fmt.Errorf("mountpath %s has been enabled", enabledMi))
 }
 
-func (t *targetrunner) handleDisableMountpathReq(w http.ResponseWriter, r *http.Request, mpath string) {
-	disabledMi, err := t.fsprg.disableMountpath(mpath)
-	if err != nil {
-		if _, ok := err.(*cmn.ErrNoMountpath); ok {
-			t.writeErr(w, r, err, http.StatusNotFound)
-		} else {
-			// cmn.InvalidMountpathError
-			t.writeErr(w, r, err)
-		}
-		return
-	}
-	if disabledMi == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	dsort.Managers.AbortAll(fmt.Errorf("mountpath %s has been disabled", disabledMi))
-}
-
-func (t *targetrunner) handleAddMountpathReq(w http.ResponseWriter, r *http.Request, mpath string) {
-	addedMi, err := t.fsprg.addMountpath(mpath)
+func (t *target) attachMpath(w http.ResponseWriter, r *http.Request, mpath string) {
+	force := cos.IsParseBool(r.URL.Query().Get(apc.QparamForce))
+	addedMi, err := t.fsprg.attachMpath(mpath, force)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
@@ -524,165 +494,204 @@ func (t *targetrunner) handleAddMountpathReq(w http.ResponseWriter, r *http.Requ
 	}
 	// create missing buckets dirs, if any
 	bmd := t.owner.bmd.get()
-	bmd.Range(nil, nil, func(bck *cluster.Bck) bool {
-		err = addedMi.CreateMissingBckDirs(bck.Bck)
+	bmd.Range(nil, nil, func(bck *meta.Bck) bool {
+		err = addedMi.CreateMissingBckDirs(bck.Bucket())
 		return err != nil // break on error
 	})
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-
-	// TODO: Currently, dSort doesn't handle adding/enabling mountpaths at runtime
-	dsort.Managers.AbortAll(fmt.Errorf("mountpath %s has been added", addedMi))
 }
 
-func (t *targetrunner) handleRemoveMountpathReq(w http.ResponseWriter, r *http.Request, mpath string) {
-	removedMi, err := t.fsprg.removeMountpath(mpath)
+func (t *target) disableMpath(w http.ResponseWriter, r *http.Request, mpath string) {
+	dontResilver := cos.IsParseBool(r.URL.Query().Get(apc.QparamDontResilver))
+	disabledMi, err := t.fsprg.disableMpath(mpath, dontResilver)
 	if err != nil {
-		t.writeErrf(w, r, err.Error())
+		if cmn.IsErrMountpathNotFound(err) {
+			t.writeErr(w, r, err, http.StatusNotFound)
+		} else {
+			// cmn.ErrInvalidMountpath
+			t.writeErr(w, r, err)
+		}
 		return
 	}
-	if removedMi == nil {
-		return
+	if disabledMi == nil {
+		w.WriteHeader(http.StatusNoContent)
 	}
-	dsort.Managers.AbortAll(fmt.Errorf("mpath %q has been removed", removedMi))
 }
 
-func (t *targetrunner) receiveBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, tag, caller string, silent bool) (err error) {
-	var (
-		rmbcks []*cluster.Bck
-		bmd    = t.owner.bmd.get()
-	)
-	glog.Infof("receive %s%s", newBMD.StringEx(), _msdetail(bmd.Version, msg, caller))
+func (t *target) detachMpath(w http.ResponseWriter, r *http.Request, mpath string) {
+	dontResilver := cos.IsParseBool(r.URL.Query().Get(apc.QparamDontResilver))
+	if _, err := t.fsprg.detachMpath(mpath, dontResilver); err != nil {
+		t.writeErr(w, r, err)
+	}
+}
+
+func (t *target) receiveBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, tag, caller string, silent bool) (err error) {
+	var oldVer int64
 	if msg.UUID == "" {
-		if rmbcks, err = t._applyBMD(newBMD, msg, payload); err == nil {
-			t._postBMD(tag, rmbcks)
+		oldVer, err = t.applyBMD(newBMD, msg, payload, tag)
+		if newBMD.Version > oldVer {
+			if err == nil {
+				logmsync(oldVer, newBMD, msg, caller, newBMD.StringEx())
+			}
 		}
 		return
 	}
-	// before -- do -- after
+
+	// txn [before -- do -- after]
 	if errDone := t.transactions.commitBefore(caller, msg); errDone != nil {
-		err = fmt.Errorf("%s commit-before %s, errDone: %v", t.si, newBMD, errDone)
+		err = fmt.Errorf("%s commit-before %s, errDone: %v", t, newBMD, errDone)
 		if !silent {
-			glog.Error(err)
+			nlog.Errorln(err)
 		}
 		return
 	}
-	if rmbcks, err = t._applyBMD(newBMD, msg, payload); err == nil {
-		t._postBMD(tag, rmbcks)
+	oldVer, err = t.applyBMD(newBMD, msg, payload, tag)
+	// log
+	switch {
+	case err != nil:
+		nlog.Errorf("%s: %v (receive %s from %q, action %q, uuid %q)", t, err, newBMD.StringEx(), caller, msg.Action, msg.UUID)
+	case newBMD.Version > oldVer:
+		logmsync(oldVer, newBMD, msg, caller, newBMD.StringEx())
+	case newBMD.Version == oldVer:
+		nlog.Warningf("%s (same version w/ txn commit): receive %s from %q (action %q, uuid %q)",
+			t, newBMD.StringEx(), caller, msg.Action, msg.UUID)
 	}
+	// --after]
 	if errDone := t.transactions.commitAfter(caller, msg, err, newBMD); errDone != nil {
-		err = fmt.Errorf("%s commit-after %s, err: %v, errDone: %v", t.si, newBMD, err, errDone)
+		err = fmt.Errorf("%s commit-after %s, err: %v, errDone: %v", t, newBMD, err, errDone)
 		if !silent {
-			glog.Error(err)
+			nlog.Errorln(err)
 		}
 	}
 	return
 }
 
-// apply under lock
-func (t *targetrunner) _applyBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload) (rmbcks []*cluster.Bck, err error) {
-	var (
-		createErrs, destroyErrs []error
-		_, psi                  = t.getPrimaryURLAndSI()
-	)
-	t.owner.bmd.Lock()
-	defer t.owner.bmd.Unlock()
+func (t *target) applyBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, tag string) (int64, error) {
+	_, psi := t.getPrimaryURLAndSI(nil)
 
-	bmd := t.owner.bmd.get()
+	t.owner.bmd.Lock()
+	rmbcks, oldVer, emsg, err := t._syncBMD(newBMD, msg, payload, psi)
+	t.owner.bmd.Unlock()
+
+	if err != nil {
+		nlog.Errorln(err)
+	} else if oldVer < newBMD.Version {
+		t.regstate.prevbmd.Store(false)
+		t._postBMD(newBMD, tag, rmbcks)
+	}
+	if emsg != "" {
+		nlog.Errorln(emsg)
+	}
+	return oldVer, err
+}
+
+// executes under lock
+func (t *target) _syncBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, psi *meta.Snode) (rmbcks []*meta.Bck,
+	oldVer int64, emsg string, err error) {
+	var (
+		createErrs  []error
+		destroyErrs []error
+		bmd         = t.owner.bmd.get()
+	)
 	if err = bmd.validateUUID(newBMD, t.si, psi, ""); err != nil {
-		cos.ExitLogf("%v", err) // FATAL: cluster integrity error (cie)
+		cos.ExitLog(err) // FATAL: cluster integrity error (cie)
 		return
 	}
-	if v := bmd.version(); newBMD.version() <= v {
-		if newBMD.version() < v {
+	// check downgrade
+	if oldVer = bmd.version(); newBMD.version() <= oldVer {
+		if newBMD.version() < oldVer {
 			err = newErrDowngrade(t.si, bmd.StringEx(), newBMD.StringEx())
 		}
 		return
 	}
+	nilbmd := bmd.version() == 0 || t.regstate.prevbmd.Load()
 
 	// 1. create
-	newBMD.Range(nil, nil, func(bck *cluster.Bck) bool {
+	newBMD.Range(nil, nil, func(bck *meta.Bck) bool {
 		if _, present := bmd.Get(bck); present {
 			return false
 		}
-		errs := fs.CreateBucket("recv-bmd-"+msg.Action, bck.Bck, bmd.version() == 0 /*nilbmd*/)
-		createErrs = append(createErrs, errs...)
+		errs := fs.CreateBucket(bck.Bucket(), nilbmd)
+		if len(errs) > 0 {
+			createErrs = append(createErrs, errs...)
+		}
 		return false
 	})
 	if len(createErrs) > 0 {
-		err = fmt.Errorf("%s: failed to receive %s: %v", t.si, newBMD, createErrs)
+		err = fmt.Errorf("%s: failed to add new buckets: %s, old/cur %s(%t): %v (total errors: %d)",
+			t, newBMD, bmd, nilbmd, createErrs[0], len(createErrs))
 		return
 	}
 
 	// 2. persist
 	if err = t.owner.bmd.putPersist(newBMD, payload); err != nil {
-		cos.ExitLogf("%v", err)
+		cos.ExitLog(err)
 		return
 	}
 
 	// 3. delete, ignore errors
-	bmd.Range(nil, nil, func(obck *cluster.Bck) bool {
+	bmd.Range(nil, nil, func(obck *meta.Bck) bool {
 		var present bool
-		newBMD.Range(nil, nil, func(nbck *cluster.Bck) bool {
+		newBMD.Range(nil, nil, func(nbck *meta.Bck) bool {
 			if !obck.Equal(nbck, false /*ignore BID*/, false /* ignore backend */) {
 				return false
 			}
 			present = true
 			if obck.Props.Mirror.Enabled && !nbck.Props.Mirror.Enabled {
-				xreg.DoAbort(cmn.ActPutCopies, nbck)
-				// NOTE: cmn.ActMakeNCopies takes care of itself
+				flt := xreg.Flt{Kind: apc.ActPutCopies, Bck: nbck}
+				xreg.DoAbort(flt, errors.New("apply-bmd"))
+				// NOTE: apc.ActMakeNCopies takes care of itself
 			}
 			if obck.Props.EC.Enabled && !nbck.Props.EC.Enabled {
-				xreg.DoAbort(cmn.ActECEncode, nbck)
+				flt := xreg.Flt{Kind: apc.ActECEncode, Bck: nbck}
+				xreg.DoAbort(flt, errors.New("apply-bmd"))
 			}
 			return true
 		})
 		if !present {
 			rmbcks = append(rmbcks, obck)
-			if errD := fs.DestroyBucket("recv-bmd-"+msg.Action, obck.Bck, obck.Props.BID); errD != nil {
+			if errD := fs.DestroyBucket("recv-bmd-"+msg.Action, obck.Bucket(), obck.Props.BID); errD != nil {
 				destroyErrs = append(destroyErrs, errD)
 			}
 		}
 		return false
 	})
 	if len(destroyErrs) > 0 {
-		glog.Errorf("%s: failed to cleanup destroyed buckets: %v", t.si, destroyErrs)
+		emsg = fmt.Sprintf("%s: failed to cleanup destroyed buckets: %s, old/cur %s(%t): %v",
+			t, newBMD, bmd, nilbmd, destroyErrs)
 	}
 	return
 }
 
-func (t *targetrunner) _postBMD(tag string, rmbcks []*cluster.Bck) {
+func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {
 	// evict LOM cache
 	if len(rmbcks) > 0 {
-		xreg.AbortAllBuckets(rmbcks...)
-		go func(bcks ...*cluster.Bck) {
+		errV := fmt.Errorf("[post-bmd] %s %s: remove bucket%s", tag, newBMD, cos.Plural(len(rmbcks)))
+		xreg.AbortAllBuckets(errV, rmbcks...)
+		go func(bcks ...*meta.Bck) {
 			for _, b := range bcks {
 				cluster.EvictLomCache(b)
 			}
 		}(rmbcks...)
 	}
-	if tag != bucketMDRegister {
+	if tag != bmdReg {
 		// ecmanager will get updated BMD upon its init()
 		if err := ec.ECM.BucketsMDChanged(); err != nil {
-			glog.Errorf("Failed to initialize EC manager: %v", err)
+			nlog.Errorf("Failed to initialize EC manager: %v", err)
 		}
 	}
-	// refresh used/avail capacity and run LRU if need be (in part, to remove $trash)
-	if _, err := fs.RefreshCapStatus(nil, nil); err != nil {
-		go t.RunLRU("" /*uuid*/, nil /*wg*/, false)
+	// since some buckets may have been destroyed
+	if cs := fs.Cap(); cs.Err != nil {
+		_ = t.OOS(nil)
 	}
 }
 
-func (t *targetrunner) receiveRMD(newRMD *rebMD, msg *aisMsg, caller string) (err error) {
+// NOTE: is called under lock
+func (t *target) receiveRMD(newRMD *rebMD, msg *aisMsg) (err error) {
 	rmd := t.owner.rmd.get()
-	glog.Infof("receive %s%s", newRMD, _msdetail(rmd.Version, msg, caller))
-
-	t.owner.rmd.Lock()
-	defer t.owner.rmd.Unlock()
-
-	rmd = t.owner.rmd.get()
 	if newRMD.Version <= rmd.Version {
 		if newRMD.Version < rmd.Version {
 			err = newErrDowngrade(t.si, rmd.String(), newRMD.String())
@@ -693,135 +702,153 @@ func (t *targetrunner) receiveRMD(newRMD *rebMD, msg *aisMsg, caller string) (er
 	if err = smap.validate(); err != nil {
 		return
 	}
-	if smap.GetNode(t.si.ID()) == nil {
-		err = fmt.Errorf("%s (self) not present in %s", t.si, smap.StringEx())
+	if smap.GetNode(t.SID()) == nil {
+		err = fmt.Errorf("%s (self) not present in %s", t, smap.StringEx())
 		return
 	}
 	for _, tsi := range rmd.TargetIDs {
 		if smap.GetNode(tsi) == nil {
-			glog.Warningf("%s: %s (target_id) not present in %s (old %s, new %s)",
+			nlog.Warningf("%s: %s (target_id) not present in %s (old %s, new %s)",
 				t.si, tsi, smap.StringEx(), rmd, newRMD)
 		}
 	}
-	notif := &xaction.NotifXact{
-		NotifBase: nl.NotifBase{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.callerNotifyFin},
+	if !t.regstate.disabled.Load() {
+		//
+		// run rebalance
+		//
+		notif := &xact.NotifXact{
+			Base: nl.Base{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+		}
+		if msg.Action == apc.ActRebalance {
+			nlog.Infof("%s: starting user-requested rebalance[%s]", t, msg.UUID)
+			go t.reb.RunRebalance(&smap.Smap, newRMD.Version, notif)
+			return
+		}
+
+		nlog.Infof("%s: starting rebalance[%s]", t, xact.RebID2S(newRMD.Version))
+		go t.reb.RunRebalance(&smap.Smap, newRMD.Version, notif)
+
+		if newRMD.Resilver != "" {
+			nlog.Infof("%s: ... and resilver", t)
+			go t.runResilver(res.Args{UUID: newRMD.Resilver, SkipGlobMisplaced: true}, nil /*wg*/)
+		}
+		t.owner.rmd.put(newRMD)
+		// TODO: move and refactor
+	} else if msg.Action == apc.ActAdminJoinTarget && daemon.cli.target.standby && msg.Name == t.SID() {
+		nlog.Warningf("%s: standby => join %s", t, msg)
+		if _, err = t.joinCluster(msg.Action); err == nil {
+			err = t.endStartupStandby()
+		}
+		t.owner.rmd.put(newRMD)
 	}
-	if msg.Action == cmn.ActRebalance {
-		glog.Infof("%s: starting user-requested rebalance", t.si)
-		go t.rebManager.RunRebalance(&smap.Smap, newRMD.Version, notif)
-		return
-	}
-	glog.Infof("%s: starting auto-rebalance", t.si)
-	go t.rebManager.RunRebalance(&smap.Smap, newRMD.Version, notif)
-	if newRMD.Resilver != "" {
-		glog.Infof("%s: ... and resilver", t.si)
-		go t.runResilver(newRMD.Resilver /*uuid*/, nil /*wg*/, true /*skipGlobMisplaced*/)
-	}
-	t.owner.rmd.put(newRMD)
 	return
 }
 
-func (t *targetrunner) ensureLatestBMD(msg *aisMsg, r *http.Request) {
+func (t *target) ensureLatestBMD(msg *aisMsg, r *http.Request) {
 	bmd, bmdVersion := t.owner.bmd.Get(), msg.BMDVersion
 	if bmd.Version < bmdVersion {
-		glog.Errorf("%s: local %s < v%d, action %q - fetching latest...", t.si, bmd, bmdVersion, msg.Action)
+		nlog.Errorf("%s: local %s < v%d %s - running fixup...", t, bmd, bmdVersion, msg)
 		t.BMDVersionFixup(r)
 	} else if bmd.Version > bmdVersion {
 		// If metasync outraces the request, we end up here, just log it and continue.
-		glog.Warningf("%s: local %s > v%d, action %q", t.si, bmd, bmdVersion, msg.Action)
+		nlog.Warningf("%s: local %s > v%d %s", t, bmd, bmdVersion, msg)
 	}
 }
 
-func (t *targetrunner) fetchPrimaryMD(what string, outStruct interface{}, renamed string) (err error) {
+func (t *target) getPrimaryBMD(renamed string) (bmd *bucketMD, err error) {
 	smap := t.owner.smap.get()
 	if err = smap.validate(); err != nil {
-		return fmt.Errorf("%s: %s is invalid: %v", t.si, smap, err)
+		return nil, cmn.NewErrFailedTo(t, "get-primary-bmd", smap, err)
 	}
-	psi := smap.Primary
-	q := url.Values{}
-	q.Set(cmn.URLParamWhat, what)
+	var (
+		what    = apc.WhatBMD
+		q       = url.Values{apc.QparamWhat: []string{what}}
+		psi     = smap.Primary
+		path    = apc.URLPathDae.S
+		url     = psi.URL(cmn.NetIntraControl)
+		timeout = cmn.Timeout.CplaneOperation()
+	)
 	if renamed != "" {
-		q.Add(whatRenamedLB, renamed)
+		q.Set(whatRenamedLB, renamed)
 	}
-	path := cmn.URLPathDaemon.S
-	url := psi.URL(cmn.NetworkIntraControl)
-	config := cmn.GCO.Get()
-	timeout := config.Timeout.CplaneOperation.D()
-	args := callArgs{
-		si:      psi,
-		req:     cmn.ReqArgs{Method: http.MethodGet, Base: url, Path: path, Query: q},
-		timeout: timeout,
+	cargs := allocCargs()
+	{
+		cargs.si = psi
+		cargs.req = cmn.HreqArgs{Method: http.MethodGet, Base: url, Path: path, Query: q}
+		cargs.timeout = timeout
+		cargs.cresv = cresBM{}
 	}
-	res := t.call(args)
-	defer _freeCallRes(res)
+	res := t.call(cargs)
 	if res.err != nil {
 		time.Sleep(timeout / 2)
-		res = t.call(args)
+		res = t.call(cargs)
 		if res.err != nil {
 			err = res.errorf("%s: failed to GET(%q)", t.si, what)
-			return
 		}
 	}
-	err = jsoniter.Unmarshal(res.bytes, outStruct)
-	if err != nil {
-		err = fmt.Errorf(cmn.FmtErrUnmarshal, t.si, what, cmn.BytesHead(res.bytes), err)
+	if err == nil {
+		bmd = res.v.(*bucketMD)
 	}
+	freeCargs(cargs)
+	freeCR(res)
 	return
 }
 
-func (t *targetrunner) BMDVersionFixup(r *http.Request, bcks ...cmn.Bck) {
+func (t *target) BMDVersionFixup(r *http.Request, bcks ...cmn.Bck) {
 	var (
-		caller      string
-		bck         cmn.Bck
-		newBucketMD = &bucketMD{}
+		caller string
+		bck    cmn.Bck
 	)
 	if len(bcks) > 0 {
 		bck = bcks[0]
 	}
 	time.Sleep(200 * time.Millisecond)
-	if err := t.fetchPrimaryMD(cmn.GetWhatBMD, newBucketMD, bck.Name); err != nil {
-		glog.Error(err)
+	newBucketMD, err := t.getPrimaryBMD(bck.Name)
+	if err != nil {
+		nlog.Errorln(err)
 		return
 	}
-	msg := t.newAmsgStr("get-what="+cmn.GetWhatBMD, newBucketMD)
+	msg := t.newAmsgStr("get-what="+apc.WhatBMD, newBucketMD)
 	if r != nil {
-		caller = r.Header.Get(cmn.HdrCallerName)
+		caller = r.Header.Get(apc.HdrCallerName)
 	}
-	t.regstate.Lock()
-	defer t.regstate.Unlock()
+	t.regstate.mu.Lock()
 	if daemon.stopping.Load() {
+		t.regstate.mu.Unlock()
 		return
 	}
-	if err := t.receiveBMD(newBucketMD, msg, nil, bucketMDFixup, caller, true /*silent*/); err != nil && !isErrDowngrade(err) {
-		glog.Error(err)
+	err = t.receiveBMD(newBucketMD, msg, nil, bmdFixup, caller, true /*silent*/)
+	t.regstate.mu.Unlock()
+	if err != nil && !isErrDowngrade(err) {
+		nlog.Errorln(err)
 	}
 }
 
 // [METHOD] /v1/metasync
-func (t *targetrunner) metasyncHandler(w http.ResponseWriter, r *http.Request) {
-	t.regstate.Lock()
-	defer t.regstate.Unlock()
+func (t *target) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 	if daemon.stopping.Load() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 	switch r.Method {
 	case http.MethodPut:
-		t.metasyncHandlerPut(w, r)
+		t.regstate.mu.Lock()
+		if daemon.stopping.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			t.metasyncPut(w, r)
+		}
+		t.regstate.mu.Unlock()
 	case http.MethodPost:
-		t.metasyncHandlerPost(w, r)
+		t.metasyncPost(w, r)
 	default:
 		cmn.WriteErr405(w, r, http.MethodPost, http.MethodPut)
 	}
 }
 
 // PUT /v1/metasync
-// TODO: excepting small difference around receiveSmap and ReceiveBMD
-//       the code is identical to p.metasyncHandler() - not reducing it to
-//       one is lack of polymorphism to execute target-specific
-//       receive* while adding interfaces won't do enough.
-// NOTE: compare with receiveCluMeta() and p.metasyncHandlerPut
-func (t *targetrunner) metasyncHandlerPut(w http.ResponseWriter, r *http.Request) {
+// compare w/ p.metasyncHandler (NOTE: executes under regstate lock)
+func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 	var (
 		err = &errMsync{}
 		cii = &err.Cii
@@ -837,104 +864,150 @@ func (t *targetrunner) metasyncHandlerPut(w http.ResponseWriter, r *http.Request
 	}
 	// 1. extract
 	var (
-		caller                    = r.Header.Get(cmn.HdrCallerName)
-		newConf, msgConf, errConf = t.extractConfig(payload, caller)
-		newSmap, msgSmap, errSmap = t.extractSmap(payload, caller)
-		newBMD, msgBMD, errBMD    = t.extractBMD(payload, caller)
-		newRMD, msgRMD, errRMD    = t.extractRMD(payload, caller)
+		caller                       = r.Header.Get(apc.HdrCallerName)
+		newConf, msgConf, errConf    = t.extractConfig(payload, caller)
+		newSmap, msgSmap, errSmap    = t.extractSmap(payload, caller, false /*skip validation*/)
+		newBMD, msgBMD, errBMD       = t.extractBMD(payload, caller)
+		newRMD, msgRMD, errRMD       = t.extractRMD(payload, caller)
+		newEtlMD, msgEtlMD, errEtlMD = t.extractEtlMD(payload, caller)
 	)
 	// 2. apply
 	if errConf == nil && newConf != nil {
 		errConf = t.receiveConfig(newConf, msgConf, payload, caller)
 	}
 	if errSmap == nil && newSmap != nil {
-		errSmap = t.receiveSmap(newSmap, msgSmap, payload, caller, nil)
+		errSmap = t.receiveSmap(newSmap, msgSmap, payload, caller, t.htrun.smapUpdatedCB)
 	}
 	if errBMD == nil && newBMD != nil {
-		errBMD = t.receiveBMD(newBMD, msgBMD, payload, bucketMDReceive, caller, false /*silent*/)
+		errBMD = t.receiveBMD(newBMD, msgBMD, payload, bmdRecv, caller, false /*silent*/)
 	}
 	if errRMD == nil && newRMD != nil {
-		errRMD = t.receiveRMD(newRMD, msgRMD, caller)
+		rmd := t.owner.rmd.get()
+		logmsync(rmd.Version, newRMD, msgRMD, caller)
+
+		t.owner.rmd.Lock()
+		errRMD = t.receiveRMD(newRMD, msgRMD)
+		t.owner.rmd.Unlock()
+	}
+	if errEtlMD == nil && newEtlMD != nil {
+		errEtlMD = t.receiveEtlMD(newEtlMD, msgEtlMD, payload, caller, t._etlMDChange)
 	}
 	// 3. respond
-	if errConf == nil && errSmap == nil && errBMD == nil && errRMD == nil {
+	if errConf == nil && errSmap == nil && errBMD == nil && errRMD == nil && errEtlMD == nil {
 		return
 	}
-	cii.fill(&t.httprunner)
-	err.message(errConf, errSmap, errBMD, errRMD, nil)
-	t.writeErr(w, r, errors.New(cos.MustMarshalToString(err)), http.StatusConflict)
+	cii.fill(&t.htrun)
+	retErr := err.message(errConf, errSmap, errBMD, errRMD, errEtlMD, nil)
+	t.writeErr(w, r, retErr, http.StatusConflict)
 }
 
-func (t *targetrunner) receiveConfig(newConfig *globalConfig, msg *aisMsg, payload msPayload, caller string) (err error) {
+func (t *target) _etlMDChange(newEtlMD, oldEtlMD *etlMD, action string) {
+	for key := range oldEtlMD.ETLs {
+		if _, ok := newEtlMD.ETLs[key]; ok {
+			continue
+		}
+		// TODO: stop only when running
+		nlog.Infoln("ETL MD change resulting from action: " + action)
+		etl.Stop(t, key, nil)
+	}
+}
+
+// compare w/ p.receiveConfig
+func (t *target) receiveConfig(newConfig *globalConfig, msg *aisMsg, payload msPayload, caller string) (err error) {
 	oldConfig := cmn.GCO.Get()
-	err = t.httprunner.receiveConfig(newConfig, msg, payload, caller)
+	logmsync(oldConfig.Version, newConfig, msg, caller)
+
+	t.owner.config.Lock()
+	err = t._recvCfg(newConfig, payload)
+	t.owner.config.Unlock()
 	if err != nil {
 		return
 	}
-	if !t.NodeStarted() { // starting up
-		debug.Assert(msg.Action != cmn.ActAttach && msg.Action != cmn.ActDetach)
-		return
-	}
-	if msg.Action == cmn.ActAttach || msg.Action == cmn.ActDetach {
-		// NOTE: apply the entire config: add new and _refresh_ existing
-		aisConf, ok := newConfig.Backend.ProviderConf(cmn.ProviderAIS)
-		cos.Assert(ok)
-		aisCloud := t.backend[cmn.ProviderAIS].(*backend.AISBackendProvider)
-		err = aisCloud.Apply(aisConf, msg.Action)
-		if err != nil {
-			glog.Errorf("%s: %v - proceeding anyway...", t.si, err)
+
+	if !t.NodeStarted() {
+		if msg.Action == apc.ActAttachRemAis || msg.Action == apc.ActDetachRemAis {
+			nlog.Errorf("%s: cannot handle %s (%s => %s) - starting up...", t, msg, oldConfig, newConfig)
 		}
 		return
 	}
-	if !newConfig.Backend.EqualRemAIS(&oldConfig.Backend) {
-		t.backend.init(t, false /*starting*/) // re-init from scratch
-		return
+
+	// special: remais update
+	if msg.Action == apc.ActAttachRemAis || msg.Action == apc.ActDetachRemAis {
+		return t.attachDetachRemAis(newConfig, msg)
 	}
-	// NOTE: primary command-line flag `-override_backends` allows to choose
-	//       cloud backends (and HDFS) at deployment time
-	//       (via build tags) - see earlystart
-	if !newConfig.Backend.EqualClouds(&oldConfig.Backend) {
-		t.backend.initExt(t, false /*starting*/)
+
+	if !newConfig.Backend.EqualRemAIS(&oldConfig.Backend, t.String()) {
+		if aisConf := newConfig.Backend.Get(apc.AIS); aisConf != nil {
+			err = t.attachDetachRemAis(newConfig, msg)
+		} else {
+			t.backend[apc.AIS] = backend.NewAIS(t)
+		}
 	}
 	return
 }
 
+// NOTE: apply the entire config: add new and update existing entries (remote clusters)
+func (t *target) attachDetachRemAis(newConfig *globalConfig, msg *aisMsg) (err error) {
+	var (
+		aisBackend *backend.AISBackendProvider
+		aisConf    = newConfig.Backend.Get(apc.AIS)
+	)
+	debug.Assert(aisConf != nil)
+	aisBackend = t.aisBackend()
+	return aisBackend.Apply(aisConf, msg.Action, &newConfig.ClusterConfig)
+}
+
 // POST /v1/metasync
-func (t *targetrunner) metasyncHandlerPost(w http.ResponseWriter, r *http.Request) {
+func (t *target) metasyncPost(w http.ResponseWriter, r *http.Request) {
 	payload := make(msPayload)
 	if err := payload.unmarshal(r.Body, "metasync post"); err != nil {
 		cmn.WriteErr(w, r, err)
 		return
 	}
-	caller := r.Header.Get(cmn.HdrCallerName)
-	newSmap, msg, err := t.extractSmap(payload, caller)
+	caller := r.Header.Get(apc.HdrCallerName)
+	newSmap, msg, err := t.extractSmap(payload, caller, true /*skip validation*/)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-
-	if newSmap != nil && msg.Action == cmn.ActStartGFN {
-		t.gfn.global.activateTimed()
+	ntid := msg.UUID
+	if cmn.FastV(4, cos.SmoduleAIS) {
+		nlog.Infof("%s %s: %s, join %s", t, msg, newSmap, meta.Tname(ntid)) // "start-gfn" | "stop-gfn"
+	}
+	switch msg.Action {
+	case apc.ActStartGFN:
+		reb.OnTimedGFN()
+	case apc.ActStopGFN:
+		detail := meta.Tname(ntid) + " " + newSmap.String()
+		reb.OffTimedGFN(detail)
+	default:
+		debug.Assert(false, msg.String())
+		t.writeErrAct(w, r, msg.Action)
 	}
 }
 
-// GET /v1/health (cmn.Health)
-func (t *targetrunner) healthHandler(w http.ResponseWriter, r *http.Request) {
-	if !t.NodeStarted() {
+// GET /v1/health (apc.Health)
+func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if t.regstate.disabled.Load() && daemon.cli.target.standby {
+		nlog.Warningf("[health] %s: standing by...", t)
+	} else if !t.NodeStarted() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 	if responded := t.healthByExternalWD(w, r); responded {
 		return
 	}
+
+	t.uptime2hdr(w.Header())
+
 	// cluster info piggy-back
 	query := r.URL.Query()
-	getCii := cos.IsParseBool(query.Get(cmn.URLParamClusterInfo))
+	getCii := cos.IsParseBool(query.Get(apc.QparamClusterInfo))
 	if getCii {
-		debug.Assert(query.Get(cmn.URLParamRebStatus) == "")
+		debug.Assert(!query.Has(apc.QparamRebStatus))
 		cii := &clusterInfo{}
-		cii.fill(&t.httprunner)
-		_ = t.writeJSON(w, r, cii, "cluster-info")
+		cii.fill(&t.htrun)
+		t.writeJSON(w, r, cii, "cluster-info")
 		return
 	}
 	// valid?
@@ -944,117 +1017,189 @@ func (t *targetrunner) healthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// return ok plus optional reb info
-	callerID := r.Header.Get(cmn.HdrCallerID)
-	caller := r.Header.Get(cmn.HdrCallerName)
-	callerSmapVer, _ := strconv.ParseInt(r.Header.Get(cmn.HdrCallerSmapVersion), 10, 64)
+	var (
+		err              error
+		callerID         = r.Header.Get(apc.HdrCallerID)
+		caller           = r.Header.Get(apc.HdrCallerName)
+		callerSmapVer, _ = strconv.ParseInt(r.Header.Get(apc.HdrCallerSmapVersion), 10, 64)
+	)
 	if smap.version() != callerSmapVer {
-		glog.Warningf("%s[%s]: health-ping from node (%s, %s) with different Smap v%d",
-			t.si, smap.StringEx(), callerID, caller, callerSmapVer)
+		s := "older"
+		if smap.version() < callerSmapVer {
+			s = "newer"
+		}
+		err = fmt.Errorf("health-ping from (%s, %s) with %s Smap v%d", callerID, caller, s, callerSmapVer)
+		nlog.Warningf("%s[%s]: %v", t, smap.StringEx(), err)
 	}
-	getRebStatus := cos.IsParseBool(query.Get(cmn.URLParamRebStatus))
+	getRebStatus := cos.IsParseBool(query.Get(apc.QparamRebStatus))
 	if getRebStatus {
 		status := &reb.Status{}
-		t.rebManager.RebStatus(status)
-		if ok := t.writeJSON(w, r, status, "rebalance-status"); !ok {
+		t.reb.RebStatus(status)
+		if !t.writeJS(w, r, status, "rebalance-status") {
 			return
+		}
+		if smap.version() < callerSmapVer && status.Running {
+			// NOTE: abort right away but don't broadcast
+			t.reb.AbortLocal(smap.version(), err)
 		}
 	}
 	if smap.GetProxy(callerID) != nil {
-		if glog.FastV(4, glog.SmoduleAIS) {
-			glog.Infof("%s: health-ping from %s", t.si, caller)
-		}
 		t.keepalive.heardFrom(callerID, false)
-	} else if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("%s: health-ping from %s", t.si, caller)
 	}
 }
 
 // unregisters the target and marks it as disabled by an internal event
-func (t *targetrunner) disable() error {
-	t.regstate.Lock()
-	defer t.regstate.Unlock()
+func (t *target) disable(msg string) {
+	t.regstate.mu.Lock()
 
-	if t.regstate.disabled {
-		return nil
+	if t.regstate.disabled.Load() {
+		t.regstate.mu.Unlock()
+		return // nothing to do
 	}
-	glog.Infof("Disabling %s", t.si)
 	if err := t.unregisterSelf(false); err != nil {
-		return err
+		t.regstate.mu.Unlock()
+		nlog.Errorf("%s but failed to remove self from Smap: %v", msg, err)
+		return
 	}
-	t.regstate.disabled = true
-	glog.Infof("%s has been disabled (unregistered)", t.si)
-	return nil
+	t.regstate.disabled.Store(true)
+	t.regstate.mu.Unlock()
+	nlog.Errorf("Warning: %s => disabled and removed self from Smap", msg)
 }
 
 // registers the target again if it was disabled by and internal event
-func (t *targetrunner) enable() error {
-	t.regstate.Lock()
-	defer t.regstate.Unlock()
+func (t *target) enable() error {
+	t.regstate.mu.Lock()
 
-	if !t.regstate.disabled {
+	if !t.regstate.disabled.Load() {
+		t.regstate.mu.Unlock()
 		return nil
 	}
-	glog.Infof("Enabling %s", t.si)
-	if _, err := t.joinCluster(); err != nil {
+	if _, err := t.joinCluster(apc.ActSelfJoinTarget); err != nil {
+		t.regstate.mu.Unlock()
+		nlog.Infof("%s failed to re-join: %v", t, err)
 		return err
 	}
-	t.regstate.disabled = false
-	glog.Infof("%s has been enabled", t.si)
+	t.regstate.disabled.Store(false)
+	t.regstate.mu.Unlock()
+	nlog.Infof("%s is now active", t)
 	return nil
 }
 
-// lookupRemoteSingle sends the message to the given target to see if it has the specific object.
-func (t *targetrunner) LookupRemoteSingle(lom *cluster.LOM, tsi *cluster.Snode) (ok bool) {
-	header := make(http.Header)
-	header.Add(cmn.HdrCallerID, t.SID())
-	header.Add(cmn.HdrCallerName, t.Sname())
-	query := make(url.Values)
-	query.Set(cmn.URLParamSilent, "true")
-	config := cmn.GCO.Get()
-	args := callArgs{
-		si: tsi,
-		req: cmn.ReqArgs{
+//
+// HeadObj* where target acts as a client
+//
+
+// HeadObjT2T checks with a given target to see if it has the object.
+// (compare with api.HeadObject)
+func (t *target) HeadObjT2T(lom *cluster.LOM, tsi *meta.Snode) (ok bool) {
+	q := lom.Bck().AddToQuery(nil)
+	q.Set(apc.QparamSilent, "true")
+	q.Set(apc.QparamFltPresence, strconv.Itoa(apc.FltPresent))
+	cargs := allocCargs()
+	{
+		cargs.si = tsi
+		cargs.req = cmn.HreqArgs{
 			Method: http.MethodHead,
-			Header: header,
-			Base:   tsi.URL(cmn.NetworkIntraControl),
-			Path:   cmn.URLPathObjects.Join(lom.Bck().Name, lom.ObjName),
-			Query:  query,
-		},
-		timeout: config.Timeout.CplaneOperation.D(),
+			Header: http.Header{
+				apc.HdrCallerID:   []string{t.SID()},
+				apc.HdrCallerName: []string{t.callerName()},
+			},
+			Base:  tsi.URL(cmn.NetIntraControl),
+			Path:  apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName),
+			Query: q,
+		}
+		cargs.timeout = cmn.Timeout.CplaneOperation()
 	}
-	res := t.call(args)
+	res := t.call(cargs)
 	ok = res.err == nil
+	freeCargs(cargs)
+	freeCR(res)
 	return
 }
 
-// lookupRemoteAll sends the broadcast message to all targets to see if they
-// have the specific object.
-func (t *targetrunner) lookupRemoteAll(lom *cluster.LOM, smap *smapX) *cluster.Snode {
-	header := make(http.Header)
-	header.Add(cmn.HdrCallerID, t.SID())
-	header.Add(cmn.HdrCallerName, t.Sname())
-	query := make(url.Values)
-	query.Set(cmn.URLParamSilent, "true")
-	query.Set(cmn.URLParamCheckExistsAny, "true") // lookup all mountpaths _and_ copy if misplaced
-	bck := lom.Bck().Bck
-	args := allocBcastArgs()
-	args.req = cmn.ReqArgs{
+// headObjBcast broadcasts to all targets to find out if anyone has the specified object.
+// NOTE: 1) apc.QparamCheckExistsAny to make an extra effort, 2) `ignoreMaintenance`
+func (t *target) headObjBcast(lom *cluster.LOM, smap *smapX) *meta.Snode {
+	q := lom.Bck().AddToQuery(nil)
+	q.Set(apc.QparamSilent, "true")
+	// lookup across all mountpaths and copy (ie., restore) if misplaced
+	q.Set(apc.QparamFltPresence, strconv.Itoa(apc.FltPresentCluster))
+	args := allocBcArgs()
+	args.req = cmn.HreqArgs{
 		Method: http.MethodHead,
-		Header: header,
-		Path:   cmn.URLPathObjects.Join(bck.Name, lom.ObjName),
-		Query:  cmn.AddBckToQuery(query, bck),
+		Header: http.Header{
+			apc.HdrCallerID:   []string{t.SID()},
+			apc.HdrCallerName: []string{t.callerName()},
+		},
+		Path:  apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName),
+		Query: q,
 	}
 	args.ignoreMaintenance = true
 	args.smap = smap
 	results := t.bcastGroup(args)
-	freeBcastArgs(args)
+	freeBcArgs(args)
 	for _, res := range results {
 		if res.err == nil {
 			si := res.si
-			freeCallResults(results)
+			freeBcastRes(results)
 			return si
 		}
 	}
-	freeCallResults(results)
+	freeBcastRes(results)
 	return nil
+}
+
+//
+// termination(s)
+//
+
+func (t *target) termKaliveX(action string) {
+	t.keepalive.ctrl(kaSuspendMsg)
+
+	err := fmt.Errorf("%s: term-kalive by %q", t, action)
+	dsort.Managers.AbortAll(err) // all dsort jobs
+	xreg.AbortAll(err)           // all xactions
+}
+
+func (t *target) shutdown(action string) {
+	t.regstate.mu.Lock()
+	daemon.stopping.Store(true)
+	t.regstate.mu.Unlock()
+
+	t.Stop(&errNoUnregister{action})
+}
+
+func (t *target) decommission(action string, opts *apc.ActValRmNode) {
+	t.regstate.mu.Lock()
+	daemon.stopping.Store(true)
+	t.regstate.mu.Unlock()
+
+	nlog.Infof("%s: %s %v", t, action, opts)
+	fs.Decommission(!opts.RmUserData /*ais metadata only*/)
+	cleanupConfigDir(t.Name(), opts.KeepInitialConfig)
+
+	fpath := filepath.Join(cmn.GCO.Get().ConfigDir, dbName)
+	if err := cos.RemoveFile(fpath); err != nil { // delete kvdb
+		nlog.Errorf("failed to delete kvdb: %v", err)
+	}
+	if !opts.NoShutdown {
+		t.Stop(&errNoUnregister{action})
+	}
+}
+
+// stop gracefully, return from rungroup.run
+func (t *target) Stop(err error) {
+	if !daemon.stopping.Load() {
+		// vs metasync
+		t.regstate.mu.Lock()
+		daemon.stopping.Store(true)
+		t.regstate.mu.Unlock()
+	}
+	if err == nil {
+		nlog.Infoln("Stopping " + t.String())
+	} else {
+		nlog.Warningf("Stopping %s: %v", t, err)
+	}
+	xreg.AbortAll(err)
+	t.htrun.stop(t.netServ.pub.s != nil && !isErrNoUnregister(err) /*rm from Smap*/)
 }

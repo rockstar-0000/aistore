@@ -1,9 +1,9 @@
-// +build nethttp
+//go:build nethttp
 
 // Package transport provides streaming object-based transport over http for intra-cluster continuous
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -12,10 +12,13 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
+
+const ua = "aisnode/streams"
 
 type Client interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -27,7 +30,7 @@ func whichClient() string { return "net/http" }
 func NewIntraDataClient() (client *http.Client) {
 	config := cmn.GCO.Get()
 
-	// apply global defaults
+	// compare with ais/httpcommon.go
 	wbuf, rbuf := config.Net.HTTP.WriteBufferSize, config.Net.HTTP.ReadBufferSize
 	if wbuf == 0 {
 		wbuf = cmn.DefaultWriteBufferSize
@@ -35,9 +38,12 @@ func NewIntraDataClient() (client *http.Client) {
 	if rbuf == 0 {
 		rbuf = cmn.DefaultReadBufferSize
 	}
-
+	tcpbuf := config.Net.L4.SndRcvBufSize
+	if tcpbuf == 0 {
+		tcpbuf = cmn.DefaultSendRecvBufferSize
+	}
 	return cmn.NewClient(cmn.TransportArgs{
-		SndRcvBufSize:   config.Net.L4.SndRcvBufSize,
+		SndRcvBufSize:   tcpbuf,
 		WriteBufferSize: wbuf,
 		ReadBufferSize:  rbuf,
 		UseHTTPS:        config.Net.HTTP.UseHTTPS,
@@ -50,18 +56,19 @@ func (s *streamBase) do(body io.Reader) (err error) {
 		request  *http.Request
 		response *http.Response
 	)
-	if request, err = http.NewRequest(http.MethodPut, s.toURL, body); err != nil {
+	if request, err = http.NewRequest(http.MethodPut, s.dstURL, body); err != nil {
 		return
 	}
 	if s.streamer.compressed() {
-		request.Header.Set(cmn.HdrCompress, cmn.LZ4Compression)
+		request.Header.Set(apc.HdrCompress, apc.LZ4Compression)
 	}
-	request.Header.Set(cmn.HdrSessID, strconv.FormatInt(s.sessID, 10))
+	request.Header.Set(apc.HdrSessID, strconv.FormatInt(s.sessID, 10))
+	request.Header.Set(cos.HdrUserAgent, ua)
 
 	response, err = s.client.Do(request)
 	if err != nil {
 		if verbose {
-			glog.Errorf("%s: Error [%v]", s, err)
+			nlog.Errorf("%s: Error [%v]", s, err)
 		}
 		return
 	}

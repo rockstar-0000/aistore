@@ -11,18 +11,17 @@ redirect_from:
 
 Training deep learning (DL) models on petascale datasets is essential for achieving competitive and state-of-the-art performance in applications such as speech, video analytics, and object recognition. However, existing distributed filesystems were not developed for the access patterns and usability requirements of DL jobs.
 
-In this [white paper](https://arxiv.org/abs/2001.01858) we describe AIStore and components, and then compare system performance experimentally using image classification workloads and storing training data on a variety of backends. For details, please see:
+In this [white paper](https://arxiv.org/abs/2001.01858) we describe AIStore (AIS) and components, and then compare system performance experimentally using image classification workloads and storing training data on a variety of backends.
 
-* AIStore [white paper](https://arxiv.org/abs/2001.01858).
-* IEEE BigData 2019 [poster](https://storagetarget.files.wordpress.com/2019/12/deep-learning-large-scale-phys-poster-1.pdf)
+See also:
 
-Also, for insights and specific requirements from a deep-learning perspective, please watch:
-
-* [Introduction to Large Scale Deep Learning](https://www.youtube.com/watch?v=kNuA2wflygM&list=PL0dsKxFNMcX4XcB0w1Wm-pvSfQu-eWM26)
+* [blog](https://aiatscale.org/blog)
+* [white paper](https://arxiv.org/abs/2001.01858)
+* [at-a-glance poster](https://storagetarget.files.wordpress.com/2019/12/deep-learning-large-scale-phys-poster-1.pdf)
 
 The rest of this document is structured as follows:
 
-- [At-a-Glance](#at-a-glance)
+- [At a glance](#at-a-glance)
 - [ETL](#etl)
 - [Recently Added](#recently-added)
 - [Design Philosophy](#design-philosophy)
@@ -31,24 +30,39 @@ The rest of this document is structured as follows:
 - [Open Format](#open-format)
 - [Existing Datasets](#existing-datasets)
 - [Data Protection](#data-protection)
+  - [Erasure Coding vs IO Performance](#erasure-coding-vs-io-performance)
 - [Scale-Out](#scale-out)
 - [HA](#ha)
 - [Other Services](#other-services)
 - [dSort](#dsort)
 - [CLI](#cli)
-- [Python Client](#python-client)
 - [AIS no-limitations principle](#ais-no-limitations-principle)
 
+## Terminology
 
-## At-a-Glance
+* [Backend Provider](providers.md) - an abstraction, and simultaneously an API-supported option, that allows to delineate between "remote" and "local" buckets with respect to a given AIS cluster.
 
-Following is a high-level block diagram with an emphasis on supported (frontend and backend) APIs and the capability to scale-out horizontally. The picture also tries to make the point that AIStore aggregates arbitrary numbers of storage servers with local drives,  whereby each drive is formatted with a local filesystem (e. g., xfs or zfs).
+* [Unified Global Namespace](providers.md) - AIS clusters *attached* to each other, effectively, form a super-cluster providing unified global namespace whereby all buckets and all objects of all included clusters are uniformly accessible via any and all individual access points (of those clusters).
+
+* [Mountpath](configuration.md) - a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS can fully own and utilize (to store user data and system metadata). Note that any given disk (or RAID) can have (at most) one mountpath - meaning **no disk sharing**. Secondly, mountpath directories cannot be nested. Further:
+   - a mountpath can be temporarily disabled and (re)enabled;
+   - a mountpath can also be detached and (re)attached, thus effectively supporting growth and "shrinkage" of local capacity;
+   - it is safe to execute the 4 listed operations (enable, disable, attach, detach) at any point during runtime;
+   - in a typical deployment, the total number of mountpaths would compute as a direct product of (number of storage targets) x (number of disks in each target).
+
+* [Xaction](/xact/README.md) - asynchronous batch operations that may take many seconds (minutes, hours, etc.) to execute - are called *eXtended actions* or simply *xactions*. CLI and [CLI documentation](/docs/cli) refers to such operations as **jobs** - the more familiar term that can be used interchangeably. Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, archiving multiple objects, copying buckets, and many more. All [eXtended actions](/xact/README.md) support generic [API](/api/xaction.go) and [CLI](/docs/cli/job.md#show-job-statistics) to show both common counters (byte and object numbers) as well as operation-specific extended statistics.
+
+## At a glance
+
+Following is a high-level block diagram with an emphasis on supported frontend and backend APIs, and the capability to scale-out horizontally. The picture also tries to make the point that AIS aggregates arbitrary numbers of storage servers with local drive(s), whereby each drive is formatted with a local filesystem of choice (e.g., xfs or zfs).
 
 ![At-a-Glance](images/ais-block.png)
 
+All user data is at any point in time equally [balanced](/docs/rebalance.md) across all storage nodes (aka "targets"). Which, combined with zero (I/O routing and metadata processing) overhead, provides for linear scale with no limitation on the total number of aggregated storage drives.
+
 ## ETL
 
-AIStore is a hyper-converged architecture tailored specifically to run AI apps. To that end, we are supporting [ETL offload](/etl/README.md): the capability to run custom extract-transform-load workloads close to data on (and by) the storage cluster:
+AIStore is a hyper-converged architecture tailored specifically to run [extract-transform-load](/ext/etl/README.md) workloads - run them close to data and on (and by) all storage nodes in parallel:
 
 ![etl-v3.3](images/etl-v3.3.png)
 
@@ -59,22 +73,8 @@ For background and further references, see:
 
 ## Recently Added
 
-- (**new**) [AIS Kubernetes Operator](https://github.com/NVIDIA/ais-k8s)
-- (**new**) DNS hostnames - public and intra-cluster networks;
-- (**new**) HDFS backend;
-- (**new**) Cluster and node shutdown and decommission (API, CLI);
-- bucket ACLs, users and roles, bucket and cluster level permissions;
-- [CLI](videos.md#cli-top-level-commands) (category, action, subject) auto-completions;
-- (**new**) Metadata and system data versioning and backward compatibility;
-- List objects v2: optimized `list-objects` to greatly reduce response times;
-- (**new**) Query objects: extends `list-objects` with advanced filtering capabilities;
-- (**new**) Downloader:  an option to keep AIS bucket in-sync with a (downloaded) destination;
-- (**new**) Build-time option to run AIS cluster in a reverese-proxy mode;
-- and more (for details, see https://github.com/NVIDIA/aistore/releases).
-
-In addition to AIS (native) REST API and CLI with extended capabilities to manipulate distributed content, AIStore also supports a growing list of [Backend providers](providers.md).
-
-Each specific capability is separately documented elsewhere. In particular, supported backend providers and *unified global namespace* are described [here](providers.md).
+- [v3.16](https://github.com/NVIDIA/aistore/releases/tag/v1.3.16)
+- [v3.12](https://github.com/NVIDIA/aistore/releases/tag/v1.3.15)
 
 ## Design Philosophy
 
@@ -111,16 +111,6 @@ Finally, AIS target provides a number of storage services with [S3-like RESTful 
 
 ![AIS target block diagram](images/ais-target-20-block.png)
 
-## Terminology
-
-* [Backend Provider](providers.md) - an abstraction, and simultaneously an API-supported option, that allows to delineate between "remote" and "local" buckets with respect to a given AIS cluster.
-
-* [Unified Global Namespace](providers.md) - AIS clusters *attached* to each other, effectively, form a super-cluster providing unified global namespace whereby all buckets and all objects of all included clusters are uniformly accessible via any and all individual access points (of those clusters).
-
-* [Mountpath](configuration.md) - a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS utilizes to store user data and AIS metadata. A mountpath can be disabled and (re)enabled, automatically or administratively, at any point during runtime. In a given cluster, a total number of mountpaths would normally compute as a direct product of (number of storage targets) x (number of disks in each target).
-
-* [Xaction](/xaction/README.md) - asynchronous batch operations that may take many seconds (minutes, sometimes hours) to execute are called *eXtended actions* or simply *xactions*. CLI docs refers to such operations as **jobs** - the more familiar term that can be used interchangeably. Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, archiving multiple objects, copying buckets, and many more. All [eXtended actions](/xaction/README.md) support generic [API](/api/xaction.go) and [CLI](/docs/cli/job.md#show-job-statistics) to show both common counters (byte and object numbers) as well as operation-specific extended statistics.
-
 ## Traffic Patterns
 
 In AIS, all inter- and intra-cluster networking is based on HTTP/1.1 (with HTTP/2 option currently under development).
@@ -153,13 +143,17 @@ Notwithstanding, AIS stores and then maintains object replicas, erasure-coded sl
 
 ## Existing Datasets
 
-One common way to use AIStore includes the most basic step: populating it with an existing dataset, or datasets from remote buckets (AWS, Google Cloud, Azure, or HDFS) or any vanilla HTTP(S) resources. To this end, AIS provides 6 (six) easy ways ranging from the (conventional) on-demand caching to (advanced) *promoting* of colocated files and directories:
+Common way to use AIStore include the most fundamental and, often, the very first step: populating AIS cluster with an existing dataset, or datasets. Those (datasets) can come from remote buckets (AWS, Google Cloud, Azure), HDFS directories, NFS shares, local files, or any vanilla HTTP(S) locations.
+
+To this end, AIS provides 6 (six) easy ways ranging from the conventional on-demand caching to *promoting* colocated files and directories, and more.
+
+> Related references and examples include this [technical blog](https://aiatscale.org/blog/2021/12/07/cp-files-to-ais) that shows how to copy a file-based dataset in two easy steps.
 
 1. [Cold GET](#existing-datasets-cold-get)
 2. [Prefetch](#existing-datasets-batch-prefetch)
 3. [Internet Downloader](#existing-datasets-integrated-downloader)
 4. [HTTP(S) Datasets](#existing-datasets-https-datasets)
-5. [Promote (API and CLI)](#existing-datasets-promote-api-and-cli)
+5. [Promote local or shared files](#promote-local-or-shared-files)
 6. [Backend Bucket](bucket.md#backend-bucket)
 
 In particular:
@@ -202,21 +196,48 @@ $ export http_proxy=<AIS proxy IPv4 or hostname>
 
 In combination, these two settings have an effect of redirecting all **unmodified** client-issued HTTP(S) requests to the AIS proxy/gateway with subsequent execution transparently from the client perspective. AIStore will on the fly create a bucket to store and cache HTTP(S) reachable files all the while supporting the entire gamut of functionality including ETL. Examples for HTTP(S) datasets can be found in [this readme](bucket.md#public-https-dataset)
 
-### Existing Datasets: Promote (API and CLI)
+### Promote local or shared files
 
-Finally, AIS can *promote* files and directories to objects. The only requirement is that the files and directories in question are colocated within AIS storage target machines.
+AIS can also `promote` files and directories to objects. The operation entails synchronous or asynchronus massively-parallel downloading of any accessible file source, including:
 
-Let's consider a quick example. Say, some (or all) of the deployed storage nodes contain a directory called `/tmp/mydata`. By running the following [CLI](/docs/cli.md), we could make AIS objects (**one file = one object**) out of all files scattered across all nodes:
+- a local directory (or directories) of any target node (or nodes);
+- a file share mounted on one or several (or all) target nodes in the cluster.
 
-```console
-$ ais object promote /tmp/mydata mybucket/ -r --keep=false
-```
+You can now use `promote` ([CLI](/docs/cli/object.md#promote-files-and-directories), API) to populate AIS datasets with **any external file source**.
 
-In this example, `mybucket` would be the designated (destination) bucket.
+Originally (experimentally) introduced in the v3.0 to handle "files and directories colocated within AIS storage target machines", `promote` has been redefined, extended (in terms of supported options and permutations), and completely reworked in the v3.9.
 
 ## Data Protection
 
-AIS [supports](storage_svcs.md) end-to-end checksum protection, 2-way local mirroring, and Reed-Solomon [erasure coding](storage_svcs.md#erasure-coding) - thus providing for arbitrary user-defined levels of cluster-wide data redundancy and space efficiency.
+AIS supports end-to-end checksumming and two distinct [storage services](storage_svcs.md) - N-way mirroring and erasure coding - providing for data redundancy.
+
+The functionality that we denote as end-to-end checksumming further entails:
+
+  - self-healing upon detecting corruption,
+  - optimizing-out redundant writes upon detecting existence of the destination object,
+  - utilizing client-provided checksum (iff provided) to perform end-to-end checksum validation,
+  - utilizing Cloud checksum of an object that originated in a Cloud bucket, and
+  - utilizing its version to perform so-called "cold" GET when object exists both in AIS and in the Cloud,
+
+and more.
+
+Needless to say, each of these sub-topics may require additional discussion of:
+
+* [configurable options](configuration.md),
+* [default settings](bucket.md), and
+* the corresponding performance tradeoffs.
+
+### Erasure Coding vs IO Performance
+
+When an AIS bucket is EC-configured as (D, P), where D is the number of data slices and P - the number of parity slices, the corresponding space utilization ratio is not `(D + P)/D`, as one would assume.
+
+It is, actually, `1 + (D + P)/D`.
+
+This is because AIS was created to perform and scale in the first place. AIS always keeps one full replica at its [HRW location](traffic_patterns.md).
+
+AIS will utilize EC to automatically self-heal upon detecting corruption (of the full replica). When a client performs a read on a non-existing (or not found) name, AIS will check with EC - assuming, obviously, that the bucket is erasure coded.
+
+EC-related philosophy can be summarized as one word: **recovery**. EC plays no part in the fast path.
 
 ## Scale-Out
 
@@ -228,10 +249,12 @@ Similar to the AIS gateways, AIS storage targets can join and leave at any momen
 
 ## HA
 
-AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](http_api.md). Gateways can be ad hoc added and removed, deployed remotely and/or locally to the compute clients (the latter option will eliminate one network roundtrip to resolve object locations).
+AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](http_api.md).
+
+Gateways can be ad hoc added and removed, deployed remotely and/or locally to the compute clients (the latter option will eliminate one network roundtrip to resolve object locations).
 
 ## Fast Tier
-AIS can be deployed as a fast tier in front of existing Amazon S3 and Google Cloud (GCP) storage.
+AIS can be deployed as a fast tier in front of any of the multiple supported [backends](providers.md).
 
 As a fast tier, AIS populates itself on demand (via *cold* GETs) and/or via its own *prefetch* API (see [List/Range Operations](batch.md#listrange-operations)) that runs in the background to download batches of objects.
 
@@ -272,6 +295,7 @@ One salient feature of AIS CLI is its Bash style [auto-completions](/docs/cli.md
 AIS CLI is currently quickly developing. For more information, please see the project's own [README](/docs/cli.md).
 
 ## AIS no-limitations principle
+
 There are **no** designed-in limitations on the:
 
 * object sizes

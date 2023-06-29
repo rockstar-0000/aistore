@@ -12,21 +12,22 @@ echo "Enter number of proxies (gateway):"
 read -r PROXY_CNT
 is_number ${PROXY_CNT}
 if [[ ${PROXY_CNT} -lt 1 ]]; then
-  print_error "${PROXY_CNT} is less than 1"
+  exit_error "${PROXY_CNT} is less than 1"
 fi
 
 source utils/parse_fsparams.sh
 source utils/parse_cld.sh
 
-export DOCKER_IMAGE="aistore/aisnode:minikube"
+export DOCKER_IMAGE="aistorage/aisnode-minikube:latest"
+
 echo "Build and push to local registry: (y/n) ?"
 read -r build
 if [[ "$build" == "y" ]]; then
-  echo "Building image with mode=${MODE}..."
-  export DOCKER_IMAGE="localhost:5000/aisnode:minikube"
-  docker build ./../../../ --force-rm -t ${DOCKER_IMAGE} --build-arg MODE="${MODE}" -f Dockerfile-aisnode-ubuntu
-  docker push ${DOCKER_IMAGE}
+  export REGISTRY_URL="localhost:5000" && \
+  ./utils/build_aisnode.sh
+  export DOCKER_IMAGE="${REGISTRY_URL}/${DOCKER_IMAGE}"
 fi
+
 
 PRIMARY_PORT=8080
 HOST_URL="http://$(minikube ip):${PRIMARY_PORT}"
@@ -73,25 +74,14 @@ done
 echo "Waiting for the targets to be ready..."
 kubectl wait --for="condition=ready" --timeout=2m pods -l type=aistarget
 
-echo "Would you like to deploy datascience stack? (y/n) ?"
-read -r ds_stack
-if  [[ "$ds_stack" == "y" ]]; then
-  echo "Deploying datascience stack..."
-  docker_image="aistore/datascience:latest"
-  jupyter_port=${JUPYTER_PORT:-8888}
-  jupyter_local_dir=${JUPYTER_LOCAL_DIR:-"$(pwd)/ais_datascience"}
-  mkdir -p ${jupyter_local_dir}
-  if [[ "${JUPYTER_TOKEN}" == "" ]]; then
-    echo "Enter token to access jupyter notebook:"
-    read -s -r JUPYTER_TOKEN
-  fi
-  docker run -p ${jupyter_port}:8888 --name ais_datascience -v ${jupyter_local_dir}:/home/jovyan/work -e AIS_ENDPOINT=${AIS_PRIMARY_URL} --entrypoint='/bin/bash' -d ${docker_image} -c "cd work && start-notebook.sh --NotebookApp.token='${JUPYTER_TOKEN}'"
-fi
-
 echo "List of running pods"
 kubectl get pods -o wide
 
 echo "Done."
 echo ""
+(cd ../../../  && make cli)
+echo ""
 echo "Set the \"AIS_ENDPOINT\" for use of CLI:"
 echo "export AIS_ENDPOINT=\"http://$(minikube ip):8080\""
+
+export AIS_ENDPOINT="http://$(minikube ip):8080"

@@ -1,6 +1,6 @@
 // Package fs implements an AIStore file system.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -72,12 +72,12 @@ func (fs *aisfs) ReadFile(_ context.Context, req *fuseops.ReadFileOp) (err error
 	req.BytesRead, err = fhandle.readChunk(req.Dst, req.Offset)
 
 	var (
-		ioErr   *ais.ErrIO
-		httpErr *cmn.ErrHTTP
+		ioErr *ais.ErrIO
+		herr  *cmn.ErrHTTP
 	)
-	if errors.As(err, &ioErr) && errors.As(ioErr.Err, &httpErr) {
+	if errors.As(err, &ioErr) && errors.As(ioErr.Err, &herr) {
 		// Forget file on 404 error
-		if httpErr.Status == http.StatusNotFound {
+		if herr.Status == http.StatusNotFound {
 			fhandle.file.parent.ForgetFile(filepath.Base(fhandle.file.Path()))
 			return syscall.ENOENT
 		}

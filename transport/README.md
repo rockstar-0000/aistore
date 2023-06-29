@@ -235,24 +235,11 @@ Finally, there are two important facts to remember:
 
 ## Testing
 
-* **Run all tests while redirecting glog to STDERR**:
+* **Run tests matching "Multi" with debug-enabled assertions**:
 
 ```console
-$ go test -v -logtostderr=true
+$ go test -v -run=Multi -tags=debug
 ```
-
-* **Run tests matching "Multi" with debug-enabled assertions and glog level=1 (non-verbose)**:
-
-```console
-$ AIS_DEBUG=transport=1 go test -v -run=Multi -tags=debug
-```
-
-* **Same as above, with super-verbose glog**:
-
-```console
-$ AIS_DEBUG=transport=4 go test -v -run=Multi -tags=debug -logtostderr=true
-```
-
 
 * **Use `nethttp` build tag to run with net/http, e.g.**:
 
@@ -272,7 +259,6 @@ For more examples, please see tests in the package directory.
 
 | Environment Variable | Description |
 |--- | --- |
-| `AIS_DEBUG` | Enable inline assertions and verbose tracing (eg. `AIS_DEBUG=transport=1`) |
 | `AIS_STREAM_BURST_NUM` | Max number of objects the caller is permitted to post for sending without experiencing any sort of back-pressure |
 | `AIS_STREAM_DRY_RUN` | If enabled, read and immediately discard all read data (can be used to evaluate client-side throughput) |
 

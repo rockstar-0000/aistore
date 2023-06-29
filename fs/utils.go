@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -19,52 +19,13 @@ const maxNumCopies = 16
 var (
 	pid  int64 = 0xDEADBEEF   // pid of the current process
 	spid       = "0xDEADBEEF" // string version of the pid
-
-	CSM *ContentSpecMgr
 )
 
 func init() {
 	pid = int64(os.Getpid())
 	spid = strconv.FormatInt(pid, 16)
 
-	CSM = &ContentSpecMgr{RegisteredContentTypes: make(map[string]ContentResolver, 8)}
-}
-
-// A simplified version of the filepath.Rel that determines the
-// relative path of targ (target) to mpath. Note that mpath and
-// targ must be clean (as in: filepath.Clean)
-// pathPrefixMatch will only return true if the targ is equivalent to
-// mpath + relative path.
-func pathPrefixMatch(mpath, targ string) (rel string, match bool) {
-	if len(mpath) == len(targ) && mpath == targ {
-		return ".", true
-	}
-	bl := len(mpath)
-	tl := len(targ)
-	var b0, bi, t0, ti int
-	for {
-		for bi < bl && mpath[bi] != filepath.Separator {
-			bi++
-		}
-		for ti < tl && targ[ti] != filepath.Separator {
-			ti++
-		}
-		if targ[t0:ti] != mpath[b0:bi] {
-			break
-		}
-		if bi < bl {
-			bi++
-		}
-		if ti < tl {
-			ti++
-		}
-		b0 = bi
-		t0 = ti
-	}
-	if b0 != bl {
-		return "", false
-	}
-	return targ[t0:], true
+	CSM = &contentSpecMgr{m: make(map[string]ContentResolver, 8)}
 }
 
 func IsDirEmpty(dir string) (names []string, empty bool, err error) {
@@ -117,7 +78,7 @@ func ValidateNCopies(tname string, copies int) (err error) {
 		return fmt.Errorf("%s: invalid num copies %d, must be in [1, %d] range",
 			tname, copies, maxNumCopies)
 	}
-	availablePaths, _ := Get()
+	availablePaths := GetAvail()
 	if num := len(availablePaths); num < copies {
 		return fmt.Errorf("%s: number of copies (%d) exceeds the number of mountpaths (%d)",
 			tname, copies, num)

@@ -7,12 +7,10 @@ ais object put $OBJECT_1.txt ais://$BUCKET_1/obj_1.txt
 ais object put $OBJECT_1.txt ais://$BUCKET_1/obj_2.txt
 ais object put $OBJECT_1.txt ais://$BUCKET_1/obj_3.txt
 
-ais object put --source-bck=ais://$BUCKET_1 --template="obj_{1..3}.txt" --archive ais://$BUCKET_2/tmpl.tar
-ais object put --source-bck=ais://$BUCKET_1 --list="obj_1.txt,obj_2.txt,obj_3.txt" --archive ais://$BUCKET_2/list.tar
+ais archive bucket ais://$BUCKET_1 ais://$BUCKET_2/tmpl.tar --template="obj_{1..3}.txt" --wait
+ais archive bucket ais://$BUCKET_1 ais://$BUCKET_2/list.tar --list="obj_1.txt,obj_2.txt,obj_3.txt" --wait
 
-sleep 5 // IGNORE // wait for all archives are created
+ais archive put $OBJECT_1.txt ais://$BUCKET_2/tmpl.tar -archpath=fourth.txt --append
 
-ais object put $OBJECT_1.txt ais://$BUCKET_2/tmpl.tar -archpath=fourth.txt
-
-ais ls ais://$BUCKET_2 --prefix=list --list-archive | wc -l
-ais ls ais://$BUCKET_2 --prefix=tmpl --list-archive | wc -l
+ais ls ais://$BUCKET_2 --prefix=list --archive | wc -l
+ais ls ais://$BUCKET_2 --prefix=tmpl --archive | wc -l

@@ -1,7 +1,7 @@
 // Package ios is a collection of interfaces to the local storage subsystem;
 // the package includes OS-dependent implementations for those interfaces.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package ios
 
@@ -11,8 +11,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 // The "sectors" in question are the standard UNIX 512-byte sectors, not any device- or filesystem-specific block size
@@ -20,7 +21,8 @@ import (
 const sectorSize = int64(512)
 
 // based on https://www.kernel.org/doc/Documentation/iostats.txt
-//   and https://www.kernel.org/doc/Documentation/block/stat.txt
+//
+//	and https://www.kernel.org/doc/Documentation/block/stat.txt
 type dblockStat struct {
 	readComplete  int64 // 1 - # of reads completed
 	readMerged    int64 // 2 - # of reads merged
@@ -42,10 +44,10 @@ var (
 
 var blockStats = make(diskBlockStats, 10)
 
-// readDiskStats returns disk stats
-func readDiskStats(disks, sysfnames cos.SimpleKVs) diskBlockStats {
+// readStats returns disk stats
+func readStats(disks, sysfnames cos.StrKVs) diskBlockStats {
 	for d := range disks {
-		stat, ok := readSingleDiskStat(sysfnames[d])
+		stat, ok := _read(sysfnames[d])
 		if !ok {
 			continue
 		}
@@ -55,10 +57,10 @@ func readDiskStats(disks, sysfnames cos.SimpleKVs) diskBlockStats {
 }
 
 // https://www.kernel.org/doc/Documentation/block/stat.txt
-func readSingleDiskStat(sysfn string) (dblockStat, bool) {
+func _read(sysfn string) (dblockStat, bool) {
 	file, err := os.Open(sysfn)
 	if err != nil {
-		glog.Errorf("%s: %v", sysfn, err)
+		nlog.Errorf("%s: %v", sysfn, err)
 		return dblockStat{}, false
 	}
 	scanner := bufio.NewScanner(file)
@@ -69,30 +71,28 @@ func readSingleDiskStat(sysfn string) (dblockStat, bool) {
 	if len(fields) < 11 {
 		return dblockStat{}, false
 	}
-	return extractDiskStat(fields, 0), true
+	return _extact(fields, 0), true
 }
 
-func extractDiskStat(fields []string, offset int) dblockStat {
+func _extact(fields []string, offset int) dblockStat {
 	return dblockStat{
-		extractI64(fields[offset]),
-		extractI64(fields[offset+1]),
-		extractI64(fields[offset+2]),
-		extractI64(fields[offset+3]),
-		extractI64(fields[offset+4]),
-		extractI64(fields[offset+5]),
-		extractI64(fields[offset+6]),
-		extractI64(fields[offset+7]),
-		extractI64(fields[offset+8]),
-		extractI64(fields[offset+9]),
-		extractI64(fields[offset+10]),
+		_exI64(fields[offset]),
+		_exI64(fields[offset+1]),
+		_exI64(fields[offset+2]),
+		_exI64(fields[offset+3]),
+		_exI64(fields[offset+4]),
+		_exI64(fields[offset+5]),
+		_exI64(fields[offset+6]),
+		_exI64(fields[offset+7]),
+		_exI64(fields[offset+8]),
+		_exI64(fields[offset+9]),
+		_exI64(fields[offset+10]),
 	}
 }
 
-func extractI64(field string) int64 {
+func _exI64(field string) int64 {
 	val, err := strconv.ParseInt(field, 10, 64)
-	if err != nil {
-		cos.Assertf(false, "failed to parse %q field to integer", field)
-	}
+	debug.AssertNoErr(err)
 	return val
 }
 

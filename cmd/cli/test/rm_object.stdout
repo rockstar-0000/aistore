@@ -1,2 +1,3 @@
-PUT "object.txt" into bucket "ais://$BUCKET"
-"object.txt" deleted from "ais://$BUCKET" bucket
+^PUT.*=> ais://$BUCKET/object.txt$
+
+deleted "object.txt" from ais://$BUCKET

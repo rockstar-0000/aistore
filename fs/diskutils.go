@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -8,8 +8,8 @@ import "github.com/NVIDIA/aistore/ios"
 
 func GetTotalDisksSize() (uint64, error) {
 	var (
-		totalSize         = uint64(0)
-		availablePaths, _ = Get()
+		totalSize      uint64
+		availablePaths = GetAvail()
 	)
 	for mpath := range availablePaths {
 		numBlocks, _, blockSize, err := ios.GetFSStats(mpath)

@@ -7,13 +7,14 @@ package ais
 import (
 	"net/http"
 
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/dsort"
+	"github.com/NVIDIA/aistore/ext/dsort"
 )
 
 // POST /v1/sort
-func (p *proxyrunner) proxyStartSortHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) proxyStartSortHandler(w http.ResponseWriter, r *http.Request) {
 	rs := &dsort.RequestSpec{}
 	if cmn.ReadJSON(w, r, &rs) != nil {
 		return
@@ -24,15 +25,15 @@ func (p *proxyrunner) proxyStartSortHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	bck := cluster.NewBckEmbed(parsedRS.Bck)
-	args := bckInitArgs{p: p, w: w, r: r, bck: bck, onlyRemote: true, perms: cmn.AccessObjLIST | cmn.AccessGET}
-	if _, err = args.initAndTry(bck.Name); err != nil {
+	bck := meta.CloneBck(&parsedRS.Bck)
+	args := bckInitArgs{p: p, w: w, r: r, bck: bck, perms: apc.AceObjLIST | apc.AceGET}
+	if _, err = args.initAndTry(); err != nil {
 		return
 	}
 
-	bck = cluster.NewBckEmbed(parsedRS.OutputBck)
-	args = bckInitArgs{p: p, w: w, r: r, bck: bck, onlyRemote: true, perms: cmn.AccessPUT}
-	if _, err = args.initAndTry(bck.Name); err != nil {
+	bck = meta.CloneBck(&parsedRS.OutputBck)
+	args = bckInitArgs{p: p, w: w, r: r, bck: bck, perms: apc.AcePUT}
+	if _, err = args.initAndTry(); err != nil {
 		return
 	}
 

@@ -1,16 +1,16 @@
-// +build !hdfs
+//go:build !hdfs
 
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
 import (
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cmn"
 )
 
-func NewHDFS(_ cluster.Target) (cluster.BackendProvider, error) {
-	return nil, newErrInitBackend(cmn.ProviderHDFS)
+func NewHDFS(_ cluster.TargetPut) (cluster.BackendProvider, error) {
+	return nil, newErrInitBackend(apc.HDFS)
 }

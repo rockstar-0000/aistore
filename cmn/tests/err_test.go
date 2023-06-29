@@ -1,6 +1,6 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package tests
 
@@ -9,14 +9,14 @@ import (
 	"testing"
 
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/devtools/tassert"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 func TestAbortedErrorAs(t *testing.T) {
 	mockDetails := "mock details"
 	mockWhat := "mock what"
 
-	abortedError := cmn.NewAbortedError(mockWhat, mockDetails)
+	abortedError := cmn.NewErrAborted(mockWhat, mockDetails, nil)
 	tassert.Fatalf(t, cmn.IsErrAborted(abortedError), "expected errors.As to return true on the same error type")
 
 	mockError := fmt.Errorf("wrapping aborted error %w", abortedError)

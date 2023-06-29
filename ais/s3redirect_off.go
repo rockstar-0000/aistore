@@ -1,4 +1,4 @@
-// +build s3rproxy
+//go:build s3rproxy
 
 // Package ais provides core functionality for the AIStore object storage.
 /*
@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 )
 
 func init() {
@@ -26,6 +26,6 @@ func init() {
 // * docs/s3compat.md
 // * Makefile (for `s3rproxy` build tag)
 // * ais/s3redirect_on.go
-func (p *proxyrunner) s3Redirect(w http.ResponseWriter, r *http.Request, si *cluster.Snode, _, _ string) {
+func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snode, _, _ string) {
 	p.reverseNodeRequest(w, r, si)
 }

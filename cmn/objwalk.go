@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -9,58 +9,60 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
-func SortBckEntries(bckEntries []*BucketEntry) {
+type LsoEntries []*LsoEntry // separately from (code-generated) objlist* - no need to msgpack
+
+func SortLso(bckEntries LsoEntries) {
 	entryLess := func(i, j int) bool {
 		if bckEntries[i].Name == bckEntries[j].Name {
-			return bckEntries[i].Flags&EntryStatusMask < bckEntries[j].Flags&EntryStatusMask
+			return bckEntries[i].Flags&apc.EntryStatusMask < bckEntries[j].Flags&apc.EntryStatusMask
 		}
 		return bckEntries[i].Name < bckEntries[j].Name
 	}
 	sort.Slice(bckEntries, entryLess)
 }
 
-func deduplicateBckEntries(bckEntries []*BucketEntry, maxSize uint) ([]*BucketEntry, string) {
-	objCount := uint(len(bckEntries))
-
-	j := 0
-	token := ""
-	for _, obj := range bckEntries {
-		if j > 0 && bckEntries[j-1].Name == obj.Name {
+func DedupLso(entries LsoEntries, maxSize uint) ([]*LsoEntry, string) {
+	var (
+		token    string
+		j        int
+		objCount = uint(len(entries))
+	)
+	for _, obj := range entries {
+		if j > 0 && entries[j-1].Name == obj.Name {
 			continue
 		}
-		bckEntries[j] = obj
+		entries[j] = obj
 		j++
 
 		if maxSize > 0 && j == int(maxSize) {
 			break
 		}
 	}
-
-	// Set extra infos to nil to avoid memory leaks
-	// see NOTE on https://github.com/golang/go/wiki/SliceTricks
+	// nullify discarded entries to avoid leaks (e.g. https://github.com/golang/go/wiki/SliceTricks)
 	for i := j; i < int(objCount); i++ {
-		bckEntries[i] = nil
+		entries[i] = nil
 	}
 	if maxSize > 0 && objCount >= maxSize {
-		token = bckEntries[j-1].Name
+		token = entries[j-1].Name
 	}
-	return bckEntries[:j], token
+	return entries[:j], token
 }
 
-// ConcatObjLists takes a slice of object lists and concatenates them: all lists
+// ConcatLso takes a slice of object lists and concatenates them: all lists
 // are appended to the first one.
 // If maxSize is greater than 0, the resulting list is sorted and truncated. Zero
 // or negative maxSize means returning all objects.
-func ConcatObjLists(lists []*BucketList, maxSize uint) (objs *BucketList) {
+func ConcatLso(lists []*LsoResult, maxSize uint) (objs *LsoResult) {
 	if len(lists) == 0 {
-		return &BucketList{}
+		return &LsoResult{}
 	}
 
-	objs = &BucketList{}
-	objs.Entries = make([]*BucketEntry, 0)
+	objs = &LsoResult{}
+	objs.Entries = make(LsoEntries, 0)
 
 	for _, l := range lists {
 		objs.Flags |= l.Flags
@@ -74,14 +76,14 @@ func ConcatObjLists(lists []*BucketList, maxSize uint) (objs *BucketList) {
 	// For corner case: we have objects with replicas on page threshold
 	// we have to sort taking status into account. Otherwise wrong
 	// one(Status=moved) may get into the response
-	SortBckEntries(objs.Entries)
+	SortLso(objs.Entries)
 
 	// Remove duplicates
-	objs.Entries, objs.ContinuationToken = deduplicateBckEntries(objs.Entries, maxSize)
+	objs.Entries, objs.ContinuationToken = DedupLso(objs.Entries, maxSize)
 	return
 }
 
-// MergeObjLists takes a few object lists and merges its content: properties
+// MergeLso takes a few object lists and merges its content: properties
 // of objects with the same name are merged.
 // The function is used to merge eg. the requests from targets for a cloud
 // bucket list: each target reads cloud list page and fills with available info.
@@ -89,75 +91,69 @@ func ConcatObjLists(lists []*BucketList, maxSize uint) (objs *BucketList) {
 // them to get single list with merged information for each object.
 // If maxSize is greater than 0, the resulting list is sorted and truncated. Zero
 // or negative maxSize means returning all objects.
-func MergeObjLists(lists []*BucketList, maxSize uint) (objs *BucketList) {
+func MergeLso(lists []*LsoResult, maxSize uint) *LsoResult {
 	if len(lists) == 0 {
-		return &BucketList{}
+		return &LsoResult{}
 	}
-
-	bckList := lists[0] // main list to collect all info
-	contiunationToken := bckList.ContinuationToken
-
+	resList := lists[0]
+	continuationToken := resList.ContinuationToken
 	if len(lists) == 1 {
-		SortBckEntries(bckList.Entries)
-		bckList.Entries, _ = deduplicateBckEntries(bckList.Entries, maxSize)
-		bckList.ContinuationToken = contiunationToken
-		return bckList
+		SortLso(resList.Entries)
+		resList.Entries, _ = DedupLso(resList.Entries, maxSize)
+		resList.ContinuationToken = continuationToken
+		return resList
 	}
 
-	objSet := make(map[string]*BucketEntry, len(bckList.Entries))
+	lst := make(map[string]*LsoEntry, len(resList.Entries))
 	for _, l := range lists {
-		bckList.Flags |= l.Flags
-		if contiunationToken < l.ContinuationToken {
-			contiunationToken = l.ContinuationToken
+		resList.Flags |= l.Flags
+		if continuationToken < l.ContinuationToken {
+			continuationToken = l.ContinuationToken
 		}
 		for _, e := range l.Entries {
-			entry, exists := objSet[e.Name]
+			entry, exists := lst[e.Name]
 			if !exists {
-				objSet[e.Name] = e
+				lst[e.Name] = e
 				continue
 			}
 			// detect which list contains real information about the object
 			if !entry.CheckExists() && e.CheckExists() {
 				e.Version = cos.Either(e.Version, entry.Version)
-				objSet[e.Name] = e
+				lst[e.Name] = e
 			} else {
-				// TargetURL maybe filled even if an object is not cached
-				entry.TargetURL = cos.Either(entry.TargetURL, e.TargetURL)
+				entry.Location = cos.Either(entry.Location, e.Location)
 				entry.Version = cos.Either(entry.Version, e.Version)
 			}
 		}
 	}
 
-	if len(objSet) == 0 {
-		return &BucketList{}
+	if len(lst) == 0 {
+		return &LsoResult{}
 	}
 
-	// cleanup and refill
-	bckList.Entries = bckList.Entries[:0]
-	for _, v := range objSet {
-		bckList.Entries = append(bckList.Entries, v)
+	// cleanup and sort
+	resList.Entries = resList.Entries[:0]
+	for _, v := range lst {
+		resList.Entries = append(resList.Entries, v)
 	}
-
-	SortBckEntries(bckList.Entries)
-	bckList.Entries, _ = deduplicateBckEntries(bckList.Entries, maxSize)
-	bckList.ContinuationToken = contiunationToken
-	return bckList
+	SortLso(resList.Entries)
+	resList.Entries, _ = DedupLso(resList.Entries, maxSize)
+	resList.ContinuationToken = continuationToken
+	return resList
 }
 
-// Returns true if given `token` includes given object name.
-// `token` includes an object name iff the object name would
-// be included in response having given continuation token.
-func TokenIncludesObject(token, objName string) bool {
-	return strings.Compare(token, objName) >= 0
-}
+// Returns true if the continuation token >= object's name (in other words, the object is
+// already listed and must be skipped). Note that string `>=` is lexicographic.
+func TokenGreaterEQ(token, objName string) bool { return token >= objName }
 
-func DirNameContainsPrefix(dirPath, prefix string) bool {
-	// Every directory has to either:
-	// - be contained in prefix (for levels lower than prefix: prefix="abcd/def", directory="abcd")
-	// - include prefix (for levels deeper than prefix: prefix="a/", directory="a/b")
+// Directory has to either:
+// - include (or match) prefix, or
+// - be contained in prefix - motivation: don't SkipDir a/b when looking for a/b/c
+// An alternative name for this function could be smth. like SameBranch()
+func DirHasOrIsPrefix(dirPath, prefix string) bool {
 	return prefix == "" || (strings.HasPrefix(prefix, dirPath) || strings.HasPrefix(dirPath, prefix))
 }
 
-func ObjNameContainsPrefix(objName, prefix string) bool {
+func ObjHasPrefix(objName, prefix string) bool {
 	return prefix == "" || strings.HasPrefix(objName, prefix)
 }

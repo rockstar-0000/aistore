@@ -1,6 +1,6 @@
 // Package k8s provides utilities for communicating with Kubernetes cluster.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package k8s
 
@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	corev1 "k8s.io/api/core/v1"
@@ -20,30 +19,26 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	tcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/remotecommand"
 	metrics "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 type (
 	// Client is simplified version of default `kubernetes.Interface` client.
 	Client interface {
-		Create(v interface{}) error
+		Create(v any) error
 		Delete(entityType, entityName string) error
 		CheckExists(entityType, entityName string) (bool, error)
-
 		Pod(name string) (*corev1.Pod, error)
+		Pods() (*corev1.PodList, error)
 		Service(name string) (*corev1.Service, error)
 		Node(name string) (*corev1.Node, error)
-
 		Logs(podName string) ([]byte, error)
-		Health(podName string) (cpuCores float64, freeMem int64, err error)
+		Health(podName string) (string, error)
+		Metrics(podName string) (cpuCores float64, freeMem int64, err error)
 		CheckMetricsAvailability() error
-		ExecCmd(podName string, command []string,
-			stdin io.Reader, stdout, stderr io.Writer) error
 	}
 
 	// defaultClient implements Client interface.
@@ -75,7 +70,7 @@ func (c *defaultClient) services() tcorev1.ServiceInterface {
 	return c.client.CoreV1().Services(c.namespace)
 }
 
-func (c *defaultClient) Create(v interface{}) (err error) {
+func (c *defaultClient) Create(v any) (err error) {
 	ctx := context.Background()
 	switch t := v.(type) {
 	case *corev1.Pod:
@@ -83,37 +78,9 @@ func (c *defaultClient) Create(v interface{}) (err error) {
 	case *corev1.Service:
 		_, err = c.services().Create(ctx, t, metav1.CreateOptions{})
 	default:
-		debug.Assertf(false, "unknown entity type: %T", t)
+		debug.FailTypeCast(v)
 	}
 	return
-}
-
-func (c *defaultClient) ExecCmd(podName string, command []string,
-	stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
-	req := c.client.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Namespace(c.namespace).
-		Name(podName).
-		SubResource("exec")
-	req.VersionedParams(
-		&corev1.PodExecOptions{
-			Command: []string{"bash", "-c", strings.Join(command, " ")},
-			Stdin:   stdin != nil,
-			Stdout:  true,
-			Stderr:  stderr != nil,
-			TTY:     false,
-		},
-		scheme.ParameterCodec,
-	)
-	exec, err := remotecommand.NewSPDYExecutor(c.config, "POST", req.URL())
-	if err != nil {
-		return err
-	}
-	return exec.Stream(remotecommand.StreamOptions{
-		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
-	})
 }
 
 func (c *defaultClient) Delete(entityType, entityName string) (err error) {
@@ -165,6 +132,10 @@ func (c *defaultClient) Pod(name string) (*corev1.Pod, error) {
 	return c.pods().Get(context.Background(), name, metav1.GetOptions{})
 }
 
+func (c *defaultClient) Pods() (*corev1.PodList, error) {
+	return c.pods().List(context.Background(), metav1.ListOptions{})
+}
+
 func (c *defaultClient) Service(name string) (*corev1.Service, error) {
 	return c.services().Get(context.Background(), name, metav1.GetOptions{})
 }
@@ -187,7 +158,15 @@ func (c *defaultClient) CheckMetricsAvailability() error {
 	return err
 }
 
-func (*defaultClient) Health(podName string) (cpuCores float64, freeMem int64, err error) {
+func (c *defaultClient) Health(podName string) (string, error) {
+	response, err := c.pods().Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return "Error", err
+	}
+	return string(response.Status.Phase), nil
+}
+
+func (*defaultClient) Metrics(podName string) (cpuCores float64, freeMem int64, err error) {
 	var (
 		totalCPU, totalMem int64
 		fracCPU            float64
@@ -198,10 +177,11 @@ func (*defaultClient) Health(podName string) (cpuCores float64, freeMem int64, e
 		return 0, 0, err
 	}
 
-	ms, err := mc.MetricsV1beta1().PodMetricses(metav1.NamespaceDefault).Get(context.Background(), podName, metav1.GetOptions{})
+	msgetter := mc.MetricsV1beta1().PodMetricses(metav1.NamespaceDefault)
+	ms, err := msgetter.Get(context.Background(), podName, metav1.GetOptions{})
 	if err != nil {
 		if statusErr, ok := err.(*errors.StatusError); ok && statusErr.Status().Reason == metav1.StatusReasonNotFound {
-			err = cmn.NewNotFoundError("metrics for pod %q", podName)
+			err = cos.NewErrNotFound("metrics for pod %q", podName)
 		}
 		return 0, 0, err
 	}
@@ -286,9 +266,9 @@ func _initMetricsClient() {
 
 // Retrieve pod namespace
 // See:
-//  * https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/client-go/tools/clientcmd/client_config.go
-//  * https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
-//  * https://kubernetes.io/docs/tasks/access-application-cluster/access-cluster/#accessing-the-api-from-a-pod.
+//   - https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/client-go/tools/clientcmd/client_config.go
+//   - https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+//   - https://kubernetes.io/docs/tasks/access-application-cluster/access-cluster/#accessing-the-api-from-a-pod.
 func _namespace() (namespace string) {
 	if namespace = os.Getenv("POD_NAMESPACE"); namespace != "" {
 		return

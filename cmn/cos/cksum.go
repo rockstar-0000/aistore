@@ -1,11 +1,12 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/sha512"
 	"encoding"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"sort"
 
 	"github.com/OneOfOne/xxhash"
+	jsoniter "github.com/json-iterator/go"
 )
 
 // NOTE: not supporting SHA-3 family is its current golang.org/x/crypto/sha3 source
@@ -42,12 +44,12 @@ type (
 
 	ErrBadCksum struct {
 		prefix  string
-		a, b    interface{}
+		a, b    any
 		context string
 	}
 	Cksum struct {
-		ty    string
-		value string
+		ty    string `json:"-"` // Without "json" tag, IterFields function panics
+		value string `json:"-"`
 	}
 	CksumHash struct {
 		Cksum
@@ -60,7 +62,7 @@ type (
 	}
 )
 
-var checksums = StringSet{
+var checksums = StrSet{
 	ChecksumNone:   {},
 	ChecksumXXHash: {},
 	ChecksumMD5:    {},
@@ -90,6 +92,16 @@ func NewCksumHash(ty string) (ck *CksumHash) {
 	return
 }
 
+func (ck *Cksum) MarshalJSON() ([]byte, error) {
+	if ck == nil {
+		return nil, nil
+	}
+	return jsoniter.Marshal(struct {
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	}{Type: ck.ty, Value: ck.value})
+}
+
 func (ck *CksumHash) Init(ty string) {
 	Assert(ck.H == nil)
 	ck.ty = ty
@@ -103,7 +115,7 @@ func (ck *CksumHash) Init(ty string) {
 	case ChecksumCRC32C:
 		ck.H = NewCRC32C()
 	case ChecksumSHA256:
-		ck.H = sha512.New512_256()
+		ck.H = sha256.New()
 	case ChecksumSHA512:
 		ck.H = sha512.New()
 	default:
@@ -183,12 +195,15 @@ func (ck *Cksum) String() string {
 	if ck == nil {
 		return "checksum <nil>"
 	}
-	return fmt.Sprintf("(%s,%s...)", ck.ty, ck.value[:Min(10, len(ck.value))])
+	if ck.ty == "" || ck.ty == ChecksumNone {
+		return "checksum <none>"
+	}
+	return ck.ty + "[" + SHead(ck.value) + "]"
 }
 
-/////////////
-// helpers //
-/////////////
+//
+// helpers
+//
 
 func NewCRC32C() hash.Hash {
 	return crc32.New(crc32.MakeTable(crc32.Castagnoli))
@@ -219,9 +234,9 @@ func ValidateCksumType(ty string, emptyOK ...bool) (err error) {
 	return
 }
 
-//////////////
-// noopHash //
-//////////////
+//
+// noopHash
+//
 
 func newNoopHash() hash.Hash                     { return &noopHash{} }
 func (*noopHash) Write(b []byte) (int, error)    { return len(b), nil }
@@ -232,11 +247,11 @@ func (*noopHash) BlockSize() int                 { return KiB }
 func (*noopHash) MarshalBinary() ([]byte, error) { return nil, nil }
 func (*noopHash) UnmarshalBinary([]byte) error   { return nil }
 
-////////////
-// errors //
-////////////
+//
+// errors
+//
 
-func NewBadDataCksumError(a, b *Cksum, context ...string) error {
+func NewErrDataCksum(a, b *Cksum, context ...string) error {
 	ctx := ""
 	if len(context) > 0 {
 		ctx = context[0]
@@ -244,7 +259,7 @@ func NewBadDataCksumError(a, b *Cksum, context ...string) error {
 	return &ErrBadCksum{prefix: badDataCksumPrefix, a: a, b: b, context: ctx}
 }
 
-func NewBadMetaCksumError(a, b uint64, context ...string) error {
+func NewErrMetaCksum(a, b uint64, context ...string) error {
 	ctx := ""
 	if len(context) > 0 {
 		ctx = context[0]
@@ -276,7 +291,7 @@ func (e *ErrBadCksum) Error() string {
 	return fmt.Sprintf("%s (%v != %v)%s", e.prefix, e.a, e.b, context)
 }
 
-func (*ErrBadCksum) Is(target error) bool {
-	_, ok := target.(*ErrBadCksum)
+func IsErrBadCksum(err error) bool {
+	_, ok := err.(*ErrBadCksum)
 	return ok
 }

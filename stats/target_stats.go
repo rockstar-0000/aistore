@@ -1,44 +1,57 @@
 // Package stats provides methods and functionality to register, track, log,
 // and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
 import (
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
-	"github.com/NVIDIA/aistore/3rdparty/atomic"
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
+	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/sys"
+	"github.com/NVIDIA/aistore/transport"
 )
 
 // Naming Convention:
-//  -> "*.n" - counter
-//  -> "*.ns" - latency (nanoseconds)
-//  -> "*.size" - size (bytes)
-//  -> "*.bps" - throughput (in byte/s)
-//  -> "*.id" - ID
+//
+//	-> "*.n" - counter
+//	-> "*.ns" - latency (nanoseconds)
+//	-> "*.size" - size (bytes)
+//	-> "*.bps" - throughput (in byte/s)
+//	-> "*.id" - ID
 const (
-	// KindCounter - QPS and byte counts (always incremented, never reset)
-	GetColdCount   = "get.cold.n"
-	GetColdSize    = "get.cold.size"
-	LruEvictSize   = "lru.evict.size"
-	LruEvictCount  = "lru.evict.n"
-	VerChangeCount = "vchange.n"
-	VerChangeSize  = "vchange.size"
-	// rebalance
-	RebTxCount = "reb.tx.n"
-	RebTxSize  = "reb.tx.size"
-	RebRxCount = "reb.rx.n"
-	RebRxSize  = "reb.rx.size"
+	// KindCounter & KindSize - always incremented
+	GetColdCount = "get.cold.n"
+	GetColdSize  = "get.cold.size"
+
+	LruEvictCount = "lru.evict.n"
+	LruEvictSize  = "lru.evict.size"
+
+	CleanupStoreCount = "cleanup.store.n"
+	CleanupStoreSize  = "cleanup.store.size"
+
+	VerChangeCount = "ver.change.n"
+	VerChangeSize  = "ver.change.size"
+
+	// intra-cluster transmit & receive
+	StreamsOutObjCount = transport.OutObjCount
+	StreamsOutObjSize  = transport.OutObjSize
+	StreamsInObjCount  = transport.InObjCount
+	StreamsInObjSize   = transport.InObjSize
+
 	// errors
 	ErrCksumCount    = "err.cksum.n"
 	ErrCksumSize     = "err.cksum.size"
@@ -65,24 +78,28 @@ const (
 
 	// KindThroughput
 	GetThroughput = "get.bps" // bytes per second
+	PutThroughput = "put.bps" // ditto
+
+	// same as above via `.cumulative`
+	GetSize = "get.size"
+	PutSize = "put.size"
 )
 
 type (
 	Trunner struct {
-		statsRunner
-		T     cluster.Target `json:"-"`
-		MPCap fs.MPCap       `json:"capacity"`
-		lines []string
-		disk  ios.AllDiskStats
-	}
-	copyRunner struct {
-		Tracker copyTracker `json:"core"`
-		MPCap   fs.MPCap    `json:"capacity"`
+		t           cluster.NodeMemCap
+		TargetCDF   fs.TargetCDF `json:"cdf"`
+		disk        ios.AllDiskStats
+		xln         string
+		statsRunner // the base (compare w/ Prunner)
+		lines       []string
+		mem         sys.MemStat
+		standby     bool
 	}
 )
 
 const (
-	minLogDiskUtil = 10 // skip logDiskStats if below
+	minLogDiskUtil = 10 // skip logging idle disks
 )
 
 /////////////
@@ -92,97 +109,125 @@ const (
 // interface guard
 var _ cos.Runner = (*Trunner)(nil)
 
-func (r *Trunner) Run() error { return r.runcommon(r) }
+func NewTrunner(t cluster.NodeMemCap) *Trunner { return &Trunner{t: t} }
+
+func (r *Trunner) Run() error     { return r.runcommon(r) }
+func (r *Trunner) Standby(v bool) { r.standby = v }
 
 func (r *Trunner) Init(t cluster.Target) *atomic.Bool {
-	r.Core = &CoreStats{}
-	r.Core.init(t.Snode(), 48) // register common (target's own stats are reg()-ed elsewhere)
+	r.core = &coreStats{}
+	r.core.init(t.Snode(), 48) // register common (target's own stats are reg()-ed elsewhere)
 
 	r.ctracker = make(copyTracker, 48) // these two are allocated once and only used in serial context
 	r.lines = make([]string, 0, 16)
 	r.disk = make(ios.AllDiskStats, 16)
 
 	config := cmn.GCO.Get()
-	r.Core.statsTime = config.Periodic.StatsTime.D()
+	r.core.statsTime = config.Periodic.StatsTime.D()
 
 	r.statsRunner.name = "targetstats"
 	r.statsRunner.daemon = t
 
 	r.statsRunner.stopCh = make(chan struct{}, 4)
-	r.statsRunner.workCh = make(chan NamedVal64, 256)
+	r.statsRunner.workCh = make(chan cos.NamedVal64, 256)
 
-	r.Core.initMetricClient(t.Snode(), &r.statsRunner)
+	r.core.initMetricClient(t.Snode(), &r.statsRunner)
+
+	r.sorted = make([]string, 0, 48)
 	return &r.statsRunner.startedUp
 }
 
-func (r *Trunner) InitCapacity() error {
-	availableMountpaths, _ := fs.Get()
-	r.MPCap = make(fs.MPCap, len(availableMountpaths))
-	cs, err := fs.RefreshCapStatus(nil, r.MPCap)
+func (r *Trunner) InitCDF() error {
+	availableMountpaths := fs.GetAvail()
+	r.TargetCDF.Mountpaths = make(map[string]*fs.CDF, len(availableMountpaths))
+	for mpath := range availableMountpaths {
+		r.TargetCDF.Mountpaths[mpath] = &fs.CDF{}
+	}
+
+	cs, err := fs.CapRefresh(nil, &r.TargetCDF)
 	if err != nil {
 		return err
 	}
 	if cs.Err != nil {
-		glog.Errorf("%s: %v", r.T.Snode(), cs.Err)
+		nlog.Errorf("%s: %s", r.t, cs.String())
 	}
 	return nil
 }
 
 // register target-specific metrics in addition to those that must be
 // already added via regCommonMetrics()
-func (r *Trunner) reg(name, kind string) { r.Core.Tracker.register(r.T.Snode(), name, kind) }
+func (r *Trunner) reg(name, kind string) { r.core.Tracker.reg(r.t.Snode(), name, kind) }
 
 func nameRbps(disk string) string { return "disk." + disk + ".read.bps" }
 func nameRavg(disk string) string { return "disk." + disk + ".avg.rsize" }
-func nameWbps(disk string) string { return "disk." + disk + ".read.bps" }
+func nameWbps(disk string) string { return "disk." + disk + ".write.bps" }
 func nameWavg(disk string) string { return "disk." + disk + ".avg.wsize" }
 func nameUtil(disk string) string { return "disk." + disk + ".util" }
 
+// log vs idle logic
+func isDiskMetric(name string) bool {
+	return strings.HasPrefix(name, "disk.")
+}
+func isDiskUtilMetric(name string) bool {
+	return isDiskMetric(name) && strings.HasSuffix(name, ".util")
+}
+
 func (r *Trunner) RegDiskMetrics(disk string) {
-	s, n := r.Core.Tracker, nameRbps(disk)
+	s, n := r.core.Tracker, nameRbps(disk)
 	if _, ok := s[n]; ok { // must be config.TestingEnv()
 		return
 	}
 	r.reg(n, KindComputedThroughput)
-	r.reg(nameRavg(disk), KindGauge)
 	r.reg(nameWbps(disk), KindComputedThroughput)
+
+	r.reg(nameRavg(disk), KindGauge)
 	r.reg(nameWavg(disk), KindGauge)
 	r.reg(nameUtil(disk), KindGauge)
 }
 
-func (r *Trunner) RegMetrics(node *cluster.Snode) {
-	debug.Assert(node == r.T.Snode())
+func (r *Trunner) RegMetrics(node *meta.Snode) {
+	r.reg(GetColdCount, KindCounter)
+	r.reg(GetColdSize, KindSize)
+
+	r.reg(LruEvictCount, KindCounter)
+	r.reg(LruEvictSize, KindSize)
+
+	r.reg(CleanupStoreCount, KindCounter)
+	r.reg(CleanupStoreSize, KindSize)
+
+	r.reg(VerChangeCount, KindCounter)
+	r.reg(VerChangeSize, KindSize)
 
 	r.reg(PutLatency, KindLatency)
 	r.reg(AppendLatency, KindLatency)
-	r.reg(GetColdCount, KindCounter)
-	r.reg(GetColdSize, KindCounter)
-	r.reg(GetThroughput, KindThroughput)
-	r.reg(LruEvictSize, KindCounter)
-	r.reg(LruEvictCount, KindCounter)
-	r.reg(VerChangeCount, KindCounter)
-	r.reg(VerChangeSize, KindCounter)
 	r.reg(GetRedirLatency, KindLatency)
 	r.reg(PutRedirLatency, KindLatency)
 
+	// bps
+	r.reg(GetThroughput, KindThroughput)
+	r.reg(PutThroughput, KindThroughput)
+
+	r.reg(GetSize, KindSize)
+	r.reg(PutSize, KindSize)
+
 	// errors
 	r.reg(ErrCksumCount, KindCounter)
-	r.reg(ErrCksumSize, KindCounter)
-	r.reg(ErrMetadataCount, KindCounter)
+	r.reg(ErrCksumSize, KindSize)
 
+	r.reg(ErrMetadataCount, KindCounter)
 	r.reg(ErrIOCount, KindCounter)
 
-	// rebalance
-	r.reg(RebTxCount, KindCounter)
-	r.reg(RebTxSize, KindCounter)
-	r.reg(RebRxCount, KindCounter)
-	r.reg(RebRxSize, KindCounter)
+	// streams
+	r.reg(StreamsOutObjCount, KindCounter)
+	r.reg(StreamsOutObjSize, KindSize)
+	r.reg(StreamsInObjCount, KindCounter)
+	r.reg(StreamsInObjSize, KindSize)
 
 	// special
 	r.reg(RestartCount, KindCounter)
 
 	// download
-	r.reg(DownloadSize, KindCounter)
+	r.reg(DownloadSize, KindSize)
 	r.reg(DownloadLatency, KindLatency)
 
 	// dsort
@@ -192,21 +237,21 @@ func (r *Trunner) RegMetrics(node *cluster.Snode) {
 	r.reg(DSortCreationRespLatency, KindLatency)
 
 	// Prometheus
-	r.Core.initProm(node)
+	r.core.initProm(node)
 }
 
-func (r *Trunner) GetWhatStats() interface{} {
-	ctracker := make(copyTracker, 48)
-	r.Core.copyCumulative(ctracker)
-	return &copyRunner{Tracker: ctracker, MPCap: r.MPCap}
+func (r *Trunner) GetStats() (ds *Node) {
+	ds = r.statsRunner.GetStats()
+	ds.TargetCDF = r.TargetCDF
+	return
 }
 
-func (r *Trunner) log(now int64, uptime time.Duration) {
+func (r *Trunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 	r.lines = r.lines[:0]
 
-	// 1 collect disk stats and populate the tracker
+	// 1. collect disk stats and populate the tracker
+	s := r.core
 	fs.FillDiskStats(r.disk)
-	s := r.Core
 	for disk, stats := range r.disk {
 		v := s.Tracker[nameRbps(disk)]
 		v.Value = stats.RBps
@@ -221,52 +266,89 @@ func (r *Trunner) log(now int64, uptime time.Duration) {
 	}
 
 	// 2 copy stats, reset latencies, send via StatsD if configured
-	r.Core.updateUptime(uptime)
-	r.Core.promLock()
-	idle := r.Core.copyT(r.ctracker, []string{"kalive", Uptime})
-	r.Core.promUnlock()
-	if now >= r.nextLogTime && !idle {
-		ln, err := cos.MarshalToString(r.ctracker)
-		debug.AssertNoErr(err)
-		r.lines = append(r.lines, ln)
-		r.nextLogTime = now + cos.MinI64(int64(r.Core.statsTime)*logIntervalMult, logIntervalMax)
+	s.updateUptime(uptime)
+	s.promLock()
+	idle := s.copyT(r.ctracker, config.Disk.DiskUtilLowWM)
+	s.promUnlock()
+
+	if now >= r.next || !idle {
+		s.sgl.Reset() // sharing w/ CoreStats.copyT
+		r.ctracker.write(s.sgl, r.sorted, true /*target*/, idle)
+		if s.sgl.Len() > 3 { // skip '{}'
+			line := string(s.sgl.Bytes())
+			if line != r.prev {
+				r.lines = append(r.lines, line)
+				r.prev = line
+			}
+		}
+		if idle {
+			r.next = now + maxStatsLogInterval
+		}
 	}
 
 	// 3. capacity
-	cs, updated, _ := fs.CapPeriodic(r.MPCap)
+	cs, updated, errfs := fs.CapPeriodic(now, config, &r.TargetCDF)
 	if updated {
-		if cs.Err != nil {
-			go r.T.RunLRU("" /*uuid*/, nil /*wg*/, false)
+		if cs.Err != nil || cs.PctMax > int32(config.Space.CleanupWM) {
+			r.t.OOS(&cs)
 		}
-		for mpath, fsCapacity := range r.MPCap {
-			ln, err := cos.MarshalToString(fsCapacity)
-			debug.AssertNoErr(err)
-			debug.SetExpvar(glog.SmoduleStats, mpath+":cap%", int64(fsCapacity.PctUsed))
+		for mpath, fsCapacity := range r.TargetCDF.Mountpaths {
+			ln := cos.MustMarshalToString(fsCapacity)
 			r.lines = append(r.lines, mpath+": "+ln)
 		}
+	} else if errfs != nil {
+		nlog.Errorln(errfs)
 	}
 
 	// 4. append disk stats to log
 	r.logDiskStats()
 
-	// 5. log
+	// 5. memory pressure
+	_ = r.mem.Get()
+	mm := r.t.PageMM()
+	if p := mm.Pressure(&r.mem); p >= memsys.PressureHigh {
+		r.lines = append(r.lines, mm.Str(&r.mem))
+	}
+
+	// 6. running xactions
+	if !idle {
+		var (
+			ln     string
+			rs, is = r.t.GetAllRunning("", true /*separate idle*/)
+		)
+		if len(rs) > 0 {
+			ln = "running: " + strings.Join(rs, " ")
+			if len(is) > 0 {
+				ln += "; "
+			}
+		}
+		if len(is) > 0 {
+			ln += "idle: " + strings.Join(is, " ")
+		}
+		if ln != "" && ln != r.xln {
+			r.lines = append(r.lines, ln)
+		}
+		r.xln = ln
+	}
+
+	// 7. and, finally
 	for _, ln := range r.lines {
-		glog.Infoln(ln)
+		nlog.Infoln(ln)
 	}
 }
 
 // log formatted disk stats:
-//       [ disk: read throughput, average read size, write throughput, average write size, disk utilization ]
+// [ disk: read throughput, average read size, write throughput, average write size, disk utilization ]
 // e.g.: [ sda: 94MiB/s, 68KiB, 25MiB/s, 21KiB, 82% ]
 func (r *Trunner) logDiskStats() {
 	for disk, stats := range r.disk {
 		if stats.Util < minLogDiskUtil {
 			continue
 		}
-		rbps := cos.B2S(stats.RBps, 0)
-		wbps := cos.B2S(stats.WBps, 0)
-		ravg := cos.B2S(stats.Ravg, 0)
-		wavg := cos.B2S(stats.Wavg, 0)
+		rbps := cos.ToSizeIEC(stats.RBps, 0)
+		wbps := cos.ToSizeIEC(stats.WBps, 0)
+		ravg := cos.ToSizeIEC(stats.Ravg, 0)
+		wavg := cos.ToSizeIEC(stats.Wavg, 0)
 		l := len(disk) + len(rbps) + len(wbps) + len(ravg) + len(wavg) + 64
 		buf := make([]byte, 0, l)
 		buf = append(buf, disk...)
@@ -285,9 +367,9 @@ func (r *Trunner) logDiskStats() {
 	}
 }
 
-func (r *Trunner) doAdd(nv NamedVal64) {
+func (r *Trunner) doAdd(nv cos.NamedVal64) {
 	var (
-		s     = r.Core
+		s     = r.core
 		name  = nv.Name
 		value = nv.Value
 	)
@@ -297,5 +379,7 @@ func (r *Trunner) doAdd(nv NamedVal64) {
 }
 
 func (r *Trunner) statsTime(newval time.Duration) {
-	r.Core.statsTime = newval
+	r.core.statsTime = newval
 }
+
+func (r *Trunner) standingBy() bool { return r.standby }

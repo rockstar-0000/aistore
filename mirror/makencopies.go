@@ -1,37 +1,38 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
 import (
 	"fmt"
-	"os"
 	"sync"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/xaction"
-	"github.com/NVIDIA/aistore/xreg"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 type (
 	mncFactory struct {
 		xreg.RenewBase
-		xact *xactMNC
+		xctn *xactMNC
 		args xreg.MNCArgs
 	}
 
 	// xactMNC runs in a background, traverses all local mountpaths, and makes sure
 	// the bucket is N-way replicated (where N >= 1).
 	xactMNC struct {
-		xaction.XactBckJog
+		xact.BckJog
 		tag    string
 		copies int
 	}
@@ -47,24 +48,23 @@ var (
 // mncFactory //
 ////////////////
 
-func (*mncFactory) New(args xreg.Args, bck *cluster.Bck) xreg.Renewable {
+func (*mncFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	p := &mncFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, args: *args.Custom.(*xreg.MNCArgs)}
 	return p
 }
 
 func (p *mncFactory) Start() error {
-	slab, err := p.T.MMSA().GetSlab(memsys.MaxPageSlabSize)
-	cos.AssertNoErr(err)
-	p.xact = newXactMNC(p.Bck, p, slab)
+	slab, err := p.T.PageMM().GetSlab(memsys.MaxPageSlabSize)
+	debug.AssertNoErr(err)
+	p.xctn = newXactMNC(p.Bck, p, slab)
 	return nil
 }
 
-func (*mncFactory) Kind() string        { return cmn.ActMakeNCopies }
-func (p *mncFactory) Get() cluster.Xact { return p.xact }
+func (*mncFactory) Kind() string        { return apc.ActMakeNCopies }
+func (p *mncFactory) Get() cluster.Xact { return p.xctn }
 
 func (p *mncFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, err error) {
-	err = fmt.Errorf("%s is currently running, cannot start a new %q",
-		prevEntry.Get(), p.Str(p.Kind()))
+	err = fmt.Errorf("%s is currently running, cannot start a new %q", prevEntry.Get(), p.Str(p.Kind()))
 	return
 }
 
@@ -72,64 +72,95 @@ func (p *mncFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, 
 // xactMNC //
 /////////////
 
-func (r *xactMNC) String() string {
-	return fmt.Sprintf("%s tag=%s, copies=%d", r.XactBase.String(), r.tag, r.copies)
-}
-
-func newXactMNC(bck *cluster.Bck, p *mncFactory, slab *memsys.Slab) (r *xactMNC) {
+func newXactMNC(bck *meta.Bck, p *mncFactory, slab *memsys.Slab) (r *xactMNC) {
 	r = &xactMNC{tag: p.args.Tag, copies: p.args.Copies}
 	debug.Assert(r.tag != "" && r.copies > 0)
-	mpopts := &mpather.JoggerGroupOpts{
-		Bck:      bck.Bck,
+	mpopts := &mpather.JgroupOpts{
 		T:        p.T,
 		CTs:      []string{fs.ObjectType},
 		VisitObj: r.visitObj,
 		Slab:     slab,
-		DoLoad:   mpather.Load, // Required to fetch `NumCopies()` and skip copies.
-		Throttle: true,
+		DoLoad:   mpather.Load, // to support `NumCopies()` config
+		Throttle: true,         // NOTE: always throttling
 	}
-	r.XactBckJog.Init(p.UUID(), cmn.ActMakeNCopies, bck, mpopts)
+	mpopts.Bck.Copy(bck.Bucket())
+	r.BckJog.Init(p.UUID(), apc.ActMakeNCopies, bck, mpopts, cmn.GCO.Get())
 	return
 }
 
 func (r *xactMNC) Run(wg *sync.WaitGroup) {
 	wg.Done()
-	if err := fs.ValidateNCopies(r.Target().Sname(), r.copies); err != nil {
-		r.Finish(err)
+	tname := r.T.String()
+	if err := fs.ValidateNCopies(tname, r.copies); err != nil {
+		r.AddErr(err)
+		r.Finish()
 		return
 	}
-	r.XactBckJog.Run()
-	glog.Infoln(r.String())
-	err := r.XactBckJog.Wait()
-	r.Finish(err)
+	r.BckJog.Run()
+	nlog.Infoln(r.Name())
+	err := r.BckJog.Wait()
+	r.AddErr(err)
+	r.Finish()
 }
 
 func (r *xactMNC) visitObj(lom *cluster.LOM, buf []byte) (err error) {
-	var size int64
-	if n := lom.NumCopies(); n == r.copies {
+	var (
+		size int64
+		n    = lom.NumCopies()
+	)
+	switch {
+	case n == r.copies:
 		return nil
-	} else if n > r.copies {
+	case n > r.copies:
+		lom.Lock(true)
 		size, err = delCopies(lom, r.copies)
-	} else {
+		lom.Unlock(true)
+	default:
+		lom.Lock(true)
 		size, err = addCopies(lom, r.copies, buf)
+		lom.Unlock(true)
+	}
+	config := r.BckJog.Config
+	if err != nil {
+		if cmn.IsObjNotExist(err) {
+			return nil
+		}
+		if cos.IsErrOOS(err) {
+			err = cmn.NewErrAborted(r.Name(), "mnc", err)
+		} else if cs := fs.Cap(); cs.Err != nil {
+			err = cmn.NewErrAborted(r.Name(), "mnc, orig err: ["+err.Error()+"]", cs.Err)
+		}
+		r.AddErr(err)
+		if config.FastV(5, cos.SmoduleMirror) {
+			nlog.Infof("%s: Error %v (%s, %d, %d, %d)", r.Base.Name(), err, lom.Cname(), n, r.copies, size)
+		}
+		return
 	}
 
-	if os.IsNotExist(err) {
-		return nil
+	if config.FastV(5, cos.SmoduleMirror) {
+		nlog.Infof("%s: %s, copies %d=>%d, size=%d", r.Base.Name(), lom.Cname(), n, r.copies, size)
 	}
-	if err != nil && cos.IsErrOOS(err) {
-		what := fmt.Sprintf("%s(%q)", r.Kind(), r.ID())
-		return cmn.NewAbortedError(what, err.Error())
-	}
-
-	r.ObjectsInc()
-	r.BytesAdd(size)
-
-	if r.ObjCount()%100 == 0 {
-		if cs := fs.GetCapStatus(); cs.Err != nil {
-			what := fmt.Sprintf("%s(%q)", r.Kind(), r.ID())
-			return cmn.NewAbortedError(what, cs.Err.Error())
+	r.ObjsAdd(1, size)
+	if cnt := r.Objs(); cnt%128 == 0 { // TODO: tuneup
+		if cs := fs.Cap(); cs.Err != nil {
+			err = cmn.NewErrAborted(r.Name(), "mnc", cs.Err)
 		}
 	}
-	return nil
+	return
+}
+
+func (r *xactMNC) String() string {
+	return fmt.Sprintf("%s tag=%s, copies=%d", r.Base.String(), r.tag, r.copies)
+}
+
+func (r *xactMNC) Name() string {
+	return fmt.Sprintf("%s tag=%s, copies=%d", r.Base.Name(), r.tag, r.copies)
+}
+
+func (r *xactMNC) Snap() (snap *cluster.Snap) {
+	snap = &cluster.Snap{}
+	r.ToSnap(snap)
+
+	snap.IdleX = r.IsIdle()
+	return
 }

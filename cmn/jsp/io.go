@@ -1,7 +1,7 @@
 // Package jsp (JSON persistence) provides utilities to store and load arbitrary
 // JSON-encoded structures with optional checksumming and compression.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
  */
 package jsp
 
@@ -11,7 +11,6 @@ import (
 	"hash"
 	"io"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/OneOfOne/xxhash"
@@ -24,7 +23,7 @@ const (
 	lz4BufferSize = 64 << 10
 )
 
-func Encode(ws cos.WriterAt, v interface{}, opts Options) (err error) {
+func Encode(ws cos.WriterAt, v any, opts Options) (err error) {
 	var (
 		h       hash.Hash
 		w       io.Writer = ws
@@ -88,7 +87,7 @@ func Encode(ws cos.WriterAt, v interface{}, opts Options) (err error) {
 	return
 }
 
-func Decode(reader io.ReadCloser, v interface{}, opts Options, tag string) (checksum *cos.Cksum, err error) {
+func Decode(reader io.ReadCloser, v any, opts Options, tag string) (checksum *cos.Cksum, err error) {
 	var (
 		r             io.Reader = reader
 		expectedCksum uint64
@@ -112,22 +111,15 @@ func Decode(reader io.ReadCloser, v interface{}, opts Options, tag string) (chec
 		}
 		jspVer = prefix[l]
 		if jspVer != Metaver {
-			err = newErrVersion("jsp", uint32(jspVer), Metaver, 2)
-			// NOTE: start jsp backward compatibility
-			if _, ok := err.(*ErrCompatibleVersion); ok {
-				glog.Errorf("%v - skipping meta-version check", err)
-				err = nil
-				goto skip
-			}
-			// NOTE: end jsp backward compatibility
+			err = newErrVersion("jsp", uint32(jspVer), Metaver)
 			return
 		}
 		metaVer = binary.BigEndian.Uint32(prefix[cos.SizeofI64:])
 		if metaVer != opts.Metaver {
+			// NOTE: potential backward compatibility case for the caller
 			err = newErrVersion(tag, metaVer, opts.Metaver)
 			return
 		}
-	skip:
 		flags := binary.BigEndian.Uint32(prefix[cos.SizeofI64+cos.SizeofI32:])
 		opts.Compress = flags&(1<<0) != 0
 		opts.Checksum = flags&(1<<1) != 0
@@ -164,7 +156,7 @@ func Decode(reader io.ReadCloser, v interface{}, opts Options, tag string) (chec
 		actual := h.Sum(nil)
 		actualCksum := binary.BigEndian.Uint64(actual)
 		if expectedCksum != actualCksum {
-			err = cos.NewBadMetaCksumError(expectedCksum, actualCksum, tag)
+			err = cos.NewErrMetaCksum(expectedCksum, actualCksum, tag)
 			return
 		}
 		checksum = cos.NewCksum(cos.ChecksumXXHash, hex.EncodeToString(actual))

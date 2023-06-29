@@ -1,6 +1,6 @@
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -9,20 +9,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
+	"time"
 
-	"github.com/NVIDIA/aistore/3rdparty/glog"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
 )
 
 type (
 	httpProvider struct {
-		t           cluster.Target
+		t           cluster.TargetPut
 		httpClient  *http.Client
 		httpsClient *http.Client
 	}
@@ -31,7 +33,7 @@ type (
 // interface guard
 var _ cluster.BackendProvider = (*httpProvider)(nil)
 
-func NewHTTP(t cluster.Target, config *cmn.Config) (cluster.BackendProvider, error) {
+func NewHTTP(t cluster.TargetPut, config *cmn.Config) cluster.BackendProvider {
 	hp := &httpProvider{t: t}
 	hp.httpClient = cmn.NewClient(cmn.TransportArgs{
 		Timeout:         config.Client.TimeoutLong.D(),
@@ -47,7 +49,7 @@ func NewHTTP(t cluster.Target, config *cmn.Config) (cluster.BackendProvider, err
 		UseHTTPS:        true,
 		SkipVerify:      config.Net.HTTP.SkipVerify,
 	})
-	return hp, nil
+	return hp
 }
 
 func (hp *httpProvider) client(u string) *http.Client {
@@ -57,15 +59,15 @@ func (hp *httpProvider) client(u string) *http.Client {
 	return hp.httpClient
 }
 
-func (*httpProvider) Provider() string  { return cmn.ProviderHTTP }
+func (*httpProvider) Provider() string  { return apc.HTTP }
 func (*httpProvider) MaxPageSize() uint { return 10000 }
 
-func (hp *httpProvider) CreateBucket(*cluster.Bck) (int, error) {
-	// TODO: We could support it.
-	return creatingBucketNotSupportedErr(hp.Provider())
+// TODO: can be done
+func (hp *httpProvider) CreateBucket(*meta.Bck) (int, error) {
+	return http.StatusNotImplemented, cmn.NewErrNotImpl("create", hp.Provider()+" bucket")
 }
 
-func (hp *httpProvider) HeadBucket(ctx context.Context, bck *cluster.Bck) (bckProps cos.SimpleKVs, errCode int, err error) {
+func (hp *httpProvider) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.StrKVs, errCode int, err error) {
 	// TODO: we should use `bck.RemoteBck()`.
 
 	origURL, err := getOriginalURL(ctx, bck, "")
@@ -73,8 +75,8 @@ func (hp *httpProvider) HeadBucket(ctx context.Context, bck *cluster.Bck) (bckPr
 		return nil, http.StatusBadRequest, err
 	}
 
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[head_bucket] original_url: %q", origURL)
+	if verbose {
+		nlog.Infof("[head_bucket] original_url: %q", origURL)
 	}
 
 	// Contact the original URL - as long as we can make connection we assume it's good.
@@ -89,18 +91,17 @@ func (hp *httpProvider) HeadBucket(ctx context.Context, bck *cluster.Bck) (bckPr
 		return nil, resp.StatusCode, err
 	}
 
-	// TODO: improve validation - check `content-type` header
-	if resp.Header.Get(cmn.HdrETag) == "" {
-		err = fmt.Errorf("invalid resource - missing header %s", cmn.HdrETag)
-		return nil, http.StatusBadRequest, err
+	if resp.Header.Get(cos.HdrETag) == "" {
+		// TODO: improve validation
+		nlog.Errorf("Warning: missing header %s (response header: %+v)", cos.HdrETag, resp.Header)
 	}
 
-	bckProps = make(cos.SimpleKVs)
-	bckProps[cmn.HdrBackendProvider] = cmn.ProviderHTTP
+	bckProps = make(cos.StrKVs)
+	bckProps[apc.HdrBackendProvider] = apc.HTTP
 	return
 }
 
-func (*httpProvider) ListObjects(*cluster.Bck, *cmn.SelectMsg) (bckList *cmn.BucketList, errCode int, err error) {
+func (*httpProvider) ListObjects(*meta.Bck, *apc.LsoMsg, *cmn.LsoResult) (errCode int, err error) {
 	debug.Assert(false)
 	return
 }
@@ -110,11 +111,11 @@ func (*httpProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err
 	return
 }
 
-func getOriginalURL(ctx context.Context, bck *cluster.Bck, objName string) (string, error) {
-	origURL, ok := ctx.Value(cmn.CtxOriginalURL).(string)
+func getOriginalURL(ctx context.Context, bck *meta.Bck, objName string) (string, error) {
+	origURL, ok := ctx.Value(cos.CtxOriginalURL).(string)
 	if !ok || origURL == "" {
 		if bck.Props == nil {
-			return "", fmt.Errorf("failed to HEAD (%s): original_url is empty", bck.Bck)
+			return "", fmt.Errorf("failed to HEAD (%s): original_url is empty", bck)
 		}
 		origURL = bck.Props.Extra.HTTP.OrigURLBck
 		debug.Assert(origURL != "")
@@ -125,19 +126,17 @@ func getOriginalURL(ctx context.Context, bck *cluster.Bck, objName string) (stri
 	return origURL, nil
 }
 
-func (hp *httpProvider) HeadObj(ctx context.Context, lom *cluster.LOM) (objMeta cos.SimpleKVs, errCode int, err error) {
+func (hp *httpProvider) HeadObj(ctx context.Context, lom *cluster.LOM) (oa *cmn.ObjAttrs, errCode int, err error) {
 	var (
 		h   = cmn.BackendHelpers.HTTP
 		bck = lom.Bck() // TODO: This should be `cloudBck = lom.Bck().RemoteBck()`
 	)
-
 	origURL, err := getOriginalURL(ctx, bck, lom.ObjName)
 	debug.AssertNoErr(err)
 
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[head_object] original_url: %q", origURL)
+	if verbose {
+		nlog.Infof("[head_object] original_url: %q", origURL)
 	}
-
 	resp, err := hp.client(origURL).Head(origURL)
 	if err != nil {
 		return nil, http.StatusBadRequest, err
@@ -146,37 +145,39 @@ func (hp *httpProvider) HeadObj(ctx context.Context, lom *cluster.LOM) (objMeta 
 	if resp.StatusCode != http.StatusOK {
 		return nil, resp.StatusCode, fmt.Errorf("error occurred: %v", resp.StatusCode)
 	}
-	objMeta = make(cos.SimpleKVs, 2)
-	objMeta[cmn.HdrBackendProvider] = cmn.ProviderHTTP
+	oa = &cmn.ObjAttrs{}
+	oa.SetCustomKey(cmn.SourceObjMD, apc.HTTP)
 	if resp.ContentLength >= 0 {
-		objMeta[cmn.HdrObjSize] = strconv.FormatInt(resp.ContentLength, 10)
+		oa.Size = resp.ContentLength
 	}
-	if v, ok := h.EncodeVersion(resp.Header.Get(cmn.HdrETag)); ok {
-		objMeta[cluster.VersionObjMD] = v
+	if v, ok := h.EncodeVersion(resp.Header.Get(cos.HdrETag)); ok {
+		oa.SetCustomKey(cmn.ETag, v)
 	}
-
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[head_object] %s", lom)
+	if verbose {
+		nlog.Infof("[head_object] %s", lom)
 	}
 	return
 }
 
-func (hp *httpProvider) GetObj(ctx context.Context, lom *cluster.LOM) (errCode int, err error) {
+func (hp *httpProvider) GetObj(ctx context.Context, lom *cluster.LOM, owt cmn.OWT) (errCode int, err error) {
 	reader, _, errCode, err := hp.GetObjReader(ctx, lom)
 	if err != nil {
 		return errCode, err
 	}
-	params := cluster.PutObjectParams{
-		Tag:      fs.WorkfileColdget,
-		Reader:   reader,
-		RecvType: cluster.ColdGet,
+	params := cluster.AllocPutObjParams()
+	{
+		params.WorkTag = fs.WorkfileColdget
+		params.Reader = reader
+		params.OWT = owt
+		params.Atime = time.Now()
 	}
 	err = hp.t.PutObject(lom, params)
+	cluster.FreePutObjParams(params)
 	if err != nil {
 		return
 	}
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[get_object] %s", lom)
+	if verbose {
+		nlog.Infof("[get_object] %s", lom)
 	}
 	return
 }
@@ -191,11 +192,11 @@ func (hp *httpProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r i
 	origURL, err := getOriginalURL(ctx, bck, lom.ObjName)
 	debug.AssertNoErr(err)
 
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[HTTP CLOUD][GET] original_url: %q", origURL)
+	if verbose {
+		nlog.Infof("[HTTP CLOUD][GET] original_url: %q", origURL)
 	}
 
-	resp, err := hp.client(origURL).Get(origURL) // nolint:bodyclose // is closed by the caller
+	resp, err := hp.client(origURL).Get(origURL) //nolint:bodyclose // is closed by the caller
 	if err != nil {
 		return nil, nil, http.StatusInternalServerError, err
 	}
@@ -203,27 +204,23 @@ func (hp *httpProvider) GetObjReader(ctx context.Context, lom *cluster.LOM) (r i
 		return nil, nil, resp.StatusCode, fmt.Errorf("error occurred: %v", resp.StatusCode)
 	}
 
-	if glog.FastV(4, glog.SmoduleAIS) {
-		glog.Infof("[HTTP CLOUD][GET] success, size: %d", resp.ContentLength)
+	if verbose {
+		nlog.Infof("[HTTP CLOUD][GET] success, size: %d", resp.ContentLength)
 	}
 
-	customMD := cos.SimpleKVs{
-		cluster.SourceObjMD:  cluster.SourceHTTPObjMD,
-		cluster.OrigURLObjMD: origURL,
+	lom.SetCustomKey(cmn.SourceObjMD, apc.HTTP)
+	lom.SetCustomKey(cmn.OrigURLObjMD, origURL)
+	if v, ok := h.EncodeVersion(resp.Header.Get(cos.HdrETag)); ok {
+		lom.SetCustomKey(cmn.ETag, v)
 	}
-	if v, ok := h.EncodeVersion(resp.Header.Get(cmn.HdrETag)); ok {
-		customMD[cluster.VersionObjMD] = v
-	}
-
-	lom.SetCustom(customMD)
 	setSize(ctx, resp.ContentLength)
 	return wrapReader(ctx, resp.Body), nil, 0, nil
 }
 
-func (hp *httpProvider) PutObj(io.ReadCloser, *cluster.LOM) (string, int, error) {
-	return "", http.StatusBadRequest, fmt.Errorf(cmn.FmtErrUnsupported, hp.Provider(), "creating new objects")
+func (*httpProvider) PutObj(io.ReadCloser, *cluster.LOM) (int, error) {
+	return http.StatusBadRequest, cmn.NewErrUnsupp("PUT", " objects => HTTP backend")
 }
 
-func (hp *httpProvider) DeleteObj(*cluster.LOM) (int, error) {
-	return http.StatusBadRequest, fmt.Errorf(cmn.FmtErrUnsupported, hp.Provider(), "deleting object")
+func (*httpProvider) DeleteObj(*cluster.LOM) (int, error) {
+	return http.StatusBadRequest, cmn.NewErrUnsupp("DELETE", " objects from HTTP backend")
 }

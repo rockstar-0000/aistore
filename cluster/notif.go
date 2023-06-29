@@ -1,6 +1,6 @@
 // Package cluster provides local access to cluster-level metadata
 /*
- * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package cluster
 
@@ -22,6 +22,7 @@ import (
 /////////////////////////
 // notification sender //
 /////////////////////////
+
 // enum: when to notify
 const (
 	UponTerm     = Upon(1 << iota) // success or fail is separately provided via error
@@ -45,11 +46,11 @@ type (
 	// intra-cluster notification base
 
 	NotifMsg struct {
-		UUID   string `json:"uuid"`    // uuid
-		NodeID string `json:"node_id"` // notifier node id
-		Kind   string `json:"kind"`    // kind of xaction
-		Data   []byte `json:"message"` // typed message
+		UUID   string `json:"uuid"`    // xaction UUID
+		NodeID string `json:"node_id"` // notifier node ID
+		Kind   string `json:"kind"`    // xaction `Kind`
 		ErrMsg string `json:"err"`     // error.Error()
+		Data   []byte `json:"message"` // typed message
 	}
 )
 
