@@ -920,7 +920,7 @@ func (p *proxy) syncNewICOwners(smap, newSmap *smapX) {
 	for _, psi := range newSmap.Pmap {
 		if p.SID() != psi.ID() && newSmap.IsIC(psi) && !smap.IsIC(psi) {
 			go func(psi *meta.Snode) {
-				if err := p.ic.sendOwnershipTbl(psi); err != nil {
+				if err := p.ic.sendOwnershipTbl(psi, newSmap); err != nil {
 					nlog.Errorf("%s: failed to send ownership table to %s, err:%v", p, psi, err)
 				}
 			}(psi)
@@ -2029,7 +2029,8 @@ func (p *proxy) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Qu
 	}
 
 	// via random target
-	si, err := p.owner.smap.get().GetRandTarget()
+	smap := p.owner.smap.get()
+	si, err := smap.GetRandTarget()
 	if err != nil {
 		p.writeErr(w, r, err)
 		return
@@ -2047,7 +2048,7 @@ func (p *proxy) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Qu
 		}
 		cargs.timeout = apc.DefaultTimeout
 	}
-	res := p.call(cargs)
+	res := p.call(cargs, smap)
 	freeCargs(cargs)
 
 	if res.err != nil {
@@ -2223,7 +2224,7 @@ func (p *proxy) lsObjsR(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX, tsi *meta
 			cargs.timeout = reqTimeout
 			cargs.cresv = cresLso{} // -> cmn.LsoResult
 		}
-		res := p.call(cargs)
+		res := p.call(cargs, smap)
 		freeCargs(cargs)
 		results = make(sliceResults, 1)
 		results[0] = res
@@ -2646,7 +2647,7 @@ func (p *proxy) smapFromURL(baseURL string) (smap *smapX, err error) {
 		cargs.timeout = apc.DefaultTimeout
 		cargs.cresv = cresSM{} // -> smapX
 	}
-	res := p.call(cargs)
+	res := p.call(cargs, p.owner.smap.get())
 	if res.err != nil {
 		err = res.errorf("failed to get Smap from %s", baseURL)
 	} else {
@@ -3131,7 +3132,7 @@ func (p *proxy) getDaemonInfo(osi *meta.Snode) (si *meta.Snode, err error) {
 		cargs.timeout = cmn.Timeout.CplaneOperation()
 		cargs.cresv = cresND{} // -> meta.Snode
 	}
-	res := p.call(cargs)
+	res := p.call(cargs, p.owner.smap.get())
 	if res.err != nil {
 		err = res.err
 	} else {
@@ -3146,8 +3147,9 @@ func (p *proxy) headRemoteBck(bck *cmn.Bck, q url.Values) (header http.Header, s
 	var (
 		tsi  *meta.Snode
 		path = apc.URLPathBuckets.Join(bck.Name)
+		smap = p.owner.smap.get()
 	)
-	if tsi, err = p.owner.smap.get().GetRandTarget(); err != nil {
+	if tsi, err = smap.GetRandTarget(); err != nil {
 		return
 	}
 	if bck.IsCloud() {
@@ -3166,7 +3168,7 @@ func (p *proxy) headRemoteBck(bck *cmn.Bck, q url.Values) (header http.Header, s
 		cargs.req = cmn.HreqArgs{Method: http.MethodHead, Path: path, Query: q}
 		cargs.timeout = apc.DefaultTimeout
 	}
-	res := p.call(cargs)
+	res := p.call(cargs, smap)
 	if res.status == http.StatusNotFound {
 		err = cmn.NewErrRemoteBckNotFound(bck)
 	} else if res.status == http.StatusGone {
@@ -3300,9 +3302,15 @@ func (p *proxy) Stop(err error) {
 		s         = "Stopping " + p.String()
 		smap      = p.owner.smap.get()
 		isPrimary = smap.isPrimary(p.si)
+		e, isEnu  = err.(*errNoUnregister)
 	)
 	if isPrimary {
 		s += "(primary)"
+		if !isEnu || e.action != apc.ActShutdownCluster {
+			if npsi, err := cluster.HrwProxy(&smap.Smap, p.SID()); err == nil {
+				p.notifyCandidate(npsi, smap)
+			}
+		}
 	}
 	if err == nil {
 		nlog.Infoln(s)
@@ -3311,6 +3319,19 @@ func (p *proxy) Stop(err error) {
 	}
 	xreg.AbortAll(errors.New("p-stop"))
 
-	rmFromSmap := !isPrimary && smap.isValid() && !isErrNoUnregister(err)
-	p.htrun.stop(rmFromSmap)
+	p.htrun.stop(!isPrimary && smap.isValid() && !isEnu /*rmFromSmap*/)
+}
+
+// on a best-effort basis, ignoring errors and bodyclose
+func (p *proxy) notifyCandidate(npsi *meta.Snode, smap *smapX) {
+	cargs := allocCargs()
+	cargs.si = npsi
+	cargs.req = cmn.HreqArgs{Method: http.MethodPut, Base: npsi.URL(cmn.NetIntraControl), Path: apc.URLPathVotePriStop.S}
+	req, err := cargs.req.Req()
+	if err != nil {
+		return
+	}
+	req.Header.Set(apc.HdrCallerID, p.SID())
+	req.Header.Set(apc.HdrCallerSmapVersion, smap.vstr)
+	p.client.control.Do(req) //nolint:bodyclose // exiting
 }

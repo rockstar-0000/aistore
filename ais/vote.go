@@ -84,17 +84,29 @@ func (p *proxy) voteHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	item := apiItems[0]
 	if !p.NodeStarted() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	switch {
-	case r.Method == http.MethodGet && apiItems[0] == apc.Proxy:
+	// MethodGet
+	if r.Method == http.MethodGet {
+		if item != apc.Proxy {
+			p.writeErrURL(w, r)
+			return
+		}
 		p.httpgetvote(w, r)
-	case r.Method == http.MethodPut && apiItems[0] == apc.Voteres:
+		return
+	}
+	// MethodPut
+	switch item {
+	case apc.Voteres:
 		p.httpsetprimary(w, r)
-	case r.Method == http.MethodPut && apiItems[0] == apc.VoteInit:
+	case apc.VoteInit:
 		p.httpelect(w, r)
+	case apc.PriStop:
+		callerID := r.Header.Get(apc.HdrCallerID)
+		p.onPrimaryDown(p, callerID)
 	default:
 		p.writeErrURL(w, r)
 	}
@@ -195,6 +207,7 @@ func (p *proxy) startElection(vr *VoteRecord) {
 
 func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 	var (
+		smap       *smapX
 		err        error
 		curPrimary = vr.Smap.Primary
 		config     = cmn.GCO.Get()
@@ -205,12 +218,12 @@ func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 		if i > 0 {
 			runtime.Gosched()
 		}
-		smap := p.owner.smap.get()
+		smap = p.owner.smap.get()
 		if smap.version() > vr.Smap.version() {
 			nlog.Warningf("%s: %s updated from %s, moving back to idle", p, smap, vr.Smap)
 			return
 		}
-		_, _, err = p.Health(curPrimary, timeout, nil /*ask primary*/)
+		_, _, err = p.reqHealth(curPrimary, timeout, nil /*ask primary*/, smap)
 		if err == nil {
 			break
 		}
@@ -219,7 +232,7 @@ func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 	if err == nil {
 		// move back to idle
 		query := url.Values{apc.QparamAskPrimary: []string{"true"}}
-		_, _, err = p.Health(curPrimary, timeout, query /*ask primary*/)
+		_, _, err = p.reqHealth(curPrimary, timeout, query /*ask primary*/, smap)
 		if err == nil {
 			nlog.Infof("%s: current primary %s is up, moving back to idle", p, curPrimary)
 		} else {
@@ -382,24 +395,35 @@ func (t *target) voteHandler(w http.ResponseWriter, r *http.Request) {
 // voting: common methods
 //
 
-func (h *htrun) onPrimaryFail(self *proxy) {
+func (h *htrun) onPrimaryDown(self *proxy, callerID string) {
 	smap := h.owner.smap.get()
 	if smap.validate() != nil {
 		return
 	}
 	clone := smap.clone()
-	nlog.Infof("%s: primary %s has FAILED", h.si, clone.Primary.StringEx())
+	s := "via keepalive"
+	if callerID != "" {
+		s = "via direct call"
+		if callerID != clone.Primary.ID() {
+			nlog.Errorf("%s (%s): non-primary caller reporting primary down (%s, %s, %s)",
+				h, s, callerID, clone.Primary.StringEx(), smap)
+			return
+		}
+	}
+	nlog.Infof("%s (%s): primary %s is no longer online and must be reelected", h, s, clone.Primary.StringEx())
 
 	for {
+		if daemon.stopping.Load() {
+			return
+		}
 		// use HRW ordering
 		nextPrimaryProxy, err := cluster.HrwProxy(&clone.Smap, clone.Primary.ID())
 		if err != nil {
 			if !daemon.stopping.Load() {
-				nlog.Errorf("%s: failed to execute HRW selection, err: %v", h, err)
+				nlog.Errorf("%s failed to execute HRW selection: %v", h, err)
 			}
 			return
 		}
-		nlog.Infof("%s: trying %s as the new primary candidate", h, meta.Pname(nextPrimaryProxy.ID()))
 
 		// If this proxy is the next primary proxy candidate, it starts the election directly.
 		if nextPrimaryProxy.ID() == h.si.ID() {
@@ -416,6 +440,8 @@ func (h *htrun) onPrimaryFail(self *proxy) {
 			self.startElection(vr)
 			return
 		}
+
+		nlog.Infof("%s: trying %s as the new primary candidate", h, meta.Pname(nextPrimaryProxy.ID()))
 
 		// ask the candidate to start election
 		vr := &VoteInitiation{
@@ -560,7 +586,7 @@ func (h *htrun) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *meta.S
 		}
 		cargs.timeout = apc.DefaultTimeout
 	}
-	res := h.call(cargs)
+	res := h.call(cargs, vr.Smap)
 	err = res.err
 	freeCR(res)
 	defer freeCargs(cargs)
@@ -571,7 +597,7 @@ func (h *htrun) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *meta.S
 	sleep := cmn.Timeout.CplaneOperation() / 2
 	for i := 0; i < maxRetryElectReq; i++ {
 		time.Sleep(sleep)
-		res = h.call(cargs)
+		res = h.call(cargs, vr.Smap)
 		err = res.err
 		freeCR(res)
 		if err == nil {

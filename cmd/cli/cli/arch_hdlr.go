@@ -34,13 +34,15 @@ var (
 		indent1 + "\t" + archExts + "-formatted object - aka \"shard\".\n" +
 		indent1 + "\tBoth APPEND (to an existing shard) and PUT (a new version of the shard) are supported.\n" +
 		indent1 + "\tExamples:\n" +
-		indent1 + "\t- 'local-filename bucket/shard-00123.tar.lz4 --archpath name-in-archive' - append file to a given shard,\n" +
+		indent1 + "\t- 'local-file s3://q/shard-00123.tar.lz4 --append --archpath name-in-archive' - append file to a given shard,\n" +
 		indent1 + "\t   optionally, rename it (inside archive) as specified;\n" +
-		indent1 + "\t- 'src-dir bucket/shard-99999.zip -put' - one directory; iff the destination .zip doesn't exist create a new one;\n" +
+		indent1 + "\t- 'local-file s3://q/shard-00123.tar.lz4 --append-or-put --archpath name-in-archive' - append file to a given shard if exists,\n" +
+		indent1 + "\t   otherwise, create a new shard (and name it shard-00123.tar.lz4, as specified);\n" +
+		indent1 + "\t- 'src-dir gs://w/shard-999.zip --append' - archive entire 'src-dir' directory; iff the destination .zip doesn't exist create a new one;\n" +
 		indent1 + "\t- '\"sys, docs\" ais://dst/CCC.tar --dry-run -y -r --archpath ggg/' - dry-run to recursively archive two directories.\n" +
 		indent1 + "\tTips:\n" +
 		indent1 + "\t- use '--dry-run' option if in doubt;\n" +
-		indent1 + "\t- to archive objects from a ais:// or remote bucket, run 'ais archive bucket', see --help for details."
+		indent1 + "\t- to archive objects from a ais:// or remote bucket, run 'ais archive bucket' (see --help for details)."
 )
 
 var (
@@ -51,14 +53,14 @@ var (
 			listFlag,
 			dryRunFlag,
 			inclSrcBucketNameFlag,
-			archAppendIfExistFlag,
+			archAppendOrPutFlag,
 			continueOnErrorFlag,
 			waitFlag,
 		},
 		commandPut: append(
 			listrangeFlags,
-			archAppendIfExistFlag,
-			archAppendFlag,
+			archAppendOrPutFlag,
+			archAppendOnlyFlag,
 			archpathFlag,
 			concurrencyFlag,
 			dryRunFlag,
@@ -100,14 +102,12 @@ var (
 
 	// archive get
 	archGetCmd = cli.Command{
-		Name: commandGet,
-		Usage: "get a shard, an archived file, or a range of bytes from the above;\n" +
-			indent4 + "\t- use '--prefix' to get multiple objects in one shot (empty prefix for the entire bucket)\n" +
-			indent4 + "\t- write the content locally with destination options including: filename, directory, STDOUT ('-')",
+		Name:         objectCmdGet.Name,
+		Usage:        objectCmdGet.Usage,
 		ArgsUsage:    getShardArgument,
-		Flags:        objectCmdsFlags[commandGet],
-		Action:       getHandler,
-		BashComplete: bucketCompletions(bcmplop{separator: true}),
+		Flags:        rmFlags(objectCmdGet.Flags, checkObjCachedFlag, lengthFlag, offsetFlag),
+		Action:       getArchHandler,
+		BashComplete: objectCmdGet.BashComplete,
 	}
 
 	// archive ls
@@ -115,7 +115,7 @@ var (
 		Name:         cmdList,
 		Usage:        "list archived content (supported formats: " + archFormats + ")",
 		ArgsUsage:    optionalShardArgument,
-		Flags:        rmFlags(bucketCmdsFlags[commandList], listArchFlag),
+		Flags:        rmFlags(bucketCmdsFlags[commandList], listArchFlag), // is implied
 		Action:       listArchHandler,
 		BashComplete: bucketCompletions(bcmplop{}),
 	}
@@ -191,7 +191,7 @@ func archMultiObjHandler(c *cli.Context) error {
 
 	// parse
 	var a archbck
-	a.apndIfExist = flagIsSet(c, archAppendIfExistFlag)
+	a.apndIfExist = flagIsSet(c, archAppendOrPutFlag)
 	if err := a.parse(c); err != nil {
 		return err
 	}
@@ -245,7 +245,8 @@ func putApndArchHandler(c *cli.Context) (err error) {
 		src, dst := c.Args().Get(0), c.Args().Get(1)
 		if _, _, err := parseBckObjURI(c, src, true); err == nil {
 			if _, _, err := parseBckObjURI(c, dst, true); err == nil {
-				msg := "expecting " + c.Command.ArgsUsage + "\n(hint: use 'ais archive bucket' command, '--help' for details)"
+				msg := "expecting " + c.Command.ArgsUsage +
+					"\n(hint: use 'ais archive bucket' command, '--help' for details)"
 				return errors.New(msg)
 			}
 		}
@@ -276,11 +277,18 @@ func putApndArchHandler(c *cli.Context) (err error) {
 	//
 	// multi-file cases
 	//
+	if !a.appendOnly && !a.appendOrPut {
+		warn := fmt.Sprintf("multi-file 'archive put' operation requires either %s or %s",
+			qflprn(archAppendOnlyFlag), qflprn(archAppendOrPutFlag))
+		actionWarn(c, warn)
+		fmt.Fprintf(c.App.ErrWriter, "Assuming %s - proceeding to execute...\n\n", qflprn(archAppendOrPutFlag))
+		a.appendOrPut = true
+	}
 
 	// archpath
 	if a.archpath != "" && !strings.HasSuffix(a.archpath, "/") {
 		if !flagIsSet(c, yesFlag) {
-			warn := fmt.Sprintf("no traling filepath separator in: '%s=%s'", qflprn(archpathFlag), a.archpath)
+			warn := fmt.Sprintf("no trailing filepath separator in: '%s=%s'", qflprn(archpathFlag), a.archpath)
 			actionWarn(c, warn)
 			if ok := confirm(c, "Proceed anyway?"); !ok {
 				return
@@ -356,7 +364,7 @@ func a2aRegular(c *cli.Context, a *archput) error {
 	if a.appendOnly {
 		putApndArchArgs.Flags = apc.ArchAppend
 	}
-	if a.appendIf {
+	if a.appendOrPut {
 		debug.Assert(!a.appendOnly)
 		putApndArchArgs.Flags = apc.ArchAppendIfExist
 	}
@@ -367,6 +375,10 @@ func a2aRegular(c *cli.Context, a *archput) error {
 	return err
 }
 
+func getArchHandler(c *cli.Context) error {
+	return getHandler(c)
+}
+
 func listArchHandler(c *cli.Context) error {
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
@@ -375,7 +387,15 @@ func listArchHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	return listObjects(c, bck, objName, true /*list arch*/)
+	prefix := parseStrFlag(c, listObjPrefixFlag)
+	if objName != "" && prefix != "" && !strings.HasPrefix(prefix, objName) {
+		return fmt.Errorf("cannot handle object name ('%s') and prefix ('%s') simultaneously - not implemented yet",
+			objName, prefix)
+	}
+	if prefix == "" {
+		prefix = objName
+	}
+	return listObjects(c, bck, prefix, true /*list arch*/)
 }
 
 //

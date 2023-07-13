@@ -908,35 +908,23 @@ func (e *ErrHTTP) _trace() {
 }
 
 func IsStatusServiceUnavailable(err error) (yes bool) {
-	hErr, ok := err.(*ErrHTTP)
-	if !ok {
-		return false
-	}
-	return hErr.Status == http.StatusServiceUnavailable
+	herr, ok := err.(*ErrHTTP)
+	return ok && herr.Status == http.StatusServiceUnavailable
 }
 
 func IsStatusNotFound(err error) (yes bool) {
-	hErr, ok := err.(*ErrHTTP)
-	if !ok {
-		return false
-	}
-	return hErr.Status == http.StatusNotFound
+	herr, ok := err.(*ErrHTTP)
+	return ok && herr.Status == http.StatusNotFound
 }
 
 func IsStatusBadGateway(err error) (yes bool) {
-	hErr, ok := err.(*ErrHTTP)
-	if !ok {
-		return false
-	}
-	return hErr.Status == http.StatusBadGateway
+	herr, ok := err.(*ErrHTTP)
+	return ok && herr.Status == http.StatusBadGateway
 }
 
 func IsStatusGone(err error) (yes bool) {
-	hErr, ok := err.(*ErrHTTP)
-	if !ok {
-		return false
-	}
-	return hErr.Status == http.StatusGone
+	herr, ok := err.(*ErrHTTP)
+	return ok && herr.Status == http.StatusGone
 }
 
 func Str2HTTPErr(msg string) *ErrHTTP {

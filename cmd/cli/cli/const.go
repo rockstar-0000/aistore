@@ -495,7 +495,7 @@ var (
 		Name:  "paged",
 		Usage: "list objects page by page, one page at a time (see also '--page-size' and '--limit')",
 	}
-	showUnmatchedFlag = cli.BoolFlag{Name: "show-unmatched", Usage: "list objects that were not matched by regex and template"}
+	showUnmatchedFlag = cli.BoolFlag{Name: "show-unmatched", Usage: "list also objects that were _not_ matched by regex and/or template (range)"}
 
 	keepMDFlag       = cli.BoolFlag{Name: "keep-md", Usage: "keep bucket metadata"}
 	dataSlicesFlag   = cli.IntFlag{Name: "data-slices,data,d", Usage: "number of data slices", Required: true}
@@ -663,7 +663,7 @@ var (
 			"(as seen from the target)",
 	}
 
-	yesFlag = cli.BoolFlag{Name: "yes,y", Usage: "assume 'yes' for all questions"}
+	yesFlag = cli.BoolFlag{Name: "yes,y", Usage: "assume 'yes' to all questions"}
 
 	chunkSizeFlag = cli.StringFlag{
 		Name:  "chunk-size",
@@ -700,11 +700,11 @@ var (
 
 	archpathFlag = cli.StringFlag{
 		Name:  "archpath",
-		Usage: "filename in archive",
+		Usage: "filename in archive (shard)",
 	}
 	archpathGetFlag = cli.StringFlag{
 		Name:  archpathFlag.Name,
-		Usage: "extract the specified file from archive (shard)",
+		Usage: "extract the specified file from an archive (shard)",
 	}
 	extractFlag = cli.BoolFlag{
 		Name:  "extract,x",
@@ -720,12 +720,12 @@ var (
 		Usage: "prefix the names of archived files with the (root) source directory (omitted by default)",
 	}
 	// 'ais archive put': conditional APPEND
-	archAppendIfExistFlag = cli.BoolFlag{
-		Name:  "append-if",
+	archAppendOrPutFlag = cli.BoolFlag{
+		Name:  "append-or-put",
 		Usage: "if destination object (\"archive\", \"shard\") exists append to it, otherwise archive a new one",
 	}
-	// 'ais archive put': unconditional APPEND
-	archAppendFlag = cli.BoolFlag{
+	// 'ais archive put': unconditional APPEND: destination must exist
+	archAppendOnlyFlag = cli.BoolFlag{
 		Name:  "append",
 		Usage: "add newly archived content to the destination object (\"archive\", \"shard\") that must exist",
 	}
