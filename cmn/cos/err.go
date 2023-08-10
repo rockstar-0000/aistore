@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -132,8 +133,14 @@ func IsErrOOS(err error) bool {
 	return errors.Is(err, syscall.ENOSPC)
 }
 
+func isErrDNSLookup(err error) bool {
+	_, ok := err.(*net.DNSError)
+	return ok
+}
+
 func IsUnreachable(err error, status int) bool {
 	return IsErrConnectionRefused(err) ||
+		isErrDNSLookup(err) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		status == http.StatusRequestTimeout ||
 		status == http.StatusServiceUnavailable ||
@@ -166,7 +173,7 @@ func ExitLogf(f string, a ...any) {
 	msg := fmt.Sprintf(fatalPrefix+f, a...)
 	if flag.Parsed() {
 		nlog.ErrorDepth(1, msg+"\n")
-		nlog.FlushExit()
+		nlog.Flush(true)
 	}
 	_exit(msg)
 }
@@ -175,7 +182,7 @@ func ExitLog(a ...any) {
 	msg := fatalPrefix + fmt.Sprint(a...)
 	if flag.Parsed() {
 		nlog.ErrorDepth(1, msg+"\n")
-		nlog.FlushExit()
+		nlog.Flush(true)
 	}
 	_exit(msg)
 }

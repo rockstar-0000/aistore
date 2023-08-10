@@ -72,9 +72,11 @@ var (
 		"cp":     "bucket cp",
 		"rmb":    "bucket rm",
 		// job
-		"start": "job start",
-		"stop":  "job stop",
-		"wait":  "job wait",
+		"start":    "job start",
+		"stop":     "job stop",
+		"wait":     "job wait",
+		"dsort":    "job start dsort",
+		"download": "job start download",
 	}
 )
 

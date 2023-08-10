@@ -1,14 +1,10 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
- *
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-
-// Package dsort provides APIs for distributed archive file shuffling.
 package dsort
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"net/url"
@@ -22,48 +18,10 @@ import (
 	"github.com/NVIDIA/aistore/ext/dsort/extract"
 )
 
-const (
-	templBash = "bash"
-	templAt   = "@"
-)
-
-var (
-	templateExamples         = "(examples: bash format: 'prefix{0001..0010}suffix', at format: 'prefix@00100suffix')"
-	errInvalidInputTemplate  = errors.New("could not parse input template " + templateExamples)
-	errInvalidOutputTemplate = errors.New("could not parse output template " + templateExamples)
-)
-
-var (
-	errMissingBucket            = errors.New("missing field 'bucket'")
-	errInvalidExtension         = errors.New("extension must be one of '.tar', '.tar.gz', or '.tgz'")
-	errNegOutputShardSize       = errors.New("output shard size must be >= 0")
-	errEmptyOutputShardSize     = errors.New("output shard size must be set (cannot be 0)")
-	errNegativeConcurrencyLimit = errors.New("concurrency max limit must be 0 (limits will be calculated) or > 0")
-
-	errInvalidOrderParam = errors.New("could not parse order format, required URL")
-
-	errInvalidAlgorithm          = errors.New("invalid algorithm specified")
-	errInvalidSeed               = errors.New("invalid seed provided, should be int")
-	errInvalidAlgorithmExtension = errors.New("invalid extension provided, should be in the format: .ext")
-)
-
-// supportedExtensions is a list of extensions (archives) supported by dSort
-var supportedExtensions = archive.FileExtensions
-
-// TODO: maybe this struct should be composed of `type` and `template` where
-// template is interface and each template has it's own struct. Then we could
-// reflect the interface and based on it start different traverse function.
 type parsedInputTemplate struct {
-	Type string `json:"type"`
-
-	// Used by 'bash' and 'at' template
 	Template cos.ParsedTemplate `json:"template"`
-
-	// Used by 'regex' template
-	Regex string `json:"regex"`
-
-	// Used by 'file' template
-	File []string `json:"file"`
+	ObjNames []string           `json:"objnames"`
+	Prefix   string             `json:"prefix"`
 }
 
 type parsedOutputTemplate struct {
@@ -71,59 +29,29 @@ type parsedOutputTemplate struct {
 	Template cos.ParsedTemplate
 }
 
-// RequestSpec defines the user specification for requests to the endpoint /v1/sort.
-type RequestSpec struct {
-	// Required
-	Bck             cmn.Bck `json:"bck" yaml:"bck"`
-	Extension       string  `json:"extension" yaml:"extension"`
-	InputFormat     string  `json:"input_format" yaml:"input_format"`
-	OutputFormat    string  `json:"output_format" yaml:"output_format"`
-	OutputShardSize string  `json:"output_shard_size" yaml:"output_shard_size"`
-
-	// Optional
-	Description string `json:"description" yaml:"description"`
-	// Default: same as `bck` field
-	OutputBck cmn.Bck `json:"output_bck" yaml:"output_bck"`
-	// Default: alphanumeric, increasing
-	Algorithm SortAlgorithm `json:"algorithm" yaml:"algorithm"`
-	// Default: ""
-	OrderFileURL string `json:"order_file" yaml:"order_file"`
-	// Default: "\t"
-	OrderFileSep string `json:"order_file_sep" yaml:"order_file_sep"`
-	// Default: "80%"
-	MaxMemUsage string `json:"max_mem_usage" yaml:"max_mem_usage"`
-	// Default: calcMaxLimit()
-	ExtractConcMaxLimit int `json:"extract_concurrency_max_limit" yaml:"extract_concurrency_max_limit"`
-	// Default: calcMaxLimit()
-	CreateConcMaxLimit int `json:"create_concurrency_max_limit" yaml:"create_concurrency_max_limit"`
-	// Default: bundle.Multiplier
-	StreamMultiplier int `json:"stream_multiplier" yaml:"stream_multiplier"`
-	// Default: false
-	ExtendedMetrics bool `json:"extended_metrics" yaml:"extended_metrics"`
-
-	// debug
-	DSorterType string `json:"dsorter_type"`
-	DryRun      bool   `json:"dry_run"` // Default: false
-
-	cmn.DSortConf
+type ParsedReq struct {
+	InputBck  cmn.Bck
+	OutputBck cmn.Bck
+	pars      *parsedReqSpec
 }
 
-type ParsedRequestSpec struct {
-	Bck                 cmn.Bck               `json:"bck"`
+type parsedReqSpec struct {
+	InputBck            cmn.Bck               `json:"input_bck"`
 	Description         string                `json:"description"`
 	OutputBck           cmn.Bck               `json:"output_bck"`
-	Extension           string                `json:"extension"`
+	InputExtension      string                `json:"input_extension"`
+	OutputExtension     string                `json:"output_extension"`
 	OutputShardSize     int64                 `json:"output_shard_size,string"`
-	InputFormat         *parsedInputTemplate  `json:"input_format"`
-	OutputFormat        *parsedOutputTemplate `json:"output_format"`
-	Algorithm           *SortAlgorithm        `json:"algorithm"`
+	Pit                 *parsedInputTemplate  `json:"pit"`
+	Pot                 *parsedOutputTemplate `json:"pot"`
+	Algorithm           *Algorithm            `json:"algorithm"`
 	OrderFileURL        string                `json:"order_file"`
 	OrderFileSep        string                `json:"order_file_sep"`
 	MaxMemUsage         cos.ParsedQuantity    `json:"max_mem_usage"`
 	TargetOrderSalt     []byte                `json:"target_order_salt"`
 	ExtractConcMaxLimit int                   `json:"extract_concurrency_max_limit"`
 	CreateConcMaxLimit  int                   `json:"create_concurrency_max_limit"`
-	StreamMultiplier    int                   `json:"stream_multiplier"` // TODO: should be removed
+	SbundleMult         int                   `json:"bundle_multiplier"`
 	ExtendedMetrics     bool                  `json:"extended_metrics"`
 
 	// debug
@@ -133,217 +61,260 @@ type ParsedRequestSpec struct {
 	cmn.DSortConf
 }
 
-type SortAlgorithm struct {
-	Kind string `json:"kind"`
+/////////////////
+// RequestSpec //
+/////////////////
 
-	// Kind: alphanumeric, content
-	Decreasing bool `json:"decreasing"`
+func specErr(s string, err error) error { return fmt.Errorf("[dsort] parse-spec: %q %w", s, err) }
 
-	// Kind: shuffle
-	Seed string `json:"seed"` // seed provided to random generator
-
-	// Kind: content
-	Extension  string `json:"extension"`
-	FormatType string `json:"format_type"`
+func (rs *RequestSpec) ParseCtx() (*ParsedReq, error) {
+	pars, err := rs.parse()
+	return &ParsedReq{pars.InputBck, pars.OutputBck, pars}, err
 }
 
-// Parse returns a non-nil error if a RequestSpec is invalid. When RequestSpec
-// is valid it parses all the fields, sets the values and returns ParsedRequestSpec.
-func (rs *RequestSpec) Parse() (*ParsedRequestSpec, error) {
+func (rs *RequestSpec) parse() (*parsedReqSpec, error) {
 	var (
-		cfg      = cmn.GCO.Get().DSort
-		parsedRS = &ParsedRequestSpec{}
+		cfg  = cmn.GCO.Get().DSort
+		pars = &parsedReqSpec{}
 	)
 
-	if rs.Bck.Name == "" {
-		return parsedRS, errMissingBucket
+	// src bck
+	if rs.InputBck.IsEmpty() {
+		return pars, specErr("input_bck", errMissingSrcBucket)
 	}
-	if rs.Bck.Provider == "" {
-		rs.Bck.Provider = apc.AIS
+	pars.InputBck = rs.InputBck
+	if rs.InputBck.Provider == "" {
+		pars.InputBck.Provider = apc.AIS // NOTE: ais:// is the default
+	} else {
+		normp, err := cmn.NormalizeProvider(rs.InputBck.Provider)
+		if err != nil {
+			return pars, specErr("input_bck_provider", err)
+		}
+		pars.InputBck.Provider = normp
 	}
-	if _, err := cmn.NormalizeProvider(rs.Bck.Provider); err != nil {
-		return parsedRS, err
-	}
-	if err := rs.Bck.Validate(); err != nil {
-		return parsedRS, err
-	}
-	parsedRS.Description = rs.Description
-	parsedRS.Bck = rs.Bck
-	parsedRS.OutputBck = rs.OutputBck
-	if parsedRS.OutputBck.IsEmpty() {
-		parsedRS.OutputBck = parsedRS.Bck
-	} else if _, err := cmn.NormalizeProvider(rs.OutputBck.Provider); err != nil {
-		return parsedRS, err
-	} else if err := rs.OutputBck.Validate(); err != nil {
-		return parsedRS, err
+	if err := rs.InputBck.Validate(); err != nil {
+		return pars, specErr("input_bck", err)
 	}
 
+	pars.Description = rs.Description
+
+	// dst bck
+	pars.OutputBck = rs.OutputBck
+	if pars.OutputBck.IsEmpty() {
+		pars.OutputBck = pars.InputBck // NOTE: source can be the destination as well
+	} else {
+		normp, err := cmn.NormalizeProvider(rs.OutputBck.Provider)
+		if err != nil {
+			return pars, specErr("output_bck_provider", err)
+		}
+		pars.OutputBck.Provider = normp
+		if err := rs.OutputBck.Validate(); err != nil {
+			return pars, specErr("output_bck", err)
+		}
+	}
+
+	// input format
 	var err error
-	parsedRS.InputFormat, err = parseInputFormat(rs.InputFormat)
+	pars.Pit, err = parseInputFormat(rs.InputFormat)
 	if err != nil {
-		return nil, err
+		return nil, specErr("input_format", err)
+	}
+	if rs.InputFormat.Template != "" {
+		// template is not a filename but all we do here is
+		// checking the template's suffix for specific supported extensions
+		if ext, err := archive.Mime("", rs.InputFormat.Template); err == nil {
+			if rs.InputExtension != "" && rs.InputExtension != ext {
+				return nil, fmt.Errorf("input_extension: %q vs %q", rs.InputExtension, ext)
+			}
+			rs.InputExtension = ext
+		}
+	}
+	if rs.InputExtension != "" {
+		pars.InputExtension, err = archive.Mime(rs.InputExtension, "")
+		if err != nil {
+			return nil, specErr("input_extension", err)
+		}
 	}
 
-	if !validateExtension(rs.Extension) {
-		return nil, errInvalidExtension
-	}
-	parsedRS.Extension = rs.Extension
-
-	parsedRS.OutputShardSize, err = cos.ParseSize(rs.OutputShardSize, cos.UnitsIEC)
+	// output format
+	pars.OutputShardSize, err = cos.ParseSize(rs.OutputShardSize, cos.UnitsIEC)
 	if err != nil {
-		return nil, err
+		return nil, specErr("output_shard_size", err)
 	}
-	if parsedRS.OutputShardSize < 0 {
-		return nil, errNegOutputShardSize
+	if pars.OutputShardSize < 0 {
+		return nil, fmt.Errorf(fmtErrNegOutputSize, pars.OutputShardSize)
 	}
-
-	parsedRS.Algorithm, err = parseAlgorithm(rs.Algorithm)
+	pars.Algorithm, err = parseAlgorithm(rs.Algorithm)
 	if err != nil {
-		return nil, errInvalidAlgorithm
+		return nil, specErr("algorithm", err)
 	}
 
-	if empty, valid := validateOrderFileURL(rs.OrderFileURL); !valid {
-		return nil, errInvalidOrderParam
-	} else if empty {
-		if parsedRS.OutputFormat, err = parseOutputFormat(rs.OutputFormat); err != nil {
+	var isOrder bool
+	if isOrder, err = validateOrderFileURL(rs.OrderFileURL); err != nil {
+		return nil, fmt.Errorf(fmtErrOrderURL, rs.OrderFileURL, err)
+	}
+	if isOrder {
+		if pars.Pot, err = parseOutputFormat(rs.OutputFormat); err != nil {
 			return nil, err
 		}
-		if parsedRS.OutputFormat.Template.Count() > math.MaxInt32 {
-			// If the count is not defined then the output shard size must be set.
-			if parsedRS.OutputShardSize == 0 {
-				return nil, errEmptyOutputShardSize
+		if pars.Pot.Template.Count() > math.MaxInt32 {
+			// If the count is not defined the output shard size must be
+			if pars.OutputShardSize == 0 {
+				return nil, errMissingOutputSize
 			}
 		}
-	} else { // Valid and not empty.
-		// For the order file the output shard size must be set.
-		if parsedRS.OutputShardSize == 0 {
-			return nil, errEmptyOutputShardSize
+		if rs.OutputFormat != "" {
+			// (ditto)
+			if ext, err := archive.Mime("", rs.OutputFormat); err == nil {
+				if rs.OutputExtension != "" && rs.OutputExtension != ext {
+					return nil, fmt.Errorf("output_extension: %q vs %q", rs.OutputExtension, ext)
+				}
+				rs.OutputExtension = ext
+			}
 		}
-
-		parsedRS.OrderFileURL = rs.OrderFileURL
-
-		parsedRS.OrderFileSep = rs.OrderFileSep
-		if parsedRS.OrderFileSep == "" {
-			parsedRS.OrderFileSep = "\t"
+	} else {
+		// For the order file the output shard size must be set.
+		if pars.OutputShardSize == 0 {
+			return nil, errMissingOutputSize
+		}
+		pars.OrderFileURL = rs.OrderFileURL
+		pars.OrderFileSep = rs.OrderFileSep
+		if pars.OrderFileSep == "" {
+			pars.OrderFileSep = "\t"
+		}
+	}
+	if rs.OutputExtension == "" {
+		pars.OutputExtension = pars.InputExtension
+	} else {
+		pars.OutputExtension, err = archive.Mime(rs.OutputExtension, "")
+		if err != nil {
+			return nil, specErr("output_extension", err)
 		}
 	}
 
+	// mem & conc
 	if rs.MaxMemUsage == "" {
 		rs.MaxMemUsage = cfg.DefaultMaxMemUsage
 	}
-
-	parsedRS.MaxMemUsage, err = cos.ParseQuantity(rs.MaxMemUsage)
+	pars.MaxMemUsage, err = cos.ParseQuantity(rs.MaxMemUsage)
 	if err != nil {
 		return nil, err
 	}
-
 	if rs.ExtractConcMaxLimit < 0 {
-		return nil, errNegativeConcurrencyLimit
+		return nil, fmt.Errorf("%w ('extract', %d)", errNegConcLimit, rs.ExtractConcMaxLimit)
 	}
 	if rs.CreateConcMaxLimit < 0 {
-		return nil, errNegativeConcurrencyLimit
+		return nil, fmt.Errorf("%w ('create', %d)", errNegConcLimit, rs.CreateConcMaxLimit)
 	}
 
-	parsedRS.ExtractConcMaxLimit = rs.ExtractConcMaxLimit
-	parsedRS.CreateConcMaxLimit = rs.CreateConcMaxLimit
-	parsedRS.StreamMultiplier = rs.StreamMultiplier
-	parsedRS.ExtendedMetrics = rs.ExtendedMetrics
-	parsedRS.DSorterType = rs.DSorterType
-	parsedRS.DryRun = rs.DryRun
+	pars.ExtractConcMaxLimit = rs.ExtractConcMaxLimit
+	pars.CreateConcMaxLimit = rs.CreateConcMaxLimit
+	pars.ExtendedMetrics = rs.ExtendedMetrics
+	pars.DSorterType = rs.DSorterType
+	pars.DryRun = rs.DryRun
 
-	// Check for values that override the global config.
-	if err := rs.DSortConf.ValidateWithOpts(true); err != nil {
+	// `cfg` here contains inherited (aka global) part of the dsort config -
+	// apply this request's rs.Config values to override or assign defaults
+
+	if err := rs.Config.ValidateWithOpts(true); err != nil {
 		return nil, err
 	}
-	parsedRS.DSortConf = rs.DSortConf
-	if parsedRS.MissingShards == "" {
-		parsedRS.MissingShards = cfg.MissingShards
+	pars.DSortConf = rs.Config
+
+	pars.SbundleMult = rs.Config.SbundleMult
+	if pars.SbundleMult == 0 {
+		pars.SbundleMult = cfg.SbundleMult
 	}
-	if parsedRS.EKMMalformedLine == "" {
-		parsedRS.EKMMalformedLine = cfg.EKMMalformedLine
+	if pars.MissingShards == "" {
+		pars.MissingShards = cfg.MissingShards
 	}
-	if parsedRS.EKMMissingKey == "" {
-		parsedRS.EKMMissingKey = cfg.EKMMissingKey
+	if pars.EKMMalformedLine == "" {
+		pars.EKMMalformedLine = cfg.EKMMalformedLine
 	}
-	if parsedRS.DuplicatedRecords == "" {
-		parsedRS.DuplicatedRecords = cfg.DuplicatedRecords
+	if pars.EKMMissingKey == "" {
+		pars.EKMMissingKey = cfg.EKMMissingKey
 	}
-	if parsedRS.DSorterMemThreshold == "" {
-		parsedRS.DSorterMemThreshold = cfg.DSorterMemThreshold
+	if pars.DuplicatedRecords == "" {
+		pars.DuplicatedRecords = cfg.DuplicatedRecords
+	}
+	if pars.DSorterMemThreshold == "" {
+		pars.DSorterMemThreshold = cfg.DSorterMemThreshold
 	}
 
-	return parsedRS, nil
+	return pars, nil
 }
 
-// validateExtension checks if extension is supported by dsort
-func validateExtension(ext string) bool {
-	return cos.StringInSlice(ext, supportedExtensions)
-}
-
-// parseInputFormat makes sure that the input format is either `at` or `bash`
-// (see cmn/cos/template.go for detaiuls)
-func parseInputFormat(inputFormat string) (pit *parsedInputTemplate, err error) {
-	pit = &parsedInputTemplate{}
-	template := strings.TrimSpace(inputFormat)
-	if pit.Template, err = cos.ParseBashTemplate(template); err == nil {
-		pit.Type = templBash
-	} else {
-		if pit.Template, err = cos.ParseAtTemplate(template); err != nil {
-			return nil, errInvalidInputTemplate
+func parseAlgorithm(alg Algorithm) (*Algorithm, error) {
+	if !cos.StringInSlice(alg.Kind, algorithms) {
+		return nil, fmt.Errorf(fmtErrInvalidAlg, algorithms)
+	}
+	if alg.Seed != "" {
+		if value, err := strconv.ParseInt(alg.Seed, 10, 64); value < 0 || err != nil {
+			return nil, fmt.Errorf(fmtErrSeed, alg.Seed)
 		}
-		pit.Type = templAt
 	}
+	if alg.Kind == Content {
+		alg.Ext = strings.TrimSpace(alg.Ext)
+		if alg.Ext == "" || alg.Ext[0] != '.' {
+			return nil, fmt.Errorf("%w %q", errAlgExt, alg.Ext)
+		}
+		if err := extract.ValidateContentKeyT(alg.ContentKeyType); err != nil {
+			return nil, err
+		}
+	} else {
+		alg.ContentKeyType = extract.ContentKeyString
+	}
+
+	return &alg, nil
+}
+
+func validateOrderFileURL(orderURL string) (empty bool, err error) {
+	if orderURL == "" {
+		return true, nil
+	}
+	_, err = url.ParseRequestURI(orderURL)
 	return
 }
 
-// parseOutputFormat validates the output format
+//////////////////////////
+// parsedOutputTemplate //
+//////////////////////////
+
 func parseOutputFormat(outputFormat string) (pot *parsedOutputTemplate, err error) {
 	pot = &parsedOutputTemplate{}
 	if pot.Template, err = cos.NewParsedTemplate(strings.TrimSpace(outputFormat)); err != nil {
 		return
 	}
-	if len(pot.Template.Ranges) == 0 { // with no parsed ranges, we currently assume that there's only prefix
-		return nil, errInvalidOutputTemplate
+	if len(pot.Template.Ranges) == 0 {
+		return nil, fmt.Errorf("invalid output template %q: no ranges (prefix-only output is not supported)",
+			outputFormat)
 	}
 	return
 }
 
-func parseAlgorithm(algo SortAlgorithm) (parsedAlgo *SortAlgorithm, err error) {
-	if !cos.StringInSlice(algo.Kind, supportedAlgorithms) {
-		return nil, fmt.Errorf(fmtInvalidAlgorithmKind, supportedAlgorithms)
+/////////////////////////
+// parsedInputTemplate //
+/////////////////////////
+
+func parseInputFormat(inputFormat apc.ListRange) (pit *parsedInputTemplate, err error) {
+	pit = &parsedInputTemplate{}
+	if inputFormat.IsList() {
+		pit.ObjNames = inputFormat.ObjNames
+		return
 	}
+	pit.Template, err = cos.NewParsedTemplate(inputFormat.Template)
 
-	if algo.Seed != "" {
-		if value, err := strconv.ParseInt(algo.Seed, 10, 64); value < 0 || err != nil {
-			return nil, errInvalidSeed
-		}
+	if err == cos.ErrEmptyTemplate {
+		// empty template => empty prefix (match any)
+		err = nil
+		pit.Prefix = ""
+	} else if err == nil && len(pit.Template.Ranges) == 0 {
+		// prefix only
+		pit.Prefix = pit.Template.Prefix
 	}
-
-	if algo.Kind == SortKindContent {
-		algo.Extension = strings.TrimSpace(algo.Extension)
-		if algo.Extension == "" {
-			return nil, errInvalidAlgorithmExtension
-		}
-
-		if algo.Extension[0] != '.' { // extension should begin with dot: .cls
-			return nil, errInvalidAlgorithmExtension
-		}
-
-		if err := extract.ValidateAlgorithmFormatType(algo.FormatType); err != nil {
-			return nil, err
-		}
-	} else {
-		algo.FormatType = extract.FormatTypeString
-	}
-
-	return &algo, nil
+	return
 }
 
-func validateOrderFileURL(orderURL string) (empty, valid bool) {
-	if orderURL == "" {
-		return true, true
-	}
-
-	_, err := url.ParseRequestURI(orderURL)
-	return false, err == nil
-}
+func (pit *parsedInputTemplate) isList() bool   { return len(pit.ObjNames) > 0 }
+func (pit *parsedInputTemplate) isRange() bool  { return len(pit.Template.Ranges) > 0 }
+func (pit *parsedInputTemplate) isPrefix() bool { return !pit.isList() && !pit.isRange() }

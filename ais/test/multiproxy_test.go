@@ -916,7 +916,7 @@ func proxyStress(t *testing.T) {
 		proxyURL = tools.RandomProxyURL(t)
 	)
 
-	tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	defer func() {
 		err := tools.WaitNodeReady(proxyURL)
 		tassert.CheckFatal(t, err)
@@ -941,7 +941,7 @@ func proxyStress(t *testing.T) {
 	wg.Add(1)
 	go primaryKiller(t, proxyURL, stopChs[workerCnt], proxyURLChs, errChs[workerCnt], &wg)
 
-	timer := time.After(multiProxyTestTimeout)
+	timer := time.After(tools.MultiProxyTestTimeout)
 loop:
 	for {
 		for _, ch := range errChs {
@@ -1477,7 +1477,7 @@ func icSyncOwnershipTable(t *testing.T) {
 		}
 	)
 
-	tools.CreateBucketWithCleanup(t, proxyURL, src, nil)
+	tools.CreateBucket(t, proxyURL, src, nil, true /*cleanup*/)
 
 	// Start any xaction and get ID.
 	xid, err := api.CopyBucket(baseParams, src, dstBck, nil)
@@ -1548,7 +1548,7 @@ func icSinglePrimaryRevamp(t *testing.T) {
 
 	proxyURL = smap.Primary.URL(cmn.NetPublic)
 	baseParams = tools.BaseAPIParams(proxyURL)
-	tools.CreateBucketWithCleanup(t, proxyURL, src, nil)
+	tools.CreateBucket(t, proxyURL, src, nil, true /*cleanup*/)
 
 	// Start any xaction and get ID.
 	xid, err := api.CopyBucket(baseParams, src, dstBck, nil)
@@ -1589,8 +1589,8 @@ func icStressMonitorXactMultiICFail(t *testing.T) {
 	)
 
 	// 1. Populate a bucket required for copy xactions
-	m.initWithCleanup()
-	tools.CreateBucketWithCleanup(t, proxyURL, m.bck, nil)
+	m.init(true /*cleanup*/)
+	tools.CreateBucket(t, proxyURL, m.bck, nil, true /*cleanup*/)
 	m.puts()
 
 	// 2. Kill and restore random IC members in background
@@ -1629,7 +1629,7 @@ func startCPBckAndWait(t testing.TB, srcBck cmn.Bck, count int) *sync.WaitGroup 
 				tools.DestroyBucket(t, proxyURL, dstBck)
 				wg.Done()
 			}()
-			xargs := xact.ArgsMsg{ID: xid, Timeout: rebalanceTimeout}
+			xargs := xact.ArgsMsg{ID: xid, Timeout: tools.RebalanceTimeout}
 			_, err = api.WaitForXactionIC(baseParams, xargs)
 			tassert.CheckError(t, err)
 		}(i)

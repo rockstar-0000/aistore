@@ -329,8 +329,6 @@ func (t *target) Run() error {
 		t.regstate.disabled.Store(true)
 		nlog.Warningf("%s not joining - standing by...", t)
 
-		go t.gostandby(2 * config.Periodic.StatsTime.D())
-
 		// see endStartupStandby()
 	} else {
 		// discover primary and join cluster (compare with manual `apc.AdminJoin`)
@@ -383,14 +381,6 @@ func (t *target) Run() error {
 	cos.Close(db)                              // close kv db
 	fs.RemoveMarker(fname.NodeRestartedMarker) // exit gracefully
 	return err
-}
-
-func (t *target) gostandby(sleep time.Duration) {
-	sleep = cos.MaxDuration(sleep, 10*time.Second)
-	for !t.ClusterStarted() {
-		time.Sleep(sleep)
-		nlog.Flush()
-	}
 }
 
 func (t *target) gojoin(config *cmn.Config) {

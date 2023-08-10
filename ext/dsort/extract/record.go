@@ -1,4 +1,4 @@
-// Package extract provides ExtractShard and associated methods for dsort
+// Package extract provides Extract(shard), Create(shard), and associated methods
 // across all suppported archival formats (see cmn/archive/mime.go)
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
@@ -62,10 +62,10 @@ type (
 		Extension    string `msg:"e" json:"e"`
 	}
 
-	// Record represents the metadata corresponding to a single file from an archive file.
+	// Record represents the metadata corresponding to a single file from a shard.
 	Record struct {
 		Key      any    `msg:"k" json:"k"` // Used to determine the sorting order.
-		Name     string `msg:"n" json:"n"` // Name which uniquely identifies record across all shards.
+		Name     string `msg:"n" json:"n"` // Name that uniquely identifies record across all shards.
 		DaemonID string `msg:"d" json:"d"` // ID of the target which maintains the contents for this record.
 		// All objects associated with given record. Record can be composed of
 		// multiple objects which have the same name but different extension.
@@ -74,13 +74,17 @@ type (
 
 	// Records abstract array of records. It safe to be used concurrently.
 	Records struct {
-		sync.RWMutex     `msg:"-"`
 		arr              []*Record           `msg:"a"`
 		m                map[string]*Record  `msg:"-"`
 		dups             map[string]struct{} `msg:"-"` // contains duplicate object names, if any
 		totalObjectCount int                 `msg:"-"` // total number of objects in all records (dups are removed so not counted)
+		sync.RWMutex     `msg:"-"`
 	}
 )
+
+////////////
+// Record //
+////////////
 
 // Merges two records into single one. It is required for records to have the
 // same Name. Since records should only differ on objects this is the thing that
@@ -127,6 +131,10 @@ func (r *Record) TotalSize() int64 {
 func (r *Record) MakeUniqueName(obj *RecordObj) string {
 	return r.Name + obj.Extension
 }
+
+/////////////
+// Records //
+/////////////
 
 // NewRecords creates new instance of Records struct and allocates n places for
 // the actual Record's
@@ -214,7 +222,7 @@ func (r *Records) Len() int {
 
 func (r *Records) Swap(i, j int) { r.arr[i], r.arr[j] = r.arr[j], r.arr[i] }
 
-func (r *Records) Less(i, j int, formatType string) (bool, error) {
+func (r *Records) Less(i, j int, keyType string) (bool, error) {
 	lhs, rhs := r.arr[i].Key, r.arr[j].Key
 	if lhs == nil {
 		return false, errors.Errorf("key is missing for %q", r.arr[i].Name)
@@ -222,28 +230,32 @@ func (r *Records) Less(i, j int, formatType string) (bool, error) {
 		return false, errors.Errorf("key is missing for %q", r.arr[j].Name)
 	}
 
-	switch formatType {
-	case FormatTypeInt:
+	switch keyType {
+	case ContentKeyInt:
 		ilhs, lok := lhs.(int64)
 		irhs, rok := rhs.(int64)
 		if lok && rok {
 			return ilhs < irhs, nil
 		}
-
-		// One side was parsed as float64 - javascript does not support
-		// int64 type and it fallback to float64
+		// (motivation: javascript does not support int64 type)
 		if !lok {
 			ilhs = int64(lhs.(float64))
-		}
-		if !rok {
+		} else {
 			irhs = int64(rhs.(float64))
 		}
-
 		return ilhs < irhs, nil
-	case FormatTypeFloat:
-		return lhs.(float64) < rhs.(float64), nil
-	case FormatTypeString:
-		return lhs.(string) < rhs.(string), nil
+	case ContentKeyFloat:
+		flhs, lok := lhs.(float64)
+		frhs, rok := rhs.(float64)
+		debug.Assert(lok, lhs)
+		debug.Assert(rok, rhs)
+		return flhs < frhs, nil
+	case ContentKeyString:
+		slhs, lok := lhs.(string)
+		srhs, rok := rhs.(string)
+		debug.Assert(lok, lhs)
+		debug.Assert(rok, rhs)
+		return slhs < srhs, nil
 	}
 
 	debug.Assertf(false, "lhs: %v, rhs: %v, arr[i]: %v, arr[j]: %v", lhs, rhs, r.arr[i], r.arr[j])

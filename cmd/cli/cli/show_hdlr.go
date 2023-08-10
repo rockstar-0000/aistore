@@ -7,7 +7,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -72,9 +71,10 @@ var (
 			longRunFlags,
 			jsonFlag,
 		),
-		cmdBMD: {
+		cmdBMD: append(
+			longRunFlags,
 			jsonFlag,
-		},
+		),
 		cmdBucket: {
 			jsonFlag,
 			compactPropFlag,
@@ -87,11 +87,6 @@ var (
 			verboseFlag,
 			jsonFlag,
 		},
-		cmdLog: append(
-			longRunFlags,
-			logSevFlag,
-			logFlushFlag,
-		),
 	}
 
 	showCmd = cli.Command{
@@ -189,15 +184,6 @@ var (
 		ArgsUsage: "",
 		Flags:     showCmdsFlags[cmdShowRemoteAIS],
 		Action:    showRemoteAISHandler,
-	}
-
-	showCmdLog = cli.Command{
-		Name:         cmdLog,
-		Usage:        "show log",
-		ArgsUsage:    nodeIDArgument,
-		Flags:        showCmdsFlags[cmdLog],
-		Action:       showNodeLogHandler,
-		BashComplete: suggestAllNodes,
 	}
 
 	showCmdJob = cli.Command{
@@ -564,6 +550,7 @@ func showSmapHandler(c *cli.Context) error {
 	var (
 		sid              string
 		node, sname, err = arg0Node(c)
+		smap             *meta.Smap
 	)
 	if err != nil {
 		return err
@@ -572,18 +559,88 @@ func showSmapHandler(c *cli.Context) error {
 	setLongRunParams(c)
 
 	if node != nil {
+		var out any
 		sid = node.ID()
 		actionCptn(c, "Cluster map from: ", sname)
+		out, err = api.GetNodeMeta(apiBP, sid, apc.WhatSmap)
+		if err == nil {
+			smap = out.(*meta.Smap)
+		}
+	} else {
+		smap, err = getClusterMap(c)
 	}
-	smap, err := getClusterMap(c)
 	if err != nil {
 		return err // cannot happen
 	}
 	return smapFromNode(smap, sid, flagIsSet(c, jsonFlag))
 }
 
-func showBMDHandler(c *cli.Context) (err error) {
-	return getBMD(c)
+func showBMDHandler(c *cli.Context) error {
+	var (
+		bmd              *meta.BMD
+		sid              string
+		node, sname, err = arg0Node(c)
+	)
+	if err != nil {
+		return err
+	}
+
+	setLongRunParams(c)
+
+	if node != nil {
+		var out any
+		sid = node.ID()
+		actionCptn(c, "BMD from: ", sname)
+		out, err = api.GetNodeMeta(apiBP, sid, apc.WhatBMD)
+		if err == nil {
+			bmd = out.(*meta.BMD)
+		}
+	} else {
+		bmd, err = api.GetBMD(apiBP)
+	}
+	if err != nil {
+		return V(err)
+	}
+
+	if bmd.IsEmpty() {
+		msg := fmt.Sprintf("%s is empty - no buckets", bmd)
+		actionDone(c, msg)
+		return nil
+	}
+
+	usejs := flagIsSet(c, jsonFlag)
+	if usejs {
+		return teb.Print(bmd, "", teb.Jopts(usejs))
+	}
+
+	tw := &tabwriter.Writer{}
+	tw.Init(c.App.Writer, 0, 8, 2, ' ', 0)
+	if !flagIsSet(c, noHeaderFlag) {
+		fmt.Fprintln(tw, "PROVIDER\tNAMESPACE\tNAME\tBACKEND\tCOPIES\tEC(D/P, minsize)\tCREATED")
+	}
+	for provider, namespaces := range bmd.Providers {
+		for nsUname, buckets := range namespaces {
+			ns := cmn.ParseNsUname(nsUname)
+			for bucket, props := range buckets {
+				var copies, ec string
+				if props.Mirror.Enabled {
+					copies = strconv.Itoa(int(props.Mirror.Copies))
+				}
+				if props.EC.Enabled {
+					ec = fmt.Sprintf("%d/%d, %s", props.EC.DataSlices,
+						props.EC.ParitySlices, cos.ToSizeIEC(props.EC.ObjSizeLimit, 0))
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					provider, ns, bucket, props.BackendBck, copies, ec,
+					cos.FormatNanoTime(props.Created, ""))
+			}
+		}
+	}
+	tw.Flush()
+	fmt.Fprintln(c.App.Writer)
+	fmt.Fprintf(c.App.Writer, "Version:\t%d\n", bmd.Version)
+	fmt.Fprintf(c.App.Writer, "UUID:\t\t%s\n", bmd.UUID)
+	return nil
 }
 
 func showClusterConfigHandler(c *cli.Context) (err error) {
@@ -622,8 +679,8 @@ func showClusterConfig(c *cli.Context, section string) error {
 	if usejs {
 		return teb.Print(cluConfig, "", teb.Jopts(usejs))
 	}
-	flat := flattenConfig(cluConfig, section)
-	err = teb.Print(flat, teb.ConfigTmpl)
+	flat := flattenJSON(cluConfig, section)
+	err = teb.Print(flat, teb.FlatTmpl)
 	if err == nil && section == "" {
 		msg := fmt.Sprintf("(Hint: use '[SECTION] %s' to show config section(s), see %s for details)",
 			flprn(jsonFlag), qflprn(cli.HelpFlag))
@@ -715,18 +772,18 @@ func showNodeConfig(c *cli.Context) error {
 	// fill-in `data`
 	switch scope {
 	case cfgScopeLocal:
-		data.LocalConfigPairs = flattenConfig(config.LocalConfig, section)
+		data.LocalConfigPairs = flattenJSON(config.LocalConfig, section)
 	default: // cfgScopeInherited | cfgScopeAll
 		cluConf, err := api.GetClusterConfig(apiBP)
 		if err != nil {
 			return V(err)
 		}
 		// diff cluster <=> this node
-		flatNode := flattenConfig(config.ClusterConfig, section)
-		flatCluster := flattenConfig(cluConf, section)
+		flatNode := flattenJSON(config.ClusterConfig, section)
+		flatCluster := flattenJSON(cluConf, section)
 		data.ClusterConfigDiff = diffConfigs(flatNode, flatCluster)
 		if scope == cfgScopeAll {
-			data.LocalConfigPairs = flattenConfig(config.LocalConfig, section)
+			data.LocalConfigPairs = flattenJSON(config.LocalConfig, section)
 		}
 	}
 	// show "flat" diff-s
@@ -742,56 +799,6 @@ func showNodeConfig(c *cli.Context) error {
 		actionDone(c, msg)
 	}
 	return err
-}
-
-func showNodeLogHandler(c *cli.Context) error {
-	if c.NArg() < 1 {
-		return missingArgumentsError(c, c.Command.ArgsUsage)
-	}
-	node, sname, err := getNode(c, c.Args().Get(0))
-	if err != nil {
-		return err
-	}
-
-	firstIteration := setLongRunParams(c, 0)
-
-	sev := strings.ToLower(parseStrFlag(c, logSevFlag))
-	if sev != "" {
-		switch sev[0] {
-		case apc.LogInfo[0], apc.LogWarn[0], apc.LogErr[0]:
-		default:
-			return fmt.Errorf("invalid log severity, expecting empty string or one of: %s, %s, %s",
-				apc.LogInfo, apc.LogWarn, apc.LogErr)
-		}
-	}
-	if firstIteration && flagIsSet(c, logFlushFlag) {
-		var (
-			flushRate = parseDurationFlag(c, logFlushFlag)
-			nvs       = make(cos.StrKVs)
-		)
-		config, err := api.GetDaemonConfig(apiBP, node)
-		if err != nil {
-			return V(err)
-		}
-		if config.Log.FlushTime.D() != flushRate {
-			nvs[nodeLogFlushName] = flushRate.String()
-			if err := api.SetDaemonConfig(apiBP, node.ID(), nvs, true /*transient*/); err != nil {
-				return V(err)
-			}
-			warn := fmt.Sprintf("run 'ais config node %s inherited %s %s' to change it back",
-				sname, nodeLogFlushName, config.Log.FlushTime)
-			actionWarn(c, warn)
-			time.Sleep(2 * time.Second)
-			fmt.Fprintln(c.App.Writer)
-		}
-	}
-
-	args := api.GetLogInput{Writer: os.Stdout, Severity: sev, Offset: getLongRunOffset(c)}
-	readsize, err := api.GetDaemonLog(apiBP, node, args)
-	if err == nil {
-		addLongRunOffset(c, readsize)
-	}
-	return V(err)
 }
 
 func showRemoteAISHandler(c *cli.Context) error {

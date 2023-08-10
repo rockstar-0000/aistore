@@ -1,4 +1,4 @@
-// Package extract provides ExtractShard and associated methods for dsort
+// Package extract provides Extract(shard), Create(shard), and associated methods
 // across all suppported archival formats (see cmn/archive/mime.go)
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
@@ -18,20 +18,20 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 )
 
-type targzExtractCreator struct {
+type targzRW struct {
 	t   cluster.Target
 	ext string
 }
 
 // interface guard
-var _ Creator = (*targzExtractCreator)(nil)
+var _ Creator = (*targzRW)(nil)
 
-func NewTargzExtractCreator(t cluster.Target, ext string) Creator {
-	return &targzExtractCreator{t: t, ext: ext}
+func NewTargzRW(t cluster.Target, ext string) Creator {
+	return &targzRW{t: t, ext: ext}
 }
 
-// ExtractShard reads the tarball f and extracts its metadata.
-func (t *targzExtractCreator) ExtractShard(lom *cluster.LOM, r cos.ReadReaderAt, extractor RecordExtractor, toDisk bool) (int64, int, error) {
+// Extract reads the tarball f and extracts its metadata.
+func (t *targzRW) Extract(lom *cluster.LOM, r cos.ReadReaderAt, extractor RecordExtractor, toDisk bool) (int64, int, error) {
 	ar, err := archive.NewReader(t.ext, r)
 	if err != nil {
 		return 0, 0, err
@@ -55,9 +55,9 @@ func (t *targzExtractCreator) ExtractShard(lom *cluster.LOM, r cos.ReadReaderAt,
 	return s.extractedSize, s.extractedCount, err
 }
 
-// CreateShard creates a new shard locally based on the Shard.
+// Create creates a new shard locally based on the Shard.
 // Note that the order of closing must be trw, gzw, then finally tarball.
-func (t *targzExtractCreator) CreateShard(s *Shard, tarball io.Writer, loadContent LoadContentFunc) (written int64, err error) {
+func (t *targzRW) Create(s *Shard, tarball io.Writer, loader ContentLoader) (written int64, err error) {
 	var (
 		n         int64
 		needFlush bool
@@ -85,7 +85,7 @@ func (t *targzExtractCreator) CreateShard(s *Shard, tarball io.Writer, loadConte
 					needFlush = false
 				}
 
-				if n, err = loadContent(gzw, rec, obj); err != nil {
+				if n, err = loader.Load(gzw, rec, obj); err != nil {
 					return written + n, err
 				}
 
@@ -100,7 +100,7 @@ func (t *targzExtractCreator) CreateShard(s *Shard, tarball io.Writer, loadConte
 				debug.Assert(diff >= 0 && diff < archive.TarBlockSize)
 			case SGLStoreType, DiskStoreType:
 				rdReader.reinit(tw, obj.Size, obj.MetadataSize)
-				if n, err = loadContent(rdReader, rec, obj); err != nil {
+				if n, err = loader.Load(rdReader, rec, obj); err != nil {
 					return written + n, err
 				}
 				written += n
@@ -117,6 +117,5 @@ func (t *targzExtractCreator) CreateShard(s *Shard, tarball io.Writer, loadConte
 	return written, nil
 }
 
-func (*targzExtractCreator) UsingCompression() bool { return true }
-func (*targzExtractCreator) SupportsOffset() bool   { return true }
-func (*targzExtractCreator) MetadataSize() int64    { return archive.TarBlockSize } // size of tar header with padding
+func (*targzRW) SupportsOffset() bool { return true }
+func (*targzRW) MetadataSize() int64  { return archive.TarBlockSize } // size of tar header with padding

@@ -107,25 +107,24 @@ func (tm *testSmap) Listeners() meta.SmapListeners {
 }
 
 //
-// MOCKS
+// MOCKs
 //
 
 type extractCreatorMock struct {
-	useCompression bool
-	createShard    func(s *extract.Shard, w io.Writer, loadContent extract.LoadContentFunc) // func to hijack CreateShard function
+	createShard func(s *extract.Shard, w io.Writer, loader extract.ContentLoader) // func to hijack CreateShard function
 }
 
-func (*extractCreatorMock) ExtractShard(*cluster.LOM, cos.ReadReaderAt, extract.RecordExtractor, bool) (int64, int, error) {
+func (*extractCreatorMock) Extract(*cluster.LOM, cos.ReadReaderAt, extract.RecordExtractor, bool) (int64, int, error) {
 	return 0, 0, nil
 }
 
-func (ec *extractCreatorMock) CreateShard(s *extract.Shard, w io.Writer, loadContent extract.LoadContentFunc) (int64, error) {
-	ec.createShard(s, w, loadContent)
+func (ec *extractCreatorMock) Create(s *extract.Shard, w io.Writer, loader extract.ContentLoader) (int64, error) {
+	ec.createShard(s, w, loader)
 	return 0, nil
 }
-func (*extractCreatorMock) SupportsOffset() bool      { return true }
-func (ec *extractCreatorMock) UsingCompression() bool { return ec.useCompression }
-func (*extractCreatorMock) MetadataSize() int64       { return 0 }
+
+func (*extractCreatorMock) SupportsOffset() bool { return true }
+func (*extractCreatorMock) MetadataSize() int64  { return 0 }
 
 type targetNodeMock struct {
 	daemonID  string
@@ -145,10 +144,10 @@ type testContext struct {
 
 func newTargetMock(daemonID string, smap *testSmap) *targetNodeMock {
 	// Initialize dSort manager
-	rs := &ParsedRequestSpec{
-		Extension: archive.ExtTar,
-		Algorithm: &SortAlgorithm{
-			FormatType: extract.FormatTypeString,
+	rs := &parsedReqSpec{
+		InputExtension: archive.ExtTar,
+		Algorithm: &Algorithm{
+			ContentKeyType: extract.ContentKeyString,
 		},
 		MaxMemUsage: cos.ParsedQuantity{Type: cos.QuantityPercent, Value: 0},
 		DSorterType: DSorterGeneralType,
@@ -372,7 +371,7 @@ var _ = Describe("Distributed Sort", func() {
 
 					for _, target := range tctx.targets {
 						handlers := map[string]http.HandlerFunc{
-							apc.URLPathdSortRecords.S + "/": recordsHandler(target.managers),
+							apc.URLPathdSortRecords.S + "/": target.managers.recordsHandler,
 						}
 						target.setHandlers(handlers)
 					}
@@ -411,7 +410,7 @@ var _ = Describe("Distributed Sort", func() {
 							// For each target add sorted record
 							manager, exists := target.managers.Get(globalManagerUUID)
 							Expect(exists).To(BeTrue())
-							manager.recManager.Records = createRecords(target.daemonID)
+							manager.recm.Records = createRecords(target.daemonID)
 
 							targetOrder := randomTargetOrder(1, tctx.smap.Tmap)
 							isFinal, err := manager.participateInRecordDistribution(targetOrder)
@@ -421,7 +420,7 @@ var _ = Describe("Distributed Sort", func() {
 							}
 
 							if isFinal {
-								srecordsCh <- manager.recManager.Records
+								srecordsCh <- manager.recm.Records
 							}
 						}(target)
 					}
@@ -453,14 +452,14 @@ var _ = Describe("Distributed Sort", func() {
 						manager, exists := target.managers.Get(globalManagerUUID)
 						Expect(exists).To(BeTrue())
 
-						rs := &ParsedRequestSpec{
-							Algorithm: &SortAlgorithm{
-								Decreasing: true,
-								FormatType: extract.FormatTypeString,
+						rs := &parsedReqSpec{
+							Algorithm: &Algorithm{
+								Decreasing:     true,
+								ContentKeyType: extract.ContentKeyString,
 							},
-							Extension:   archive.ExtTar,
-							MaxMemUsage: cos.ParsedQuantity{Type: cos.QuantityPercent, Value: 0},
-							DSorterType: DSorterGeneralType,
+							InputExtension: archive.ExtTar,
+							MaxMemUsage:    cos.ParsedQuantity{Type: cos.QuantityPercent, Value: 0},
+							DSorterType:    DSorterGeneralType,
 						}
 						ctx.node = ctx.smapOwner.Get().Tmap[target.daemonID]
 						manager.lock()
@@ -472,7 +471,7 @@ var _ = Describe("Distributed Sort", func() {
 						}
 
 						// For each target add sorted record
-						manager.recManager.Records = createRecords(target.daemonID)
+						manager.recm.Records = createRecords(target.daemonID)
 					}
 
 					for _, target := range tctx.targets {
@@ -492,7 +491,7 @@ var _ = Describe("Distributed Sort", func() {
 							if isFinal {
 								manager, exists := target.managers.Get(globalManagerUUID)
 								Expect(exists).To(BeTrue())
-								srecordsCh <- manager.recManager.Records
+								srecordsCh <- manager.recm.Records
 							}
 						}(target)
 					}

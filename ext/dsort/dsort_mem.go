@@ -62,14 +62,12 @@ type (
 	}
 
 	dsorterMem struct {
-		m *Manager
-
+		m       *Manager
 		streams struct {
 			cleanupDone atomic.Bool
 			builder     *bundle.Streams // streams for sending information about building shards
 			records     *bundle.Streams // streams for sending the record
 		}
-
 		creationPhase struct {
 			connector       *rwConnector // used to connect readers (streams, local data) with writers (shards)
 			requestedShards chan string
@@ -189,11 +187,11 @@ func (ds *dsorterMem) init() error {
 	ds.creationPhase.requestedShards = make(chan string, 10000)
 
 	ds.creationPhase.adjuster.read = newConcAdjuster(
-		ds.m.rs.CreateConcMaxLimit,
+		ds.m.pars.CreateConcMaxLimit,
 		1, /*goroutineLimitCoef*/
 	)
 	ds.creationPhase.adjuster.write = newConcAdjuster(
-		ds.m.rs.CreateConcMaxLimit,
+		ds.m.pars.CreateConcMaxLimit,
 		1, /*goroutineLimitCoef*/
 	)
 	return nil
@@ -210,24 +208,20 @@ func (ds *dsorterMem) start() error {
 
 	client := transport.NewIntraDataClient()
 
-	streamMultiplier := config.DSort.SbundleMult
-	if ds.m.rs.StreamMultiplier != 0 {
-		streamMultiplier = ds.m.rs.StreamMultiplier
-	}
 	trname := fmt.Sprintf(recvReqStreamNameFmt, ds.m.ManagerUUID)
 	reqSbArgs := bundle.Args{
-		Multiplier: streamMultiplier,
+		Multiplier: ds.m.pars.SbundleMult,
 		Net:        reqNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
 	}
-	if err := transport.HandleObjStream(trname, ds.makeRecvRequestFunc()); err != nil {
+	if err := transport.HandleObjStream(trname, ds.recvReq); err != nil {
 		return errors.WithStack(err)
 	}
 
 	trname = fmt.Sprintf(recvRespStreamNameFmt, ds.m.ManagerUUID)
 	respSbArgs := bundle.Args{
-		Multiplier: streamMultiplier,
+		Multiplier: ds.m.pars.SbundleMult,
 		Net:        respNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
@@ -237,7 +231,7 @@ func (ds *dsorterMem) start() error {
 			MMSA:        mm,
 		},
 	}
-	if err := transport.HandleObjStream(trname, ds.makeRecvResponseFunc()); err != nil {
+	if err := transport.HandleObjStream(trname, ds.recvResp); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -308,14 +302,11 @@ func (ds *dsorterMem) postShardCreation(mi *fs.Mountpath) {
 	ds.creationPhase.adjuster.write.releaseSema(mi)
 }
 
-func (ds *dsorterMem) loadContent() extract.LoadContentFunc {
-	return func(w io.Writer, rec *extract.Record, obj *extract.RecordObj) (int64, error) {
-		if ds.m.aborted() {
-			return 0, newDSortAbortedError(ds.m.ManagerUUID)
-		}
-
-		return ds.creationPhase.connector.connectWriter(rec.MakeUniqueName(obj), w)
+func (ds *dsorterMem) Load(w io.Writer, rec *extract.Record, obj *extract.RecordObj) (int64, error) {
+	if ds.m.aborted() {
+		return 0, newDSortAbortedError(ds.m.ManagerUUID)
 	}
+	return ds.creationPhase.connector.connectWriter(rec.MakeUniqueName(obj), w)
 }
 
 // createShardsLocally waits until it's given the signal to start creating
@@ -325,14 +316,9 @@ func (ds *dsorterMem) createShardsLocally() error {
 
 	ds.creationPhase.adjuster.read.start()
 	ds.creationPhase.adjuster.write.start()
-	defer func() {
-		ds.creationPhase.adjuster.write.stop()
-		ds.creationPhase.adjuster.read.stop()
-	}()
 
 	metrics := ds.m.Metrics.Creation
 	metrics.begin()
-	defer metrics.finish()
 	metrics.mu.Lock()
 	metrics.ToCreate = int64(len(phaseInfo.metadata.Shards))
 	metrics.mu.Unlock()
@@ -344,111 +330,33 @@ func (ds *dsorterMem) createShardsLocally() error {
 		stopCh = &cos.StopCh{}
 	)
 	stopCh.Init()
-	defer stopCh.Close()
+
+	// cleanup
+	defer func(metrics *ShardCreation, stopCh *cos.StopCh) {
+		stopCh.Close()
+		metrics.finish()
+		ds.creationPhase.adjuster.write.stop()
+		ds.creationPhase.adjuster.read.stop()
+	}(metrics, stopCh)
 
 	if err := mem.Get(); err != nil {
 		return err
 	}
-	maxMemoryToUse := calcMaxMemoryUsage(ds.m.rs.MaxMemUsage, &mem)
+	maxMemoryToUse := calcMaxMemoryUsage(ds.m.pars.MaxMemUsage, &mem)
 	sa := newInmemShardAllocator(maxMemoryToUse - mem.ActualUsed)
 
 	// read
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		group, ctx := errgroup.WithContext(context.Background())
-	SendAllShards:
-		for {
-			// If that was last shard to send we need to break and we will
-			// be waiting for the result.
-			if len(phaseInfo.metadata.SendOrder) == 0 {
-				break SendAllShards
-			}
-
-			select {
-			case shardName := <-ds.creationPhase.requestedShards:
-				shard, ok := phaseInfo.metadata.SendOrder[shardName]
-				if !ok {
-					break
-				}
-
-				ds.creationPhase.adjuster.read.acquireGoroutineSema()
-				group.Go(func(shard *extract.Shard) func() error {
-					return func() error {
-						defer ds.creationPhase.adjuster.read.releaseGoroutineSema()
-
-						bck := meta.NewBck(ds.m.rs.OutputBck.Name, ds.m.rs.OutputBck.Provider, cmn.NsGlobal)
-						if err := bck.Init(ds.m.ctx.bmdOwner); err != nil {
-							return err
-						}
-						toNode, err := cluster.HrwTarget(bck.MakeUname(shard.Name), ds.m.ctx.smapOwner.Get())
-						if err != nil {
-							return err
-						}
-
-						for _, rec := range shard.Records.All() {
-							for _, obj := range rec.Objects {
-								if err := ds.sendRecordObj(rec, obj, toNode); err != nil {
-									return err
-								}
-							}
-						}
-						return nil
-					}
-				}(shard))
-
-				delete(phaseInfo.metadata.SendOrder, shardName)
-			case <-ds.m.listenAborted():
-				stopCh.Close()
-				group.Wait()
-				errCh <- newDSortAbortedError(ds.m.ManagerUUID)
-				return
-			case <-ctx.Done(): // context was canceled, therefore we have an error
-				stopCh.Close()
-				break SendAllShards
-			case <-stopCh.Listen(): // writing side stopped we need to do the same
-				break SendAllShards
-			}
-		}
-
-		errCh <- group.Wait()
+		ds.localRead(stopCh, errCh)
+		wg.Done()
 	}()
 
 	// write
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		group, ctx := errgroup.WithContext(context.Background())
-	CreateAllShards:
-		for _, s := range phaseInfo.metadata.Shards {
-			select {
-			case <-ds.m.listenAborted():
-				stopCh.Close()
-				group.Wait()
-				errCh <- newDSortAbortedError(ds.m.ManagerUUID)
-				return
-			case <-ctx.Done(): // context was canceled, therefore we have an error
-				stopCh.Close()
-				break CreateAllShards
-			case <-stopCh.Listen():
-				break CreateAllShards // reading side stopped we need to do the same
-			default:
-			}
-
-			sa.alloc(uint64(s.Size))
-
-			ds.creationPhase.adjuster.write.acquireGoroutineSema()
-			group.Go(func(s *extract.Shard) func() error {
-				return func() error {
-					err := ds.m.createShard(s)
-					ds.creationPhase.adjuster.write.releaseGoroutineSema()
-					sa.free(uint64(s.Size))
-					return err
-				}
-			}(s))
-		}
-
-		errCh <- group.Wait()
+		ds.localWrite(sa, stopCh, errCh)
+		wg.Done()
 	}()
 
 	wg.Wait()
@@ -462,6 +370,78 @@ func (ds *dsorterMem) createShardsLocally() error {
 	return nil
 }
 
+func (ds *dsorterMem) localRead(stopCh *cos.StopCh, errCh chan error) {
+	var (
+		phaseInfo  = &ds.m.creationPhase
+		group, ctx = errgroup.WithContext(context.Background())
+	)
+outer:
+	for {
+		// If that was the last shard to send we need to break and we will
+		// be waiting for the result.
+		if len(phaseInfo.metadata.SendOrder) == 0 {
+			break outer
+		}
+
+		select {
+		case shardName := <-ds.creationPhase.requestedShards:
+			shard, ok := phaseInfo.metadata.SendOrder[shardName]
+			if !ok {
+				break
+			}
+
+			ds.creationPhase.adjuster.read.acquireGoroutineSema()
+			es := &dsmExtractShard{ds, shard}
+			group.Go(es.do)
+
+			delete(phaseInfo.metadata.SendOrder, shardName)
+		case <-ds.m.listenAborted():
+			stopCh.Close()
+			group.Wait()
+			errCh <- newDSortAbortedError(ds.m.ManagerUUID)
+			return
+		case <-ctx.Done(): // context was canceled, therefore we have an error
+			stopCh.Close()
+			break outer
+		case <-stopCh.Listen(): // writing side stopped we need to do the same
+			break outer
+		}
+	}
+
+	errCh <- group.Wait()
+}
+
+func (ds *dsorterMem) localWrite(sa *inmemShardAllocator, stopCh *cos.StopCh, errCh chan error) {
+	var (
+		phaseInfo  = &ds.m.creationPhase
+		group, ctx = errgroup.WithContext(context.Background())
+	)
+outer:
+	for _, s := range phaseInfo.metadata.Shards {
+		select {
+		case <-ds.m.listenAborted():
+			stopCh.Close()
+			group.Wait()
+			errCh <- newDSortAbortedError(ds.m.ManagerUUID)
+			return
+		case <-ctx.Done(): // context was canceled, therefore we have an error
+			stopCh.Close()
+			break outer
+		case <-stopCh.Listen():
+			break outer // reading side stopped we need to do the same
+		default:
+		}
+
+		sa.alloc(uint64(s.Size))
+
+		ds.creationPhase.adjuster.write.acquireGoroutineSema()
+		cs := &dsmCreateShard{ds, s, sa}
+		group.Go(cs.do)
+	}
+
+	errCh <- group.Wait()
+}
+
 func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj, toNode *meta.Snode) (err error) {
 	var (
 		local = toNode.ID() == ds.m.ctx.node.ID()
@@ -471,8 +451,8 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 		}
 		beforeSend int64
 	)
-	fullContentPath := ds.m.recManager.FullContentPath(obj)
-	ct, err := cluster.NewCTFromBO(&ds.m.rs.OutputBck, fullContentPath, nil)
+	fullContentPath := ds.m.recm.FullContentPath(obj)
+	ct, err := cluster.NewCTFromBO(&ds.m.pars.OutputBck, fullContentPath, nil)
 	if err != nil {
 		return
 	}
@@ -515,7 +495,7 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 		return
 	}
 
-	if ds.m.rs.DryRun {
+	if ds.m.pars.DryRun {
 		lr := cos.NopReader(obj.MetadataSize + obj.Size)
 		r := cos.NopOpener(io.NopCloser(lr))
 		hdr.ObjAttrs.Size = obj.MetadataSize + obj.Size
@@ -550,81 +530,128 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 
 func (*dsorterMem) postExtraction() {}
 
-func (ds *dsorterMem) makeRecvRequestFunc() transport.RecvObj {
-	return func(hdr transport.ObjHdr, object io.Reader, err error) error {
-		ds.m.inFlightInc()
-		defer func() {
-			transport.DrainAndFreeReader(object)
-			ds.m.inFlightDec()
-		}()
+// implements receiver i/f
+func (ds *dsorterMem) recvReq(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	ds.m.inFlightInc()
+	defer func() {
+		transport.DrainAndFreeReader(objReader)
+		ds.m.inFlightDec()
+	}()
 
-		if err != nil {
-			ds.m.abort(err)
-			return err
-		}
-
-		unpacker := cos.NewUnpacker(hdr.Opaque)
-		req := buildingShardInfo{}
-		if err := unpacker.ReadAny(&req); err != nil {
-			ds.m.abort(err)
-			return err
-		}
-
-		if ds.m.aborted() {
-			return newDSortAbortedError(ds.m.ManagerUUID)
-		}
-
-		ds.creationPhase.requestedShards <- req.shardName
-		return nil
+	if err != nil {
+		ds.m.abort(err)
+		return err
 	}
+
+	unpacker := cos.NewUnpacker(hdr.Opaque)
+	req := buildingShardInfo{}
+	if err := unpacker.ReadAny(&req); err != nil {
+		ds.m.abort(err)
+		return err
+	}
+
+	if ds.m.aborted() {
+		return newDSortAbortedError(ds.m.ManagerUUID)
+	}
+
+	ds.creationPhase.requestedShards <- req.shardName
+	return nil
 }
 
-func (ds *dsorterMem) makeRecvResponseFunc() transport.RecvObj {
-	metrics := ds.m.Metrics.Creation
-	return func(hdr transport.ObjHdr, object io.Reader, err error) error {
-		ds.m.inFlightInc()
-		defer func() {
-			transport.DrainAndFreeReader(object)
-			ds.m.inFlightDec()
-		}()
+func (ds *dsorterMem) recvResp(hdr transport.ObjHdr, object io.Reader, err error) error {
+	ds.m.inFlightInc()
+	defer func() {
+		transport.DrainAndFreeReader(object)
+		ds.m.inFlightDec()
+	}()
 
-		if err != nil {
-			ds.m.abort(err)
-			return err
-		}
-
-		req := RemoteResponse{}
-		if err := jsoniter.Unmarshal(hdr.Opaque, &req); err != nil {
-			ds.m.abort(err)
-			return err
-		}
-
-		var beforeSend int64
-		if ds.m.Metrics.extended {
-			beforeSend = mono.NanoTime()
-		}
-
-		if ds.m.aborted() {
-			return newDSortAbortedError(ds.m.ManagerUUID)
-		}
-
-		uname := req.Record.MakeUniqueName(req.RecordObj)
-		if err := ds.creationPhase.connector.connectReader(uname, object, hdr.ObjAttrs.Size); err != nil {
-			ds.m.abort(err)
-			return err
-		}
-
-		if ds.m.Metrics.extended {
-			dur := mono.Since(beforeSend)
-			metrics.mu.Lock()
-			metrics.LocalRecvStats.updateTime(dur)
-			metrics.LocalRecvStats.updateThroughput(hdr.ObjAttrs.Size, dur)
-			metrics.mu.Unlock()
-		}
-		return nil
+	if err != nil {
+		ds.m.abort(err)
+		return err
 	}
+
+	req := RemoteResponse{}
+	if err := jsoniter.Unmarshal(hdr.Opaque, &req); err != nil {
+		ds.m.abort(err)
+		return err
+	}
+
+	var beforeSend int64
+	if ds.m.Metrics.extended {
+		beforeSend = mono.NanoTime()
+	}
+
+	if ds.m.aborted() {
+		return newDSortAbortedError(ds.m.ManagerUUID)
+	}
+
+	uname := req.Record.MakeUniqueName(req.RecordObj)
+	if err := ds.creationPhase.connector.connectReader(uname, object, hdr.ObjAttrs.Size); err != nil {
+		ds.m.abort(err)
+		return err
+	}
+
+	if ds.m.Metrics.extended {
+		metrics := ds.m.Metrics.Creation
+		dur := mono.Since(beforeSend)
+		metrics.mu.Lock()
+		metrics.LocalRecvStats.updateTime(dur)
+		metrics.LocalRecvStats.updateThroughput(hdr.ObjAttrs.Size, dur)
+		metrics.mu.Unlock()
+	}
+	return nil
 }
 
 func (*dsorterMem) preShardExtraction(uint64) bool { return true }
 func (*dsorterMem) postShardExtraction(uint64)     {}
 func (ds *dsorterMem) onAbort()                    { _ = ds.cleanupStreams() }
+
+////////////////////
+// dsmCreateShard //
+////////////////////
+
+type dsmCreateShard struct {
+	ds    *dsorterMem
+	shard *extract.Shard
+	sa    *inmemShardAllocator
+}
+
+func (cs *dsmCreateShard) do() (err error) {
+	lom := cluster.AllocLOM(cs.shard.Name)
+	err = cs.ds.m.createShard(cs.shard, lom)
+	cluster.FreeLOM(lom)
+	cs.ds.creationPhase.adjuster.write.releaseGoroutineSema()
+	cs.sa.free(uint64(cs.shard.Size))
+	return
+}
+
+////////////////////
+// dsmExtractShard //
+////////////////////
+
+type dsmExtractShard struct {
+	ds    *dsorterMem
+	shard *extract.Shard
+}
+
+func (es *dsmExtractShard) do() error {
+	ds, shard := es.ds, es.shard
+	defer ds.creationPhase.adjuster.read.releaseGoroutineSema()
+
+	bck := meta.NewBck(ds.m.pars.OutputBck.Name, ds.m.pars.OutputBck.Provider, cmn.NsGlobal)
+	if err := bck.Init(ds.m.ctx.bmdOwner); err != nil {
+		return err
+	}
+	toNode, err := cluster.HrwTarget(bck.MakeUname(shard.Name), ds.m.ctx.smapOwner.Get())
+	if err != nil {
+		return err
+	}
+	for _, rec := range shard.Records.All() {
+		for _, obj := range rec.Objects {
+			if err := ds.sendRecordObj(rec, obj, toNode); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

@@ -67,9 +67,9 @@ type (
 	dsortContext struct {
 		smapOwner meta.Sowner
 		bmdOwner  meta.Bowner
-		node      *meta.Snode
 		t         cluster.Target // Set only on target.
 		stats     stats.Tracker
+		node      *meta.Snode
 		client    *http.Client // Client for broadcast.
 	}
 
@@ -93,7 +93,7 @@ type (
 	// Manager maintains all the state required for a single run of a distributed archive file shuffle.
 	Manager struct {
 		// Fields with json tags are the only fields which are persisted
-		// into the disk once the dSort is finished.
+		// into the disk once the dSort finishes.
 		ManagerUUID string   `json:"manager_uuid"`
 		Metrics     *Metrics `json:"metrics"`
 
@@ -103,17 +103,16 @@ type (
 		ctx  dsortContext
 		smap *meta.Smap
 
-		recManager     *extract.RecordManager
-		extractCreator extract.Creator
+		recm *extract.RecordManager
+		ec   extract.Creator
 
 		startShardCreation chan struct{}
-		rs                 *ParsedRequestSpec
+		pars               *parsedReqSpec
 
-		client        *http.Client // Client for sending records metadata
-		fileExtension string
-		compression   struct {
-			compressed   atomic.Int64 // Total compressed size
-			uncompressed atomic.Int64 // Total uncompressed size
+		client      *http.Client // Client for sending records metadata
+		compression struct {
+			totalShardSize     atomic.Int64
+			totalExtractedSize atomic.Int64
 		}
 		received struct {
 			count atomic.Int32 // Number of FileMeta slices received, defining what step in the sort a target is in.
@@ -135,13 +134,10 @@ type (
 			mu sync.Mutex
 			m  map[string]struct{} // finished acks: daemonID -> ack
 		}
-
 		dsorter        dsorter
 		dsorterStarted sync.WaitGroup
-
-		callTimeout time.Duration // Maximal time we will wait for other node to respond
-
-		config *cmn.Config
+		callTimeout    time.Duration // max time to wait for other node to respond
+		config         *cmn.Config
 	}
 )
 
@@ -169,10 +165,17 @@ func RegisterNode(smapOwner meta.Sowner, bmdOwner meta.Bowner, snode *meta.Snode
 	}
 }
 
+/////////////
+// Manager //
+/////////////
+
+func (m *Manager) String() string { return m.ManagerUUID }
+func (m *Manager) lock()          { m.mu.Lock() }
+func (m *Manager) unlock()        { m.mu.Unlock() }
+
 // init initializes all necessary fields.
-//
 // PRECONDITION: `m.mu` must be locked.
-func (m *Manager) init(rs *ParsedRequestSpec) error {
+func (m *Manager) init(pars *parsedReqSpec) error {
 	debug.AssertMutexLocked(&m.mu)
 
 	m.ctx = ctx
@@ -180,8 +183,8 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 
 	targetCount := m.smap.CountActiveTs()
 
-	m.rs = rs
-	m.Metrics = newMetrics(rs.Description, rs.ExtendedMetrics)
+	m.pars = pars
+	m.Metrics = newMetrics(pars.Description, pars.ExtendedMetrics)
 	m.startShardCreation = make(chan struct{}, 1)
 
 	m.ctx.smapOwner.Listeners().Reg(m)
@@ -195,7 +198,7 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 	}
 
 	// Set extract creator depending on extension provided by the user
-	if err := m.setExtractCreator(); err != nil {
+	if err := m.setRW(); err != nil {
 		return err
 	}
 
@@ -209,15 +212,12 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 		SkipVerify:  m.config.Net.HTTP.SkipVerify,
 	})
 
-	m.fileExtension = rs.Extension
 	m.received.ch = make(chan int32, 10)
 
-	// By default we want avg compression ratio to be equal to 1
-	m.compression.compressed = *atomic.NewInt64(1)
-	m.compression.uncompressed = *atomic.NewInt64(1)
+	m.compression.totalShardSize.Store(1)
+	m.compression.totalExtractedSize.Store(1)
 
-	// Concurrency
-
+	// Concurrency:
 	// Number of goroutines should be larger than number of concurrency limit
 	// but it should not be:
 	// * too small - we don't want to artificially bottleneck the phases.
@@ -228,7 +228,7 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 	// Coefficient for extraction should be larger and depends on target count
 	// because we will skip a lot shards (which do not belong to us).
 	m.extractionPhase.adjuster = newConcAdjuster(
-		rs.ExtractConcMaxLimit,
+		pars.ExtractConcMaxLimit,
 		2*targetCount, /*goroutineLimitCoef*/
 	)
 
@@ -252,9 +252,8 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 }
 
 // TODO: Currently we create streams for each dSort job but maybe we should
-//
-//	create streams once and have them available for all the dSort jobs so they
-//	would share the resource rather than competing for it.
+// create streams once and have them available for all the dSort jobs so they
+// would share the resource rather than competing for it.
 func (m *Manager) initStreams() error {
 	config := cmn.GCO.Get()
 
@@ -273,7 +272,7 @@ func (m *Manager) initStreams() error {
 			MMSA:        mm,
 		},
 	}
-	if err := transport.HandleObjStream(trname, m.makeRecvShardFunc()); err != nil {
+	if err := transport.HandleObjStream(trname, m.recvShard); err != nil {
 		return errors.WithStack(err)
 	}
 	client := transport.NewIntraDataClient()
@@ -301,9 +300,7 @@ func (m *Manager) cleanupStreams() (err error) {
 }
 
 // cleanup removes all memory allocated and removes all files created during sort run.
-//
 // PRECONDITION: manager must be not in progress state (either actual finish or abort).
-//
 // NOTE: If cleanup is invoked during the run it is treated as abort.
 func (m *Manager) cleanup() {
 	nlog.Infof("[dsort] %s started cleanup", m.ManagerUUID)
@@ -325,7 +322,7 @@ func (m *Manager) cleanup() {
 
 	debug.Assertf(!m.inProgress(), "%s: was still in progress", m.ManagerUUID)
 
-	m.extractCreator = nil
+	m.ec = nil
 	m.client = nil
 
 	m.ctx.smapOwner.Listeners().Unreg(m)
@@ -376,7 +373,7 @@ func (m *Manager) finalCleanup() {
 	// The reason why this is not in regular cleanup is because we are only sure
 	// that this can be freed once we cleanup streams - streams are asynchronous
 	// and we may have race between in-flight request and cleanup.
-	m.recManager.Cleanup()
+	m.recm.Cleanup()
 
 	m.creationPhase.metadata.SendOrder = nil
 	m.creationPhase.metadata.Shards = nil
@@ -400,7 +397,6 @@ func (m *Manager) abort(errs ...error) {
 		m.unlock()
 		return
 	}
-
 	if len(errs) > 0 {
 		m.Metrics.lock()
 		for _, err := range errs {
@@ -409,7 +405,7 @@ func (m *Manager) abort(errs ...error) {
 		m.Metrics.unlock()
 	}
 
-	nlog.Infof("[dsort] %s has been aborted", m.ManagerUUID)
+	nlog.Infof("%s: %s aborted", m.ctx.t, m.ManagerUUID)
 	m.setAbortedTo(true)
 	inProgress := m.inProgress()
 	m.unlock()
@@ -421,7 +417,7 @@ func (m *Manager) abort(errs ...error) {
 			nlog.Infof("[dsort] %s is in progress, waiting for finish", m.ManagerUUID)
 		}
 		// Wait for dsorter to initialize all the resources.
-		m.waitDSorterToStart()
+		m.waitToStart()
 
 		m.dsorter.onAbort()
 		m.waitForFinish()
@@ -438,70 +434,64 @@ func (m *Manager) abort(errs ...error) {
 
 // setDSorter sets what type of dsorter implementation should be used
 func (m *Manager) setDSorter() (err error) {
-	switch m.rs.DSorterType {
+	switch m.pars.DSorterType {
 	case DSorterGeneralType:
 		m.dsorter, err = newDSorterGeneral(m)
 	case DSorterMemType:
 		m.dsorter = newDSorterMem(m)
 	default:
-		debug.Assertf(false, "dsorter type is invalid: %q", m.rs.DSorterType)
+		debug.Assertf(false, "dsorter type is invalid: %q", m.pars.DSorterType)
 	}
 	m.dsorterStarted.Add(1)
 	return
 }
 
-func (m *Manager) markDSorterStarted() { m.dsorterStarted.Done() }
-func (m *Manager) waitDSorterToStart() { m.dsorterStarted.Wait() }
+func (m *Manager) markStarted()               { m.dsorterStarted.Done() }
+func (m *Manager) waitToStart()               { m.dsorterStarted.Wait() }
+func (m *Manager) onDupRecs(msg string) error { return m.react(m.pars.DuplicatedRecords, msg) }
 
-// setExtractCreator sets what type of file extraction and creation is used based on the RequestSpec.
-func (m *Manager) setExtractCreator() (err error) {
-	var keyExtractor extract.KeyExtractor
-
-	switch m.rs.Algorithm.Kind {
-	case SortKindContent:
-		keyExtractor, err = extract.NewContentKeyExtractor(m.rs.Algorithm.FormatType, m.rs.Algorithm.Extension)
-	case SortKindMD5:
-		keyExtractor, err = extract.NewMD5KeyExtractor()
+// setRW sets what type of file extraction and creation is used based on the RequestSpec.
+func (m *Manager) setRW() (err error) {
+	var ke extract.KeyExtractor
+	switch m.pars.Algorithm.Kind {
+	case Content:
+		ke, err = extract.NewContentKeyExtractor(m.pars.Algorithm.ContentKeyType, m.pars.Algorithm.Ext)
+	case MD5:
+		ke, err = extract.NewMD5KeyExtractor()
 	default:
-		keyExtractor, err = extract.NewNameKeyExtractor()
+		ke, err = extract.NewNameKeyExtractor()
 	}
-
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	onDuplicatedRecords := func(msg string) error {
-		return m.react(m.rs.DuplicatedRecords, msg)
+	m.ec = newExtractCreator(m.ctx.t, m.pars.InputExtension)
+	if m.ec == nil {
+		debug.Assert(m.pars.InputExtension == "", m.pars.InputExtension)
+		// NOTE: [feature] allow non-specified extension; assign default extract-creator;
+		// handle all shards we encounter - all supported formats
+		m.ec = extract.NewTarRW(m.ctx.t)
 	}
-
-	var extractCreator extract.Creator
-	switch m.rs.Extension {
-	case archive.ExtTar:
-		extractCreator = extract.NewTarExtractCreator(m.ctx.t)
-	case archive.ExtTarTgz, archive.ExtTgz:
-		extractCreator = extract.NewTargzExtractCreator(m.ctx.t, m.rs.Extension)
-	case archive.ExtZip:
-		extractCreator = extract.NewZipExtractCreator(m.ctx.t)
-	case archive.ExtTarLz4:
-		extractCreator = extract.NewTarlz4ExtractCreator(m.ctx.t)
-	default:
-		debug.Assertf(false, "unknown extension %s", m.rs.Extension)
-		return archive.NewErrUnknownMime(m.rs.Extension)
+	if m.pars.DryRun {
+		debug.Assert(m.ec != nil, "dry-run in combination with _any_ shard extension is not supported yet")
+		m.ec = extract.NopRW(m.ec)
 	}
-
-	if !m.rs.DryRun {
-		m.extractCreator = extractCreator
-	} else {
-		m.extractCreator = extract.NopExtractCreator(extractCreator)
-	}
-
-	m.recManager = extract.NewRecordManager(
-		m.ctx.t, m.rs.Bck,
-		m.rs.Extension, m.extractCreator,
-		keyExtractor, onDuplicatedRecords,
-	)
-
+	m.recm = extract.NewRecordManager(m.ctx.t, m.pars.InputBck, m.ec, ke, m.onDupRecs)
 	return nil
+}
+
+func newExtractCreator(t cluster.Target, ext string) (ec extract.Creator) {
+	switch ext {
+	case archive.ExtTar:
+		ec = extract.NewTarRW(t)
+	case archive.ExtTarGz, archive.ExtTgz:
+		ec = extract.NewTargzRW(t, ext)
+	case archive.ExtZip:
+		ec = extract.NewZipRW(t)
+	case archive.ExtTarLz4:
+		ec = extract.NewTarlz4RW(t)
+	}
+	return
 }
 
 // updateFinishedAck marks daemonID as finished. If all daemons ack then the
@@ -528,21 +518,20 @@ func (m *Manager) listenReceived() chan int32 {
 	return m.received.ch
 }
 
-func (m *Manager) addCompressionSizes(compressed, uncompressed int64) {
-	m.compression.compressed.Add(compressed)
-	m.compression.uncompressed.Add(uncompressed)
+func (m *Manager) addSizes(shardSize, extractedSize int64) {
+	if shardSize > extractedSize {
+		// .tar with padding or poor compression
+		shardSize = extractedSize
+	}
+	m.compression.totalShardSize.Add(shardSize)
+	m.compression.totalExtractedSize.Add(extractedSize)
 }
 
-func (m *Manager) totalCompressedSize() int64 {
-	return m.compression.compressed.Load()
-}
+func (m *Manager) totalShardSize() int64     { return m.compression.totalShardSize.Load() }
+func (m *Manager) totalExtractedSize() int64 { return m.compression.totalExtractedSize.Load() }
 
-func (m *Manager) totalUncompressedSize() int64 {
-	return m.compression.uncompressed.Load()
-}
-
-func (m *Manager) avgCompressionRatio() float64 {
-	return float64(m.totalCompressedSize()) / float64(m.totalUncompressedSize())
+func (m *Manager) compressionRatio() float64 {
+	return float64(m.totalShardSize()) / float64(m.totalExtractedSize())
 }
 
 // incrementRef increments reference counter. This prevents from premature cleanup.
@@ -570,23 +559,10 @@ func (m *Manager) decrementRef(by int64) {
 	}
 }
 
-func (m *Manager) inFlightInc() { m.inFlight.Inc() }
-func (m *Manager) inFlightDec() { m.inFlight.Dec() }
-
-// waitForInFlight waits for all in-flight stream requests to finish.
-func (m *Manager) waitForInFlight() {
-	for m.inFlight.Load() > 0 {
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-func (m *Manager) inProgress() bool {
-	return m.state.inProgress.Load()
-}
-
-func (m *Manager) aborted() bool {
-	return m.state.aborted.Load()
-}
+func (m *Manager) inFlightInc()     { m.inFlight.Inc() }
+func (m *Manager) inFlightDec()     { m.inFlight.Dec() }
+func (m *Manager) inProgress() bool { return m.state.inProgress.Load() }
+func (m *Manager) aborted() bool    { return m.state.aborted.Load() }
 
 // listenAborted returns channel which is closed when DSort job was aborted.
 // This allows for the listen to be notified when job is aborted.
@@ -595,15 +571,21 @@ func (m *Manager) listenAborted() chan struct{} {
 }
 
 // waitForFinish waits for DSort job to be finished. Note that aborted is also
-// considered finished.
+// 'finished'.
 func (m *Manager) waitForFinish() {
 	m.state.wg.Wait()
+}
+
+// waitForInFlight waits for all in-flight stream requests to finish.
+func (m *Manager) waitForInFlight() {
+	for m.inFlight.Load() > 0 {
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // setInProgressTo updates in progress state. If inProgress is set to false and
 // sort was aborted this means someone is waiting. Therefore the function is
 // waking up everyone who is waiting.
-//
 // PRECONDITION: `m.mu` must be locked.
 func (m *Manager) setInProgressTo(inProgress bool) {
 	// If marking as finished and job was aborted to need to free everyone
@@ -636,14 +618,6 @@ func (m *Manager) setAbortedTo(aborted bool) {
 	m.Metrics.setAbortedTo(aborted)
 }
 
-func (m *Manager) lock() {
-	m.mu.Lock()
-}
-
-func (m *Manager) unlock() {
-	m.mu.Unlock()
-}
-
 func (m *Manager) sentCallback(hdr transport.ObjHdr, rc io.ReadCloser, x any, err error) {
 	if m.Metrics.extended {
 		dur := mono.Since(x.(int64))
@@ -662,54 +636,52 @@ func (m *Manager) sentCallback(hdr transport.ObjHdr, rc io.ReadCloser, x any, er
 	}
 }
 
-func (m *Manager) makeRecvShardFunc() transport.RecvObj {
-	return func(hdr transport.ObjHdr, object io.Reader, err error) error {
-		defer transport.DrainAndFreeReader(object)
-		if err != nil {
-			m.abort(err)
-			return err
-		}
-		if m.aborted() {
-			return newDSortAbortedError(m.ManagerUUID)
-		}
-		lom := cluster.AllocLOM(hdr.ObjName)
-		defer cluster.FreeLOM(lom)
-		if err = lom.InitBck(&hdr.Bck); err == nil {
-			err = lom.Load(false /*cache it*/, false /*locked*/)
-		}
-		if err != nil && !os.IsNotExist(err) {
-			m.abort(err)
-			return err
-		}
-		if err == nil {
-			if lom.EqCksum(hdr.ObjAttrs.Cksum) {
-				if m.config.FastV(4, cos.SmoduleDsort) {
-					nlog.Infof("[dsort] %s shard (%s) already exists and checksums are equal, skipping",
-						m.ManagerUUID, lom)
-				}
-				return nil
-			}
-			nlog.Warningf("[dsort] %s shard (%s) already exists, overriding", m.ManagerUUID, lom)
-		}
-		started := time.Now()
-		lom.SetAtimeUnix(started.UnixNano())
-		rc := io.NopCloser(object)
-
-		params := cluster.AllocPutObjParams()
-		{
-			params.WorkTag = ct.WorkfileRecvShard
-			params.Reader = rc
-			params.Cksum = nil
-			params.Atime = started
-		}
-		erp := m.ctx.t.PutObject(lom, params)
-		cluster.FreePutObjParams(params)
-		if erp != nil {
-			m.abort(err)
-			return erp
-		}
-		return nil
+func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	defer transport.DrainAndFreeReader(objReader)
+	if err != nil {
+		m.abort(err)
+		return err
 	}
+	if m.aborted() {
+		return newDSortAbortedError(m.ManagerUUID)
+	}
+	lom := cluster.AllocLOM(hdr.ObjName)
+	defer cluster.FreeLOM(lom)
+	if err = lom.InitBck(&hdr.Bck); err == nil {
+		err = lom.Load(false /*cache it*/, false /*locked*/)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		m.abort(err)
+		return err
+	}
+	if err == nil {
+		if lom.EqCksum(hdr.ObjAttrs.Cksum) {
+			if m.config.FastV(4, cos.SmoduleDsort) {
+				nlog.Infof("[dsort] %s shard (%s) already exists and checksums are equal, skipping",
+					m.ManagerUUID, lom)
+			}
+			return nil
+		}
+		nlog.Warningf("[dsort] %s shard (%s) already exists, overriding", m.ManagerUUID, lom)
+	}
+	started := time.Now()
+	lom.SetAtimeUnix(started.UnixNano())
+	rc := io.NopCloser(objReader)
+
+	params := cluster.AllocPutObjParams()
+	{
+		params.WorkTag = ct.WorkfileRecvShard
+		params.Reader = rc
+		params.Cksum = nil
+		params.Atime = started
+	}
+	erp := m.ctx.t.PutObject(lom, params)
+	cluster.FreePutObjParams(params)
+	if erp != nil {
+		m.abort(err)
+		return erp
+	}
+	return nil
 }
 
 // doWithAbort sends requests through client. If manager aborts during the call
@@ -727,7 +699,7 @@ func (m *Manager) doWithAbort(reqArgs *cmn.HreqArgs) error {
 		defer func() {
 			doneCh <- struct{}{}
 		}()
-		resp, err := m.client.Do(req) //nolint:bodyclose // closed inside cos.Close
+		resp, err := m.client.Do(req) //nolint:bodyclose // cos.Close below
 		if err != nil {
 			errCh <- err
 			return
@@ -754,7 +726,6 @@ func (m *Manager) doWithAbort(reqArgs *cmn.HreqArgs) error {
 	case <-doneCh:
 		break
 	}
-
 	close(errCh)
 	return errors.WithStack(<-errCh)
 }
@@ -764,21 +735,15 @@ func (m *Manager) ListenSmapChanged() {
 	if newSmap.Version <= m.smap.Version {
 		return
 	}
-
 	if newSmap.CountActiveTs() != m.smap.CountActiveTs() {
 		// Currently adding new target as well as removing one is not
 		// supported during the run.
-		//
 		// TODO: dSort should survive adding new target. For now it is
-		//  not possible as rebalance deletes moved object - dSort needs
-		//  to use `GetObject` method instead of relaying on simple `os.Open`.
-		err := errors.Errorf("number of target has changed during dSort run, aborting due to possible errors")
+		// not possible as rebalance deletes moved object - dSort needs
+		// to use `GetObject` method instead of relaying on simple `os.Open`.
+		err := errors.Errorf("number of targets changed during run - aborting")
 		go m.abort(err)
 	}
-}
-
-func (m *Manager) String() string {
-	return m.ManagerUUID
 }
 
 func (m *Manager) freeMemory() uint64 {
@@ -786,7 +751,7 @@ func (m *Manager) freeMemory() uint64 {
 	if err := mem.Get(); err != nil {
 		return 0
 	}
-	maxMemoryToUse := calcMaxMemoryUsage(m.rs.MaxMemUsage, &mem)
+	maxMemoryToUse := calcMaxMemoryUsage(m.pars.MaxMemUsage, &mem)
 	return maxMemoryToUse - mem.ActualUsed
 }
 
@@ -800,28 +765,11 @@ func (m *Manager) react(reaction, msg string) error {
 		m.Metrics.unlock()
 		return nil
 	case cmn.AbortReaction:
-		return fmt.Errorf("%s", msg) // error will be reported on abort
+		return fmt.Errorf("%s", msg) // (dsort job aborts and returns this error)
 	default:
 		debug.Assert(false, reaction)
 		return nil
 	}
-}
-
-func (bsi *buildingShardInfo) Unpack(unpacker *cos.ByteUnpack) error {
-	var err error
-	bsi.shardName, err = unpacker.ReadString()
-	return err
-}
-func (bsi *buildingShardInfo) Pack(packer *cos.BytePack) { packer.WriteString(bsi.shardName) }
-func (bsi *buildingShardInfo) PackedSize() int           { return cos.SizeofLen + len(bsi.shardName) }
-func (bsi *buildingShardInfo) NewPack(mm *memsys.MMSA) []byte {
-	var (
-		size   = bsi.PackedSize()
-		buf, _ = mm.AllocSize(int64(size))
-		packer = cos.NewPacker(buf, size)
-	)
-	packer.WriteAny(bsi)
-	return packer.Bytes()
 }
 
 func calcMaxMemoryUsage(maxUsage cos.ParsedQuantity, mem *sys.MemStat) uint64 {
@@ -834,4 +782,26 @@ func calcMaxMemoryUsage(maxUsage cos.ParsedQuantity, mem *sys.MemStat) uint64 {
 		debug.Assertf(false, "mem usage type (%s) is not recognized.. something went wrong", maxUsage.Type)
 		return 0
 	}
+}
+
+///////////////////////
+// buildingShardInfo //
+///////////////////////
+
+func (bsi *buildingShardInfo) Unpack(unpacker *cos.ByteUnpack) error {
+	var err error
+	bsi.shardName, err = unpacker.ReadString()
+	return err
+}
+
+func (bsi *buildingShardInfo) Pack(packer *cos.BytePack) { packer.WriteString(bsi.shardName) }
+func (bsi *buildingShardInfo) PackedSize() int           { return cos.SizeofLen + len(bsi.shardName) }
+func (bsi *buildingShardInfo) NewPack(mm *memsys.MMSA) []byte {
+	var (
+		size   = bsi.PackedSize()
+		buf, _ = mm.AllocSize(int64(size))
+		packer = cos.NewPacker(buf, size)
+	)
+	packer.WriteAny(bsi)
+	return packer.Bytes()
 }

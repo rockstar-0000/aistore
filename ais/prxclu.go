@@ -494,8 +494,10 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 		apiOp = apc.SelfJoin
 	}
 
+	msg := &apc.ActMsg{Action: action, Name: nsi.ID()}
+
 	p.owner.smap.mu.Lock()
-	upd, err := p._joinKalive(nsi, regReq.Smap, apiOp, nsi.Flags, &regReq)
+	upd, err := p._joinKalive(nsi, regReq.Smap, apiOp, nsi.Flags, &regReq, msg)
 	p.owner.smap.mu.Unlock()
 	if err != nil {
 		p.writeErr(w, r, err)
@@ -509,7 +511,6 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg := &apc.ActMsg{Action: action, Name: nsi.ID()}
 	nlog.Infof("%s: %s(%q) %s (%s)", p, apiOp, action, nsi.StringEx(), regReq.Smap)
 
 	if apiOp == apc.AdminJoin {
@@ -567,7 +568,7 @@ func (p *proxy) adminJoinHandshake(smap *smapX, nsi *meta.Snode, apiOp string) (
 }
 
 // executes under lock
-func (p *proxy) _joinKalive(nsi *meta.Snode, regSmap *smapX, apiOp string, flags cos.BitFlags, regReq *cluMeta) (upd bool, err error) {
+func (p *proxy) _joinKalive(nsi *meta.Snode, regSmap *smapX, apiOp string, flags cos.BitFlags, regReq *cluMeta, msg *apc.ActMsg) (upd bool, err error) {
 	smap := p.owner.smap.get()
 	if !smap.isPrimary(p.si) {
 		err = newErrNotPrimary(p.si, smap, "cannot "+apiOp+" "+nsi.StringEx())
@@ -607,11 +608,15 @@ func (p *proxy) _joinKalive(nsi *meta.Snode, regSmap *smapX, apiOp string, flags
 	}
 
 	// when cluster's starting up
-	if a, b := p.ClusterStarted(), p.owner.rmd.starting.Load(); !a || b {
+	if a, b := p.ClusterStarted(), p.owner.rmd.starting.Load(); err == nil && (!a || b) {
 		clone := smap.clone()
 		clone.putNode(nsi, flags, false /*silent*/)
 		p.owner.smap.put(clone)
 		upd = false
+		if a {
+			aisMsg := p.newAmsg(msg, nil)
+			_ = p.metasyncer.sync(revsPair{clone, aisMsg})
+		}
 		return
 	}
 
@@ -1092,6 +1097,25 @@ func (p *proxy) xstop(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 		return
 	}
 	xargs.Kind, _ = xact.GetKindName(xargs.Kind) // display name => kind
+
+	if xargs.Kind == apc.ActRebalance {
+		// disallow aborting rebalance during
+		// critical (meta.SnodeMaint => meta.SnodeMaintPostReb) and (meta.SnodeDecomm => removed) transitions
+		smap := p.owner.smap.get()
+		for _, tsi := range smap.Tmap {
+			if tsi.Flags.IsAnySet(meta.SnodeMaint) && !tsi.Flags.IsAnySet(meta.SnodeMaintPostReb) {
+				p.writeErrf(w, r, "cannot abort %s: putting target %s in maintenance mode - rebalancing cluster...",
+					xargs.String(), tsi.StringEx())
+				return
+			}
+			if tsi.Flags.IsAnySet(meta.SnodeDecomm) {
+				p.writeErrf(w, r, "cannot abort %s: decommissioning target %s - rebalancing cluster...",
+					xargs.String(), tsi.StringEx())
+				return
+			}
+		}
+	}
+
 	body := cos.MustMarshal(apc.ActMsg{Action: msg.Action, Value: xargs})
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: apc.URLPathXactions.S, Body: body}
@@ -1348,6 +1372,7 @@ func (p *proxy) mcastMaint(msg *apc.ActMsg, si *meta.Snode, reb, maintPostReb bo
 			[]string{apc.ActDecommissionNode, apc.ActStartMaintenance, apc.ActShutdownNode})
 		return
 	}
+	nlog.Infof("%s mcast-maint: %s, %s reb=(%t, %t)", p, msg, si.StringEx(), reb, maintPostReb)
 	ctx = &smapModifier{
 		pre:     p._markMaint,
 		post:    p._rebPostRm, // (rmdCtx.rmNode => p.rmNodeFinal when all done)
@@ -1393,7 +1418,7 @@ func (p *proxy) _rebPostRm(ctx *smapModifier, clone *smapX) {
 		debug.AssertNoErr(err)
 		return
 	}
-	rmdCtx.listen(rmdCtx.rmNode)
+	rmdCtx.listen(rmdCtx.postRm)
 	ctx.rmdCtx = rmdCtx
 }
 
@@ -1595,6 +1620,7 @@ func (p *proxy) _remaisConf(ctx *configModifier, config *globalConfig) (bool, er
 }
 
 func (p *proxy) mcastStopMaint(msg *apc.ActMsg, opts *apc.ActValRmNode) (rebID string, err error) {
+	nlog.Infof("%s mcast-stopm: %s, %s", p, msg, opts.DaemonID)
 	ctx := &smapModifier{
 		pre:     p._stopMaintPre,
 		post:    p._newRMD,
@@ -1649,15 +1675,6 @@ func (p *proxy) _newRMD(ctx *smapModifier, clone *smapX) {
 	}
 	rmdCtx.listen(nil)
 	ctx.rmdCtx = rmdCtx
-}
-
-func (p *proxy) bmodSync(ctx *bmdModifier, clone *bucketMD) {
-	debug.Assert(clone._sgl != nil)
-	msg := p.newAmsg(ctx.msg, clone, ctx.txnID)
-	wg := p.metasyncer.sync(revsPair{clone, msg})
-	if ctx.wait {
-		wg.Wait()
-	}
 }
 
 func (p *proxy) cluSetPrimary(w http.ResponseWriter, r *http.Request) {
@@ -1875,6 +1892,7 @@ func (p *proxy) rmNodeFinal(msg *apc.ActMsg, si *meta.Snode, ctx *smapModifier) 
 }
 
 func (p *proxy) mcastUnreg(msg *apc.ActMsg, si *meta.Snode) (errCode int, err error) {
+	nlog.Infof("%s mcast-unreg: %s, %s", p, msg, si.StringEx())
 	ctx := &smapModifier{
 		pre:     p._unregNodePre,
 		final:   p._syncFinal,

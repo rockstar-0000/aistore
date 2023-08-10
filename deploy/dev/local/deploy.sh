@@ -68,9 +68,10 @@ else
   PORT_INTRA_DATA=${PORT_INTRA_DATA:-13080}
   NEXT_TIER="_next"
 fi
-AIS_PRIMARY_URL="http://localhost:$PORT"
+PRIMARY_HOST=${AIS_PRIMARY_HOST:-localhost}
+AIS_PRIMARY_URL="http://$PRIMARY_HOST:$PORT"
 if $AIS_USE_HTTPS; then
-  AIS_PRIMARY_URL="https://localhost:$PORT"
+  AIS_PRIMARY_URL="https://$PRIMARY_HOST:$PORT"
 fi
 LOG_ROOT="${LOG_ROOT:-/tmp/ais}${NEXT_TIER}"
 #### Authentication setup #########
@@ -136,14 +137,14 @@ is_number ${TARGET_CNT}
 echo "Enter number of proxies (gateways):"
 read -r PROXY_CNT
 is_number ${PROXY_CNT}
-if  [[ ${PROXY_CNT} -lt 1 ]] ; then
-  exit_error "${PROXY_CNT} must be at least 1"
+if  [[ ${PROXY_CNT} -lt 1 && -z "${AIS_PRIMARY_HOST}" ]] ; then
+  exit_error "Number of proxies must be at least 1 if no external primary proxy is specified with AIS_PRIMARY_HOST. Received "${PROXY_CNT}""
 fi
 if [[ ${PROXY_CNT} -gt 1 ]] ; then
   AIS_DISCOVERY_PORT=$((PORT + 1))
-  AIS_DISCOVERY_URL="http://localhost:$AIS_DISCOVERY_PORT"
+  AIS_DISCOVERY_URL="http://$PRIMARY_HOST:$AIS_DISCOVERY_PORT"
   if $AIS_USE_HTTPS; then
-    AIS_DISCOVERY_URL="https://localhost:$AIS_DISCOVERY_PORT"
+    AIS_DISCOVERY_URL="https://$PRIMARY_HOST:$AIS_DISCOVERY_PORT"
   fi
 fi
 
@@ -211,7 +212,7 @@ for (( c=START; c<=END; c++ )); do
 
   pub_port=$(grep "\"port\":" ${AIS_LOCAL_CONF_FILE} | awk '{ print $2 }')
   pub_port=${pub_port:1:$((${#pub_port} - 3))}
-  if [[ $c -eq 0 ]]; then
+  if [[ $c -eq 0 && $PROXY_CNT -gt 0 ]]; then
     export AIS_IS_PRIMARY="true"
     run_cmd "${CMD} ${PROXY_PARAM}"
     listening_on+=${pub_port}

@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/ext/dsort/extract"
 	"github.com/NVIDIA/aistore/sys"
@@ -42,12 +43,17 @@ const (
 	scopeSpec   = "spec"
 )
 
+const (
+	startingDS = "starting dsort"
+	finishedDS = "finished dsort"
+)
+
 var (
 	dsortDescCurPrefix = fmt.Sprintf("%s-%d-", dsortDescAllPrefix, os.Getpid())
 
 	dsorterTypes       = []string{dsort.DSorterGeneralType, dsort.DSorterMemType}
 	dsortPhases        = []string{dsort.ExtractionPhase, dsort.SortingPhase, dsort.CreationPhase}
-	dsortAlgorithms    = []string{dsort.SortKindAlphanumeric, dsort.SortKindShuffle}
+	dsortAlgorithms    = []string{dsort.Alphanumeric, dsort.Shuffle}
 	dsortSettingScopes = []string{scopeConfig, scopeSpec}
 )
 
@@ -59,7 +65,7 @@ type (
 		phases     []string
 		reactions  []string
 		scopes     []string
-		algorithms []string
+		algs       []string
 	}
 
 	dsortFramework struct {
@@ -71,21 +77,23 @@ type (
 		inputPrefix  string
 		outputPrefix string
 
-		inputTempl            string
+		inputTempl            apc.ListRange
 		outputTempl           string
 		orderFileURL          string
-		tarballCnt            int
-		tarballCntToSkip      int
-		fileInTarballCnt      int
-		fileInTarballSize     int
-		tarballSize           int
+		shardCnt              int
+		shardCntToSkip        int
+		filesPerShard         int
+		fileSz                int // in a shard
+		shardSize             int
 		outputShardCnt        int
 		recordDuplicationsCnt int
 		recordExts            []string
 
+		inputShards []string
+
 		tarFormat       tar.Format
 		extension       string
-		algorithm       *dsort.SortAlgorithm
+		alg             *dsort.Algorithm
 		missingKeys     bool
 		outputShardSize string
 		maxMemUsage     string
@@ -168,15 +176,15 @@ func runDSortTest(t *testing.T, dts dsortTestSpec, f any) {
 						}
 					})
 				}
-			} else if len(dts.algorithms) > 0 {
-				g := f.(func(dsorterType, algorithm string, t *testing.T))
-				for _, algorithm := range dts.algorithms {
-					algorithm := algorithm // pin
-					t.Run(algorithm, func(t *testing.T) {
+			} else if len(dts.algs) > 0 {
+				g := f.(func(dsorterType, alg string, t *testing.T))
+				for _, alg := range dts.algs {
+					alg := alg // pin
+					t.Run(alg, func(t *testing.T) {
 						if dts.p {
 							t.Parallel()
 						}
-						g(dsorterType, algorithm, t)
+						g(dsorterType, alg, t)
 					})
 				}
 			} else {
@@ -188,43 +196,38 @@ func runDSortTest(t *testing.T, dts dsortTestSpec, f any) {
 }
 
 func (df *dsortFramework) init() {
-	if df.inputTempl == "" {
-		df.inputTempl = fmt.Sprintf("input-{0..%d}", df.tarballCnt-1)
+	if df.inputTempl.Template == "" {
+		df.inputTempl = apc.ListRange{Template: fmt.Sprintf("input-{0..%d}", df.shardCnt-1)}
 	}
 	if df.outputTempl == "" {
 		df.outputTempl = "output-{00000..10000}"
 	}
-	// NOTE: default extension/format/MIME
 	if df.extension == "" {
-		df.extension = archive.ExtTar
+		df.extension = dsort.DefaultExt
 	}
 
 	// Assumption is that all prefixes end with dash: "-"
-	df.inputPrefix = df.inputTempl[:strings.Index(df.inputTempl, "-")+1]
+	df.inputPrefix = df.inputTempl.Template[:strings.Index(df.inputTempl.Template, "-")+1]
 	df.outputPrefix = df.outputTempl[:strings.Index(df.outputTempl, "-")+1]
 
-	if df.fileInTarballSize == 0 {
-		df.fileInTarballSize = cos.KiB
+	if df.fileSz == 0 {
+		df.fileSz = cos.KiB
 	}
 
-	if df.maxMemUsage == "" {
-		df.maxMemUsage = "99%"
-	}
-
-	df.tarballSize = df.fileInTarballCnt * df.fileInTarballSize
+	df.shardSize = df.filesPerShard * df.fileSz
 	if df.outputShardSize == "-1" {
 		df.outputShardSize = ""
 		pt, err := cos.ParseBashTemplate(df.outputTempl)
 		cos.AssertNoErr(err)
 		df.outputShardCnt = int(pt.Count())
 	} else {
-		outputShardSize := int64(10 * df.fileInTarballCnt * df.fileInTarballSize)
+		outputShardSize := int64(10 * df.filesPerShard * df.fileSz)
 		df.outputShardSize = cos.ToSizeIEC(outputShardSize, 0)
-		df.outputShardCnt = (df.tarballCnt * df.tarballSize) / int(outputShardSize)
+		df.outputShardCnt = (df.shardCnt * df.shardSize) / int(outputShardSize)
 	}
 
-	if df.algorithm == nil {
-		df.algorithm = &dsort.SortAlgorithm{}
+	if df.alg == nil {
+		df.alg = &dsort.Algorithm{}
 	}
 
 	df.baseParams = tools.BaseAPIParams(df.m.proxyURL)
@@ -233,13 +236,13 @@ func (df *dsortFramework) init() {
 func (df *dsortFramework) gen() dsort.RequestSpec {
 	return dsort.RequestSpec{
 		Description:         generateDSortDesc(),
-		Bck:                 df.m.bck,
+		InputBck:            df.m.bck,
 		OutputBck:           df.outputBck,
-		Extension:           df.extension,
+		InputExtension:      df.extension,
 		InputFormat:         df.inputTempl,
 		OutputFormat:        df.outputTempl,
 		OutputShardSize:     df.outputShardSize,
-		Algorithm:           *df.algorithm,
+		Algorithm:           *df.alg,
 		OrderFileURL:        df.orderFileURL,
 		ExtractConcMaxLimit: 10,
 		CreateConcMaxLimit:  10,
@@ -247,7 +250,7 @@ func (df *dsortFramework) gen() dsort.RequestSpec {
 		DSorterType:         df.dsorterType,
 		DryRun:              df.dryRun,
 
-		DSortConf: cmn.DSortConf{
+		Config: cmn.DSortConf{
 			MissingShards:     df.missingShards,
 			DuplicatedRecords: df.duplicatedRecords,
 		},
@@ -256,11 +259,10 @@ func (df *dsortFramework) gen() dsort.RequestSpec {
 
 func (df *dsortFramework) start() {
 	var (
-		err error
-		rs  = df.gen()
+		err  error
+		spec = df.gen()
 	)
-
-	df.managerUUID, err = api.StartDSort(df.baseParams, rs)
+	df.managerUUID, err = api.StartDSort(df.baseParams, &spec)
 	tassert.CheckFatal(df.m.t, err)
 }
 
@@ -268,11 +270,14 @@ func (df *dsortFramework) createInputShards() {
 	const tmpDir = "/tmp"
 	var (
 		wg    = cos.NewLimitedWaitGroup(40, 0)
-		errCh = make(chan error, df.tarballCnt)
-	)
+		errCh = make(chan error, df.shardCnt)
 
-	tlog.Logf("creating %d shards...\n", df.tarballCnt)
-	for i := df.tarballCntToSkip; i < df.tarballCnt; i++ {
+		mu = &sync.Mutex{} // to collect inputShards (obj names)
+	)
+	debug.Assert(len(df.inputShards) == 0)
+
+	tlog.Logf("creating %d shards...\n", df.shardCnt)
+	for i := df.shardCntToSkip; i < df.shardCnt; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -282,29 +287,36 @@ func (df *dsortFramework) createInputShards() {
 				path        = fmt.Sprintf("%s/%s/%s%d", tmpDir, df.m.bck.Name, df.inputPrefix, i)
 				tarName     string
 			)
-			if df.algorithm.Kind == dsort.SortKindContent {
+			if df.alg.Kind == dsort.Content {
 				tarName = path + archive.ExtTar
 			} else {
 				tarName = path + df.extension
 			}
-			if df.algorithm.Kind == dsort.SortKindContent {
-				err = tarch.CreateArchCustomFiles(tarName, df.tarFormat, df.extension, df.fileInTarballCnt, df.fileInTarballSize, df.algorithm.FormatType, df.algorithm.Extension, df.missingKeys)
+			if df.alg.Kind == dsort.Content {
+				err = tarch.CreateArchCustomFiles(tarName, df.tarFormat, df.extension, df.filesPerShard,
+					df.fileSz, df.alg.ContentKeyType, df.alg.Ext, df.missingKeys)
 			} else if df.extension == archive.ExtTar {
-				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.extension, df.fileInTarballCnt, df.fileInTarballSize, duplication, df.recordExts, nil)
-			} else if df.extension == archive.ExtTarTgz || df.extension == archive.ExtZip || df.extension == archive.ExtTarLz4 {
-				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.extension, df.fileInTarballCnt, df.fileInTarballSize, duplication, nil, nil)
+				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.extension, df.filesPerShard,
+					df.fileSz, duplication, df.recordExts, nil)
+			} else if df.extension == archive.ExtTarGz || df.extension == archive.ExtZip || df.extension == archive.ExtTarLz4 {
+				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.extension, df.filesPerShard,
+					df.fileSz, duplication, nil, nil)
 			} else {
 				df.m.t.Fail()
 			}
 			tassert.CheckFatal(df.m.t, err)
 
-			fqn := path + df.extension
-			defer os.Remove(fqn)
-
-			reader, err := readers.NewFileReaderFromFile(fqn, cos.ChecksumNone)
+			reader, err := readers.NewFileReaderFromFile(tarName, cos.ChecksumNone)
 			tassert.CheckFatal(df.m.t, err)
 
-			tools.Put(df.m.proxyURL, df.m.bck, filepath.Base(fqn), reader, errCh)
+			objName := filepath.Base(tarName)
+			tools.Put(df.m.proxyURL, df.m.bck, objName, reader, errCh)
+
+			mu.Lock()
+			df.inputShards = append(df.inputShards, objName)
+			mu.Unlock()
+
+			os.Remove(tarName)
 		}(i)
 	}
 	wg.Wait()
@@ -312,7 +324,7 @@ func (df *dsortFramework) createInputShards() {
 	for err := range errCh {
 		tassert.CheckFatal(df.m.t, err)
 	}
-	tlog.Logln("done creating tarballs")
+	tlog.Logln("done creating shards")
 }
 
 func (df *dsortFramework) checkOutputShards(zeros int) {
@@ -324,7 +336,7 @@ func (df *dsortFramework) checkOutputShards(zeros int) {
 		baseParams = tools.BaseAPIParams(df.m.proxyURL)
 		records    = make(map[string]int, 100)
 	)
-	tlog.Logln("checking if files are sorted...")
+	tlog.Logln("checking that files are sorted...")
 	for i := 0; i < df.outputShardCnt; i++ {
 		var (
 			buffer    bytes.Buffer
@@ -337,7 +349,7 @@ func (df *dsortFramework) checkOutputShards(zeros int) {
 		}
 
 		_, err := api.GetObject(baseParams, bucket, shardName, &getArgs)
-		if err != nil && df.extension == archive.ExtZip && i > df.outputShardCnt/2 {
+		if err != nil && archive.IsCompressed(df.extension) && i > df.outputShardCnt/2 {
 			// We estimated too much output shards to be produced - zip compression
 			// was so good that we could fit more files inside the shard.
 			//
@@ -347,32 +359,34 @@ func (df *dsortFramework) checkOutputShards(zeros int) {
 		}
 		tassert.CheckFatal(df.m.t, err)
 
-		if df.algorithm.Kind == dsort.SortKindContent {
-			files, err := tarch.GetFilesFromArchBuffer(cos.Ext(shardName), buffer, df.algorithm.Extension)
+		if df.alg.Kind == dsort.Content {
+			files, err := tarch.GetFilesFromArchBuffer(cos.Ext(shardName), buffer, df.alg.Ext)
 			tassert.CheckFatal(df.m.t, err)
 			for _, file := range files {
-				if file.Ext == df.algorithm.Extension {
-					if strings.TrimSuffix(file.Name, filepath.Ext(file.Name)) != strings.TrimSuffix(lastName, filepath.Ext(lastName)) {
-						// custom files should be AFTER the regular files
-						df.m.t.Fatalf("names are not in correct order (shard: %s, lastName: %s, curName: %s)", shardName, lastName, file.Name)
+				if file.Ext == df.alg.Ext {
+					if strings.TrimSuffix(file.Name, filepath.Ext(file.Name)) !=
+						strings.TrimSuffix(lastName, filepath.Ext(lastName)) {
+						// custom files should go AFTER the regular files
+						df.m.t.Fatalf("names are not in the correct order (shard: %s, lastName: %s, curName: %s)",
+							shardName, lastName, file.Name)
 					}
 
-					switch df.algorithm.FormatType {
-					case extract.FormatTypeInt:
+					switch df.alg.ContentKeyType {
+					case extract.ContentKeyInt:
 						intValue, err := strconv.ParseInt(string(file.Content), 10, 64)
 						tassert.CheckFatal(df.m.t, err)
 						if lastValue != nil && intValue < lastValue.(int64) {
 							df.m.t.Fatalf("int values are not in correct order (shard: %s, lastIntValue: %d, curIntValue: %d)", shardName, lastValue.(int64), intValue)
 						}
 						lastValue = intValue
-					case extract.FormatTypeFloat:
+					case extract.ContentKeyFloat:
 						floatValue, err := strconv.ParseFloat(string(file.Content), 64)
 						tassert.CheckFatal(df.m.t, err)
 						if lastValue != nil && floatValue < lastValue.(float64) {
 							df.m.t.Fatalf("string values are not in correct order (shard: %s, lastStringValue: %f, curStringValue: %f)", shardName, lastValue.(float64), floatValue)
 						}
 						lastValue = floatValue
-					case extract.FormatTypeString:
+					case extract.ContentKeyString:
 						stringValue := string(file.Content)
 						if lastValue != nil && stringValue < lastValue.(string) {
 							df.m.t.Fatalf("string values are not in correct order (shard: %s, lastStringValue: %s, curStringValue: %s)", shardName, lastValue.(string), stringValue)
@@ -393,17 +407,18 @@ func (df *dsortFramework) checkOutputShards(zeros int) {
 			}
 
 			for _, file := range files {
-				if df.algorithm.Kind == "" || df.algorithm.Kind == dsort.SortKindAlphanumeric {
+				if df.alg.Kind == "" || df.alg.Kind == dsort.Alphanumeric {
 					if lastName > file.Name() && canonicalName(lastName) != canonicalName(file.Name()) {
-						df.m.t.Fatalf("names are not in correct order (shard: %s, lastName: %s, curName: %s)", shardName, lastName, file.Name())
+						df.m.t.Fatalf("names are not in correct order (shard: %s, lastName: %s, curName: %s)",
+							shardName, lastName, file.Name())
 					}
-				} else if df.algorithm.Kind == dsort.SortKindShuffle {
+				} else if df.alg.Kind == dsort.Shuffle {
 					if lastName > file.Name() {
 						inversions++
 					}
 				}
-				if file.Size() != int64(df.fileInTarballSize) {
-					df.m.t.Fatalf("file sizes has changed (expected: %d, got: %d)", df.fileInTarballSize, file.Size())
+				if file.Size() != int64(df.fileSz) {
+					df.m.t.Fatalf("file sizes has changed (expected: %d, got: %d)", df.fileSz, file.Size())
 				}
 				lastName = file.Name()
 
@@ -433,7 +448,7 @@ func (df *dsortFramework) checkOutputShards(zeros int) {
 		}
 	}
 
-	if df.algorithm.Kind == dsort.SortKindShuffle {
+	if df.alg.Kind == dsort.Shuffle {
 		if inversions == 0 {
 			df.m.t.Fatal("shuffle sorting did not create any inversions")
 		}
@@ -545,24 +560,24 @@ func (df *dsortFramework) checkMetrics(expectAbort bool) map[string]*dsort.Metri
 // helper for dispatching i-th dSort job
 func dispatchDSortJob(m *ioContext, dsorterType string, i int) {
 	df := &dsortFramework{
-		m:                m,
-		dsorterType:      dsorterType,
-		inputTempl:       fmt.Sprintf("input%d-{0..999}", i),
-		outputTempl:      fmt.Sprintf("output%d-{00000..01000}", i),
-		tarballCnt:       500,
-		fileInTarballCnt: 50,
-		maxMemUsage:      "99%",
+		m:             m,
+		dsorterType:   dsorterType,
+		inputTempl:    apc.ListRange{Template: fmt.Sprintf("input%d-{0..999}", i)},
+		outputTempl:   fmt.Sprintf("output%d-{00000..01000}", i),
+		shardCnt:      500,
+		filesPerShard: 50,
+		maxMemUsage:   "99%",
 	}
 
 	df.init()
 	df.createInputShards()
 
-	tlog.Logln("starting distributed sort...")
+	tlog.Logln(startingDS)
 	df.start()
 
 	_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 	tassert.CheckFatal(m.t, err)
-	tlog.Logln("finished distributed sort")
+	tlog.Logln(finishedDS)
 
 	df.checkMetrics(false /* expectAbort */)
 	df.checkOutputShards(5)
@@ -597,14 +612,21 @@ func waitForDSortPhase(t *testing.T, proxyURL, managerUUID, phaseName string, ca
 			callback()
 			break
 		}
-
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func TestDistributedSort(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	for _, ext := range []string{archive.ExtTar, archive.ExtTarLz4, archive.ExtZip} {
+		for _, lr := range []string{"list", "range"} {
+			t.Run(ext+"/"+lr, func(t *testing.T) {
+				testDsort(t, ext, lr)
+			})
+		}
+	}
+}
 
+func testDsort(t *testing.T, ext, lr string) {
 	runDSortTest(
 		// Include empty ("") type - in this case type must be selected automatically.
 		t, dsortTestSpec{p: true, types: append(dsorterTypes, "")},
@@ -614,30 +636,41 @@ func TestDistributedSort(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					maxMemUsage:      "99%",
+					m:             m,
+					extension:     ext,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 100,
+					maxMemUsage:   "99%",
 				}
 			)
+			if testing.Short() {
+				df.shardCnt /= 10
+			}
 
 			// Initialize ioContext
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(1)
 
 			// Create ais bucket
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logln("starting distributed sort...")
+			if lr == "list" {
+				// iterate list
+				df.inputTempl.ObjNames = df.inputShards
+				df.inputTempl.Template = ""
+				df.missingShards = cmn.AbortReaction // (when shards are explicitly enumerated...)
+			}
+
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 			df.checkOutputShards(5)
@@ -660,34 +693,35 @@ func TestDistributedSortNonExistingBuckets(t *testing.T) {
 						Name:     trand.String(15),
 						Provider: apc.AIS,
 					},
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					maxMemUsage:      "99%",
+					shardCnt:      500,
+					filesPerShard: 100,
+					maxMemUsage:   "99%",
 				}
 			)
 
 			// Initialize ioContext
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
 			df.init()
 
-			// Create local output bucket
-			tools.CreateBucketWithCleanup(t, m.proxyURL, df.outputBck, nil)
+			// Create ais:// output
+			tools.CreateBucket(t, m.proxyURL, df.outputBck, nil, true /*cleanup*/)
 
-			tlog.Logln("starting distributed sort...")
-			rs := df.gen()
-			if _, err := api.StartDSort(df.baseParams, rs); err == nil {
-				t.Errorf("expected %s job to fail when input bucket does not exist", dsort.DSortName)
+			tlog.Logln(startingDS)
+			spec := df.gen()
+			tlog.Logf("dsort %s(-) => %s\n", m.bck, df.outputBck)
+			if _, err := api.StartDSort(df.baseParams, &spec); err == nil {
+				t.Error("expected dsort to fail when input bucket doesn't exist")
 			}
 
 			// Now destroy output bucket and create input bucket
 			tools.DestroyBucket(t, m.proxyURL, df.outputBck)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
-			tlog.Logln("starting second distributed sort...")
-			if _, err := api.StartDSort(df.baseParams, rs); err == nil {
-				t.Errorf("expected %s job to fail when output bucket does not exist", dsort.DSortName)
+			tlog.Logf("dsort %s => %s(-)\n", m.bck, df.outputBck)
+			if _, err := api.StartDSort(df.baseParams, &spec); err != nil {
+				t.Errorf("expected dsort to create output bucket on the fly, got: %v", err)
 			}
 		},
 	)
@@ -702,31 +736,31 @@ func TestDistributedSortEmptyBucket(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       100,
-					fileInTarballCnt: 10,
-					maxMemUsage:      "99%",
-					missingShards:    reaction,
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      100,
+					filesPerShard: 10,
+					maxMemUsage:   "99%",
+					missingShards: reaction,
 				}
 			)
 
 			// Initialize ioContext
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 
-			tlog.Logln("starting distributed sort...")
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(reaction == cmn.AbortReaction /*expectAbort*/)
-			df.checkReactionResult(reaction, df.tarballCnt)
+			df.checkReactionResult(reaction, df.shardCnt)
 		},
 	)
 }
@@ -748,29 +782,29 @@ func TestDistributedSortOutputBucket(t *testing.T) {
 						Name:     trand.String(15),
 						Provider: apc.AIS,
 					},
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					maxMemUsage:      "99%",
+					shardCnt:      500,
+					filesPerShard: 100,
+					maxMemUsage:   "99%",
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 			// Create ais buckets
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			// Create local output bucket
-			tools.CreateBucketWithCleanup(t, m.proxyURL, df.outputBck, nil)
+			tools.CreateBucket(t, m.proxyURL, df.outputBck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 			df.checkOutputShards(5)
@@ -792,9 +826,9 @@ func TestDistributedSortParallel(t *testing.T) {
 				dSortsCount = 5
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			wg := &sync.WaitGroup{}
 			for i := 0; i < dSortsCount; i++ {
@@ -823,9 +857,9 @@ func TestDistributedSortChain(t *testing.T) {
 				dSortsCount = 5
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			for i := 0; i < dSortsCount; i++ {
 				dispatchDSortJob(m, dsorterType, i)
@@ -843,28 +877,28 @@ func TestDistributedSortShuffle(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					algorithm:        &dsort.SortAlgorithm{Kind: dsort.SortKindShuffle},
-					tarballCnt:       500,
-					fileInTarballCnt: 10,
-					maxMemUsage:      "99%",
+					m:             m,
+					dsorterType:   dsorterType,
+					alg:           &dsort.Algorithm{Kind: dsort.Shuffle},
+					shardCnt:      500,
+					filesPerShard: 10,
+					maxMemUsage:   "99%",
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 			df.checkOutputShards(5)
@@ -881,27 +915,27 @@ func TestDistributedSortDisk(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					outputTempl:      "output-%d",
-					tarballCnt:       100,
-					fileInTarballCnt: 10,
-					maxMemUsage:      "1KB",
+					m:             m,
+					dsorterType:   dsorterType,
+					outputTempl:   "output-%d",
+					shardCnt:      100,
+					filesPerShard: 10,
+					maxMemUsage:   "1KB",
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
-			tlog.Logf("starting distributed sort with spilling to disk... (%d/%d)\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort with spilling to disk... (%d/%d)\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			allMetrics := df.checkMetrics(false /* expectAbort */)
 			for target, metrics := range allMetrics {
@@ -916,7 +950,7 @@ func TestDistributedSortDisk(t *testing.T) {
 }
 
 func TestDistributedSortCompressionDisk(t *testing.T) {
-	for _, ext := range []string{archive.ExtTarTgz, archive.ExtTarLz4} {
+	for _, ext := range []string{archive.ExtTarGz, archive.ExtTarLz4} {
 		t.Run(ext, func(t *testing.T) {
 			runDSortTest(
 				t, dsortTestSpec{p: true, types: dsorterTypes},
@@ -926,29 +960,29 @@ func TestDistributedSortCompressionDisk(t *testing.T) {
 							t: t,
 						}
 						df = &dsortFramework{
-							m:                m,
-							dsorterType:      dsorterType,
-							tarballCnt:       200,
-							fileInTarballCnt: 50,
-							extension:        ext,
-							maxMemUsage:      "1KB",
+							m:             m,
+							dsorterType:   dsorterType,
+							shardCnt:      200,
+							filesPerShard: 50,
+							extension:     ext,
+							maxMemUsage:   "1KB",
 						}
 					)
 
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					df.init()
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort: %d/%d, %s\n",
-						df.tarballCnt, df.fileInTarballCnt, df.extension)
+					tlog.Logf("starting dsort: %d/%d, %s\n",
+						df.shardCnt, df.filesPerShard, df.extension)
 					df.start()
 
 					_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 					tassert.CheckFatal(t, err)
-					tlog.Logln("finished distributed sort")
+					tlog.Logln(finishedDS)
 
 					df.checkMetrics(false /* expectAbort */)
 					df.checkOutputShards(5)
@@ -966,18 +1000,18 @@ func TestDistributedSortMemDisk(t *testing.T) {
 			t: t,
 		}
 		df = &dsortFramework{
-			m:                 m,
-			dsorterType:       dsort.DSorterGeneralType,
-			tarballCnt:        500,
-			fileInTarballSize: cos.MiB,
-			fileInTarballCnt:  5,
+			m:             m,
+			dsorterType:   dsort.DSorterGeneralType,
+			shardCnt:      500,
+			fileSz:        cos.MiB,
+			filesPerShard: 5,
 		}
 		mem sys.MemStat
 	)
 
-	m.initWithCleanupAndSaveState()
+	m.initAndSaveState(true /*cleanup*/)
 	m.expectTargets(3)
-	tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+	tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 	df.init()
 	df.createInputShards()
@@ -991,13 +1025,13 @@ func TestDistributedSortMemDisk(t *testing.T) {
 	tassert.CheckFatal(t, err)
 	df.maxMemUsage = cos.ToSizeIEC(int64(mem.ActualUsed+500*cos.MiB), 2)
 
-	tlog.Logf("starting distributed sort with memory and disk (max mem usage: %s)... (%d/%d)\n", df.maxMemUsage,
-		df.tarballCnt, df.fileInTarballCnt)
+	tlog.Logf("starting dsort with memory and disk (max mem usage: %s)... (%d/%d)\n", df.maxMemUsage,
+		df.shardCnt, df.filesPerShard)
 	df.start()
 
 	_, err = tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 	tassert.CheckFatal(t, err)
-	tlog.Logln("finished distributed sort")
+	tlog.Logln(finishedDS)
 
 	allMetrics := df.checkMetrics(false /* expectAbort */)
 	var (
@@ -1021,26 +1055,26 @@ func TestDistributedSortMemDisk(t *testing.T) {
 
 func TestDistributedSortMemDiskTarCompression(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
-	for _, ext := range []string{archive.ExtTarTgz, archive.ExtTarLz4} {
+	for _, ext := range []string{archive.ExtTarGz, archive.ExtTarLz4} {
 		t.Run(ext, func(t *testing.T) {
 			var (
 				m = &ioContext{
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                 m,
-					dsorterType:       dsort.DSorterGeneralType,
-					tarballCnt:        400,
-					fileInTarballSize: cos.MiB,
-					fileInTarballCnt:  5,
-					extension:         ext,
+					m:             m,
+					dsorterType:   dsort.DSorterGeneralType,
+					shardCnt:      400,
+					fileSz:        cos.MiB,
+					filesPerShard: 5,
+					extension:     ext,
 				}
 				mem sys.MemStat
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
@@ -1054,13 +1088,13 @@ func TestDistributedSortMemDiskTarCompression(t *testing.T) {
 			tassert.CheckFatal(t, err)
 			df.maxMemUsage = cos.ToSizeIEC(int64(mem.ActualUsed+300*cos.MiB), 2)
 
-			tlog.Logf("starting distributed sort with memory, disk, and compression (max mem usage: %s) ... %d/%d, %s\n",
-				df.maxMemUsage, df.tarballCnt, df.fileInTarballCnt, df.extension)
+			tlog.Logf("starting dsort with memory, disk, and compression (max mem usage: %s) ... %d/%d, %s\n",
+				df.maxMemUsage, df.shardCnt, df.filesPerShard, df.extension)
 			df.start()
 
 			_, err = tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			allMetrics := df.checkMetrics(false /*expectAbort*/)
 			var (
@@ -1098,29 +1132,28 @@ func TestDistributedSortZipLz4(t *testing.T) {
 							t: t,
 						}
 						df = &dsortFramework{
-							m:                m,
-							dsorterType:      dsorterType,
-							tarballCnt:       500,
-							fileInTarballCnt: 100,
-							extension:        ext,
-							maxMemUsage:      "99%",
+							m:             m,
+							dsorterType:   dsorterType,
+							shardCnt:      500,
+							filesPerShard: 100,
+							extension:     ext,
+							maxMemUsage:   "99%",
 						}
 					)
 
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					df.init()
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort: %d/%d, %s\n",
-						df.tarballCnt, df.fileInTarballCnt, df.extension)
+					tlog.Logf("starting dsort: %d/%d, %s\n", df.shardCnt, df.filesPerShard, df.extension)
 					df.start()
 
 					_, err = tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 					tassert.CheckFatal(t, err)
-					tlog.Logln("finished distributed sort")
+					tlog.Logln(finishedDS)
 
 					df.checkMetrics(false /* expectAbort */)
 					df.checkOutputShards(5)
@@ -1132,7 +1165,7 @@ func TestDistributedSortZipLz4(t *testing.T) {
 
 func TestDistributedSortTarCompression(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
-	for _, ext := range []string{archive.ExtTarTgz, archive.ExtTarLz4} {
+	for _, ext := range []string{archive.ExtTarGz, archive.ExtTarLz4} {
 		t.Run(ext, func(t *testing.T) {
 			runDSortTest(
 				t, dsortTestSpec{p: true, types: dsorterTypes},
@@ -1143,29 +1176,28 @@ func TestDistributedSortTarCompression(t *testing.T) {
 							t: t,
 						}
 						df = &dsortFramework{
-							m:                m,
-							dsorterType:      dsorterType,
-							tarballCnt:       500,
-							fileInTarballCnt: 50,
-							extension:        ext,
-							maxMemUsage:      "99%",
+							m:             m,
+							dsorterType:   dsorterType,
+							shardCnt:      500,
+							filesPerShard: 50,
+							extension:     ext,
+							maxMemUsage:   "99%",
 						}
 					)
 
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					df.init()
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort: %d/%d, %s\n",
-						df.tarballCnt, df.fileInTarballCnt, df.extension)
+					tlog.Logf("starting dsort: %d/%d, %s\n", df.shardCnt, df.filesPerShard, df.extension)
 					df.start()
 
 					_, err = tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 					tassert.CheckFatal(t, err)
-					tlog.Logln("finished distributed sort")
+					tlog.Logln(finishedDS)
 
 					df.checkMetrics(false /* expectAbort */)
 					df.checkOutputShards(5)
@@ -1182,22 +1214,22 @@ func TestDistributedSortContent(t *testing.T) {
 		t, dsortTestSpec{p: true, types: dsorterTypes},
 		func(dsorterType string, t *testing.T) {
 			cases := []struct {
-				extension   string
-				formatType  string
-				missingKeys bool
+				extension      string
+				contentKeyType string
+				missingKeys    bool
 			}{
-				{".loss", extract.FormatTypeInt, false},
-				{".cls", extract.FormatTypeFloat, false},
-				{".smth", extract.FormatTypeString, false},
+				{".loss", extract.ContentKeyInt, false},
+				{".cls", extract.ContentKeyFloat, false},
+				{".smth", extract.ContentKeyString, false},
 
-				{".loss", extract.FormatTypeInt, true},
-				{".cls", extract.FormatTypeFloat, true},
-				{".smth", extract.FormatTypeString, true},
+				{".loss", extract.ContentKeyInt, true},
+				{".cls", extract.ContentKeyFloat, true},
+				{".smth", extract.ContentKeyString, true},
 			}
 
 			for _, entry := range cases {
 				entry := entry // pin
-				test := fmt.Sprintf("%s-%v", entry.formatType, entry.missingKeys)
+				test := fmt.Sprintf("%s-%v", entry.contentKeyType, entry.missingKeys)
 				t.Run(test, func(t *testing.T) {
 					t.Parallel()
 
@@ -1208,26 +1240,26 @@ func TestDistributedSortContent(t *testing.T) {
 						df = &dsortFramework{
 							m:           m,
 							dsorterType: dsorterType,
-							algorithm: &dsort.SortAlgorithm{
-								Kind:       dsort.SortKindContent,
-								Extension:  entry.extension,
-								FormatType: entry.formatType,
+							alg: &dsort.Algorithm{
+								Kind:           dsort.Content,
+								Ext:            entry.extension,
+								ContentKeyType: entry.contentKeyType,
 							},
-							missingKeys:      entry.missingKeys,
-							tarballCnt:       500,
-							fileInTarballCnt: 100,
-							maxMemUsage:      "90%",
+							missingKeys:   entry.missingKeys,
+							shardCnt:      500,
+							filesPerShard: 100,
+							maxMemUsage:   "90%",
 						}
 					)
 
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					df.init()
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+					tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 					df.start()
 
 					aborted, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
@@ -1240,7 +1272,8 @@ func TestDistributedSortContent(t *testing.T) {
 					allMetrics, err := api.MetricsDSort(df.baseParams, df.managerUUID)
 					tassert.CheckFatal(t, err)
 					if len(allMetrics) != m.originalTargetCount {
-						t.Errorf("number of metrics %d is not same as number of targets %d", len(allMetrics), m.originalTargetCount)
+						t.Errorf("number of metrics %d is not same as the number of targets %d",
+							len(allMetrics), m.originalTargetCount)
 					}
 
 					for target, metrics := range allMetrics {
@@ -1268,28 +1301,28 @@ func TestDistributedSortAbort(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 10,
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 10,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
-			tlog.Logln("aborting distributed sort...")
+			tlog.Logf("aborting dsort[%s]\n", df.managerUUID)
 			err = api.AbortDSort(df.baseParams, df.managerUUID)
 			tassert.CheckFatal(t, err)
 
-			tlog.Logln("waiting for distributed sort to finish up...")
+			tlog.Logln("waiting for dsort to finish")
 			_, err = tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
 
@@ -1309,31 +1342,30 @@ func TestDistributedSortAbortDuringPhases(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 200,
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 200,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort (abort on: %s)...\n", phase)
+			tlog.Logf("starting dsort (abort on: %s)...\n", phase)
 			df.start()
 
 			waitForDSortPhase(t, m.proxyURL, df.managerUUID, phase, func() {
-				tlog.Logln("aborting distributed sort...")
+				tlog.Logf("aborting dsort[%s]\n", df.managerUUID)
 				err := api.AbortDSort(df.baseParams, df.managerUUID)
 				tassert.CheckFatal(t, err)
 			})
 
-			tlog.Logln("waiting for distributed sort to finish up...")
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
 
@@ -1353,25 +1385,25 @@ func TestDistributedSortKillTargetDuringPhases(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					outputTempl:      "output-{0..100000}",
-					tarballCnt:       1000,
-					fileInTarballCnt: 500,
+					m:             m,
+					dsorterType:   dsorterType,
+					outputTempl:   "output-{0..100000}",
+					shardCnt:      1000,
+					filesPerShard: 500,
 				}
 				target *meta.Snode
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
 			df.init()
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort (abort on: %s)...\n", phase)
+			tlog.Logf("starting dsort (abort on: %s)...\n", phase)
 			df.start()
 
 			waitForDSortPhase(t, m.proxyURL, df.managerUUID, phase, func() {
@@ -1380,7 +1412,6 @@ func TestDistributedSortKillTargetDuringPhases(t *testing.T) {
 				target = m.startMaintenanceNoRebalance()
 			})
 
-			tlog.Logln("waiting for distributed sort to finish up...")
 			aborted, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckError(t, err)
 			if !aborted {
@@ -1391,7 +1422,8 @@ func TestDistributedSortKillTargetDuringPhases(t *testing.T) {
 			allMetrics, err := api.MetricsDSort(df.baseParams, df.managerUUID)
 			tassert.CheckError(t, err)
 			if len(allMetrics) == m.originalTargetCount {
-				t.Errorf("number of metrics %d is same as number of original targets %d", len(allMetrics), m.originalTargetCount)
+				t.Errorf("number of metrics %d is same as number of original targets %d",
+					len(allMetrics), m.originalTargetCount)
 			}
 
 			for target, metrics := range allMetrics {
@@ -1401,7 +1433,7 @@ func TestDistributedSortKillTargetDuringPhases(t *testing.T) {
 			}
 
 			rebID := m.stopMaintenance(target)
-			tools.WaitForRebalanceByID(t, -1 /*orig target cnt*/, df.baseParams, rebID)
+			tools.WaitForRebalanceByID(t, df.baseParams, rebID)
 		},
 	)
 }
@@ -1419,17 +1451,17 @@ func TestDistributedSortManipulateMountpathDuringPhases(t *testing.T) {
 							t: t,
 						}
 						df = &dsortFramework{
-							m:                m,
-							dsorterType:      dsorterType,
-							outputTempl:      "output-{0..100000}",
-							tarballCnt:       500,
-							fileInTarballCnt: 200,
+							m:             m,
+							dsorterType:   dsorterType,
+							outputTempl:   "output-{0..100000}",
+							shardCnt:      500,
+							filesPerShard: 200,
 						}
 
 						mountpaths = make(map[*meta.Snode]string)
 					)
 
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
 
 					// Initialize `df.baseParams`
@@ -1476,11 +1508,11 @@ func TestDistributedSortManipulateMountpathDuringPhases(t *testing.T) {
 						tools.WaitForResilvering(t, df.baseParams, nil)
 					})
 
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort (abort on: %s)...\n", phase)
+					tlog.Logf("starting dsort (abort on: %s)...\n", phase)
 					df.start()
 
 					waitForDSortPhase(t, m.proxyURL, df.managerUUID, phase, func() {
@@ -1491,13 +1523,13 @@ func TestDistributedSortManipulateMountpathDuringPhases(t *testing.T) {
 								tassert.CheckFatal(t, err)
 							} else {
 								tlog.Logf("removing mountpath %q from %s...\n", mpath, target.ID())
-								err := api.DetachMountpath(df.baseParams, target, mpath, false /*dont-resil*/)
+								err := api.DetachMountpath(df.baseParams, target,
+									mpath, false /*dont-resil*/)
 								tassert.CheckFatal(t, err)
 							}
 						}
 					})
 
-					tlog.Logln("waiting for distributed sort to finish up...")
 					_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 					tassert.CheckError(t, err)
 
@@ -1519,26 +1551,26 @@ func TestDistributedSortAddTarget(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					outputTempl:      "output-{0..100000}",
-					tarballCnt:       1000,
-					fileInTarballCnt: 200,
+					m:             m,
+					dsorterType:   dsorterType,
+					outputTempl:   "output-{0..100000}",
+					shardCnt:      1000,
+					filesPerShard: 200,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
 			df.init()
 
 			target := m.startMaintenanceNoRebalance()
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			defer tools.WaitForRebalAndResil(t, df.baseParams)
@@ -1547,7 +1579,6 @@ func TestDistributedSortAddTarget(t *testing.T) {
 				m.stopMaintenance(target)
 			})
 
-			tlog.Logln("waiting for distributed sort to finish up...")
 			aborted, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
 			if !aborted {
@@ -1573,28 +1604,28 @@ func TestDistributedSortMetricsAfterFinish(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					outputTempl:      "output-{0..1000}",
-					tarballCnt:       50,
-					fileInTarballCnt: 10,
+					m:             m,
+					dsorterType:   dsorterType,
+					outputTempl:   "output-{0..1000}",
+					shardCnt:      50,
+					filesPerShard: 10,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 			df.checkOutputShards(0)
@@ -1617,27 +1648,27 @@ func TestDistributedSortSelfAbort(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					missingShards:    cmn.AbortReaction,
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 100,
+					missingShards: cmn.AbortReaction,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			// Wait a while for all targets to abort
 			time.Sleep(2 * time.Second)
@@ -1658,11 +1689,11 @@ func TestDistributedSortOnOOM(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                 m,
-					dsorterType:       dsorterType,
-					fileInTarballCnt:  200,
-					fileInTarballSize: 10 * cos.MiB,
-					maxMemUsage:       "80%",
+					m:             m,
+					dsorterType:   dsorterType,
+					filesPerShard: 200,
+					fileSz:        10 * cos.MiB,
+					maxMemUsage:   "80%",
 				}
 				mem sys.MemStat
 			)
@@ -1673,22 +1704,22 @@ func TestDistributedSortOnOOM(t *testing.T) {
 			// Calculate number of shards to cause OOM and overestimate it to make sure
 			// that if dSort doesn't prevent it, it will happen. Notice that maxMemUsage
 			// is 80% so dSort should never go above this number in memory usage.
-			df.tarballCnt = int(float64(mem.ActualFree/uint64(df.fileInTarballSize)/uint64(df.fileInTarballCnt)) * 1.4)
+			df.shardCnt = int(float64(mem.ActualFree/uint64(df.fileSz)/uint64(df.filesPerShard)) * 1.4)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logf("starting distributed sort: %d/%d\n", df.tarballCnt, df.fileInTarballCnt)
+			tlog.Logf("starting dsort: %d/%d\n", df.shardCnt, df.filesPerShard)
 			df.start()
 
 			_, err = tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 			df.checkOutputShards(5)
@@ -1717,24 +1748,25 @@ func TestDistributedSortMissingShards(t *testing.T) {
 							t: t,
 						}
 						df = &dsortFramework{
-							m:                m,
-							dsorterType:      dsorterType,
-							outputTempl:      "output-{0..100000}",
-							tarballCnt:       500,
-							tarballCntToSkip: 50,
-							fileInTarballCnt: 200,
-							extension:        ext,
+							m:              m,
+							dsorterType:    dsorterType,
+							outputTempl:    "output-{0..100000}",
+							shardCnt:       500,
+							shardCntToSkip: 50,
+							filesPerShard:  200,
+							extension:      ext,
 						}
 					)
 
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
 
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					switch scope {
 					case scopeConfig:
-						defer tools.SetClusterConfig(t, cos.StrKVs{"distributed_sort.missing_shards": cmn.IgnoreReaction})
+						defer tools.SetClusterConfig(t,
+							cos.StrKVs{"distributed_sort.missing_shards": cmn.IgnoreReaction})
 						tools.SetClusterConfig(t, cos.StrKVs{"distributed_sort.missing_shards": reaction})
 
 						tlog.Logf("changed `missing_shards` config to: %s\n", reaction)
@@ -1748,15 +1780,14 @@ func TestDistributedSortMissingShards(t *testing.T) {
 					df.init()
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort: %d/%d, %s\n",
-						df.tarballCnt, df.fileInTarballCnt, df.extension)
+					tlog.Logf("starting dsort: %d/%d, %s\n", df.shardCnt, df.filesPerShard, df.extension)
 					df.start()
 
 					_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 					tassert.CheckFatal(t, err)
-					tlog.Logln("finished distributed sort")
+					tlog.Logln(finishedDS)
 
-					df.checkReactionResult(reaction, df.tarballCntToSkip)
+					df.checkReactionResult(reaction, df.shardCntToSkip)
 				},
 			)
 		})
@@ -1765,7 +1796,7 @@ func TestDistributedSortMissingShards(t *testing.T) {
 
 func TestDistributedSortDuplications(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
-	for _, ext := range []string{archive.ExtTar} { // TODO: currently, fails archive.ExtTarLz4 and archive.ExtTarTgz, both
+	for _, ext := range []string{archive.ExtTar} { // TODO: currently, fails archive.ExtTarLz4 and archive.ExtTarGz, both
 		t.Run(ext, func(t *testing.T) {
 			runDSortTest(
 				t, dsortTestSpec{
@@ -1786,15 +1817,15 @@ func TestDistributedSortDuplications(t *testing.T) {
 							m:                     m,
 							dsorterType:           dsorterType,
 							outputTempl:           "output-{0..100000}",
-							tarballCnt:            500,
-							fileInTarballCnt:      200,
+							shardCnt:              500,
+							filesPerShard:         200,
 							recordDuplicationsCnt: 50,
 							extension:             ext,
 						}
 					)
-					m.initWithCleanupAndSaveState()
+					m.initAndSaveState(true /*cleanup*/)
 					m.expectTargets(3)
-					tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+					tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 					switch scope {
 					case scopeConfig:
@@ -1813,13 +1844,12 @@ func TestDistributedSortDuplications(t *testing.T) {
 					df.init()
 					df.createInputShards()
 
-					tlog.Logf("starting distributed sort: %d/%d, %s\n",
-						df.tarballCnt, df.fileInTarballCnt, df.extension)
+					tlog.Logf("starting dsort: %d/%d, %s\n", df.shardCnt, df.filesPerShard, df.extension)
 					df.start()
 
 					_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 					tassert.CheckFatal(t, err)
-					tlog.Logln("finished distributed sort")
+					tlog.Logln(finishedDS)
 
 					df.checkReactionResult(reaction, df.recordDuplicationsCnt)
 				},
@@ -1844,8 +1874,8 @@ func TestDistributedSortOrderFile(t *testing.T) {
 						Name:     trand.String(15),
 						Provider: apc.AIS,
 					},
-					tarballCnt:       100,
-					fileInTarballCnt: 10,
+					shardCnt:      100,
+					filesPerShard: 10,
 				}
 
 				orderFileName = "orderFileName"
@@ -1859,7 +1889,7 @@ func TestDistributedSortOrderFile(t *testing.T) {
 				baseParams = tools.BaseAPIParams(proxyURL)
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
 			// Set URL for order file (points to the object in cluster).
@@ -1871,10 +1901,10 @@ func TestDistributedSortOrderFile(t *testing.T) {
 
 			df.init()
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			// Create local output bucket
-			tools.CreateBucketWithCleanup(t, m.proxyURL, df.outputBck, nil)
+			tools.CreateBucket(t, m.proxyURL, df.outputBck, nil, true /*cleanup*/)
 
 			df.createInputShards()
 
@@ -1899,14 +1929,14 @@ func TestDistributedSortOrderFile(t *testing.T) {
 			_, err = api.PutObject(args)
 			tassert.CheckFatal(t, err)
 
-			tlog.Logln("starting distributed sort...")
-			rs := df.gen()
-			managerUUID, err := api.StartDSort(baseParams, rs)
+			tlog.Logln(startingDS)
+			spec := df.gen()
+			managerUUID, err := api.StartDSort(baseParams, &spec)
 			tassert.CheckFatal(t, err)
 
 			_, err = tools.WaitForDSortToFinish(m.proxyURL, managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			allMetrics, err := api.MetricsDSort(baseParams, managerUUID)
 			tassert.CheckFatal(t, err)
@@ -1924,7 +1954,8 @@ func TestDistributedSortOrderFile(t *testing.T) {
 						match = match || fmt.Sprintf(ekm[recordName], i) == shard.name
 					}
 					if !match {
-						t.Errorf("record %q was not part of any shard with format %q but was in shard %q", recordName, ekm[recordName], shard.name)
+						t.Errorf("record %q was not part of any shard with format %q but was in shard %q",
+							recordName, ekm[recordName], shard.name)
 					}
 				}
 			}
@@ -1948,8 +1979,8 @@ func TestDistributedSortOrderJSONFile(t *testing.T) {
 						Name:     trand.String(15),
 						Provider: apc.AIS,
 					},
-					tarballCnt:       100,
-					fileInTarballCnt: 10,
+					shardCnt:      100,
+					filesPerShard: 10,
 				}
 
 				orderFileName = "order_file_name.json"
@@ -1963,7 +1994,7 @@ func TestDistributedSortOrderJSONFile(t *testing.T) {
 				baseParams = tools.BaseAPIParams(proxyURL)
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
 			// Set URL for order file (points to the object in cluster).
@@ -1975,10 +2006,10 @@ func TestDistributedSortOrderJSONFile(t *testing.T) {
 
 			df.init()
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			// Create local output bucket
-			tools.CreateBucketWithCleanup(t, m.proxyURL, df.outputBck, nil)
+			tools.CreateBucket(t, m.proxyURL, df.outputBck, nil, true /*cleanup*/)
 
 			df.createInputShards()
 
@@ -2006,19 +2037,20 @@ func TestDistributedSortOrderJSONFile(t *testing.T) {
 			_, err = api.PutObject(args)
 			tassert.CheckFatal(t, err)
 
-			tlog.Logln("starting distributed sort...")
-			rs := df.gen()
-			managerUUID, err := api.StartDSort(baseParams, rs)
+			tlog.Logln(startingDS)
+			spec := df.gen()
+			managerUUID, err := api.StartDSort(baseParams, &spec)
 			tassert.CheckFatal(t, err)
 
 			_, err = tools.WaitForDSortToFinish(m.proxyURL, managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			allMetrics, err := api.MetricsDSort(baseParams, managerUUID)
 			tassert.CheckFatal(t, err)
 			if len(allMetrics) != m.originalTargetCount {
-				t.Errorf("number of metrics %d is not same as number of targets %d", len(allMetrics), m.originalTargetCount)
+				t.Errorf("number of metrics %d is not same as number of targets %d",
+					len(allMetrics), m.originalTargetCount)
 			}
 
 			tlog.Logln("checking if all records are in specified shards...")
@@ -2031,7 +2063,8 @@ func TestDistributedSortOrderJSONFile(t *testing.T) {
 						match = match || fmt.Sprintf(ekm[recordName], i) == shard.name
 					}
 					if !match {
-						t.Errorf("record %q was not part of any shard with format %q but was in shard %q", recordName, ekm[recordName], shard.name)
+						t.Errorf("record %q was not part of any shard with format %q but was in shard %q",
+							recordName, ekm[recordName], shard.name)
 					}
 				}
 			}
@@ -2050,28 +2083,28 @@ func TestDistributedSortDryRun(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					dryRun:           true,
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 100,
+					dryRun:        true,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logln("starting distributed sort...")
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 		},
@@ -2089,28 +2122,28 @@ func TestDistributedSortDryRunDisk(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					dryRun:           true,
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 100,
+					dryRun:        true,
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logln("starting distributed sort...")
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 		},
@@ -2121,38 +2154,38 @@ func TestDistributedSortLongerExt(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 
 	runDSortTest(
-		t, dsortTestSpec{p: true, types: dsorterTypes, algorithms: dsortAlgorithms},
-		func(dsorterType, algorithm string, t *testing.T) {
+		t, dsortTestSpec{p: true, types: dsorterTypes, algs: dsortAlgorithms},
+		func(dsorterType, alg string, t *testing.T) {
 			var (
 				m = &ioContext{
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					outputTempl:      "output-%05d",
-					tarballCnt:       200,
-					fileInTarballCnt: 10,
-					maxMemUsage:      "99%",
-					algorithm:        &dsort.SortAlgorithm{Kind: algorithm},
-					recordExts:       []string{".txt", ".json.info", ".info", ".json"},
+					m:             m,
+					dsorterType:   dsorterType,
+					outputTempl:   "output-%05d",
+					shardCnt:      200,
+					filesPerShard: 10,
+					maxMemUsage:   "99%",
+					alg:           &dsort.Algorithm{Kind: alg},
+					recordExts:    []string{".txt", ".json.info", ".info", ".json"},
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logln("starting distributed sort...")
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /*expectAbort*/)
 			df.checkOutputShards(5)
@@ -2171,30 +2204,30 @@ func TestDistributedSortAutomaticallyCalculateOutputShards(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       200,
-					fileInTarballCnt: 10,
-					maxMemUsage:      "99%",
-					outputShardSize:  "-1",
-					outputTempl:      "output-{0..10}",
+					m:               m,
+					dsorterType:     dsorterType,
+					shardCnt:        200,
+					filesPerShard:   10,
+					maxMemUsage:     "99%",
+					outputShardSize: "-1",
+					outputTempl:     "output-{0..10}",
 				}
 			)
 
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logln("starting distributed sort...")
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /*expectAbort*/)
 			df.checkOutputShards(0)
@@ -2215,32 +2248,32 @@ func TestDistributedSortWithTarFormats(t *testing.T) {
 					t: t,
 				}
 				df = &dsortFramework{
-					m:                m,
-					dsorterType:      dsorterType,
-					tarballCnt:       500,
-					fileInTarballCnt: 100,
-					maxMemUsage:      "1B",
-					tarFormat:        tarFormat,
-					recordExts:       []string{".txt"},
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      500,
+					filesPerShard: 100,
+					maxMemUsage:   "1B",
+					tarFormat:     tarFormat,
+					recordExts:    []string{".txt"},
 				}
 			)
 
 			// Initialize ioContext
-			m.initWithCleanupAndSaveState()
+			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(1)
 
 			// Create ais bucket
-			tools.CreateBucketWithCleanup(t, m.proxyURL, m.bck, nil)
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 			df.init()
 			df.createInputShards()
 
-			tlog.Logln("starting distributed sort...")
+			tlog.Logln(startingDS)
 			df.start()
 
 			_, err := tools.WaitForDSortToFinish(m.proxyURL, df.managerUUID)
 			tassert.CheckFatal(t, err)
-			tlog.Logln("finished distributed sort")
+			tlog.Logln(finishedDS)
 
 			df.checkMetrics(false /* expectAbort */)
 			df.checkOutputShards(5)

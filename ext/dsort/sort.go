@@ -14,45 +14,31 @@ import (
 	"github.com/NVIDIA/aistore/ext/dsort/extract"
 )
 
-const (
-	sortKindEmpty        = ""             // default one - alphanumeric (sort decreasing)
-	SortKindAlphanumeric = "alphanumeric" // sort the records (decreasing or increasing)
-	SortKindNone         = "none"         // none, used for resharding
-	SortKindMD5          = "md5"
-	SortKindShuffle      = "shuffle" // shuffle randomly, can be used with seed to get reproducible results
-	SortKindContent      = "content" // sort by content of given file
-)
-
-const (
-	fmtInvalidAlgorithmKind = "invalid algorithm kind, expecting one of: %+v" // <--- supportedAlgorithms
-)
-
-var supportedAlgorithms = []string{sortKindEmpty, SortKindAlphanumeric, SortKindMD5, SortKindShuffle, SortKindContent, SortKindNone}
-
 type (
 	alphaByKey struct {
-		*extract.Records
-		decreasing bool
-		formatType string
 		err        error
+		records    *extract.Records
+		keyType    string
+		decreasing bool
 	}
 )
 
 // interface guard
 var _ sort.Interface = (*alphaByKey)(nil)
 
+func (s *alphaByKey) Len() int      { return s.records.Len() }
+func (s *alphaByKey) Swap(i, j int) { s.records.Swap(i, j) }
+
 func (s *alphaByKey) Less(i, j int) bool {
 	var (
-		less bool
 		err  error
+		less bool
 	)
-
 	if s.decreasing {
-		less, err = s.Records.Less(j, i, s.formatType)
+		less, err = s.records.Less(j, i, s.keyType)
 	} else {
-		less, err = s.Records.Less(i, j, s.formatType)
+		less, err = s.records.Less(i, j, s.keyType)
 	}
-
 	if err != nil {
 		s.err = err
 	}
@@ -60,28 +46,27 @@ func (s *alphaByKey) Less(i, j int) bool {
 }
 
 // sortRecords sorts records by each Record.Key in the order determined by sort algorithm.
-func sortRecords(r *extract.Records, algo *SortAlgorithm) (err error) {
-	var rnd *rand.Rand
-	if algo.Kind == SortKindNone {
+func sortRecords(r *extract.Records, alg *Algorithm) (err error) {
+	if alg.Kind == None {
 		return nil
-	} else if algo.Kind == SortKindShuffle {
-		seed := time.Now().Unix()
-		if algo.Seed != "" {
-			seed, err = strconv.ParseInt(algo.Seed, 10, 64)
-			// We assert error since we know that the seed should be validated
-			// during request spec validation.
+	}
+	if alg.Kind == Shuffle {
+		var (
+			rnd  *rand.Rand
+			seed = time.Now().Unix()
+		)
+		if alg.Seed != "" {
+			seed, err = strconv.ParseInt(alg.Seed, 10, 64)
 			debug.AssertNoErr(err)
 		}
-
 		rnd = rand.New(rand.NewSource(seed))
 		for i := 0; i < r.Len(); i++ { // https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle
 			j := rnd.Intn(i + 1)
 			r.Swap(i, j)
 		}
 	} else {
-		keys := &alphaByKey{r, algo.Decreasing, algo.FormatType, nil}
+		keys := &alphaByKey{records: r, decreasing: alg.Decreasing, keyType: alg.ContentKeyType, err: nil}
 		sort.Sort(keys)
-
 		if keys.err != nil {
 			return keys.err
 		}

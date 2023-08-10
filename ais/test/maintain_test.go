@@ -73,8 +73,8 @@ func TestMaintenanceListObjects(t *testing.T) {
 		origEntries = make(map[string]*cmn.LsoEntry, 1500)
 	)
 
-	m.initWithCleanupAndSaveState()
-	tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+	m.initAndSaveState(true /*cleanup*/)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 	m.puts()
 	// 1. Perform list-object and populate entries map
@@ -100,7 +100,7 @@ func TestMaintenanceListObjects(t *testing.T) {
 		tassert.CheckFatal(t, err)
 		_, err = tools.WaitForClusterState(proxyURL, "target is back",
 			m.smap.Version, m.smap.CountActivePs(), m.smap.CountTargets())
-		args := xact.ArgsMsg{ID: rebID, Timeout: rebalanceTimeout}
+		args := xact.ArgsMsg{ID: rebID, Timeout: tools.RebalanceTimeout}
 		_, err = api.WaitForXactionIC(baseParams, args)
 		tassert.CheckFatal(t, err)
 	}()
@@ -110,7 +110,7 @@ func TestMaintenanceListObjects(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	// Wait for reb to complete
-	args := xact.ArgsMsg{ID: rebID, Timeout: rebalanceTimeout}
+	args := xact.ArgsMsg{ID: rebID, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, args)
 	tassert.CheckFatal(t, err)
 
@@ -147,7 +147,7 @@ func TestMaintenanceMD(t *testing.T) {
 	tlog.Logf("targets: %d, proxies: %d\n", smap.CountActiveTs(), smap.CountActivePs())
 
 	t.Cleanup(func() {
-		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: rebalanceTimeout}
+		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		api.WaitForXactionIC(baseParams, args)
 	})
 
@@ -189,15 +189,14 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		objPath    = "ic-decomm/"
 		fileSize   = cos.KiB
 
-		dcmTarget, _          = smap.GetRandTarget()
-		origTargetCount       = smap.CountTargets()
-		origActiveTargetCount = smap.CountActiveTs()
-		origActiveProxyCount  = smap.CountActivePs()
-		bck                   = cmn.Bck{Name: t.Name(), Provider: apc.AIS}
+		dcmTarget, _         = smap.GetRandTarget()
+		origTargetCount      = smap.CountTargets()
+		origActiveProxyCount = smap.CountActivePs()
+		bck                  = cmn.Bck{Name: t.Name(), Provider: apc.AIS}
 	)
 	tlog.Logf("targets: %d, proxies: %d\n", smap.CountActiveTs(), smap.CountActivePs())
 
-	tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	for i := 0; i < objCount; i++ {
 		objName := fmt.Sprintf("%sobj%04d", objPath, i)
 		r, _ := readers.NewRandReader(int64(fileSize), cos.ChecksumXXHash)
@@ -220,7 +219,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		smap.Version, origActiveProxyCount, origTargetCount-1, dcmTarget.ID())
 	tassert.CheckFatal(t, err)
 
-	tools.WaitForRebalanceByID(t, origActiveTargetCount, baseParams, rebID, rebalanceTimeout)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 	msgList := &apc.LsoMsg{Prefix: objPath}
 	lst, err := api.ListObjects(baseParams, bck, msgList, api.ListArgs{})
 	tassert.CheckError(t, err)
@@ -254,9 +253,9 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		val := &apc.ActValRmNode{DaemonID: dcm.ID()}
 		rebID, err = api.StopMaintenance(baseParams, val)
 		tassert.CheckError(t, err)
-		tools.WaitForRebalanceByID(t, origActiveTargetCount, baseParams, rebID, rebalanceTimeout)
+		tools.WaitForRebalanceByID(t, baseParams, rebID)
 	} else {
-		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: rebalanceTimeout}
+		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		_, err = api.WaitForXactionIC(baseParams, args)
 		tassert.CheckError(t, err)
 	}
@@ -298,13 +297,13 @@ func TestMaintenanceRebalance(t *testing.T) {
 		baseParams = tools.BaseAPIParams(proxyURL)
 	)
 
-	m.initWithCleanupAndSaveState()
-	tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+	m.initAndSaveState(true /*cleanup*/)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	origProxyCnt, origTargetCount := m.smap.CountActivePs(), m.smap.CountActiveTs()
 
 	m.puts()
 	tsi, _ := m.smap.GetRandTarget()
-	tlog.Logf("Removing target %s\n", tsi)
+	tlog.Logf("Removing %s\n", tsi.StringEx())
 	restored := false
 	actVal.DaemonID = tsi.ID()
 	rebID, err := api.StartMaintenance(baseParams, actVal)
@@ -315,16 +314,15 @@ func TestMaintenanceRebalance(t *testing.T) {
 			tassert.CheckError(t, err)
 			_, err = tools.WaitForClusterState(
 				proxyURL,
-				"target joined the cluster",
+				"target joined",
 				m.smap.Version, origProxyCnt, origTargetCount,
 			)
 			tassert.CheckFatal(t, err)
-			tools.WaitForRebalanceByID(t, m.originalTargetCount, baseParams, rebID, time.Minute)
+			tools.WaitForRebalanceByID(t, baseParams, rebID)
 		}
 		tools.ClearMaintenance(baseParams, tsi)
 	}()
-	tlog.Logf("Wait for rebalance %s\n", rebID)
-	tools.WaitForRebalanceByID(t, m.originalTargetCount, baseParams, rebID, time.Minute)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 
 	smap, err := tools.WaitForClusterState(
 		proxyURL,
@@ -342,13 +340,13 @@ func TestMaintenanceRebalance(t *testing.T) {
 	restored = true
 	smap, err = tools.WaitForClusterState(
 		proxyURL,
-		"target joined the cluster",
+		"target joined",
 		m.smap.Version, origProxyCnt, origTargetCount,
 	)
 	tassert.CheckFatal(t, err)
 	m.smap = smap
 
-	tools.WaitForRebalanceByID(t, m.originalTargetCount, baseParams, rebID, time.Minute)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 }
 
 func TestMaintenanceGetWhileRebalance(t *testing.T) {
@@ -369,8 +367,8 @@ func TestMaintenanceGetWhileRebalance(t *testing.T) {
 		baseParams = tools.BaseAPIParams(proxyURL)
 	)
 
-	m.initWithCleanupAndSaveState()
-	tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+	m.initAndSaveState(true /*cleanup*/)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	origProxyCnt, origTargetCount := m.smap.CountActivePs(), m.smap.CountActiveTs()
 
 	m.puts()
@@ -378,7 +376,7 @@ func TestMaintenanceGetWhileRebalance(t *testing.T) {
 	stopped := false
 
 	tsi, _ := m.smap.GetRandTarget()
-	tlog.Logf("Removing target %s\n", tsi)
+	tlog.Logf("Removing %s\n", tsi.StringEx())
 	restored := false
 	actVal.DaemonID = tsi.ID()
 	rebID, err := api.StartMaintenance(baseParams, actVal)
@@ -392,16 +390,15 @@ func TestMaintenanceGetWhileRebalance(t *testing.T) {
 			tassert.CheckFatal(t, err)
 			_, err = tools.WaitForClusterState(
 				proxyURL,
-				"target joined the cluster",
+				"target joined",
 				m.smap.Version, origProxyCnt, origTargetCount,
 			)
 			tassert.CheckFatal(t, err)
-			tools.WaitForRebalanceByID(t, m.originalTargetCount, baseParams, rebID, time.Minute)
+			tools.WaitForRebalanceByID(t, baseParams, rebID)
 		}
 		tools.ClearMaintenance(baseParams, tsi)
 	}()
-	tlog.Logf("Wait for rebalance %s\n", rebID)
-	tools.WaitForRebalanceByID(t, m.originalTargetCount, baseParams, rebID, time.Minute)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 
 	smap, err := tools.WaitForClusterState(
 		proxyURL,
@@ -420,12 +417,12 @@ func TestMaintenanceGetWhileRebalance(t *testing.T) {
 	restored = true
 	smap, err = tools.WaitForClusterState(
 		proxyURL,
-		"target joined the cluster",
+		"target joined",
 		m.smap.Version, origProxyCnt, origTargetCount,
 	)
 	tassert.CheckFatal(t, err)
 	m.smap = smap
-	tools.WaitForRebalanceByID(t, m.originalTargetCount, baseParams, rebID, time.Minute)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 }
 
 func TestNodeShutdown(t *testing.T) {
@@ -463,7 +460,7 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 				t.Name(), minNumNodes, cos.Plural(minNumNodes), origTargetCount)
 		}
 		bck := cmn.Bck{Name: "shutdown-node" + cos.GenTie(), Provider: apc.AIS}
-		tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+		tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 		node, err = smap.GetRandTarget()
 		tdc = 1
@@ -475,7 +472,7 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 	tassert.CheckFatal(t, err)
 	if nodeType == apc.Target && origTargetCount > 1 {
 		time.Sleep(time.Second)
-		xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: rebalanceTimeout}
+		xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		for i := 0; i < 3; i++ {
 			status, err := api.WaitForXactionIC(baseParams, xargs)
 			if err == nil {
@@ -538,9 +535,9 @@ func TestShutdownListObjects(t *testing.T) {
 		origEntries = make(map[string]*cmn.LsoEntry, m.num)
 	)
 
-	m.initWithCleanupAndSaveState()
+	m.initAndSaveState(true /*cleanup*/)
 	origTargetCount := m.smap.CountActiveTs()
-	tools.CreateBucketWithCleanup(t, proxyURL, bck, nil)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	m.puts()
 
 	// 1. Perform list-object and populate entries map.
@@ -581,7 +578,7 @@ func TestShutdownListObjects(t *testing.T) {
 
 	if origTargetCount > 1 {
 		time.Sleep(time.Second)
-		xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: rebalanceTimeout}
+		xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		for i := 0; i < 3; i++ {
 			status, err := api.WaitForXactionIC(baseParams, xargs)
 			if err == nil {

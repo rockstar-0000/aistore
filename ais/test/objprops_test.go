@@ -133,7 +133,7 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 	if err != nil {
 		t.Errorf("Failed to evict objects: %v\n", err)
 	}
-	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: rebalanceTimeout}
+	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, args)
 	tassert.CheckFatal(t, err)
 
@@ -252,7 +252,7 @@ func propsRebalance(t *testing.T, proxyURL string, bck cmn.Bck, objects map[stri
 		smap.CountActiveTs()+1,
 	)
 	tassert.CheckFatal(t, err)
-	tools.WaitForRebalanceByID(t, origActiveTargetCnt, baseParams, rebID, rebalanceTimeout)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 
 	tlog.Logf("Listing objects...\n")
 	reslist := testListObjects(t, proxyURL, bck, msg)
@@ -364,7 +364,7 @@ func propsVersion(t *testing.T, bck cmn.Bck, versionEnabled bool, cksumType stri
 		proxyURL = tools.RandomProxyURL()
 	)
 
-	m.initWithCleanup()
+	m.init(true /*cleanup*/)
 	if m.bck.IsRemote() {
 		m.del(-1 /* delete all */)
 	}
@@ -474,18 +474,18 @@ func TestObjProps(t *testing.T) {
 				prefix:    "props/obj-",
 			}
 
-			m.initWithCleanup()
+			m.init(true /*cleanup*/)
 
 			switch test.bucketType {
 			case typeCloud:
 				m.bck = cliBck
 				tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
 			case typeLocal:
-				tools.CreateBucketWithCleanup(t, proxyURL, m.bck, nil)
+				tools.CreateBucket(t, proxyURL, m.bck, nil, true /*cleanup*/)
 			case typeRemoteAIS:
 				tools.CheckSkip(t, tools.SkipTestArgs{RequiresRemoteCluster: true})
 				m.bck.Ns.UUID = tools.RemoteCluster.UUID
-				tools.CreateBucketWithCleanup(t, proxyURL, m.bck, nil)
+				tools.CreateBucket(t, proxyURL, m.bck, nil, true /*cleanup*/)
 			default:
 				tassert.CheckFatal(t, fmt.Errorf("unknown type %q", test.bucketType))
 			}

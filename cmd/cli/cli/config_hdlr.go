@@ -55,9 +55,9 @@ For more usage examples, see ` + cmn.GitHubHome + `/blob/master/docs/cli/config.
 
 const examplesNodeSetCfg = `
 Usage examples:
-- ais config node [NODE] inherited log.level=4
-- ais config node [NODE] inherited log
-- ais config node [NODE] inherited disk.disk_util_high_wm=93
+- ais config node [NODE_ID] inherited log.level=4
+- ais config node [NODE_ID] inherited log
+- ais config node [NODE_ID] inherited disk.disk_util_high_wm=93
 For more usage examples, see ` + cmn.GitHubHome + `/blob/master/docs/cli/config.md
 `
 
@@ -429,11 +429,11 @@ func showCfgCLI(c *cli.Context) (err error) {
 		return
 	}
 
-	flat := flattenConfig(cfg, c.Args().Get(0))
+	flat := flattenJSON(cfg, c.Args().Get(0))
 	sort.Slice(flat, func(i, j int) bool {
 		return flat[i].Name < flat[j].Name
 	})
-	return teb.Print(flat, teb.ConfigTmpl)
+	return teb.Print(flat, teb.FlatTmpl)
 }
 
 func setCfgCLI(c *cli.Context) (err error) {
@@ -449,14 +449,14 @@ func setCfgCLI(c *cli.Context) (err error) {
 		return err
 	}
 
-	flatOld := flattenConfig(cfg, "")
+	flatOld := flattenJSON(cfg, "")
 	for k, v := range nvs {
 		if err := cmn.UpdateFieldValue(cfg, k, v); err != nil {
 			return err
 		}
 	}
 
-	flatNew := flattenConfig(cfg, "")
+	flatNew := flattenJSON(cfg, "")
 	diff := diffConfigs(flatNew, flatOld)
 	for _, val := range diff {
 		if val.Old == "-" {

@@ -50,7 +50,7 @@ const (
 	smapHdr = "NODE\t TYPE\t PUBLIC URL" +
 		"{{ if (eq $.ExtendedURLs true) }}\t INTRA CONTROL URL\t INTRA DATA URL{{end}}" +
 		"\n"
-	smapBody = "{{FormatDaemonID $value.ID $.Smap}}\t {{$value.DaeType}}\t {{$value.PubNet.URL}}" +
+	smapBody = "{{FormatDaemonID $value.ID $.Smap \"\"}}\t {{$value.DaeType}}\t {{$value.PubNet.URL}}" +
 		"{{ if (eq $.ExtendedURLs true) }}\t {{$value.ControlNet.URL}}\t {{$value.DataNet.URL}}{{end}}" +
 		"\n"
 
@@ -79,11 +79,12 @@ const (
 		indent1 + "Version:\t{{ ( Versions .Status) }}\n" +
 		indent1 + "Build:\t{{ ( BuildTimes .Status) }}\n"
 
-	// Config
-	ConfigTmpl = "PROPERTY\t VALUE\n{{range $item := .}}" +
+	// any JSON struct (e.g. config)
+	FlatTmpl = "PROPERTY\t VALUE\n{{range $item := .}}" +
 		"{{ $item.Name }}\t {{ $item.Value }}\n" +
 		"{{end}}\n"
 
+	// Config
 	DaemonConfigTmpl = "{{ if .ClusterConfigDiff }}PROPERTY\t VALUE\t DEFAULT\n{{range $item := .ClusterConfigDiff }}" +
 		"{{ $item.Name }}\t {{ $item.Current }}\t {{ $item.Old }}\n" +
 		"{{end}}\n{{end}}" +

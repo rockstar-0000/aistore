@@ -58,7 +58,7 @@ func TestGetFromArch(t *testing.T) {
 					ext: archive.ExtTar, nested: false, autodetect: false, mime: false,
 				},
 				{
-					ext: archive.ExtTarTgz, nested: false, autodetect: false, mime: false,
+					ext: archive.ExtTarGz, nested: false, autodetect: false, mime: false,
 				},
 				{
 					ext: archive.ExtZip, nested: false, autodetect: false, mime: false,
@@ -70,7 +70,7 @@ func TestGetFromArch(t *testing.T) {
 					ext: archive.ExtTar, nested: true, autodetect: true, mime: false,
 				},
 				{
-					ext: archive.ExtTarTgz, nested: true, autodetect: true, mime: false,
+					ext: archive.ExtTarGz, nested: true, autodetect: true, mime: false,
 				},
 				{
 					ext: archive.ExtZip, nested: true, autodetect: true, mime: false,
@@ -82,7 +82,7 @@ func TestGetFromArch(t *testing.T) {
 					ext: archive.ExtTar, nested: true, autodetect: true, mime: true,
 				},
 				{
-					ext: archive.ExtTarTgz, nested: true, autodetect: true, mime: true,
+					ext: archive.ExtTarGz, nested: true, autodetect: true, mime: true,
 				},
 				{
 					ext: archive.ExtZip, nested: true, autodetect: true, mime: true,
@@ -275,14 +275,14 @@ func testArch(t *testing.T, bck *meta.Bck) {
 			if m.bck.IsRemote() {
 				m.num = numPuts >> 1
 			}
-			m.initWithCleanup()
+			m.init(true /*cleanup*/)
 			m.fileSize = cos.MinU64(m.fileSize+m.fileSize/3, 32*cos.KiB)
 			m.puts()
 			if m.bck.IsRemote() {
 				defer m.del(-1)
 			}
 			bckTo := cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
-			tools.CreateBucketWithCleanup(t, proxyURL, bckTo, nil)
+			tools.CreateBucket(t, proxyURL, bckTo, nil, true /*cleanup*/)
 
 			if test.list {
 				for i := 0; i < numArchs; i++ {
@@ -478,9 +478,9 @@ func TestAppendToArch(t *testing.T) {
 	for _, test := range subtests {
 		tname := fmt.Sprintf("%s/multi=%t", test.ext, test.multi)
 		t.Run(tname, func(t *testing.T) {
-			tools.CreateBucketWithCleanup(t, proxyURL, bckFrom, nil)
-			tools.CreateBucketWithCleanup(t, proxyURL, bckTo, nil)
-			m.initWithCleanup()
+			tools.CreateBucket(t, proxyURL, bckFrom, nil, true /*cleanup*/)
+			tools.CreateBucket(t, proxyURL, bckTo, nil, true /*cleanup*/)
+			m.init(true /*cleanup*/)
 			m.fileSize = cos.MinU64(m.fileSize+m.fileSize/3, 32*cos.KiB)
 			m.puts()
 

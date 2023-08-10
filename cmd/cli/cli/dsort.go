@@ -6,10 +6,13 @@
 package cli
 
 import (
+	"bytes"
 	jsonStd "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -20,15 +23,248 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/ext/dsort"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
 	"github.com/vbauerster/mpb/v4/decor"
+	"gopkg.in/yaml.v2"
 )
+
+const (
+	dsortExampleJ = `$ ais start dsort '{
+			"input_extension": ".tar",
+			"input_bck": {"name": "dsort-testing"},
+			"input_format": {"template": "shard-{0..9}"},
+			"output_shard_size": "200KB",
+			"description": "pack records into categorized shards",
+			"order_file": "http://website.web/static/order_file.txt",
+			"order_file_sep": " "
+		}'`
+	dsortExampleY = `$ ais start dsort -f - <<EOM
+			input_extension: .tar
+			input_bck:
+			    name: dsort-testing
+			input_format:
+			    template: shard-{0..9}
+			output_format: new-shard-{0000..1000}
+			output_shard_size: 10KB
+			description: shuffle shards from 0 to 9
+			algorithm:
+			    kind: shuffle
+			EOM`
+)
+
+type (
+	dsortResult struct {
+		dur      time.Duration
+		created  int64
+		errors   []string
+		warnings []string
+		aborted  bool
+	}
+	dsortPhaseState struct {
+		total    int64
+		progress int64
+		bar      *mpb.Bar
+	}
+	dsortPB struct {
+		id          string
+		apiBP       api.BaseParams
+		refreshTime time.Duration
+		p           *mpb.Progress
+		dur         time.Duration
+		phases      map[string]*dsortPhaseState
+		warnings    []string
+		errors      []string
+		aborted     bool
+	}
+)
+
+var dsortStartCmd = cli.Command{
+	Name: cmdDsort,
+	Usage: "start " + dsort.DSortName + " job\n" +
+		indent1 + "Required parameters:\n" +
+		indent1 + "\t- input_bck: source bucket (used as both source and destination if the latter is not specified)\n" +
+		indent1 + "\t- input_format: see docs and examples below\n" +
+		indent1 + "\t- output_format: ditto\n" +
+		indent1 + "\t- output_shard_size: (as the name implies)\n" +
+		indent1 + "E.g. inline JSON spec:\n" +
+		indent4 + "\t  " + dsortExampleJ + "\n" +
+		indent1 + "E.g. inline YAML spec:\n" +
+		indent4 + "\t  " + dsortExampleY + "\n" +
+		indent1 + "Tip: use '--dry-run' to see the results without making any changes\n" +
+		indent1 + "Tip: use '--verbose' to print the spec (with all its parameters including applied defaults)\n" +
+		indent1 + "See also: docs/dsort.md, docs/cli/dsort.md, and ais/test/scripts/dsort*",
+	ArgsUsage: dsortSpecArgument,
+	Flags:     startSpecialFlags[cmdDsort],
+	Action:    startDsortHandler,
+}
 
 var phasesOrdered = []string{
 	dsort.ExtractionPhase,
 	dsort.SortingPhase,
 	dsort.CreationPhase,
+}
+
+func startDsortHandler(c *cli.Context) (err error) {
+	var (
+		id             string
+		specPath       string
+		specBytes      []byte
+		shift          int
+		srcbck, dstbck cmn.Bck
+		spec           dsort.RequestSpec
+	)
+	// parse command line
+	specPath = parseStrFlag(c, dsortSpecFlag)
+	if c.NArg() == 0 && specPath == "" {
+		return fmt.Errorf("missing %q argument (see %s for details and usage examples)",
+			c.Command.ArgsUsage, qflprn(cli.HelpFlag))
+	}
+	if specPath == "" {
+		// spec is inline
+		specBytes = []byte(c.Args().Get(0))
+		shift = 1
+	}
+	if c.NArg() > shift {
+		srcbck, err = parseBckURI(c, c.Args().Get(shift), true)
+		if err != nil {
+			return fmt.Errorf("failed to parse source bucket: %v\n(see %s for details)",
+				err, qflprn(cli.HelpFlag))
+		}
+	}
+	if c.NArg() > shift+1 {
+		dstbck, err = parseBckURI(c, c.Args().Get(shift+1), true)
+		if err != nil {
+			return fmt.Errorf("failed to parse destination bucket: %v\n(see %s for details)",
+				err, qflprn(cli.HelpFlag))
+		}
+	}
+
+	// load spec from file or standard input
+	if specPath != "" {
+		var r io.Reader
+		if specPath == fileStdIO {
+			r = os.Stdin
+		} else {
+			f, err := os.Open(specPath)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			r = f
+		}
+
+		var b bytes.Buffer
+		// Read at most 1MB so we don't blow up when reading don't know what
+		if _, errV := io.CopyN(&b, r, cos.MiB); errV == nil {
+			return errors.New("file too big")
+		} else if errV != io.EOF {
+			return errV
+		}
+		specBytes = b.Bytes()
+	}
+	if errj := jsoniter.Unmarshal(specBytes, &spec); errj != nil {
+		if erry := yaml.Unmarshal(specBytes, &spec); erry != nil {
+			return fmt.Errorf(
+				"failed to determine the type of the job specification, errs: (%v, %v)",
+				errj, erry,
+			)
+		}
+	}
+
+	// NOTE: args SRC_BUCKET and DST_BUCKET, if defined, override specBytes/specPath (`dsort.RequestSpec`)
+	if !srcbck.IsEmpty() {
+		spec.InputBck = srcbck
+	}
+	if !dstbck.IsEmpty() {
+		spec.OutputBck = dstbck
+	}
+
+	// print resulting spec TODO -- FIXME
+	if flagIsSet(c, verboseFlag) {
+		flat, config := _flattenSpec(&spec)
+		err = teb.Print(flat, teb.FlatTmpl)
+		if err != nil {
+			actionWarn(c, err.Error())
+		}
+		if len(config) == 0 {
+			fmt.Fprintln(c.App.Writer, "Config override:\t\t none")
+		} else {
+			fmt.Fprintln(c.App.Writer, "Config override:")
+			_ = teb.Print(config, teb.FlatTmpl)
+		}
+		time.Sleep(time.Second / 2)
+		fmt.Fprintln(c.App.Writer)
+	}
+
+	// execute
+	if id, err = api.StartDSort(apiBP, &spec); err == nil {
+		fmt.Fprintln(c.App.Writer, id)
+	}
+	return
+}
+
+// with minor editing
+func _flattenSpec(spec *dsort.RequestSpec) (flat, config nvpairList) {
+	var src, dst cmn.Bck
+	cmn.IterFields(spec, func(tag string, field cmn.IterField) (error, bool) {
+		v := _toStr(field.Value())
+		// add config override in a 2nd pass
+		if tag[0] == '.' {
+			if v != "" && v != "0" && v != "0s" {
+				config = append(config, nvpair{tag, v})
+			}
+			return nil, false
+		}
+		switch {
+		case tag == "input_bck.name":
+			src.Name = v
+		case tag == "input_bck.provider":
+			src.Provider = v
+		case tag == "output_bck.name":
+			dst.Name = v
+		case tag == "output_bck.provider":
+			dst.Provider = v
+		default:
+			// defaults
+			switch tag {
+			case "input_format.objnames":
+				if v == `[]` {
+					v = teb.NotSetVal
+				}
+			case "algorithm.kind":
+				if v == "" {
+					v = dsort.Alphanumeric
+				}
+			case "order_file_sep":
+				if v == "" {
+					v = `\t`
+				}
+			default:
+				if v == "" {
+					v = teb.NotSetVal
+				}
+			}
+			flat = append(flat, nvpair{tag, v})
+		}
+		return nil, false
+	})
+	if dst.IsEmpty() {
+		dst = src
+	}
+	flat = append(flat, nvpair{"input_bck", src.Cname("")}, nvpair{"output_bck", dst.Cname("")})
+	sort.Slice(flat, func(i, j int) bool {
+		di, dj := flat[i], flat[j]
+		return di.Name < dj.Name
+	})
+	if len(config) > 0 {
+		sort.Slice(config, func(i, j int) bool {
+			di, dj := config[i], config[j]
+			return di.Name < dj.Name
+		})
+	}
+	return
 }
 
 // Creates bucket if not exists. If exists uses it or deletes and creates new
@@ -55,14 +291,6 @@ func setupBucket(c *cli.Context, bck cmn.Bck) error {
 	return nil
 }
 
-type dsortResult struct {
-	dur      time.Duration
-	created  int64
-	errors   []string
-	warnings []string
-	aborted  bool
-}
-
 func (d dsortResult) String() string {
 	if d.aborted {
 		return dsort.DSortName + " job was aborted"
@@ -81,27 +309,6 @@ func (d dsortResult) String() string {
 	}
 
 	return sb.String()
-}
-
-type dsortPhaseState struct {
-	total    int64
-	progress int64
-	bar      *mpb.Bar
-}
-
-type dsortPB struct {
-	id          string
-	apiBP       api.BaseParams
-	refreshTime time.Duration
-
-	p *mpb.Progress
-
-	dur     time.Duration
-	phases  map[string]*dsortPhaseState
-	aborted bool
-
-	warnings []string
-	errors   []string
 }
 
 func newPhases() map[string]*dsortPhaseState {

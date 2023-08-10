@@ -13,16 +13,25 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
 // supported archive types (file extensions); see also archExts in cmd/cli/cli/const.go
+// NOTE: when adding/removing update:
+// - FileExtensions
+// - IsCompressed
+// - allMagics
 const (
 	ExtTar    = ".tar"
 	ExtTgz    = ".tgz"
-	ExtTarTgz = ".tar.gz"
+	ExtTarGz  = ".tar.gz"
 	ExtZip    = ".zip"
 	ExtTarLz4 = ".tar.lz4"
+)
+
+const (
+	sizeDetectMime = 512
 )
 
 // - here and elsewhere, mime (string) is a "." + IANA mime
@@ -37,13 +46,17 @@ type detect struct {
 	offset int
 }
 
-// when adding/removing update `allMagics` below
-var FileExtensions = []string{ExtTar, ExtTgz, ExtTarTgz, ExtZip, ExtTarLz4}
+var FileExtensions = []string{ExtTar, ExtTgz, ExtTarGz, ExtZip, ExtTarLz4}
+
+func IsCompressed(mime string) bool {
+	debug.Assert(cos.StringInSlice(mime, FileExtensions), mime)
+	return mime != ExtTar
+}
 
 // standard file signatures
 var (
 	magicTar  = detect{offset: 257, sig: []byte("ustar"), mime: ExtTar}
-	magicGzip = detect{sig: []byte{0x1f, 0x8b}, mime: ExtTarTgz}
+	magicGzip = detect{sig: []byte{0x1f, 0x8b}, mime: ExtTarGz}
 	magicZip  = detect{sig: []byte{0x50, 0x4b}, mime: ExtZip}
 	magicLz4  = detect{sig: []byte{0x04, 0x22, 0x4d, 0x18}, mime: ExtTarLz4}
 
@@ -78,8 +91,8 @@ func Mime(mime, filename string) (string, error) {
 // e.g. MIME: "application/zip"
 func normalize(mime string) (string, error) {
 	switch {
-	case strings.Contains(mime, ExtTarTgz[1:]): // ExtTarTgz contains ExtTar
-		return ExtTarTgz, nil
+	case strings.Contains(mime, ExtTarGz[1:]): // ExtTarGz contains ExtTar
+		return ExtTarGz, nil
 	case strings.Contains(mime, ExtTarLz4[1:]): // ditto
 		return ExtTarLz4, nil
 	default:
@@ -101,8 +114,6 @@ func byExt(filename string) (string, error) {
 	}
 	return "", NewErrUnknownFileExt(filename, "")
 }
-
-const sizeDetectMime = 512
 
 // NOTE convention: caller may pass nil `smm` _not_ to spend time (usage: listing and reading)
 func MimeFile(file *os.File, smm *memsys.MMSA, mime, archname string) (m string, err error) {
@@ -167,4 +178,16 @@ func _detect(file *os.File, archname string, buf []byte) (m string, n int, err e
 	}
 	err = fmt.Errorf("failed to detect file signature in %q", archname)
 	return
+}
+
+func EqExt(ext1, ext2 string) bool {
+	switch {
+	case ext1 == ext2:
+		return true
+	case ext1 == ExtTarGz && ext2 == ExtTgz:
+		return true
+	case ext2 == ExtTarGz && ext1 == ExtTgz:
+		return true
+	}
+	return false
 }

@@ -72,8 +72,9 @@ const (
 
 	cmdSmap   = apc.WhatSmap
 	cmdBMD    = apc.WhatBMD
-	cmdConfig = "config"
+	cmdConfig = "config" // apc.WhatNodeConfig and apc.WhatClusterConfig
 	cmdLog    = apc.WhatLog
+
 	cmdBucket = "bucket"
 	cmdObject = "object"
 	cmdProps  = "props"
@@ -101,7 +102,6 @@ const (
 	cmdNode       = "node"
 	cmdPrimary    = "set-primary"
 	cmdList       = commandList
-	cmdLogs       = "logs"
 	cmdStop       = "stop"
 	cmdStart      = "start"
 	cmdMembership = "add-remove-nodes"
@@ -109,6 +109,9 @@ const (
 	cmdAttach     = "attach"
 	cmdDetach     = "detach"
 	cmdResetStats = "reset-stats"
+
+	cmdDownloadLogs = "download-logs"
+	cmdViewLogs     = "view-logs" // etl
 
 	// Cluster subcommands
 	cmdCluAttach = "remote-" + cmdAttach
@@ -235,7 +238,6 @@ const (
 	// key/value
 	keyValuePairsArgument = "KEY=VALUE [KEY=VALUE...]"
 	jsonKeyValueArgument  = "JSON-formatted-KEY-VALUE"
-	jsonSpecArgument      = "JSON_SPECIFICATION"
 
 	// Buckets
 	bucketArgument         = "BUCKET"
@@ -246,6 +248,8 @@ const (
 	bucketSrcArgument      = "SRC_BUCKET"
 	bucketDstArgument      = "DST_BUCKET"
 	bucketNewArgument      = "NEW_BUCKET"
+
+	dsortSpecArgument = "[JSON_SPECIFICATION|YAML_SPECIFICATION|-] [SRC_BUCKET] [DST_BUCKET]"
 
 	// Objects
 	objectArgument          = "BUCKET/OBJECT_NAME"
@@ -275,6 +279,10 @@ const (
 	optionalTargetIDArgument  = "[TARGET_ID]"
 	joinNodeArgument          = "IP:PORT"
 	nodeMountpathPairArgument = "NODE_ID=MOUNTPATH [NODE_ID=MOUNTPATH...]"
+
+	// node log
+	showLogArgument = nodeIDArgument
+	getLogArgument  = nodeIDArgument + " [OUT_FILE|OUT_DIR|-]"
 
 	// cluster
 	showClusterArgument = "[NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | " +
@@ -348,6 +356,7 @@ var (
 	allRunningJobsFlag  = cli.BoolFlag{Name: scopeAll, Usage: "all running jobs"}
 	allFinishedJobsFlag = cli.BoolFlag{Name: scopeAll, Usage: "all finished jobs"}
 	rmrfFlag            = cli.BoolFlag{Name: scopeAll, Usage: "remove all objects (use it with extreme caution!)"}
+	allLogsFlag         = cli.BoolFlag{Name: scopeAll, Usage: "download all logs"}
 
 	allColumnsFlag = cli.BoolFlag{
 		Name:  scopeAll,
@@ -366,6 +375,10 @@ var (
 	copyAllObjsFlag = cli.BoolFlag{
 		Name:  scopeAll,
 		Usage: "copy all objects from a remote bucket including those that are not present (not \"cached\") in the cluster",
+	}
+	etlAllObjsFlag = cli.BoolFlag{
+		Name:  scopeAll,
+		Usage: "transform all objects from a remote bucket including those that are not present (not \"cached\") in the cluster",
 	}
 
 	// obj props
@@ -413,8 +426,9 @@ var (
 			indent4 + "\tvalid time units: " + timeUnits,
 	}
 	countFlag = cli.IntFlag{
-		Name:  "count",
-		Usage: "used together with " + qflprn(refreshFlag) + " to limit the number of generated reports",
+		Name: "count",
+		Usage: "used together with " + qflprn(refreshFlag) + " to limit the number of generated reports, e.g.:\n" +
+			indent4 + "\t '--refresh 10 --count 5' - run 5 times with 10s interval",
 	}
 	longRunFlags = []cli.Flag{refreshFlag, countFlag}
 
@@ -488,8 +502,9 @@ var (
 		Usage: "perform checks (correctness of placement, number of copies, and more) and show the corresponding error counts",
 	}
 	bckSummaryFlag = cli.BoolFlag{
-		Name:  "summary",
-		Usage: "show object numbers, bucket sizes, and used capacity; applies _only_ to buckets and objects that are _present_ in the cluster",
+		Name: "summary",
+		Usage: "show object numbers, bucket sizes, and used capacity;\n" +
+			indent4 + "\tnote: applies only to buckets and objects that are _present_ in the cluster",
 	}
 	pagedFlag = cli.BoolFlag{
 		Name:  "paged",
@@ -508,7 +523,11 @@ var (
 	}
 
 	// Log severity (cmn.LogInfo, ....) enum
-	logSevFlag   = cli.StringFlag{Name: "severity", Usage: "show the specified log, one of: 'i[nfo]','w[arning]','e[rror]'"}
+	logSevFlag = cli.StringFlag{
+		Name: "severity",
+		Usage: "log severity is either 'i' or 'info' (default, can be omitted), or 'error', whereby error logs contain\n" +
+			indent4 + "\tonly errors and warnings, e.g.: '--severity info', '--severity error', '--severity e'",
+	}
 	logFlushFlag = DurationFlag{
 		Name:  "log-flush",
 		Usage: "can be used in combination with " + qflprn(refreshFlag) + " to override configured '" + nodeLogFlushName + "'",
@@ -549,9 +568,9 @@ var (
 
 	// dSort
 	dsortFsizeFlag  = cli.StringFlag{Name: "fsize", Value: "1024", Usage: "size of the files in a shard"}
-	dsortLogFlag    = cli.StringFlag{Name: "log", Usage: "path to file where the metrics will be saved"}
+	dsortLogFlag    = cli.StringFlag{Name: "log", Usage: "filename to log metrics (statistics)"}
 	dsortFcountFlag = cli.IntFlag{Name: "fcount", Value: 5, Usage: "number of files in a shard"}
-	dsortSpecFlag   = cli.StringFlag{Name: "file,f", Value: "", Usage: "path to file with dSort specification"}
+	dsortSpecFlag   = cli.StringFlag{Name: "file,f", Value: "", Usage: "path to JSON or YAML job specification"}
 
 	cleanupFlag = cli.BoolFlag{
 		Name:  "cleanup",

@@ -6,10 +6,8 @@
 package cli
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -26,7 +24,6 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
-	"gopkg.in/yaml.v2"
 )
 
 // top-level job command
@@ -68,6 +65,7 @@ var (
 		},
 		cmdDsort: {
 			dsortSpecFlag,
+			verboseFlag,
 		},
 		commandPrefetch: append(
 			listrangeFlags,
@@ -107,13 +105,7 @@ var (
 				Flags:     startSpecialFlags[cmdDownload],
 				Action:    startDownloadHandler,
 			},
-			{
-				Name:      cmdDsort,
-				Usage:     "start " + dsort.DSortName + " job",
-				ArgsUsage: jsonSpecArgument,
-				Flags:     startSpecialFlags[cmdDsort],
-				Action:    startDsortHandler,
-			},
+			dsortStartCmd,
 			{
 				Name:         cmdLRU,
 				Usage:        "run LRU eviction",
@@ -562,7 +554,7 @@ func bgDownload(c *cli.Context, id string) (err error) {
 
 	if resp.ErrorCnt != 0 {
 		msg := toShowMsg(c, id, "For details", true)
-		warn := fmt.Sprintf("%d of %d download jobs failed. %sBarFlag)s", resp.ErrorCnt, resp.ScheduledCnt, msg)
+		warn := fmt.Sprintf("%d of %d download jobs failed. %s", resp.ErrorCnt, resp.ScheduledCnt, msg)
 		actionWarn(c, warn)
 	} else if resp.FinishedTime.UnixNano() != 0 {
 		actionDownloaded(c, resp.FinishedCnt)
@@ -603,68 +595,6 @@ func waitDownload(c *cli.Context, id string) (err error) {
 		return fmt.Errorf("download job %s was aborted", id)
 	}
 	return nil
-}
-
-func startDsortHandler(c *cli.Context) (err error) {
-	var (
-		id       string
-		specPath = parseStrFlag(c, dsortSpecFlag)
-	)
-	if c.NArg() == 0 && specPath == "" {
-		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() > 0 && specPath != "" {
-		return &errUsage{
-			context:      c,
-			message:      "multiple job specifications provided, expected one",
-			helpData:     c.Command,
-			helpTemplate: cli.CommandHelpTemplate,
-		}
-	}
-
-	var specBytes []byte
-	if specPath == "" {
-		// Specification provided as an argument.
-		specBytes = []byte(c.Args().Get(0))
-	} else {
-		// Specification provided as path to the file (flag).
-		var r io.Reader
-		if specPath == fileStdIO {
-			r = os.Stdin
-		} else {
-			f, err := os.Open(specPath)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			r = f
-		}
-
-		var b bytes.Buffer
-		// Read at most 1MB so we don't blow up when reading a malicious file.
-		if _, err := io.CopyN(&b, r, cos.MiB); err == nil {
-			return errors.New("file too big")
-		} else if err != io.EOF {
-			return err
-		}
-		specBytes = b.Bytes()
-	}
-
-	var rs dsort.RequestSpec
-	if errj := jsoniter.Unmarshal(specBytes, &rs); errj != nil {
-		if erry := yaml.Unmarshal(specBytes, &rs); erry != nil {
-			return fmt.Errorf(
-				"failed to determine the type of the job specification, errs: (%v, %v)",
-				errj, erry,
-			)
-		}
-	}
-
-	if id, err = api.StartDSort(apiBP, rs); err != nil {
-		return
-	}
-
-	fmt.Fprintln(c.App.Writer, id)
-	return
 }
 
 func startLRUHandler(c *cli.Context) (err error) {

@@ -76,9 +76,10 @@ type (
 	}
 )
 
-// TODO: use it instead of splitting handlers into functions (unify)
+// TODO: unify, use instead of splitting handlers (that each have different flags)
+// reflection possibly can be used but requires way too many lines
 func actionIsHandler(action any, handler func(c *cli.Context) error) bool {
-	return fmt.Sprintf("%p", action) == fmt.Sprintf("%p", handler) // TODO: reflect and unsafe doesn't help but still
+	return fmt.Sprintf("%p", action) == fmt.Sprintf("%p", handler)
 }
 
 func argLast(c *cli.Context) (last string) {
@@ -618,9 +619,9 @@ func parseURLtoBck(strURL string) (bck cmn.Bck) {
 }
 
 // see also authNConfPairs
-func flattenConfig(cfg any, section string) (flat nvpairList) {
+func flattenJSON(jstruct any, section string) (flat nvpairList) {
 	flat = make(nvpairList, 0, 40)
-	cmn.IterFields(cfg, func(tag string, field cmn.IterField) (error, bool) {
+	cmn.IterFields(jstruct, func(tag string, field cmn.IterField) (error, bool) {
 		if section == "" || strings.HasPrefix(tag, section) {
 			v := _toStr(field.Value())
 			flat = append(flat, nvpair{tag, v})
@@ -758,7 +759,7 @@ func defaultBckProps(bck cmn.Bck) (*cmn.BucketProps, error) {
 	return props, nil
 }
 
-// see also flattenConfig
+// see also flattenJSON
 func authNConfPairs(conf *authn.Config, prefix string) (nvpairList, error) {
 	flat := make(nvpairList, 0, 8)
 	err := cmn.IterFields(conf, func(tag string, field cmn.IterField) (error, bool) {
