@@ -7,12 +7,15 @@ redirect_from:
  - /docs/cli/aws_profile_endpoint.md/
 ---
 
-AIStore supports AWS-specific configuration on a per s3 bucket basis. Any bucket that is backed up by an AWS S3 bucket (**) can be configured to use alternative:
+AIStore supports vendor-specific configuration on a per bucket basis. For instance, any bucket _backed up_ by an AWS S3 bucket (**) can be configured to use alternative:
 
 * named AWS profiles (with alternative credentials and/or region)
-* alternative s3 endpoints
+* s3 endpoints
 
-(**) Terminology-wise, "s3 bucket" is a shortcut phrase indicating a bucket in an AIS cluster that either (A) has the same name (e.g. `s3://abc`) or (B) a differently named AIS bucket that has `backend_bck` property that specifies the s3 bucket in question.
+(**) Terminology-wise, when we say "s3 bucket" or "google cloud bucket" we in fact reference a bucket in an AIS cluster that is either:
+
+* (A) denoted with the respective `s3:` or `gs:` protocol schema, or
+* (B) is a differently named AIS (that is, `ais://`) bucket that has its `backend_bck` property referencing the s3 (or google cloud) bucket in question.
 
 For supported backends (that include, but are not limited, to AWS S3), see also:
 
@@ -23,6 +26,7 @@ For supported backends (that include, but are not limited, to AWS S3), see also:
 - [Viewing vendor-specific properties](#viewing-vendor-specific-properties)
 - [Environment variables](#environment-variables)
 - [Setting profile with alternative access/secret keys and/or region](#setting-profile-with-alternative-accesssecret-keys-andor-region)
+- [When bucket does not exist](#when-bucket-does-not-exist)
 - [Configuring custom AWS S3 endpoint](#configuring-custom-aws-s3-endpoint)
 
 ## Viewing vendor-specific properties
@@ -91,6 +95,29 @@ extra.aws.profile           prod
 ```
 
 From this point on, all calls to read, write, list `s3://abc` and get/set its properties will use AWS "prod" profile (see above).
+
+## When bucket does not exist
+
+But what if we need to set alternative profile (with alternative access and secret keys) on a bucket that does not yet exist in the cluster?
+
+That must be a fairly common situation, and the way to resolve it is to use `--skip-lookup` option:
+
+```console
+$ ais create --help
+...
+OPTIONS:
+   --props value   bucket properties, e.g. --props="mirror.enabled=true mirror.copies=4 checksum.type=md5"
+   --skip-lookup   add Cloud bucket to aistore without checking the bucket's accessibility and getting its Cloud properties
+                   (usage must be limited to setting up bucket's aistore properties with alternative profile and/or endpoint)
+
+
+$ ais create s3://abc --skip-lookup
+"s3://abc" created
+```
+
+Once this is done (**), we simply go ahead and run `ais bucket props set s3://abc extra.aws.profile` (as shown above). Assuming, the updated profile contains correct access keys, the bucket will then be fully available for reading, writing, listing, and all the rest operations.
+
+> (**) `ais create` command results in adding the bucket to aistore `BMD` - a protected, versioned, and replicated bucket metadata that is further used to update properties of any bucket in the cluster, including certainly the one that we have just added.
 
 ## Configuring custom AWS S3 endpoint
 

@@ -1,15 +1,14 @@
-// Package transport provides streaming object-based transport over http for intra-cluster continuous
+// Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
 import (
-	"fmt"
 	"io"
 	"math"
-	"reflect"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -18,7 +17,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 )
@@ -51,7 +49,6 @@ type (
 	// advanced usage: additional stream control
 	Extra struct {
 		Callback     ObjSentCB     // typical usage: to free SGLs, close files, etc.
-		MMSA         *memsys.MMSA  // compression-related buffering
 		Config       *cmn.Config   // (to optimize-out GCO.Get())
 		Compression  string        // see CompressAlways, etc. enum
 		SenderID     string        // e.g., xaction ID (optional)
@@ -59,7 +56,10 @@ type (
 		SizePDU      int32         // NOTE: 0(zero): no PDUs; must be below maxSizePDU; unknown size _requires_ PDUs
 		MaxHdrSize   int32         // overrides `dfltMaxHdr` if specified
 	}
-	EndpointStats map[uint64]*Stats // all stats for a given (network, trname) endpoint indexed by session ID
+
+	// receive-side session stats indexed by session ID (see recv.go for "uid")
+	// optional, currently tests only
+	RxStats map[uint64]*Stats
 
 	// object header
 	ObjHdr struct {
@@ -119,9 +119,9 @@ func NewObjStream(client Client, dstURL, dstID string, extra *Extra) (s *Stream)
 	}
 	debug.Assert(s.usePDU() == extra.UsePDU())
 
-	burst := burst(extra.Config)      // num objects the caller can post without blocking
-	s.workCh = make(chan *Obj, burst) // Send Qeueue (SQ)
-	s.cmplCh = make(chan cmpl, burst) // Send Completion Queue (SCQ)
+	chsize := burst(extra.Config)      // num objects the caller can post without blocking
+	s.workCh = make(chan *Obj, chsize) // Send Qeueue (SQ)
+	s.cmplCh = make(chan cmpl, chsize) // Send Completion Queue (SCQ)
 
 	s.wg.Add(2)
 	go s.sendLoop(dryrun()) // handle SQ
@@ -152,25 +152,17 @@ func NewObjStream(client Client, dstURL, dstID string, extra *Extra) (s *Stream)
 //     stream(s).
 func (s *Stream) Send(obj *Obj) (err error) {
 	debug.Assertf(len(obj.Hdr.Opaque) < len(s.maxhdr)-sizeofh, "(%d, %d)", len(obj.Hdr.Opaque), len(s.maxhdr))
-
 	if err = s.startSend(obj); err != nil {
 		s.doCmpl(obj, err) // take a shortcut
 		return
 	}
 
-	// reader == nil iff is-header-only
-	debug.Func(func() {
-		if obj.Reader == nil {
-			debug.Assert(obj.IsHeaderOnly())
-		} else if obj.IsHeaderOnly() {
-			val := reflect.ValueOf(obj.Reader)
-			debug.Assert(val.IsNil(), obj.String())
-		}
-	})
-
 	s.workCh <- obj
-	if verbose {
-		nlog.Infof("%s: send %s[sq=%d]", s, obj, len(s.workCh))
+	if l, c := len(s.workCh), cap(s.workCh); l > c/2 {
+		runtime.Gosched() // poor man's throttle
+		if l == c {
+			s.chanFull.Inc()
+		}
 	}
 	return
 }
@@ -180,75 +172,30 @@ func (s *Stream) Fin() {
 	s.wg.Wait()
 }
 
-////////////////////
-// message stream //
-////////////////////
-
-func NewMsgStream(client Client, dstURL, dstID string) (s *MsgStream) {
-	extra := &Extra{Config: cmn.GCO.Get()}
-	s = &MsgStream{streamBase: *newBase(client, dstURL, dstID, extra)}
-	s.streamBase.streamer = s
-
-	burst := burst(extra.Config)      // num messages the caller can post without blocking
-	s.workCh = make(chan *Msg, burst) // Send Qeueue or SQ
-
-	s.wg.Add(1)
-	go s.sendLoop(dryrun())
-
-	gc.ctrlCh <- ctrl{&s.streamBase, true /* collect */}
-	return
-}
-
-func (s *MsgStream) Send(msg *Msg) (err error) {
-	debug.Assert(len(msg.Body) < len(s.maxhdr)-int(unsafe.Sizeof(Msg{})))
-	if err = s.startSend(msg); err != nil {
-		return
-	}
-	s.workCh <- msg
-	if verbose {
-		nlog.Infof("%s: send %s[sq=%d]", s, msg, len(s.workCh))
-	}
-	return
-}
-
-func (s *MsgStream) Fin() {
-	_ = s.Send(&Msg{Opcode: opcFin})
-	s.wg.Wait()
-}
-
 //////////////////////
 // receive-side API //
 //////////////////////
 
-func HandleObjStream(trname string, rxObj RecvObj) error {
-	h := &handler{trname: trname, rxObj: rxObj, hkName: ObjURLPath(trname)}
-	return h.handle()
-}
-
-func HandleMsgStream(trname string, rxMsg RecvMsg) error {
-	h := &handler{trname: trname, rxMsg: rxMsg, hkName: MsgURLPath(trname)}
-	return h.handle()
-}
-
-func Unhandle(trname string) (err error) {
-	mu.Lock()
-	if h, ok := handlers[trname]; ok {
-		delete(handlers, trname)
-		mu.Unlock()
-		hk.Unreg(h.hkName + hk.NameSuffix)
+func Handle(trname string, rxObj RecvObj, withStats ...bool) error {
+	var h handler
+	if len(withStats) > 0 && withStats[0] {
+		hkName := ObjURLPath(trname)
+		hex := &hdlExtra{hdl: hdl{trname: trname, rxObj: rxObj}, hkName: hkName}
+		hk.Reg(hkName+hk.NameSuffix, hex.cleanup, sessionIsOld)
+		h = hex
 	} else {
-		mu.Unlock()
-		err = fmt.Errorf(cmn.FmtErrUnknown, "transport", "endpoint", trname)
+		h = &hdl{trname: trname, rxObj: rxObj}
 	}
-	return
+	return oput(trname, h)
 }
+
+func Unhandle(trname string) error { return odel(trname) }
 
 ////////////////////
 // stats and misc //
 ////////////////////
 
 func ObjURLPath(trname string) string { return _urlPath(apc.ObjStream, trname) }
-func MsgURLPath(trname string) string { return _urlPath(apc.MsgStream, trname) }
 
 func _urlPath(endp, trname string) string {
 	if trname == "" {
@@ -257,24 +204,16 @@ func _urlPath(endp, trname string) string {
 	return cos.JoinWords(apc.Version, endp, trname)
 }
 
-func GetStats() (netstats map[string]EndpointStats, err error) {
-	netstats = make(map[string]EndpointStats)
-	mu.Lock()
-	for trname, h := range handlers {
-		eps := make(EndpointStats)
-		f := func(key, value any) bool {
-			out := &Stats{}
-			uid := key.(uint64)
-			in := value.(*Stats)
-			out.Num.Store(in.Num.Load())
-			out.Offset.Store(in.Offset.Load())
-			out.Size.Store(in.Size.Load())
-			eps[uid] = out
-			return true
+func GetRxStats() (netstats map[string]RxStats) {
+	netstats = make(map[string]RxStats)
+	for i, hmap := range hmaps {
+		hmtxs[i].Lock()
+		for trname, h := range hmap {
+			if s := h.getStats(); s != nil {
+				netstats[trname] = s
+			}
 		}
-		h.sessions.Range(f)
-		netstats[trname] = eps
+		hmtxs[i].Unlock()
 	}
-	mu.Unlock()
 	return
 }

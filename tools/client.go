@@ -52,7 +52,8 @@ const (
 	EvictPrefetchTimeout = 2 * time.Minute
 	BucketCleanupTimeout = time.Minute
 
-	xactPollSleep = time.Second
+	xactPollSleep     = time.Second
+	controlPlaneSleep = 2 * time.Second
 )
 
 type Ctx struct {
@@ -329,7 +330,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 	if args.WorkerCnt > 0 {
 		workerCnt = args.WorkerCnt
 	}
-	workerCnt = cos.Min(workerCnt, args.ObjCnt)
+	workerCnt = min(workerCnt, args.ObjCnt)
 
 	for i := 0; i < args.ObjCnt; i++ {
 		if args.Ordered {
@@ -354,7 +355,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 						args.CksumType = cos.ChecksumNone
 					}
 
-					reader, err := readers.NewRandReader(int64(size), args.CksumType)
+					reader, err := readers.NewRand(int64(size), args.CksumType)
 					cos.AssertNoErr(err)
 
 					// We could PUT while creating files, but that makes it
@@ -380,7 +381,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 				}
 				return nil
 			}
-		}(i, cos.Min(i+chunkSize, len(objNames))))
+		}(i, min(i+chunkSize, len(objNames))))
 	}
 
 	err := group.Wait()
@@ -424,25 +425,26 @@ func GetObjectAtime(t *testing.T, bp api.BaseParams, bck cmn.Bck, object, timeFo
 // WaitForDSortToFinish waits until all dSorts jobs finished without failure or
 // all jobs abort.
 func WaitForDSortToFinish(proxyURL, managerUUID string) (allAborted bool, err error) {
-	tlog.Logf("waiting for dsort[%s] to finish\n", managerUUID)
+	tlog.Logf("waiting for dsort[%s]\n", managerUUID)
 
 	bp := BaseAPIParams(proxyURL)
 	deadline := time.Now().Add(DsortFinishTimeout)
 	for time.Now().Before(deadline) {
-		allMetrics, err := api.MetricsDSort(bp, managerUUID)
+		all, err := api.MetricsDSort(bp, managerUUID)
 		if err != nil {
 			return false, err
 		}
 
 		allAborted := true
 		allFinished := true
-		for _, metrics := range allMetrics {
-			allAborted = allAborted && metrics.Aborted.Load()
+		for _, jmetrics := range all {
+			m := jmetrics.Metrics
+			allAborted = allAborted && m.Aborted.Load()
 			allFinished = allFinished &&
-				!metrics.Aborted.Load() &&
-				metrics.Extraction.Finished &&
-				metrics.Sorting.Finished &&
-				metrics.Creation.Finished
+				!m.Aborted.Load() &&
+				m.Extraction.Finished &&
+				m.Sorting.Finished &&
+				m.Creation.Finished
 		}
 		if allAborted {
 			return true, nil
@@ -523,7 +525,7 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 		// NOTE in re nat == 1: single remaining target vs. graceful shutdown and such
 		s := "No targets"
 		tlog.Logf("%s, %s - cannot rebalance\n", s, smap)
-		_waitResil(t, bp, 2*time.Second)
+		_waitResil(t, bp, controlPlaneSleep)
 		return
 	}
 
@@ -606,7 +608,7 @@ func WaitForRebalanceByID(t *testing.T, bp api.BaseParams, rebID string, timeout
 func _waitReToStart(bp api.BaseParams) {
 	var (
 		kinds   = []string{apc.ActRebalance, apc.ActResilver}
-		timeout = cos.MaxDuration(10*xactPollSleep, MaxCplaneTimeout)
+		timeout = max(10*xactPollSleep, MaxCplaneTimeout)
 		retries = int(timeout / xactPollSleep)
 		args    = xact.ArgsMsg{Timeout: xactPollSleep, OnlyRunning: true}
 	)

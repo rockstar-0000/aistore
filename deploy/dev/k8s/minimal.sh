@@ -1,8 +1,10 @@
 #!/bin/bash
 
 source utils/ais_minikube_setup.sh
+
+# Default values and environment variables
 export AIS_FS_PATHS=""
-export TEST_FSPATH_COUNT=1
+export TEST_FSPATH_COUNT=4
 REGISTRY_URL="${REGISTRY_URL:-docker.io}"
 IMAGE_TAG="latest"
 export DOCKER_IMAGE="${REGISTRY_URL}/aistorage/aisnode-minikube:${IMAGE_TAG}"
@@ -19,6 +21,10 @@ export TARGET_CNT=1
 export POD_NAME="ais-proxy-0"
 export PORT=$PRIMARY_PORT
 export AIS_IS_PRIMARY=true
+export INSTANCE=0
+
+export AIS_LOG_DIR="/tmp/ais/${INSTANCE}/log"
+(minikube ssh "sudo mkdir -p ${AIS_LOG_DIR}")
 
 ([[ $(kubectl get pods | grep -c "${POD_NAME}") -gt 0 ]] && kubectl delete pods ${POD_NAME}) || true
 envsubst < kube_templates/aisproxy_deployment.yml | kubectl apply -f -
@@ -33,23 +39,30 @@ export PORT=9090
 export PORT_INTRA_CONTROL=9080
 export PORT_INTRA_DATA=10080
 export TARGET_POS_NUM=1
+export INSTANCE=1
 
-(minikube ssh "sudo mkdir -p /tmp/${TARGET_POS_NUM}")
+export AIS_LOG_DIR="/tmp/ais/${INSTANCE}/log"
+(minikube ssh "sudo mkdir -p ${AIS_LOG_DIR}")
 
+# Delete and apply target deployment
 ([[ $(kubectl get pods | grep -c "${POD_NAME}") -gt 0 ]] && kubectl delete pods ${POD_NAME}) || true
 envsubst < kube_templates/aistarget_deployment.yml | kubectl create -f -
 
 echo "Waiting for the targets to be ready..."
 kubectl wait --for="condition=ready" --timeout=2m pods -l type=aistarget
 
+# Display a list of running pods
 echo "List of running pods"
 kubectl get pods -o wide
 
 echo "Done."
 echo ""
-(cd ../../../  && make cli)
-echo ""
-echo "Set the \"AIS_ENDPOINT\" for use of CLI:"
-echo "export AIS_ENDPOINT=\"http://$(minikube ip):8080\""
 
+# Build the CLI in the appropriate directory
+(cd ../../../ && make cli)
+echo ""
+
+# Set AIS_ENDPOINT for use with the CLI
 export AIS_ENDPOINT="http://$(minikube ip):8080"
+echo "Set the \"AIS_ENDPOINT\" for use of CLI:"
+echo "export AIS_ENDPOINT=\"$AIS_ENDPOINT\""

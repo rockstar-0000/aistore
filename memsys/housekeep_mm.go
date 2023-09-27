@@ -1,12 +1,11 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
 import (
-	"runtime"
 	"sort"
 	"time"
 
@@ -24,8 +23,8 @@ const (
 
 // hk tunables (via config.Memsys section)
 var (
-	sizeToGC      int64 = cos.GiB + cos.GiB>>1 // run GC when sum(`freed`) > sizeToGC
-	memCheckAbove       = 90 * time.Second     // memory checking frequency when above low watermark
+	sizeToGC      = int64(cos.GiB + cos.GiB>>1) // run GC when sum(`freed`) > sizeToGC
+	memCheckAbove = 90 * time.Second            // memory checking frequency when above low watermark
 )
 
 // API: on-demand memory freeing to the user-provided specification
@@ -57,14 +56,14 @@ func (r *MMSA) FreeSpec(spec FreeSpec) {
 		if spec.MinSize == 0 {
 			spec.MinSize = sizeToGC // using default
 		}
-		r.doGC(spec.MinSize, spec.ToOS /* force */)
+		r.freeMemToOS(spec.MinSize, spec.ToOS /* force */)
 	}
 }
 
+// copies part of the internal stats into user-visible Stats
 func (r *MMSA) GetStats() (stats *Stats) {
-	r.slabStats.RLock()
-	stats = r.snapStats()
-	r.slabStats.RUnlock()
+	stats = &Stats{}
+	r._snap(stats, mono.NanoTime())
 	return
 }
 
@@ -72,10 +71,9 @@ func (r *MMSA) GetStats() (stats *Stats) {
 // private
 //
 
-// hkcb is called periodically by the system's house-keeper (hk)
 func (r *MMSA) hkcb() time.Duration {
-	// 1. refresh stats and sort idle < busy
-	r.refreshStatsSortIdle()
+	// 1. refresh and clone stats
+	r.refreshStats()
 
 	// 2. update swapping state and compute mem-pressure ranking
 	err := r.mem.Get()
@@ -88,7 +86,7 @@ func (r *MMSA) hkcb() time.Duration {
 		r.optDepth.Store(optDepth)
 		if freed := r.freeIdle(); freed > 0 {
 			r.toGC.Add(freed)
-			r.doGC(sizeToGC, false)
+			r.freeMemToOS(sizeToGC, false)
 		}
 		return r.hkIval(pressure)
 	}
@@ -104,7 +102,7 @@ func (r *MMSA) hkcb() time.Duration {
 		depth = minDepth
 		mingc = sizeToGC / 4
 	case PressureHigh:
-		tmp := cos.MaxI64(r.optDepth.Load()/2, optDepth/4)
+		tmp := max(r.optDepth.Load()/2, optDepth/4)
 		r.optDepth.Store(tmp)
 		depth = int(tmp)
 		mingc = sizeToGC / 2
@@ -113,25 +111,20 @@ func (r *MMSA) hkcb() time.Duration {
 		depth = optDepth / 2
 	}
 
-	// 5. reduce
-	var gced bool
+	// 5.
+	// - sort (idle < less-idle < busy) taking into account durations and ring hits (in that order)
+	// - _reduce_
+	sort.Slice(r.sorted, r.idleLess)
 	for _, s := range r.sorted { // idle first
 		if idle := r.statsSnapshot.Idle[s.ringIdx()]; idle > freeIdleMinDur/2 {
 			depth = minDepth
 		}
 		freed := s.reduce(depth)
-		if freed > 0 {
-			r.toGC.Add(freed)
-			if !gced {
-				gced = r.doGC(mingc, true)
-			}
-		}
+		r.toGC.Add(freed)
 	}
 
-	// 6. GC
-	if pressure >= PressureHigh {
-		r.doGC(mingc, true)
-	}
+	// 6. GC and free mem to OS
+	r.freeMemToOS(mingc, pressure >= PressureHigh /*force*/)
 	return r.hkIval(pressure)
 }
 
@@ -146,27 +139,21 @@ func (r *MMSA) hkIval(pressure int) time.Duration {
 	}
 }
 
-// 1) refresh internal stats
-// 2) "snapshot" internal stats
-// 3) sort by idle < less idle < busy (taking into account idle duration and hits inc, in that order)
-func (r *MMSA) refreshStatsSortIdle() {
-	r.slabStats.Lock()
+// refresh and clone internal hits/idle stats
+func (r *MMSA) refreshStats() {
 	now := mono.NanoTime()
 	for i := 0; i < r.numSlabs; i++ {
 		hits, prev := r.slabStats.hits[i].Load(), r.slabStats.prev[i]
 		hinc := hits - prev
 		if hinc == 0 {
-			if r.slabStats.idleTs[i] == 0 {
-				r.slabStats.idleTs[i] = now
-			}
+			r.slabStats.idleTs[i].CAS(0, now)
 		} else {
-			r.slabStats.idleTs[i] = 0
+			r.slabStats.idleTs[i].Store(0)
 		}
 		r.slabStats.hinc[i], r.slabStats.prev[i] = hinc, hits
 	}
-	_ = r.snapStats(r.statsSnapshot /* to fill in */)
-	r.slabStats.Unlock()
-	sort.Slice(r.sorted, r.idleLess /* idle < busy */)
+
+	r._snap(r.statsSnapshot, now)
 }
 
 func (r *MMSA) idleLess(i, j int) bool {
@@ -180,7 +167,7 @@ func (r *MMSA) idleLess(i, j int) bool {
 		}
 		return true
 	}
-	if r.slabStats.idleTs[jj] != 0 {
+	if r.slabStats.idleTs[jj].Load() != 0 {
 		return false
 	}
 	return r.slabStats.hinc[ii] < r.slabStats.hinc[jj]
@@ -212,49 +199,36 @@ func (r *MMSA) freeIdle() (total int64) {
 	return
 }
 
-// The method is called:
-// 1) upon periodic freeing of idle slabs
-// 2) after forceful reduction of the /less/ active slabs (done when memory is running low)
-// 3) on demand via MMSA.Free()
-func (r *MMSA) doGC(mingc int64, force bool) (gced bool) {
+// check "minimum" and "load" conditions and calls (expensive, serialized) goroutine
+func (r *MMSA) freeMemToOS(mingc int64, force bool) {
 	avg, err := sys.LoadAverage()
 	if err != nil {
-		nlog.Errorf("Failed to load averages, err: %v", err) // (should never happen)
+		nlog.Errorf("Failed to load averages: %v", err) // (unlikely)
 		avg.One = 999
 	}
-	if avg.One > loadAvg /*idle*/ && !force { // NOTE
-		return
-	}
 	togc := r.toGC.Load()
+
+	// too little to bother?
 	if togc < mingc {
 		return
 	}
-	sgc := cos.ToSizeIEC(togc, 1)
-	if force {
-		nlog.Warningf("%s: freeing %s to the OS (load %.2f)", r, sgc, avg.One)
-		cos.FreeMemToOS()
-	} else {
-		nlog.Warningf("%s: GC %s (load %.2f)", r, sgc, avg.One)
-		runtime.GC()
+	// too loaded w/ no urgency?
+	if avg.One > loadAvg /*idle*/ && !force {
+		return
 	}
-	gced = true
-	r.toGC.Store(0)
-	return
+
+	if started := cos.FreeMemToOS(force); started {
+		nlog.Infof("%s: free mem to OS: %s, load %.2f, force %t", r, cos.ToSizeIEC(togc, 1), avg.One, force)
+		r.toGC.Store(0)
+	}
 }
 
-// copies (under lock) part of the internal stats into user-visible Stats
-func (r *MMSA) snapStats(sts ...*Stats) (stats *Stats) {
-	if len(sts) > 0 {
-		stats = sts[0]
-	} else {
-		stats = &Stats{}
-	}
-	now := mono.NanoTime()
+func (r *MMSA) _snap(stats *Stats, now int64) {
 	for i := range r.rings {
 		stats.Hits[i] = r.slabStats.hits[i].Load()
-		if r.slabStats.idleTs[i] != 0 {
-			stats.Idle[i] = time.Duration(now - r.slabStats.idleTs[i])
+		stats.Idle[i] = 0
+		if since := r.slabStats.idleTs[i].Load(); since != 0 {
+			stats.Idle[i] = time.Duration(now - since)
 		}
 	}
-	return
 }

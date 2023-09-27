@@ -17,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/xact"
@@ -28,7 +29,7 @@ const (
 	keepOldThreshold = 256 // keep so many
 
 	waitPrevAborted = 2 * time.Second
-	waitLimitedCoex = 5 * time.Second
+	waitLimitedCoex = 3 * time.Second
 )
 
 type WPR int
@@ -87,9 +88,10 @@ type (
 	}
 
 	entries struct {
-		active []Renewable // running entries - finished entries are gradually removed
-		all    []Renewable
-		mtx    sync.RWMutex
+		active   []Renewable // running entries - finished entries are gradually removed
+		roActive []Renewable // read-only copy
+		all      []Renewable
+		mtx      sync.RWMutex
 	}
 	// All entries in the registry. The entries are periodically cleaned up
 	// to make sure that we don't keep old entries forever.
@@ -120,8 +122,9 @@ func TestReset() { dreg = newRegistry() } // tests only
 func newRegistry() (r *registry) {
 	return &registry{
 		entries: entries{
-			all:    make([]Renewable, 0, initialCap),
-			active: make([]Renewable, 0, 32),
+			all:      make([]Renewable, 0, initialCap),
+			active:   make([]Renewable, 0, 32),
+			roActive: make([]Renewable, 0, 64),
 		},
 		bckXacts:    make(map[string]Renewable, 32),
 		nonbckXacts: make(map[string]Renewable, 32),
@@ -157,17 +160,28 @@ outer:
 	return
 }
 
-func GetAllRunning(kind string, separateIdle bool) ([]string, []string) {
-	return dreg.entries.getAllRunning(kind, separateIdle)
+func GetAllRunning(inout *cluster.AllRunningInOut, periodic bool) {
+	dreg.entries.getAllRunning(inout, periodic)
 }
 
-func (e *entries) getAllRunning(kind string, separateIdle bool) (running, idle []string) {
-	for _, entry := range e.active {
+func (e *entries) getAllRunning(inout *cluster.AllRunningInOut, periodic bool) {
+	var roActive []Renewable
+	if periodic {
+		roActive = e.roActive
+		roActive = roActive[:len(e.active)]
+	} else {
+		roActive = make([]Renewable, len(e.active))
+	}
+	e.mtx.RLock()
+	copy(roActive, e.active)
+	e.mtx.RUnlock()
+
+	for _, entry := range roActive {
 		var (
 			xctn = entry.Get()
 			k    = xctn.Kind()
 		)
-		if kind != "" && kind != k {
+		if inout.Kind != "" && inout.Kind != k {
 			continue
 		}
 		if !xctn.Running() {
@@ -177,20 +191,20 @@ func (e *entries) getAllRunning(kind string, separateIdle bool) (running, idle [
 			xqn    = k + xact.LeftID + xctn.ID() + xact.RightID // e.g. "make-n-copies[fGhuvvn7t]"
 			isIdle bool
 		)
-		if separateIdle {
+		if inout.Idle != nil {
 			if _, ok := xctn.(xact.Demand); ok {
 				isIdle = xctn.Snap().IsIdle()
 			}
 		}
 		if isIdle {
-			idle = append(idle, xqn)
+			inout.Idle = append(inout.Idle, xqn)
 		} else {
-			running = append(running, xqn)
+			inout.Running = append(inout.Running, xqn)
 		}
 	}
-	sort.Strings(running)
-	sort.Strings(idle)
-	return
+
+	sort.Strings(inout.Running)
+	sort.Strings(inout.Idle)
 }
 
 func GetRunning(flt Flt) Renewable { return dreg.getRunning(flt) }
@@ -467,12 +481,11 @@ func (r *registry) renew(entry Renewable, bck *meta.Bck, buckets ...*meta.Bck) (
 }
 
 func (r *registry) _renewFlt(entry Renewable, flt Flt) (rns RenewRes) {
-	bck := flt.Bck
 	// first, try to reuse under rlock
 	r.renewMtx.RLock()
 	if prevEntry := r.getRunning(flt); prevEntry != nil {
 		xprev := prevEntry.Get()
-		if usePrev(xprev, entry, bck) {
+		if usePrev(xprev, entry, flt) {
 			r.renewMtx.RUnlock()
 			return RenewRes{Entry: prevEntry, UUID: xprev.ID()}
 		}
@@ -492,37 +505,49 @@ func (r *registry) _renewFlt(entry Renewable, flt Flt) (rns RenewRes) {
 
 	// second
 	r.renewMtx.Lock()
-	rns = r.renewLocked(entry, flt, bck)
+	rns = r.renewLocked(entry, flt)
 	r.renewMtx.Unlock()
 	return
 }
 
 // reusing current (aka "previous") xaction: default policies
-func usePrev(xprev cluster.Xact, nentry Renewable, bck *meta.Bck) (use bool) {
+func usePrev(xprev cluster.Xact, nentry Renewable, flt Flt) bool {
 	pkind, nkind := xprev.Kind(), nentry.Kind()
 	debug.Assertf(pkind == nkind && pkind != "", "%s != %s", pkind, nkind)
 	pdtor, ndtor := xact.Table[pkind], xact.Table[nkind]
 	debug.Assert(pdtor.Scope == ndtor.Scope)
+
 	// same ID
 	if xprev.ID() != "" && xprev.ID() == nentry.UUID() {
-		use = true
-		return
+		return true // yes, use prev
 	}
+	if _, ok := xprev.(xact.Demand); !ok {
+		return false // upon return call xaction-specific WhenPrevIsRunning()
+	}
+	//
 	// on-demand
-	if _, ok := xprev.(xact.Demand); ok {
-		if pdtor.Scope != xact.ScopeB {
-			use = true
-			return
-		}
-		debug.Assert(!bck.IsEmpty())
-		use = bck.Equal(xprev.Bck(), true, true)
-		return
+	//
+	if pdtor.Scope != xact.ScopeB {
+		return true
 	}
-	// otherwise, consult with the impl via WhenPrevIsRunning()
-	return
+	bck := flt.Bck
+	debug.Assert(!bck.IsEmpty())
+	if !bck.Equal(xprev.Bck(), true, true) {
+		return false
+	}
+	// on-demand (from-bucket, to-bucket)
+	from, to := xprev.FromTo()
+	if len(flt.Buckets) == 2 && from != nil && to != nil {
+		for _, bck := range flt.Buckets {
+			if !bck.Equal(from, true, true) && !bck.Equal(to, true, true) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
-func (r *registry) renewLocked(entry Renewable, flt Flt, bck *meta.Bck) (rns RenewRes) {
+func (r *registry) renewLocked(entry Renewable, flt Flt) (rns RenewRes) {
 	var (
 		xprev cluster.Xact
 		wpr   WPR
@@ -530,7 +555,7 @@ func (r *registry) renewLocked(entry Renewable, flt Flt, bck *meta.Bck) (rns Ren
 	)
 	if prevEntry := r.getRunning(flt); prevEntry != nil {
 		xprev = prevEntry.Get()
-		if usePrev(xprev, entry, bck) {
+		if usePrev(xprev, entry, flt) {
 			return RenewRes{Entry: prevEntry, UUID: xprev.ID()}
 		}
 		wpr, err = entry.WhenPrevIsRunning(prevEntry)
@@ -569,8 +594,11 @@ func (e *entries) findRunning(flt Flt) Renewable {
 // internal use, special case: Flt{Kind: kind}; NOTE: the caller must take rlock
 func (e *entries) findRunningKind(kind string) Renewable {
 	for _, entry := range e.active {
+		if entry.Kind() != kind {
+			continue
+		}
 		xctn := entry.Get()
-		if xctn.Kind() == kind && xctn.Running() {
+		if xctn.Running() {
 			return entry
 		}
 	}
@@ -638,22 +666,25 @@ func (e *entries) add(entry Renewable) {
 	e.active = append(e.active, entry)
 	e.all = append(e.all, entry)
 	e.mtx.Unlock()
+
+	// grow
+	if cap(e.roActive) < len(e.active) {
+		e.roActive = make([]Renewable, 0, len(e.active)+len(e.active)>>1)
+	}
 }
 
-//
 // LimitedCoexistence checks whether a given xaction that is about to start can, in fact, "coexist"
 // with those that are currently running. It's a piece of logic designed to centralize all decision-making
 // of that sort. Further comments below.
-//
 
 func LimitedCoexistence(tsi *meta.Snode, bck *meta.Bck, action string, otherBck ...*meta.Bck) (err error) {
+	if cmn.Features.IsSet(feat.IgnoreLimitedCoexistence) {
+		return
+	}
 	const sleep = time.Second
-	for i := time.Duration(0); i < waitLimitedCoex; i += sleep {
+	for i := time.Duration(0); i <= waitLimitedCoex; i += sleep {
 		if err = dreg.limco(tsi, bck, action, otherBck...); err == nil {
 			break
-		}
-		if action == apc.ActMoveBck {
-			return
 		}
 		time.Sleep(sleep)
 	}
@@ -683,14 +714,15 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 	}
 	var locked bool
 	for kind, d := range xact.Table {
-		// note that rebalance-vs-rebalance and resilver-vs-resilver sort it out between themselves
+		// rebalance-vs-rebalance and resilver-vs-resilver sort it out between themselves
+		// (by preempting)
 		conflict := (d.MassiveBck && admin) ||
 			(d.Rebalance && nd.MassiveBck) || (d.Resilver && nd.MassiveBck)
 		if !conflict {
 			continue
 		}
 
-		// the potential conflict becomes very real if the 'kind' is actually running
+		// potential conflict becomes very real if the 'kind' is actually running
 		if !locked {
 			r.entries.mtx.RLock()
 			locked = true

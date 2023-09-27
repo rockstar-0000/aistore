@@ -67,12 +67,11 @@ func getHandler(c *cli.Context) error {
 		archpath = parseStrFlag(c, archpathGetFlag)
 	}
 	if actionIsHandler(c.Command.Action, getArchHandler) {
-		if flagIsSet(c, extractFlag) {
-			return fmt.Errorf("'ais archive get': flag %s is redundant (implied)", qflprn(extractFlag))
-		}
-		extract = true
+		extract = true // extractFlag is implied unless:
 
-		if oname, fname := splitObjnameShardBoundary(objName); fname != "" {
+		if archpath != "" {
+			extract = false
+		} else if oname, fname := splitObjnameShardBoundary(objName); fname != "" {
 			objName = oname
 			archpath = fname
 			extract = false
@@ -426,7 +425,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 	}
 	if err != nil {
 		if cmn.IsStatusNotFound(err) && archpath == "" {
-			err = fmt.Errorf("%q does not exist", bck.Cname(objName))
+			err = &errDoesNotExist{what: "object", name: bck.Cname(objName)}
 		}
 		return
 	}
@@ -438,7 +437,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 	if extract {
 		mime, err = doExtract(objName, outFile, objLen)
 		if err != nil {
-			if verbose() {
+			if configuredVerbosity() {
 				return fmt.Errorf("failed to extract %s (from local %q): %v", bck.Cname(objName), outFile, err)
 			}
 			return fmt.Errorf("failed to extract %s: %v", bck.Cname(objName), err)

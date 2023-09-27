@@ -254,6 +254,7 @@ class ETLDetails(BaseModel):
     dependencies: Optional[str]
     runtime: Optional[str]  # see ext/etl/runtime/all.go
     chunk_size: int = 0
+    argument: str = ""
 
     @validator("code")
     def set_code(cls, code):  # pylint: disable=no-self-argument
@@ -276,6 +277,7 @@ class InitETLArgs(BaseModel):
     etl_name: str
     communication_type: str
     timeout: str
+    arg_type: str = ""
 
 
 class InitSpecETLArgs(InitETLArgs):
@@ -291,6 +293,7 @@ class InitSpecETLArgs(InitETLArgs):
             "timeout": self.timeout,
             "communication": f"{self.communication_type}://",
             "spec": self.spec,
+            "argument": self.arg_type,
         }
 
 
@@ -304,7 +307,6 @@ class InitCodeETLArgs(InitETLArgs):
     functions: Dict[str, str]
     code: str
     chunk_size: int = None
-    transform_url: bool = False
 
     def as_dict(self):
         dict_rep = {
@@ -315,7 +317,7 @@ class InitCodeETLArgs(InitETLArgs):
             "funcs": self.functions,
             "code": self.code,
             "dependencies": self.dependencies,
-            "transform_url": self.transform_url,
+            "argument": self.arg_type,
         }
         if self.chunk_size:
             dict_rep["chunk_size"] = self.chunk_size

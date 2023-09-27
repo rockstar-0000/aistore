@@ -59,8 +59,8 @@ func TestMain(m *testing.M) {
 	defer os.RemoveAll(testMountpath)
 	fs.TestNew(nil)
 	fs.TestDisableValidation()
-	_ = fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
-	_ = fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
+	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
+	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 
 	// target
 	config := cmn.GCO.Get()
@@ -115,7 +115,7 @@ func BenchmarkObjPut(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				r, _ := readers.NewRandReader(bench.fileSize, cos.ChecksumNone)
+				r, _ := readers.NewRand(bench.fileSize, cos.ChecksumNone)
 				poi := &putOI{
 					atime:   time.Now().UnixNano(),
 					t:       t,
@@ -163,9 +163,9 @@ func BenchmarkObjAppend(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				r, _ := readers.NewRandReader(bench.fileSize, cos.ChecksumNone)
+				r, _ := readers.NewRand(bench.fileSize, cos.ChecksumNone)
 				aoi := &apndOI{
-					started: time.Now(),
+					started: time.Now().UnixNano(),
 					t:       t,
 					lom:     lom,
 					r:       r,
@@ -224,7 +224,7 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 				b.Fatal(err)
 			}
 
-			r, _ := readers.NewRandReader(bench.fileSize, cos.ChecksumNone)
+			r, _ := readers.NewRand(bench.fileSize, cos.ChecksumNone)
 			poi := &putOI{
 				atime:   time.Now().UnixNano(),
 				t:       t,

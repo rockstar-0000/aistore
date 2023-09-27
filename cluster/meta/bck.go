@@ -59,6 +59,7 @@ func (b *Bck) Validate() error                    { return (*cmn.Bck)(b).Validat
 func (b *Bck) MakeUname(name string) string       { return (*cmn.Bck)(b).MakeUname(name) }
 func (b *Bck) Cname(name string) string           { return (*cmn.Bck)(b).Cname(name) }
 func (b *Bck) IsEmpty() bool                      { return (*cmn.Bck)(b).IsEmpty() }
+func (b *Bck) NewQuery() url.Values               { return (*cmn.Bck)(b).NewQuery() }
 func (b *Bck) AddToQuery(q url.Values) url.Values { return (*cmn.Bck)(b).AddToQuery(q) }
 
 func (b *Bck) Backend() *Bck { backend := (*cmn.Bck)(b).Backend(); return (*Bck)(backend) }
@@ -168,13 +169,13 @@ func (b *Bck) InitFast(bowner Bowner) (err error) {
 func (b *Bck) InitNoBackend(bowner Bowner) error { return b.init(bowner.Get()) }
 
 func (b *Bck) init(bmd *BMD) error {
-	if b.Provider == "" { // NOTE: ais:// is the default
+	switch {
+	case b.Provider == "": // ais: is the default
 		b.Provider = apc.AIS
 		bmd.initBckGlobalNs(b)
-	} else if apc.IsRemoteProvider(b.Provider) {
-		present := bmd.initBck(b)
-		debug.Assert(!b.IsHDFS() || !present || b.Props.Extra.HDFS.RefDirectory != "")
-	} else {
+	case apc.IsRemoteProvider(b.Provider):
+		bmd.initBck(b)
+	default:
 		b.Props, _ = bmd.Get(b)
 	}
 	if b.Props != nil {

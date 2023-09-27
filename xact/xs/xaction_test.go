@@ -6,6 +6,7 @@ package xs_test
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -278,5 +279,40 @@ func TestXactionQueryFinished(t *testing.T) {
 	}
 	for _, test := range tests {
 		f(t, test)
+	}
+}
+
+func TestBeid(t *testing.T) {
+	const div = uint64(100 * time.Millisecond)
+	num := 100
+	if testing.Short() {
+		num = 10
+	}
+	now := time.Now()
+	xreg.PrimeTime.Store(now.UnixNano())
+	xreg.MyTime.Store(now.Add(time.Second).UnixNano())
+
+	var (
+		ids  = make(map[string]struct{}, num)
+		tags = []string{"tag1", "tag2"}
+		cnt  int
+	)
+	for i := 0; i < num; i++ {
+		beid, _, _ := xreg.GenBEID(div, tags[i%2])
+		if _, ok := ids[beid]; ok {
+			t.Fatalf("%d: %s duplicated", i, beid)
+		}
+		ids[beid] = struct{}{}
+
+		time.Sleep(time.Millisecond)
+		id, _, _ := xreg.GenBEID(div, tags[i%2])
+		if beid != id {
+			cnt++
+		}
+
+		time.Sleep(time.Duration(div))
+	}
+	if cnt > 0 {
+		fmt.Printf("Warning: failed to reproduce %d time%s out of %d\n", cnt, cos.Plural(cnt), num)
 	}
 }

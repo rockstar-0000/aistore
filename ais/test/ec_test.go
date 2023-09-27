@@ -333,7 +333,7 @@ func doECPutsAndCheck(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, o *e
 				}
 			}
 
-			r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+			r, err := readers.NewRand(objSize, cos.ChecksumNone)
 			defer func() {
 				r.Close()
 				o.sema.Release()
@@ -446,7 +446,7 @@ func bucketSize(t *testing.T, baseParams api.BaseParams, bck cmn.Bck) int {
 }
 
 func putRandomFile(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPath string, size int) {
-	r, err := readers.NewRandReader(int64(size), cos.ChecksumNone)
+	r, err := readers.NewRand(int64(size), cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
 	_, err = api.PutObject(api.PutArgs{
 		BaseParams: baseParams,
@@ -619,7 +619,7 @@ func createECReplicas(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objN
 	objPath := ecTestDir + objName
 
 	tlog.Logf("Creating %s, size %8d\n", objPath, objSize)
-	r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
 	_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 	tassert.CheckFatal(t, err)
@@ -647,7 +647,7 @@ func createECObject(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objNam
 	}
 
 	tlog.LogfCond(!o.silent, "Creating %s, size %8d [%2s]\n", objPath, objSize, ecStr)
-	r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
 	_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 	tassert.CheckFatal(t, err)
@@ -686,7 +686,7 @@ func createDamageRestoreECFile(t *testing.T, baseParams api.BaseParams, bck cmn.
 		delStr = "obj+slice"
 	}
 	tlog.LogfCond(!o.silent, "Creating %s, size %8d [%2s] [%s]\n", objPath, objSize, ecStr, delStr)
-	r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
 	_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 	tassert.CheckFatal(t, err)
@@ -924,7 +924,7 @@ func putECFile(baseParams api.BaseParams, bck cmn.Bck, objName string) error {
 	objSize := int64(ecMinBigSize * 2)
 	objPath := ecTestDir + objName
 
-	r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	if err != nil {
 		return err
 	}
@@ -1412,7 +1412,7 @@ func ecStressCore(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 			} else {
 				tlog.Logf("Object %s, size %9d[%9s]\n", objName, objSize, "-")
 			}
-			r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+			r, err := readers.NewRand(objSize, cos.ChecksumNone)
 			tassert.Errorf(t, err == nil, "Failed to create reader: %v", err)
 			putArgs := api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r}
 			_, err = api.PutObject(putArgs)
@@ -1505,7 +1505,7 @@ func TestECXattrs(t *testing.T) {
 			ecStr = "EC"
 		}
 		tlog.Logf("Creating %s, size %8d [%2s] [%s]\n", objPath, objSize, ecStr, delStr)
-		r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+		r, err := readers.NewRand(objSize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
 		_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 		tassert.CheckFatal(t, err)
@@ -1727,7 +1727,7 @@ func TestECEmergencyTargetForSlices(t *testing.T) {
 			ecStr = "EC"
 		}
 		tlog.Logf("Creating %s, size %8d [%2s]\n", objPath, objSize, ecStr)
-		r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+		r, err := readers.NewRand(objSize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
 		_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 		tassert.CheckFatal(t, err)
@@ -1975,7 +1975,7 @@ func TestECEmergencyMountpath(t *testing.T) {
 			ecStr = "EC"
 		}
 		tlog.Logf("Creating %s, size %8d [%2s]\n", objPath, objSize, ecStr)
-		r, err := readers.NewRandReader(objSize, cos.ChecksumNone)
+		r, err := readers.NewRand(objSize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
 		_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 		tassert.CheckFatal(t, err)
@@ -2091,6 +2091,9 @@ func TestECMountpaths(t *testing.T) {
 			ecMountpaths(t, o, proxyURL, bck)
 		})
 	}
+
+	reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
+	api.WaitForXactionIdle(tools.BaseAPIParams(proxyURL), reqArgs)
 }
 
 // The test only checks that the number of object after rebalance equals
@@ -2165,7 +2168,10 @@ func ecOnlyRebalance(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 // Simple test to check if EC correctly finds all the objects and its slices
 // that will be used by rebalance
 func TestECBucketEncode(t *testing.T) {
-	const parityCnt = 2
+	const (
+		parityCnt = 2
+		dataCnt   = 1
+	)
 	var (
 		proxyURL = tools.RandomProxyURL()
 		m        = ioContext{
@@ -2178,8 +2184,9 @@ func TestECBucketEncode(t *testing.T) {
 	m.initAndSaveState(true /*cleanup*/)
 	baseParams := tools.BaseAPIParams(proxyURL)
 
-	if m.smap.CountActiveTs() < parityCnt+1 {
-		t.Skipf("Not enough targets to run %s test, must be at least %d", t.Name(), parityCnt+1)
+	if nt := m.smap.CountActiveTs(); nt < parityCnt+dataCnt+1 {
+		t.Skipf("%s: not enough targets (%d): (d=%d, p=%d) requires at least %d",
+			t.Name(), nt, dataCnt, parityCnt, parityCnt+dataCnt+1)
 	}
 
 	initMountpaths(t, proxyURL)

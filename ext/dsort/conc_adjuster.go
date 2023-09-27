@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dsort
@@ -36,13 +36,13 @@ const (
 	// Default value of initial concurrency limit for functions - defined per mountpath.
 	// This value is used when user provided `0` as concurrency limit.
 	defaultConcFuncLimit = 10
-	// Determines maximal concurrency limit per disk.
+	// Determines maximum concurrency limit per disk.
 	//
 	// Setting this too high can result in big number of goroutines in the system
 	// what can put tremendous pressure on scheduler and other goroutines in the
 	// system - eg. http handlers which are spawned in new goroutines.
 	maxConcFuncPerDiskLimit = 15
-	// Determines maximal concurrency limit per dSort per node.
+	// Determines maximum concurrency limit per dsort per node.
 	maxConcFuncPerDSortLimit = 200
 	// TODO: add global max concurrency limit - should be preserved between
 	//  all dSorts on single node.
@@ -53,7 +53,7 @@ const (
 	defaultBatchSize = 10
 	// Defines how much interval size will increase every time it is changed.
 	batchIncRatio = 1.2
-	// Defines the maximal batch size - this prevents from growing batch indefinitely.
+	// Defines maximum batch size (to prevent unlimited growth).
 	maxBatchSize = 200
 
 	lastInfoCnt = 30 // maximum number of latest adjust information
@@ -86,9 +86,9 @@ type (
 
 func calcMaxLimit() int {
 	availablePaths := fs.GetAvail()
-	maxLimitPerDisk := cos.Min(
+	maxLimitPerDisk := min(
 		maxConcFuncPerDiskLimit,
-		maxConcFuncPerDSortLimit/cos.Max(len(availablePaths), 1),
+		maxConcFuncPerDSortLimit/max(len(availablePaths), 1),
 	)
 	return maxLimitPerDisk
 }
@@ -109,7 +109,7 @@ func newConcAdjuster(maxLimit, goroutineLimitCoef int) (ca *concAdjuster) {
 	if maxLimit == 0 {
 		maxLimit = calcMaxLimit()
 	}
-	limit := cos.Min(defaultConcFuncLimit, maxLimit)
+	limit := min(defaultConcFuncLimit, maxLimit)
 	for _, mi := range availablePaths {
 		adjusters[mi.Path] = newMpathAdjuster(limit, maxLimit)
 	}
@@ -219,7 +219,7 @@ func (adjuster *mpathAdjuster) recalc(newUtil int64, config *cmn.Config) (prevLi
 		adjuster.curBatchSize *= 2 * batchIncRatio
 	}
 
-	adjuster.curBatchSize = cos.MinF64(adjuster.curBatchSize, maxBatchSize)
+	adjuster.curBatchSize = min(adjuster.curBatchSize, maxBatchSize)
 	if adjuster.limit < 1 {
 		adjuster.limit = 1
 	} else if adjuster.limit > adjuster.maxLimit {

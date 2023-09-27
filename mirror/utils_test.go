@@ -43,8 +43,8 @@ var _ = Describe("Mirror", func() {
 	fs.TestDisableValidation()
 	_, _ = fs.Add(mpath, "daeID")
 	_, _ = fs.Add(mpath2, "daeID")
-	_ = fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
-	_ = fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
+	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
+	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 
 	var (
 		props = &cmn.BucketProps{
@@ -133,7 +133,7 @@ func createTestFile(filePath, objName string, size int64) {
 	err := cos.CreateDir(filePath)
 	Expect(err).ShouldNot(HaveOccurred())
 
-	r, err := readers.NewFileReader(filePath, objName, size, cos.ChecksumNone)
+	r, err := readers.NewRandFile(filePath, objName, size, cos.ChecksumNone)
 	Expect(err).ShouldNot(HaveOccurred())
 	Expect(r.Close()).ShouldNot(HaveOccurred())
 }

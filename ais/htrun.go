@@ -35,7 +35,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
-	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -46,7 +45,7 @@ const ciePrefix = "cluster integrity error cie#"
 
 // extra or extended state - currently, target only
 type htext interface {
-	rebMarked() xact.Marked
+	interruptedRestarted() (bool, bool)
 }
 
 type htrun struct {
@@ -135,8 +134,9 @@ func (h *htrun) cluMeta(opts cmetaFillOpt) (*cluMeta, error) {
 		}
 	}
 	// don't send Smap when it is undergoing changes (and is about to get metasync-ed)
+	smap := h.owner.smap.get()
 	if !opts.skipSmap {
-		cm.Smap = h.owner.smap.get()
+		cm.Smap = smap
 	}
 	if !opts.skipBMD {
 		cm.BMD = h.owner.bmd.get()
@@ -148,8 +148,10 @@ func (h *htrun) cluMeta(opts cmetaFillOpt) (*cluMeta, error) {
 		cm.EtlMD = h.owner.etl.get()
 	}
 	if h.si.IsTarget() && opts.fillRebMarker {
-		rebMarked := opts.htext.rebMarked()
-		cm.RebInterrupted, cm.Restarted = rebMarked.Interrupted, rebMarked.Restarted
+		cm.RebInterrupted, cm.Restarted = opts.htext.interruptedRestarted()
+	}
+	if !opts.skipPrimeTime && smap.IsPrimary(h.si) {
+		cm.PrimeTime = time.Now().UnixNano()
 	}
 	return cm, nil
 }
@@ -476,39 +478,19 @@ func (h *htrun) setDaemonConfigQuery(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *htrun) run() error {
-	config := cmn.GCO.Get()
-
-	// A wrapper to log http.Server errors
-	logger := log.New(&nlogWriter{}, "net/http err: ", 0)
-	if config.HostNet.UseIntraControl || config.HostNet.UseIntraData {
-		var errCh chan error
-		if config.HostNet.UseIntraControl && config.HostNet.UseIntraData {
-			errCh = make(chan error, 3)
-		} else {
-			errCh = make(chan error, 2)
-		}
-		if config.HostNet.UseIntraControl {
-			go func() {
-				addr := h.si.ControlNet.TCPEndpoint()
-				errCh <- h.netServ.control.listen(addr, logger)
-			}()
-		}
-		if config.HostNet.UseIntraData {
-			go func() {
-				addr := h.si.DataNet.TCPEndpoint()
-				errCh <- h.netServ.data.listen(addr, logger)
-			}()
-		}
+func (h *htrun) run(config *cmn.Config) error {
+	logger := log.New(&nlogWriter{}, "net/http err: ", 0) // a wrapper to log http.Server errors
+	if config.HostNet.UseIntraControl {
 		go func() {
-			addr := h.pubListeningAddr(config)
-			errCh <- h.netServ.pub.listen(addr, logger)
+			_ = h.netServ.control.listen(h.si.ControlNet.TCPEndpoint(), logger)
 		}()
-		return <-errCh
 	}
-
-	addr := h.pubListeningAddr(config)
-	return h.netServ.pub.listen(addr, logger)
+	if config.HostNet.UseIntraData {
+		go func() {
+			_ = h.netServ.data.listen(h.si.DataNet.TCPEndpoint(), logger)
+		}()
+	}
+	return h.netServ.pub.listen(h.pubListeningAddr(config), logger)
 }
 
 // testing environment excluding Kubernetes: listen on `host:port`
@@ -652,11 +634,13 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 		return
 	}
 
-	req.Header.Set(apc.HdrCallerID, h.si.ID())
+	req.Header.Set(apc.HdrCallerID, h.SID())
 	req.Header.Set(apc.HdrCallerName, h.si.Name())
-	debug.Assert(smap != nil)
 	if smap.vstr != "" {
-		req.Header.Set(apc.HdrCallerSmapVersion, smap.vstr)
+		if smap.IsPrimary(h.si) {
+			req.Header.Set(apc.HdrCallerIsPrimary, "true")
+		}
+		req.Header.Set(apc.HdrCallerSmapVer, smap.vstr)
 	}
 	req.Header.Set(cos.HdrUserAgent, ua)
 
@@ -673,11 +657,11 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 	if res.status >= http.StatusBadRequest {
 		if args.req.Method == http.MethodHead {
 			msg := resp.Header.Get(apc.HdrError)
-			res.err = res2HTTPErr(req, msg, res.status)
+			res.err = res.herr(req, msg)
 		} else {
 			b := cmn.NewBuffer()
 			b.ReadFrom(resp.Body)
-			res.err = res2HTTPErr(req, b.String(), res.status)
+			res.err = res.herr(req, b.String())
 			cmn.FreeBuffer(b)
 		}
 		res.details = res.err.Error()
@@ -700,7 +684,7 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 	}
 
 	if sid != unknownDaemonID {
-		h.keepalive.heardFrom(sid, false /* reset */)
+		h.keepalive.heardFrom(sid)
 	}
 	return
 }
@@ -1000,16 +984,6 @@ func (h *htrun) logerr(tag string, v any, err error) {
 	h.statsT.IncErr(stats.ErrHTTPWriteCount)
 }
 
-func res2HTTPErr(r *http.Request, msg string, status int) (herr *cmn.ErrHTTP) {
-	if msg != "" {
-		herr = cmn.Str2HTTPErr(msg)
-	}
-	if herr == nil {
-		herr = cmn.NewErrHTTP(r, errors.New(msg), status)
-	}
-	return
-}
-
 func _parseNCopies(value any) (copies int64, err error) {
 	switch v := value.(type) {
 	case string:
@@ -1058,7 +1032,7 @@ func (h *htrun) httpdaeget(w http.ResponseWriter, r *http.Request, query url.Val
 		body = h.owner.bmd.get()
 	case apc.WhatSmapVote:
 		var err error
-		body, err = h.cluMeta(cmetaFillOpt{htext: htext})
+		body, err = h.cluMeta(cmetaFillOpt{htext: htext, skipPrimeTime: true})
 		if err != nil {
 			nlog.Errorf("failed to fetch cluster config, err: %v", err)
 		}
@@ -1364,7 +1338,7 @@ func (h *htrun) bcastHealth(smap *smapX, checkAll bool) (*clusterInfo, int /*num
 	if checkAll || (c.cnt < maxVerConfirmations && smap.CountActiveTs() > 0) {
 		h._bch(&c, smap, apc.Target)
 	}
-	nlog.Infof("%s: %s", h.si, c.maxCii.String())
+	nlog.Infoln(h.String()+":", c.maxCii.String())
 	return c.maxCii, c.cnt
 }
 
@@ -1380,7 +1354,7 @@ func (h *htrun) _bch(c *getMaxCii, smap *smapX, nodeTy string) {
 	if c.checkAll {
 		wg = cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), len(nodemap))
 	} else {
-		count = cos.Min(meta.MaxBcastParallel(), maxVerConfirmations<<1)
+		count = min(meta.MaxBcastParallel(), maxVerConfirmations<<1)
 		wg = cos.NewLimitedWaitGroup(count, len(nodemap) /*have*/)
 	}
 	for sid, si := range nodemap {
@@ -1655,7 +1629,8 @@ func (h *htrun) _recvCfg(newConfig *globalConfig, payload msPayload) (err error)
 	if err = cmn.GCO.Update(&newConfig.ClusterConfig); err != nil {
 		return
 	}
-	// update assorted read-mostly knobs
+
+	// NOTE: update assorted read-mostly knobs
 	cmn.Features = newConfig.Features
 	cmn.Timeout.Set(&newConfig.ClusterConfig)
 	return
@@ -1746,7 +1721,7 @@ func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res 
 	for _, u := range contactURLs {
 		addCandidate(u)
 	}
-	sleep := cos.MaxDuration(2*time.Second, cmn.Timeout.MaxKeepalive())
+	sleep := max(2*time.Second, cmn.Timeout.MaxKeepalive())
 	for i := 0; i < 4; i++ {
 		for _, candidateURL := range candidates {
 			if daemon.stopping.Load() {
@@ -1758,7 +1733,7 @@ func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res 
 			}
 			res = h.regTo(candidateURL, nil, apc.DefaultTimeout, query, htext, false /*keepalive*/)
 			if res.err == nil {
-				nlog.Infof("%s: primary responded Ok via %s", h.si, candidateURL)
+				nlog.Infoln(h.String()+": primary responded Ok via", candidateURL)
 				return // ok
 			}
 			resPrev = res
@@ -1787,7 +1762,7 @@ func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res 
 	}
 	res = h.regTo(primaryURL, nil, apc.DefaultTimeout, query, htext, false /*keepalive*/)
 	if res.err == nil {
-		nlog.Infof("%s: joined cluster via %s", h.si, primaryURL)
+		nlog.Infoln(h.String()+": joined cluster via", primaryURL)
 	}
 	return
 }
@@ -1804,6 +1779,7 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, q url.Val
 			skipConfig:    keepalive,
 			skipEtlMD:     keepalive,
 			fillRebMarker: !keepalive,
+			skipPrimeTime: true,
 		}
 	)
 	cm, err := h.cluMeta(opts)
@@ -1833,13 +1809,32 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, q url.Val
 	return res
 }
 
-func (h *htrun) sendKalive(smap *smapX, htext htext, timeout time.Duration) (pid string, status int, err error) {
+func (h *htrun) sendKalive(smap *smapX, htext htext, timeout time.Duration, fast bool) (pid string, status int, err error) {
 	if daemon.stopping.Load() {
-		err = fmt.Errorf("%s is stopping", h)
+		err = errors.New(h.String() + " is stopping")
 		return
 	}
 	primaryURL, psi := h.getPrimaryURLAndSI(smap)
 	pid = psi.ID()
+
+	if fast {
+		// fast path
+		debug.Assert(h.ClusterStarted())
+		path := apc.URLPathCluKalive.Join(h.SID())
+		cargs := allocCargs()
+		{
+			cargs.si = psi
+			cargs.req = cmn.HreqArgs{Method: http.MethodPost, Base: primaryURL, Path: path}
+			cargs.timeout = timeout
+		}
+		res := h.call(cargs, smap)
+		freeCargs(cargs)
+		err = res.err
+		freeCR(res)
+		return
+	}
+
+	// slow path
 	res := h.regTo(primaryURL, psi, timeout, nil, htext, true /*keepalive*/)
 	if res.err != nil {
 		if strings.Contains(res.err.Error(), ciePrefix) {
@@ -1849,7 +1844,6 @@ func (h *htrun) sendKalive(smap *smapX, htext htext, timeout time.Duration) (pid
 		freeCR(res)
 		return
 	}
-	debug.Assert(len(res.bytes) == 0)
 	freeCR(res)
 	return
 }
@@ -1873,7 +1867,7 @@ func (h *htrun) pollClusterStarted(config *cmn.Config, psi *meta.Snode) (maxCii 
 		query                    = url.Values{apc.QparamAskPrimary: []string{"true"}}
 	)
 	for {
-		sleep = cos.MinDuration(cmn.Timeout.MaxKeepalive(), sleep+time.Second)
+		sleep = min(cmn.Timeout.MaxKeepalive(), sleep+time.Second)
 		time.Sleep(sleep)
 		total += sleep
 		rediscover += sleep
@@ -1890,7 +1884,7 @@ func (h *htrun) pollClusterStarted(config *cmn.Config, psi *meta.Snode) (maxCii 
 		}
 		if _, _, err := h.reqHealth(smap.Primary, healthTimeout, query /*ask primary*/, smap); err == nil {
 			// log
-			s := fmt.Sprintf("%s via primary health: cluster startup ok, %s", h.si, smap.StringEx())
+			s := fmt.Sprintf("%s via primary health: cluster startup Ok, %s", h.si, smap.StringEx())
 			if self := smap.GetNode(h.si.ID()); self == nil {
 				nlog.Warningln(s + "; NOTE: not present in the cluster map")
 			} else if self.Flags.IsSet(meta.SnodeMaint) {
@@ -1950,7 +1944,8 @@ func (h *htrun) unregisterSelf(ignoreErr bool) (err error) {
 	return
 }
 
-func (h *htrun) healthByExternalWD(w http.ResponseWriter, r *http.Request) (responded bool) {
+// via /health handler
+func (h *htrun) externalWD(w http.ResponseWriter, r *http.Request) (responded bool) {
 	callerID := r.Header.Get(apc.HdrCallerID)
 	caller := r.Header.Get(apc.HdrCallerName)
 	// external call
@@ -1985,7 +1980,7 @@ func (h *htrun) isIntraCall(hdr http.Header, fromPrimary bool) (err error) {
 		smap       = h.owner.smap.get()
 		callerID   = hdr.Get(apc.HdrCallerID)
 		callerName = hdr.Get(apc.HdrCallerName)
-		callerSver = hdr.Get(apc.HdrCallerSmapVersion)
+		callerSver = hdr.Get(apc.HdrCallerSmapVer)
 		callerVer  int64
 		erP        error
 	)
@@ -2060,14 +2055,19 @@ func isRedirect(q url.Values) (ptime string) {
 	return q.Get(apc.QparamUnixTime)
 }
 
-func ptLatency(tts int64, ptime string) (delta int64) {
+func ptLatency(tts int64, ptime, isPrimary string) (dur int64) {
 	pts, err := cos.S2UnixNano(ptime)
 	if err != nil {
+		debug.AssertNoErr(err)
 		return
 	}
-	delta = tts - pts
-	if delta < 0 && -delta < int64(clusterClockDrift) {
-		delta = 0
+	if ok, _ := cos.ParseBool(isPrimary); ok {
+		xreg.PrimeTime.Store(pts)
+		xreg.MyTime.Store(tts)
+	}
+	dur = tts - pts
+	if dur < 0 && -dur < int64(clusterClockDrift) {
+		dur = 0
 	}
 	return
 }
@@ -2169,7 +2169,7 @@ func (res *callResult) toErr() error {
 	if res.err == nil {
 		return nil
 	}
-	// cmn.ErrHTTP
+	// is cmn.ErrHTTP
 	if herr := cmn.Err2HTTPErr(res.err); herr != nil {
 		// add status, details
 		if res.status >= http.StatusBadRequest {
@@ -2186,12 +2186,24 @@ func (res *callResult) toErr() error {
 		if res.details != "" {
 			detail = "[" + res.details + "]"
 		}
-		return cmn.NewErrHTTP(nil, fmt.Errorf("%v%s", res.err, detail), res.status)
+		return res.herr(nil, fmt.Sprintf("%v%s", res.err, detail))
 	}
 	if res.details == "" {
 		return res.err
 	}
 	return cmn.NewErrFailedTo(nil, "call "+res.si.StringEx(), res.details, res.err)
+}
+
+func (res *callResult) herr(r *http.Request, msg string) *cmn.ErrHTTP {
+	orig := &cmn.ErrHTTP{}
+	if e := jsoniter.Unmarshal([]byte(msg), orig); e == nil {
+		return orig
+	}
+	nherr := cmn.NewErrHTTP(r, errors.New(msg), res.status)
+	if res.si != nil {
+		nherr.Node = res.si.StringEx()
+	}
+	return nherr
 }
 
 func (res *callResult) errorf(format string, a ...any) error {

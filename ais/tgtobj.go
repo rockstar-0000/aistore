@@ -32,6 +32,7 @@ import (
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/mirror"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
@@ -69,7 +70,6 @@ type (
 		archive    archiveQuery    // archive query
 		ranges     byteRanges      // range read (see https://www.rfc-editor.org/rfc/rfc7233#section-2.1)
 		atime      int64           // access time
-		latency    int64           // get vnanoseconds
 		isGFN      bool            // is GFN
 		chunked    bool            // chunked transfer (en)coding: https://tools.ietf.org/html/rfc7230#page-36
 		unlocked   bool            // internal
@@ -85,7 +85,7 @@ type (
 	}
 	// (see also putA2I)
 	apndOI struct {
-		started time.Time     // started time of receiving - used to calculate the recv duration
+		started int64         // started time of receiving - used to calculate the recv duration
 		r       io.ReadCloser // reader with the content of the object.
 		t       *target       // this
 		lom     *cluster.LOM  // append to
@@ -119,7 +119,7 @@ type (
 		lom      *cluster.LOM  // resulting shard
 		filename string        // fqn inside
 		mime     string        // format
-		started  time.Time     // time of receiving
+		started  int64         // time of receiving
 		size     int64         // aka Content-Length
 		put      bool          // overwrite
 	}
@@ -177,18 +177,22 @@ func (poi *putOI) putObject() (errCode int, err error) {
 	if errCode, err = poi.finalize(); err != nil {
 		goto rerr
 	}
+	//
 	// stats
+	//
 	if !poi.t2t {
 		// NOTE: counting only user PUTs; ignoring EC and copies, on the one hand, and
 		// same-checksum-skip-writing, on the other
 		if poi.owt == cmn.OwtPut && poi.restful {
 			debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
-			now := time.Now().UnixNano()
 			poi.t.statsT.AddMany(
 				cos.NamedVal64{Name: stats.PutCount, Value: 1},
 				cos.NamedVal64{Name: stats.PutThroughput, Value: poi.lom.SizeBytes()},
-				cos.NamedVal64{Name: stats.PutLatency, Value: now - poi.atime},
 			)
+			if sparseVerbStats(poi.atime) {
+				// see also: sparseRedirStats
+				poi.t.statsT.Add(stats.PutLatency, time.Now().UnixNano()-poi.atime)
+			}
 			// via /s3 (TODO: revisit)
 			if poi.resphdr != nil {
 				cmn.ToHeader(poi.lom.ObjAttrs(), poi.resphdr)
@@ -240,7 +244,7 @@ func (poi *putOI) finalize() (errCode int, err error) {
 	if !poi.skipEC {
 		if ecErr := ec.ECM.EncodeObject(poi.lom); ecErr != nil && ecErr != ec.ErrorECDisabled {
 			err = ecErr
-			if cmn.IsErrCapacityExceeded(err) {
+			if cmn.IsErrCapExceeded(err) {
 				errCode = http.StatusInsufficientStorage
 			}
 			return
@@ -512,8 +516,8 @@ do:
 			return
 		}
 		cs = fs.Cap()
-		if cs.OOS {
-			errCode, err = http.StatusInsufficientStorage, cs.Err
+		if cs.IsOOS() {
+			errCode, err = http.StatusInsufficientStorage, cs.Err()
 			return
 		}
 	}
@@ -580,8 +584,8 @@ do:
 		if cs.IsNil() {
 			cs = fs.Cap()
 		}
-		if cs.OOS {
-			errCode, err = http.StatusInsufficientStorage, cs.Err
+		if cs.IsOOS() {
+			errCode, err = http.StatusInsufficientStorage, cs.Err()
 			return
 		}
 		goi.lom.SetAtimeUnix(goi.atime)
@@ -762,7 +766,7 @@ gfn:
 		err = cmn.NewErrFailedTo(tname, "load EC-recovered", goi.lom, ecErr)
 	} else if ecErr != ec.ErrorECDisabled {
 		err = cmn.NewErrFailedTo(tname, "EC-recover", goi.lom, ecErr)
-		if cmn.IsErrCapacityExceeded(ecErr) {
+		if cmn.IsErrCapExceeded(ecErr) {
 			errCode = http.StatusInsufficientStorage
 		}
 		return
@@ -778,7 +782,7 @@ gfn:
 }
 
 func (goi *getOI) getFromNeighbor(lom *cluster.LOM, tsi *meta.Snode) bool {
-	query := lom.Bck().AddToQuery(nil)
+	query := lom.Bck().NewQuery()
 	query.Set(apc.QparamIsGFNRequest, "true")
 	reqArgs := cmn.AllocHra()
 	{
@@ -977,12 +981,17 @@ func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string, coldGet bool) er
 	if goi.isGFN {
 		goi.t.reb.FilterAdd([]byte(goi.lom.Uname()))
 	}
+	//
 	// stats
+	//
 	goi.t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetThroughput, Value: written},
-		cos.NamedVal64{Name: stats.GetLatency, Value: mono.SinceNano(goi.latency)},
 		cos.NamedVal64{Name: stats.GetCount, Value: 1},
+		cos.NamedVal64{Name: stats.GetThroughput, Value: written},
 	)
+	if sparseVerbStats(goi.atime) {
+		// see also: sparseRedirStats
+		goi.t.statsT.Add(stats.GetLatency, time.Now().UnixNano()-goi.atime)
+	}
 	if goi.verchanged {
 		goi.t.statsT.AddMany(
 			cos.NamedVal64{Name: stats.VerChangeCount, Value: 1},
@@ -1105,10 +1114,10 @@ func (a *apndOI) do() (newHandle string, errCode int, err error) {
 		return
 	}
 
-	delta := time.Since(a.started)
+	delta := time.Now().UnixNano() - a.started
 	a.t.statsT.AddMany(
 		cos.NamedVal64{Name: stats.AppendCount, Value: 1},
-		cos.NamedVal64{Name: stats.AppendLatency, Value: int64(delta)},
+		cos.NamedVal64{Name: stats.AppendLatency, Value: delta},
 	)
 	if cmn.FastV(4, cos.SmoduleAIS) {
 		nlog.Infof("APPEND %s: %s", a.lom, delta)
@@ -1428,7 +1437,7 @@ func (coi *copyOI) dm(lom *cluster.LOM, sargs *sendArgs) error {
 func (coi *copyOI) put(sargs *sendArgs) error {
 	var (
 		hdr   = make(http.Header, 8)
-		query = sargs.bckTo.AddToQuery(nil)
+		query = sargs.bckTo.NewQuery()
 	)
 	cmn.ToHeader(sargs.objAttrs, hdr)
 	hdr.Set(apc.HdrT2TPutterID, coi.t.SID())
@@ -1519,7 +1528,7 @@ cpap: // copy + append
 		return http.StatusInternalServerError, err
 	}
 	// currently, arch writers only use size and time but it may change
-	oah := cos.SimpleOAH{Size: a.size, Atime: a.started.UnixNano()}
+	oah := cos.SimpleOAH{Size: a.size, Atime: a.started}
 	if a.put {
 		// when append becomes PUT (TODO: checksum type)
 		cksum.Init(cos.ChecksumXXHash)
@@ -1563,7 +1572,7 @@ func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format) (size int64, err erro
 			Typeflag: tar.TypeReg,
 			Name:     a.filename,
 			Size:     a.size,
-			ModTime:  a.started,
+			ModTime:  time.Unix(0, a.started),
 			Mode:     int64(cos.PermRWRR),
 			Format:   tarFormat,
 		}
@@ -1581,7 +1590,7 @@ func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format) (size int64, err erro
 
 func (*putA2I) reterr(err error) (int, error) {
 	errCode := http.StatusInternalServerError
-	if cmn.IsErrCapacityExceeded(err) {
+	if cmn.IsErrCapExceeded(err) {
 		errCode = http.StatusInsufficientStorage
 	}
 	return errCode, err
@@ -1599,7 +1608,7 @@ func (a *putA2I) finalize(size int64, cksum *cos.Cksum, fqn string) error {
 	}
 	a.lom.SetSize(size)
 	a.lom.SetCksum(cksum)
-	a.lom.SetAtimeUnix(a.started.UnixNano())
+	a.lom.SetAtimeUnix(a.started)
 	if err := a.lom.Persist(); err != nil {
 		return err
 	}
@@ -1610,6 +1619,38 @@ func (a *putA2I) finalize(size int64, cksum *cos.Cksum, fqn string) error {
 	}
 	a.t.putMirror(a.lom)
 	return nil
+}
+
+//
+// put mirorr (main)
+//
+
+func (t *target) putMirror(lom *cluster.LOM) {
+	mconfig := lom.MirrorConf()
+	if !mconfig.Enabled {
+		return
+	}
+	if mpathCnt := fs.NumAvail(); mpathCnt < int(mconfig.Copies) {
+		t.statsT.IncErr(stats.ErrPutMirrorCount)
+		nanotim := mono.NanoTime()
+		if nanotim&0x7 == 7 {
+			if mpathCnt == 0 {
+				nlog.Errorf("%s: %v", t, cmn.ErrNoMountpaths)
+			} else {
+				nlog.Errorf(fmtErrInsuffMpaths2, t, mpathCnt, lom, mconfig.Copies)
+			}
+		}
+		return
+	}
+	rns := xreg.RenewPutMirror(t, lom)
+	if rns.Err != nil {
+		nlog.Errorf("%s: %s %v", t, lom, rns.Err)
+		debug.AssertNoErr(rns.Err)
+		return
+	}
+	xctn := rns.Entry.Get()
+	xputlrep := xctn.(*mirror.XactPut)
+	xputlrep.Repl(lom)
 }
 
 //

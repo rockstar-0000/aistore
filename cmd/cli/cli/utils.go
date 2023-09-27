@@ -166,7 +166,7 @@ func _refreshRate(c *cli.Context) time.Duration {
 	refreshRate := refreshRateDefault
 	if flagIsSet(c, refreshFlag) {
 		duration := parseDurationFlag(c, refreshFlag)
-		refreshRate = cos.MaxDuration(duration, refreshRateMinDur)
+		refreshRate = max(duration, refreshRateMinDur)
 	}
 	return refreshRate // aka sleep
 }
@@ -447,11 +447,11 @@ func headBucket(bck cmn.Bck, dontAddBckMD bool) (p *cmn.BucketProps, err error) 
 	}
 	if herr, ok := err.(*cmn.ErrHTTP); ok {
 		switch {
-		case verbose():
+		case configuredVerbosity():
 			herr.Message = herr.StringEx()
 			err = errors.New(herr.Message)
 		case herr.Status == http.StatusNotFound:
-			err = fmt.Errorf("bucket %q does not exist", bck)
+			err = &errDoesNotExist{what: "bucket", name: bck.Cname("")}
 		case herr.Message != "":
 			err = errors.New(herr.Message)
 		default:
@@ -478,7 +478,7 @@ func limitedLineWriter(w io.Writer, maxLines int, fmtStr string, args ...[]strin
 	}
 	minLen := math.MaxInt64
 	for _, a := range args {
-		minLen = cos.Min(minLen, len(a))
+		minLen = min(minLen, len(a))
 	}
 
 	i := 0

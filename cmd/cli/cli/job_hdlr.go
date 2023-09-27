@@ -16,7 +16,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/ext/dsort"
@@ -537,7 +536,7 @@ func actionDownloaded(c *cli.Context, cnt int) {
 func bgDownload(c *cli.Context, id string) (err error) {
 	var (
 		resp           *dload.StatusResp
-		startedTimeout = cos.MaxDuration(dloadStartedTime, refreshRateMinDur*2)
+		startedTimeout = max(dloadStartedTime, refreshRateMinDur*2)
 	)
 
 	// In a non-interactive mode, allow downloader to start before checking
@@ -1055,13 +1054,13 @@ func waitDsortHandler(c *cli.Context, id string) error {
 		}
 		finished := true
 		for _, targetMetrics := range resp {
-			if targetMetrics.Aborted.Load() {
+			if targetMetrics.Metrics.Aborted.Load() {
 				if total > wasFast {
 					fmt.Fprintln(c.App.Writer)
 				}
 				return fmt.Errorf("%s was aborted", qn)
 			}
-			finished = finished && targetMetrics.Creation.Finished
+			finished = finished && targetMetrics.Metrics.Creation.Finished
 		}
 		if finished {
 			break
@@ -1192,7 +1191,7 @@ func jobArgs(c *cli.Context, shift int, ignoreDaemonID bool) (name, xid, daemonI
 	daemonID = c.Args().Get(shift + 2)
 
 	// validate and reassign
-	if name != "" && name != dsort.DSortName {
+	if name != "" && name != apc.ActDsort {
 		if xactKind, _ := xact.GetKindName(name); xactKind == "" {
 			daemonID = xid
 			xid = name

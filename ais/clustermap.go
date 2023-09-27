@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"unsafe"
+	ratomic "sync/atomic"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster/meta"
@@ -57,7 +57,7 @@ type (
 		meta.Smap
 	}
 	smapOwner struct {
-		smap    atomic.Pointer
+		smap    ratomic.Pointer[smapX]
 		sls     *sls
 		fpath   string
 		immSize int64
@@ -461,13 +461,11 @@ func (r *smapOwner) Listeners() meta.SmapListeners { return r.sls }
 func (r *smapOwner) put(smap *smapX) {
 	smap.InitDigests()
 	smap.vstr = strconv.FormatInt(smap.Version, 10)
-	r.smap.Store(unsafe.Pointer(smap))
+	r.smap.Store(smap)
 	r.sls.notify(smap.version())
 }
 
-func (r *smapOwner) get() (smap *smapX) {
-	return (*smapX)(r.smap.Load())
-}
+func (r *smapOwner) get() (smap *smapX) { return r.smap.Load() }
 
 func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayload, cb smapUpdatedCB) (err error) {
 	if err = newSmap.validate(); err != nil {
@@ -475,11 +473,15 @@ func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayloa
 		return
 	}
 
-	var ofl, nfl cos.BitFlags
+	var (
+		ofl, nfl cos.BitFlags
+		ofs, nfs string
+	)
 	r.mu.Lock()
 	smap := r.get()
 	if nsi := newSmap.GetNode(si.ID()); nsi != nil && si.Flags != nsi.Flags {
 		ofl, nfl = si.Flags, nsi.Flags
+		ofs, nfs = si.Fl2S(), nsi.Fl2S()
 		si.Flags = nsi.Flags
 	}
 	if smap != nil {
@@ -503,7 +505,7 @@ func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayloa
 
 	if err == nil {
 		if ofl != nfl {
-			nlog.Infof("%s flags: from %#b to %#b", si, ofl, nfl)
+			nlog.Infof("%s flags: from %s to %s", si, ofs, nfs)
 		}
 		cb(newSmap, smap, nfl, ofl)
 	}
@@ -535,7 +537,7 @@ func (r *smapOwner) persist(newSmap *smapX) error {
 		wto = newSmap._sgl
 	} else {
 		sgl := newSmap._encode(r.immSize)
-		r.immSize = cos.MaxI64(r.immSize, sgl.Len())
+		r.immSize = max(r.immSize, sgl.Len())
 		defer sgl.Free()
 		wto = sgl
 	}
@@ -550,7 +552,7 @@ func (r *smapOwner) prepost(ctx *smapModifier) (clone *smapX, err error) {
 		return
 	}
 	clone._sgl = clone._encode(r.immSize)
-	r.immSize = cos.MaxI64(r.immSize, clone._sgl.Len())
+	r.immSize = max(r.immSize, clone._sgl.Len())
 	if err := r.persist(clone); err != nil {
 		clone._free()
 		return nil, cmn.NewErrFailedTo(nil, "persist", clone, err)
@@ -585,8 +587,8 @@ func (r *smapOwner) modify(ctx *smapModifier) error {
 
 func newSmapListeners() *sls {
 	sls := &sls{
-		listeners: make(map[string]meta.Slistener, 8),
-		postCh:    make(chan int64, 8),
+		listeners: make(map[string]meta.Slistener, 16),
+		postCh:    make(chan int64, 32),
 	}
 	return sls
 }
@@ -605,7 +607,7 @@ func (sls *sls) run() {
 		sls.mu.RLock()
 		for _, l := range sls.listeners {
 			// NOTE: Reg() or Unreg() from inside ListenSmapChanged() callback
-			//       may cause a trivial deadlock
+			// may cause a trivial deadlock
 			l.ListenSmapChanged()
 		}
 		sls.mu.RUnlock()
@@ -643,8 +645,12 @@ func (sls *sls) Unreg(sl meta.Slistener) {
 }
 
 func (sls *sls) notify(ver int64) {
-	cos.Assert(ver >= 0)
-	if sls.running.Load() {
-		sls.postCh <- ver
+	debug.Assert(ver >= 0)
+	if !sls.running.Load() {
+		return
+	}
+	sls.postCh <- ver
+	if len(sls.postCh) == cap(sls.postCh) {
+		nlog.ErrorDepth(1, "sls channel full: Smap v", ver) // unlikely
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,7 +31,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/kvdb"
-	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/dload"
@@ -47,7 +45,6 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/volume"
-	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
@@ -75,14 +72,30 @@ type (
 	}
 )
 
+type redial struct {
+	t         *target
+	dialTout  time.Duration
+	totalTout time.Duration
+	inUse     string
+}
+
 // interface guard
 var (
 	_ cos.Runner = (*target)(nil)
 	_ htext      = (*target)(nil)
 )
 
-func (*target) Name() string           { return apc.Target }          // as cos.Runner
-func (*target) rebMarked() xact.Marked { return xreg.GetRebMarked() } // as htext
+func (*target) Name() string { return apc.Target } // as cos.Runner
+
+// as htext
+func (*target) interruptedRestarted() (interrupted, restarted bool) {
+	interrupted = fs.MarkerExists(fname.RebalanceMarker)
+	restarted = fs.MarkerExists(fname.NodeRestartedPrev)
+	return
+}
+
+func sparseVerbStats(tm int64) bool  { return tm&7 == 1 }
+func sparseRedirStats(tm int64) bool { return tm&3 == 2 }
 
 //
 // target
@@ -98,9 +111,9 @@ func (t *target) initBackends() {
 
 	if aisConf := config.Backend.Get(apc.AIS); aisConf != nil {
 		if err := aisBackend.Apply(aisConf, "init", &config.ClusterConfig); err != nil {
-			nlog.Errorf("%s: %v - proceeding to start anyway...", t, err)
+			nlog.Errorln(t.String()+":", err, "- proceeding to start anyway")
 		} else {
-			nlog.Infof("%s: remote-ais %v", t, aisConf)
+			nlog.Infoln(t.String()+": remote-ais", aisConf)
 		}
 	}
 
@@ -154,7 +167,7 @@ func (t *target) _initBuiltin() error {
 	case len(disabled) > 0:
 		nlog.Warningf("%s backends: enabled %v, disabled %v", t, enabled, disabled)
 	default:
-		nlog.Infof("%s backends: %v", t, enabled)
+		nlog.Infoln(t.String(), "backends:", enabled)
 	}
 	return nil
 }
@@ -166,6 +179,11 @@ func (t *target) aisBackend() *backend.AISBackendProvider {
 
 func (t *target) init(config *cmn.Config) {
 	t.initNetworks()
+
+	// (a) get node ID from command-line or env var (see envDaemonID())
+	// (b) load existing node ID (replicated xattr at roots of respective mountpaths)
+	// (c) generate a new one (genDaemonID())
+	// - in that exact sequence
 	tid, generated := initTID(config)
 	if generated && len(config.FSP.Paths) > 0 {
 		// in an unlikely case of losing all mountpath-stored IDs but still having a volume
@@ -184,7 +202,7 @@ func (t *target) init(config *cmn.Config) {
 	daemon.rg.add(t)
 
 	ts := stats.NewTrunner(t) // iostat below
-	startedUp := ts.Init(t)
+	startedUp := ts.Init(t)   // reg common metrics (and target-only - via RegMetrics/regDiskMetrics below)
 	daemon.rg.add(ts)
 	t.statsT = ts // stats tracker
 
@@ -263,10 +281,10 @@ func initTID(config *cmn.Config) (tid string, generated bool) {
 	return
 }
 
-func regDiskMetrics(tstats *stats.Trunner, mpi fs.MPI) {
+func regDiskMetrics(node *meta.Snode, tstats *stats.Trunner, mpi fs.MPI) {
 	for _, mi := range mpi {
 		for _, disk := range mi.Disks {
-			tstats.RegDiskMetrics(disk)
+			tstats.RegDiskMetrics(node, disk)
 		}
 	}
 }
@@ -287,11 +305,11 @@ func (t *target) Run() error {
 	if len(availablePaths) == 0 {
 		cos.ExitLog(cmn.ErrNoMountpaths)
 	}
-	regDiskMetrics(tstats, availablePaths)
-	regDiskMetrics(tstats, disabledPaths)
+	regDiskMetrics(t.si, tstats, availablePaths)
+	regDiskMetrics(t.si, tstats, disabledPaths)
 	t.statsT.RegMetrics(t.si) // + Prometheus, if configured
 
-	fatalErr, writeErr := t.checkRestarted()
+	fatalErr, writeErr := t.checkRestarted(config)
 	if fatalErr != nil {
 		cos.ExitLog(fatalErr)
 	}
@@ -302,12 +320,8 @@ func (t *target) Run() error {
 	}
 
 	// register object type and workfile type
-	if err := fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}); err != nil {
-		cos.ExitLog(err)
-	}
-	if err := fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}); err != nil {
-		cos.ExitLog(err)
-	}
+	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
+	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
 
 	// Init meta-owners and load local instances
 	if prev := t.owner.bmd.init(); prev {
@@ -320,21 +334,21 @@ func (t *target) Run() error {
 		smap = newSmap()
 		smap.Tmap[t.SID()] = t.si // add self to initial temp smap
 	} else {
-		nlog.Infof("%s: loaded %s", t.si.StringEx(), smap.StringEx())
+		nlog.Infoln(t.String()+": loaded", smap.StringEx())
 	}
 	t.owner.smap.put(smap)
 
 	if daemon.cli.target.standby {
 		tstats.Standby(true)
 		t.regstate.disabled.Store(true)
-		nlog.Warningf("%s not joining - standing by...", t)
+		nlog.Warningln(t.String(), "not joining - standing by")
 
 		// see endStartupStandby()
 	} else {
 		// discover primary and join cluster (compare with manual `apc.AdminJoin`)
 		if status, err := t.joinCluster(apc.ActSelfJoinTarget); err != nil {
-			nlog.Errorf("%s failed to join cluster (status: %d, err: %v)", t, status, err)
-			nlog.Errorf("%s is terminating", t)
+			nlog.Errorf("%s failed to join cluster: %v(%d)", t, err, status)
+			nlog.Errorln(t.String(), "terminating")
 			return err
 		}
 		t.markNodeStarted()
@@ -345,7 +359,7 @@ func (t *target) Run() error {
 
 	db, err := kvdb.NewBuntDB(filepath.Join(config.ConfigDir, dbName))
 	if err != nil {
-		nlog.Errorf("Failed to initialize DB: %v", err)
+		nlog.Errorln(t.String(), "failed to initialize kvdb:", err)
 		return err
 	}
 
@@ -372,10 +386,9 @@ func (t *target) Run() error {
 		go t.goreslver(marked.Interrupted)
 	}
 
-	dsort.InitManagers(db)
-	dsort.RegisterNode(t.owner.smap, t.owner.bmd, t.si, t, t.statsT)
+	dsort.Tinit(t, t.statsT, db)
 
-	err = t.htrun.run()
+	err = t.htrun.run(config)
 
 	etl.StopAll(t)                             // stop all running ETLs if any
 	cos.Close(db)                              // close kv db
@@ -471,17 +484,13 @@ func (t *target) initRecvHandlers() {
 	t.regNetHandlers(networkHandlers)
 }
 
-func (t *target) checkRestarted() (fatalErr, writeErr error) {
+func (t *target) checkRestarted(config *cmn.Config) (fatalErr, writeErr error) {
 	if fs.MarkerExists(fname.NodeRestartedMarker) {
-		// NOTE the risk: duplicate aisnode run - which'll fail shortly with "bind:
-		// address already in use" but not before triggering (`NodeRestartedPrev` => GFN)
-		// sequence and stealing nlog symlinks - that's why we go extra length
-		if _lsof(t.si.PubNet.TCPEndpoint()) {
-			fatalErr = fmt.Errorf("%s: %q is in use (duplicate or overlapping run?)",
-				t, t.si.PubNet.TCPEndpoint())
+		red := redial{t: t, dialTout: config.Timeout.CplaneOperation.D(), totalTout: config.Timeout.MaxKeepalive.D()}
+		if red.acked() {
+			fatalErr = fmt.Errorf("%s: %q is in use (duplicate or overlapping run?)", t, red.inUse)
 			return
 		}
-
 		t.statsT.Inc(stats.RestartCount)
 		fs.PersistMarker(fname.NodeRestartedPrev)
 	}
@@ -489,12 +498,45 @@ func (t *target) checkRestarted() (fatalErr, writeErr error) {
 	return
 }
 
-// only when restarted marker exists
-func _lsof(addr string) bool {
-	arg := []string{"-sTCP:LISTEN", "-i", "tcp@" + addr}
-	cmd := exec.Command("lsof", arg...)
-	_, err := cmd.CombinedOutput()
-	return err == nil // detected dup
+// NOTE in re 'node-restarted' scenario: the risk of "overlapping" aisnode run -
+// which'll fail shortly with "bind: address already in use" but not before
+// triggering (`NodeRestartedPrev` => GFN) sequence and stealing nlog symlinks
+// - this risk exists, and that's why we go extra length
+func (red *redial) acked() bool {
+	var (
+		err   error
+		tsi   = red.t.si
+		sleep = cos.ProbingFrequency(red.totalTout)
+		addrs = []string{tsi.PubNet.TCPEndpoint()}
+		once  bool
+	)
+	if ep := red.t.si.DataNet.TCPEndpoint(); ep != addrs[0] {
+		addrs = append(addrs, ep)
+	} else if ep := red.t.si.ControlNet.TCPEndpoint(); ep != addrs[0] {
+		addrs = append(addrs, ep)
+	}
+	for _, addr := range addrs {
+		for elapsed := time.Duration(0); elapsed < red.totalTout; elapsed += sleep {
+			_, err = net.DialTimeout("tcp4", addr, max(2*time.Second, red.dialTout))
+			if err != nil {
+				break
+			}
+			once = true
+			time.Sleep(sleep)
+			// could be shutting down
+		}
+		if !once {
+			return false
+		}
+		if err == nil {
+			if red.inUse == "" {
+				red.inUse = addr
+			}
+			return true
+		}
+		time.Sleep(sleep)
+	}
+	return false // got tcp synack at least once but not (getting it) any longer
 }
 
 //
@@ -632,7 +674,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 			err = lom.InitBck(bck.Bucket())
 		}
 		if err != nil {
-			t.writeErr(w, r, err)
+			t._erris(w, r, dpq.silent, err, 0)
 			return lom
 		}
 	}
@@ -649,18 +691,15 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 			filename = rel
 		}
 	}
-	// GET latency and access time
-	tm := mono.NanoTime()
-	atime := time.Now().UnixNano()
-	if dpq.ptime != "" && tm&0x5 == 5 {
-		if redelta := ptLatency(atime, dpq.ptime); redelta != 0 {
-			t.statsT.Add(stats.GetRedirLatency, redelta)
-		}
-	}
+	// GET context
 	goi := allocGOI()
 	{
-		goi.atime = atime
-		goi.latency = tm // assigned upon transmitting resp.
+		goi.atime = time.Now().UnixNano()
+		if dpq.ptime != "" && sparseRedirStats(goi.atime) {
+			if d := ptLatency(goi.atime, dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
+				t.statsT.Add(stats.GetRedirLatency, d)
+			}
+		}
 		goi.t = t
 		goi.lom = lom
 		goi.w = w
@@ -680,7 +719,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 	if errCode, err := goi.getObject(); err != nil {
 		t.statsT.IncErr(stats.GetCount)
 		if err != errSendingResp {
-			t.writeErr(w, r, err, errCode)
+			t._erris(w, r, dpq.silent, err, errCode)
 		}
 	}
 	lom = goi.lom
@@ -688,27 +727,33 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 	return lom
 }
 
+// err in silence
+func (t *target) _erris(w http.ResponseWriter, r *http.Request, silent string /*apc.QparamSilent*/, err error, code int) {
+	if cos.IsParseBool(silent) {
+		t.writeErr(w, r, err, code, Silent)
+	} else {
+		t.writeErr(w, r, err, code)
+	}
+}
+
 // PUT /v1/objects/bucket-name/object-name; does:
 // 1) append object 2) append to archive 3) PUT
 func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRequest, lom *cluster.LOM) {
 	var (
 		config  = cmn.GCO.Get()
-		started = time.Now()
+		started = time.Now().UnixNano()
 		t2tput  = isT2TPut(r.Header)
 	)
-	if apireq.dpq.ptime == "" {
-		if !t2tput {
-			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
-			return
-		}
-	} else if redelta := ptLatency(started.UnixNano(), apireq.dpq.ptime); redelta != 0 {
-		t.statsT.Add(stats.PutRedirLatency, redelta)
+	if apireq.dpq.ptime == "" && !t2tput {
+		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
+		return
 	}
-	if cs := fs.Cap(); cs.Err != nil || cs.PctMax > int32(config.Space.CleanupWM) {
+	cs := fs.Cap()
+	if errCap := cs.Err(); errCap != nil || cs.PctMax > int32(config.Space.CleanupWM) {
 		cs = t.OOS(nil)
-		if cs.OOS {
+		if cs.IsOOS() {
 			// fail this write
-			t.writeErr(w, r, cs.Err, http.StatusInsufficientStorage)
+			t.writeErr(w, r, errCap, http.StatusInsufficientStorage)
 			return
 		}
 	}
@@ -766,7 +811,12 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 	default:
 		poi := allocPOI()
 		{
-			poi.atime = started.UnixNano()
+			poi.atime = started
+			if apireq.dpq.ptime != "" && sparseRedirStats(poi.atime) {
+				if d := ptLatency(poi.atime, apireq.dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
+					t.statsT.Add(stats.PutRedirLatency, d)
+				}
+			}
 			poi.t = t
 			poi.lom = lom
 			poi.config = config
@@ -872,13 +922,8 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 	lom := cluster.AllocLOM(objName)
 	errCode, err := t.objhead(w.Header(), query, bck, lom)
 	cluster.FreeLOM(lom)
-	if err == nil {
-		return
-	}
-	if cos.IsParseBool(query.Get(apc.QparamSilent)) {
-		t.writeErr(w, r, err, errCode, Silent)
-	} else {
-		t.writeErr(w, r, err, errCode)
+	if err != nil {
+		t._erris(w, r, query.Get(apc.QparamSilent), err, errCode)
 	}
 }
 
@@ -1153,7 +1198,7 @@ func (t *target) CompareObjects(ctx context.Context, lom *cluster.LOM) (equal bo
 	return
 }
 
-func (t *target) appendObj(r *http.Request, lom *cluster.LOM, started time.Time, dpq *dpq) (string, int, error) {
+func (t *target) appendObj(r *http.Request, lom *cluster.LOM, started int64, dpq *dpq) (string, int, error) {
 	var (
 		cksumValue    = r.Header.Get(apc.HdrObjCksumVal)
 		cksumType     = r.Header.Get(apc.HdrObjCksumType)
@@ -1188,7 +1233,7 @@ func (t *target) appendObj(r *http.Request, lom *cluster.LOM, started time.Time,
 }
 
 // called under lock
-func (t *target) putApndArch(r *http.Request, lom *cluster.LOM, started time.Time, dpq *dpq) (int, error) {
+func (t *target) putApndArch(r *http.Request, lom *cluster.LOM, started int64, dpq *dpq) (int, error) {
 	var (
 		mime     = dpq.archmime // apc.QparamArchmime
 		filename = dpq.archpath // apc.QparamArchpath
@@ -1236,34 +1281,6 @@ func (t *target) putApndArch(r *http.Request, lom *cluster.LOM, started time.Tim
 			lom.Cname(), cos.HdrContentLength)
 	}
 	return a.do()
-}
-
-func (t *target) putMirror(lom *cluster.LOM) {
-	mconfig := lom.MirrorConf()
-	if !mconfig.Enabled {
-		return
-	}
-	if mpathCnt := fs.NumAvail(); mpathCnt < int(mconfig.Copies) {
-		t.statsT.IncErr(stats.ErrPutMirrorCount)
-		nanotim := mono.NanoTime()
-		if nanotim&0x7 == 7 {
-			if mpathCnt == 0 {
-				nlog.Errorf("%s: %v", t, cmn.ErrNoMountpaths)
-			} else {
-				nlog.Errorf(fmtErrInsuffMpaths2, t, mpathCnt, lom, mconfig.Copies)
-			}
-		}
-		return
-	}
-	rns := xreg.RenewPutMirror(t, lom)
-	if rns.Err != nil {
-		nlog.Errorf("%s: %s %v", t, lom, rns.Err)
-		debug.AssertNoErr(rns.Err)
-		return
-	}
-	xctn := rns.Entry.Get()
-	xputlrep := xctn.(*mirror.XactPut)
-	xputlrep.Repl(lom)
 }
 
 func (t *target) DeleteObject(lom *cluster.LOM, evict bool) (code int, err error) {
@@ -1383,7 +1400,7 @@ func (t *target) fsErr(err error, filepath string) {
 	}
 	if cos.IsErrOOS(err) {
 		cs := t.OOS(nil)
-		nlog.Errorf("%s: %s", t, cs.String())
+		nlog.Errorf("%s: fsErr %s", t, cs.String())
 		return
 	}
 	nlog.Errorf("%s: waking up FSHC to check %q for err %v", t, filepath, err)

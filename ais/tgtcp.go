@@ -25,7 +25,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/ec"
-	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
@@ -69,6 +68,11 @@ func (t *target) recvCluMetaBytes(action string, body []byte, caller string) err
 	if err := jsoniter.Unmarshal(body, &cm); err != nil {
 		return fmt.Errorf(cmn.FmtErrUnmarshal, t, "clumeta", cos.BHead(body), err)
 	}
+
+	debug.Assert(cm.PrimeTime != 0, t.String()) // expecting
+	xreg.PrimeTime.Store(cm.PrimeTime)
+	xreg.MyTime.Store(time.Now().UnixNano())
+
 	msg := t.newAmsgStr(action, cm.BMD)
 
 	// Config
@@ -682,7 +686,8 @@ func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {
 		}
 	}
 	// since some buckets may have been destroyed
-	if cs := fs.Cap(); cs.Err != nil {
+	cs := fs.Cap()
+	if cs.Err() != nil {
 		_ = t.OOS(nil)
 	}
 }
@@ -1003,22 +1008,30 @@ func (t *target) metasyncPost(w http.ResponseWriter, r *http.Request) {
 // GET /v1/health (apc.Health)
 func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if t.regstate.disabled.Load() && daemon.cli.target.standby {
-		nlog.Warningf("[health] %s: standing by...", t)
+		if cmn.FastV(4, cos.SmoduleAIS) {
+			nlog.Warningf("[health] %s: standing by...", t)
+		}
 	} else if !t.NodeStarted() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if responded := t.healthByExternalWD(w, r); responded {
+	if responded := t.externalWD(w, r); responded {
 		return
 	}
 
 	t.uptime2hdr(w.Header())
 
-	// cluster info piggy-back
-	query := r.URL.Query()
-	getCii := cos.IsParseBool(query.Get(apc.QparamClusterInfo))
+	var (
+		getCii, getRebStatus bool
+	)
+	if r.URL.RawQuery != "" {
+		query := r.URL.Query()
+		getCii = cos.IsParseBool(query.Get(apc.QparamClusterInfo))
+		getRebStatus = cos.IsParseBool(query.Get(apc.QparamRebStatus))
+	}
+
+	// piggyback [cluster info]
 	if getCii {
-		debug.Assert(!query.Has(apc.QparamRebStatus))
 		cii := &clusterInfo{}
 		cii.fill(&t.htrun)
 		t.writeJSON(w, r, cii, "cluster-info")
@@ -1030,12 +1043,13 @@ func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+
 	// return ok plus optional reb info
 	var (
 		err              error
 		callerID         = r.Header.Get(apc.HdrCallerID)
 		caller           = r.Header.Get(apc.HdrCallerName)
-		callerSmapVer, _ = strconv.ParseInt(r.Header.Get(apc.HdrCallerSmapVersion), 10, 64)
+		callerSmapVer, _ = strconv.ParseInt(r.Header.Get(apc.HdrCallerSmapVer), 10, 64)
 	)
 	if smap.version() != callerSmapVer {
 		s := "older"
@@ -1045,7 +1059,6 @@ func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 		err = fmt.Errorf("health-ping from (%s, %s) with %s Smap v%d", callerID, caller, s, callerSmapVer)
 		nlog.Warningf("%s[%s]: %v", t, smap.StringEx(), err)
 	}
-	getRebStatus := cos.IsParseBool(query.Get(apc.QparamRebStatus))
 	if getRebStatus {
 		status := &reb.Status{}
 		t.reb.RebStatus(status)
@@ -1058,7 +1071,7 @@ func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if smap.GetProxy(callerID) != nil {
-		t.keepalive.heardFrom(callerID, false)
+		t.keepalive.heardFrom(callerID)
 	}
 }
 
@@ -1102,7 +1115,7 @@ func (t *target) enable() error {
 // checks with a given target to see if it has the object.
 // target acts as a client - compare with api.HeadObject
 func (t *target) headt2t(lom *cluster.LOM, tsi *meta.Snode, smap *smapX) (ok bool) {
-	q := lom.Bck().AddToQuery(nil)
+	q := lom.Bck().NewQuery()
 	q.Set(apc.QparamSilent, "true")
 	q.Set(apc.QparamFltPresence, strconv.Itoa(apc.FltPresent))
 	cargs := allocCargs()
@@ -1130,7 +1143,7 @@ func (t *target) headt2t(lom *cluster.LOM, tsi *meta.Snode, smap *smapX) (ok boo
 // headObjBcast broadcasts to all targets to find out if anyone has the specified object.
 // NOTE: 1) apc.QparamCheckExistsAny to make an extra effort, 2) `ignoreMaintenance`
 func (t *target) headObjBcast(lom *cluster.LOM, smap *smapX) *meta.Snode {
-	q := lom.Bck().AddToQuery(nil)
+	q := lom.Bck().NewQuery()
 	q.Set(apc.QparamSilent, "true")
 	// lookup across all mountpaths and copy (ie., restore) if misplaced
 	q.Set(apc.QparamFltPresence, strconv.Itoa(apc.FltPresentCluster))
@@ -1167,8 +1180,7 @@ func (t *target) termKaliveX(action string) {
 	t.keepalive.ctrl(kaSuspendMsg)
 
 	err := fmt.Errorf("%s: term-kalive by %q", t, action)
-	dsort.Managers.AbortAll(err) // all dsort jobs
-	xreg.AbortAll(err)           // all xactions
+	xreg.AbortAll(err) // all xactions
 }
 
 func (t *target) shutdown(action string) {

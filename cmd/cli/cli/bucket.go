@@ -23,18 +23,18 @@ import (
 )
 
 // Creates new ais bucket
-func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BucketPropsToUpdate) (err error) {
-	if err = api.CreateBucket(apiBP, bck, props); err != nil {
+func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BucketPropsToUpdate, dontHeadRemote bool) (err error) {
+	if err = api.CreateBucket(apiBP, bck, props, dontHeadRemote); err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); ok {
 			if herr.Status == http.StatusConflict {
 				desc := fmt.Sprintf("Bucket %q already exists", bck)
 				if flagIsSet(c, ignoreErrorFlag) {
-					fmt.Fprint(c.App.Writer, desc)
+					fmt.Fprintln(c.App.Writer, desc)
 					return nil
 				}
 				return errors.New(desc)
 			}
-			if verbose() {
+			if configuredVerbosity() {
 				herr.Message = herr.StringEx()
 			}
 			return fmt.Errorf("failed to create %q: %w", bck, herr)
@@ -47,27 +47,28 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BucketPropsToUpdate) (
 }
 
 // Destroy ais buckets
-func destroyBuckets(c *cli.Context, buckets []cmn.Bck) (err error) {
+func destroyBuckets(c *cli.Context, buckets []cmn.Bck) error {
 	for _, bck := range buckets {
-		var empty bool
-		empty, err = isBucketEmpty(bck)
-		if err == nil && !empty {
+		empty, errEmp := isBucketEmpty(bck)
+		if errEmp == nil && !empty {
 			if !flagIsSet(c, yesFlag) {
 				if ok := confirm(c, fmt.Sprintf("Proceed to destroy %s?", bck)); !ok {
 					continue
 				}
 			}
 		}
-		if err = api.DestroyBucket(apiBP, bck); err == nil {
+
+		err := api.DestroyBucket(apiBP, bck)
+		if err == nil {
 			fmt.Fprintf(c.App.Writer, "%q destroyed\n", bck.Cname(""))
 			continue
 		}
 		if cmn.IsStatusNotFound(err) {
-			desc := fmt.Sprintf("Bucket %q does not exist", bck)
+			err := &errDoesNotExist{what: "bucket", name: bck.Cname("")}
 			if !flagIsSet(c, ignoreErrorFlag) {
-				return errors.New(desc)
+				return err
 			}
-			fmt.Fprint(c.App.Writer, desc)
+			fmt.Fprintln(c.App.ErrWriter, err.Error())
 			continue
 		}
 		return err
@@ -375,7 +376,7 @@ func printObjProps(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter,
 	}
 	if len(matched) > 10 {
 		listed := fblue("Listed:")
-		fmt.Fprintln(c.App.Writer, listed, len(matched), "names")
+		fmt.Fprintln(c.App.Writer, listed, cos.FormatBigNum(len(matched)), "names")
 	}
 	if flagIsSet(c, showUnmatchedFlag) && len(other) > 0 {
 		unmatched := fcyan("\nNames that didn't match: ") + strconv.Itoa(len(other))

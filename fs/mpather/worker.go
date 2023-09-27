@@ -6,6 +6,7 @@ package mpather
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
@@ -58,12 +59,18 @@ func (wg *WorkerGroup) Run() {
 	}
 }
 
-func (wg *WorkerGroup) Do(lom *cluster.LOM) bool {
-	worker, ok := wg.workers[lom.Mountpath().Path]
-	if ok {
-		worker.workCh <- lom.LIF()
+func (wg *WorkerGroup) PostLIF(lom *cluster.LOM) (chanFull bool, err error) {
+	mi := lom.Mountpath()
+	worker, ok := wg.workers[mi.Path]
+	if !ok {
+		return false, fmt.Errorf("post-lif: %s not found", mi)
 	}
-	return ok
+	worker.workCh <- lom.LIF()
+	if l, c := len(worker.workCh), cap(worker.workCh); l > c/2 {
+		runtime.Gosched() // poor man's throttle
+		chanFull = l == c
+	}
+	return
 }
 
 // Stop aborts all the workers. It should be called after we are sure no more

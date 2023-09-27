@@ -217,8 +217,8 @@ type (
 
 	// maximum intra-cluster latencies (in the increasing order)
 	TimeoutConf struct {
-		CplaneOperation cos.Duration `json:"cplane_operation"` // readonly - change requires restart
-		MaxKeepalive    cos.Duration `json:"max_keepalive"`    // ditto (see `timeout struct` below)
+		CplaneOperation cos.Duration `json:"cplane_operation"` // read-mostly via global cmn.Timeout.CplaneOperation
+		MaxKeepalive    cos.Duration `json:"max_keepalive"`    // ditto, cmn.Timeout.MaxKeepalive - see below
 		MaxHostBusy     cos.Duration `json:"max_host_busy"`
 		Startup         cos.Duration `json:"startup_time"`
 		JoinAtStartup   cos.Duration `json:"join_startup_time"` // (join cluster at startup) timeout
@@ -435,10 +435,9 @@ type (
 		Enabled *bool   `json:"enabled,omitempty"`
 	}
 
-	// config for one keepalive tracker
-	// all type of trackers share the same struct, not all fields are used by all trackers
+	// keepalive tracker
 	KeepaliveTrackerConf struct {
-		Name     string       `json:"name"`     // "heartbeat", "average"
+		Name     string       `json:"name"`     // "heartbeat" (other enumerated values TBD)
 		Interval cos.Duration `json:"interval"` // keepalive interval
 		Factor   uint8        `json:"factor"`   // only average
 	}
@@ -1175,52 +1174,33 @@ func (c *WritePolicyConf) ValidateAsProps(...any) error { return c.Validate() }
 // KeepaliveConf //
 ///////////////////
 
-const (
-	KeepaliveHeartbeatType = "heartbeat"
-	KeepaliveAverageType   = "average"
-)
-
-func validKeepaliveType(t string) bool {
-	return t == KeepaliveHeartbeatType || t == KeepaliveAverageType
-}
-
 func (c *KeepaliveConf) Validate() (err error) {
-	if !validKeepaliveType(c.Proxy.Name) {
-		return fmt.Errorf("invalid keepalivetracker.proxy.name %s", c.Proxy.Name)
+	if c.Proxy.Name != "heartbeat" {
+		err = fmt.Errorf("invalid keepalivetracker.proxy.name %s", c.Proxy.Name)
+	} else if c.Target.Name != "heartbeat" {
+		err = fmt.Errorf("invalid keepalivetracker.target.name %s", c.Target.Name)
+	} else if c.RetryFactor < 1 || c.RetryFactor > 10 {
+		err = fmt.Errorf("invalid keepalivetracker.retry_factor %d (expecting 1 thru 10)", c.RetryFactor)
 	}
-	if !validKeepaliveType(c.Target.Name) {
-		return fmt.Errorf("invalid keepalivetracker.target.name %s", c.Target.Name)
-	}
-	return nil
+	return
 }
 
-func KeepaliveRetryDuration(cs ...*Config) time.Duration {
-	var c *Config
-	if len(cs) != 0 {
-		c = cs[0]
-	} else {
-		c = GCO.Get()
-	}
-	return c.Timeout.CplaneOperation.D() * time.Duration(c.Keepalive.RetryFactor)
+func KeepaliveRetryDuration(c *Config) time.Duration {
+	d := c.Timeout.CplaneOperation.D() * time.Duration(c.Keepalive.RetryFactor)
+	return min(d, c.Timeout.MaxKeepalive.D()+time.Second/2)
 }
 
 /////////////
 // NetConf //
 /////////////
 
-const (
-	tcpProto   = "tcp"
-	httpProto  = "http"
-	httpsProto = "https"
-)
-
 func (c *NetConf) Validate() (err error) {
-	if c.L4.Proto != tcpProto {
-		return fmt.Errorf("l4 proto %q is not recognized (expecting %s)", c.L4.Proto, tcpProto)
+	if c.L4.Proto != "tcp" {
+		return fmt.Errorf("l4 proto %q is not recognized (expecting %s)", c.L4.Proto, "tcp")
 	}
-	c.HTTP.Proto = httpProto // not validating: read-only, and can take only two values
+	c.HTTP.Proto = "http" // not validating: read-only, and can take only two values
 	if c.HTTP.UseHTTPS {
-		c.HTTP.Proto = httpsProto
+		c.HTTP.Proto = "https"
 	}
 	return nil
 }
@@ -1788,7 +1768,7 @@ func handleOverrideConfig(config *Config) error {
 	}
 
 	// update config with locally-stored 'OverrideConfigFname' and validate the result
-	GCO.PutOverrideConfig(overrideConfig)
+	GCO.PutOverride(overrideConfig)
 	if overrideConfig.FSP != nil {
 		config.LocalConfig.FSP = *overrideConfig.FSP // override local config's fspaths
 		overrideConfig.FSP = nil

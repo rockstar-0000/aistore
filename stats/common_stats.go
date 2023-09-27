@@ -79,6 +79,70 @@ const (
 	Uptime = "up.ns.time"
 )
 
+// interfaces
+type (
+	metric = statsd.Metric // type alias
+
+	// implemented by the stats runners
+	statsLogger interface {
+		log(now int64, uptime time.Duration, config *cmn.Config)
+		statsTime(newval time.Duration)
+		standingBy() bool
+	}
+	runnerHost interface {
+		ClusterStarted() bool
+	}
+)
+
+// primitives: values and maps
+type (
+	// Stats are tracked via a map of stats names (key) to statsValue (values).
+	// There are two main types of stats: counter and latency declared
+	// using the the kind field. Only latency stats have numSamples used to compute latency.
+	statsValue struct {
+		kind  string // enum { KindCounter, ..., KindSpecial }
+		label struct {
+			comm string // common part of the metric label (as in: <prefix> . comm . <suffix>)
+			stsd string // StatsD label
+			prom string // Prometheus label
+		}
+		Value      int64 `json:"v,string"`
+		numSamples int64 // (log + StatsD) only
+		cumulative int64
+	}
+	copyValue struct {
+		Value int64 `json:"v,string"`
+	}
+	copyTracker map[string]copyValue // aggregated every statsTime interval
+	promDesc    map[string]*prometheus.Desc
+)
+
+// main types
+type (
+	coreStats struct {
+		Tracker   map[string]*statsValue
+		promDesc  promDesc
+		statsdC   *statsd.Client
+		sgl       *memsys.SGL
+		statsTime time.Duration
+		cmu       sync.RWMutex // ctracker vs Prometheus Collect()
+	}
+
+	// Prunner and Trunner
+	runner struct {
+		daemon    runnerHost
+		stopCh    chan struct{}
+		ticker    *time.Ticker
+		core      *coreStats
+		ctracker  copyTracker // to avoid making it at runtime
+		sorted    []string    // sorted names
+		name      string      // this stats-runner's name
+		prev      string      // prev ctracker.write
+		next      int64       // mono.NanoTime()
+		startedUp atomic.Bool
+	}
+)
+
 // interface guard
 var (
 	_ Tracker = (*Prunner)(nil)
@@ -99,82 +163,6 @@ func ignore(s string) bool {
 	return false
 }
 
-//
-// private types
-//
-
-type (
-	metric = statsd.Metric // type alias
-
-	// implemented by the stats runners
-	statsLogger interface {
-		log(now int64, uptime time.Duration, config *cmn.Config)
-		doAdd(nv cos.NamedVal64)
-		statsTime(newval time.Duration)
-		standingBy() bool
-	}
-	runnerHost interface {
-		ClusterStarted() bool
-	}
-)
-
-type (
-	coreStats struct {
-		Tracker   statsTracker
-		promDesc  promDesc
-		statsdC   *statsd.Client
-		sgl       *memsys.SGL
-		statsTime time.Duration
-		cmu       sync.RWMutex // ctracker vs Prometheus Collect()
-	}
-
-	// implements Tracker, inherited by Prunner and Trunner
-	statsRunner struct {
-		daemon    runnerHost
-		stopCh    chan struct{}
-		workCh    chan cos.NamedVal64
-		ticker    *time.Ticker
-		core      *coreStats
-		ctracker  copyTracker // to avoid making it at runtime
-		sorted    []string    // sorted names
-		name      string      // this stats-runner's name
-		prev      string      // prev ctracker.write
-		next      int64       // mono.NanoTime()
-		startedUp atomic.Bool
-	}
-
-	//
-	// values
-	//
-
-	// Stats are tracked via a map of stats names (key) to statsValue (values).
-	// There are two main types of stats: counter and latency declared
-	// using the the kind field. Only latency stats have numSamples used to compute latency.
-	statsValue struct {
-		kind  string // enum { KindCounter, ..., KindSpecial }
-		label struct {
-			comm string // common part of the metric label (as in: <prefix> . comm . <suffix>)
-			stsd string // StatsD label
-			prom string // Prometheus label
-		}
-		Value      int64 `json:"v,string"`
-		numSamples int64 // (log + StatsD) only
-		cumulative int64
-		mu         sync.RWMutex
-	}
-	copyValue struct {
-		Value int64 `json:"v,string"`
-	}
-
-	//
-	// maps
-	//
-
-	statsTracker map[string]*statsValue
-	copyTracker  map[string]copyValue // NOTE: values aggregated and computed every (log) statsTime
-	promDesc     map[string]*prometheus.Desc
-)
-
 ///////////////
 // coreStats //
 ///////////////
@@ -193,21 +181,10 @@ func roundMBs(val int64) (mbs float64) {
 	return
 }
 
-func (s *coreStats) init(node *meta.Snode, size int) {
-	s.Tracker = make(statsTracker, size)
+func (s *coreStats) init(size int) {
+	s.Tracker = make(map[string]*statsValue, size)
 	s.promDesc = make(promDesc, size)
 
-	// debug.NewExpvar & debug.SetExpvar could be placed here and elsewhere to visualize:
-	//     * all counters including errors
-	//     * latencies including keepalive
-	//     * mountpath capacities
-	//     * mountpath (disk) utilizations
-	//     * total number of goroutines, etc.
-	// (access via host:port/debug/vars in debug mode)
-
-	s.Tracker.regCommon(node)
-
-	// reusable sgl => (udp) => StatsD
 	s.sgl = memsys.PageMM().NewSGL(memsys.PageSize)
 }
 
@@ -240,7 +217,7 @@ func (s *coreStats) promUnlock() {
 }
 
 // init MetricClient client: StatsD (default) or Prometheus
-func (s *coreStats) initMetricClient(node *meta.Snode, parent *statsRunner) {
+func (s *coreStats) initMetricClient(node *meta.Snode, parent *runner) {
 	// Either Prometheus
 	if prom := os.Getenv("AIS_PROMETHEUS"); prom != "" {
 		nlog.Infoln("Using Prometheus")
@@ -329,43 +306,28 @@ func (s *coreStats) UnmarshalJSON(b []byte) error { return jsoniter.Unmarshal(b,
 
 func (s *coreStats) get(name string) (val int64) {
 	v := s.Tracker[name]
-	switch v.kind {
-	case KindLatency, KindThroughput:
-		v.mu.RLock()
-		val = v.Value
-		v.mu.RUnlock()
-	default:
-		val = ratomic.LoadInt64(&v.Value)
-	}
+	val = ratomic.LoadInt64(&v.Value)
 	return
 }
 
-// NOTE naming convention: ".n" for the count and ".ns" for duration (nanoseconds)
-func (s *coreStats) doAdd(name, nameSuffix string, val int64) {
-	v, ok := s.Tracker[name]
-	debug.Assertf(ok, "invalid metric name %q", name)
+func (s *coreStats) update(nv cos.NamedVal64) {
+	v, ok := s.Tracker[nv.Name]
+	debug.Assertf(ok, "invalid metric name %q", nv.Name)
 	switch v.kind {
 	case KindLatency:
-		v.mu.Lock()
-		v.numSamples++
-		v.cumulative += val
-		v.Value += val
-		v.mu.Unlock()
+		ratomic.AddInt64(&v.numSamples, 1)
+		fallthrough
 	case KindThroughput:
-		v.mu.Lock()
-		v.cumulative += val
-		v.Value += val
-		v.mu.Unlock()
+		ratomic.AddInt64(&v.cumulative, nv.Value)
+		ratomic.AddInt64(&v.Value, nv.Value)
 	case KindCounter, KindSize:
-		// NOTE: not locking (KindCounter isn't compound, making an exception to speed-up)
-		ratomic.AddInt64(&v.Value, val)
-
+		ratomic.AddInt64(&v.Value, nv.Value)
 		// - non-empty suffix forces an immediate Tx with no aggregation (see below);
 		// - suffix is an arbitrary string that can be defined at runtime;
 		// - e.g. usage: per-mountpath error counters.
-		if !s.isPrometheus() && nameSuffix != "" {
-			s.statsdC.Send(v.label.comm+"."+nameSuffix,
-				1, metric{Type: statsd.Counter, Name: "count", Value: val})
+		if !s.isPrometheus() && nv.NameSuffix != "" {
+			s.statsdC.Send(v.label.comm+"."+nv.NameSuffix,
+				1, metric{Type: statsd.Counter, Name: "count", Value: nv.Value})
 		}
 	default:
 		debug.Assert(false, v.kind)
@@ -375,22 +337,18 @@ func (s *coreStats) doAdd(name, nameSuffix string, val int64) {
 // log + StatsD (Prometheus is done separately via `Collect`)
 func (s *coreStats) copyT(out copyTracker, diskLowUtil ...int64) bool {
 	idle := true
+	intl := max(int64(s.statsTime.Seconds()), 1)
 	s.sgl.Reset()
 	for name, v := range s.Tracker {
 		switch v.kind {
 		case KindLatency:
 			var lat int64
-			v.mu.Lock()
-			if v.numSamples > 0 {
-				lat = v.Value / v.numSamples
+			if num := ratomic.SwapInt64(&v.numSamples, 0); num > 0 {
+				lat = ratomic.SwapInt64(&v.Value, 0) / num
 				if !ignore(name) {
 					idle = false
 				}
 			}
-			v.Value = 0
-			v.numSamples = 0
-			v.mu.Unlock()
-
 			out[name] = copyValue{lat}
 			// NOTE: ns => ms, and not reporting zeros
 			millis := cos.DivRound(lat, int64(time.Millisecond))
@@ -399,17 +357,12 @@ func (s *coreStats) copyT(out copyTracker, diskLowUtil ...int64) bool {
 			}
 		case KindThroughput:
 			var throughput int64
-			v.mu.Lock()
-			if v.Value > 0 {
-				throughput = v.Value / cos.MaxI64(int64(s.statsTime.Seconds()), 1)
+			if throughput = ratomic.SwapInt64(&v.Value, 0); throughput > 0 {
+				throughput /= intl
 				if !ignore(name) {
 					idle = false
 				}
-				// NOTE: ok to zero-out as we report .cumulative via API
-				v.Value = 0
 			}
-			v.mu.Unlock()
-
 			out[name] = copyValue{throughput}
 			if !s.isPrometheus() && throughput > 0 {
 				fv := roundMBs(throughput)
@@ -476,17 +429,13 @@ func (s *coreStats) copyCumulative(ctracker copyTracker) {
 	for name, v := range s.Tracker {
 		switch v.kind {
 		case KindLatency:
-			v.mu.RLock()
-			ctracker[name] = copyValue{v.cumulative}
-			v.mu.RUnlock()
+			ctracker[name] = copyValue{ratomic.LoadInt64(&v.cumulative)}
 		case KindThroughput:
-			v.mu.RLock()
-			val := copyValue{v.cumulative}
-			v.mu.RUnlock()
+			val := copyValue{ratomic.LoadInt64(&v.cumulative)}
 			ctracker[name] = val
 
-			// NOTE: here we effectively add a metric that was never added/updated
-			// via `statsRunner.Add` and friends. Is OK to replace ".bps" suffix
+			// NOTE: effectively, add same-value metric that was never added/updated
+			// via `runner.Add` and friends. Is OK to replace ".bps" suffix
 			// as statsValue.cumulative _is_ the total size (aka, KindSize)
 			n := name[:len(name)-3] + "size"
 			ctracker[n] = val
@@ -513,10 +462,12 @@ func (s *coreStats) reset(errorsOnly bool) {
 
 	for _, v := range s.Tracker {
 		switch v.kind {
-		case KindLatency, KindThroughput:
-			v.mu.Lock()
-			v.Value, v.cumulative = 0, 0
-			v.mu.Unlock()
+		case KindLatency:
+			ratomic.StoreInt64(&v.numSamples, 0)
+			fallthrough
+		case KindThroughput:
+			ratomic.StoreInt64(&v.Value, 0)
+			ratomic.StoreInt64(&v.cumulative, 0)
 		case KindCounter, KindSize, KindComputedThroughput, KindGauge:
 			ratomic.StoreInt64(&v.Value, 0)
 		default: // KindSpecial - do nothing
@@ -535,15 +486,7 @@ var (
 )
 
 func (v *statsValue) MarshalJSON() ([]byte, error) {
-	var s string
-	switch v.kind {
-	case KindLatency, KindThroughput:
-		v.mu.RLock()
-		s = strconv.FormatInt(v.Value, 10)
-		v.mu.RUnlock()
-	default:
-		s = strconv.FormatInt(ratomic.LoadInt64(&v.Value), 10)
-	}
+	s := strconv.FormatInt(ratomic.LoadInt64(&v.Value), 10)
 	return cos.UnsafeB(s), nil
 }
 
@@ -618,15 +561,68 @@ func (ctracker copyTracker) write(sgl *memsys.SGL, sorted []string, target, idle
 	sgl.WriteByte('}')
 }
 
-//////////////////
-// statsTracker //
-//////////////////
+////////////
+// runner //
+////////////
 
-// NOTE: naming; compare with coreStats.initProm()
-func (tracker statsTracker) reg(node *meta.Snode, name, kind string) {
-	debug.Assert(kind == KindCounter || kind == KindSize || kind == KindGauge || kind == KindLatency ||
-		kind == KindThroughput || kind == KindComputedThroughput || kind == KindSpecial)
+// interface guard
+var (
+	_ prometheus.Collector = (*runner)(nil)
+)
 
+func (r *runner) GetStats() *Node {
+	ctracker := make(copyTracker, 48)
+	r.core.copyCumulative(ctracker)
+	return &Node{Tracker: ctracker}
+}
+
+func (r *runner) ResetStats(errorsOnly bool) {
+	r.core.reset(errorsOnly)
+}
+
+func (r *runner) GetMetricNames() cos.StrKVs {
+	out := make(cos.StrKVs, 32)
+	for name, v := range r.core.Tracker {
+		out[name] = v.kind
+	}
+	return out
+}
+
+// common (target, proxy) metrics
+func (r *runner) regCommon(node *meta.Snode) {
+	// basic counters
+	r.reg(node, GetCount, KindCounter)
+	r.reg(node, PutCount, KindCounter)
+	r.reg(node, AppendCount, KindCounter)
+	r.reg(node, DeleteCount, KindCounter)
+	r.reg(node, RenameCount, KindCounter)
+	r.reg(node, ListCount, KindCounter)
+
+	// basic error counters, respectively
+	r.reg(node, errPrefix+GetCount, KindCounter)
+	r.reg(node, errPrefix+PutCount, KindCounter)
+	r.reg(node, errPrefix+AppendCount, KindCounter)
+	r.reg(node, errPrefix+DeleteCount, KindCounter)
+	r.reg(node, errPrefix+RenameCount, KindCounter)
+	r.reg(node, errPrefix+ListCount, KindCounter)
+
+	// more error counters
+	r.reg(node, ErrHTTPWriteCount, KindCounter)
+	r.reg(node, ErrDownloadCount, KindCounter)
+	r.reg(node, ErrPutMirrorCount, KindCounter)
+
+	// latency
+	r.reg(node, GetLatency, KindLatency)
+	r.reg(node, ListLatency, KindLatency)
+	r.reg(node, KeepAliveLatency, KindLatency)
+
+	// special uptime
+	r.reg(node, Uptime, KindSpecial)
+}
+
+// NOTE naming convention: ".n" for the count and ".ns" for duration (nanoseconds)
+// compare with coreStats.initProm()
+func (r *runner) reg(node *meta.Snode, name, kind string) {
 	v := &statsValue{kind: kind}
 	// in StatsD metrics ":" delineates the name and the value - replace with underscore
 	switch kind {
@@ -652,6 +648,7 @@ func (tracker statsTracker) reg(node *meta.Snode, name, kind string) {
 		v.label.comm = strings.ReplaceAll(v.label.comm, ":", "_")
 		v.label.stsd = fmt.Sprintf("%s.%s.%s.%s", "ais"+node.Type(), node.ID(), v.label.comm, "mbps")
 	default:
+		debug.Assert(kind == KindGauge || kind == KindSpecial)
 		v.label.comm = name
 		v.label.comm = strings.ReplaceAll(v.label.comm, ":", "_")
 		if name == Uptime {
@@ -661,95 +658,44 @@ func (tracker statsTracker) reg(node *meta.Snode, name, kind string) {
 			v.label.stsd = fmt.Sprintf("%s.%s.%s", "ais"+node.Type(), node.ID(), v.label.comm)
 		}
 	}
-	tracker[name] = v
-}
-
-// register common metrics; see RegMetrics() in target_stats.go
-func (tracker statsTracker) regCommon(node *meta.Snode) {
-	// basic counters
-	tracker.reg(node, GetCount, KindCounter)
-	tracker.reg(node, PutCount, KindCounter)
-	tracker.reg(node, AppendCount, KindCounter)
-	tracker.reg(node, DeleteCount, KindCounter)
-	tracker.reg(node, RenameCount, KindCounter)
-	tracker.reg(node, ListCount, KindCounter)
-
-	// basic error counters, respectively
-	tracker.reg(node, errPrefix+GetCount, KindCounter)
-	tracker.reg(node, errPrefix+PutCount, KindCounter)
-	tracker.reg(node, errPrefix+AppendCount, KindCounter)
-	tracker.reg(node, errPrefix+DeleteCount, KindCounter)
-	tracker.reg(node, errPrefix+RenameCount, KindCounter)
-	tracker.reg(node, errPrefix+ListCount, KindCounter)
-
-	// more error counters
-	tracker.reg(node, ErrHTTPWriteCount, KindCounter)
-	tracker.reg(node, ErrDownloadCount, KindCounter)
-	tracker.reg(node, ErrPutMirrorCount, KindCounter)
-
-	// latency
-	tracker.reg(node, GetLatency, KindLatency)
-	tracker.reg(node, ListLatency, KindLatency)
-	tracker.reg(node, KeepAliveLatency, KindLatency)
-
-	// special uptime
-	tracker.reg(node, Uptime, KindSpecial)
-}
-
-/////////////////
-// statsRunner //
-/////////////////
-
-// interface guard
-var (
-	_ prometheus.Collector = (*statsRunner)(nil)
-)
-
-func (r *statsRunner) GetStats() *Node {
-	ctracker := make(copyTracker, 48)
-	r.core.copyCumulative(ctracker)
-	return &Node{Tracker: ctracker}
-}
-
-func (r *statsRunner) ResetStats(errorsOnly bool) {
-	r.core.reset(errorsOnly)
-}
-
-func (r *statsRunner) GetMetricNames() cos.StrKVs {
-	out := make(cos.StrKVs, 32)
-	for name, v := range r.core.Tracker {
-		out[name] = v.kind
-	}
-	return out
+	r.core.Tracker[name] = v
 }
 
 //
 // as cos.StatsUpdater
 //
 
-func (r *statsRunner) Add(name string, val int64) {
-	r.workCh <- cos.NamedVal64{Name: name, Value: val}
+func (r *runner) Add(name string, val int64) {
+	r.core.update(cos.NamedVal64{Name: name, Value: val})
 }
 
-func (r *statsRunner) Inc(name string) {
-	r.workCh <- cos.NamedVal64{Name: name, Value: 1}
+func (r *runner) Inc(name string) {
+	r.core.update(cos.NamedVal64{Name: name, Value: 1})
 }
 
-func (r *statsRunner) AddMany(nvs ...cos.NamedVal64) {
-	for _, nv := range nvs {
-		r.workCh <- nv
+func (r *runner) IncErr(metric string) {
+	if IsErrMetric(metric) {
+		r.core.update(cos.NamedVal64{Name: metric, Value: 1})
+	} else { // e.g. "err." + GetCount
+		r.core.update(cos.NamedVal64{Name: errPrefix + metric, Value: 1})
 	}
 }
 
-func (r *statsRunner) IsPrometheus() bool { return r.core.isPrometheus() }
+func (r *runner) AddMany(nvs ...cos.NamedVal64) {
+	for _, nv := range nvs {
+		r.core.update(nv)
+	}
+}
 
-func (r *statsRunner) Describe(ch chan<- *prometheus.Desc) {
+func (r *runner) IsPrometheus() bool { return r.core.isPrometheus() }
+
+func (r *runner) Describe(ch chan<- *prometheus.Desc) {
 	for _, desc := range r.core.promDesc {
 		ch <- desc
 	}
 }
 
-func (r *statsRunner) Collect(ch chan<- prometheus.Metric) {
+func (r *runner) Collect(ch chan<- prometheus.Metric) {
 	if !r.StartedUp() {
 		return
 	}
@@ -797,11 +743,11 @@ func (r *statsRunner) Collect(ch chan<- prometheus.Metric) {
 	r.core.promRUnlock()
 }
 
-func (r *statsRunner) Name() string { return r.name }
+func (r *runner) Name() string { return r.name }
 
-func (r *statsRunner) Get(name string) (val int64) { return r.core.get(name) }
+func (r *runner) Get(name string) (val int64) { return r.core.get(name) }
 
-func (r *statsRunner) runcommon(logger statsLogger) error {
+func (r *runner) _run(logger statsLogger /* Prunner or Trunner */) error {
 	var (
 		i, j   time.Duration
 		sleep  = startupSleep
@@ -819,8 +765,6 @@ func (r *statsRunner) runcommon(logger statsLogger) error {
 waitStartup:
 	for {
 		select {
-		case <-r.workCh:
-			// Drain workCh until the daemon (proxy or target) starts up.
 		case <-r.stopCh:
 			ticker.Stop()
 			return nil
@@ -866,10 +810,6 @@ waitStartup:
 	)
 	for {
 		select {
-		case nv, ok := <-r.workCh:
-			if ok {
-				logger.doAdd(nv)
-			}
 		case <-r.ticker.C:
 			now := mono.NanoTime()
 			config = cmn.GCO.Get()
@@ -926,9 +866,9 @@ func _whingeGoroutines(now, checkNumGorHigh int64, goMaxProcs int) int64 {
 	return checkNumGorHigh
 }
 
-func (r *statsRunner) StartedUp() bool { return r.startedUp.Load() }
+func (r *runner) StartedUp() bool { return r.startedUp.Load() }
 
-func (r *statsRunner) Stop(err error) {
+func (r *runner) Stop(err error) {
 	nlog.Infof("Stopping %s, err: %v", r.Name(), err)
 	r.stopCh <- struct{}{}
 	if !r.IsPrometheus() {
@@ -1008,10 +948,12 @@ func removeOlderLogs(config *cmn.Config, tot, maxtotal int64, logdir, logtype st
 	}
 }
 
-func (r *statsRunner) IncErr(metric string) {
-	if IsErrMetric(metric) {
-		r.workCh <- cos.NamedVal64{Name: metric, Value: 1}
-	} else { // e.g. "err." + GetCount
-		r.workCh <- cos.NamedVal64{Name: errPrefix + metric, Value: 1}
-	}
-}
+// debug.NewExpvar & debug.SetExpvar to visualize:
+// * all counters including errors
+// * latencies including keepalive
+// * mountpath capacities
+// * mountpath (disk) utilizations
+// * total number of goroutines, etc.
+// (access via host:port/debug/vars in debug mode)
+
+// reusable sgl => (udp) => StatsD

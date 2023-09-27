@@ -42,12 +42,57 @@ spec:
       imagePullPolicy: Always
       ports:
         - name: default
-          containerPort: 80
-      command: ['/code/server.py', '--listen', '0.0.0.0', '--port', '80']
+          containerPort: 8000
+      command: ["gunicorn", "main:app", "--workers", "20", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+      # command: ["uvicorn", "main:app", "--reload"]
+      env:
+        - name: ARG_TYPE
+          value: "fqn"
       readinessProbe:
         httpGet:
           path: /health
           port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
+"""
+
+# Returns "Hello World!" on any request.
+# pylint: disable=unused-variable
+GO_HELLO_WORLD = """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello-world-go-transformer
+  annotations:
+    communication_type: "{communication_type}://"
+    wait_timeout: 5m
+spec:
+  containers:
+    - name: server
+      image: aistorage/transformer_hello_world_go:latest
+      imagePullPolicy: Always
+      ports:
+        - name: default
+          containerPort: 80
+      command: ['./echo', '-l', '0.0.0.0', '-p', '80']
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """
 
 # Returns the original data, with an MD5 sum in the response headers.
@@ -74,6 +119,14 @@ spec:
         httpGet:
           path: /health
           port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """
 
 # Returns the original data, with an MD5 sum in the response headers.
@@ -94,12 +147,20 @@ spec:
       imagePullPolicy: Always
       ports:
         - name: default
-          containerPort: 80
-      command: ['/code/server.py', '--listen', '0.0.0.0', '--port', '80']
+          containerPort: 8000
+      command: ["gunicorn", "main:app", "--workers", "20", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"] 
       readinessProbe:
         httpGet:
           path: /health
           port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """
 
 # Returns the transformed TensorFlow compatible data for the input TAR files. For
@@ -164,6 +225,14 @@ spec:
         httpGet:
           path: /health
           port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """
 
 # pylint: disable=unused-variable
@@ -182,17 +251,27 @@ spec:
       imagePullPolicy: Always
       ports:
         - name: default
-          containerPort: 80
-      command: ["gunicorn", "--bind", "0.0.0.0:80", "app:app"]
+          containerPort: 8000
+      command: ["gunicorn", "main:app", "--workers", "20", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"] 
       env:
         - name: FORMAT
           value: "{format}"
         - name: TRANSFORM
           value: '{transform}'
+        - name: ARG_TYPE
+          value: "{arg_type}"
       readinessProbe:
         httpGet:
           path: /health
           port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """
 
 # Returns the FFMPEG decoded content. For more information on command options, visit
@@ -224,6 +303,14 @@ spec:
       httpGet:
         path: /health
         port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """
 
 # Returns the transformed images using `Torchvision` pre-processing. For more
@@ -236,9 +323,10 @@ kind: Pod
 metadata:
   name: transformer-torchvision
   annotations:
-    # Values it can take ["hpull://","hrev://","hpush://"]
-    communication_type: "{communication_type}"
-    wait_timeout: 5m
+    # Values `communication_type` can take are ["hpull://", "hrev://", "hpush://", "io://"].
+    # Visit https://github.com/NVIDIA/aistore/blob/master/docs/etl.md#communication-mechanisms 
+    communication_type: "{communication_type}://"
+    wait_timeout: 10m
 spec:
   containers:
     - name: server
@@ -246,11 +334,11 @@ spec:
       imagePullPolicy: Always
       ports:
         - name: default
-          containerPort: 80
-      command: ['/code/server.py', '--listen', '0.0.0.0', '--port', '80']
+          containerPort: 8000
+      command:  ["gunicorn", "main:app", "--workers", "20", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
       env:
         - name: FORMAT
-        # Expected Values - PNG, JPEG, etc.
+        # expected values - PNG, JPEG, etc
           value: "{format}"
         - name: TRANSFORM
           value: '{transform}'
@@ -258,4 +346,12 @@ spec:
         httpGet:
           path: /health
           port: default
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/
+        type: Directory
 """

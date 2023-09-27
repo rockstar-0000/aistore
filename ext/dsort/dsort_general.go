@@ -11,6 +11,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
@@ -18,7 +19,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/ext/dsort/extract"
+	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
@@ -71,8 +73,8 @@ type (
 	}
 
 	remoteRequest struct {
-		Record    *extract.Record    `json:"r"`
-		RecordObj *extract.RecordObj `json:"o"`
+		Record    *shard.Record    `json:"r"`
+		RecordObj *shard.RecordObj `json:"o"`
 	}
 )
 
@@ -84,7 +86,7 @@ func newDSorterGeneral(m *Manager) (*dsorterGeneral, error) {
 	if err := mem.Get(); err != nil {
 		return nil, err
 	}
-	maxMemoryToUse := calcMaxMemoryUsage(m.pars.MaxMemUsage, &mem)
+	maxMemoryToUse := calcMaxMemoryUsage(m.Pars.MaxMemUsage, &mem)
 	ds := &dsorterGeneral{
 		m:  m,
 		mw: newMemoryWatcher(m, maxMemoryToUse),
@@ -117,7 +119,7 @@ func (*dsorterGeneral) name() string { return DSorterGeneralType }
 
 func (ds *dsorterGeneral) init() error {
 	ds.creationPhase.adjuster = newConcAdjuster(
-		ds.m.pars.CreateConcMaxLimit,
+		ds.m.Pars.CreateConcMaxLimit,
 		1, /*goroutineLimitCoef*/
 	)
 	return nil
@@ -136,33 +138,35 @@ func (ds *dsorterGeneral) start() error {
 
 	trname := fmt.Sprintf(recvReqStreamNameFmt, ds.m.ManagerUUID)
 	reqSbArgs := bundle.Args{
-		Multiplier: 20,
+		Multiplier: ds.m.Pars.SbundleMult,
 		Net:        reqNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
+		Extra: &transport.Extra{
+			Config: config,
+		},
 	}
-	if err := transport.HandleObjStream(trname, ds.recvReq); err != nil {
+	if err := transport.Handle(trname, ds.recvReq); err != nil {
 		return errors.WithStack(err)
 	}
 
 	trname = fmt.Sprintf(recvRespStreamNameFmt, ds.m.ManagerUUID)
 	respSbArgs := bundle.Args{
-		Multiplier: ds.m.pars.SbundleMult,
+		Multiplier: ds.m.Pars.SbundleMult,
 		Net:        respNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
 		Extra: &transport.Extra{
 			Compression: config.DSort.Compression,
 			Config:      config,
-			MMSA:        mm,
 		},
 	}
-	if err := transport.HandleObjStream(trname, ds.recvResp); err != nil {
+	if err := transport.Handle(trname, ds.recvResp); err != nil {
 		return errors.WithStack(err)
 	}
 
-	ds.streams.request = bundle.New(ds.m.ctx.smapOwner, ds.m.ctx.node, client, reqSbArgs)
-	ds.streams.response = bundle.New(ds.m.ctx.smapOwner, ds.m.ctx.node, client, respSbArgs)
+	ds.streams.request = bundle.New(g.t.Sowner(), g.t.Snode(), client, reqSbArgs)
+	ds.streams.response = bundle.New(g.t.Sowner(), g.t.Snode(), client, respSbArgs)
 
 	// start watching memory
 	return ds.mw.watch()
@@ -208,7 +212,7 @@ func (ds *dsorterGeneral) finalCleanup() error {
 
 func (ds *dsorterGeneral) postRecordDistribution() {
 	// In shard creation we should not expect memory increase (at least
-	// not from dSort). Also it would be really hard to have concurrent
+	// not from dsort). Also it would be really hard to have concurrent
 	// sends and memory cleanup. We must stop before sending records
 	// because it affects content of the records.
 	ds.mw.stopWatchingExcess()
@@ -260,29 +264,29 @@ func (ds *dsorterGeneral) postShardCreation(mi *fs.Mountpath) {
 }
 
 // loads content from disk or memory, local or remote
-func (ds *dsorterGeneral) Load(w io.Writer, rec *extract.Record, obj *extract.RecordObj) (int64, error) {
+func (ds *dsorterGeneral) Load(w io.Writer, rec *shard.Record, obj *shard.RecordObj) (int64, error) {
 	if ds.m.aborted() {
 		return 0, newDSortAbortedError(ds.m.ManagerUUID)
 	}
-	if rec.DaemonID != ds.m.ctx.node.ID() {
+	if rec.DaemonID != g.t.SID() {
 		return ds.loadRemote(w, rec, obj)
 	}
 	return ds.loadLocal(w, obj)
 }
 
-func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *extract.RecordObj) (written int64, err error) {
+func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *shard.RecordObj) (written int64, err error) {
 	var (
 		slab      *memsys.Slab
 		buf       []byte
 		storeType = obj.StoreType
 	)
 
-	if storeType != extract.SGLStoreType { // SGL does not need buffer as it is buffer itself
-		buf, slab = mm.AllocSize(obj.Size)
+	if storeType != shard.SGLStoreType { // SGL does not need buffer as it is buffer itself
+		buf, slab = g.mm.AllocSize(obj.Size)
 	}
 
 	defer func() {
-		if storeType != extract.SGLStoreType {
+		if storeType != shard.SGLStoreType {
 			slab.Free(buf)
 		}
 		ds.m.decrementRef(1)
@@ -290,7 +294,7 @@ func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *extract.RecordObj) (writte
 
 	fullContentPath := ds.m.recm.FullContentPath(obj)
 
-	if ds.m.pars.DryRun {
+	if ds.m.Pars.DryRun {
 		r := cos.NopReader(obj.MetadataSize + obj.Size)
 		written, err = io.CopyBuffer(w, r, buf)
 		return
@@ -298,7 +302,7 @@ func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *extract.RecordObj) (writte
 
 	var n int64
 	switch storeType {
-	case extract.OffsetStoreType:
+	case shard.OffsetStoreType:
 		f, err := os.Open(fullContentPath) // TODO: it should be open always
 		if err != nil {
 			return written, errors.WithMessage(err, "(offset) open local content failed")
@@ -311,7 +315,7 @@ func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *extract.RecordObj) (writte
 		if n, err = io.CopyBuffer(w, io.LimitReader(f, obj.MetadataSize+obj.Size), buf); err != nil {
 			return written, errors.WithMessage(err, "(offset) copy local content failed")
 		}
-	case extract.SGLStoreType:
+	case shard.SGLStoreType:
 		debug.Assert(buf == nil)
 		v, ok := ds.m.recm.RecordContents().Load(fullContentPath)
 		debug.Assert(ok, fullContentPath)
@@ -323,7 +327,7 @@ func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *extract.RecordObj) (writte
 		if n, err = io.Copy(w, sgl); err != nil {
 			return written, errors.WithMessage(err, "(sgl) copy local content failed")
 		}
-	case extract.DiskStoreType:
+	case shard.DiskStoreType:
 		f, err := os.Open(fullContentPath)
 		if err != nil {
 			return written, errors.WithMessage(err, "(disk) open local content failed")
@@ -341,24 +345,15 @@ func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *extract.RecordObj) (writte
 	return
 }
 
-func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *extract.Record, obj *extract.RecordObj) (int64, error) {
+func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *shard.Record, obj *shard.RecordObj) (int64, error) {
 	var (
-		cbErr      error
-		beforeRecv int64
-		beforeSend int64
-
-		daemonID = rec.DaemonID
-		twg      = cos.NewTimeoutGroup()
-		writer   = ds.newStreamWriter(rec.MakeUniqueName(obj), w)
-		metrics  = ds.m.Metrics.Creation
-
-		toNode = ds.m.smap.GetTarget(daemonID)
+		tid    = rec.DaemonID
+		tsi    = ds.m.smap.GetTarget(tid)
+		writer = ds.newStreamWriter(rec.MakeUniqueName(obj), w)
 	)
-
-	if toNode == nil {
-		return 0, errors.Errorf("tried to send request to node %q which is not present in the smap", daemonID)
+	if tsi == nil {
+		return 0, errors.Errorf("cannot send request to node %q - not present in %s", tid, ds.m.smap)
 	}
-
 	req := remoteRequest{
 		Record:    rec,
 		RecordObj: obj,
@@ -366,63 +361,29 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *extract.Record, obj *extr
 	opaque := cos.MustMarshal(req)
 	o := transport.AllocSend()
 	o.Hdr = transport.ObjHdr{Opaque: opaque}
-	if ds.m.Metrics.extended {
-		beforeSend = mono.NanoTime()
-	}
-	o.Callback = func(hdr transport.ObjHdr, r io.ReadCloser, _ any, err error) {
-		if err != nil {
-			cbErr = err
-		}
-		if ds.m.Metrics.extended {
-			delta := mono.Since(beforeSend)
-			metrics.mu.Lock()
-			metrics.RequestStats.updateTime(delta)
-			metrics.mu.Unlock()
+	o.Callback, o.CmplArg = ds.sentCallback, &req
 
-			ds.m.ctx.stats.AddMany(
-				cos.NamedVal64{Name: stats.DSortCreationReqCount, Value: 1},
-				cos.NamedVal64{Name: stats.DSortCreationReqLatency, Value: int64(delta)},
-			)
-		}
-		twg.Done()
-	}
-
-	twg.Add(1)
-	if err := ds.streams.request.Send(o, nil, toNode); err != nil {
+	if err := ds.streams.request.Send(o, nil, tsi); err != nil {
 		return 0, errors.WithStack(err)
 	}
 
-	// Send should be synchronous to make sure that 'wait timeout' is
-	// calculated only for the receive side.
-	twg.Wait()
-
-	if cbErr != nil {
-		return 0, errors.WithStack(cbErr)
-	}
-
-	if ds.m.Metrics.extended {
-		beforeRecv = mono.NanoTime()
-	}
-
-	// It may happen that the target we are trying to contact was
+	// May happen that the target we are trying to contact was
 	// aborted or for some reason is not responding. Thus we need to do
 	// some precaution and wait for the content only for limited time or
 	// until we receive abort signal.
-	var pulled bool
+	var (
+		beforeRecv = mono.NanoTime()
+		pulled     bool
+	)
 	timed, stopped := writer.wg.WaitTimeoutWithStop(ds.m.callTimeout, ds.m.listenAborted())
 	if timed || stopped {
-		// In case of time out or abort we need to pull the writer to
+		// In case of timeout or abort we need to pull the writer to
 		// avoid concurrent Close and Write on `writer.w`.
 		pulled = ds.pullStreamWriter(rec.MakeUniqueName(obj)) != nil
-	}
-
-	if ds.m.Metrics.extended {
+	} else {
+		// stats
 		delta := mono.Since(beforeRecv)
-		metrics.mu.Lock()
-		metrics.ResponseStats.updateTime(delta)
-		metrics.mu.Unlock()
-
-		ds.m.ctx.stats.AddMany(
+		g.tstats.AddMany(
 			cos.NamedVal64{Name: stats.DSortCreationRespCount, Value: 1},
 			cos.NamedVal64{Name: stats.DSortCreationRespLatency, Value: int64(delta)},
 		)
@@ -431,7 +392,7 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *extract.Record, obj *extr
 	// If we timed out or were stopped but failed to pull the
 	// writer then someone else should've done it and we barely
 	// missed. In this case we should wait for the job to finish
-	// (when stopped we should receive error anyway).
+	// (when stopped, we should receive an error anyway).
 
 	if pulled { // managed to pull the writer, can safely return error
 		var err error
@@ -439,8 +400,7 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *extract.Record, obj *extr
 		case stopped:
 			err = cmn.NewErrAborted("wait for remote content", "", nil)
 		case timed:
-			err = errors.Errorf("wait for remote content has timed out (%q was waiting for %q)",
-				ds.m.ctx.node.ID(), daemonID)
+			err = errors.Errorf("wait for remote content timed out (%q was waiting for %q)", g.t.SID(), tid)
 		default:
 			debug.Assert(false, "pulled but not stopped or timed?")
 		}
@@ -450,7 +410,18 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *extract.Record, obj *extr
 	if timed || stopped {
 		writer.wg.Wait()
 	}
+
 	return writer.n, writer.err
+}
+
+func (ds *dsorterGeneral) sentCallback(_ transport.ObjHdr, _ io.ReadCloser, arg any, err error) {
+	if err == nil {
+		g.tstats.Add(stats.DSortCreationReqCount, 1)
+		return
+	}
+	req := arg.(*remoteRequest)
+	nlog.Errorf("%s: [dsort] %s failed to send remore-req %s: %v",
+		g.t, ds.m.ManagerUUID, req.Record.MakeUniqueName(req.RecordObj), err)
 }
 
 func (ds *dsorterGeneral) errHandler(err error, node *meta.Snode, o *transport.Obj) {
@@ -470,7 +441,7 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 	transport.FreeRecv(objReader)
 	req := remoteRequest{}
 	if err := jsoniter.Unmarshal(hdr.Opaque, &req); err != nil {
-		err := fmt.Errorf(cmn.FmtErrUnmarshal, DSortName, "recv request", cos.BHead(hdr.Opaque), err)
+		err := fmt.Errorf(cmn.FmtErrUnmarshal, apc.ActDsort, "recv request", cos.BHead(hdr.Opaque), err)
 		ds.m.abort(err)
 		return err
 	}
@@ -490,19 +461,13 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 		return newDSortAbortedError(ds.m.ManagerUUID)
 	}
 
-	var (
-		beforeSend int64
-		o          = transport.AllocSend() // NOTE: Send(o, ...) must be called
-	)
-	if ds.m.Metrics.extended {
-		beforeSend = mono.NanoTime()
-	}
+	o := transport.AllocSend()
 	o.Hdr = transport.ObjHdr{ObjName: req.Record.MakeUniqueName(req.RecordObj)}
-	o.Callback, o.CmplArg = ds.responseCallback, beforeSend
+	o.Callback = ds.responseCallback
 
 	fullContentPath := ds.m.recm.FullContentPath(req.RecordObj)
 
-	if ds.m.pars.DryRun {
+	if ds.m.Pars.DryRun {
 		lr := cos.NopReader(req.RecordObj.MetadataSize + req.RecordObj.Size)
 		r := cos.NopOpener(io.NopCloser(lr))
 		o.Hdr.ObjAttrs.Size = req.RecordObj.MetadataSize + req.RecordObj.Size
@@ -511,7 +476,7 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 	}
 
 	switch req.RecordObj.StoreType {
-	case extract.OffsetStoreType:
+	case shard.OffsetStoreType:
 		o.Hdr.ObjAttrs.Size = req.RecordObj.MetadataSize + req.RecordObj.Size
 		offset := req.RecordObj.Offset - req.RecordObj.MetadataSize
 		r, err := cos.NewFileSectionHandle(fullContentPath, offset, o.Hdr.ObjAttrs.Size)
@@ -520,14 +485,14 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 			return err
 		}
 		ds.streams.response.Send(o, r, fromNode)
-	case extract.SGLStoreType:
+	case shard.SGLStoreType:
 		v, ok := ds.m.recm.RecordContents().Load(fullContentPath)
 		debug.Assert(ok, fullContentPath)
 		ds.m.recm.RecordContents().Delete(fullContentPath)
 		sgl := v.(*memsys.SGL)
 		o.Hdr.ObjAttrs.Size = sgl.Size()
 		ds.streams.response.Send(o, sgl, fromNode)
-	case extract.DiskStoreType:
+	case shard.DiskStoreType:
 		f, err := cos.NewFileHandle(fullContentPath)
 		if err != nil {
 			ds.errHandler(err, fromNode, o)
@@ -547,20 +512,14 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 	return nil
 }
 
-func (ds *dsorterGeneral) responseCallback(hdr transport.ObjHdr, rc io.ReadCloser, x any, err error) {
-	if ds.m.Metrics.extended {
-		dur := mono.Since(x.(int64))
-		ds.m.Metrics.Creation.mu.Lock()
-		ds.m.Metrics.Creation.LocalSendStats.updateTime(dur)
-		ds.m.Metrics.Creation.LocalSendStats.updateThroughput(hdr.ObjAttrs.Size, dur)
-		ds.m.Metrics.Creation.mu.Unlock()
-	}
-
+func (ds *dsorterGeneral) responseCallback(hdr transport.ObjHdr, rc io.ReadCloser, _ any, err error) {
 	if sgl, ok := rc.(*memsys.SGL); ok {
 		sgl.Free()
 	}
 	ds.m.decrementRef(1)
 	if err != nil {
+		nlog.Errorf("%s: [dsort] %s failed to send rsp %s (size %d): %v - aborting...",
+			g.t, ds.m.ManagerUUID, hdr.ObjName, hdr.ObjAttrs.Size, err)
 		ds.m.abort(err)
 	}
 }
@@ -596,24 +555,11 @@ func (ds *dsorterGeneral) recvResp(hdr transport.ObjHdr, object io.Reader, err e
 		return nil
 	}
 
-	var beforeSend int64
-	if ds.m.Metrics.extended {
-		beforeSend = mono.NanoTime()
-	}
-
-	buf, slab := mm.AllocSize(hdr.ObjAttrs.Size)
+	buf, slab := g.mm.AllocSize(hdr.ObjAttrs.Size)
 	writer.n, writer.err = io.CopyBuffer(writer.w, object, buf)
 	writer.wg.Done()
 	slab.Free(buf)
 
-	if ds.m.Metrics.extended {
-		metrics := ds.m.Metrics.Creation
-		dur := mono.Since(beforeSend)
-		metrics.mu.Lock()
-		metrics.LocalRecvStats.updateTime(dur)
-		metrics.LocalRecvStats.updateThroughput(writer.n, dur)
-		metrics.mu.Unlock()
-	}
 	return nil
 }
 
@@ -635,7 +581,7 @@ func (ds *dsorterGeneral) onAbort() {
 
 type dsgCreateShard struct {
 	ds    *dsorterGeneral
-	shard *extract.Shard
+	shard *shard.Shard
 }
 
 func (cs *dsgCreateShard) do() (err error) {

@@ -39,7 +39,7 @@ type Algorithm struct {
 	Ext string `json:"extension"`
 
 	// ditto: Content only
-	// `extract.contentKeyTypes` enum values: {"int", "string", "float" }
+	// `shard.contentKeyTypes` enum values: {"int", "string", "float" }
 	ContentKeyType string `json:"content_key_type"`
 }
 
@@ -73,8 +73,6 @@ type RequestSpec struct {
 	ExtractConcMaxLimit int `json:"extract_concurrency_max_limit" yaml:"extract_concurrency_max_limit"`
 	// Default: calcMaxLimit()
 	CreateConcMaxLimit int `json:"create_concurrency_max_limit" yaml:"create_concurrency_max_limit"`
-	// Default: false
-	ExtendedMetrics bool `json:"extended_metrics" yaml:"extended_metrics"`
 
 	// debug
 	DSorterType string `json:"dsorter_type"`

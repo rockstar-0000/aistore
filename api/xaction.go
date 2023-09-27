@@ -5,7 +5,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -26,7 +25,7 @@ func StartXaction(bp BaseParams, args xact.ArgsMsg) (xid string, err error) {
 	if !xact.Table[args.Kind].Startable {
 		return "", fmt.Errorf("xaction %q is not startable", args.Kind)
 	}
-	q := args.Bck.AddToQuery(nil)
+	q := args.Bck.NewQuery()
 	if args.Force {
 		q.Set(apc.QparamForce, "true")
 	}
@@ -55,7 +54,7 @@ func AbortXaction(bp BaseParams, args xact.ArgsMsg) (err error) {
 		reqParams.Path = apc.URLPathClu.S
 		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = args.Bck.AddToQuery(nil)
+		reqParams.Query = args.Bck.NewQuery()
 	}
 	err = reqParams.DoRequest()
 	FreeRp(reqParams)
@@ -263,9 +262,7 @@ func _waitx(bp BaseParams, args xact.ArgsMsg, fn func(xact.MultiSnap) (bool, boo
 		begin           = mono.NanoTime()
 		total, maxSleep = _times(args)
 		sleep           = xact.MinPollTime
-		ctx, cancel     = context.WithTimeout(context.Background(), total)
 	)
-	defer cancel()
 	for {
 		var done bool
 		if fn == nil {
@@ -289,14 +286,11 @@ func _waitx(bp BaseParams, args xact.ArgsMsg, fn func(xact.MultiSnap) (bool, boo
 			return
 		}
 		time.Sleep(sleep)
-		elapsed = mono.Since(begin)
-		sleep = cos.MinDuration(maxSleep, sleep+sleep/2)
+		sleep = min(maxSleep, sleep+sleep/2)
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-			break
+		if elapsed = mono.Since(begin); elapsed >= total {
+			err = fmt.Errorf("api.wait: timed out (%v) waiting for %s", total, args.String())
+			return
 		}
 	}
 }
@@ -309,5 +303,5 @@ func _times(args xact.ArgsMsg) (time.Duration, time.Duration) {
 	case args.Timeout < 0:
 		total = xact.DefWaitTimeLong
 	}
-	return total, cos.MinDuration(xact.MaxProbingFreq, cos.ProbingFrequency(total))
+	return total, min(xact.MaxProbingFreq, cos.ProbingFrequency(total))
 }

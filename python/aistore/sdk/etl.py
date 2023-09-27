@@ -67,9 +67,10 @@ class Etl:
         template: str,
         communication_type: str = DEFAULT_ETL_COMM,
         timeout: str = DEFAULT_ETL_TIMEOUT,
+        arg_type: str = "",
     ) -> str:
         """
-        Initializes ETL based on Kubernetes pod spec template. Returns etl_name.
+        Initializes ETL based on Kubernetes pod spec template.
 
         Args:
             template (str): Kubernetes pod spec template
@@ -92,6 +93,7 @@ class Etl:
             etl_name=self._name,
             communication_type=communication_type,
             timeout=timeout,
+            arg_type=arg_type,
         ).as_dict()
 
         return self._client.request(HTTP_METHOD_PUT, path=URL_PATH_ETL, json=value).text
@@ -106,10 +108,10 @@ class Etl:
         communication_type: str = DEFAULT_ETL_COMM,
         timeout: str = DEFAULT_ETL_TIMEOUT,
         chunk_size: int = None,
-        transform_url: bool = False,
+        arg_type: str = "",
     ) -> str:
         """
-        Initializes ETL based on the provided source code. Returns etl_name.
+        Initializes ETL based on the provided source code.
 
         Args:
             transform (Callable): Transform function of the ETL
@@ -124,8 +126,9 @@ class Etl:
             timeout (str): [optional, default="5m"] Timeout of the ETL job (e.g. 5m for 5 minutes)
             chunk_size (int): Chunk size in bytes if transform function in streaming data.
                 (whole object is read by default)
-            transform_url (optional, bool): If True, the runtime will provide the transform function with the URL to the
-             object on the target rather than the raw bytes read from the object
+            arg_type (optional, str): The type of argument the runtime will provide the transform function.
+                The default value of "" will provide the raw bytes read from the object.
+                When used with hpull communication_type, setting this to "url" will provide the URL of the object.
         Returns:
             Job ID string associated with this ETL
         """
@@ -147,7 +150,7 @@ class Etl:
                 transform, preimported_modules, communication_type
             ),
             chunk_size=chunk_size,
-            transform_url=transform_url,
+            arg_type=arg_type,
         ).as_dict()
 
         return self._client.request(

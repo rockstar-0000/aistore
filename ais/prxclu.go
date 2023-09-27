@@ -12,14 +12,17 @@ import (
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact"
@@ -339,31 +342,55 @@ func (p *proxy) _tresRaw(w http.ResponseWriter, r *http.Request, results sliceRe
 
 // POST /v1/cluster - handles joins and keepalives
 func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
-	var (
-		regReq cluMeta
-		nsi    *meta.Snode
-		apiOp  string // one of: admin-join, self-join, keepalive
-		action string // msg.Action, one: apc.ActSelfJoinProxy, ...
-	)
-	apiItems, err := p.parseURL(w, r, 1, false, apc.URLPathClu.L)
+	apiItems, err := p.parseURL(w, r, 1, true, apc.URLPathClu.L)
 	if err != nil {
-		return
-	}
-	apiOp = apiItems[0]
-	// Ignore keepalive beat if the primary is in transition.
-	if p.inPrimaryTransition.Load() && apiOp == apc.Keepalive {
 		return
 	}
 	if p.forwardCP(w, r, nil, "httpclupost") {
 		return
 	}
-	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
+
+	var (
+		nsi    *meta.Snode
+		action string
+		regReq cluMeta
+		smap   = p.owner.smap.get()
+		config = cmn.GCO.Get()
+		apiOp  = apiItems[0]
+	)
+	if len(apiItems) > 1 && apiOp != apc.Keepalive {
+		p.writeErrURL(w, r)
+		return
+	}
+	if p.settingNewPrimary.Load() {
+		// ignore of fail
+		if apiOp != apc.Keepalive {
+			var s string
+			if apiOp == apc.AdminJoin {
+				s = " (retry in a few seconds)"
+			}
+			p.writeErr(w, r, errors.New("setting new primary - transitioning"+s), http.StatusServiceUnavailable)
+		}
 		return
 	}
 
-	// unmarshal and validate
 	switch apiOp {
+	case apc.Keepalive:
+		// fast path(?)
+		if len(apiItems) > 1 {
+			p.fastKalive(w, r, smap, config, apiItems[1])
+			return
+		}
+
+		// slow path
+		if cmn.ReadJSON(w, r, &regReq) != nil {
+			return
+		}
+		nsi = regReq.SI
 	case apc.AdminJoin: // administrative join
+		if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
+			return
+		}
 		if cmn.ReadJSON(w, r, &regReq.SI) != nil {
 			return
 		}
@@ -374,30 +401,20 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 			p.writeErrf(w, r, "%s: failed to obtain node info from %s: %v", p.si, nsi.StringEx(), err)
 			return
 		}
-		// NOTE: ID _and_ 3-networks configuration is obtained from the node itself;
-		// as far as ID, `aisnode` either:
-		// (a) loads existing one,
-		// (b) gets it from command line or env (see `envDaemonID`), or
-		// (c) generates a new one (see `genDaemonID`)
-		// - in that exact sequence.
+		// NOTE: node ID and 3-networks configuration is obtained from the node itself
 		*nsi = *si
 	case apc.SelfJoin: // auto-join at node startup
 		if cmn.ReadJSON(w, r, &regReq) != nil {
 			return
 		}
+		// NOTE: ditto
 		nsi = regReq.SI
 		if !p.ClusterStarted() {
 			p.reg.mu.Lock()
 			p.reg.pool = append(p.reg.pool, regReq)
 			p.reg.mu.Unlock()
 		}
-	case apc.Keepalive: // keep-alive
-		if cmn.ReadJSON(w, r, &regReq) != nil {
-			return
-		}
-		nsi = regReq.SI
 	default:
-		debug.Assert(false, apiOp) // must be one of the (3) above
 		p.writeErrURL(w, r)
 		return
 	}
@@ -447,7 +464,6 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// node flags
-	smap := p.owner.smap.get()
 	if osi := smap.GetNode(nsi.ID()); osi != nil {
 		nsi.Flags = osi.Flags
 	}
@@ -478,14 +494,15 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !cmn.GCO.Get().Rebalance.Enabled {
+	if !config.Rebalance.Enabled {
 		regReq.RebInterrupted, regReq.Restarted = false, false
 	}
 	if nsi.IsTarget() && (regReq.RebInterrupted || regReq.Restarted) {
 		if a, b := p.ClusterStarted(), p.owner.rmd.starting.Load(); !a || b {
 			// handle via rmd.starting + resumeReb
 			if p.owner.rmd.interrupted.CAS(false, true) {
-				nlog.Warningf("%s: will resume rebalance %s(%t, %t)", p, nsi.StringEx(), regReq.RebInterrupted, regReq.Restarted)
+				nlog.Warningf("%s: will resume rebalance %s(%t, %t)", p, nsi.StringEx(),
+					regReq.RebInterrupted, regReq.Restarted)
 			}
 		}
 	}
@@ -536,6 +553,31 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 	go p.mcastJoined(nsi, msg, nsi.Flags, &regReq)
 }
 
+func (p *proxy) fastKalive(w http.ResponseWriter, r *http.Request, smap *smapX, config *cmn.Config, sid string) {
+	fast := p.readyToFastKalive.Load()
+	if !fast {
+		now := mono.NanoTime()
+		cfg := config.Keepalive
+		min := max(cfg.Target.Interval.D(), cfg.Proxy.Interval.D()) << 1
+		if fast = p.keepalive.cluUptime(now) > min; fast {
+			p.readyToFastKalive.Store(true) // not resetting upon a change of primary
+		}
+	}
+	if fast {
+		var (
+			callerID   = r.Header.Get(apc.HdrCallerID)
+			callerSver = r.Header.Get(apc.HdrCallerSmapVer)
+		)
+		if callerID == sid && callerSver != "" && callerSver == smap.vstr {
+			if si := smap.GetNode(sid); si != nil {
+				p.keepalive.heardFrom(sid)
+				return
+			}
+		}
+	}
+	p.writeErr(w, r, errFastKalive, 0, Silent)
+}
+
 // when joining manually: update the node with cluster meta that does not include Smap
 // (the later gets finalized and metasync-ed upon success)
 func (p *proxy) adminJoinHandshake(smap *smapX, nsi *meta.Snode, apiOp string) (int, error) {
@@ -568,7 +610,8 @@ func (p *proxy) adminJoinHandshake(smap *smapX, nsi *meta.Snode, apiOp string) (
 }
 
 // executes under lock
-func (p *proxy) _joinKalive(nsi *meta.Snode, regSmap *smapX, apiOp string, flags cos.BitFlags, regReq *cluMeta, msg *apc.ActMsg) (upd bool, err error) {
+func (p *proxy) _joinKalive(nsi *meta.Snode, regSmap *smapX, apiOp string, flags cos.BitFlags, regReq *cluMeta,
+	msg *apc.ActMsg) (upd bool, err error) {
 	smap := p.owner.smap.get()
 	if !smap.isPrimary(p.si) {
 		err = newErrNotPrimary(p.si, smap, "cannot "+apiOp+" "+nsi.StringEx())
@@ -639,7 +682,7 @@ func (p *proxy) kalive(nsi, osi *meta.Snode) bool {
 		return true // NOTE: update cluster map
 	}
 
-	p.keepalive.heardFrom(nsi.ID(), false /*reset*/)
+	p.keepalive.heardFrom(nsi.ID())
 	return false
 }
 
@@ -890,15 +933,20 @@ func (p *proxy) cluputJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg.Action != apc.ActSendOwnershipTbl {
-		// must be primary
+		// must be primary to execute all the rest actions
 		if p.forwardCP(w, r, msg, "") {
 			return
 		}
-		if err := p.pready(nil); err != nil {
+
+		// not just 'cluster-started' - must be ready to rebalance as well
+		// with two distinct exceptions
+		withRR := (msg.Action != apc.ActShutdownCluster && msg.Action != apc.ActXactStop)
+		if err := p.pready(nil, withRR); err != nil {
 			p.writeErr(w, r, err, http.StatusServiceUnavailable)
 			return
 		}
 	}
+
 	switch msg.Action {
 	case apc.ActSetConfig:
 		toUpdate := &cmn.ConfigToUpdate{}
@@ -971,12 +1019,23 @@ func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUp
 		toUpdate: toUpdate,
 		wait:     true,
 	}
-
 	// NOTE: critical cluster-wide config updates requiring restart (of the cluster)
 	if toUpdate.Net != nil && toUpdate.Net.HTTP != nil {
-		from, _ := jsoniter.Marshal(cmn.GCO.Get().Net.HTTP)
+		config := cmn.GCO.Get()
+		from, _ := jsoniter.Marshal(config.Net.HTTP)
 		to, _ := jsoniter.Marshal(toUpdate.Net.HTTP)
 		whingeToUpdate("net.http", string(from), string(to))
+
+		// complementary
+		if toUpdate.Net.HTTP.UseHTTPS != nil {
+			use := *toUpdate.Net.HTTP.UseHTTPS
+			if config.Net.HTTP.UseHTTPS != use {
+				if toUpdate.Proxy == nil {
+					toUpdate.Proxy = &cmn.ProxyConfToUpdate{}
+				}
+				switchHTTPS(toUpdate.Proxy, &config.Proxy, use)
+			}
+		}
 	}
 	if toUpdate.Auth != nil {
 		from, _ := jsoniter.Marshal(cmn.GCO.Get().Auth)
@@ -988,6 +1047,26 @@ func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUp
 	if _, err := p.owner.config.modify(ctx); err != nil {
 		p.writeErr(w, r, err)
 	}
+}
+
+// switch http => https, or vice versa
+func switchHTTPS(toCfg *cmn.ProxyConfToUpdate, fromCfg *cmn.ProxyConf, use bool) {
+	toScheme, fromScheme := "http", "https"
+	if use {
+		toScheme, fromScheme = "https", "http"
+	}
+	f := func(to *string, from string) *string {
+		if to == nil && strings.HasPrefix(from, fromScheme) {
+			s := strings.Replace(from, fromScheme, toScheme, 1)
+			to = api.String(s)
+		}
+		return to
+	}
+	toCfg.PrimaryURL = f(toCfg.PrimaryURL, fromCfg.PrimaryURL)
+	toCfg.OriginalURL = f(toCfg.OriginalURL, fromCfg.OriginalURL)
+	toCfg.DiscoveryURL = f(toCfg.DiscoveryURL, fromCfg.DiscoveryURL)
+
+	nlog.Errorln("Warning: _prior_ to restart make sure to remove all copies of cluster maps")
 }
 
 func whingeToUpdate(what, from, to string) {
@@ -1052,7 +1131,7 @@ func (p *proxy) xstart(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 	xargs.Kind, _ = xact.GetKindName(xargs.Kind) // display name => kind
 	// rebalance
 	if xargs.Kind == apc.ActRebalance {
-		p.rebalanceCluster(w, r)
+		p.rebalanceCluster(w, r, msg)
 		return
 	}
 
@@ -1133,7 +1212,7 @@ func (p *proxy) xstop(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	freeBcastRes(results)
 }
 
-func (p *proxy) rebalanceCluster(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) rebalanceCluster(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	// note operational priority over config-disabled `errRebalanceDisabled`
 	if err := p.canRebalance(); err != nil && err != errRebalanceDisabled {
 		p.writeErr(w, r, err)
@@ -1151,7 +1230,7 @@ func (p *proxy) rebalanceCluster(w http.ResponseWriter, r *http.Request) {
 		pre:     rmdInc,
 		final:   rmdSync, // metasync new rmd instance
 		p:       p,
-		smapCtx: &smapModifier{smap: smap},
+		smapCtx: &smapModifier{smap: smap, msg: msg},
 	}
 	_, err := p.owner.rmd.modify(rmdCtx)
 	if err != nil {
@@ -1290,7 +1369,7 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 		return
 	}
 
-	nlog.Infof("%s: %s(%s) %v", p, msg.Action, si.StringEx(), opts)
+	nlog.Infof("%s: %s(%s) opts=%v", p, msg.Action, si.StringEx(), opts)
 
 	switch {
 	case si.IsProxy():
@@ -1315,6 +1394,7 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 		}
 	default: // target
 		reb := !opts.SkipRebalance && cmn.GCO.Get().Rebalance.Enabled && !inMaint
+		nlog.Infof("%s: %s reb=%t", p, msg.Action, reb)
 		if reb {
 			if err := p.canRebalance(); err != nil {
 				p.writeErr(w, r, err)
@@ -1372,7 +1452,8 @@ func (p *proxy) mcastMaint(msg *apc.ActMsg, si *meta.Snode, reb, maintPostReb bo
 			[]string{apc.ActDecommissionNode, apc.ActStartMaintenance, apc.ActShutdownNode})
 		return
 	}
-	nlog.Infof("%s mcast-maint: %s, %s reb=(%t, %t)", p, msg, si.StringEx(), reb, maintPostReb)
+	var dummy = meta.Snode{Flags: flags}
+	nlog.Infof("%s mcast-maint: %s, %s reb=(%t, %t), nflags=%s", p, msg, si.StringEx(), reb, maintPostReb, dummy.Fl2S())
 	ctx = &smapModifier{
 		pre:     p._markMaint,
 		post:    p._rebPostRm, // (rmdCtx.rmNode => p.rmNodeFinal when all done)
@@ -1437,6 +1518,9 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 		p.writeErr(w, r, err, http.StatusNotFound)
 		return
 	}
+
+	nlog.Infof("%s: %s(%s) opts=%v", p, msg.Action, si.StringEx(), opts)
+
 	if !smap.InMaint(si) {
 		p.writeErrf(w, r, "node %s is not in maintenance mode - nothing to do", si.StringEx())
 		return
@@ -1478,17 +1562,19 @@ func (p *proxy) cluputQuery(w http.ResponseWriter, r *http.Request, action strin
 	if p.forwardCP(w, r, &apc.ActMsg{Action: action}, "") {
 		return
 	}
-	if action != apc.ActAttachRemAis && action != apc.ActDetachRemAis {
-		if err := p.pready(nil); err != nil {
+	switch action {
+	case apc.Proxy:
+		if err := p.pready(nil, true); err != nil {
 			p.writeErr(w, r, err, http.StatusServiceUnavailable)
 			return
 		}
-	}
-	switch action {
-	case apc.Proxy:
 		// cluster-wide: designate a new primary proxy administratively
 		p.cluSetPrimary(w, r)
 	case apc.ActSetConfig: // set-config via query parameters and "?n1=v1&n2=v2..."
+		if err := p.pready(nil, true); err != nil {
+			p.writeErr(w, r, err, http.StatusServiceUnavailable)
+			return
+		}
 		var (
 			query    = r.URL.Query()
 			toUpdate = &cmn.ConfigToUpdate{}
@@ -1620,10 +1706,10 @@ func (p *proxy) _remaisConf(ctx *configModifier, config *globalConfig) (bool, er
 }
 
 func (p *proxy) mcastStopMaint(msg *apc.ActMsg, opts *apc.ActValRmNode) (rebID string, err error) {
-	nlog.Infof("%s mcast-stopm: %s, %s", p, msg, opts.DaemonID)
+	nlog.Infof("%s mcast-stopm: %s, %s, skip-reb=%t", p, msg, opts.DaemonID, opts.SkipRebalance)
 	ctx := &smapModifier{
 		pre:     p._stopMaintPre,
-		post:    p._newRMD,
+		post:    p._stopMaintRMD,
 		final:   p._syncFinal,
 		sid:     opts.DaemonID,
 		skipReb: opts.SkipRebalance,
@@ -1639,7 +1725,7 @@ func (p *proxy) mcastStopMaint(msg *apc.ActMsg, opts *apc.ActValRmNode) (rebID s
 }
 
 func (p *proxy) _stopMaintPre(ctx *smapModifier, clone *smapX) error {
-	const efmt = "cannot take %s out of maintenance"
+	const efmt = "cannot take %s out of maintenance:"
 	if !clone.isPrimary(p.si) {
 		return newErrNotPrimary(p.si, clone, fmt.Sprintf(efmt, ctx.sid))
 	}
@@ -1655,12 +1741,18 @@ func (p *proxy) _stopMaintPre(ctx *smapModifier, clone *smapX) error {
 	return nil
 }
 
-func (p *proxy) _newRMD(ctx *smapModifier, clone *smapX) {
-	// e.g., taking node out of maintenance w/ no rebalance
+func (p *proxy) _stopMaintRMD(ctx *smapModifier, clone *smapX) {
 	if ctx.skipReb {
+		nlog.Infoln("ctx.skip-reb", ctx.skipReb)
 		return
 	}
-	if !mustRebalance(ctx, clone) {
+	if !cmn.GCO.Get().Rebalance.Enabled {
+		return
+	}
+	if daemon.stopping.Load() {
+		return
+	}
+	if clone.CountActiveTs() < 2 {
 		return
 	}
 	rmdCtx := &rmdModifier{
@@ -1686,9 +1778,11 @@ func (p *proxy) cluSetPrimary(w http.ResponseWriter, r *http.Request) {
 	if p.forwardCP(w, r, nil, "designate new primary proxy '"+npid+"'") {
 		return
 	}
+
+	// am current primary - validating
 	smap := p.owner.smap.get()
-	psi := smap.GetProxy(npid)
-	if psi == nil {
+	npsi := smap.GetProxy(npid)
+	if npsi == nil {
 		p.writeErrf(w, r, "new primary proxy %s is not present in the %s", npid, smap.StringEx())
 		return
 	}
@@ -1697,26 +1791,36 @@ func (p *proxy) cluSetPrimary(w http.ResponseWriter, r *http.Request) {
 		nlog.Warningf("Request to set primary to %s(self) - nothing to do", npid)
 		return
 	}
-	if smap.InMaintOrDecomm(psi) {
+	if smap.InMaintOrDecomm(npsi) {
 		var err error
-		if smap.InMaint(psi) {
-			err = fmt.Errorf("%s cannot become the new primary as it's currently under maintenance", psi)
+		if smap.InMaint(npsi) {
+			err = fmt.Errorf("%s cannot become the new primary as it's currently under maintenance", npsi)
 		} else {
-			err = fmt.Errorf("%s cannot become the new primary as it's currently being decommissioned", psi)
+			err = fmt.Errorf("%s cannot become the new primary as it's currently being decommissioned", npsi)
 		}
 		debug.AssertNoErr(err)
 		p.writeErr(w, r, err, http.StatusServiceUnavailable)
 		return
 	}
 
+	// executing
+	if p.settingNewPrimary.CAS(false, true) {
+		p._setPrimary(w, r, npsi)
+		p.settingNewPrimary.Store(false)
+	}
+}
+
+func (p *proxy) _setPrimary(w http.ResponseWriter, r *http.Request, npsi *meta.Snode) {
+	//
 	// (I.1) Prepare phase - inform other nodes.
-	urlPath := apc.URLPathDaeProxy.Join(npid)
+	//
+	urlPath := apc.URLPathDaeProxy.Join(npsi.ID())
 	q := url.Values{}
 	q.Set(apc.QparamPrepare, "true")
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: urlPath, Query: q}
 
-	cluMeta, errM := p.cluMeta(cmetaFillOpt{skipSmap: true})
+	cluMeta, errM := p.cluMeta(cmetaFillOpt{skipSmap: true, skipPrimeTime: true})
 	if errM != nil {
 		p.writeErr(w, r, errM)
 		return
@@ -1730,25 +1834,26 @@ func (p *proxy) cluSetPrimary(w http.ResponseWriter, r *http.Request) {
 		if res.err == nil {
 			continue
 		}
-		err := res.errorf("node %s failed to set primary %s in the prepare phase", res.si, npid)
+		err := res.errorf("node %s failed to set primary %s in the prepare phase", res.si, npsi.StringEx())
 		p.writeErr(w, r, err)
 		freeBcastRes(results)
 		return
 	}
 	freeBcastRes(results)
 
+	//
 	// (I.2) Prepare phase - local changes.
-	p.inPrimaryTransition.Store(true)
-	defer p.inPrimaryTransition.Store(false)
-
-	err = p.owner.smap.modify(&smapModifier{pre: func(_ *smapModifier, clone *smapX) error {
-		clone.Primary = psi
+	//
+	err := p.owner.smap.modify(&smapModifier{pre: func(_ *smapModifier, clone *smapX) error {
+		clone.Primary = npsi
 		p.metasyncer.becomeNonPrimary()
 		return nil
 	}})
 	debug.AssertNoErr(err)
 
+	//
 	// (II) Commit phase.
+	//
 	q.Set(apc.QparamPrepare, "false")
 	args = allocBcArgs()
 	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: urlPath, Query: q}
@@ -1759,11 +1864,11 @@ func (p *proxy) cluSetPrimary(w http.ResponseWriter, r *http.Request) {
 		if res.err == nil {
 			continue
 		}
-		if res.si.ID() == npid {
-			cos.ExitLogf("commit phase failure: new primary %q returned %v", npid, res.err)
+		if res.si.ID() == npsi.ID() {
+			cos.ExitLogf("commit phase failure: new primary %s returned %v", npsi.StringEx(), res.err)
 		} else {
-			nlog.Errorf("Commit phase failure: %s returned err %v when setting primary = %s",
-				res.si.ID(), res.err, npid)
+			nlog.Errorf("Commit phase failure: %s returned %v when setting primary = %s",
+				res.si.ID(), res.err, npsi.StringEx())
 		}
 	}
 	freeBcastRes(results)
@@ -1799,10 +1904,13 @@ func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request) {
 		p.writeErrStatusf(w, r, http.StatusServiceUnavailable, "%s is not ready yet (starting up)", p)
 		return
 	}
-	if err := p.pready(smap); err != nil {
+
+	// primary (and cluster) to start and finalize rebalancing status _prior_ to removing invidual nodes
+	if err := p.pready(smap, true); err != nil {
 		p.writeErr(w, r, err, http.StatusServiceUnavailable)
 		return
 	}
+
 	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
 		return
 	}
@@ -1851,7 +1959,7 @@ func (p *proxy) rmNodeFinal(msg *apc.ActMsg, si *meta.Snode, ctx *smapModifier) 
 			[]string{apc.ActShutdownNode, apc.ActStartMaintenance, apc.ActDecommissionNode, apc.ActRmNodeUnsafe})
 	}
 
-	nlog.Infof("%s: %s %s", p, msg.Action, sname)
+	nlog.InfoDepth(1, p.String()+":", msg.Action, sname)
 	res := p.call(cargs, smap)
 	err = res.unwrap()
 	freeCargs(cargs)
@@ -1944,7 +2052,7 @@ func (p *proxy) canRebalance() (err error) {
 	// NOTE: cluster startup handles rebalance elsewhere (see p.resumeReb), and so
 	// all rebalance-triggering events (shutdown, decommission, maintenance, etc.)
 	// are not permitted and will fail during startup.
-	if err = p.pready(smap); err != nil {
+	if err = p.pready(smap, true); err != nil {
 		return
 	}
 	if !cmn.GCO.Get().Rebalance.Enabled {

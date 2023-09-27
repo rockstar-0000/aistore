@@ -8,7 +8,7 @@ package bundle
 import (
 	"fmt"
 	"sync"
-	"unsafe"
+	ratomic "sync/atomic"
 
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cluster/meta"
@@ -26,13 +26,23 @@ const (
 )
 
 type (
+	// multiple streams to the same destination with round-robin selection
+	stsdest []*transport.Stream
+	robin   struct {
+		stsdest stsdest
+		i       atomic.Int64
+	}
+	bundle map[string]*robin // stream "bundle" indexed by node ID
+)
+
+type (
 	Streams struct {
 		sowner       meta.Sowner
 		client       transport.Client
 		smap         *meta.Smap // current Smap
 		smaplock     *sync.Mutex
-		lsnode       *meta.Snode    // this node
-		streams      atomic.Pointer // points to the bundle (map below)
+		lsnode       *meta.Snode             // this node
+		streams      ratomic.Pointer[bundle] // stream bundle
 		trname       string
 		network      string
 		lid          string
@@ -42,15 +52,6 @@ type (
 		manualResync bool
 	}
 	Stats map[string]*transport.Stats // by DaemonID
-	//
-	// private types to support multiple streams to the same destination with round-robin selection
-	//
-	stsdest []*transport.Stream // STreams to the Same Destination (stsdest)
-	robin   struct {
-		stsdest stsdest
-		i       atomic.Int64
-	}
-	bundle map[string]*robin // stream "bundle" indexed by DaemonID
 
 	Args struct {
 		Extra        *transport.Extra // additional parameters
@@ -59,6 +60,12 @@ type (
 		Ntype        int              // cluster.Target (0) by default
 		Multiplier   int              // so-many TCP connections per Rx endpoint, with round-robin
 		ManualResync bool             // auto-resync by default
+	}
+
+	ErrDestinationMissing struct {
+		streamStr string
+		tname     string
+		smapStr   string
 	}
 )
 
@@ -72,9 +79,9 @@ var _ meta.Slistener = (*Streams)(nil)
 func (sb *Streams) UsePDU() bool   { return sb.extra.UsePDU() }
 func (sb *Streams) Trname() string { return sb.trname }
 
-func New(sowner meta.Sowner, lsnode *meta.Snode, cl transport.Client, sbArgs Args) (sb *Streams) {
-	if sbArgs.Net == "" {
-		sbArgs.Net = cmn.NetIntraData
+func New(sowner meta.Sowner, lsnode *meta.Snode, cl transport.Client, args Args) (sb *Streams) {
+	if args.Net == "" {
+		args.Net = cmn.NetIntraData
 	}
 	listeners := sowner.Listeners()
 	sb = &Streams{
@@ -83,15 +90,14 @@ func New(sowner meta.Sowner, lsnode *meta.Snode, cl transport.Client, sbArgs Arg
 		smaplock:     &sync.Mutex{},
 		lsnode:       lsnode,
 		client:       cl,
-		network:      sbArgs.Net,
-		trname:       sbArgs.Trname,
-		rxNodeType:   sbArgs.Ntype,
-		multiplier:   sbArgs.Multiplier,
-		manualResync: sbArgs.ManualResync,
+		network:      args.Net,
+		trname:       args.Trname,
+		rxNodeType:   args.Ntype,
+		multiplier:   args.Multiplier,
+		manualResync: args.ManualResync,
 	}
-	if sbArgs.Extra != nil {
-		sb.extra = *sbArgs.Extra
-	}
+	debug.Assert(args.Extra != nil && args.Extra.Config != nil)
+	sb.extra = *args.Extra
 	if sb.multiplier == 0 {
 		sb.multiplier = 1
 	}
@@ -182,7 +188,7 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 			if _, ok := streams[di.ID()]; ok {
 				continue
 			}
-			err = cos.NewErrNotFound("destination mismatch: stream (%s) => %s", sb, di)
+			err = &ErrDestinationMissing{sb.String(), di.StringEx(), sb.smap.String()}
 			_doCmpl(obj, roc, err) // ditto
 			return
 		}
@@ -239,7 +245,7 @@ func (sb *Streams) GetStats() Stats {
 //
 
 func (sb *Streams) get() (bun bundle) {
-	optr := (*bundle)(sb.streams.Load())
+	optr := sb.streams.Load()
 	if optr != nil {
 		bun = *optr
 	}
@@ -347,9 +353,9 @@ func (sb *Streams) Resync() {
 	obundle := sb.get()
 	l := len(added) - len(removed)
 	if obundle != nil {
-		l = cos.Max(len(obundle), len(obundle)+l)
+		l = max(len(obundle), len(obundle)+l)
 	}
-	nbundle := make(map[string]*robin, l)
+	nbundle := make(bundle, l)
 	for id, robin := range obundle {
 		nbundle[id] = robin
 	}
@@ -359,7 +365,7 @@ func (sb *Streams) Resync() {
 		}
 		// not connecting to the peer that's in maintenance and already rebalanced-out
 		if si.InMaintPostReb() {
-			nlog.Infof("%s => %s[-/%#b] - skipping", sb, si.StringEx(), si.Flags)
+			nlog.Infof("%s => %s[-/%s] per %s - skipping", sb, si.StringEx(), si.Fl2S(), smap)
 			continue
 		}
 
@@ -384,7 +390,7 @@ func (sb *Streams) Resync() {
 		}
 		delete(nbundle, id)
 	}
-	sb.streams.Store(unsafe.Pointer(&nbundle))
+	sb.streams.Store(&nbundle)
 	sb.smap = smap
 }
 
@@ -395,7 +401,7 @@ func mdiff(oldMaps, newMaps []meta.NodeMap) (added, removed meta.NodeMap) {
 		for id, si := range mnew {
 			if _, ok := mold[id]; !ok {
 				if added == nil {
-					added = make(meta.NodeMap, cos.Max(len(mnew)-len(mold), 1))
+					added = make(meta.NodeMap, max(len(mnew)-len(mold), 1))
 				}
 				added[id] = si
 			}
@@ -413,4 +419,17 @@ func mdiff(oldMaps, newMaps []meta.NodeMap) (added, removed meta.NodeMap) {
 		}
 	}
 	return
+}
+
+///////////////////////////
+// ErrDestinationMissing //
+///////////////////////////
+
+func (e *ErrDestinationMissing) Error() string {
+	return fmt.Sprintf("destination missing: stream (%s) => %s, %s", e.streamStr, e.tname, e.smapStr)
+}
+
+func IsErrDestinationMissing(e error) bool {
+	_, ok := e.(*ErrDestinationMissing)
+	return ok
 }

@@ -15,28 +15,28 @@ import (
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/ext/dsort/ct"
-	"github.com/NVIDIA/aistore/ext/dsort/extract"
+	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/pkg/errors"
 )
 
 const (
 	// Stream names
-	recvReqStreamNameFmt  = DSortName + "-%s-recv_req"
-	recvRespStreamNameFmt = DSortName + "-%s-recv_resp"
-	shardStreamNameFmt    = DSortName + "-%s-shard"
+	recvReqStreamNameFmt  = "recv-%sq"
+	recvRespStreamNameFmt = "recv-%sp"
+	shardStreamNameFmt    = "shrd-%ss"
 )
 
 // State of the cleans - see `cleanup` and `finalCleanup`
@@ -51,26 +51,11 @@ const (
 	serializationBufSize = 10 * cos.MiB
 )
 
-var (
-	ctx dsortContext
-	mm  *memsys.MMSA
-)
-
-// interface guard
-var (
-	_ meta.Slistener = (*Manager)(nil)
-	_ cos.Packer     = (*buildingShardInfo)(nil)
-	_ cos.Unpacker   = (*buildingShardInfo)(nil)
-)
-
 type (
-	dsortContext struct {
-		smapOwner meta.Sowner
-		bmdOwner  meta.Bowner
-		t         cluster.Target // Set only on target.
-		stats     stats.Tracker
-		node      *meta.Snode
-		client    *http.Client // Client for broadcast.
+	global struct {
+		t      cluster.Target
+		tstats stats.Tracker
+		mm     *memsys.MMSA
 	}
 
 	buildingShardInfo struct {
@@ -92,77 +77,90 @@ type (
 
 	// Manager maintains all the state required for a single run of a distributed archive file shuffle.
 	Manager struct {
-		// Fields with json tags are the only fields which are persisted
-		// into the disk once the dSort finishes.
-		ManagerUUID string   `json:"manager_uuid"`
-		Metrics     *Metrics `json:"metrics"`
+		// tagged fields are the only fields persisted once dsort finishes
+		ManagerUUID string         `json:"manager_uuid"`
+		Metrics     *Metrics       `json:"metrics"`
+		Pars        *parsedReqSpec `json:"pars"`
 
-		mg *ManagerGroup // parent
-
-		mu   sync.Mutex
-		ctx  dsortContext
-		smap *meta.Smap
-
-		recm *extract.RecordManager
-		ec   extract.Creator
-
+		mg                 *ManagerGroup // parent
+		mu                 sync.Mutex
+		smap               *meta.Smap
+		recm               *shard.RecordManager
+		shardRW            shard.RW
 		startShardCreation chan struct{}
-		pars               *parsedReqSpec
-
-		client      *http.Client // Client for sending records metadata
-		compression struct {
+		client             *http.Client // Client for sending records metadata
+		compression        struct {
 			totalShardSize     atomic.Int64
 			totalExtractedSize atomic.Int64
 		}
 		received struct {
-			count atomic.Int32 // Number of FileMeta slices received, defining what step in the sort a target is in.
+			count atomic.Int32 // Number of FileMeta slices received, defining what step in the sort target is in.
 			ch    chan int32
 		}
-		refCount        atomic.Int64 // Reference counter used to determine if we can do cleanup.
-		inFlight        atomic.Int64 // Reference counter that counts number of in-flight stream requests.
+		refCount        atomic.Int64 // Refcount to cleanup.
+		inFlight        atomic.Int64 // Refcount in-flight stream requests
 		state           progressState
 		extractionPhase struct {
 			adjuster *concAdjuster
 		}
 		streams struct {
-			shards *bundle.Streams // streams for pushing streams to other targets if the fqn is non-local
+			shards *bundle.Streams
 		}
 		creationPhase struct {
 			metadata CreationPhaseMetadata
 		}
 		finishedAck struct {
 			mu sync.Mutex
-			m  map[string]struct{} // finished acks: daemonID -> ack
+			m  map[string]struct{} // finished acks: tid -> ack
 		}
 		dsorter        dsorter
 		dsorterStarted sync.WaitGroup
-		callTimeout    time.Duration // max time to wait for other node to respond
+		callTimeout    time.Duration // max time to wait for another node to respond
 		config         *cmn.Config
+		xctn           *xaction
 	}
 )
 
-func RegisterNode(smapOwner meta.Sowner, bmdOwner meta.Bowner, snode *meta.Snode, t cluster.Target, stats stats.Tracker) {
-	ctx.smapOwner = smapOwner
-	ctx.bmdOwner = bmdOwner
-	ctx.node = snode
-	ctx.t = t
-	ctx.stats = stats
-	debug.Assert(mm == nil)
+var g global
 
+// interface guard
+var (
+	_ meta.Slistener = (*Manager)(nil)
+	_ cos.Packer     = (*buildingShardInfo)(nil)
+	_ cos.Unpacker   = (*buildingShardInfo)(nil)
+	_ cluster.Xact   = (*xaction)(nil)
+)
+
+func Pinit(si cluster.Node) {
+	psi = si
+	newClient()
+}
+
+func Tinit(t cluster.Target, stats stats.Tracker, db kvdb.Driver) {
+	Managers = NewManagerGroup(db, false)
+
+	xreg.RegBckXact(&factory{})
+
+	debug.Assert(g.mm == nil) // only once
+	g.mm = t.PageMM()
+	g.t = t
+	g.tstats = stats
+
+	shard.T = t
+
+	fs.CSM.Reg(ct.DSortFileType, &ct.DSortFile{})
+	fs.CSM.Reg(ct.DSortWorkfileType, &ct.DSortFile{})
+
+	newClient()
+}
+
+func newClient() {
 	config := cmn.GCO.Get()
-	ctx.client = cmn.NewClient(cmn.TransportArgs{
+	bcastClient = cmn.NewClient(cmn.TransportArgs{
 		Timeout:    config.Timeout.MaxHostBusy.D(),
 		UseHTTPS:   config.Net.HTTP.UseHTTPS,
 		SkipVerify: config.Net.HTTP.SkipVerify,
 	})
-
-	if ctx.node.IsTarget() {
-		mm = t.PageMM()
-		err := fs.CSM.Reg(ct.DSortFileType, &ct.DSortFile{})
-		debug.AssertNoErr(err)
-		err = fs.CSM.Reg(ct.DSortWorkfileType, &ct.DSortFile{})
-		debug.AssertNoErr(err)
-	}
 }
 
 /////////////
@@ -176,18 +174,15 @@ func (m *Manager) unlock()        { m.mu.Unlock() }
 // init initializes all necessary fields.
 // PRECONDITION: `m.mu` must be locked.
 func (m *Manager) init(pars *parsedReqSpec) error {
-	debug.AssertMutexLocked(&m.mu)
-
-	m.ctx = ctx
-	m.smap = m.ctx.smapOwner.Get()
+	m.smap = g.t.Sowner().Get()
 
 	targetCount := m.smap.CountActiveTs()
 
-	m.pars = pars
-	m.Metrics = newMetrics(pars.Description, pars.ExtendedMetrics)
+	m.Pars = pars
+	m.Metrics = newMetrics(pars.Description)
 	m.startShardCreation = make(chan struct{}, 1)
 
-	m.ctx.smapOwner.Listeners().Reg(m)
+	g.t.Sowner().Listeners().Reg(m)
 
 	if err := m.setDSorter(); err != nil {
 		return err
@@ -197,7 +192,6 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 		return err
 	}
 
-	// Set extract creator depending on extension provided by the user
 	if err := m.setRW(); err != nil {
 		return err
 	}
@@ -205,6 +199,8 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 	// NOTE: Total size of the records metadata can sometimes be large
 	// and so this is why we need such a long timeout.
 	m.config = cmn.GCO.Get()
+
+	// TODO -- FIXME: must be a single instance (similar to streams)
 	m.client = cmn.NewClient(cmn.TransportArgs{
 		DialTimeout: 5 * time.Minute,
 		Timeout:     30 * time.Minute,
@@ -251,9 +247,8 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 	return nil
 }
 
-// TODO: Currently we create streams for each dSort job but maybe we should
-// create streams once and have them available for all the dSort jobs so they
-// would share the resource rather than competing for it.
+// TODO -- FIXME: create on demand and reuse streams across jobs
+// (in re: global rebalance and EC)
 func (m *Manager) initStreams() error {
 	config := cmn.GCO.Get()
 
@@ -269,14 +264,13 @@ func (m *Manager) initStreams() error {
 		Extra: &transport.Extra{
 			Compression: config.DSort.Compression,
 			Config:      config,
-			MMSA:        mm,
 		},
 	}
-	if err := transport.HandleObjStream(trname, m.recvShard); err != nil {
+	if err := transport.Handle(trname, m.recvShard); err != nil {
 		return errors.WithStack(err)
 	}
 	client := transport.NewIntraDataClient()
-	m.streams.shards = bundle.New(m.ctx.smapOwner, m.ctx.node, client, shardsSbArgs)
+	m.streams.shards = bundle.New(g.t.Sowner(), g.t.Snode(), client, shardsSbArgs)
 	return nil
 }
 
@@ -291,7 +285,7 @@ func (m *Manager) cleanupStreams() (err error) {
 	for _, streamBundle := range []*bundle.Streams{m.streams.shards} {
 		if streamBundle != nil {
 			// NOTE: We don't want stream to send a message at this point as the
-			//  receiver might have closed its corresponding stream.
+			// receiver might have closed its corresponding stream.
 			streamBundle.Close(false /*gracefully*/)
 		}
 	}
@@ -322,18 +316,19 @@ func (m *Manager) cleanup() {
 
 	debug.Assertf(!m.inProgress(), "%s: was still in progress", m.ManagerUUID)
 
-	m.ec = nil
+	m.shardRW = nil
 	m.client = nil
 
-	m.ctx.smapOwner.Listeners().Unreg(m)
+	g.t.Sowner().Listeners().Unreg(m)
 
 	if !m.aborted() {
-		m.updateFinishedAck(m.ctx.node.ID())
+		m.updateFinishedAck(g.t.SID())
+		m.xctn.Finish()
 	}
 }
 
-// finalCleanup is invoked only when all the target confirmed finishing the
-// dSort operations. To ensure that finalCleanup is not invoked before regular
+// finalCleanup is invoked only when all targets confirm finishing.
+// To ensure that finalCleanup is not invoked before regular
 // cleanup is finished, we also ack ourselves.
 //
 // finalCleanup can be invoked only after cleanup and this is ensured by
@@ -341,9 +336,11 @@ func (m *Manager) cleanup() {
 // on which finalCleanup will sleep if needed. Note that it is hard (or even
 // impossible) to ensure that cleanup and finalCleanup will be invoked in order
 // without having ordering mechanism since cleanup and finalCleanup are invoked
-// in goroutines (there is possibility that finalCleanup would start before
+// in goroutines (there is a possibility that finalCleanup would start before
 // cleanup) - this cannot happen with current ordering mechanism.
 func (m *Manager) finalCleanup() {
+	nlog.Infof("%s: [dsort] %s started final cleanup", g.t, m.ManagerUUID)
+
 	m.lock()
 	for m.state.cleaned != initiallyCleanedState {
 		if m.state.cleaned == finallyCleanedState {
@@ -356,7 +353,6 @@ func (m *Manager) finalCleanup() {
 		}
 	}
 
-	nlog.Infof("[dsort] %s started final cleanup", m.ManagerUUID)
 	now := time.Now()
 
 	if err := m.cleanupStreams(); err != nil {
@@ -373,6 +369,8 @@ func (m *Manager) finalCleanup() {
 	// The reason why this is not in regular cleanup is because we are only sure
 	// that this can be freed once we cleanup streams - streams are asynchronous
 	// and we may have race between in-flight request and cleanup.
+	// Also, NOTE:
+	// recm.Cleanup => gmm.freeMemToOS => cos.FreeMemToOS to forcefully free memory to the OS
 	m.recm.Cleanup()
 
 	m.creationPhase.metadata.SendOrder = nil
@@ -387,28 +385,31 @@ func (m *Manager) finalCleanup() {
 	m.unlock()
 
 	m.mg.persist(m.ManagerUUID)
-	nlog.Infof("[dsort] %s finished final cleanup in %v", m.ManagerUUID, time.Since(now))
+	nlog.Infof("%s: [dsort] %s finished final cleanup in %v", g.t, m.ManagerUUID, time.Since(now))
 }
 
-// abort stops currently running sort job and frees associated resources.
-func (m *Manager) abort(errs ...error) {
+// stop this job and free associated resources
+func (m *Manager) abort(err error) {
+	if m.aborted() { // do not abort if already aborted
+		return
+	}
+	// serialize
 	m.lock()
 	if m.aborted() { // do not abort if already aborted
 		m.unlock()
 		return
 	}
-	if len(errs) > 0 {
+	if err != nil {
 		m.Metrics.lock()
-		for _, err := range errs {
-			m.Metrics.Errors = append(m.Metrics.Errors, err.Error())
-		}
+		m.Metrics.Errors = append(m.Metrics.Errors, err.Error())
 		m.Metrics.unlock()
 	}
-
-	nlog.Infof("%s: %s aborted", m.ctx.t, m.ManagerUUID)
 	m.setAbortedTo(true)
+	m.xctn.Base.Abort(err) // notice Base, compare w/ xaction.Abort (xact.go)
 	inProgress := m.inProgress()
 	m.unlock()
+
+	nlog.Infof("%s: [dsort] %s aborted", g.t, m.ManagerUUID)
 
 	// If job has already finished we just free resources, otherwise we must wait
 	// for it to finish.
@@ -434,13 +435,13 @@ func (m *Manager) abort(errs ...error) {
 
 // setDSorter sets what type of dsorter implementation should be used
 func (m *Manager) setDSorter() (err error) {
-	switch m.pars.DSorterType {
+	switch m.Pars.DSorterType {
 	case DSorterGeneralType:
 		m.dsorter, err = newDSorterGeneral(m)
 	case DSorterMemType:
 		m.dsorter = newDSorterMem(m)
 	default:
-		debug.Assertf(false, "dsorter type is invalid: %q", m.pars.DSorterType)
+		debug.Assertf(false, "dsorter type is invalid: %q", m.Pars.DSorterType)
 	}
 	m.dsorterStarted.Add(1)
 	return
@@ -448,57 +449,42 @@ func (m *Manager) setDSorter() (err error) {
 
 func (m *Manager) markStarted()               { m.dsorterStarted.Done() }
 func (m *Manager) waitToStart()               { m.dsorterStarted.Wait() }
-func (m *Manager) onDupRecs(msg string) error { return m.react(m.pars.DuplicatedRecords, msg) }
+func (m *Manager) onDupRecs(msg string) error { return m.react(m.Pars.DuplicatedRecords, msg) }
 
 // setRW sets what type of file extraction and creation is used based on the RequestSpec.
 func (m *Manager) setRW() (err error) {
-	var ke extract.KeyExtractor
-	switch m.pars.Algorithm.Kind {
+	var ke shard.KeyExtractor
+	switch m.Pars.Algorithm.Kind {
 	case Content:
-		ke, err = extract.NewContentKeyExtractor(m.pars.Algorithm.ContentKeyType, m.pars.Algorithm.Ext)
+		ke, err = shard.NewContentKeyExtractor(m.Pars.Algorithm.ContentKeyType, m.Pars.Algorithm.Ext)
 	case MD5:
-		ke, err = extract.NewMD5KeyExtractor()
+		ke, err = shard.NewMD5KeyExtractor()
 	default:
-		ke, err = extract.NewNameKeyExtractor()
+		ke, err = shard.NewNameKeyExtractor()
 	}
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	m.ec = newExtractCreator(m.ctx.t, m.pars.InputExtension)
-	if m.ec == nil {
-		debug.Assert(m.pars.InputExtension == "", m.pars.InputExtension)
-		// NOTE: [feature] allow non-specified extension; assign default extract-creator;
-		// handle all shards we encounter - all supported formats
-		m.ec = extract.NewTarRW(m.ctx.t)
+	m.shardRW = shard.RWs[m.Pars.InputExtension]
+	if m.shardRW == nil {
+		debug.Assert(!m.Pars.DryRun, "dry-run in combination with _any_ shard extension is not supported")
+		debug.Assert(m.Pars.InputExtension == "", m.Pars.InputExtension)
+		// TODO -- FIXME: niy
 	}
-	if m.pars.DryRun {
-		debug.Assert(m.ec != nil, "dry-run in combination with _any_ shard extension is not supported yet")
-		m.ec = extract.NopRW(m.ec)
+	if m.Pars.DryRun {
+		m.shardRW = shard.NopRW(m.shardRW)
 	}
-	m.recm = extract.NewRecordManager(m.ctx.t, m.pars.InputBck, m.ec, ke, m.onDupRecs)
+
+	m.recm = shard.NewRecordManager(m.Pars.InputBck, m.shardRW, ke, m.onDupRecs)
 	return nil
 }
 
-func newExtractCreator(t cluster.Target, ext string) (ec extract.Creator) {
-	switch ext {
-	case archive.ExtTar:
-		ec = extract.NewTarRW(t)
-	case archive.ExtTarGz, archive.ExtTgz:
-		ec = extract.NewTargzRW(t, ext)
-	case archive.ExtZip:
-		ec = extract.NewZipRW(t)
-	case archive.ExtTarLz4:
-		ec = extract.NewTarlz4RW(t)
-	}
-	return
-}
-
-// updateFinishedAck marks daemonID as finished. If all daemons ack then the
+// updateFinishedAck marks tid as finished. If all daemons ack then the
 // finalCleanup is dispatched in separate goroutine.
-func (m *Manager) updateFinishedAck(daemonID string) {
+func (m *Manager) updateFinishedAck(tid string) {
 	m.finishedAck.mu.Lock()
-	delete(m.finishedAck.m, daemonID)
+	delete(m.finishedAck.m, tid)
 	if len(m.finishedAck.m) == 0 {
 		go m.finalCleanup()
 	}
@@ -618,24 +604,6 @@ func (m *Manager) setAbortedTo(aborted bool) {
 	m.Metrics.setAbortedTo(aborted)
 }
 
-func (m *Manager) sentCallback(hdr transport.ObjHdr, rc io.ReadCloser, x any, err error) {
-	if m.Metrics.extended {
-		dur := mono.Since(x.(int64))
-		m.Metrics.Creation.mu.Lock()
-		m.Metrics.Creation.LocalSendStats.updateTime(dur)
-		m.Metrics.Creation.LocalSendStats.updateThroughput(hdr.ObjAttrs.Size, dur)
-		m.Metrics.Creation.mu.Unlock()
-	}
-
-	if sgl, ok := rc.(*memsys.SGL); ok {
-		sgl.Free()
-	}
-	m.decrementRef(1)
-	if err != nil {
-		m.abort(err)
-	}
-}
-
 func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 	defer transport.DrainAndFreeReader(objReader)
 	if err != nil {
@@ -675,7 +643,7 @@ func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error
 		params.Cksum = nil
 		params.Atime = started
 	}
-	erp := m.ctx.t.PutObject(lom, params)
+	erp := g.t.PutObject(lom, params)
 	cluster.FreePutObjParams(params)
 	if erp != nil {
 		m.abort(err)
@@ -684,62 +652,16 @@ func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error
 	return nil
 }
 
-// doWithAbort sends requests through client. If manager aborts during the call
-// request is canceled.
-func (m *Manager) doWithAbort(reqArgs *cmn.HreqArgs) error {
-	req, _, cancel, err := reqArgs.ReqWithCancel()
-	if err != nil {
-		return err
-	}
-
-	// Start request
-	doneCh := make(chan struct{}, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		defer func() {
-			doneCh <- struct{}{}
-		}()
-		resp, err := m.client.Do(req) //nolint:bodyclose // cos.Close below
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer cos.Close(resp.Body)
-
-		if resp.StatusCode >= http.StatusBadRequest {
-			b, err := io.ReadAll(resp.Body)
-			if err != nil {
-				errCh <- err
-			} else {
-				errCh <- errors.New(string(b))
-			}
-			return
-		}
-	}()
-
-	// Wait for abort or request to finish
-	select {
-	case <-m.listenAborted():
-		cancel()
-		<-doneCh
-		return newDSortAbortedError(m.ManagerUUID)
-	case <-doneCh:
-		break
-	}
-	close(errCh)
-	return errors.WithStack(<-errCh)
-}
-
 func (m *Manager) ListenSmapChanged() {
-	newSmap := m.ctx.smapOwner.Get()
+	newSmap := g.t.Sowner().Get()
 	if newSmap.Version <= m.smap.Version {
 		return
 	}
 	if newSmap.CountActiveTs() != m.smap.CountActiveTs() {
 		// Currently adding new target as well as removing one is not
 		// supported during the run.
-		// TODO: dSort should survive adding new target. For now it is
-		// not possible as rebalance deletes moved object - dSort needs
+		// TODO: dsort should survive adding new target. For now it is
+		// not possible as rebalance deletes moved object - dsort needs
 		// to use `GetObject` method instead of relaying on simple `os.Open`.
 		err := errors.Errorf("number of targets changed during run - aborting")
 		go m.abort(err)
@@ -751,7 +673,7 @@ func (m *Manager) freeMemory() uint64 {
 	if err := mem.Get(); err != nil {
 		return 0
 	}
-	maxMemoryToUse := calcMaxMemoryUsage(m.pars.MaxMemUsage, &mem)
+	maxMemoryToUse := calcMaxMemoryUsage(m.Pars.MaxMemUsage, &mem)
 	return maxMemoryToUse - mem.ActualUsed
 }
 
@@ -777,7 +699,7 @@ func calcMaxMemoryUsage(maxUsage cos.ParsedQuantity, mem *sys.MemStat) uint64 {
 	case cos.QuantityPercent:
 		return maxUsage.Value * (mem.Total / 100)
 	case cos.QuantityBytes:
-		return cos.MinU64(maxUsage.Value, mem.Total)
+		return min(maxUsage.Value, mem.Total)
 	default:
 		debug.Assertf(false, "mem usage type (%s) is not recognized.. something went wrong", maxUsage.Type)
 		return 0

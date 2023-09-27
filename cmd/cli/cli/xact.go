@@ -167,8 +167,14 @@ func flattenXactStats(snap *cluster.Snap, units string) nvpairList {
 					value = cos.ToSizeIEC(i, 2)
 				}
 			}
-			if value == "" {
-				value = fmt.Sprintf("%v", v)
+			if value == "" { // not ".size"
+				if mapVal, ok := v.(map[string]any); ok {
+					vv, err := jsonMarshalIndent(mapVal)
+					debug.AssertNoErr(err)
+					value = string(vv)
+				} else {
+					value = fmt.Sprintf("%v", v)
+				}
 			}
 			props = append(props, nvpair{Name: k, Value: value})
 		}
@@ -195,7 +201,7 @@ func getXactSnap(xargs xact.ArgsMsg) (*cluster.Snap, error) {
 func queryXactions(xargs xact.ArgsMsg) (xs xact.MultiSnap, err error) {
 	orig := apiBP.Client.Timeout
 	if !xargs.OnlyRunning {
-		apiBP.Client.Timeout = cos.MinDuration(orig, longClientTimeout)
+		apiBP.Client.Timeout = min(orig, longClientTimeout)
 		defer func(t time.Duration) {
 			apiBP.Client.Timeout = t
 		}(orig)

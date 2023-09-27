@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	ratomic "sync/atomic"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -33,8 +34,7 @@ type (
 		eutime atomic.Int64
 		abort  struct {
 			ch   chan error
-			err  error
-			mu   sync.RWMutex
+			err  ratomic.Pointer[error]
 			done atomic.Bool
 		}
 		stats struct {
@@ -106,19 +106,19 @@ func (xctn *Base) ChanAbort() <-chan error { return xctn.abort.ch }
 
 func (xctn *Base) IsAborted() bool { return xctn.abort.done.Load() }
 
-// NOTE: polls for `wait` time
 func (xctn *Base) AbortErr() (err error) {
-	const wait = time.Second
 	if !xctn.IsAborted() {
 		return
 	}
+	// (is aborted)
+	// normally, is expected to return `abort.err` without any sleep
+	// but may also poll up to 4 times for 1s total
+	const wait = time.Second
 	sleep := cos.ProbingFrequency(wait)
 	for elapsed := time.Duration(0); elapsed < wait; elapsed += sleep {
-		xctn.abort.mu.RLock()
-		err = xctn.abort.err
-		xctn.abort.mu.RUnlock()
-		if err != nil {
-			break
+		perr := xctn.abort.err.Load()
+		if perr != nil {
+			return *perr
 		}
 		time.Sleep(sleep)
 	}
@@ -148,12 +148,12 @@ func (xctn *Base) Abort(err error) (ok bool) {
 			err = errCause
 		}
 	}
-	xctn.abort.mu.Lock()
-	debug.Assert(xctn.abort.err == nil, xctn.String())
-	xctn.abort.err = err
+	perr := xctn.abort.err.Swap(&err)
+	debug.Assert(perr == nil, xctn.String())
+	debug.Assert(len(xctn.abort.ch) == 0, xctn.String()) // CAS above
+
 	xctn.abort.ch <- err
 	close(xctn.abort.ch)
-	xctn.abort.mu.Unlock()
 
 	if xctn.Kind() != apc.ActList {
 		nlog.Infof("%s aborted(%v)", xctn.Name(), err)
@@ -202,8 +202,8 @@ func (xctn *Base) Quiesce(d time.Duration, cb cluster.QuiCB) cluster.QuiRes {
 		case cluster.QuiInactiveCB: // NOTE: used by callbacks, converts to one of the returned codes
 			idle += sleep
 		case cluster.QuiActive:
-			idle = 0                              // reset
-			dur = cos.MinDuration(dur+sleep, 2*d) // bump up to 2x initial
+			idle = 0                  // reset
+			dur = min(dur+sleep, 2*d) // bump up to 2x initial
 		case cluster.QuiActiveRet:
 			return cluster.QuiActiveRet
 		case cluster.QuiDone:
@@ -265,9 +265,9 @@ func (xctn *Base) onFinished(err error) {
 	}
 	xactRecord := Table[xctn.kind]
 	if xactRecord.RefreshCap {
-		if cs, _ := fs.CapRefresh(nil, nil); cs.Err != nil {
-			nlog.Errorln(cs.Err) // log warning
-		}
+		// currently, ignoring returned err-cap and not calling t.OOS()
+		// both (conditions) handled by periodic stats
+		fs.CapRefresh(nil /*config*/, nil /*tcdf*/)
 	}
 
 	IncFinished() // in re: HK cleanup long-time finished
@@ -290,9 +290,9 @@ func (xctn *Base) Finish() {
 	}
 	xctn.eutime.Store(time.Now().UnixNano())
 	if aborted = xctn.IsAborted(); aborted {
-		xctn.abort.mu.RLock()
-		err = xctn.abort.err
-		xctn.abort.mu.RUnlock()
+		if perr := xctn.abort.err.Load(); perr != nil {
+			err = *perr
+		}
 	}
 	if xctn.ErrCnt() > 0 {
 		if err == nil {

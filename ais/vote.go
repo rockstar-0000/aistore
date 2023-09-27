@@ -581,7 +581,7 @@ func (h *htrun) _votedPrimary(ctx *smapModifier, clone *smapX) error {
 	newPrimary, oldPrimary := ctx.nid, ctx.sid
 	psi := clone.GetProxy(newPrimary)
 	if psi == nil {
-		return &errNodeNotFound{"cannot accept new primary election", newPrimary, h.si, clone}
+		return &errNodeNotFound{"cannot accept new primary election:", newPrimary, h.si, clone}
 	}
 	clone.Primary = psi
 	if oldPrimary != "" && clone.GetProxy(oldPrimary) != nil {
@@ -640,7 +640,7 @@ func (h *htrun) voteOnProxy(daemonID, currPrimaryID string) (bool, error) {
 	config := cmn.GCO.Get()
 	// First: Check last keepalive timestamp. If the proxy was recently successfully reached,
 	// this will always vote no, as we believe the original proxy is still alive.
-	if !h.keepalive.isTimeToPing(currPrimaryID) {
+	if !h.keepalive.timeToPing(currPrimaryID) {
 		if config.FastV(4, cos.SmoduleAIS) {
 			nlog.Warningf("Primary %s is still alive", currPrimaryID)
 		}

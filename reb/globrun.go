@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	ratomic "sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
@@ -69,8 +69,8 @@ const fmtpend = "%s: newer rebalance[g%d] pending - not running"
 type (
 	Reb struct {
 		t         cluster.Target
-		smap      atomic.Pointer // new smap which will be soon live
-		xreb      atomic.Pointer // unsafe(*xact.Rebalance)
+		smap      ratomic.Pointer[meta.Smap] // next smap (new that'll become current after rebalance)
+		xreb      ratomic.Pointer[xs.Rebalance]
 		dm        *bundle.DataMover
 		pushes    *bundle.Streams // broadcast notifications
 		filterGFN *prob.Filter
@@ -129,6 +129,7 @@ func New(t cluster.Target, config *cmn.Config) *Reb {
 	}
 	dmExtra := bundle.Extra{
 		RecvAck:     reb.recvAck,
+		Config:      config,
 		Compression: config.Rebalance.Compression,
 		Multiplier:  config.Rebalance.SbundleMult,
 	}
@@ -147,7 +148,7 @@ func (reb *Reb) regRecv() {
 	if err := reb.dm.RegRecv(); err != nil {
 		cos.ExitLog(err)
 	}
-	if err := transport.HandleObjStream(trnamePsh, reb.recvStageNtfn /*RecvObj*/); err != nil {
+	if err := transport.Handle(trnamePsh, reb.recvStageNtfn /*RecvObj*/); err != nil {
 		cos.ExitLog(err)
 	}
 }
@@ -182,7 +183,8 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 	reb.mu.Unlock()
 
 	logHdr := reb.logHdr(id, smap, true /*initializing*/)
-	nlog.Infof("%s: initializing", logHdr)
+	nlog.Infoln(logHdr + ": initializing")
+
 	bmd := reb.t.Bowner().Get()
 	rargs := &rebArgs{id: id, smap: smap, config: cmn.GCO.Get(), ecUsed: bmd.IsECUsed()}
 	if !reb.serialize(rargs, logHdr) {
@@ -190,8 +192,8 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 	}
 
 	reb.regRecv()
-	// TODO -- FIXME: minimally, must be num(active) + num(maintenance-mode-rebalancing-out)
-	haveStreams := smap.CountTargets() > 1
+
+	haveStreams := smap.HasActiveTs(reb.t.SID())
 	if bmd.IsEmpty() {
 		haveStreams = false
 	}
@@ -245,18 +247,18 @@ func (reb *Reb) run(rargs *rebArgs) error {
 
 	// No EC-enabled buckets - run only regular rebalance
 	if !rargs.ecUsed {
-		nlog.Infof("starting global rebalance (g%d)", rargs.id)
+		nlog.Infof("starting g%d", rargs.id)
 		return reb.runNoEC(rargs)
 	}
 
 	// In all other cases run both rebalances simultaneously
 	group := &errgroup.Group{}
 	group.Go(func() error {
-		nlog.Infof("starting global rebalance (g%d)", rargs.id)
+		nlog.Infof("starting non-EC g%d", rargs.id)
 		return reb.runNoEC(rargs)
 	})
 	group.Go(func() error {
-		nlog.Infof("EC detected - starting EC rebalance (g%d)", rargs.id)
+		nlog.Infof("starting EC g%d", rargs.id)
 		return reb.runEC(rargs)
 	})
 	return group.Wait()
@@ -286,8 +288,8 @@ func (reb *Reb) acquire(rargs *rebArgs, logHdr string) (newerRMD, alreadyRunning
 	var (
 		total    time.Duration
 		sleep    = rargs.config.Timeout.CplaneOperation.D()
-		maxTotal = cos.MaxDuration(20*sleep, 10*time.Second) // time to abort prev. streams
-		maxwt    = cos.MaxDuration(rargs.config.Rebalance.DestRetryTime.D(), 2*maxTotal)
+		maxTotal = max(20*sleep, 10*time.Second) // time to abort prev. streams
+		maxwt    = max(rargs.config.Rebalance.DestRetryTime.D(), 2*maxTotal)
 		errcnt   int
 		acquired bool
 	)
@@ -341,7 +343,7 @@ func (reb *Reb) _preempt(rargs *rebArgs, logHdr string, total, maxTotal time.Dur
 		var (
 			rebID   = reb.RebID()
 			rsmap   = reb.smap.Load()
-			rlogHdr = reb.logHdr(rebID, (*meta.Smap)(rsmap), true)
+			rlogHdr = reb.logHdr(rebID, rsmap, true)
 			xreb    = reb.xctn()
 			s       string
 		)
@@ -402,6 +404,14 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 	reb.setXact(xreb)
 	reb.rebID.Store(rargs.id)
 
+	// check Smap _prior_ to opening streams
+	smap := reb.t.Sowner().Get()
+	if smap.Version != rargs.smap.Version {
+		debug.Assert(smap.Version > rargs.smap.Version)
+		nlog.Errorf("Warning %s: %s post-init version change %s => %s", reb.t, xreb, rargs.smap, smap)
+		// TODO: handle an unlikely corner case keeping in mind that not every change warants a different rebalance
+	}
+
 	// 3. init streams and data structures
 	if haveStreams {
 		reb.beginStreams(rargs.config)
@@ -431,7 +441,7 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 	}
 
 	// 5. ready - can receive objects
-	reb.smap.Store(unsafe.Pointer(rargs.smap))
+	reb.smap.Store(rargs.smap)
 	reb.stages.cleanup()
 
 	reb.mu.Unlock()
@@ -449,7 +459,7 @@ func (reb *Reb) beginStreams(config *cmn.Config) {
 		Net:        reb.dm.NetC(),
 		Trname:     trnamePsh,
 		Multiplier: config.Rebalance.SbundleMult,
-		Extra:      &transport.Extra{SenderID: xreb.ID()},
+		Extra:      &transport.Extra{SenderID: xreb.ID(), Config: config},
 	}
 	reb.pushes = bundle.New(reb.t.Sowner(), reb.t.Snode(), transport.NewIntraDataClient(), pushArgs)
 
@@ -525,7 +535,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 		xreb   = reb.xctn()
 	)
 	maxwt += time.Duration(int64(time.Minute) * int64(rargs.smap.CountTargets()/10))
-	maxwt = cos.MinDuration(maxwt, rargs.config.Rebalance.DestRetryTime.D()*2)
+	maxwt = min(maxwt, rargs.config.Rebalance.DestRetryTime.D()*2)
 	reb.changeStage(rebStageWaitAck)
 
 	for {
@@ -731,7 +741,7 @@ func (rj *rebJogger) walkBck(bck *meta.Bck) bool {
 	if rj.xreb.IsAborted() {
 		nlog.Infof("aborting traversal")
 	} else {
-		nlog.Errorf("%s: failed to traverse, err: %v", rj.m.t, err)
+		nlog.Errorf("%s: %s failed to traverse: %v", rj.m.t, rj.xreb.Name(), err)
 	}
 	return true
 }
@@ -739,16 +749,20 @@ func (rj *rebJogger) walkBck(bck *meta.Bck) bool {
 // send completion
 func (rj *rebJogger) objSentCallback(hdr transport.ObjHdr, _ io.ReadCloser, arg any, err error) {
 	rj.m.inQueue.Dec()
-	if err != nil {
-		if cmn.FastV(4, cos.SmoduleReb) || !cos.IsRetriableConnErr(err) {
-			lom, ok := arg.(*cluster.LOM)
-			debug.Assert(ok)
-			nlog.Errorf("%s: failed to send %s: %v", rj.m.t.Snode(), lom, err)
-		}
+	if err == nil {
+		rj.xreb.OutObjsAdd(1, hdr.ObjAttrs.Size) // NOTE: double-counts retransmissions
 		return
 	}
-	xreb := rj.xreb
-	xreb.OutObjsAdd(1, hdr.ObjAttrs.Size) // NOTE: double-counts retransmissions
+	// log err
+	if cmn.FastV(4, cos.SmoduleReb) || !cos.IsRetriableConnErr(err) {
+		if bundle.IsErrDestinationMissing(err) {
+			nlog.Errorf("%s: %v, %s", rj.xreb.Name(), err, rj.smap)
+		} else {
+			lom, ok := arg.(*cluster.LOM)
+			debug.Assert(ok)
+			nlog.Errorf("%s: %s failed to send %s: %v", rj.m.t, rj.xreb.Name(), lom, err)
+		}
+	}
 }
 
 func (rj *rebJogger) visitObj(fqn string, de fs.DirEntry) (err error) {
@@ -800,12 +814,14 @@ func (rj *rebJogger) _lwalk(lom *cluster.LOM, fqn string) error {
 	if err != nil {
 		return err
 	}
+
 	// transmit (unlock via transport completion => roc.Close)
 	rj.m.addLomAck(lom)
 	if err := rj.doSend(lom, tsi, roc); err != nil {
 		rj.m.delLomAck(lom, 0, false /*free LOM*/)
 		return err
 	}
+
 	return nil
 }
 

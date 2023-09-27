@@ -7,6 +7,7 @@ package ais
 import (
 	"fmt"
 	"sync"
+	ratomic "sync/atomic"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -36,14 +37,14 @@ const (
 
 type (
 	keepaliver interface {
-		sendKalive(*smapX, time.Duration) (string, int, error)
-		onerr(err error, status int)
-		heardFrom(sid string, reset bool)
-		do() (stopped bool)
-		isTimeToPing(sid string) bool
+		sendKalive(*smapX, time.Duration, bool) (string, int, error)
+		heardFrom(sid string)
+		do(config *cmn.Config) (stopped bool)
+		timeToPing(sid string) bool
 		ctrl(msg string)
 		paused() bool
 		cfg(config *cmn.Config) *cmn.KeepaliveTrackerConf
+		cluUptime(int64) time.Duration
 	}
 	talive struct {
 		t *target
@@ -57,40 +58,30 @@ type (
 	}
 	keepalive struct {
 		k            keepaliver
-		kt           KeepaliveTracker
+		hb           hbTracker
 		statsT       stats.Tracker
-		tt           *timeoutTracker
 		controlCh    chan controlSignal
 		startedUp    *atomic.Bool
 		name         string
-		inProgress   atomic.Int64 // toggle used only by the primary
-		maxKeepalive int64
-		interval     time.Duration
+		interval     time.Duration // config.Keepalive.Target.Interval or config.Keepalive.Proxy.Interval (10s)
+		inProgress   atomic.Bool
 		tickerPaused atomic.Bool
-	}
-	timeoutTracker struct {
-		timeoutStats map[string]*timeoutStats
-		mu           sync.Mutex
-	}
-	timeoutStats struct {
-		srtt    int64 // smoothed round-trip time in ns
-		rttvar  int64 // round-trip time variation in ns
-		timeout int64 // in ns
 	}
 	controlSignal struct {
 		err error
 		msg string
 	}
 
-	KeepaliveTracker interface {
-		// HeardFrom notifies tracker that the server identified by 'id' has responded;
-		// 'reset'=true when it is not a regular keepalive call (could be reconnect or re-register).
-		HeardFrom(id string, reset bool)
-		// TimedOut returns true if the 'id` server did not respond - an indication that the server
-		// could be down
-		TimedOut(id string) bool
+	hbTracker interface {
+		HeardFrom(id string, now int64) // callback for 'id' to respond
+		TimedOut(id string) bool        // true if 'id` didn't keepalive or called (via "heard") within the interval (above)
 
-		changed(factor uint8, interval time.Duration) bool
+		reg(id string)
+		set(interval time.Duration) bool
+	}
+	heartBeat struct {
+		last     sync.Map
+		interval time.Duration // timeout
 	}
 )
 
@@ -102,8 +93,7 @@ var (
 	_ keepaliver = (*talive)(nil)
 	_ keepaliver = (*palive)(nil)
 
-	_ KeepaliveTracker = (*HBTracker)(nil)
-	_ KeepaliveTracker = (*AvgTracker)(nil)
+	_ hbTracker = (*heartBeat)(nil)
 )
 
 ////////////
@@ -118,28 +108,52 @@ func newTalive(t *target, statsT stats.Tracker, startedUp *atomic.Bool) *talive 
 	tkr.keepalive.k = tkr
 	tkr.statsT = statsT
 	tkr.keepalive.startedUp = startedUp
-	tkr.kt = newKeepaliveTracker(&config.Keepalive.Target)
-	tkr.tt = &timeoutTracker{timeoutStats: make(map[string]*timeoutStats, 8)}
+	tkr.hb = newHB(config.Keepalive.Target.Interval.D())
 	tkr.controlCh = make(chan controlSignal) // unbuffered on purpose
 	tkr.interval = config.Keepalive.Target.Interval.D()
-	tkr.maxKeepalive = int64(config.Timeout.MaxKeepalive)
 	return tkr
+}
+
+func (tkr *talive) Run() error {
+	if stopped := tkr.wait(); stopped {
+		return nil
+	}
+
+	tkr.init(tkr.t.owner.smap.get(), tkr.t.SID())
+
+	nlog.Infof("Starting %s", tkr.Name())
+	tkr._run()
+	return nil
 }
 
 func (*talive) cfg(config *cmn.Config) *cmn.KeepaliveTrackerConf {
 	return &config.Keepalive.Target
 }
 
-func (tkr *talive) sendKalive(smap *smapX, timeout time.Duration) (string, int, error) {
-	return tkr.t.sendKalive(smap, tkr.t, timeout)
+func (tkr *talive) cluUptime(now int64) (elapsed time.Duration) {
+	if at := tkr.t.startup.cluster.Load(); at > 0 {
+		elapsed = time.Duration(now - at)
+	}
+	return
 }
 
-func (tkr *talive) do() (stopped bool) {
+func (tkr *talive) sendKalive(smap *smapX, timeout time.Duration, fast bool) (string, int, error) {
+	if fast {
+		interrupted, restarted := tkr.t.interruptedRestarted()
+		fast = !interrupted && !restarted
+	}
+	return tkr.t.sendKalive(smap, tkr.t, timeout, fast)
+}
+
+func (tkr *talive) do(config *cmn.Config) (stopped bool) {
 	smap := tkr.t.owner.smap.get()
 	if smap == nil || smap.validate() != nil {
 		return
 	}
-	if stopped = tkr.keepalive.do(smap, tkr.t.si); stopped {
+	if !tkr.timeToPing(smap.Primary.ID()) { // skip sending keepalive
+		return
+	}
+	if stopped = tkr.keepalive.do(smap, tkr.t.si, config); stopped {
 		tkr.t.onPrimaryDown(nil /*proxy*/, "")
 	}
 	return
@@ -157,44 +171,58 @@ func newPalive(p *proxy, statsT stats.Tracker, startedUp *atomic.Bool) *palive {
 	pkr.keepalive.k = pkr
 	pkr.statsT = statsT
 	pkr.keepalive.startedUp = startedUp
-	pkr.kt = newKeepaliveTracker(&config.Keepalive.Proxy)
-	pkr.tt = &timeoutTracker{timeoutStats: make(map[string]*timeoutStats, 8)}
+	pkr.hb = newHB(config.Keepalive.Proxy.Interval.D())
 	pkr.controlCh = make(chan controlSignal) // unbuffered on purpose
 	pkr.interval = config.Keepalive.Proxy.Interval.D()
-	pkr.maxKeepalive = int64(config.Timeout.MaxKeepalive)
 	return pkr
+}
+
+func (pkr *palive) Run() error {
+	if stopped := pkr.wait(); stopped {
+		return nil
+	}
+
+	pkr.init(pkr.p.owner.smap.get(), pkr.p.SID())
+
+	nlog.Infof("Starting %s", pkr.Name())
+	pkr._run()
+	return nil
 }
 
 func (*palive) cfg(config *cmn.Config) *cmn.KeepaliveTrackerConf {
 	return &config.Keepalive.Proxy
 }
 
-func (pkr *palive) sendKalive(smap *smapX, timeout time.Duration) (pid string, status int, err error) {
-	if smap == nil {
-		smap = pkr.p.owner.smap.get()
-		if smap == nil {
-			return
-		}
+func (pkr *palive) cluUptime(now int64) (elapsed time.Duration) {
+	if at := pkr.p.startup.cluster.Load(); at > 0 {
+		elapsed = time.Duration(now - at)
 	}
-	pid = smap.Primary.ID()
-	if smap.isPrimary(pkr.p.si) && smap.version() > 0 {
-		return
-	}
-	return pkr.p.htrun.sendKalive(smap, nil /*htext*/, timeout)
+	return
 }
 
-func (pkr *palive) do() (stopped bool) {
+func (pkr *palive) sendKalive(smap *smapX, timeout time.Duration, fast bool) (string, int, error) {
+	debug.Assert(!smap.isPrimary(pkr.p.si))
+	return pkr.p.htrun.sendKalive(smap, nil /*htext*/, timeout, fast)
+}
+
+func (pkr *palive) do(config *cmn.Config) (stopped bool) {
 	smap := pkr.p.owner.smap.get()
 	if smap == nil || smap.validate() != nil {
 		return
 	}
 	if smap.isPrimary(pkr.p.si) {
-		return pkr.updateSmap()
-	}
-	if !pkr.isTimeToPing(smap.Primary.ID()) {
+		if !pkr.inProgress.CAS(false, true) {
+			nlog.Infoln(pkr.p.String() + ": primary keepalive in progress")
+			return
+		}
+		stopped = pkr.updateSmap(config)
+		pkr.inProgress.Store(false)
 		return
 	}
-	if stopped = pkr.keepalive.do(smap, pkr.p.si); stopped {
+	if !pkr.timeToPing(smap.Primary.ID()) { // skip sending keepalive
+		return
+	}
+	if stopped = pkr.keepalive.do(smap, pkr.p.si, config); stopped {
 		pkr.p.onPrimaryDown(pkr.p /*self*/, "")
 	}
 	return
@@ -202,38 +230,41 @@ func (pkr *palive) do() (stopped bool) {
 
 // updateSmap pings all nodes in parallel. Non-responding nodes get removed from the Smap and
 // the resulting map is then metasync-ed.
-func (pkr *palive) updateSmap() (stopped bool) {
-	if !pkr.inProgress.CAS(0, 1) {
-		nlog.Infof("%s: primary keepalive is in progress...", pkr.p)
-		return
-	}
-	defer pkr.inProgress.CAS(1, 0)
+func (pkr *palive) updateSmap(config *cmn.Config) (stopped bool) {
 	var (
-		p         = pkr.p
-		smap      = p.owner.smap.get()
-		daemonCnt = smap.Count()
+		p    = pkr.p
+		smap = p.owner.smap.get()
+		cnt  = smap.Count()
 	)
-	pkr.openCh(daemonCnt)
-	// limit parallelism, here and elsewhere
-	wg := cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), daemonCnt)
-	for _, daemons := range []meta.NodeMap{smap.Tmap, smap.Pmap} {
-		for sid, si := range daemons {
+	pkr.openCh(cnt)
+	wg := cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), cnt) // limit parallelism
+	for _, nm := range []meta.NodeMap{smap.Tmap, smap.Pmap} {
+		for sid, si := range nm {
 			if sid == p.SID() {
 				continue
 			}
 			// skipping
-			if !pkr.isTimeToPing(sid) {
+			if !pkr.timeToPing(sid) {
 				continue
 			}
-			// NOTE in re maintenance-mode nodes:
+			// in re maintenance-mode nodes:
 			// for future activation, passively (ie, no keepalives) keeping them in the cluster map -
 			// use apc.ActRmNodeUnsafe to remove, if need be
 			if si.InMaintOrDecomm() {
 				continue
 			}
-			// do keepalive
+
+			// direct call first
+			started := mono.NanoTime()
+			if _, _, err := pkr.p.reqHealth(si, config.Timeout.CplaneOperation.D(), nil, smap); err == nil {
+				now := mono.NanoTime()
+				pkr.statsT.Add(stats.KeepAliveLatency, now-started)
+				pkr.hb.HeardFrom(si.ID(), now) // effectively, yes
+				continue
+			}
+			// otherwise, go keepalive with retries
 			wg.Add(1)
-			go pkr.ping(si, wg, smap)
+			go pkr.ping(si, wg, smap, config)
 		}
 	}
 	wg.Wait()
@@ -256,37 +287,38 @@ func (pkr *palive) updateSmap() (stopped bool) {
 	return
 }
 
-func (pkr *palive) ping(si *meta.Snode, wg cos.WG, smap *smapX) {
-	defer wg.Done()
+func (pkr *palive) ping(si *meta.Snode, wg cos.WG, smap *smapX, config *cmn.Config) {
 	if len(pkr.stoppedCh) > 0 {
+		wg.Done()
 		return
 	}
-	ok, stopped := pkr._pingRetry(si, smap)
+	ok, stopped := pkr._pingRetry(si, smap, config)
 	if stopped {
 		pkr.stoppedCh <- struct{}{}
 	}
 	if !ok {
 		pkr.toRemoveCh <- si.ID()
 	}
+	wg.Done()
 }
 
-func (pkr *palive) _pingRetry(to *meta.Snode, smap *smapX) (ok, stopped bool) {
+func (pkr *palive) _pingRetry(si *meta.Snode, smap *smapX, config *cmn.Config) (ok, stopped bool) {
 	var (
-		timeout        = time.Duration(pkr.timeoutStats(to.ID()).timeout)
-		t              = mono.NanoTime()
-		_, status, err = pkr.p.reqHealth(to, timeout, nil, smap)
+		timeout = config.Timeout.CplaneOperation.D()
+		started = mono.NanoTime()
 	)
-	delta := mono.Since(t)
-	pkr.updateTimeoutFor(to.ID(), delta)
-	pkr.statsT.Add(stats.KeepAliveLatency, int64(delta))
-
+	_, status, err := pkr.p.reqHealth(si, timeout, nil, smap)
 	if err == nil {
+		now := mono.NanoTime()
+		pkr.statsT.Add(stats.KeepAliveLatency, now-started)
+		pkr.hb.HeardFrom(si.ID(), now) // effectively, yes
 		return true, false
 	}
 
-	nlog.Warningf("%s fails to respond: [%v(%d)] - retrying...", to.StringEx(), err, status)
-	ticker := time.NewTicker(cmn.KeepaliveRetryDuration())
-	ok, stopped = pkr.retry(to, ticker)
+	nlog.Warningf("node %s failed health ping [%v(%d)] - retry with max=%s", si.StringEx(), err, status,
+		config.Timeout.MaxKeepalive.String())
+	ticker := time.NewTicker(cmn.KeepaliveRetryDuration(config))
+	ok, stopped = pkr.retry(si, ticker, config.Timeout.MaxKeepalive.D())
 	ticker.Stop()
 
 	return ok, stopped
@@ -330,7 +362,7 @@ loop:
 				cnt++
 			} else {
 				metaction += unknownDaemonID
-				nlog.Warningf("%s not present in the %s (old %s)", sid, clone, ctx.smap)
+				nlog.Warningf("node %s not present in the %s (old %s)", sid, clone, ctx.smap)
 			}
 			metaction += ":" + sid + "] "
 
@@ -354,29 +386,32 @@ func (pkr *palive) _final(ctx *smapModifier, clone *smapX) {
 	_ = pkr.p.metasyncer.sync(revsPair{clone, msg})
 }
 
-func (pkr *palive) retry(si *meta.Snode, ticker *time.Ticker) (ok, stopped bool) {
-	var (
-		timeout = time.Duration(pkr.timeoutStats(si.ID()).timeout)
-		i       int
-	)
+func (pkr *palive) retry(si *meta.Snode, ticker *time.Ticker, timeout time.Duration) (ok, stopped bool) {
+	var i int
 	for {
-		if !pkr.isTimeToPing(si.ID()) {
+		if !pkr.timeToPing(si.ID()) {
 			return true, false
 		}
 		select {
 		case <-ticker.C:
-			now := mono.NanoTime()
-			smap := pkr.p.owner.smap.get()
+			if !pkr.timeToPing(si.ID()) {
+				return true, false // heard from the node, skipping health check
+			}
+			var (
+				started = mono.NanoTime()
+				smap    = pkr.p.owner.smap.get()
+			)
 			_, status, err := pkr.p.reqHealth(si, timeout, nil, smap)
-			timeout = pkr.updateTimeoutFor(si.ID(), mono.Since(now))
 			if err == nil {
+				now := mono.NanoTime()
+				pkr.statsT.Add(stats.KeepAliveLatency, now-started)
+				pkr.hb.HeardFrom(si.ID(), now) // effectively, yes
 				return true, false
 			}
+
 			i++
 			if i == kaNumRetries {
-				sname := si.StringEx()
-				nlog.Warningf("Failed to keepalive %s after %d attempts - removing %s from the %s",
-					sname, i, sname, smap)
+				nlog.Warningf("Failed after %d attempts - removing %s from %s", i, si.StringEx(), smap)
 				return false, false
 			}
 			if cos.IsUnreachable(err, status) {
@@ -397,24 +432,24 @@ func (pkr *palive) retry(si *meta.Snode, ticker *time.Ticker) (ok, stopped bool)
 
 func (k *keepalive) Name() string { return k.name }
 
-func (k *keepalive) Run() error {
+func (k *keepalive) heardFrom(sid string) {
+	k.hb.HeardFrom(sid, 0 /*now*/)
+}
+
+// wait for stats-runner to set startedUp=true
+func (k *keepalive) wait() (stopped bool) {
 	var ticker *time.Ticker
 	if daemon.cli.target.standby {
 		ticker = time.NewTicker(waitStandby)
 	} else {
 		ticker = time.NewTicker(waitSelfJoin)
 	}
-	stopped := k.waitStatsRunner(ticker)
+	stopped = k._wait(ticker)
 	ticker.Stop()
-	if stopped {
-		return nil // exit
-	}
-	nlog.Infof("Starting %s", k.Name())
-	k._run()
-	return nil
+	return
 }
 
-func (k *keepalive) waitStatsRunner(ticker *time.Ticker) (stopped bool) {
+func (k *keepalive) _wait(ticker *time.Ticker) (stopped bool) {
 	for {
 		select {
 		case <-ticker.C:
@@ -431,6 +466,18 @@ func (k *keepalive) waitStatsRunner(ticker *time.Ticker) (stopped bool) {
 	}
 }
 
+// pre-populate hb
+func (k *keepalive) init(smap *smapX, self string) {
+	for _, nm := range []meta.NodeMap{smap.Pmap, smap.Tmap} {
+		for sid := range nm {
+			if sid == self {
+				continue
+			}
+			k.hb.reg(sid)
+		}
+	}
+}
+
 func (k *keepalive) _run() {
 	var (
 		ticker    = time.NewTicker(k.interval)
@@ -441,9 +488,9 @@ func (k *keepalive) _run() {
 		select {
 		case <-ticker.C:
 			lastCheck = mono.NanoTime()
-			k.k.do()
 			config := cmn.GCO.Get()
-			k.configUpdate(config.Timeout.MaxKeepalive.D(), k.k.cfg(config))
+			k.k.do(config)
+			k.configUpdate(k.k.cfg(config))
 		case sig := <-k.controlCh:
 			switch sig.msg {
 			case kaResumeMsg:
@@ -458,10 +505,11 @@ func (k *keepalive) _run() {
 				ticker.Stop()
 				return
 			case kaErrorMsg:
-				if mono.Since(lastCheck) >= cmn.KeepaliveRetryDuration() {
+				config := cmn.GCO.Get()
+				if mono.Since(lastCheck) >= cmn.KeepaliveRetryDuration(config) {
 					lastCheck = mono.NanoTime()
 					nlog.Infof("triggered by %v", sig.err)
-					if stopped := k.k.do(); stopped {
+					if stopped := k.k.do(config); stopped {
 						ticker.Stop()
 						return
 					}
@@ -471,62 +519,67 @@ func (k *keepalive) _run() {
 	}
 }
 
-func (k *keepalive) configUpdate(maxKeepalive time.Duration, cfg *cmn.KeepaliveTrackerConf) {
-	k.maxKeepalive = int64(maxKeepalive)
-	if !k.kt.changed(cfg.Factor, cfg.Interval.D()) {
-		return
+func (k *keepalive) configUpdate(cfg *cmn.KeepaliveTrackerConf) {
+	if k.hb.set(cfg.Interval.D()) {
+		k.interval = cfg.Interval.D()
 	}
-	k.interval = cfg.Interval.D()
-	k.kt = newKeepaliveTracker(cfg)
 }
 
-// is called by non-primary proxies and (all) targets to send keepalive req. to the primary
-func (k *keepalive) do(smap *smapX, si *meta.Snode) (stopped bool) {
+// keepalive => primary
+// is called by non-primary proxies and all targets
+func (k *keepalive) do(smap *smapX, si *meta.Snode, config *cmn.Config) (stopped bool) {
 	var (
 		pid     = smap.Primary.ID()
-		timeout = time.Duration(k.timeoutStats(pid).timeout)
-		now     = mono.NanoTime()
+		timeout = config.Timeout.CplaneOperation.D()
+		started = mono.NanoTime()
+		fast    bool
 	)
-	cpid, status, err := k.k.sendKalive(smap, timeout)
-	k.statsT.Add(stats.KeepAliveLatency, mono.SinceNano(now))
-	if err == nil {
-		return
-	}
 	if daemon.stopping.Load() {
 		return
 	}
+	fast = k.k.cluUptime(started) > max(k.interval<<2, config.Timeout.Startup.D()>>1)
+	cpid, status, err := k.k.sendKalive(smap, timeout, fast)
+	if err == nil {
+		now := mono.NanoTime()
+		k.statsT.Add(stats.KeepAliveLatency, now-started)
+		k.hb.HeardFrom(pid, now) // effectively, yes
+		return
+	}
+
 	debug.Assert(cpid == pid && cpid != si.ID(), pid+", "+cpid+", "+si.ID())
 	nlog.Warningf("%s => %s keepalive failed: %v(%d)", si, meta.Pname(pid), err, status)
 
+	//
+	// retry
+	//
 	var (
-		ticker = time.NewTicker(cmn.KeepaliveRetryDuration())
+		ticker = time.NewTicker(cmn.KeepaliveRetryDuration(config))
 		i      int
 	)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
+			// NOTE: suspecting primary down, not checking k.timeToPing(smap.Primary),
+			// and therefore not skipping keepalive req (compare with palive.retry)
 			i++
-			now = mono.NanoTime()
-			pid, status, err = k.k.sendKalive(nil, timeout)
+			started := mono.NanoTime()
+			pid, status, err = k.k.sendKalive(nil, timeout, false)
 			if pid == si.ID() {
 				return // elected as primary
 			}
-			delta := mono.Since(now)
-			// In case the error is some kind of connection error, the round-trip
-			// could be much shorter than the specified `timeout`. In such case
-			// we want to report the worst-case scenario, otherwise we could possibly
-			// decrease next retransmission timeout (which doesn't make much sense).
-			if cos.IsRetriableConnErr(err) {
-				delta = time.Duration(k.maxKeepalive)
-			}
-			timeout = k.updateTimeoutFor(pid, delta)
 			if err == nil {
+				now := mono.NanoTime()
+				k.statsT.Add(stats.KeepAliveLatency, now-started)
+				k.hb.HeardFrom(pid, now) // effectively, yes
 				nlog.Infof("%s: OK after %d attempt%s", si, i, cos.Plural(i))
 				return
 			}
+			// repeat up to `kaNumRetries` with the max timeout
+			timeout = config.Timeout.MaxKeepalive.D()
+
 			if i == kaNumRetries {
-				nlog.Warningf("%s: failed to keepalive with %s after %d attempts", si, meta.Pname(pid), i)
+				nlog.Warningf("%s: failed %d attempts => %s (primary)", si, i, meta.Pname(pid))
 				return true
 			}
 			if cos.IsUnreachable(err, status) {
@@ -546,53 +599,8 @@ func (k *keepalive) do(smap *smapX, si *meta.Snode) (stopped bool) {
 	}
 }
 
-// updateTimeoutForDaemon calculates the new timeout for the daemon with ID sid, updates it in
-// k.timeoutStats, and returns it. The algorithm is loosely based on TCP's RTO calculation,
-// as documented in RFC 6298.
-func (k *keepalive) updateTimeoutFor(sid string, d time.Duration) time.Duration {
-	const (
-		alpha = 125
-		beta  = 250
-		c     = 4
-	)
-	next := int64(d)
-	ts := k.timeoutStats(sid)
-	ts.rttvar = (1000-beta)*ts.rttvar + beta*(cos.AbsI64(ts.srtt-next))
-	ts.rttvar = cos.DivRound(ts.rttvar, 1000)
-	ts.srtt = (1000-alpha)*ts.srtt + alpha*next
-	ts.srtt = cos.DivRound(ts.srtt, 1000)
-	ts.timeout = cos.MinI64(k.maxKeepalive, ts.srtt+c*ts.rttvar)
-	ts.timeout = cos.MaxI64(ts.timeout, k.maxKeepalive/2)
-	return time.Duration(ts.timeout)
-}
-
-// timeoutStats returns the timeoutStats corresponding to daemon ID sid.
-// If there is no entry in k.timeoutStats for sid, then the initial timeout will be set to
-// maxKeepaliveNS, with the other stats loosely based on RFC 6298.
-func (k *keepalive) timeoutStats(sid string) *timeoutStats {
-	k.tt.mu.Lock()
-	if ts := k.tt.timeoutStats[sid]; ts != nil {
-		k.tt.mu.Unlock()
-		return ts
-	}
-	ts := &timeoutStats{srtt: k.maxKeepalive, rttvar: k.maxKeepalive / 2, timeout: k.maxKeepalive}
-	k.tt.timeoutStats[sid] = ts
-	k.tt.mu.Unlock()
-	return ts
-}
-
-func (k *keepalive) onerr(err error, status int) {
-	if cos.IsUnreachable(err, status) {
-		k.controlCh <- controlSignal{msg: kaErrorMsg, err: err}
-	}
-}
-
-func (k *keepalive) heardFrom(sid string, reset bool) {
-	k.kt.HeardFrom(sid, reset)
-}
-
-func (k *keepalive) isTimeToPing(sid string) bool {
-	return k.kt.TimedOut(sid)
+func (k *keepalive) timeToPing(sid string) bool {
+	return k.hb.TimedOut(sid)
 }
 
 func (k *keepalive) Stop(err error) {
@@ -609,112 +617,43 @@ func (k *keepalive) ctrl(msg string) {
 func (k *keepalive) paused() bool { return k.tickerPaused.Load() }
 
 ///////////////
-// HBTracker //
+// heartBeat //
 ///////////////
 
-// HBTracker tracks the timestamp of the last time a message is received from a server.
-// Timeout: a message is not received within the `interval`.
-type HBTracker struct {
-	last     map[string]int64
-	interval time.Duration
-	mtx      sync.RWMutex
-}
+func newHB(interval time.Duration) *heartBeat { return &heartBeat{interval: interval} }
 
-// NewKeepaliveTracker returns a keepalive tracker based on the parameters given.
-func newKeepaliveTracker(c *cmn.KeepaliveTrackerConf) KeepaliveTracker {
-	switch c.Name {
-	case cmn.KeepaliveHeartbeatType:
-		return newHBTracker(c.Interval.D())
-	case cmn.KeepaliveAverageType:
-		return newAvgTracker(c.Factor)
+func (hb *heartBeat) HeardFrom(id string, now int64) {
+	var (
+		val   *int64
+		v, ok = hb.last.Load(id)
+	)
+	if now == 0 {
+		now = mono.NanoTime()
 	}
-	return nil
-}
-
-// newHBTracker returns a HBTracker.
-func newHBTracker(interval time.Duration) *HBTracker {
-	return &HBTracker{
-		last:     make(map[string]int64),
-		interval: interval,
+	if ok {
+		val = v.(*int64) // almost always
+	} else {
+		val = new(int64)
+		hb.last.Store(id, val)
 	}
+	ratomic.StoreInt64(val, now)
 }
 
-func (hb *HBTracker) HeardFrom(id string, _ bool) {
-	hb.mtx.Lock()
-	hb.last[id] = mono.NanoTime()
-	hb.mtx.Unlock()
-}
-
-func (hb *HBTracker) TimedOut(id string) bool {
-	hb.mtx.RLock()
-	t, ok := hb.last[id]
-	hb.mtx.RUnlock()
-	return !ok || mono.Since(t) > hb.interval
-}
-
-func (hb *HBTracker) changed(_ uint8, interval time.Duration) bool {
-	return hb.interval != interval
-}
-
-////////////////
-// AvgTracker //
-////////////////
-
-// AvgTracker keeps track of the average latency of all messages.
-// Timeout: last received is more than the 'factor' of current average.
-type (
-	AvgTracker struct {
-		rec    map[string]avgTrackerRec
-		mtx    sync.RWMutex
-		factor uint8
-	}
-	avgTrackerRec struct {
-		count   int64
-		last    int64
-		totalMS int64 // in ms
-	}
-)
-
-func (rec *avgTrackerRec) avg() int64 {
-	return rec.totalMS / rec.count
-}
-
-// newAvgTracker returns an AvgTracker.
-func newAvgTracker(factor uint8) *AvgTracker {
-	return &AvgTracker{rec: make(map[string]avgTrackerRec), factor: factor}
-}
-
-// HeardFrom is called to indicate that a keepalive message (or equivalent) has been received.
-func (a *AvgTracker) HeardFrom(id string, reset bool) {
-	var rec avgTrackerRec
-	a.mtx.Lock()
-	defer a.mtx.Unlock()
-	rec, ok := a.rec[id]
-	if reset || !ok {
-		a.rec[id] = avgTrackerRec{count: 0, totalMS: 0, last: mono.NanoTime()}
-		return
-	}
-	t := mono.NanoTime()
-	delta := t - rec.last
-	rec.last = t
-	rec.count++
-	rec.totalMS += delta / int64(time.Millisecond)
-	a.rec[id] = rec
-}
-
-func (a *AvgTracker) TimedOut(id string) bool {
-	a.mtx.RLock()
-	rec, ok := a.rec[id]
-	a.mtx.RUnlock()
+func (hb *heartBeat) TimedOut(id string) bool {
+	v, ok := hb.last.Load(id)
 	if !ok {
 		return true
 	}
-	if rec.count == 0 {
-		return false
-	}
-	return int64(mono.Since(rec.last)/time.Millisecond) > int64(a.factor)*rec.avg()
+	val := v.(*int64)
+	tim := ratomic.LoadInt64(val)
+
+	return mono.Since(tim) > hb.interval
 }
 
-func (a *AvgTracker) changed(factor uint8, _ time.Duration) bool {
-	return a.factor != factor
+func (hb *heartBeat) reg(id string) { hb.last.Store(id, new(int64)) }
+
+func (hb *heartBeat) set(interval time.Duration) (changed bool) {
+	changed = hb.interval != interval
+	hb.interval = interval
+	return
 }

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/cmn/nlog"
@@ -33,10 +34,6 @@ type ManagerGroup struct {
 	db       kvdb.Driver
 }
 
-func InitManagers(db kvdb.Driver) {
-	Managers = NewManagerGroup(db, false)
-}
-
 // NewManagerGroup returns new, initialized manager group.
 func NewManagerGroup(db kvdb.Driver, skipHk bool) *ManagerGroup {
 	mg := &ManagerGroup{
@@ -44,7 +41,7 @@ func NewManagerGroup(db kvdb.Driver, skipHk bool) *ManagerGroup {
 		db:       db,
 	}
 	if !skipHk {
-		hk.Reg(DSortName+hk.NameSuffix, mg.housekeep, hk.DayInterval)
+		hk.Reg(apc.ActDsort+hk.NameSuffix, mg.housekeep, hk.DayInterval)
 	}
 	return mg
 }
@@ -73,13 +70,14 @@ func (mg *ManagerGroup) List(descRegex *regexp.Regexp, onlyActive bool) []JobInf
 
 	jobsInfos := make([]JobInfo, 0, len(mg.managers))
 	for _, v := range mg.managers {
-		if descRegex == nil || descRegex.MatchString(v.Metrics.Description) {
-			job := v.Metrics.ToJobInfo(v.ManagerUUID)
-			if onlyActive && job.IsFinished() {
-				continue
-			}
-			jobsInfos = append(jobsInfos, job)
+		if descRegex != nil && !descRegex.MatchString(v.Metrics.Description) {
+			continue
 		}
+		job := v.Metrics.ToJobInfo(v.ManagerUUID, v.Pars)
+		if onlyActive && job.IsFinished() {
+			continue
+		}
+		jobsInfos = append(jobsInfos, job)
 	}
 
 	// Always check persistent db
@@ -97,7 +95,7 @@ func (mg *ManagerGroup) List(descRegex *regexp.Regexp, onlyActive bool) []JobInf
 			continue
 		}
 		if descRegex == nil || descRegex.MatchString(m.Metrics.Description) {
-			job := m.Metrics.ToJobInfo(m.ManagerUUID)
+			job := m.Metrics.ToJobInfo(m.ManagerUUID, m.Pars)
 			if onlyActive && job.IsFinished() {
 				continue
 			}
@@ -115,17 +113,12 @@ func (mg *ManagerGroup) List(descRegex *regexp.Regexp, onlyActive bool) []JobInf
 // exist and user requested persisted lookup, it looks for it in persistent
 // storage and returns it if found. Returns false if does not exist, true
 // otherwise.
-func (mg *ManagerGroup) Get(managerUUID string, ap ...bool) (*Manager, bool) {
-	var allowPersisted bool
-
+func (mg *ManagerGroup) Get(managerUUID string, inclArchived bool) (*Manager, bool) {
 	mg.mtx.Lock()
 	defer mg.mtx.Unlock()
-	if len(ap) > 0 {
-		allowPersisted = ap[0]
-	}
 
 	manager, exists := mg.managers[managerUUID]
-	if !exists && allowPersisted {
+	if !exists && inclArchived {
 		key := path.Join(managersKey, managerUUID)
 		if err := mg.db.Get(dsortCollection, key, &manager); err != nil {
 			if !cos.IsErrNotFound(err) {
@@ -144,7 +137,7 @@ func (mg *ManagerGroup) Remove(managerUUID string) error {
 	defer mg.mtx.Unlock()
 
 	if manager, ok := mg.managers[managerUUID]; ok && !manager.Metrics.Archived.Load() {
-		return errors.Errorf("%s process %s still in progress and cannot be removed", DSortName, managerUUID)
+		return errors.Errorf("%s process %s still in progress and cannot be removed", apc.ActDsort, managerUUID)
 	} else if ok {
 		delete(mg.managers, managerUUID)
 	}

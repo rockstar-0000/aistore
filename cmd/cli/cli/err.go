@@ -38,6 +38,11 @@ type (
 		baseErr        error
 		additionalInfo string
 	}
+	errDoesNotExist struct {
+		what   string
+		name   string
+		suffix string
+	}
 )
 
 //////////////
@@ -78,6 +83,19 @@ func (e *errAdditionalInfo) Error() string {
 	return fmt.Sprintf("%s.\n%s\n", e.baseErr.Error(), cos.StrToSentence(e.additionalInfo))
 }
 
+/////////////////////
+// errDoesNotExist //
+/////////////////////
+
+func (e *errDoesNotExist) Error() string {
+	return fmt.Sprintf("%s %q does not exist%s", e.what, e.name, e.suffix)
+}
+
+func isErrDoesNotExist(err error) bool {
+	_, ok := err.(*errDoesNotExist)
+	return ok
+}
+
 //
 // misc. utils, helpers
 //
@@ -86,7 +104,7 @@ func isUnreachableError(err error) (msg string, unreachable bool) {
 	switch err := err.(type) {
 	case *cmn.ErrHTTP:
 		herr := cmn.Err2HTTPErr(err)
-		if verbose() {
+		if configuredVerbosity() {
 			herr.Message = herr.StringEx()
 		}
 		msg = herr.Message
@@ -155,7 +173,7 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 		sbWriteFlags(c, sb)
 		sb.WriteString("'?")
 		sbWriteSearch(sb, cmd, true)
-	case distance < cos.Max(incorrectCmdDistance, len(cmd)/2):
+	case distance < max(incorrectCmdDistance, len(cmd)/2):
 		sb.WriteString(prefix)
 		sb.WriteString(c.App.Name) // ditto
 		sb.WriteString(" " + closestCommand)
@@ -285,7 +303,7 @@ func completionErr(c *cli.Context, err error) {
 //
 
 func V(err error) error {
-	if err != nil && verbose() {
+	if err != nil && configuredVerbosity() {
 		if herr, ok := err.(*cmn.ErrHTTP); ok {
 			herr.Message = herr.StringEx()
 			return herr

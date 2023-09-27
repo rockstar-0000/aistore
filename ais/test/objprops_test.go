@@ -39,7 +39,7 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 	msg *apc.LsoMsg, versionEnabled bool, cksumType string) (newVersions map[string]string) {
 	newVersions = make(map[string]string, len(oldVersions))
 	tlog.Logln("Updating...")
-	r, err := readers.NewRandReader(int64(fileSize), cksumType)
+	r, err := readers.NewRand(int64(fileSize), cksumType)
 	if err != nil {
 		t.Fatalf("Failed to create reader: %v", err)
 	}
@@ -518,7 +518,7 @@ func TestObjProps(t *testing.T) {
 				})
 			} else {
 				m.puts()
-				m.gets() // set the access time
+				m.gets(nil, false) // set the access time
 			}
 
 			bckProps, err := api.HeadBucket(baseParams, m.bck, true /* don't add */)

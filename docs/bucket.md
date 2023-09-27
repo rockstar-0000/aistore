@@ -55,6 +55,20 @@ In addition, AIS supports multiple storage **backends** including itself:
 
 ![Supported Backends](images/supported-backends.png)
 
+But there's more.
+
+AIStore supports vendor-specific configuration on a per bucket basis. For instance, any bucket _backed up_ by an AWS S3 bucket (**) can be configured to use alternative:
+
+* named AWS profiles (with alternative credentials and/or region)
+* s3 endpoints
+
+(**) Terminology-wise, when we say "s3 bucket" or "google cloud bucket" we in fact reference a bucket in an AIS cluster that is either:
+
+* (A) denoted with the respective `s3:` or `gs:` protocol schema, or
+* (B) is a differently named AIS (that is, `ais://`) bucket that has its `backend_bck` property referencing the s3 (or google cloud) bucket in question.
+
+> For examples and **usage**, grep docs for `backend_bck` or see [AWS profiles and alternative s3 endpoints](/docs/cli/aws_profile_endpoint.md).
+
 All the [supported storage services](storage_svcs.md) equally apply to all storage backends with only a few exceptions. The following table summarizes them.
 
 | Kind | Description | Supported Storage Services |
@@ -618,7 +632,7 @@ An empty structure `{}` results in getting just the names of the objects (from t
 | Property/Option | Description | Value |
 | --- | --- | --- |
 | `uuid` | ID of the list objects operation | After initial request to list objects the `uuid` is returned and should be used for subsequent requests. The ID ensures integrity between next requests. |
-| `pagesize` | The maximum number of object names returned in response | For AIS buckets default value is `10000`. For remote buckets this value varies as each provider has it's own maximal page size. |
+| `pagesize` | The maximum number of object names returned in response | For AIS buckets default value is `10000`. For remote buckets this value varies as each provider has it's own maximum page size. |
 | `props` | The properties of the object to return | A comma-separated string containing any combination of: `name,size,version,checksum,atime,location,copies,ec,status` (if not specified, props are set to `name,size,version,checksum,atime`). <sup id="a1">[1](#ft1)</sup> |
 | `prefix` | The prefix which all returned objects must have | For example, `prefix = "my/directory/structure/"` will include object `object_name = "my/directory/structure/object1.txt"` but will not `object_name = "my/directory/object2.txt"` |
 | `start_after` | Name of the object after which the listing should start | For example, `start_after = "baa"` will include object `object_name = "caa"` but will not `object_name = "ba"` nor `object_name = "aab"`. |

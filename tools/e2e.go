@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/onsi/ginkgo"
@@ -113,6 +114,7 @@ func (f *E2EFramework) RunE2ETest(fileName string) {
 		target     = randomTarget()
 		mountpath  = randomMountpath(target)
 		backends   = retrieveBackendProviders()
+		etlName    = "etlname-" + strings.ToLower(trand.String(4))
 
 		inputFileName   = fileName + ".in"
 		outputFileName  = fileName + ".stdout"
@@ -134,6 +136,7 @@ func (f *E2EFramework) RunE2ETest(fileName string) {
 		s = strings.ReplaceAll(s, "$DIR", f.Dir)
 		s = strings.ReplaceAll(s, "$RESULT", lastResult)
 		s = strings.ReplaceAll(s, "$BACKENDS", strings.Join(backends, ","))
+		s = strings.ReplaceAll(s, "$ETL_NAME", etlName)
 		for k, v := range f.Vars {
 			s = strings.ReplaceAll(s, "$"+k, v)
 		}
@@ -213,6 +216,13 @@ func (f *E2EFramework) RunE2ETest(fileName string) {
 					continue
 				}
 				ginkgo.Skip("AuthN not enabled - skipping")
+				return
+			case "k8s":
+				// Skip running k8s (etl) tests if AIStore is not deployed in kubernetes
+				if k8s.Detect() == nil {
+					continue
+				}
+				ginkgo.Skip("AIStore not running in K8s - skipping")
 				return
 			default:
 				cos.AssertMsg(false, "invalid run mode: "+comment)

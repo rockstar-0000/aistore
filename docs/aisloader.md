@@ -9,9 +9,13 @@ redirect_from:
 
 # AIS Loader
 
-AIS Loader (`aisloader`) is a tool to measure storage performance. It is a load generator that we constantly use to benchmark and stress-test [AIStore](https://github.com/NVIDIA/aistore). The tool was written in such a way that it can be easily extended to benchmark any S3-compatible backend.
+AIS Loader ([`aisloader`](/bench/tools/aisloader)) is a tool to measure storage performance. It is a load generator that we constantly use to benchmark and stress-test [AIStore](https://github.com/NVIDIA/aistore) or any S3-compatible backend.
 
-In addition, `aisloader` generates synthetic workloads that mimic training and inference workloads - the capability that allows to run benchmarks in isolation (which is often preferable), and also avoid compute-side bottlenecks if there are any.
+In fact, aisloader can list, write, and read S3(**) buckets _directly_, which makes it quite useful, convenient, and easy to use benchmark to compare storage performance **with** aistore in front of S3 and **without**.
+
+> (**) `aisloader` can be further easily extended to work directly with any Cloud storage provider including, but not limited to, aistore-supported GCP and Azure.
+
+In addition, `aisloader` generates synthetic workloads that mimic training and inference workloads - the capability that allows to run benchmarks in isolation (which is often preferable) avoiding compute-side bottlenecks (if any) and associated complexity.
 
 There's a large set of command-line switches that allow to realize almost any conceivable workload, with basic permutations always including:
 
@@ -30,6 +34,7 @@ Detailed protocol-level tracing statistics are also available - see [HTTP tracin
 - [Collecting stats](#collecting-stats)
     - [Grafana](#grafana)
 - [HTTP tracing](#http-tracing)
+- [AISLoader-Composer](#aisloader-composer)
 - [References](#references)
 
 ## Setup
@@ -53,10 +58,13 @@ For the most recently updated command-line options and examples, please run `ais
 | -batchsize | `int` | Batch size to list and delete | `100` |
 | -bprops | `json` | JSON string formatted as per the SetBucketProps API and containing bucket properties to apply | `""` |
 | -bucket | `string` | Bucket name. Bucket will be created if doesn't exist. If empty, aisloader generates a new random bucket name | `""` |
-| -check-statsd | `bool` | true: prior to benchmark make sure that StatsD is reachable | `false` |
+| -cksum-type | `string` | Checksum type to use for PUT object requests | `xxhash`|
 | -cleanup | `bool` | true: remove bucket upon benchmark termination | `n/a` (required) |
 | -dry-run | `bool` | show the entire set of parameters that aisloader will use when actually running | `false` |
 | -duration | `string`, `int` | Benchmark duration (0 - run forever or until Ctrl-C, default 1m). Note that if both duration and totalputsize are zeros, aisloader will have nothing to do | `1m` |
+| -epochs | `int` |  Number of "epochs" to run whereby each epoch entails full pass through the entire listed bucket | `1`|
+| -etl | `string` | Built-in ETL, one-of: `tar2tf`, `md5`, or `echo`. Each object that `aisloader` GETs undergoes the selected transformation. See also: `-etl-spec` option. | `""` |
+| -etl-spec | `string` | Custom ETL specification (pathname). Must be compatible with Kubernetes Pod specification. Each object that `aisloader` GETs will undergo this user-defined transformation. See also: `-etl` option. | `""` |
 | -getconfig | `bool` | true: generate control plane load by reading AIS proxy configuration (that is, instead of reading/writing data exercise control path) | `false` |
 | -getloaderid | `bool` | true: print stored/computed unique loaderID aka aisloader identifier and exit | `false` |
 | -ip | `string` | AIS proxy/gateway IP address or hostname | `localhost` |
@@ -72,22 +80,28 @@ For the most recently updated command-line options and examples, please run `ais
 | -port | `int` | Port number for proxy server | `8080` |
 | -provider | `string` | ais - for AIS, cloud - for Cloud bucket; other supported values include "gcp" and "aws", for Amazon and Google clouds, respectively | `ais` |
 | -putshards | `int` | Spread generated objects over this many subdirectories (max 100k) | `0` |
+| -quiet | `bool` | When starting to run, do not print command line arguments, default settings, and usage examples | `false` |
 | -randomname | `bool` | true: generate object names of 32 random characters. This option is ignored when loadernum is defined | `true` |
 | -readertype | `string` | Type of reader: sg(default). Available: `sg`, `file`, `rand`, `tar` | `sg` |
 | -readlen | `string`, `int` | Read range length, can contain [multiplicative suffix](#bytes-multiplicative-suffix) | `""` |
 | -readoff | `string`, `int` | Read range offset (can contain multiplicative suffix K, MB, GiB, etc.) | `""` |
+| -s3endpoint | `string` | S3 endpoint to read/write S3 bucket directly (with no aistore) | `""` |
+| -s3profile | `string` | Other then default S3 config profile referencing alternative credentials | `""` |
 | -seed | `int` | Random seed to achieve deterministic reproducible results (0 - use current time in nanoseconds) | `0` |
+| -skiplist | `bool` | Whether to skip listing objects in a bucket before running PUT workload | `false` |
+| -filelist | `string` | Local or locally accessible text file file containing object names (for subsequent reading) | `""` |
 | -stats-output | `string` | filename to log statistics (empty string translates as standard output (default) | `""` |
 | -statsdip | `string` | StatsD IP address or hostname | `localhost` |
 | -statsdport | `int` | StatsD UDP port | `8125` |
 | -statsdprobe | `bool` | Test-probe StatsD server prior to benchmarks | `true` |
 | -statsinterval | `int` | Interval in seconds to print performance counters; 0 - disabled | `10` |
 | -subdir | `string` | Virtual destination directory for all aisloader-generated objects | `""` |
-| -tmpdir | `string` | Local directory to store temporary files | `/tmp/ais` |
+| -test-probe | `bool`| Test StatsD server prior to running benchmarks | `false` |
 | -timeout | `string` | Client HTTP timeout; `0` = infinity) | `10m` |
-| -etl | `string` | Built-in ETL, one-of: `tar2tf`, `md5`, or `echo`. Each object that `aisloader` GETs undergoes the selected transformation. See also: `-etl-spec` option. | `""` |
-| -etl-spec | `string` | Custom ETL specification (pathname). Must be compatible with Kubernetes Pod specification. Each object that `aisloader` GETs will undergo this user-defined transformation. See also: `-etl` option. | `""` |
+| -tmpdir | `string` | Local directory to store temporary files | `/tmp/ais` |
+| -tokenfile | `string` | Authentication token (FQN) | `""`|
 | -totalputsize | `string`, `int` | Stop PUT workload once cumulative PUT size reaches or exceeds this value, can contain [multiplicative suffix](#bytes-multiplicative-suffix), 0 = no limit | `0` |
+| -trace-http | `bool` | Trace HTTP latencies (see [HTTP tracing](#http-tracing)) | `false` |
 | -uniquegets | `bool` | true: GET objects randomly and equally. Meaning, make sure *not* to GET some objects more frequently than the others | `true` |
 | -usage | `bool` | Show command-line options, usage, and examples | `false` |
 | -verifyhash | `bool` | checksum-validate GET: recompute object checksums and validate it against the one received with the GET metadata | `true` |
@@ -185,24 +199,28 @@ Before starting a test, it is possible to set `mirror` or `EC` properties on a b
 To achieve that, use the option `-bprops`. For example:
 
 ```console
-$ aisloader -bucket=abc -pctput=0 -cleanup=false -duration 10s -bprops='{"mirror": {"copies": 2, "enabled": false, "util_thresh": 5}, "ec": {"enabled": false, "data_slices": 2, "parity_slices": 2}}'
+$ aisloader -bucket=ais://abc -pctput=0 -cleanup=false -duration 10s -bprops='{"mirror": {"copies": 2, "enabled": false}, "ec": {"enabled": false, "data_slices": 2, "parity_slices": 2}}'
 ```
 
 The above example shows the values that are globally default. You can omit the defaults and specify only those values that you'd want to change. For instance, to enable erasure coding on the bucket "abc":
 
 ```console
-$ aisloader -bucket=abc -duration 10s -bprops='{"ec": {"enabled": true}}'
+$ aisloader -bucket=ais://abc -duration 1h -bprops='{"ec": {"enabled": true}}' -cleanup=false
 ```
 
 This example sets the number of data and parity slices to 2 which, in turn, requires the cluster to have at least 5 target nodes: 2 for data slices, 2 for parity slices and one for the original object.
 
 > Once erasure coding is enabled, its properties `data_slices` and `parity_slices` cannot be changed on the fly.
 
+> Note that (n `data_slices`, m `parity_slices`) erasure coding requires at least (n + m + 1) target nodes in a cluster.
+
+> Even though erasure coding and/or mirroring can be enabled/disabled and otherwise reconfigured at any point in time, specifically for the purposes of running benchmarks it is generally recommended to do it once _prior_ to writing any data to the bucket in question.
+
 The following sequence populates a bucket configured for both local mirroring and erasure coding, and then reads from it for 1h:
 
 ```console
 # Fill bucket
-$ aisloader -bucket=abc -cleanup=false -pctput=100 -duration 100m -bprops='{"mirror": {"enabled": true}, "ec": {"enabled": true}}'
+$ aisloader -bucket=ais://abc -cleanup=false -pctput=100 -duration 100m -bprops='{"mirror": {"enabled": true}, "ec": {"enabled": true}}'
 
 # Read
 $ aisloader -bucket=abc -cleanup=false -pctput=0 -duration 1h
@@ -219,7 +237,7 @@ Note that this is entirely optional, and therefore an input such as `300` will b
 
 For the most recently updated command-line options and examples, please run `aisloader` or `aisloader usage`.
 
-1. Create a 10-seconds load of 50% PUT and 50% GET requests:
+**1**. Create a 10-seconds load of 50% PUT and 50% GET requests:
 
     ```console
     $ aisloader -bucket=my_ais_bucket -duration=10s -pctput=50 -provider=ais
@@ -233,7 +251,7 @@ For the most recently updated command-line options and examples, please run `ais
         "put upper bound": 0,
         "put %": 50,
         "minimal object size in Bytes": 1024,
-        "maximal object size in Bytes": 1048576,
+        "maximum object size in Bytes": 1048576,
         "worker count": 1,
         "stats interval": "10s",
         "backed by": "sg",
@@ -250,61 +268,61 @@ For the most recently updated command-line options and examples, please run `ais
     01:52:54 Clean up done
     ```
 
-2. Time-based 100% PUT into ais bucket. Upon exit the bucket is destroyed:
+**2**. Time-based 100% PUT into ais bucket. Upon exit the bucket is destroyed:
 
     ```console
     $ aisloader -bucket=nvais -duration 10s -cleanup=true -numworkers=3 -minsize=1K -maxsize=1K -pctput=100 -provider=ais
     ```
 
-3. Timed (for 1h) 100% GET from a Cloud bucket, no cleanup:
+**3**. Timed (for 1h) 100% GET from a Cloud bucket, no cleanup:
 
     ```console
     $ aisloader -bucket=aws://nvaws -duration 1h -numworkers=30 -pctput=0 -cleanup=false
     ```
 
-4. Mixed 30%/70% PUT and GET of variable-size objects to/from a Cloud bucket. PUT will generate random object names and is limited by the 10GB total size. Cleanup enabled - upon completion all generated objects and the bucket itself will be deleted:
+**4**. Mixed 30%/70% PUT and GET of variable-size objects to/from a Cloud bucket. PUT will generate random object names and is limited by the 10GB total size. Cleanup enabled - upon completion all generated objects and the bucket itself will be deleted:
 
     ```console
     $ aisloader -bucket=s3://nvaws -duration 0s -cleanup=true -numworkers=3 -minsize=1024 -maxsize=1MB -pctput=30 -totalputsize=10G
     ```
 
-5. PUT 1GB total into an ais bucket with cleanup disabled, object size = 1MB, duration unlimited:
+**5**. PUT 1GB total into an ais bucket with cleanup disabled, object size = 1MB, duration unlimited:
 
     ```console
     $ aisloader -bucket=nvais -cleanup=false -totalputsize=1G -duration=0 -minsize=1MB -maxsize=1MB -numworkers=8 -pctput=100 -provider=ais
     ```
 
-6. 100% GET from an ais bucket:
+**6**. 100% GET from an ais bucket:
 
     ```console
     $ aisloader -bucket=nvais -duration 5s -numworkers=3 -pctput=0 -provider=ais -cleanup=false
     ```
 
-7. PUT 2000 objects named as `aisloader/hex({0..2000}{loaderid})`:
+**7**. PUT 2000 objects named as `aisloader/hex({0..2000}{loaderid})`:
 
     ```console
     $ aisloader -bucket=nvais -duration 10s -numworkers=3 -loaderid=11 -loadernum=20 -maxputs=2000 -objNamePrefix="aisloader" -cleanup=false
     ```
 
-8. Use random object names and loaderID to report statistics:
+**8**. Use random object names and loaderID to report statistics:
 
     ```console
     $ aisloader -loaderid=10
     ```
 
-9. PUT objects with random name generation being based on the specified loaderID and the total number of concurrent aisloaders:
+**9**. PUT objects with random name generation being based on the specified loaderID and the total number of concurrent aisloaders:
 
     ```console
     $ aisloader -loaderid=10 -loadernum=20
     ```
 
-10. Same as above except that loaderID is computed by the aisloader as `hash(loaderstring) & 0xff`:
+**10**. Same as above except that loaderID is computed by the aisloader as `hash(loaderstring) & 0xff`:
 
     ```console
     $ aisloader -loaderid=loaderstring -loaderidhashlen=8
     ```
 
-11. Print loaderID and exit (all 3 examples below) with the resulting loaderID shown on the right:
+**11**. Print loaderID and exit (all 3 examples below) with the resulting loaderID shown on the right:
 
     ```console
     $ aisloader -getloaderid (0x0)
@@ -312,40 +330,57 @@ For the most recently updated command-line options and examples, please run `ais
     $ aisloader -loaderid=loaderstring -loaderidhashlen=8 -getloaderid (0xdb)
     ```
 
-12. Destroy existing ais bucket. If the bucket is Cloud-based, delete all objects:
+**12**. Destroy existing ais bucket. If the bucket is Cloud-based, delete all objects:
 
     ```console
     $ aisloader -bucket=nvais -duration 0s -totalputsize=0 -cleanup=true
     ```
 
-13. Generate load on a cluster listening on custom IP address and port:
+**13**. Generate load on a cluster listening on custom IP address and port:
 
     ```console
     $ aisloader -ip="example.com" -port=8080
     ```
 
-14. Generate load on a cluster listening on custom IP address and port from environment variable:
+**14**. Generate load on a cluster listening on custom IP address and port from environment variable:
 
     ```console
     $ AIS_ENDPOINT="examples.com:8080" aisloader
     ```
 
-15. Use HTTPS when connecting to a cluster:
+**15**. Use HTTPS when connecting to a cluster:
 
     ```console
     $ aisloader -ip="https://localhost" -port=8080
     ```
 
-16. PUT TAR files with random files inside into a cluster:
+**16**. PUT TAR files with random files inside into a cluster:
 
     ```console
     $ aisloader -bucket=my_ais_bucket -duration=10s -pctput=100 -provider=ais -readertype=tar
     ```
 
-17. Generate load on `tar2tf` ETL. New ETL is started and then stopped at the end. TAR files are PUT to the cluster. Only available when cluster is deployed on Kubernetes.
+**17**. Generate load on `tar2tf` ETL. New ETL is started and then stopped at the end. TAR files are PUT to the cluster. Only available when cluster is deployed on Kubernetes.
 
     ```console
     $ aisloader -bucket=my_ais_bucket -duration=10s -pctput=100 -provider=ais -readertype=tar -etl=tar2tf -cleanup=false
+    ```
+
+**18**. Timed 100% GET _directly_ from S3 bucket (notice '-s3endpoint' command line):
+    ```console
+    $ aisloader -bucket=s3://xyz -cleanup=false -numworkers=8 -pctput=0 -duration=10m -s3endpoint=https://s3.amazonaws.com
+    ```
+
+**19**. PUT approx. 8000 files into s3 bucket directly, skip printing usage and defaults. Similar to the previous example, aisloader goes directly to a given S3 endpoint ('-s3endpoint'), and aistore is not being used:
+    ```console
+     $ aisloader -bucket=s3://xyz -cleanup=false -minsize=16B -maxsize=16B -numworkers=8 -pctput=100 -totalputsize=128k -s3endpoint=https://s3.amazonaws.com -quiet
+    ```
+
+**20**.  Generate a list of object names (once), and then run aisloader without executing list-objects:
+
+    ```console
+    $ ais ls ais://nnn --props name -H > /tmp/a.txt
+    $ aisloader -bucket=ais://nnn -duration 1h -numworkers=30 -pctput=0 -filelist /tmp/a.txt -cleanup=false
     ```
 
 ## Collecting stats
@@ -448,6 +483,11 @@ Detailed latency info is enabled
 ```
 
 > Note that other than `--trace-http`, all command-line options in this section are used for purely illustrative purposes.
+
+# AISLoader Composer
+
+For benchmarking production-level clusters, a single AISLoader instance may not be able to fully saturate the load the cluster can handle. In this case, multiple aisloader instances can be coordinated via the [AISLoader Composer](/bench/tools/aisloader-composer/). See the [README](/bench/tools/aisloader-composer/README.md) for instructions on setting up. 
+
 
 ## References
 

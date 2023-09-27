@@ -79,23 +79,36 @@ func (*archFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	return p
 }
 
-func (p *archFactory) Start() error {
+func (p *archFactory) Start() (err error) {
+	//
+	// target-local generation of a global UUID
+	//
+	bckTo, ok := p.Args.Custom.(*meta.Bck)
+	debug.Assertf(ok, "%+v", bckTo)
+	if !ok || bckTo.IsEmpty() {
+		bckTo = &meta.Bck{Name: "any"} // local usage to gen uuid, see r.bckTo below
+	}
+	p.Args.UUID, err = p.genBEID(p.Bck, bckTo)
+	if err != nil {
+		return
+	}
+	//
+	// new x-archive
+	//
 	workCh := make(chan *cmn.ArchiveBckMsg, maxNumInParallel)
 	r := &XactArch{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}, workCh: workCh}
 	r.pending.m = make(map[string]*archwi, maxNumInParallel)
 	p.xctn = r
-	r.DemandBase.Init(p.UUID(), apc.ActArchive, p.Bck /*from*/, 0 /*use default*/)
+	r.DemandBase.Init(p.UUID() /*== p.Args.UUID above*/, p.kind, p.Bck /*from*/, xact.IdleDefault)
 
-	bmd := p.Args.T.Bowner().Get()
-	trname := fmt.Sprintf("arch-%s%s-%s-%d", p.Bck.Provider, p.Bck.Ns, p.Bck.Name, bmd.Version) // NOTE: (bmd.Version)
-	if err := p.newDM(trname, r.recv, 0 /*pdu*/); err != nil {
-		return err
+	if err = p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, 0 /*pdu*/); err != nil {
+		return
 	}
 	r.p.dm.SetXact(r)
 	r.p.dm.Open()
 
 	xact.GoRunW(r)
-	return nil
+	return
 }
 
 //////////////
@@ -163,7 +176,7 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *cluster.LOM) (err erro
 		}
 	}
 
-	// most of the time there'll be a single dst bucket for the lifetime
+	// most of the time there'll be a single destination bucket for the lifetime
 	if r.bckTo == nil {
 		if from := r.Bck().Bucket(); !from.Equal(&wi.msg.ToBck) {
 			r.bckTo = meta.CloneBck(&wi.msg.ToBck)
@@ -237,10 +250,10 @@ fin:
 
 	// [cleanup] close and rm unfinished archives (compare w/ finalize)
 	r.pending.Lock()
-	for uuid, wi := range r.pending.m {
+	for _, wi := range r.pending.m {
 		wi.cleanup()
-		delete(r.pending.m, uuid)
 	}
+	clear(r.pending.m)
 	r.pending.Unlock()
 }
 

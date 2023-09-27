@@ -35,6 +35,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         expected_action = {
             "communication": "hpush://",
             "timeout": "5m",
+            "argument": "",
         }
         self.init_spec_exec_assert(expected_action)
 
@@ -48,6 +49,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         expected_action = {
             "communication": f"{communication_type}://",
             "timeout": timeout,
+            "argument": "",
         }
         self.init_spec_exec_assert(
             expected_action, communication_type=communication_type, timeout=timeout
@@ -97,7 +99,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
             "dependencies": base64.b64encode(b"cloudpickle==2.2.0").decode(
                 UTF_ENCODING
             ),
-            "transform_url": False,
+            "argument": "",
         }
         self.init_code_exec_assert(expected_action)
 
@@ -112,7 +114,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         preimported = ["pytorch"]
         user_dependencies = ["pytorch"]
         chunk_size = 123
-        transform_url = True
+        arg_type = "url"
 
         expected_dependencies = user_dependencies.copy()
         expected_dependencies.append("cloudpickle==2.2.0")
@@ -128,7 +130,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
             "code": self.encode_fn(preimported, self.transform_fn, communication_type),
             "dependencies": expected_dep_str,
             "chunk_size": chunk_size,
-            "transform_url": transform_url,
+            "argument": arg_type,
         }
         self.init_code_exec_assert(
             expected_action,
@@ -138,7 +140,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
             communication_type=communication_type,
             timeout=timeout,
             chunk_size=chunk_size,
-            transform_url=transform_url,
+            arg_type=arg_type,
         )
 
     @staticmethod

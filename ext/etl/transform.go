@@ -5,11 +5,11 @@
 package etl
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
@@ -191,8 +191,6 @@ func InitCode(t cluster.Target, msg *InitCodeMsg, xid string) error {
 }
 
 // generate (from => to) replacements
-//
-//nolint:gocritic // appendCombine vs readability
 func fromToPairs(msg *InitCodeMsg) (ftp []string) {
 	var (
 		chunk string
@@ -200,27 +198,19 @@ func fromToPairs(msg *InitCodeMsg) (ftp []string) {
 		name  = msg.IDX
 	)
 	ftp = make([]string, 0, 16)
-	ftp = append(ftp, "<NAME>", name)
-	ftp = append(ftp, "<COMM_TYPE>", msg.CommTypeX)
+	ftp = append(ftp, "<NAME>", name, "<COMM_TYPE>", msg.CommTypeX, "<ARG_TYPE>", msg.ArgTypeX)
 
-	// chunk == 0 means no chunks (and no streaming) - in other words,
-	// reading the entire payload in memory, and then transforming in one shot
+	// chunk == 0 means no chunks (and no streaming) - ie.,
+	// reading the entire payload in memory and then transforming in one shot
 	if msg.ChunkSize > 0 {
 		chunk = "\"" + strconv.FormatInt(msg.ChunkSize, 10) + "\""
 	}
 	ftp = append(ftp, "<CHUNK_SIZE>", chunk)
 
-	if msg.CommTypeX == Hpull && msg.TransformURL {
-		ftp = append(ftp, "<ARG_TYPE>", "url")
-	}
-
 	if msg.Flags > 0 {
 		flags = "\"" + strconv.FormatInt(msg.Flags, 10) + "\""
 	}
-	ftp = append(ftp, "<FLAGS>", flags)
-
-	// functions
-	ftp = append(ftp, "<FUNC_TRANSFORM>", msg.Funcs.Transform)
+	ftp = append(ftp, "<FLAGS>", flags, "<FUNC_TRANSFORM>", msg.Funcs.Transform)
 
 	switch msg.CommTypeX {
 	case Hpush, Hpull, Hrev:
@@ -299,14 +289,11 @@ func start(t cluster.Target, msg *InitSpecMsg, xid string, opts StartOpts, confi
 	boot.setupXaction(xid)
 
 	// finally, add Communicator to the runtime registry
-	c := makeCommunicator(commArgs{
-		listener: newAborter(t, msg.IDX),
-		boot:     boot,
-	})
-	if err = reg.add(msg.IDX, c); err != nil {
+	comm := newCommunicator(newAborter(t, msg.IDX), boot)
+	if err = reg.add(msg.IDX, comm); err != nil {
 		return
 	}
-	t.Sowner().Listeners().Reg(c)
+	t.Sowner().Listeners().Reg(comm)
 	return
 }
 
@@ -461,13 +448,18 @@ func deleteEntity(errCtx *cmn.ETLErrCtx, entityType, entityName string) error {
 		return cmn.NewErrETL(errCtx, err.Error())
 	}
 
-	err = wait.PollImmediate(time.Second, time.Minute, func() (done bool, err error) {
-		exists, err := client.CheckExists(entityType, entityName)
-		if err != nil {
-			return false, err
-		}
-		return !exists, nil
-	})
+	// wait
+	interval := cos.ProbingFrequency(DefaultTimeout)
+	err = wait.PollUntilContextTimeout(context.Background(), interval, DefaultTimeout, false, /*immediate*/
+		func(context.Context) (done bool, err error) {
+			var exists bool
+			exists, err = client.CheckExists(entityType, entityName)
+			if err == nil {
+				done = !exists
+			}
+			return
+		},
+	)
 	if err != nil {
 		return cmn.NewErrETL(errCtx, err.Error())
 	}

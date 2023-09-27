@@ -19,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/ext/dload"
+	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	jsoniter "github.com/json-iterator/go"
@@ -37,6 +38,12 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		// disallow to run when above high wm (let alone OOS)
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
+			t.writeErr(w, r, err, http.StatusInsufficientStorage)
+			return
+		}
 		if _, err := t.parseURL(w, r, 0, false, apc.URLPathDownload.L); err != nil {
 			return
 		}

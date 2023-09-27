@@ -1,4 +1,4 @@
-// Package transport provides streaming object-based transport over http for intra-cluster continuous
+// Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
@@ -67,7 +67,6 @@ func (*dummyStatsTracker) AddMany(...cos.NamedVal64) {}
 
 var (
 	objmux   *mux.ServeMux
-	msgmux   *mux.ServeMux
 	duration time.Duration // test duration
 )
 
@@ -95,11 +94,6 @@ func TestMain(t *testing.M) {
 	path := transport.ObjURLPath("")
 	objmux.HandleFunc(path, transport.RxAnyStream)
 	objmux.HandleFunc(path+"/", transport.RxAnyStream)
-
-	msgmux = mux.NewServeMux()
-	path = transport.MsgURLPath("")
-	msgmux.HandleFunc(path, transport.RxAnyStream)
-	msgmux.HandleFunc(path+"/", transport.RxAnyStream)
 
 	os.Exit(t.Run())
 }
@@ -210,7 +204,7 @@ func Example_obj() {
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
 	trname := "dummy-obj"
-	err := transport.HandleObjStream(trname, receive)
+	err := transport.Handle(trname, receive)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -229,16 +223,16 @@ func Example_obj() {
 }
 
 // test random streaming
-func Test_OneStream(t *testing.T) {
+func TestOneStream(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
 
 	streamWriteUntil(t, 55, nil, ts, nil, nil, false /*compress*/, true /*PDU*/)
-	printNetworkStats(t)
+	printNetworkStats()
 }
 
-func Test_MultiStream(t *testing.T) {
+func TestMultiStream(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 
 	tlog.Logf("Duration %v\n", duration)
@@ -246,21 +240,20 @@ func Test_MultiStream(t *testing.T) {
 	defer ts.Close()
 
 	wg := &sync.WaitGroup{}
-	netstats := make(map[string]transport.EndpointStats)
+	netstats := make(map[string]transport.RxStats)
 	lock := &sync.Mutex{}
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go streamWriteUntil(t, i, wg, ts, netstats, lock, false /*compress*/, false /*PDU*/)
 	}
 	wg.Wait()
-	compareNetworkStats(t, netstats)
+	compareNetworkStats(netstats)
 }
 
-func printNetworkStats(t *testing.T) {
-	netstats, err := transport.GetStats()
-	tassert.CheckFatal(t, err)
+func printNetworkStats() {
+	netstats := transport.GetRxStats()
 	for trname, eps := range netstats {
-		for uid, stats := range eps { // EndpointStats by session ID
+		for uid, stats := range eps { // RxStats by session ID
 			xx, sessID := transport.UID2SessID(uid)
 			fmt.Printf("recv$ %s[%d:%d]: offset=%d, num=%d\n",
 				trname, xx, sessID, stats.Offset.Load(), stats.Num.Load())
@@ -268,12 +261,11 @@ func printNetworkStats(t *testing.T) {
 	}
 }
 
-func compareNetworkStats(t *testing.T, netstats1 map[string]transport.EndpointStats) {
-	netstats2, err := transport.GetStats()
-	tassert.CheckFatal(t, err)
+func compareNetworkStats(netstats1 map[string]transport.RxStats) {
+	netstats2 := transport.GetRxStats()
 	for trname, eps2 := range netstats2 {
 		eps1, ok := netstats1[trname]
-		for uid, stats2 := range eps2 { // EndpointStats by session ID
+		for uid, stats2 := range eps2 { // RxStats by session ID
 			xx, sessID := transport.UID2SessID(uid)
 			fmt.Printf("recv$ %s[%d:%d]: offset=%d, num=%d\n", trname, xx, sessID,
 				stats2.Offset.Load(), stats2.Num.Load())
@@ -292,7 +284,7 @@ func compareNetworkStats(t *testing.T, netstats1 map[string]transport.EndpointSt
 	}
 }
 
-func Test_MultipleNetworks(t *testing.T) {
+func TestMultipleNetworks(t *testing.T) {
 	totalRecv, recvFunc := makeRecvFunc(t)
 
 	streams := make([]*transport.Stream, 0, 10)
@@ -300,7 +292,7 @@ func Test_MultipleNetworks(t *testing.T) {
 		ts := httptest.NewServer(objmux)
 		defer ts.Close()
 		trname := "endpoint" + strconv.Itoa(idx)
-		err := transport.HandleObjStream(trname, recvFunc)
+		err := transport.Handle(trname, recvFunc)
 		tassert.CheckFatal(t, err)
 		defer transport.Unhandle(trname)
 
@@ -327,7 +319,7 @@ func Test_MultipleNetworks(t *testing.T) {
 	}
 }
 
-func Test_nSendCallback(t *testing.T) {
+func TestSendCallback(t *testing.T) {
 	objectCnt := 10000
 	if testing.Short() {
 		objectCnt = 1000
@@ -338,7 +330,7 @@ func Test_nSendCallback(t *testing.T) {
 
 	totalRecv, recvFunc := makeRecvFunc(t)
 	trname := "callback"
-	err := transport.HandleObjStream(trname, recvFunc)
+	err := transport.Handle(trname, recvFunc)
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 	httpclient := transport.NewIntraDataClient()
@@ -372,7 +364,7 @@ func Test_nSendCallback(t *testing.T) {
 	}
 }
 
-func Test_ObjAttrs(t *testing.T) {
+func TestObjAttrs(t *testing.T) {
 	testAttrs := []cmn.ObjAttrs{
 		{
 			Size:  1024,
@@ -414,7 +406,7 @@ func Test_ObjAttrs(t *testing.T) {
 		return nil
 	}
 	trname := "objattrs"
-	err := transport.HandleObjStream(trname, recvFunc)
+	err := transport.Handle(trname, recvFunc)
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 	httpclient := transport.NewIntraDataClient()
@@ -457,7 +449,7 @@ func receive10G(hdr transport.ObjHdr, objReader io.Reader, err error) error {
 	return nil
 }
 
-func Test_CompressedOne(t *testing.T) {
+func TestCompressedOne(t *testing.T) {
 	trname := "cmpr-one"
 	config := cmn.GCO.BeginUpdate()
 	config.Transport.LZ4BlockMaxSize = 256 * cos.KiB
@@ -471,7 +463,7 @@ func Test_CompressedOne(t *testing.T) {
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
 
-	err := transport.HandleObjStream(trname, receive10G)
+	err := transport.Handle(trname, receive10G, true /*with Rx stats*/)
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 
@@ -498,7 +490,8 @@ func Test_CompressedOne(t *testing.T) {
 			var reader io.ReadCloser
 			if num%3 == 0 {
 				hdr.ObjAttrs.Size = int64(random.Intn(100) + 1)
-				reader = io.NopCloser(&io.LimitedReader{R: random, N: hdr.ObjAttrs.Size}) // fully random to hinder compression
+				// fully random to prevent compression
+				reader = io.NopCloser(&io.LimitedReader{R: random, N: hdr.ObjAttrs.Size})
 			} else {
 				hdr.ObjAttrs.Size = int64(random.Intn(cos.GiB) + 1)
 				reader = &randReader{buf: buf, hdr: hdr, clone: true}
@@ -521,10 +514,10 @@ func Test_CompressedOne(t *testing.T) {
 	fmt.Printf("send$ %s: offset=%d, num=%d(%d/%d), compression-ratio=%.2f\n",
 		stream, stats.Offset.Load(), stats.Num.Load(), num, numhdr, stats.CompressionRatio())
 
-	printNetworkStats(t)
+	printNetworkStats()
 }
 
-func Test_DryRun(t *testing.T) {
+func TestDryRun(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 
 	t.Setenv("AIS_STREAM_DRY_RUN", "true")
@@ -569,7 +562,7 @@ func Test_DryRun(t *testing.T) {
 	fmt.Printf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
 }
 
-func Test_CompletionCount(t *testing.T) {
+func TestCompletionCount(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
 	var (
 		numSent                   int64
@@ -591,7 +584,7 @@ func Test_CompletionCount(t *testing.T) {
 	defer ts.Close()
 
 	trname := "cmpl-cnt"
-	err := transport.HandleObjStream(trname, receive)
+	err := transport.Handle(trname, receive)
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 	httpclient := transport.NewIntraDataClient()
@@ -637,13 +630,13 @@ func Test_CompletionCount(t *testing.T) {
 //
 
 func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Server,
-	netstats map[string]transport.EndpointStats, lock sync.Locker, compress, usePDU bool) {
+	netstats map[string]transport.RxStats, lock sync.Locker, compress, usePDU bool) {
 	if wg != nil {
 		defer wg.Done()
 	}
 	totalRecv, recvFunc := makeRecvFunc(t)
 	trname := fmt.Sprintf("rand-rx-%d", ii)
-	err := transport.HandleObjStream(trname, recvFunc)
+	err := transport.Handle(trname, recvFunc, true /* with Rx stats */)
 	tassert.CheckFatal(t, err)
 	defer transport.Unhandle(trname)
 
@@ -707,7 +700,7 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 			trname, sessID, stats.Offset.Load(), stats.Num.Load(), num, reason, termErr)
 	} else {
 		lock.Lock()
-		eps := make(transport.EndpointStats)
+		eps := make(transport.RxStats)
 		eps[uint64(sessID)] = &stats
 		netstats[trname] = eps
 		lock.Unlock()
@@ -847,7 +840,7 @@ func (r *randReader) Read(p []byte) (n int, err error) {
 		if rem == 0 {
 			return n, io.EOF
 		}
-		l64 := cos.MinI64(rem, int64(len(p)-n))
+		l64 := min(rem, int64(len(p)-n))
 		if l64 == 0 {
 			return
 		}

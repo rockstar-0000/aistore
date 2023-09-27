@@ -28,10 +28,10 @@ import (
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/NVIDIA/aistore/ext/dsort/extract"
+	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/OneOfOne/xxhash"
 	jsoniter "github.com/json-iterator/go"
@@ -40,8 +40,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const DSortName = "dsort"
-
 const PrefixJobID = "srt-"
 
 type (
@@ -49,7 +47,7 @@ type (
 		recvReq(hdr transport.ObjHdr, objReader io.Reader, err error) error // aka transport.RecvObj
 	}
 	dsorter interface {
-		extract.ContentLoader
+		shard.ContentLoader
 		receiver
 
 		name() string
@@ -72,7 +70,7 @@ var js = jsoniter.ConfigFastest
 
 func (m *Manager) finish() {
 	if m.config.FastV(4, cos.SmoduleDsort) {
-		nlog.Infof("%s: %s finished", m.ctx.t, m.ManagerUUID)
+		nlog.Infof("%s: %s finished", g.t, m.ManagerUUID)
 	}
 	m.lock()
 	m.setInProgressTo(false)
@@ -92,20 +90,20 @@ func (m *Manager) start() (err error) {
 	}
 
 	// Phase 1.
-	nlog.Infof("%s: %s started extraction stage", m.ctx.t, m.ManagerUUID)
+	nlog.Infof("%s: %s started extraction stage", g.t, m.ManagerUUID)
 	if err := m.extractLocalShards(); err != nil {
 		return err
 	}
 
-	s := binary.BigEndian.Uint64(m.pars.TargetOrderSalt)
-	targetOrder := randomTargetOrder(s, m.smap.Tmap)
+	s := binary.BigEndian.Uint64(m.Pars.TargetOrderSalt)
+	targetOrder := _torder(s, m.smap.Tmap)
 	if m.config.FastV(4, cos.SmoduleDsort) {
-		nlog.Infof("%s: %s final target in targetOrder => URL: %s, tid %s", m.ctx.t, m.ManagerUUID,
+		nlog.Infof("%s: %s final target in targetOrder => URL: %s, tid %s", g.t, m.ManagerUUID,
 			targetOrder[len(targetOrder)-1].PubNet.URL, targetOrder[len(targetOrder)-1].ID())
 	}
 
 	// Phase 2.
-	nlog.Infof("%s: %s started sort stage", m.ctx.t, m.ManagerUUID)
+	nlog.Infof("%s: %s started sort stage", g.t, m.ManagerUUID)
 	curTargetIsFinal, err := m.participateInRecordDistribution(targetOrder)
 	if err != nil {
 		return err
@@ -115,18 +113,20 @@ func (m *Manager) start() (err error) {
 	if curTargetIsFinal {
 		// assuming uniform distribution estimate avg. output shard size
 		ratio := m.compressionRatio()
-		debug.Assertf(archive.IsCompressed(m.pars.InputExtension) || ratio == 1, "tar ratio=%f, ext=%q",
-			ratio, m.pars.InputExtension)
+		if m.config.FastV(4, cos.SmoduleDsort) {
+			nlog.Infof("%s [dsort] %s phase3: ratio=%f", g.t, m.ManagerUUID, ratio)
+		}
+		debug.Assertf(shard.IsCompressed(m.Pars.InputExtension) || ratio == 1, "tar ratio=%f, ext=%q",
+			ratio, m.Pars.InputExtension)
 
-		shardSize := int64(float64(m.pars.OutputShardSize) / ratio)
-
-		nlog.Infof("%s: %s started phase 3 distribution", m.ctx.t, m.ManagerUUID)
+		shardSize := int64(float64(m.Pars.OutputShardSize) / ratio)
+		nlog.Infof("%s: [dsort] %s started phase 3: ratio=%f, shard size (%d, %d)",
+			g.t, m.ManagerUUID, shardSize, m.Pars.OutputShardSize)
 		if err := m.phase3(shardSize); err != nil {
+			nlog.Errorf("%s: [dsort] %s phase3 err: %v", g.t, m.ManagerUUID, err)
 			return err
 		}
 	}
-
-	cos.FreeMemToOS()
 
 	// Wait for signal to start shard creations. This will happen when manager
 	// notice that the specification for shards to be created locally was received.
@@ -139,13 +139,36 @@ func (m *Manager) start() (err error) {
 
 	// After each target participates in the cluster-wide record distribution,
 	// start listening for the signal to start creating shards locally.
-	nlog.Infof("%s: %s started creation stage", m.ctx.t, m.ManagerUUID)
+	nlog.Infof("%s: %s started creation stage", g.t, m.ManagerUUID)
 	if err := m.dsorter.createShardsLocally(); err != nil {
 		return err
 	}
 
-	nlog.Infof("%s: %s finished successfully", m.ctx.t, m.ManagerUUID)
+	nlog.Infof("%s: %s finished successfully", g.t, m.ManagerUUID)
 	return nil
+}
+
+// returns a slice of targets in a pseudorandom order
+func _torder(salt uint64, tmap meta.NodeMap) []*meta.Snode {
+	var (
+		targets = make(map[uint64]*meta.Snode, len(tmap))
+		keys    = make([]uint64, 0, len(tmap))
+	)
+	for i, d := range tmap {
+		if d.InMaintOrDecomm() {
+			continue
+		}
+		c := xxhash.Checksum64S(cos.UnsafeB(i), salt)
+		targets[c] = d
+		keys = append(keys, c)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	t := make(meta.Nodes, len(keys))
+	for i, k := range keys {
+		t[i] = targets[k]
+	}
+	return t
 }
 
 func (m *Manager) startDSorter() error {
@@ -153,7 +176,7 @@ func (m *Manager) startDSorter() error {
 	if err := m.initStreams(); err != nil {
 		return err
 	}
-	nlog.Infof("%s: %s starting with dsorter: %q", m.ctx.t, m.ManagerUUID, m.dsorter.name())
+	nlog.Infof("%s: %s starting with dsorter: %q", g.t, m.ManagerUUID, m.dsorter.name())
 	return m.dsorter.start()
 }
 
@@ -164,12 +187,12 @@ func (m *Manager) extractLocalShards() (err error) {
 	// compare with xact/xs/multiobj.go
 	group, ctx := errgroup.WithContext(context.Background())
 	switch {
-	case m.pars.Pit.isRange():
+	case m.Pars.Pit.isRange():
 		err = m.iterRange(ctx, group)
-	case m.pars.Pit.isList():
+	case m.Pars.Pit.isList():
 		err = m.iterList(ctx, group)
 	default:
-		debug.Assert(m.pars.Pit.isPrefix())
+		debug.Assert(m.Pars.Pit.isPrefix())
 		debug.Assert(false, "not implemented yet") // TODO -- FIXME
 	}
 
@@ -185,7 +208,7 @@ func (m *Manager) extractLocalShards() (err error) {
 func (m *Manager) iterRange(ctx context.Context, group *errgroup.Group) error {
 	var (
 		metrics = m.Metrics.Extraction
-		pt      = m.pars.Pit.Template
+		pt      = m.Pars.Pit.Template
 	)
 	metrics.mu.Lock()
 	metrics.TotalCnt = pt.Count()
@@ -212,10 +235,10 @@ outer:
 func (m *Manager) iterList(ctx context.Context, group *errgroup.Group) error {
 	metrics := m.Metrics.Extraction
 	metrics.mu.Lock()
-	metrics.TotalCnt = int64(len(m.pars.Pit.ObjNames))
+	metrics.TotalCnt = int64(len(m.Pars.Pit.ObjNames))
 	metrics.mu.Unlock()
 outer:
-	for _, name := range m.pars.Pit.ObjNames {
+	for _, name := range m.Pars.Pit.ObjNames {
 		select {
 		case <-m.listenAborted():
 			group.Wait()
@@ -232,13 +255,13 @@ outer:
 	return group.Wait()
 }
 
-func (m *Manager) createShard(s *extract.Shard, lom *cluster.LOM) (err error) {
+func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 	var (
 		metrics   = m.Metrics.Creation
 		shardName = s.Name
 		errCh     = make(chan error, 2)
 	)
-	if err = lom.InitBck(&m.pars.OutputBck); err != nil {
+	if err = lom.InitBck(&m.Pars.OutputBck); err != nil {
 		return
 	}
 	lom.SetAtimeUnix(time.Now().UnixNano())
@@ -252,9 +275,10 @@ func (m *Manager) createShard(s *extract.Shard, lom *cluster.LOM) (err error) {
 	}
 	defer m.dsorter.postShardCreation(lom.Mountpath())
 
-	// TODO: check capacity *prior* to starting
-	if cs := fs.Cap(); cs.Err != nil {
-		return cs.Err
+	cs := fs.Cap()
+	if err = cs.Err(); err != nil {
+		m.abort(err)
+		return
 	}
 
 	beforeCreation := time.Now()
@@ -262,12 +286,11 @@ func (m *Manager) createShard(s *extract.Shard, lom *cluster.LOM) (err error) {
 	var (
 		wg   = &sync.WaitGroup{}
 		r, w = io.Pipe()
-		n    int64
 	)
 	wg.Add(1)
 	go func() {
 		var err error
-		if !m.pars.DryRun {
+		if !m.Pars.DryRun {
 			params := cluster.AllocPutObjParams()
 			{
 				params.WorkTag = "dsort"
@@ -281,25 +304,27 @@ func (m *Manager) createShard(s *extract.Shard, lom *cluster.LOM) (err error) {
 				// TODO: params.Xact - in part, to count PUTs and bytes in a generic fashion
 				// (vs metrics.ShardCreationStats.updateThroughput - see below)
 			}
-			err = m.ctx.t.PutObject(lom, params)
+			err = g.t.PutObject(lom, params)
 			cluster.FreePutObjParams(params)
-			if err == nil {
-				n = lom.SizeBytes()
-			}
 		} else {
-			n, err = io.Copy(io.Discard, r)
+			_, err = io.Copy(io.Discard, r)
 		}
 		errCh <- err
 		wg.Done()
 	}()
 
-	ec := m.ec
-	if m.pars.InputExtension != m.pars.OutputExtension {
-		// NOTE: resharding into a different format
-		ec = newExtractCreator(m.ctx.t, m.pars.OutputExtension)
+	// may reshard into a different format
+	shardRW := m.shardRW
+	//
+	// TODO -- FIXME: compare with extractShard._do()
+	//
+	if !m.Pars.DryRun && m.Pars.OutputExtension != m.Pars.InputExtension {
+		debug.Assert(m.Pars.OutputExtension != "")
+		shardRW = shard.RWs[m.Pars.OutputExtension]
+		debug.Assert(shardRW != nil, m.Pars.OutputExtension)
 	}
 
-	_, err = ec.Create(s, w, m.dsorter)
+	_, err = shardRW.Create(s, w, m.dsorter)
 	w.CloseWithError(err)
 	if err != nil {
 		r.CloseWithError(err)
@@ -334,7 +359,7 @@ func (m *Manager) createShard(s *extract.Shard, lom *cluster.LOM) (err error) {
 	// according to HRW, send it there. Since it doesn't really matter
 	// if we have an extra copy of the object local to this target, we
 	// optimize for performance by not removing the object now.
-	if si.ID() != m.ctx.node.ID() && !m.pars.DryRun {
+	if si.ID() != g.t.SID() && !m.Pars.DryRun {
 		lom.Lock(false)
 		defer lom.Unlock(false)
 
@@ -380,13 +405,8 @@ func (m *Manager) createShard(s *extract.Shard, lom *cluster.LOM) (err error) {
 exit:
 	metrics.mu.Lock()
 	metrics.CreatedCnt++
-	if si.ID() != m.ctx.node.ID() {
+	if si.ID() != g.t.SID() {
 		metrics.MovedShardCnt++
-	}
-	if m.Metrics.extended {
-		dur := time.Since(beforeCreation)
-		metrics.ShardCreationStats.updateTime(dur)
-		metrics.ShardCreationStats.updateThroughput(n, dur)
 	}
 	metrics.mu.Unlock()
 
@@ -434,7 +454,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 		}
 
 		for i, d = range targetOrder {
-			if d != dummyTarget && d.ID() == m.ctx.node.ID() {
+			if d != dummyTarget && d.ID() == g.t.SID() {
 				break
 			}
 		}
@@ -449,19 +469,19 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 			)
 			group.Go(func() error {
 				var (
-					buf, slab = mm.AllocSize(serializationBufSize)
+					buf, slab = g.mm.AllocSize(serializationBufSize)
 					msgpw     = msgp.NewWriterBuf(w, buf)
 				)
 				defer slab.Free(buf)
 
 				if err := m.recm.Records.EncodeMsg(msgpw); err != nil {
 					w.CloseWithError(err)
-					return errors.Errorf("failed to marshal, err: %v", err)
+					return errors.Errorf("failed to marshal msgp: %v", err)
 				}
 				err := msgpw.Flush()
 				w.CloseWithError(err)
 				if err != nil {
-					return errors.Errorf("failed to marshal into JSON, err: %v", err)
+					return errors.Errorf("failed to flush msgp: %v", err)
 				}
 				return nil
 			})
@@ -480,13 +500,9 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 					Query:  query,
 					BodyR:  r,
 				}
-				err := m.doWithAbort(reqArgs)
+				err := m._do(reqArgs, sendTo, "send sorted records")
 				r.CloseWithError(err)
-				if err != nil {
-					return errors.Errorf("failed to send SortedRecords to next target (%s): %v",
-						sendTo.ID(), err)
-				}
-				return nil
+				return err
 			})
 			if err := group.Wait(); err != nil {
 				return false, err
@@ -533,19 +549,19 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 		m.recm.MergeEnqueuedRecords()
 	}
 
-	err = sortRecords(m.recm.Records, m.pars.Algorithm)
+	err = sortRecords(m.recm.Records, m.Pars.Algorithm)
 	m.dsorter.postRecordDistribution()
 	return true, err
 }
 
-func (m *Manager) generateShardsWithTemplate(maxSize int64) ([]*extract.Shard, error) {
+func (m *Manager) generateShardsWithTemplate(maxSize int64) ([]*shard.Shard, error) {
 	var (
 		start           int
 		curShardSize    int64
 		n               = m.recm.Records.Len()
-		pt              = m.pars.Pot.Template
+		pt              = m.Pars.Pot.Template
 		shardCount      = pt.Count()
-		shards          = make([]*extract.Shard, 0)
+		shards          = make([]*shard.Shard, 0)
 		numLocalRecords = make(map[string]int, m.smap.CountActiveTs())
 	)
 	pt.InitIter()
@@ -567,14 +583,14 @@ func (m *Manager) generateShardsWithTemplate(maxSize int64) ([]*extract.Shard, e
 			// no more shard names are available
 			return nil, errors.Errorf("number of shards to be created exceeds expected number of shards (%d)", shardCount)
 		}
-		shard := &extract.Shard{
+		shard := &shard.Shard{
 			Name: name,
 		}
 		ext, err := archive.Mime("", name)
 		if err == nil {
-			debug.Assert(m.pars.OutputExtension == ext)
+			debug.Assert(m.Pars.OutputExtension == ext)
 		} else {
-			shard.Name = name + m.pars.OutputExtension
+			shard.Name = name + m.Pars.OutputExtension
 		}
 
 		shard.Size = curShardSize
@@ -591,26 +607,26 @@ func (m *Manager) generateShardsWithTemplate(maxSize int64) ([]*extract.Shard, e
 	return shards, nil
 }
 
-func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*extract.Shard, error) {
+func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard, error) {
 	var (
-		shards         = make([]*extract.Shard, 0)
+		shards         = make([]*shard.Shard, 0)
 		externalKeyMap = make(map[string]string)
-		shardsBuilder  = make(map[string][]*extract.Shard)
+		shardsBuilder  = make(map[string][]*shard.Shard)
 	)
 	if maxSize <= 0 {
 		return nil, fmt.Errorf(fmtErrInvalidMaxSize, maxSize)
 	}
-	parsedURL, err := url.Parse(m.pars.OrderFileURL)
+	parsedURL, err := url.Parse(m.Pars.OrderFileURL)
 	if err != nil {
-		return nil, fmt.Errorf(fmtErrOrderURL, m.pars.OrderFileURL, err)
+		return nil, fmt.Errorf(fmtErrOrderURL, m.Pars.OrderFileURL, err)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, m.pars.OrderFileURL, http.NoBody)
+	req, err := http.NewRequest(http.MethodGet, m.Pars.OrderFileURL, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
 	// is intra-call
-	tsi := m.ctx.t.Snode()
+	tsi := g.t.Snode()
 	req.Header.Set(apc.HdrCallerID, tsi.ID())
 	req.Header.Set(apc.HdrCallerName, tsi.String())
 
@@ -622,7 +638,7 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*extract.Shar
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf(
 			"unexpected status code (%d) when requesting order file from %q",
-			resp.StatusCode, m.pars.OrderFileURL,
+			resp.StatusCode, m.Pars.OrderFileURL,
 		)
 	}
 
@@ -658,10 +674,10 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*extract.Shar
 				continue
 			}
 
-			parts := strings.Split(line, m.pars.OrderFileSep)
+			parts := strings.Split(line, m.Pars.OrderFileSep)
 			if len(parts) != 2 {
 				msg := fmt.Sprintf("malformed line (%d) in external key map: %s", idx, line)
-				if err := m.react(m.pars.EKMMalformedLine, msg); err != nil {
+				if err := m.react(m.Pars.EKMMalformedLine, msg); err != nil {
 					return nil, err
 				}
 			}
@@ -676,19 +692,19 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*extract.Shar
 		shardNameFmt, ok := externalKeyMap[key]
 		if !ok {
 			msg := fmt.Sprintf("record %q doesn't belong in external key map", key)
-			if err := m.react(m.pars.EKMMissingKey, msg); err != nil {
+			if err := m.react(m.Pars.EKMMissingKey, msg); err != nil {
 				return nil, err
 			}
 		}
 
 		shards := shardsBuilder[shardNameFmt]
-		recordSize := r.TotalSize() + m.ec.MetadataSize()*int64(len(r.Objects))
+		recordSize := r.TotalSize() + m.shardRW.MetadataSize()*int64(len(r.Objects))
 		shardCount := len(shards)
 		if shardCount == 0 || shards[shardCount-1].Size > maxSize {
-			shard := &extract.Shard{
+			shard := &shard.Shard{
 				Name:    fmt.Sprintf(shardNameFmt, shardCount),
 				Size:    recordSize,
-				Records: extract.NewRecords(1),
+				Records: shard.NewRecords(1),
 			}
 			shard.Records.Insert(r)
 			shardsBuilder[shardNameFmt] = append(shardsBuilder[shardNameFmt], shard)
@@ -721,10 +737,10 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*extract.Shar
 //     (i.e. the target with the least number of pending shard creation requests).
 func (m *Manager) phase3(maxSize int64) error {
 	var (
-		shards         []*extract.Shard
+		shards         []*shard.Shard
 		err            error
-		shardsToTarget = make(map[*meta.Snode][]*extract.Shard, m.smap.CountActiveTs())
-		sendOrder      = make(map[string]map[string]*extract.Shard, m.smap.CountActiveTs())
+		shardsToTarget = make(map[*meta.Snode][]*shard.Shard, m.smap.CountActiveTs())
+		sendOrder      = make(map[string]map[string]*shard.Shard, m.smap.CountActiveTs())
 		errCh          = make(chan error, m.smap.CountActiveTs())
 	)
 	for _, d := range m.smap.Tmap {
@@ -733,10 +749,10 @@ func (m *Manager) phase3(maxSize int64) error {
 		}
 		shardsToTarget[d] = nil
 		if m.dsorter.name() == DSorterMemType {
-			sendOrder[d.ID()] = make(map[string]*extract.Shard, 100)
+			sendOrder[d.ID()] = make(map[string]*shard.Shard, 100)
 		}
 	}
-	if m.pars.OrderFileURL != "" {
+	if m.Pars.OrderFileURL != "" {
 		shards, err = m.generateShardsWithOrderingFile(maxSize)
 	} else {
 		shards, err = m.generateShardsWithTemplate(maxSize)
@@ -745,8 +761,8 @@ func (m *Manager) phase3(maxSize int64) error {
 		return err
 	}
 
-	bck := meta.CloneBck(&m.pars.OutputBck)
-	if err := bck.Init(m.ctx.bmdOwner); err != nil {
+	bck := meta.CloneBck(&m.Pars.OutputBck)
+	if err := bck.Init(g.t.Bowner()); err != nil {
 		return err
 	}
 	for _, s := range shards {
@@ -757,17 +773,17 @@ func (m *Manager) phase3(maxSize int64) error {
 		shardsToTarget[si] = append(shardsToTarget[si], s)
 
 		if m.dsorter.name() == DSorterMemType {
-			singleSendOrder := make(map[string]*extract.Shard)
+			singleSendOrder := make(map[string]*shard.Shard)
 			for _, record := range s.Records.All() {
-				shard, ok := singleSendOrder[record.DaemonID]
+				shrd, ok := singleSendOrder[record.DaemonID]
 				if !ok {
-					shard = &extract.Shard{
+					shrd = &shard.Shard{
 						Name:    s.Name,
-						Records: extract.NewRecords(100),
+						Records: shard.NewRecords(100),
 					}
-					singleSendOrder[record.DaemonID] = shard
+					singleSendOrder[record.DaemonID] = shrd
 				}
-				shard.Records.Insert(record)
+				shrd.Records.Insert(record)
 			}
 
 			for tid, shard := range singleSendOrder {
@@ -788,20 +804,21 @@ func (m *Manager) phase3(maxSize int64) error {
 	close(errCh)
 
 	for err := range errCh {
-		return errors.Errorf("error while sending shards: %v", err)
+		nlog.Errorf("%s: [dsort] %s err while sending shards: %v", g.t, m.ManagerUUID, err)
+		return err
 	}
-	nlog.Infof("%s: %s finished sending all shards", m.ctx.t, m.ManagerUUID)
+	nlog.Infof("%s: [dsort] %s finished sending shards", g.t, m.ManagerUUID)
 	return nil
 }
 
-func (m *Manager) _dist(si *meta.Snode, s []*extract.Shard, order map[string]*extract.Shard, errCh chan error, wg cos.WG) {
+func (m *Manager) _dist(si *meta.Snode, s []*shard.Shard, order map[string]*shard.Shard, errCh chan error, wg cos.WG) {
 	var (
 		group = &errgroup.Group{}
 		r, w  = io.Pipe()
 	)
 	group.Go(func() error {
 		var (
-			buf, slab = mm.AllocSize(serializationBufSize)
+			buf, slab = g.mm.AllocSize(serializationBufSize)
 			msgpw     = msgp.NewWriterBuf(w, buf)
 			md        = &CreationPhaseMetadata{Shards: s, SendOrder: order}
 		)
@@ -814,7 +831,7 @@ func (m *Manager) _dist(si *meta.Snode, s []*extract.Shard, order map[string]*ex
 		return err
 	})
 	group.Go(func() error {
-		query := m.pars.InputBck.AddToQuery(nil)
+		query := m.Pars.InputBck.NewQuery()
 		reqArgs := &cmn.HreqArgs{
 			Method: http.MethodPost,
 			Base:   si.URL(cmn.NetIntraData),
@@ -822,7 +839,7 @@ func (m *Manager) _dist(si *meta.Snode, s []*extract.Shard, order map[string]*ex
 			Query:  query,
 			BodyR:  r,
 		}
-		err := m.doWithAbort(reqArgs)
+		err := m._do(reqArgs, si, "distribute shards")
 		r.CloseWithError(err)
 		return err
 	})
@@ -833,25 +850,27 @@ func (m *Manager) _dist(si *meta.Snode, s []*extract.Shard, order map[string]*ex
 	wg.Done()
 }
 
-// randomTargetOrder returns a meta.Snode slice for targets in a pseudorandom order.
-func randomTargetOrder(salt uint64, tmap meta.NodeMap) []*meta.Snode {
-	targets := make(map[uint64]*meta.Snode, len(tmap))
-	keys := make([]uint64, 0, len(tmap))
-	for i, d := range tmap {
-		if d.InMaintOrDecomm() {
-			continue
+func (m *Manager) _do(reqArgs *cmn.HreqArgs, tsi *meta.Snode, act string) error {
+	req, errV := reqArgs.Req()
+	if errV != nil {
+		return errV
+	}
+	resp, err := m.client.Do(req) //nolint:bodyclose // cos.Close below
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		var b []byte
+		b, err = io.ReadAll(resp.Body)
+		if err == nil {
+			err = fmt.Errorf("%s: %s failed to %s: %s", g.t, m.ManagerUUID, act, strings.TrimSuffix(string(b), "\n"))
+		} else {
+			err = fmt.Errorf("%s: %s failed to %s: got %v(%d) from %s", g.t, m.ManagerUUID, act, err,
+				resp.StatusCode, tsi.StringEx())
 		}
-		c := xxhash.ChecksumString64S(i, salt)
-		targets[c] = d
-		keys = append(keys, c)
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-	t := make(meta.Nodes, len(keys))
-	for i, k := range keys {
-		t[i] = targets[k]
-	}
-	return t
+	cos.Close(resp.Body)
+	return err
 }
 
 //////////////////
@@ -868,18 +887,18 @@ type extractShard struct {
 func (es *extractShard) do() (err error) {
 	m := es.m
 	shardName := es.name
-	if es.isRange && m.pars.InputExtension != "" {
+	if es.isRange && m.Pars.InputExtension != "" {
 		ext, errV := archive.Mime("", es.name) // from filename
 		if errV == nil {
-			if !archive.EqExt(ext, m.pars.InputExtension) {
+			if !archive.EqExt(ext, m.Pars.InputExtension) {
 				if m.config.FastV(4, cos.SmoduleDsort) {
-					nlog.Infof("%s: %s skipping %s: %q vs %q", m.ctx.t, m.ManagerUUID,
-						es.name, ext, m.pars.InputExtension)
+					nlog.Infof("%s: %s skipping %s: %q vs %q", g.t, m.ManagerUUID,
+						es.name, ext, m.Pars.InputExtension)
 				}
 				return
 			}
 		} else {
-			shardName = es.name + m.pars.InputExtension
+			shardName = es.name + m.Pars.InputExtension
 		}
 	}
 	lom := cluster.AllocLOM(shardName)
@@ -896,9 +915,9 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 	var (
 		m                        = es.m
 		estimateTotalRecordsSize uint64
-		warnPossibleOOM          bool
+		warnOOM                  bool
 	)
-	if err := lom.InitBck(&m.pars.InputBck); err != nil {
+	if err := lom.InitBck(&m.Pars.InputBck); err != nil {
 		return err
 	}
 	if _, local, err := lom.HrwTarget(m.smap); err != nil || !local {
@@ -906,20 +925,21 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 	}
 	if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
 		if cmn.IsErrObjNought(err) {
-			msg := fmt.Sprintf("extract.do: %q does not exist", lom.Cname())
-			return m.react(m.pars.MissingShards, msg)
+			msg := fmt.Sprintf("shard.do: %q does not exist", lom.Cname())
+			return m.react(m.Pars.MissingShards, msg)
 		}
 		return err
 	}
 
-	ec := m.ec
-	if m.pars.InputExtension == "" {
+	shardRW := m.shardRW
+	if shardRW == nil {
+		debug.Assert(!m.Pars.DryRun)
 		ext, err := archive.Mime("", lom.FQN)
 		if err != nil {
 			return nil // skip
 		}
-		// NOTE: extract-creator for _this_ shard (compare with createShard above)
-		ec = newExtractCreator(m.ctx.t, ext)
+		shardRW = shard.RWs[ext]
+		debug.Assert(shardRW != nil, ext)
 	}
 
 	phaseInfo := &m.extractionPhase
@@ -928,12 +948,12 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 		phaseInfo.adjuster.releaseSema(lom.Mountpath())
 		return newDSortAbortedError(m.ManagerUUID)
 	}
-	//
-	// FIXME: check capacity *prior* to starting
-	//
-	if cs := fs.Cap(); cs.Err != nil {
+
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
 		phaseInfo.adjuster.releaseSema(lom.Mountpath())
-		return cs.Err
+		m.abort(err)
+		return err
 	}
 
 	lom.Lock(false)
@@ -947,22 +967,25 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 	expectedExtractedSize := uint64(float64(lom.SizeBytes()) / m.compressionRatio())
 	toDisk := m.dsorter.preShardExtraction(expectedExtractedSize)
 
-	beforeExtraction := mono.NanoTime()
-
-	extractedSize, extractedCount, err := ec.Extract(lom, fh, m.recm, toDisk)
+	extractedSize, extractedCount, err := shardRW.Extract(lom, fh, m.recm, toDisk)
 	cos.Close(fh)
-
-	dur := mono.Since(beforeExtraction)
 
 	m.addSizes(lom.SizeBytes(), extractedSize) // update compression rate
 
 	phaseInfo.adjuster.releaseSema(lom.Mountpath())
 	lom.Unlock(false)
 
-	m.dsorter.postShardExtraction(expectedExtractedSize) // schedule unreserving reserved memory on next memory update
+	m.dsorter.postShardExtraction(expectedExtractedSize) // schedule freeing reserved memory on next memory update
 	if err != nil {
 		return errors.Errorf("failed to extract shard %s: %v", lom.Cname(), err)
 	}
+
+	if toDisk {
+		g.tstats.Add(stats.DSortExtractShardDskCnt, 1)
+	} else {
+		g.tstats.Add(stats.DSortExtractShardMemCnt, 1)
+	}
+	g.tstats.Add(stats.DSortExtractShardSize, extractedSize)
 
 	//
 	// update metrics, check OOM
@@ -980,7 +1003,7 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 		recordSize := int(m.recm.Records.RecordMemorySize())
 		estimateTotalRecordsSize = uint64(metrics.TotalCnt * int64(extractedCount*recordSize))
 		if estimateTotalRecordsSize > m.freeMemory() {
-			warnPossibleOOM = true
+			warnOOM = true
 		}
 	}
 	metrics.ExtractedSize += extractedSize
@@ -988,15 +1011,11 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 		metrics.ExtractedToDiskCnt++
 		metrics.ExtractedToDiskSize += extractedSize
 	}
-	if m.Metrics.extended {
-		metrics.ShardExtractionStats.updateTime(dur)
-		metrics.ShardExtractionStats.updateThroughput(extractedSize, dur)
-	}
 	metrics.mu.Unlock()
 
-	if warnPossibleOOM {
+	if warnOOM {
 		msg := fmt.Sprintf("(estimated) total size of records (%d) will possibly exceed available memory (%s) during sorting phase",
-			estimateTotalRecordsSize, m.pars.MaxMemUsage)
+			estimateTotalRecordsSize, m.Pars.MaxMemUsage)
 		return m.react(cmn.WarnReaction, msg)
 	}
 	return nil

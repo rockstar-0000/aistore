@@ -24,8 +24,6 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 )
 
-const nodeOffTimeout = 13 * time.Second
-
 func TestMaintenanceOnOff(t *testing.T) {
 	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3})
 	proxyURL := tools.RandomProxyURL(t)
@@ -88,9 +86,9 @@ func TestMaintenanceListObjects(t *testing.T) {
 		origEntries[en.Name] = en
 	}
 
-	// 2. Put a random target under maintenance
+	// 2. Put a random target in maintenance mode
 	tsi, _ := m.smap.GetRandTarget()
-	tlog.Logf("Put target %s under maintenance\n", tsi.StringEx())
+	tlog.Logf("Put target %s in maintenance mode\n", tsi.StringEx())
 	actVal := &apc.ActValRmNode{DaemonID: tsi.ID(), SkipRebalance: false}
 	rebID, err := api.StartMaintenance(baseParams, actVal)
 	tassert.CheckFatal(t, err)
@@ -109,10 +107,7 @@ func TestMaintenanceListObjects(t *testing.T) {
 		m.smap.Version, m.smap.CountActivePs(), m.smap.CountActiveTs()-1)
 	tassert.CheckFatal(t, err)
 
-	// Wait for reb to complete
-	args := xact.ArgsMsg{ID: rebID, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
-	tassert.CheckFatal(t, err)
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
 
 	// 3. Check if we can list all the objects
 	lst, err = api.ListObjects(baseParams, bck, msg, api.ListArgs{})
@@ -159,13 +154,27 @@ func TestMaintenanceMD(t *testing.T) {
 
 	_, err = tools.WaitForClusterState(proxyURL, "target decommissioned", smap.Version, smap.CountActivePs(),
 		smap.CountTargets()-1)
-	tassert.CheckFatal(t, err)
+	if err == tools.ErrTimedOutStabilize {
+		tlog.Logf("Retrying - checking with primary %s ...\n", smap.Primary.StringEx())
+		proxyURL = smap.Primary.URL(cmn.NetPublic)
+		_, err = tools.WaitForClusterState(proxyURL, "target decommissioned", smap.Version, smap.CountActivePs(),
+			smap.CountTargets()-1)
+	}
+	if err != nil {
+		// fail the test but first, try to recover cluster membership
+		_ = tools.RestoreNode(cmd, false, "target")
+		time.Sleep(10 * time.Second)
+		tassert.CheckFatal(t, err)
+	}
 
 	vmdTargets := countVMDTargets(allTgtsMpaths)
 	tassert.Errorf(t, vmdTargets == smap.CountTargets()-1, "expected VMD to be found on %d targets, got %d.",
 		smap.CountTargets()-1, vmdTargets)
 
-	time.Sleep(time.Second)
+	// restarting before the daemon fully terminates may result in "bind: address already in use"
+	err = tools.WaitNodePubAddrNotInUse(dcmTarget, time.Minute)
+	tassert.CheckFatal(t, err)
+
 	err = tools.RestoreNode(cmd, false, "target")
 	tassert.CheckFatal(t, err)
 	_, err = tools.WaitForClusterState(proxyURL, "target joined back", smap.Version, smap.CountActivePs(),
@@ -199,7 +208,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	for i := 0; i < objCount; i++ {
 		objName := fmt.Sprintf("%sobj%04d", objPath, i)
-		r, _ := readers.NewRandReader(int64(fileSize), cos.ChecksumXXHash)
+		r, _ := readers.NewRand(int64(fileSize), cos.ChecksumXXHash)
 		_, err := api.PutObject(api.PutArgs{
 			BaseParams: baseParams,
 			Bck:        bck,
@@ -217,9 +226,22 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 	tassert.CheckError(t, err)
 	_, err = tools.WaitForClusterState(proxyURL, "target decommissioned",
 		smap.Version, origActiveProxyCount, origTargetCount-1, dcmTarget.ID())
-	tassert.CheckFatal(t, err)
+
+	if err == tools.ErrTimedOutStabilize {
+		tlog.Logf("Retrying - checking with primary %s ...\n", smap.Primary.StringEx())
+		proxyURL = smap.Primary.URL(cmn.NetPublic)
+		_, err = tools.WaitForClusterState(proxyURL, "target decommissioned",
+			smap.Version, origActiveProxyCount, origTargetCount-1, dcmTarget.ID())
+	}
+	if err != nil {
+		// fail the test but first, try to recover cluster membership
+		_ = tools.RestoreNode(cmd, false, "target")
+		time.Sleep(10 * time.Second)
+		tassert.CheckFatal(t, err)
+	}
 
 	tools.WaitForRebalanceByID(t, baseParams, rebID)
+
 	msgList := &apc.LsoMsg{Prefix: objPath}
 	lst, err := api.ListObjects(baseParams, bck, msgList, api.ListArgs{})
 	tassert.CheckError(t, err)
@@ -227,9 +249,9 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		t.Errorf("Wrong number of objects: have %d, expected %d", len(lst.Entries), objCount)
 	}
 
-	// restarting too early may result in "bind: address already in use "
-	// TODO: instead of sleep introduce and use "WaitForNodeToTerminateAndExit"
-	time.Sleep(20 * time.Second)
+	// restarting before the daemon fully terminates may result in "bind: address already in use"
+	err = tools.WaitNodePubAddrNotInUse(dcmTarget, time.Minute)
+	tassert.CheckFatal(t, err)
 
 	smap = tools.GetClusterMap(t, proxyURL)
 	err = tools.RestoreNode(cmd, false, "target")
@@ -314,7 +336,7 @@ func TestMaintenanceRebalance(t *testing.T) {
 			tassert.CheckError(t, err)
 			_, err = tools.WaitForClusterState(
 				proxyURL,
-				"target joined",
+				"target joined (2nd attempt)",
 				m.smap.Version, origProxyCnt, origTargetCount,
 			)
 			tassert.CheckFatal(t, err)
@@ -332,18 +354,18 @@ func TestMaintenanceRebalance(t *testing.T) {
 	tassert.CheckFatal(t, err)
 	m.smap = smap
 
-	m.gets()
+	m.gets(nil, false)
 	m.ensureNoGetErrors()
 
 	rebID, err = api.StopMaintenance(baseParams, actVal)
 	tassert.CheckFatal(t, err)
-	restored = true
 	smap, err = tools.WaitForClusterState(
 		proxyURL,
 		"target joined",
 		m.smap.Version, origProxyCnt, origTargetCount,
 	)
 	tassert.CheckFatal(t, err)
+	restored = true
 	m.smap = smap
 
 	tools.WaitForRebalanceByID(t, baseParams, rebID)
@@ -468,7 +490,7 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 	tassert.CheckFatal(t, err)
 
 	// 1. Shutdown a random node.
-	pid, cmd, rebID, err := tools.ShutdownNode(t, baseParams, node)
+	_, cmd, rebID, err := tools.ShutdownNode(t, baseParams, node)
 	tassert.CheckFatal(t, err)
 	if nodeType == apc.Target && origTargetCount > 1 {
 		time.Sleep(time.Second)
@@ -485,17 +507,16 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 		}
 	}
 
-	// 2. Make sure the node has been shut down.
-	err = tools.WaitForNodeToTerminate(pid, nodeOffTimeout)
-	if err != nil {
-		tlog.Logf("Warning: WaitForNodeToTerminate returned: %v\n", err)
-	}
 	smap, err = tools.WaitForClusterState(proxyURL, "shutdown node",
 		smap.Version, origProxyCnt-pdc, origTargetCount-tdc, node.ID())
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, smap.GetNode(node.ID()) != nil, "node %s does not exist in %s after shutdown", node.ID(), smap)
 	tassert.Errorf(t, smap.GetNode(node.ID()).Flags.IsSet(meta.SnodeMaint),
 		"node should be in maintenance mode after shutdown")
+
+	// restarting before the daemon fully terminates may result in "bind: address already in use"
+	err = tools.WaitNodePubAddrNotInUse(node, time.Minute)
+	tassert.CheckFatal(t, err)
 
 	// 3. Start node again.
 	err = tools.RestoreNode(cmd, false, nodeType)
@@ -553,11 +574,15 @@ func TestShutdownListObjects(t *testing.T) {
 
 	// 2. Shut down a random target.
 	tsi, _ := m.smap.GetRandTarget()
-	pid, cmd, rebID, err := tools.ShutdownNode(t, baseParams, tsi)
+	_, cmd, rebID, err := tools.ShutdownNode(t, baseParams, tsi)
 	tassert.CheckFatal(t, err)
 
 	// Restore target after test is over.
 	t.Cleanup(func() {
+		// restarting before the daemon fully terminates may result in "bind: address already in use"
+		err = tools.WaitNodePubAddrNotInUse(tsi, time.Minute)
+		tassert.CheckFatal(t, err)
+
 		err = tools.RestoreNode(cmd, false, apc.Target)
 		tassert.CheckError(t, err)
 
@@ -591,10 +616,6 @@ func TestShutdownListObjects(t *testing.T) {
 		}
 	}
 
-	err = tools.WaitForNodeToTerminate(pid, nodeOffTimeout)
-	if err != nil {
-		tlog.Logf("Warning: WaitForNodeToTerminate returned: %v\n", err)
-	}
 	m.smap, err = tools.WaitForClusterState(proxyURL, "target shutdown", m.smap.Version, 0, origTargetCount-1, tsi.ID())
 	tassert.CheckFatal(t, err)
 

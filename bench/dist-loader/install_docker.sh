@@ -1,1 +1,0 @@
-ansible-playbook -i inventory.yaml playbooks/install_docker.yaml --become -e "ansible_become_pass=y"

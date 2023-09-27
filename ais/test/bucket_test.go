@@ -60,7 +60,7 @@ func TestHTTPProviderBucket(t *testing.T) {
 	_, err = api.ListObjects(baseParams, bck, nil, api.ListArgs{})
 	tassert.Fatalf(t, err != nil, "expected error")
 
-	reader, _ := readers.NewRandReader(cos.KiB, cos.ChecksumNone)
+	reader, _ := readers.NewRand(cos.KiB, cos.ChecksumNone)
 	_, err = api.PutObject(api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bck,
@@ -451,7 +451,7 @@ func overwriteLomCache(mdwrite apc.WritePolicy, t *testing.T) {
 	tlog.Logf("Overwrite %s objects with newer versions\n", m.bck)
 	nsize := int64(m.fileSize) * 10
 	for _, en := range objList.Entries {
-		reader, err := readers.NewRandReader(nsize, cos.ChecksumNone)
+		reader, err := readers.NewRand(nsize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
 		_, err = api.PutObject(api.PutArgs{
 			BaseParams: baseParams,
@@ -516,7 +516,7 @@ func TestStressCreateDestroyBucket(t *testing.T) {
 				if _, err := api.ListObjects(baseParams, m.bck, nil, api.ListArgs{}); err != nil {
 					return err
 				}
-				m.gets()
+				m.gets(nil, false)
 				if err := api.DestroyBucket(baseParams, m.bck); err != nil {
 					return err
 				}
@@ -1383,7 +1383,7 @@ func TestListObjectsPrefix(t *testing.T) {
 				objName := fmt.Sprintf("prefix/obj%d", i+1)
 				objNames = append(objNames, objName)
 
-				r, _ := readers.NewRandReader(fileSize, cos.ChecksumNone)
+				r, _ := readers.NewRand(fileSize, cos.ChecksumNone)
 				_, err := api.PutObject(api.PutArgs{
 					BaseParams: baseParams,
 					Bck:        bck,
@@ -1825,7 +1825,7 @@ func testLocalMirror(t *testing.T, numCopies []int) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		m.gets()
+		m.gets(nil, false)
 	}()
 
 	baseParams := tools.BaseAPIParams(m.proxyURL)
@@ -1915,7 +1915,7 @@ func TestBucketReadOnly(t *testing.T) {
 	baseParams := tools.BaseAPIParams()
 
 	m.puts()
-	m.gets()
+	m.gets(nil, false)
 
 	p, err := api.HeadBucket(baseParams, m.bck, true /* don't add */)
 	tassert.CheckFatal(t, err)
@@ -2042,7 +2042,7 @@ func TestRenameBucketNonEmpty(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	// Gets on renamed ais bucket
-	m.gets()
+	m.gets(nil, false)
 	m.ensureNoGetErrors()
 
 	tlog.Logln("checking bucket props...")
@@ -2136,6 +2136,10 @@ func TestRenameBucketTwice(t *testing.T) {
 	// Rename to first destination
 	tlog.Logf("rename %s => %s\n", srcBck, dstBck1)
 	xid, err := api.RenameBucket(baseParams, srcBck, dstBck1)
+	if err != nil && ensurePrevRebalanceIsFinished(baseParams, err) {
+		// can retry
+		xid, err = api.RenameBucket(baseParams, srcBck, dstBck1)
+	}
 	tassert.CheckFatal(t, err)
 
 	// Try to rename to first destination again - already in progress
@@ -2444,8 +2448,8 @@ func TestCopyBucket(t *testing.T) {
 				panic(bckTest)
 			}
 
-			xactIDs := make([]string, len(dstms))
-			for idx, dstm := range dstms {
+			xactIDs := make([]string, 0, len(dstms))
+			for _, dstm := range dstms {
 				var (
 					uuid string
 					err  error
@@ -2457,7 +2461,15 @@ func TestCopyBucket(t *testing.T) {
 				} else {
 					uuid, err = api.CopyBucket(baseParams, srcm.bck, dstm.bck, cmsg)
 				}
-				xactIDs[idx] = uuid
+				if uuids := strings.Split(uuid, xact.UUIDSepa); len(uuids) > 1 {
+					for _, u := range uuids {
+						tassert.Fatalf(t, xact.IsValidUUID(u), "invalid UUID %q", u)
+					}
+					xactIDs = append(xactIDs, uuids...)
+				} else {
+					tassert.Fatalf(t, xact.IsValidUUID(uuid), "invalid UUID %q", uuid)
+					xactIDs = append(xactIDs, uuid)
+				}
 				tassert.CheckFatal(t, err)
 			}
 
@@ -2526,6 +2538,7 @@ func TestCopyBucket(t *testing.T) {
 				if test.dstRemote {
 					msg.Flags = apc.LsObjCached
 				}
+
 				dstBckList, err := api.ListObjects(baseParams, dstm.bck, msg, api.ListArgs{})
 				tassert.CheckFatal(t, err)
 				if len(dstBckList.Entries) != expectedObjCount {
@@ -2804,7 +2817,7 @@ func TestRenameAndCopyBucket(t *testing.T) {
 	tassert.Errorf(t, len(list.Entries) == m.num, "expected %s to have %d, got %d", dst1, m.num, len(list.Entries))
 
 	m.bck = dst1
-	m.gets()
+	m.gets(nil, false)
 	m.ensureNoGetErrors()
 	m.bck = src
 }
@@ -3033,7 +3046,7 @@ func TestAllChecksums(t *testing.T) {
 		}
 		tag := cksumType + "/EC"
 		t.Run(tag, func(t *testing.T) {
-			tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3})
+			tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 4})
 
 			started := time.Now()
 			testWarmValidation(t, cksumType, false, true)
@@ -3144,7 +3157,7 @@ func testWarmValidation(t *testing.T, cksumType string, mirrored, eced bool) {
 	} else {
 		tlog.Logf("Reading %q objects\n", m.bck)
 	}
-	m.gets()
+	m.gets(nil, false)
 
 	msg := &apc.LsoMsg{}
 	bckObjs, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
@@ -3156,7 +3169,7 @@ func testWarmValidation(t *testing.T, cksumType string, mirrored, eced bool) {
 
 	if cksumType != cos.ChecksumNone {
 		tlog.Logf("Reading %d objects from %s with end-to-end %s validation\n", len(bckObjs.Entries), m.bck, cksumType)
-		wg := cos.NewLimitedWaitGroup(40, 0)
+		wg := cos.NewLimitedWaitGroup(20, 0)
 
 		for _, en := range bckObjs.Entries {
 			wg.Add(1)
@@ -3326,7 +3339,7 @@ func TestBucketListAndSummary(t *testing.T) {
 					}
 				}
 			} else {
-				msg := &apc.LsoMsg{PageSize: uint(cos.Min(m.num/3, 256))} // mult. pages
+				msg := &apc.LsoMsg{PageSize: uint(min(m.num/3, 256))} // mult. pages
 				if test.cached {
 					msg.Flags = apc.LsObjCached
 				}
@@ -3371,7 +3384,7 @@ func TestListObjectsNoRecursion(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	for _, nm := range objs {
 		objectSize := int64(rand.Intn(256) + 20)
-		reader, _ := readers.NewRandReader(objectSize, cos.ChecksumNone)
+		reader, _ := readers.NewRand(objectSize, cos.ChecksumNone)
 		_, err := api.PutObject(api.PutArgs{
 			BaseParams: baseParams,
 			Bck:        bck,

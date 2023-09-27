@@ -65,25 +65,36 @@ func (p *tcoFactory) New(args xreg.Args, bckFrom *meta.Bck) xreg.Renewable {
 	return np
 }
 
-func (p *tcoFactory) Start() error {
-	var sizePDU int32
+func (p *tcoFactory) Start() (err error) {
+	//
+	// target-local generation of a global UUID
+	//
+	p.Args.UUID, err = p.genBEID(p.args.BckFrom, p.args.BckTo)
+	if err != nil {
+		return
+	}
+
+	// new x-tco
 	workCh := make(chan *cmn.TCObjsMsg, maxNumInParallel)
 	r := &XactTCObjs{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}, args: p.args, workCh: workCh}
 	r.pending.m = make(map[string]*tcowi, maxNumInParallel)
 	p.xctn = r
-	r.DemandBase.Init(p.UUID(), p.Kind(), p.Bck, 0 /*use default*/)
+	r.DemandBase.Init(p.UUID(), p.Kind(), p.Bck, xact.IdleDefault)
+
+	var sizePDU int32
 	if p.kind == apc.ActETLObjects {
+		// unlike apc.ActCopyObjects (where we know the size)
+		// apc.ActETLObjects (transform) generates arbitrary sizes where we use PDU-based transport
 		sizePDU = memsys.DefaultBufSize
 	}
-	trname := "tco-" + p.UUID()
-	if err := p.newDM(trname, r.recv, sizePDU); err != nil {
-		return err
+	if err = p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, sizePDU); err != nil {
+		return
 	}
 	p.dm.SetXact(r)
 	p.dm.Open()
 
 	xact.GoRunW(r)
-	return nil
+	return
 }
 
 ////////////////
@@ -167,9 +178,7 @@ fin:
 	if r.Err() != nil {
 		// cleanup: destroy destination iff it was created by this copy
 		r.pending.Lock()
-		for uuid := range r.pending.m {
-			delete(r.pending.m, uuid)
-		}
+		clear(r.pending.m)
 		r.pending.Unlock()
 	}
 }

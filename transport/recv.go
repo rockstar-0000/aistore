@@ -1,7 +1,7 @@
-// Package transport provides streaming object-based transport over http for intra-cluster continuous
+// Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -33,11 +33,15 @@ const sessionIsOld = time.Hour
 
 // private types
 type (
+	rxStats interface {
+		addOff(int64)
+		incNum()
+	}
 	iterator struct {
 		body    io.Reader
-		handler *handler
+		handler handler
 		pdu     *rpdu
-		stats   *Stats
+		stats   rxStats
 		hbuf    []byte
 	}
 	objReader struct {
@@ -47,25 +51,36 @@ type (
 		hdr    ObjHdr
 		off    int64
 	}
-	handler struct {
-		rxObj       RecvObj
-		rxMsg       RecvMsg
+
+	handler interface {
+		recv(hdr ObjHdr, objReader io.Reader, err error) error // RecvObj
+		stats(*http.Request, string) (rxStats, uint64, string)
+		unreg()
+		addOld(uint64)
+		getStats() RxStats
+	}
+	hdl struct {
+		rxObj  RecvObj
+		trname string
+		now    int64
+	}
+	hdlExtra struct {
+		hdl
+		hkName      string
 		sessions    sync.Map
 		oldSessions sync.Map
-		hkName      string
-		trname      string
-		now         int64
-	}
-
-	ErrDuplicateTrname struct {
-		trname string
 	}
 )
 
+// interface guard
 var (
-	nextSessionID atomic.Int64        // next unique session ID
-	handlers      map[string]*handler // by trname
-	mu            *sync.RWMutex       // ptotect handlers
+	_ handler = (*hdl)(nil)
+	_ handler = (*hdlExtra)(nil)
+)
+
+// global
+var (
+	nextSessionID atomic.Int64 // next unique session ID
 )
 
 // main Rx objects
@@ -74,20 +89,28 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 		reader    io.Reader = r.Body
 		lz4Reader *lz4.Reader
 		trname    = path.Base(r.URL.Path)
+		mm        = memsys.PageMM()
 	)
-	mu.RLock()
-	h, ok := handlers[trname]
-	if !ok {
-		mu.RUnlock()
-		err := cos.NewErrNotFound("unknown transport endpoint %q", trname)
-		if verbose {
-			cmn.WriteErr(w, r, err, 0)
+	// Rx handler
+	h, err := oget(trname)
+	if err != nil {
+		//
+		//  Try reading `nextProtoHdr` containing transport.ObjHdr -
+		//  that's because low-level `Stream.Fin` (sending graceful `opcFin`)
+		//  could be the cause for `errUnknownTrname` and `errAlreadyClosedTrname`.
+		//  Secondly, `errAlreadyClosedTrname` is considered benign, attributed
+		//  to xaction abort and such - the fact that'd be difficult to confirm
+		//  at the lowest level (and with no handler and its rxObj cb).
+		//
+		if _, ok := err.(*errAlreadyClosedTrname); ok {
+			if verbose {
+				nlog.Errorln(err)
+			}
 		} else {
-			cmn.WriteErr(w, r, err, 0, 1 /*silent*/)
+			cmn.WriteErr(w, r, err, 0)
 		}
 		return
 	}
-	mu.RUnlock()
 	// compression
 	if compressionType := r.Header.Get(apc.HdrCompress); compressionType != "" {
 		debug.Assert(compressionType == apc.LZ4Compression)
@@ -95,25 +118,11 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 		reader = lz4Reader
 	}
 
-	// session
-	sessID, err := strconv.ParseInt(r.Header.Get(apc.HdrSessID), 10, 64)
-	if err != nil || sessID == 0 {
-		cmn.WriteErr(w, r, fmt.Errorf("%s[:%d]: invalid session ID, err %v", trname, sessID, err))
-		return
-	}
-	uid := uniqueID(r, sessID)
-	statsif, _ := h.sessions.LoadOrStore(uid, &Stats{})
-	xxh, _ := UID2SessID(uid)
-	loghdr := fmt.Sprintf("%s[%d:%d]", trname, xxh, sessID)
-	if verbose {
-		nlog.Infof("%s: start-of-stream from %s", loghdr, r.RemoteAddr)
-	}
-	stats := statsif.(*Stats)
-
-	// receive loop
-	mm := memsys.PageMM()
+	stats, uid, loghdr := h.stats(r, trname)
 	it := &iterator{handler: h, body: reader, stats: stats}
 	it.hbuf, _ = mm.AllocSize(dfltMaxHdr)
+
+	// receive loop
 	err = it.rxloop(uid, loghdr, mm)
 
 	// cleanup
@@ -135,31 +144,78 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 // Rx handler //
 ////////////////
 
-func (h *handler) handle() error {
-	mu.Lock()
-	if _, ok := handlers[h.trname]; ok {
-		mu.Unlock()
-		return &ErrDuplicateTrname{h.trname}
-	}
-	handlers[h.trname] = h
-	mu.Unlock()
-	hk.Reg(h.hkName+hk.NameSuffix, h.cleanup, sessionIsOld)
-	return nil
+// begin t2t session
+func (h *hdl) stats(r *http.Request, trname string) (rxStats, uint64, string) {
+	debug.Assertf(h.trname == trname, "%q vs %q", h.trname, trname)
+	sid := r.Header.Get(apc.HdrSessID)
+	loghdr := h.trname + "[" + r.RemoteAddr + ":" + sid + "]"
+	return nopRxStats{}, 0, loghdr
 }
 
-func (h *handler) cleanup() time.Duration {
+// ditto, with Rx stats
+func (h *hdlExtra) stats(r *http.Request, trname string) (rxStats, uint64, string) {
+	debug.Assertf(h.trname == trname, "%q vs %q", h.trname, trname)
+	sid := r.Header.Get(apc.HdrSessID)
+
+	sessID, err := strconv.ParseInt(sid, 10, 64)
+	if err != nil || sessID == 0 {
+		err = fmt.Errorf("%s[:%q]: invalid session ID, err %v", h.trname, sid, err)
+		cos.AssertNoErr(err)
+	}
+
+	// yet another id to index optional h.sessions & h.oldSessions sync.Maps
+	uid := uniqueID(r, sessID)
+	statsif, _ := h.sessions.LoadOrStore(uid, &Stats{})
+
+	xxh, _ := UID2SessID(uid)
+	loghdr := fmt.Sprintf("%s[%d:%d]", h.trname, xxh, sessID)
+	if verbose {
+		nlog.Infof("%s: start-of-stream from %s", loghdr, r.RemoteAddr)
+	}
+	return statsif.(rxStats), uid, loghdr
+}
+
+func (*hdl) unreg()        {}
+func (h *hdlExtra) unreg() { hk.Unreg(h.hkName + hk.NameSuffix) }
+
+func (*hdl) addOld(uint64)            {}
+func (h *hdlExtra) addOld(uid uint64) { h.oldSessions.Store(uid, mono.NanoTime()) }
+
+func (h *hdlExtra) cleanup() time.Duration {
 	h.now = mono.NanoTime()
 	h.oldSessions.Range(h.cl)
 	return sessionIsOld
 }
 
-func (h *handler) cl(key, value any) bool {
+func (h *hdlExtra) cl(key, value any) bool {
 	timeClosed := value.(int64)
 	if time.Duration(h.now-timeClosed) > sessionIsOld {
 		uid := key.(uint64)
 		h.oldSessions.Delete(uid)
 		h.sessions.Delete(uid)
 	}
+	return true
+}
+
+func (h *hdl) recv(hdr ObjHdr, objReader io.Reader, err error) error {
+	return h.rxObj(hdr, objReader, err)
+}
+
+func (*hdl) getStats() RxStats { return nil }
+
+func (h *hdlExtra) getStats() (s RxStats) {
+	s = make(RxStats, 4)
+	h.sessions.Range(s.f)
+	return
+}
+
+func (s RxStats) f(key, value any) bool {
+	out := &Stats{}
+	uid := key.(uint64)
+	in := value.(*Stats)
+	out.Num.Store(in.Num.Load())       // via rxStats.incNum
+	out.Offset.Store(in.Offset.Load()) // via rxStats.addOff
+	s[uid] = out
 	return true
 }
 
@@ -187,25 +243,23 @@ func (it *iterator) rxloop(uid uint64, loghdr string, mm *memsys.MMSA) (err erro
 			// grow
 			nlog.Warningf("%s: header length %d exceeds the current buffer %d", loghdr, hlen, cap(it.hbuf))
 			mm.Free(it.hbuf)
-			it.hbuf, _ = mm.AllocSize(cos.MinI64(int64(hlen)<<1, maxSizeHeader))
+			it.hbuf, _ = mm.AllocSize(min(int64(hlen)<<1, maxSizeHeader))
 		}
-		_ = it.stats.Offset.Add(int64(hlen + sizeProtoHdr))
-		if flags&msgFl == 0 {
-			if flags&pduStreamFl != 0 {
-				if it.pdu == nil {
-					pbuf, _ := mm.AllocSize(maxSizePDU)
-					it.pdu = newRecvPDU(it.body, pbuf)
-				} else {
-					it.pdu.reset()
-				}
+
+		it.stats.addOff(int64(hlen + sizeProtoHdr))
+		debug.Assert(flags&msgFl == 0) //  messaging: not used, removed
+		if flags&pduStreamFl != 0 {
+			if it.pdu == nil {
+				pbuf, _ := mm.AllocSize(maxSizePDU)
+				it.pdu = newRecvPDU(it.body, pbuf)
+			} else {
+				it.pdu.reset()
 			}
-			err = it.rxObj(loghdr, hlen)
-		} else {
-			err = it.rxMsg(loghdr, hlen)
 		}
+		err = it.rxObj(loghdr, hlen)
 	}
-	h := it.handler
-	h.oldSessions.Store(uid, mono.NanoTime())
+
+	it.handler.addOld(uid)
 	return
 }
 
@@ -219,36 +273,24 @@ func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
 		}
 		err = eofOK(err)
 		size, off := obj.hdr.ObjAttrs.Size, obj.off
-		if errCb := h.rxObj(obj.hdr, obj, err); errCb != nil {
+		if errCb := h.recv(obj.hdr, obj, err); errCb != nil {
 			err = errCb
 		}
 		// stats
 		if err == nil {
-			it.stats.Num.Inc()           // this stream stats
-			statsTracker.Inc(InObjCount) // stats/target_stats.go
+			it.stats.incNum()              // this stream stats
+			g.statsTracker.Inc(InObjCount) // stats/target_stats.go
 			if size >= 0 {
-				statsTracker.Add(InObjSize, size)
+				g.statsTracker.Add(InObjSize, size)
 			} else {
 				debug.Assert(size == SizeUnknown)
-				statsTracker.Add(InObjSize, obj.off-off)
+				g.statsTracker.Add(InObjSize, obj.off-off)
 			}
 		}
 	} else if err != nil && err != io.EOF {
-		if errCb := h.rxObj(ObjHdr{}, nil, err); errCb != nil {
+		if errCb := h.recv(ObjHdr{}, nil, err); errCb != nil {
 			err = errCb
 		}
-	}
-	return
-}
-
-func (it *iterator) rxMsg(loghdr string, hlen int) (err error) {
-	var msg Msg
-	h := it.handler
-	msg, err = it.nextMsg(loghdr, hlen)
-	if err == nil {
-		err = h.rxMsg(msg, nil)
-	} else if err != io.EOF {
-		err = h.rxMsg(Msg{}, err)
 	}
 	return
 }
@@ -261,7 +303,7 @@ func eofOK(err error) error {
 }
 
 // nextProtoHdr receives and handles 16 bytes of the protocol header (not to confuse with transport.Obj.Hdr)
-// returns hlen, which is header length - for transport.Obj, and message length - for transport.Msg
+// returns hlen, which is header length - for transport.Obj (and formerly, message length for transport.Msg)
 func (it *iterator) nextProtoHdr(loghdr string) (hlen int, flags uint64, err error) {
 	var n int
 	n, err = it.Read(it.hbuf[:sizeProtoHdr])
@@ -307,23 +349,6 @@ func (it *iterator) nextObj(loghdr string, hlen int) (obj *objReader, err error)
 	}
 	obj = allocRecv()
 	obj.body, obj.hdr, obj.loghdr = it.body, hdr, loghdr
-	return
-}
-
-func (it *iterator) nextMsg(loghdr string, hlen int) (msg Msg, err error) {
-	var n int
-	n, err = it.Read(it.hbuf[:hlen])
-	if n < hlen {
-		if err == nil {
-			err = fmt.Errorf("sbr5 %s: failed to receive msg (%d < %d)", loghdr, n, hlen)
-		}
-		return
-	}
-	debug.Assertf(n == hlen, "%d != %d", n, hlen)
-	msg = ExtMsg(it.hbuf, hlen)
-	if msg.isFin() {
-		err = io.EOF
-	}
 	return
 }
 
@@ -407,26 +432,13 @@ func (obj *objReader) readPDU(b []byte) (n int, err error) {
 	return
 }
 
-////////////////////////
-// ErrDuplicateTrname //
-////////////////////////
-
-func (e *ErrDuplicateTrname) Error() string {
-	return fmt.Sprintf("duplicate trname %q", e.trname)
-}
-
-func IsErrDuplicateTrname(e error) bool {
-	_, ok := e.(*ErrDuplicateTrname)
-	return ok
-}
-
 //
 // session ID <=> unique ID
 //
 
 func uniqueID(r *http.Request, sessID int64) uint64 {
-	x := xxhash.ChecksumString64S(r.RemoteAddr, cos.MLCG32)
-	return (x&math.MaxUint32)<<32 | uint64(sessID)
+	hash := xxhash.Checksum64S(cos.UnsafeB(r.RemoteAddr), cos.MLCG32)
+	return (hash&math.MaxUint32)<<32 | uint64(sessID)
 }
 
 func UID2SessID(uid uint64) (xxh, sessID uint64) {

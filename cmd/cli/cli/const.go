@@ -14,7 +14,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/ext/dload"
-	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/urfave/cli"
 )
 
@@ -90,13 +89,12 @@ const (
 	commandPrefetch = "prefetch" // apc.ActPrefetchObjects
 
 	cmdDownload    = apc.ActDownload
+	cmdDsort       = apc.ActDsort
 	cmdRebalance   = apc.ActRebalance
 	cmdLRU         = apc.ActLRU
 	cmdStgCleanup  = "cleanup" // display name for apc.ActStoreCleanup
 	cmdStgValidate = "validate"
 	cmdSummary     = "summary" // ditto apc.ActSummaryBck
-
-	cmdDsort = dsort.DSortName
 
 	cmdCluster    = commandCluster
 	cmdNode       = "node"
@@ -165,10 +163,10 @@ const (
 	cmdK8sCluster = commandCluster
 
 	// ETL subcommands
-	cmdInit = "init"
-	cmdSpec = "spec"
-	cmdCode = "code"
-	cmdSrc  = "source"
+	cmdInit    = "init"
+	cmdSpec    = "spec"
+	cmdCode    = "code"
+	cmdDetails = "details"
 
 	// config subcommands
 	cmdCLI        = "cli"
@@ -456,10 +454,15 @@ var (
 	noHeaderFlag = cli.BoolFlag{Name: "no-headers,H", Usage: "display tables without headers"}
 	noFooterFlag = cli.BoolFlag{Name: "no-footers", Usage: "display tables without footers"}
 
-	progressFlag   = cli.BoolFlag{Name: "progress", Usage: "show progress bar(s) and progress of execution in real time"}
-	dryRunFlag     = cli.BoolFlag{Name: "dry-run", Usage: "preview the results without really running the action"}
-	verboseFlag    = cli.BoolFlag{Name: "verbose,v", Usage: "verbose"}
-	nonverboseFlag = cli.BoolFlag{Name: "non-verbose,nv", Usage: "non-verbose"}
+	progressFlag = cli.BoolFlag{Name: "progress", Usage: "show progress bar(s) and progress of execution in real time"}
+	dryRunFlag   = cli.BoolFlag{Name: "dry-run", Usage: "preview the results without really running the action"}
+
+	verboseFlag    = cli.BoolFlag{Name: "verbose,v", Usage: "verbose output"}
+	nonverboseFlag = cli.BoolFlag{Name: "non-verbose,nv", Usage: "non-verbose output"}
+	verboseJobFlag = cli.BoolFlag{
+		Name:  verboseFlag.Name,
+		Usage: "show extended statistics",
+	}
 
 	averageSizeFlag = cli.BoolFlag{Name: "average-size", Usage: "show average GET, PUT, etc. request size"}
 
@@ -471,6 +474,12 @@ var (
 	bucketPropsFlag = cli.StringFlag{
 		Name:  "props",
 		Usage: "bucket properties, e.g. --props=\"mirror.enabled=true mirror.copies=4 checksum.type=md5\"",
+	}
+
+	addRemoteBucketWithNoLookupFlag = cli.BoolFlag{
+		Name: "skip-lookup",
+		Usage: "add Cloud bucket to aistore without checking the bucket's accessibility and getting its Cloud properties\n" +
+			indent4 + "\t(usage must be limited to setting up bucket's aistore properties with alternative profile and/or endpoint)",
 	}
 
 	forceFlag = cli.BoolFlag{Name: "force,f", Usage: "force an action"}
@@ -566,7 +575,7 @@ var (
 	}
 	syncFlag = cli.BoolFlag{Name: "sync", Usage: "sync bucket with Cloud"}
 
-	// dSort
+	// dsort
 	dsortFsizeFlag  = cli.StringFlag{Name: "fsize", Value: "1024", Usage: "size of the files in a shard"}
 	dsortLogFlag    = cli.StringFlag{Name: "log", Usage: "filename to log metrics (statistics)"}
 	dsortFcountFlag = cli.IntFlag{Name: "fcount", Value: 5, Usage: "number of files in a shard"}
@@ -804,17 +813,28 @@ var (
 		Required: true,
 	}
 	commTypeFlag = cli.StringFlag{
-		Name:  "comm-type",
-		Usage: "communication type which should be used when running the provided code (defaults to hpush)",
+		Name: "comm-type",
+		Usage: "enumerated communication type used between aistore cluster and ETL containers that run custom transformations:\n" +
+			indent4 + "\t - 'hpush' or 'hpush://' - ETL container provides HTTP PUT handler that'll be invoked upon every request to transform\n" +
+			indent4 + "\t -  '' - same as 'hpush://' (default, can be omitted)\n" +
+			indent4 + "\t - 'hpull' or 'hpull://' - same, but ETL container is expected to provide HTTP GET endpoint\n" +
+			indent4 + "\t - 'hrev' or 'hrev://' - same, but aistore nodes will reverse-proxy requests to their respective ETL containers)\n" +
+			indent4 + "\t - 'io' or 'io://' - for each request an aistore node will: run ETL container locally, write data\n" +
+			indent4 + "\t   to its standard input and then read transformed data from the standard output\n" +
+			indent4 + "\t For more defails, see https://aiatscale.org/docs/etl#communication-mechanisms\n",
 	}
-	transformURLFlag = cli.BoolFlag{
-		Name:  "transform-url",
-		Usage: "rather than contents (bytes), pass the URL of the objects to be transformed to the user-defined transform function (note: usage is limited to '--comm-type=hpull' only)",
-	}
+
 	funcTransformFlag = cli.StringFlag{
 		Name:  "transform",
 		Value: "transform", // NOTE: default name of the transform() function
 		Usage: "receives and _transforms_ the payload",
+	}
+	argTypeFlag = cli.StringFlag{
+		Name: "arg-type",
+		Usage: "Specifies _how_ an object to transform gets passed from aistore to ETL container:\n" +
+			indent4 + "\t - \"\" - The default option (that can be omitted), whereby ETL container receives an entire payload (bytes) to transform\n" +
+			indent4 + "\t - url - URL that points towards the data to transform (the support is currently limited to '--comm-type=hpull')\n" +
+			indent4 + "\t - fqn - Fully-qualified name (FQN) of a locally stored object (requires trusted ETL container, might not be always available)",
 	}
 
 	// Node
@@ -824,7 +844,7 @@ var (
 	}
 	noRebalanceFlag = cli.BoolFlag{
 		Name:  "no-rebalance",
-		Usage: "do _not_ run global rebalance after putting node in maintenance (advanced usage only!)",
+		Usage: "do _not_ run global rebalance after putting node in maintenance (caution: advanced usage only!)",
 	}
 	noResilverFlag = cli.BoolFlag{
 		Name:  "no-resilver",

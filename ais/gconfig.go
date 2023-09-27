@@ -137,7 +137,7 @@ func (co *configOwner) runPre(ctx *configModifier) (clone *globalConfig, err err
 	clone.Version++
 	clone.LastUpdated = time.Now().String()
 	clone._sgl = clone._encode(co.immSize)
-	co.immSize = cos.MaxI64(co.immSize, clone._sgl.Len())
+	co.immSize = max(co.immSize, clone._sgl.Len())
 	if err := co.persist(clone, nil); err != nil {
 		clone._sgl.Free()
 		clone._sgl = nil
@@ -166,7 +166,7 @@ func (co *configOwner) persist(clone *globalConfig, payload msPayload) error {
 		wto = clone._sgl
 	} else {
 		sgl := clone._encode(co.immSize)
-		co.immSize = cos.MaxI64(co.immSize, sgl.Len())
+		co.immSize = max(co.immSize, sgl.Len())
 		defer sgl.Free()
 		wto = sgl
 	}
@@ -199,7 +199,7 @@ func (co *configOwner) setDaemonConfig(toUpdate *cmn.ConfigToUpdate, transient b
 		return
 	}
 
-	override := cmn.GCO.GetOverrideConfig()
+	override := cmn.GCO.GetOverride()
 	if override == nil {
 		override = toUpdate
 	} else {
@@ -214,7 +214,7 @@ func (co *configOwner) setDaemonConfig(toUpdate *cmn.ConfigToUpdate, transient b
 	}
 
 	cmn.GCO.Put(clone)
-	cmn.GCO.PutOverrideConfig(override)
+	cmn.GCO.PutOverride(override)
 	co.Unlock()
 	return
 }
@@ -233,7 +233,7 @@ func (co *configOwner) resetDaemonConfig() (err error) {
 		nlog.Infof("Warning: reset config %s: %v", oldConfig, err)
 		return err
 	}
-	cmn.GCO.PutOverrideConfig(nil)
+	cmn.GCO.PutOverride(nil)
 	err = cos.RemoveFile(filepath.Join(oldConfig.ConfigDir, fname.OverrideConfig))
 	if err != nil {
 		co.Unlock()

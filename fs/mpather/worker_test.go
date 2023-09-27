@@ -47,7 +47,8 @@ func TestWorkerGroup(t *testing.T) {
 		err := lom.InitFQN(fqn, &out.Bck)
 		tassert.CheckError(t, err)
 
-		wg.Do(lom)
+		_, err = wg.PostLIF(lom)
+		tassert.CheckError(t, err)
 	}
 
 	// Give some time for the workers to pick all the tasks.

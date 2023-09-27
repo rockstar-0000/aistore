@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -90,10 +89,11 @@ type (
 	ErrInvalidBackendProvider struct {
 		bck Bck
 	}
-	ErrCapacityExceeded struct {
+	ErrCapExceeded struct {
 		totalBytes     uint64
 		totalBytesUsed uint64
 		highWM         int64
+		cleanupWM      int64
 		usedPct        int32
 		oos            bool
 	}
@@ -138,8 +138,6 @@ type (
 		err  error
 		what string
 		ctx  string
-		//
-		timestamp time.Time
 	}
 	ErrInitBackend struct {
 		Provider string
@@ -379,31 +377,38 @@ func NewObjectAccessDenied(object, oper string, aattrs apc.AccessAttrs) *ErrObje
 	return &ErrObjectAccessDenied{errAccessDenied{object, oper, aattrs}}
 }
 
-// ErrCapacityExceeded
+// ErrCapExceeded
 
-func NewErrCapacityExceeded(highWM int64, totalBytesUsed, totalBytes uint64, usedPct int32, oos bool) *ErrCapacityExceeded {
-	return &ErrCapacityExceeded{
-		highWM:         highWM,
-		usedPct:        usedPct,
+func NewErrCapExceeded(totalBytesUsed, totalBytes uint64, highWM, cleanupWM int64, usedPct int32, oos bool) *ErrCapExceeded {
+	return &ErrCapExceeded{
 		totalBytes:     totalBytes, // avail + used
 		totalBytesUsed: totalBytesUsed,
+		highWM:         highWM,
+		cleanupWM:      cleanupWM,
+		usedPct:        usedPct,
 		oos:            oos,
 	}
 }
 
-func (e *ErrCapacityExceeded) Error() string {
+func (e *ErrCapExceeded) Error() string {
 	suffix := fmt.Sprintf("total used %s out of %s", cos.ToSizeIEC(int64(e.totalBytesUsed), 2),
 		cos.ToSizeIEC(int64(e.totalBytes), 2))
 	if e.oos {
 		return fmt.Sprintf("out of space: used %d%% of total capacity on at least one of the mountpaths (%s)",
 			e.usedPct, suffix)
 	}
+	if e.highWM == 0 {
+		debug.Assert(e.cleanupWM > 0)
+		return fmt.Sprintf("low on free space: used capacity %d%% exceeded cleanup watermark(%d%%) (%s)",
+			e.usedPct, e.cleanupWM, suffix)
+	}
+	debug.Assert(e.highWM > 0)
 	return fmt.Sprintf("low on free space: used capacity %d%% exceeded high watermark(%d%%) (%s)",
 		e.usedPct, e.highWM, suffix)
 }
 
-func IsErrCapacityExceeded(err error) bool {
-	_, ok := err.(*ErrCapacityExceeded)
+func IsErrCapExceeded(err error) bool {
+	_, ok := err.(*ErrCapExceeded)
 	return ok
 }
 
@@ -526,11 +531,11 @@ func NewErrAborted(what, ctx string, err error) *ErrAborted {
 		return e
 	}
 	_clean(err)
-	return &ErrAborted{what: what, ctx: ctx, err: err, timestamp: time.Now()}
+	return &ErrAborted{what: what, ctx: ctx, err: err}
 }
 
 func (e *ErrAborted) Error() (s string) {
-	s = fmt.Sprintf("%s aborted at %s", e.what, cos.FormatTime(e.timestamp, cos.StampMicro))
+	s = fmt.Sprintf("%s aborted", e.what)
 	if e.err != nil {
 		s = fmt.Sprintf("%s, err: %v", s, e.err)
 	}
@@ -799,7 +804,7 @@ func TypeCodeHTTPErr(s string) (tcode string) {
 	if !strings.HasPrefix(s, "Err") {
 		return
 	}
-	for i := 3; i < cos.Min(maxTypeCodeLen, len(s)); i++ {
+	for i := 3; i < min(maxTypeCodeLen, len(s)); i++ {
 		c := s[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
 			continue

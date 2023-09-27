@@ -88,7 +88,8 @@ type (
 			mu  sync.RWMutex
 			in  atomic.Bool
 		}
-		inPrimaryTransition atomic.Bool
+		settingNewPrimary atomic.Bool // primary executing "set new primary" request (state)
+		readyToFastKalive atomic.Bool // primary can accept fast keepalives
 	}
 )
 
@@ -108,6 +109,11 @@ func (p *proxy) initClusterCIDR() {
 
 func (p *proxy) init(config *cmn.Config) {
 	p.initNetworks()
+
+	// (a) get node ID from command-line or env var (see envDaemonID())
+	// (b) load existing ID from config file stored under local config `confdir` (compare w/ target)
+	// (c) generate a new one (genDaemonID())
+	// - in that sequence
 	p.si.Init(initPID(config), apc.Proxy)
 
 	memsys.Init(p.SID(), p.SID(), config)
@@ -163,13 +169,14 @@ func readProxyID(config *cmn.Config) (id string) {
 	return
 }
 
-func (p *proxy) pready(smap *smapX) error {
+func (p *proxy) pready(smap *smapX, withRR bool /* also check readiness to rebalance */) error {
 	const msg = "%s primary: not ready yet "
 	debug.Assert(smap == nil || smap.IsPrimary(p.si))
+
 	if !p.ClusterStarted() {
 		return fmt.Errorf(msg+"(cluster is starting up)", p)
 	}
-	if p.owner.rmd.starting.Load() {
+	if withRR && p.owner.rmd.starting.Load() {
 		return fmt.Errorf(msg+"(finalizing global rebalancing state)", p)
 	}
 	return nil
@@ -245,8 +252,9 @@ func (p *proxy) Run() error {
 		nlog.Infof("%s: [%s net] listening on: %s", p, cmn.NetIntraData, p.si.DataNet.URL)
 	}
 
-	dsort.RegisterNode(p.owner.smap, p.owner.bmd, p.si, nil, p.statsT)
-	return p.htrun.run()
+	dsort.Pinit(p)
+
+	return p.htrun.run(config)
 }
 
 func (p *proxy) joinCluster(action string, primaryURLs ...string) (status int, err error) {
@@ -285,6 +293,10 @@ func (p *proxy) recvCluMeta(cm *cluMeta, action, caller string) error {
 		msg  = p.newAmsgStr(action, cm.BMD)
 		errs []error
 	)
+	if cm.PrimeTime != 0 {
+		xreg.PrimeTime.Store(cm.PrimeTime)
+		xreg.MyTime.Store(time.Now().UnixNano())
+	}
 	// Config
 	debug.Assert(cm.Config != nil)
 	if err := p.receiveConfig(cm.Config, msg, nil, caller); err != nil {
@@ -466,7 +478,7 @@ func (p *proxy) easyURLHandler(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = apc.URLPathBuckets.S
 		if r.URL.RawQuery == "" {
 			qbck := cmn.QueryBcks{Provider: provider}
-			query := qbck.AddToQuery(nil)
+			query := qbck.NewQuery()
 			r.URL.RawQuery = query.Encode()
 		} else if !strings.Contains(r.URL.RawQuery, apc.QparamProvider) {
 			r.URL.RawQuery += "&" + apc.QparamProvider + "=" + provider
@@ -497,7 +509,7 @@ func (p *proxy) easyURLHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.URL.RawQuery == "" {
-		query := bck.AddToQuery(nil)
+		query := bck.NewQuery()
 		r.URL.RawQuery = query.Encode()
 	} else if !strings.Contains(r.URL.RawQuery, apc.QparamProvider) {
 		r.URL.RawQuery += "&" + apc.QparamProvider + "=" + bck.Provider
@@ -634,15 +646,15 @@ func (p *proxy) httpobjget(w http.ResponseWriter, r *http.Request, origURLBck ..
 
 	// 3. redirect
 	smap := p.owner.smap.get()
-	si, err := cluster.HrwTarget(bck.MakeUname(objName), &smap.Smap)
+	tsi, err := cluster.HrwTarget(bck.MakeUname(objName), &smap.Smap)
 	if err != nil {
 		p.writeErr(w, r, err)
 		return
 	}
 	if cmn.FastV(5, cos.SmoduleAIS) {
-		nlog.Infof("%s %s => %s", r.Method, bck.Cname(objName), si.StringEx())
+		nlog.Infoln("GET " + bck.Cname(objName) + " => " + tsi.String())
 	}
-	redirectURL := p.redirectURL(r, si, time.Now() /*started*/, cmn.NetIntraData)
+	redirectURL := p.redirectURL(r, tsi, time.Now() /*started*/, cmn.NetIntraData)
 	http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
 
 	// 4. stats
@@ -684,36 +696,44 @@ func (p *proxy) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRe
 	bckArgs.bck, bckArgs.dpq = apireq.bck, apireq.dpq
 	bck, err := bckArgs.initAndTry()
 	freeInitBckArgs(bckArgs)
-
-	objName := apireq.items[1]
 	if err != nil {
 		return
 	}
 
 	// 3. redirect
 	var (
-		si      *meta.Snode
+		tsi     *meta.Snode
 		smap    = p.owner.smap.get()
 		started = time.Now()
+		objName = apireq.items[1]
 	)
 	if nodeID == "" {
-		si, err = cluster.HrwTarget(bck.MakeUname(objName), &smap.Smap)
+		tsi, err = cluster.HrwTarget(bck.MakeUname(objName), &smap.Smap)
 		if err != nil {
 			p.writeErr(w, r, err)
 			return
 		}
 	} else {
-		si = smap.GetTarget(nodeID)
-		if si == nil {
-			err = &errNodeNotFound{"PUT failure", nodeID, p.si, smap}
+		if tsi = smap.GetTarget(nodeID); tsi == nil {
+			err = &errNodeNotFound{"PUT failure:", nodeID, p.si, smap}
 			p.writeErr(w, r, err)
 			return
 		}
 	}
+
+	// verbose
 	if cmn.FastV(5, cos.SmoduleAIS) {
-		nlog.Infof("%s %s => %s (append: %v)", r.Method, bck.Cname(objName), si.StringEx(), appendTyProvided)
+		verb, s := "PUT", ""
+		if appendTyProvided {
+			verb = "APPEND"
+		}
+		if bck.Props.Mirror.Enabled {
+			s = " (put-mirror)"
+		}
+		nlog.Infof("%s %s => %s%s", verb, bck.Cname(objName), tsi, s)
 	}
-	redirectURL := p.redirectURL(r, si, started, cmn.NetIntraData)
+
+	redirectURL := p.redirectURL(r, tsi, started, cmn.NetIntraData)
 	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 
 	// 4. stats
@@ -739,15 +759,15 @@ func (p *proxy) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	smap := p.owner.smap.get()
-	si, err := cluster.HrwTarget(bck.MakeUname(objName), &smap.Smap)
+	tsi, err := cluster.HrwTarget(bck.MakeUname(objName), &smap.Smap)
 	if err != nil {
 		p.writeErr(w, r, err)
 		return
 	}
 	if cmn.FastV(5, cos.SmoduleAIS) {
-		nlog.Infof("%s %s => %s", r.Method, bck.Cname(objName), si.StringEx())
+		nlog.Infoln("DELETE " + bck.Cname(objName) + " => " + tsi.String())
 	}
-	redirectURL := p.redirectURL(r, si, time.Now() /*started*/, cmn.NetIntraControl)
+	redirectURL := p.redirectURL(r, tsi, time.Now() /*started*/, cmn.NetIntraControl)
 	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 
 	p.statsT.Inc(stats.DeleteCount)
@@ -937,15 +957,22 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	p.uptime2hdr(w.Header())
 
-	query := r.URL.Query()
-	prr := cos.IsParseBool(query.Get(apc.QparamPrimaryReadyReb))
+	var (
+		prr, getCii, askPrimary bool
+	)
+	if r.URL.RawQuery != "" {
+		query := r.URL.Query()
+		prr = cos.IsParseBool(query.Get(apc.QparamPrimaryReadyReb))
+		getCii = cos.IsParseBool(query.Get(apc.QparamClusterInfo))
+		askPrimary = cos.IsParseBool(query.Get(apc.QparamAskPrimary))
+	}
+
 	if !prr {
-		if responded := p.healthByExternalWD(w, r); responded {
+		if responded := p.externalWD(w, r); responded {
 			return
 		}
 	}
 	// piggy-backing cluster info on health
-	getCii := cos.IsParseBool(query.Get(apc.QparamClusterInfo))
 	if getCii {
 		debug.Assert(!prr)
 		cii := &clusterInfo{}
@@ -958,10 +985,16 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 		p.writeErr(w, r, err, http.StatusServiceUnavailable)
 		return
 	}
+
+	callerID := r.Header.Get(apc.HdrCallerID)
+	if smap.GetProxy(callerID) != nil {
+		p.keepalive.heardFrom(callerID)
+	}
+
 	// primary
 	if smap.isPrimary(p.si) {
 		if prr {
-			if err := p.pready(smap); err != nil {
+			if err := p.pready(smap, true); err != nil {
 				if cmn.FastV(5, cos.SmoduleAIS) {
 					p.writeErr(w, r, err, http.StatusServiceUnavailable)
 				} else {
@@ -979,7 +1012,7 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if prr || cos.IsParseBool(query.Get(apc.QparamAskPrimary)) {
+	if prr || askPrimary {
 		caller := r.Header.Get(apc.HdrCallerName)
 		p.writeErrf(w, r, "%s (non-primary): misdirected health-of-primary request from %s, %s",
 			p, caller, smap.StringEx())
@@ -1131,6 +1164,9 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 			p.writeErr(w, r, err)
 			return
 		}
+		if err := p.checkAccess(w, r, nil, apc.AceMoveBucket); err != nil {
+			return
+		}
 		nlog.Infof("%s bucket %s => %s", msg.Action, bckFrom, bckTo)
 		if xid, err = p.renameBucket(bckFrom, bckTo, msg); err != nil {
 			p.writeErr(w, r, err)
@@ -1175,6 +1211,9 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		}
 		if errCode == http.StatusNotFound {
 			if p.forwardCP(w, r, msg, bucket) { // to create
+				return
+			}
+			if err := p.checkAccess(w, r, nil, apc.AceCreateBucket); err != nil {
 				return
 			}
 			nlog.Warningf("%s: dst %s doesn't exist and will be created with the src (%s) props", p, bckTo, bck)
@@ -1235,6 +1274,9 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 			}
 			if errCode == http.StatusNotFound {
 				if p.forwardCP(w, r, msg, bucket) { // to create
+					return
+				}
+				if err := p.checkAccess(w, r, nil, apc.AceCreateBucket); err != nil {
 					return
 				}
 				nlog.Warningf("%s: dst %s doesn't exist and will be created with src %s props", p, bck, bckTo)
@@ -1333,8 +1375,34 @@ func (p *proxy) _bcr(w http.ResponseWriter, r *http.Request, query url.Values, m
 			errors.New("property 'extra.hdfs.ref_directory' must be specified when creating HDFS bucket"))
 		return
 	}
-	// remote: check existence and get (cloud) props
+
 	if bck.IsRemote() {
+		// (feature) add Cloud bucket to BMD, to further set its `Props.Extra`
+		// with alternative access profile and/or endpoint
+		// TODO:
+		// change bucket props - and the BMD meta-version - to have Flags int64 for
+		// the bits that'll include "renamed" (instead of the current `Props.Renamed`)
+		// and "added-with-no-head"; use the latter to synchronize Cloud props once
+		// connected
+		if cos.IsParseBool(query.Get(apc.QparamDontHeadRemote)) {
+			if !bck.IsCloud() {
+				p.writeErr(w, r, cmn.NewErrUnsupp("skip lookup for the", bck.Provider+":// bucket"))
+				return
+			}
+			msg.Action = apc.ActAddRemoteBck // NOTE: substituting action in the message
+
+			// NOTE: inherit cluster defaults
+			config := cmn.GCO.Get()
+			bprops := bck.Bucket().DefaultProps(&config.ClusterConfig)
+			bprops.SetProvider(bck.Provider)
+
+			if err := p._createBucketWithProps(msg, bck, bprops); err != nil {
+				p.writeErr(w, r, err, crerrStatus(err))
+			}
+			return
+		}
+
+		// remote: check existence and get (cloud) props
 		rhdr, statusCode, err := p.headRemoteBck(bck.RemoteBck(), nil)
 		if err != nil {
 			if bck.IsCloud() {
@@ -1347,8 +1415,7 @@ func (p *proxy) _bcr(w http.ResponseWriter, r *http.Request, query url.Values, m
 			return
 		}
 		remoteHdr = rhdr
-		// NOTE: substituting action in the message
-		msg.Action = apc.ActAddRemoteBck
+		msg.Action = apc.ActAddRemoteBck // ditto
 	}
 	// props-to-update at creation time
 	if msg.Value != nil {
@@ -1498,11 +1565,17 @@ func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	}
 	debug.Assert(lst != nil)
 
+	var ok bool
 	if strings.Contains(r.Header.Get(cos.HdrAccept), cos.ContentMsgPack) {
-		if !p.writeMsgPack(w, lst, lsotag) {
-			return
+		ok = p.writeMsgPack(w, lst, lsotag)
+	} else {
+		ok = p.writeJS(w, r, lst, lsotag)
+	}
+	if !ok {
+		// TODO -- FIXME: abort x-lso (e.g., `ls very-large-cloud-bucket` followed by Ctrl-C)
+		if false {
+			p._lstop(amsg, lst)
 		}
-	} else if !p.writeJS(w, r, lst, lsotag) {
 		return
 	}
 
@@ -1517,6 +1590,27 @@ func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	)
 }
 
+func (p *proxy) _lstop(amsg *apc.ActMsg, lst *cmn.LsoResult) {
+	body := cos.MustMarshal(apc.ActMsg{Action: apc.ActXactStop, Value: xact.ArgsMsg{ID: lst.UUID, Kind: amsg.Action}})
+	args := allocBcArgs()
+	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: apc.URLPathXactions.S, Body: body}
+	args.to = cluster.Targets
+	results := p.bcastGroup(args)
+	freeBcArgs(args)
+	ok := true
+	for _, res := range results {
+		if res.err != nil {
+			ok = false
+			nlog.Warningf("failed to stop %s[%s]: %v", amsg.Action, lst.UUID, res.toErr())
+			break
+		}
+	}
+	freeBcastRes(results)
+	if ok {
+		nlog.Infof("stopped %s[%s]", amsg.Action, lst.UUID)
+	}
+}
+
 // list-objects flow control helper
 func (p *proxy) _lsofc(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (tsi *meta.Snode, listRemote, wantOnlyRemote bool, err error) {
 	listRemote = bck.IsRemote() && !lsmsg.IsFlagSet(apc.LsObjCached)
@@ -1529,7 +1623,7 @@ func (p *proxy) _lsofc(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (tsi *meta
 	if lsmsg.SID != "" {
 		tsi = smap.GetTarget(lsmsg.SID)
 		if tsi == nil || tsi.InMaintOrDecomm() {
-			err = &errNodeNotFound{lsotag + " failure", lsmsg.SID, p.si, smap}
+			err = &errNodeNotFound{lsotag + " failure:", lsmsg.SID, p.si, smap}
 			nlog.Errorln(err)
 			if smap.CountActiveTs() == 1 {
 				// (walk an extra mile)
@@ -1605,7 +1699,7 @@ func (p *proxy) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *apiR
 		if args.DaemonID != "" {
 			smap := p.owner.smap.get()
 			if tsi = smap.GetTarget(args.DaemonID); tsi == nil {
-				err := &errNodeNotFound{apc.ActPromote + " failure", args.DaemonID, p.si, smap}
+				err := &errNodeNotFound{apc.ActPromote + " failure:", args.DaemonID, p.si, smap}
 				p.writeErr(w, r, err)
 				return
 			}
@@ -1857,7 +1951,7 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 		}
 		return true
 	}
-	if p.inPrimaryTransition.Load() {
+	if p.settingNewPrimary.Load() {
 		p.writeErrStatusf(w, r, http.StatusServiceUnavailable,
 			"%s is in transition, cannot process the request", p.si)
 		return true
@@ -2141,7 +2235,7 @@ func (p *proxy) lsObjsA(bck *meta.Bck, lsmsg *apc.LsoMsg) (allEntries *cmn.LsoRe
 	args.req = cmn.HreqArgs{
 		Method: http.MethodGet,
 		Path:   apc.URLPathBuckets.Join(bck.Name),
-		Query:  bck.AddToQuery(nil),
+		Query:  bck.NewQuery(),
 		Body:   cos.MustMarshal(aisMsg),
 	}
 	args.timeout = apc.LongTimeout
@@ -2208,7 +2302,7 @@ func (p *proxy) lsObjsR(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX, tsi *meta
 	args.req = cmn.HreqArgs{
 		Method: http.MethodGet,
 		Path:   apc.URLPathBuckets.Join(bck.Name),
-		Query:  bck.AddToQuery(nil),
+		Query:  bck.NewQuery(),
 		Body:   cos.MustMarshal(aisMsg),
 	}
 
@@ -2378,7 +2472,7 @@ func (p *proxy) reverseHandler(w http.ResponseWriter, r *http.Request) {
 	// after having lost all mountpaths.
 	nodeURL := r.Header.Get(apc.HdrNodeURL)
 	if nodeURL == "" {
-		err = &errNodeNotFound{"cannot rproxy", nodeID, p.si, smap}
+		err = &errNodeNotFound{"cannot rproxy to", nodeID, p.si, smap}
 		p.writeErr(w, r, err, http.StatusNotFound)
 		return
 	}
@@ -2715,7 +2809,7 @@ func (p *proxy) daeSetPrimary(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	force := cos.IsParseBool(query.Get(apc.QparamForce))
 
-	// forceful primary change
+	// force primary change
 	if force && apiItems[0] == apc.Proxy {
 		if smap := p.owner.smap.get(); !smap.isPrimary(p.si) {
 			p.writeErr(w, r, newErrNotPrimary(p.si, smap))
@@ -2895,6 +2989,9 @@ func (p *proxy) dsortHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if errCode == http.StatusNotFound {
+				if err := p.checkAccess(w, r, nil, apc.AceCreateBucket); err != nil {
+					return
+				}
 				naction := "dsort-create-output-bck"
 				warnfmt := "%s: %screate 'output_bck' %s with the 'input_bck' (%s) props"
 				if p.forwardCP(w, r, nil /*msg*/, naction, body /*orig body*/) { // to create
@@ -2944,7 +3041,7 @@ func (p *proxy) rootHandler(w http.ResponseWriter, r *http.Request) {
 	// with `/` root reserved for vanilla http locations via ht:// mechanism
 	config := cmn.GCO.Get()
 	cmn.Features = config.Features
-	if !cmn.Features.IsSet(feat.ProvideS3APIViaRoot) {
+	if !cmn.Features.IsSet(feat.ProvideS3APIviaRoot) {
 		p.htHandler(w, r)
 		return
 	}
@@ -3036,10 +3133,7 @@ func (p *proxy) _remais(newConfig *cmn.ClusterConfig, blocking bool) {
 		retries = 1
 	} else {
 		maxsleep := newConfig.Timeout.MaxKeepalive.D()
-		clutime := mono.Since(p.startup.cluster.Load())
-		if clutime < maxsleep {
-			sleep = 4 * maxsleep
-		} else if clutime < newConfig.Timeout.Startup.D() {
+		if uptime := p.keepalive.cluUptime(mono.NanoTime()); uptime < maxsleep {
 			sleep = 2 * maxsleep
 		}
 	}
@@ -3380,6 +3474,6 @@ func (p *proxy) notifyCandidate(npsi *meta.Snode, smap *smapX) {
 		return
 	}
 	req.Header.Set(apc.HdrCallerID, p.SID())
-	req.Header.Set(apc.HdrCallerSmapVersion, smap.vstr)
+	req.Header.Set(apc.HdrCallerSmapVer, smap.vstr)
 	p.client.control.Do(req) //nolint:bodyclose // exiting
 }

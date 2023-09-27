@@ -50,10 +50,10 @@ const (
 	fmtOutside          = "%s is present (vs requested 'flt-outside'(%d))"
 )
 
-// intra-cluster JSON control
+// intra-cluster control messages
 type (
 	// cluster-wide control information - replicated, versioned, and synchronized
-	// usages: primary election, join-cluster
+	// usage: elect new primary, join cluster, ...
 	cluMeta struct {
 		Smap           *smapX        `json:"smap"`
 		BMD            *bucketMD     `json:"bmd"`
@@ -61,6 +61,7 @@ type (
 		EtlMD          *etlMD        `json:"etlMD"`
 		Config         *globalConfig `json:"config"`
 		SI             *meta.Snode   `json:"si"`
+		PrimeTime      int64         `json:"prime_time"`
 		VoteInProgress bool          `json:"voting"`
 		// target only
 		RebInterrupted bool `json:"reb_interrupted"`
@@ -168,7 +169,7 @@ type (
 		timeout           time.Duration  // call timeout
 		to                int            // (all targets, all proxies, all nodes) enum
 		nodeCount         int            // m.b. greater or equal destination count
-		ignoreMaintenance bool           // do not skip nodes under maintenance
+		ignoreMaintenance bool           // do not skip nodes in maintenance mode
 		async             bool           // ignore results
 	}
 
@@ -189,6 +190,7 @@ type (
 		skipConfig    bool
 		skipEtlMD     bool
 		fillRebMarker bool
+		skipPrimeTime bool
 	}
 
 	getMaxCii struct {
@@ -267,6 +269,7 @@ var (
 	errRebalanceDisabled = errors.New("rebalance is disabled")
 	errForwarded         = errors.New("forwarded")
 	errSendingResp       = errors.New("err-sending-resp")
+	errFastKalive        = errors.New("cannot fast-keepalive")
 )
 
 // BMD uuid errs
@@ -277,7 +280,7 @@ func (e *errBmdUUIDSplit) Error() string     { return e.detail }
 func (e *errPrxBmdUUIDDiffer) Error() string { return e.detail }
 func (e *errSmapUUIDDiffer) Error() string   { return e.detail }
 func (e *errNodeNotFound) Error() string {
-	return fmt.Sprintf("%s: %s node %s (not present in the %s)", e.si, e.msg, e.id, e.smap)
+	return fmt.Sprintf("%s: %s node %s not present in the %s", e.si, e.msg, e.id, e.smap)
 }
 
 /////////////////////
@@ -602,7 +605,7 @@ retry:
 	}
 	if errors.Is(err, syscall.EADDRINUSE) && !retried {
 		nlog.Warningf("%q - shutting-down-and-restarting or else? will retry once...", err)
-		time.Sleep(cos.MaxDuration(5*time.Second, config.Timeout.MaxKeepalive.D()))
+		time.Sleep(max(5*time.Second, config.Timeout.MaxKeepalive.D()))
 		retried = true
 		goto retry
 	}

@@ -8,8 +8,8 @@ package ios
 import (
 	"fmt"
 	"sync"
+	ratomic "sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
@@ -58,8 +58,8 @@ type (
 		mpath2disks map[string]FsDisks
 		disk2mpath  cos.StrKVs
 		disk2sysfn  cos.StrKVs
-		lsblk       atomic.Pointer
-		cache       atomic.Pointer
+		lsblk       ratomic.Pointer[LsBlk]
+		cache       ratomic.Pointer[cache]
 		cacheHst    [16]*cache
 		cacheIdx    int
 		mu          sync.Mutex
@@ -105,14 +105,14 @@ func New(num int) IOS {
 
 	// once (cleared via Clblk)
 	if res := lsblk("new-ios", true); res != nil {
-		ios.lsblk.Store(unsafe.Pointer(res))
+		ios.lsblk.Store(res)
 	}
 	return ios
 }
 
 func Clblk(i IOS) {
 	ios := i.(*ios)
-	ios.lsblk.Store(unsafe.Pointer(nil))
+	ios.lsblk.Store(nil)
 }
 
 func newCache(num int) *cache {
@@ -133,15 +133,15 @@ func newCache(num int) *cache {
 	}
 }
 
-func (ios *ios) _get() *cache      { return (*cache)(ios.cache.Load()) }
-func (ios *ios) _put(cache *cache) { ios.cache.Store(unsafe.Pointer(cache)) }
+func (ios *ios) _get() *cache      { return ios.cache.Load() }
+func (ios *ios) _put(cache *cache) { ios.cache.Store(cache) }
 
 //
 // add mountpath
 //
 
 func (ios *ios) AddMpath(mpath, fs string, testingEnv bool) (fsdisks FsDisks, err error) {
-	if pres := (*LsBlk)(ios.lsblk.Load()); pres != nil {
+	if pres := ios.lsblk.Load(); pres != nil {
 		res := *pres
 		fsdisks = fs2disks(&res, fs, testingEnv)
 	} else {
@@ -305,8 +305,8 @@ func (ios *ios) doRefresh(nowTs int64) *cache {
 		expireTime = int64(config.Disk.IostatTimeShort)
 	} else { // use the maximum utilization to determine expiration time
 		var (
-			lowm      = cos.MaxI64(config.Disk.DiskUtilLowWM, 1)
-			hiwm      = cos.MinI64(config.Disk.DiskUtilHighWM, 100)
+			lowm      = max(config.Disk.DiskUtilLowWM, 1)
+			hiwm      = min(config.Disk.DiskUtilHighWM, 100)
 			delta     = int64(config.Disk.IostatTimeLong - config.Disk.IostatTimeShort)
 			utilRatio = cos.RatioPct(hiwm, lowm, maxUtil)
 		)
@@ -422,7 +422,7 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 				break
 			}
 			ncache.mpathUtilRO.Set(mpath, u)
-			maxUtil = cos.MaxI64(maxUtil, u)
+			maxUtil = max(maxUtil, u)
 		}
 		return
 	}
@@ -436,7 +436,7 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 		u := cos.DivRound(ncache.mpathUtil[mpath], num)
 		ncache.mpathUtil[mpath] = u
 		ncache.mpathUtilRO.Set(mpath, u)
-		maxUtil = cos.MaxI64(maxUtil, u)
+		maxUtil = max(maxUtil, u)
 	}
 	return
 }

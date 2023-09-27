@@ -76,7 +76,6 @@ type ioContext struct {
 	numPutErrs int
 }
 
-//nolint:unparam // occasionally using cleanup == false to debug
 func (m *ioContext) initAndSaveState(cleanup bool) {
 	m.init(cleanup)
 	m.saveCluState(m.proxyURL)
@@ -293,7 +292,7 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 	tassert.CheckFatal(m.t, err)
 
 	for i := 0; i < objCnt; i++ {
-		r, err := readers.NewRandReader(int64(m.fileSize), p.Cksum.Type)
+		r, err := readers.NewRand(int64(m.fileSize), p.Cksum.Type)
 		tassert.CheckFatal(m.t, err)
 
 		var objName string
@@ -376,8 +375,10 @@ func isContextDeadline(err error) bool {
 // bucket cleanup
 // is called in a variety of ways including (post-test) t.Cleanup => _cleanup()
 // and (pre-test) via deleteRemoteBckObjs
+
+const maxDelObjErrCount = 100
+
 func (m *ioContext) del(opts ...int) {
-	const maxErrCount = 100
 	var (
 		herr        *cmn.ErrHTTP
 		toRemoveCnt = -1 // remove all or opts[0]
@@ -434,55 +435,80 @@ func (m *ioContext) del(opts ...int) {
 	if toRemoveCnt >= 0 {
 		toRemove = toRemove[:toRemoveCnt]
 	}
-	if len(toRemove) == 0 {
+	l := len(toRemove)
+	if l == 0 {
 		return
 	}
-	tlog.Logf("deleting %d objects...\n", len(toRemove))
+	tlog.Logf("deleting %d object%s from %s\n", l, cos.Plural(l), m.bck.Cname(""))
 	var (
 		errCnt atomic.Int64
-		wg     = cos.NewLimitedWaitGroup(16, 0)
+		wg     = cos.NewLimitedWaitGroup(16, l)
 	)
 	for _, obj := range toRemove {
-		if errCnt.Load() > maxErrCount {
+		if errCnt.Load() > maxDelObjErrCount {
 			tassert.CheckFatal(m.t, errors.New("too many errors"))
 			break
 		}
 		wg.Add(1)
 		go func(obj *cmn.LsoEntry) {
-			defer wg.Done()
-			err := api.DeleteObject(baseParams, m.bck, obj.Name)
-			if err != nil {
-				switch {
-				case cmn.IsErrObjNought(err):
-					err = nil
-				case strings.Contains(err.Error(), "server closed idle connection"):
-					// see (unexported) http.exportErrServerClosedIdle in the Go source
-					err = nil
-				case strings.Contains(err.Error(), "try again"):
-					// aws-error[InternalError: We encountered an internal error. Please try again.]
-					time.Sleep(time.Second)
-					err = api.DeleteObject(baseParams, m.bck, obj.Name)
-				case cos.IsErrConnectionNotAvail(err):
-					errCnt.Add(maxErrCount / 10)
-				default:
-					errCnt.Inc()
-				}
-			}
-			tassert.CheckError(m.t, err)
+			m._delOne(baseParams, obj, &errCnt)
+			wg.Done()
 		}(obj)
 	}
 	wg.Wait()
 }
 
-func (m *ioContext) get(baseParams api.BaseParams, idx, totalGets int, validate bool) {
+func (m *ioContext) _delOne(baseParams api.BaseParams, obj *cmn.LsoEntry, errCnt *atomic.Int64) {
+	err := api.DeleteObject(baseParams, m.bck, obj.Name)
+	if err == nil {
+		return
+	}
+	//
+	// excepting benign (TODO: rid of strings.Contains)
+	//
+	const sleepRetry = 2 * time.Second
+	e := strings.ToLower(err.Error())
+	switch {
+	case cmn.IsErrObjNought(err):
+		return
+	case strings.Contains(e, "server closed idle connection"):
+		return // see (unexported) http.exportErrServerClosedIdle in the Go source
+	case cos.IsErrConnectionNotAvail(err):
+		errCnt.Add(maxDelObjErrCount/10 - 1)
+	// retry
+	case m.bck.IsCloud() && (cos.IsErrConnectionReset(err) || strings.Contains(e, "reset by peer")):
+		time.Sleep(sleepRetry)
+		err = api.DeleteObject(baseParams, m.bck, obj.Name)
+	case m.bck.IsCloud() && strings.Contains(e, "try again"):
+		// aws-error[InternalError: We encountered an internal error. Please try again.]
+		time.Sleep(sleepRetry)
+		err = api.DeleteObject(baseParams, m.bck, obj.Name)
+	case m.bck.IsCloud() && apc.ToScheme(m.bck.Provider) == apc.GSScheme &&
+		strings.Contains(e, "gateway") && strings.Contains(e, "timeout"):
+		// e.g:. "googleapi: Error 504: , gatewayTimeout" (where the gateway is in fact LB)
+		time.Sleep(sleepRetry)
+		err = api.DeleteObject(baseParams, m.bck, obj.Name)
+	}
+
+	if err == nil || cmn.IsErrObjNought(err) {
+		return
+	}
+	errCnt.Inc()
+	if m.bck.IsCloud() && errCnt.Load() < 5 {
+		tlog.Logf("Warning: failed to cleanup %s: %v\n", m.bck.Cname(""), err)
+	}
+	tassert.CheckError(m.t, err)
+}
+
+func (m *ioContext) get(baseParams api.BaseParams, idx, totalGets int, getArgs *api.GetArgs, validate bool) {
 	var (
 		err     error
 		objName = m.objNames[idx%len(m.objNames)]
 	)
 	if validate {
-		_, err = api.GetObjectWithValidation(baseParams, m.bck, objName, nil)
+		_, err = api.GetObjectWithValidation(baseParams, m.bck, objName, getArgs)
 	} else {
-		_, err = api.GetObject(baseParams, m.bck, objName, nil)
+		_, err = api.GetObject(baseParams, m.bck, objName, getArgs)
 	}
 	if err != nil {
 		if m.getErrIsFatal {
@@ -502,25 +528,18 @@ func (m *ioContext) get(baseParams api.BaseParams, idx, totalGets int, validate 
 	}
 
 	// Tell other tasks they can begin to do work in parallel
-	if totalGets > 0 && idx == totalGets/2 { // only for `m.gets()`
+	if totalGets > 0 && idx == totalGets/2 { // only for `m.gets(nil, false)`
 		for i := 0; i < m.otherTasksToTrigger; i++ {
 			m.controlCh <- struct{}{}
 		}
 	}
 }
 
-func (m *ioContext) gets(withValidation ...bool) {
+func (m *ioContext) gets(getArgs *api.GetArgs, withValidation bool) {
 	var (
 		baseParams = tools.BaseAPIParams()
 		totalGets  = m.num * m.numGetsEachFile
-		wg         = cos.NewLimitedWaitGroup(50, 0)
-		validate   bool
 	)
-
-	if len(withValidation) > 0 {
-		validate = withValidation[0]
-	}
-
 	if !m.silent {
 		if m.numGetsEachFile == 1 {
 			tlog.Logf("GET %d objects from %s\n", m.num, m.bck)
@@ -528,12 +547,12 @@ func (m *ioContext) gets(withValidation ...bool) {
 			tlog.Logf("GET %d objects %d times from %s\n", m.num, m.numGetsEachFile, m.bck)
 		}
 	}
-
+	wg := cos.NewLimitedWaitGroup(20, 0)
 	for i := 0; i < totalGets; i++ {
 		wg.Add(1)
 		go func(idx int) {
-			defer wg.Done()
-			m.get(baseParams, idx, totalGets, validate)
+			m.get(baseParams, idx, totalGets, getArgs, withValidation)
+			wg.Done()
 		}(i)
 	}
 	wg.Wait()
@@ -543,7 +562,7 @@ func (m *ioContext) getsUntilStop() {
 	var (
 		idx        = 0
 		baseParams = tools.BaseAPIParams()
-		wg         = cos.NewLimitedWaitGroup(40, 0)
+		wg         = cos.NewLimitedWaitGroup(20, 0)
 	)
 	for {
 		select {
@@ -554,7 +573,7 @@ func (m *ioContext) getsUntilStop() {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				m.get(baseParams, idx, 0, false /*validate*/)
+				m.get(baseParams, idx, 0, nil /*api.GetArgs*/, false /*validate*/)
 			}(idx)
 			idx++
 			if idx%5000 == 0 {
@@ -876,7 +895,7 @@ func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType str
 		keyName := fmt.Sprintf("%s/%s", prefixDir, fileName)
 
 		// NOTE: Since this test is to test prefix fetch, the reader type is ignored, always use rand reader.
-		r, err := readers.NewRandReader(fileSize, cksumType)
+		r, err := readers.NewRand(fileSize, cksumType)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -892,7 +911,7 @@ func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType str
 	for _, fName := range extraNames {
 		keyName := fmt.Sprintf("%s/%s", prefixDir, fName)
 		// NOTE: Since this test is to test prefix fetch, the reader type is ignored, always use rand reader.
-		r, err := readers.NewRandReader(fileSize, cksumType)
+		r, err := readers.NewRand(fileSize, cksumType)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1033,10 +1052,10 @@ func initFS() {
 	config.Backend = cfg.Backend
 	cmn.GCO.CommitUpdate(config)
 
-	_ = fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
-	_ = fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
-	_ = fs.CSM.Reg(fs.ECSliceType, &fs.ECSliceContentResolver{})
-	_ = fs.CSM.Reg(fs.ECMetaType, &fs.ECMetaContentResolver{})
+	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
+	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
+	fs.CSM.Reg(fs.ECSliceType, &fs.ECSliceContentResolver{})
+	fs.CSM.Reg(fs.ECMetaType, &fs.ECMetaContentResolver{})
 }
 
 func initMountpaths(t *testing.T, proxyURL string) {

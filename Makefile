@@ -21,8 +21,8 @@ CLI_VERSION := $(shell ais version 2>/dev/null)
 MAKEFLAGS += --no-print-directory
 
 # Uncomment to cross-compile aisnode and cli, respectively:
-# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.20
-# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.20
+# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.21
+# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.21
 
 # Build version, flags, and tags
 VERSION = $(shell git rev-parse --short HEAD)
@@ -93,9 +93,9 @@ term-reset = $(shell { tput sgr0 || tput me; } 2>/dev/null)
 $(call make-lazy,cyan)
 $(call make-lazy,term-reset)
 
-.PHONY: all node cli cli-autocompletions aisfs authn aisloader xmeta
+.PHONY: all node cli cli-autocompletions authn aisloader xmeta
 
-all: node cli aisfs authn aisloader ## Build all main binaries
+all: node cli authn aisloader ## Build all main binaries
 
 node: ## Build 'aisnode' binary
 	@echo "Building aisnode $(VERSION) [build tags:$(BUILD_TAGS)]"
@@ -143,12 +143,6 @@ else
 endif
 	@echo "done."
 
-## Build 'aisfs' binary (experimental)
-aisfs:
-	@echo -n "Building aisfs..."
-	@cd $(BUILD_DIR)/aisfs && go build -o $(BUILD_DEST)/aisfs $(BUILD_FLAGS) $(LDFLAGS) *.go
-	@echo "   done."
-
 #
 # local deployment (intended for developers)
 #
@@ -185,13 +179,12 @@ clean: ## Remove all AIS related files and binaries
 	@echo "done."
 
 #
-# go modules
+# modules
 #
 .PHONY: mod-all mod-clean mod-tidy
 
 mod-all: mod-clean mod-tidy
 	@echo "CLI ..." && cd cmd/cli && $(MAKE) mod-tidy
-	@echo "aisfs ..." && cd cmd/aisfs && $(MAKE) mod-tidy
 
 # cleanup go-mod cache
 mod-clean:
@@ -238,7 +231,7 @@ test-long: test-envcheck ## Run all integration tests
 	@cd $(BUILD_DIR)/cli && go test -v -tags=debug ./...
 
 test-aisloader:
-	@./bench/aisloader/test/ci-test.sh $(FLAGS)
+	@./bench/tools/aisloader/test/ci-test.sh $(FLAGS)
 
 test-run: test-envcheck # runs tests matching a specific regex
 ifeq ($(RE),)
@@ -264,7 +257,7 @@ lint-update:
 ## See also: .github/workflows/lint.yml
 lint-update-ci:
 	@rm -f $(GOPATH)/bin/golangci-lint
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.52.2
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.54.2
 
 lint:
 	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true

@@ -45,7 +45,7 @@ func patchBprops(bp BaseParams, bck cmn.Bck, body []byte) (xid string, err error
 		reqParams.Path = path
 		reqParams.Body = body
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.AddToQuery(nil)
+		reqParams.Query = bck.NewQuery()
 	}
 	_, err = reqParams.doReqStr(&xid)
 	FreeRp(reqParams)
@@ -170,9 +170,13 @@ func hdr2msg(bck cmn.Bck, err error) error {
 //   - cmn.BucketPropsToUpdate (cmn/api.go)
 //
 // Bucket properties can be also changed at any time via SetBucketProps (above).
-func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BucketPropsToUpdate) error {
+func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BucketPropsToUpdate, dontHeadRemote ...bool) error {
 	if err := bck.Validate(); err != nil {
 		return err
+	}
+	q := make(url.Values, 4)
+	if len(dontHeadRemote) > 0 && dontHeadRemote[0] {
+		q.Set(apc.QparamDontHeadRemote, "true")
 	}
 	bp.Method = http.MethodPost
 	reqParams := AllocRp()
@@ -181,7 +185,7 @@ func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BucketPropsToUpdate) er
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActCreateBck, Value: props})
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.AddToQuery(nil)
+		reqParams.Query = bck.AddToQuery(q)
 	}
 	err := reqParams.DoRequest()
 	FreeRp(reqParams)
@@ -197,7 +201,7 @@ func DestroyBucket(bp BaseParams, bck cmn.Bck) error {
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActDestroyBck})
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.AddToQuery(nil)
+		reqParams.Query = bck.NewQuery()
 	}
 	err := reqParams.DoRequest()
 	FreeRp(reqParams)
@@ -228,7 +232,7 @@ func CopyBucket(bp BaseParams, bckFrom, bckTo cmn.Bck, msg *apc.CopyBckMsg, fltP
 	if err = bckTo.Validate(); err != nil {
 		return
 	}
-	q := bckFrom.AddToQuery(nil)
+	q := bckFrom.NewQuery()
 	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo)
 	if len(fltPresence) > 0 {
 		q.Set(apc.QparamFltPresence, strconv.Itoa(fltPresence[0]))
@@ -254,7 +258,7 @@ func RenameBucket(bp BaseParams, bckFrom, bckTo cmn.Bck) (xid string, err error)
 		return
 	}
 	bp.Method = http.MethodPost
-	q := bckFrom.AddToQuery(nil)
+	q := bckFrom.NewQuery()
 	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo)
 	reqParams := AllocRp()
 	{
@@ -302,7 +306,7 @@ func MakeNCopies(bp BaseParams, bck cmn.Bck, copies int) (xid string, err error)
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActMakeNCopies, Value: copies})
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.AddToQuery(nil)
+		reqParams.Query = bck.NewQuery()
 	}
 	_, err = reqParams.doReqStr(&xid)
 	FreeRp(reqParams)
@@ -326,7 +330,7 @@ func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int) (xid string, e
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActECEncode, Value: ecConf})
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.AddToQuery(nil)
+		reqParams.Query = bck.NewQuery()
 	}
 	_, err = reqParams.doReqStr(&xid)
 	FreeRp(reqParams)

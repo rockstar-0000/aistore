@@ -16,8 +16,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/ext/dsort/extract"
+	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/sys"
@@ -138,7 +138,7 @@ func (c *rwConnector) connectReader(key string, r io.Reader, size int64) (err er
 	c.mu.Unlock()
 
 	if !all {
-		rw.sgl = mm.NewSGL(size)
+		rw.sgl = g.mm.NewSGL(size)
 		_, err = io.Copy(rw.sgl, r)
 		rw.wgr.Done()
 		return
@@ -157,9 +157,10 @@ func (c *rwConnector) connectWriter(key string, w io.Writer) (int64, error) {
 
 	timed, stopped := rw.wgr.WaitTimeoutWithStop(c.m.callTimeout, c.m.listenAborted()) // wait for reader
 	if timed {
-		return 0, errors.Errorf("wait for remote content has timed out (%q was waiting)", c.m.ctx.node.ID())
-	} else if stopped {
-		return 0, errors.Errorf("wait for remote content was aborted")
+		return 0, errors.Errorf("%s: timed out waiting for remote content", g.t)
+	}
+	if stopped {
+		return 0, errors.Errorf("%s: aborted waiting for remote content", g.t)
 	}
 
 	if all { // reader connected and left SGL with the content
@@ -187,11 +188,11 @@ func (ds *dsorterMem) init() error {
 	ds.creationPhase.requestedShards = make(chan string, 10000)
 
 	ds.creationPhase.adjuster.read = newConcAdjuster(
-		ds.m.pars.CreateConcMaxLimit,
+		ds.m.Pars.CreateConcMaxLimit,
 		1, /*goroutineLimitCoef*/
 	)
 	ds.creationPhase.adjuster.write = newConcAdjuster(
-		ds.m.pars.CreateConcMaxLimit,
+		ds.m.Pars.CreateConcMaxLimit,
 		1, /*goroutineLimitCoef*/
 	)
 	return nil
@@ -210,33 +211,35 @@ func (ds *dsorterMem) start() error {
 
 	trname := fmt.Sprintf(recvReqStreamNameFmt, ds.m.ManagerUUID)
 	reqSbArgs := bundle.Args{
-		Multiplier: ds.m.pars.SbundleMult,
+		Multiplier: ds.m.Pars.SbundleMult,
 		Net:        reqNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
+		Extra: &transport.Extra{
+			Config: config,
+		},
 	}
-	if err := transport.HandleObjStream(trname, ds.recvReq); err != nil {
+	if err := transport.Handle(trname, ds.recvReq); err != nil {
 		return errors.WithStack(err)
 	}
 
 	trname = fmt.Sprintf(recvRespStreamNameFmt, ds.m.ManagerUUID)
 	respSbArgs := bundle.Args{
-		Multiplier: ds.m.pars.SbundleMult,
+		Multiplier: ds.m.Pars.SbundleMult,
 		Net:        respNetwork,
 		Trname:     trname,
 		Ntype:      cluster.Targets,
 		Extra: &transport.Extra{
 			Compression: config.DSort.Compression,
 			Config:      config,
-			MMSA:        mm,
 		},
 	}
-	if err := transport.HandleObjStream(trname, ds.recvResp); err != nil {
+	if err := transport.Handle(trname, ds.recvResp); err != nil {
 		return errors.WithStack(err)
 	}
 
-	ds.streams.builder = bundle.New(ds.m.ctx.smapOwner, ds.m.ctx.node, client, reqSbArgs)
-	ds.streams.records = bundle.New(ds.m.ctx.smapOwner, ds.m.ctx.node, client, respSbArgs)
+	ds.streams.builder = bundle.New(g.t.Sowner(), g.t.Snode(), client, reqSbArgs)
+	ds.streams.records = bundle.New(g.t.Sowner(), g.t.Snode(), client, respSbArgs)
 	return nil
 }
 
@@ -287,8 +290,8 @@ func (ds *dsorterMem) preShardCreation(shardName string, mi *fs.Mountpath) error
 		shardName: shardName,
 	}
 	o := transport.AllocSend()
-	o.Hdr.Opaque = bsi.NewPack(ds.m.ctx.t.ByteMM())
-	if ds.m.smap.HasActiveTs(ds.m.ctx.t.SID() /*except*/) {
+	o.Hdr.Opaque = bsi.NewPack(g.t.ByteMM())
+	if ds.m.smap.HasActiveTs(g.t.SID() /*except*/) {
 		if err := ds.streams.builder.Send(o, nil); err != nil {
 			return err
 		}
@@ -302,7 +305,7 @@ func (ds *dsorterMem) postShardCreation(mi *fs.Mountpath) {
 	ds.creationPhase.adjuster.write.releaseSema(mi)
 }
 
-func (ds *dsorterMem) Load(w io.Writer, rec *extract.Record, obj *extract.RecordObj) (int64, error) {
+func (ds *dsorterMem) Load(w io.Writer, rec *shard.Record, obj *shard.RecordObj) (int64, error) {
 	if ds.m.aborted() {
 		return 0, newDSortAbortedError(ds.m.ManagerUUID)
 	}
@@ -342,7 +345,7 @@ func (ds *dsorterMem) createShardsLocally() error {
 	if err := mem.Get(); err != nil {
 		return err
 	}
-	maxMemoryToUse := calcMaxMemoryUsage(ds.m.pars.MaxMemUsage, &mem)
+	maxMemoryToUse := calcMaxMemoryUsage(ds.m.Pars.MaxMemUsage, &mem)
 	sa := newInmemShardAllocator(maxMemoryToUse - mem.ActualUsed)
 
 	// read
@@ -442,75 +445,49 @@ outer:
 	errCh <- group.Wait()
 }
 
-func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj, toNode *meta.Snode) (err error) {
+func (ds *dsorterMem) connectOrSend(rec *shard.Record, obj *shard.RecordObj, tsi *meta.Snode) error {
+	debug.Assert(g.t.SID() == rec.DaemonID, g.t.SID()+" vs "+rec.DaemonID)
 	var (
-		local = toNode.ID() == ds.m.ctx.node.ID()
-		req   = RemoteResponse{
-			Record:    rec,
-			RecordObj: obj,
+		resp = &dsmCS{
+			ds:  ds,
+			tsi: tsi,
+			rsp: RemoteResponse{Record: rec, RecordObj: obj},
 		}
-		beforeSend int64
+		fullContentPath = ds.m.recm.FullContentPath(obj)
 	)
-	fullContentPath := ds.m.recm.FullContentPath(obj)
-	ct, err := cluster.NewCTFromBO(&ds.m.pars.OutputBck, fullContentPath, nil)
-	if err != nil {
-		return
-	}
+	ct, err := cluster.NewCTFromBO(&ds.m.Pars.OutputBck, fullContentPath, nil)
 	ds.creationPhase.adjuster.read.acquireSema(ct.Mountpath())
-	defer ds.creationPhase.adjuster.read.releaseSema(ct.Mountpath())
+	defer func() {
+		if !resp.decRef {
+			ds.m.decrementRef(1)
+		}
+		ds.creationPhase.adjuster.read.releaseSema(ct.Mountpath())
+	}()
 
+	if err != nil {
+		return err
+	}
 	if ds.m.aborted() {
 		return newDSortAbortedError(ds.m.ManagerUUID)
 	}
 
-	if ds.m.Metrics.extended {
-		beforeSend = mono.NanoTime()
-	}
-
-	debug.Assert(ds.m.ctx.node.ID() == rec.DaemonID, ds.m.ctx.node.ID()+" vs "+rec.DaemonID)
-
-	if local {
-		defer ds.m.decrementRef(1)
-	}
-
-	opaque := cos.MustMarshal(req)
-	hdr := transport.ObjHdr{Opaque: opaque}
-	send := func(r cos.ReadOpenCloser) (err error) {
-		if local {
-			err = ds.creationPhase.connector.connectReader(rec.MakeUniqueName(obj), r, hdr.ObjAttrs.Size)
-			if ds.m.Metrics.extended {
-				dur := mono.Since(beforeSend)
-				ds.m.Metrics.Creation.mu.Lock()
-				ds.m.Metrics.Creation.LocalSendStats.updateTime(dur)
-				ds.m.Metrics.Creation.LocalSendStats.updateThroughput(hdr.ObjAttrs.Size, dur)
-				ds.m.Metrics.Creation.mu.Unlock()
-			}
-			cos.Close(r)
-		} else {
-			o := transport.AllocSend()
-			o.Hdr = hdr
-			o.Callback, o.CmplArg = ds.m.sentCallback, beforeSend
-			err = ds.streams.records.Send(o, r, toNode)
-		}
-		return
-	}
-
-	if ds.m.pars.DryRun {
+	resp.hdr.Opaque = cos.MustMarshal(resp.rsp)
+	if ds.m.Pars.DryRun {
 		lr := cos.NopReader(obj.MetadataSize + obj.Size)
 		r := cos.NopOpener(io.NopCloser(lr))
-		hdr.ObjAttrs.Size = obj.MetadataSize + obj.Size
-		return send(r)
+		resp.hdr.ObjAttrs.Size = obj.MetadataSize + obj.Size
+		return resp.connectOrSend(r)
 	}
 
 	switch obj.StoreType {
-	case extract.OffsetStoreType:
-		hdr.ObjAttrs.Size = obj.MetadataSize + obj.Size
-		r, err := cos.NewFileSectionHandle(fullContentPath, obj.Offset-obj.MetadataSize, hdr.ObjAttrs.Size)
+	case shard.OffsetStoreType:
+		resp.hdr.ObjAttrs.Size = obj.MetadataSize + obj.Size
+		r, err := cos.NewFileSectionHandle(fullContentPath, obj.Offset-obj.MetadataSize, resp.hdr.ObjAttrs.Size)
 		if err != nil {
 			return err
 		}
-		return send(r)
-	case extract.DiskStoreType:
+		return resp.connectOrSend(r)
+	case shard.DiskStoreType:
 		f, err := cos.NewFileHandle(fullContentPath)
 		if err != nil {
 			return err
@@ -520,11 +497,24 @@ func (ds *dsorterMem) sendRecordObj(rec *extract.Record, obj *extract.RecordObj,
 			cos.Close(f)
 			return err
 		}
-		hdr.ObjAttrs.Size = fi.Size()
-		return send(f)
+		resp.hdr.ObjAttrs.Size = fi.Size()
+		return resp.connectOrSend(f)
 	default:
 		debug.Assert(false, obj.StoreType)
 		return nil
+	}
+}
+
+func (ds *dsorterMem) sentCallback(_ transport.ObjHdr, rc io.ReadCloser, x any, err error) {
+	if sgl, ok := rc.(*memsys.SGL); ok {
+		sgl.Free()
+	}
+	ds.m.decrementRef(1)
+	if err != nil {
+		req := x.(*RemoteResponse)
+		nlog.Errorf("%s: [dsort] %s failed to send remore-rsp %s: %v - aborting...",
+			g.t, ds.m.ManagerUUID, req.Record.MakeUniqueName(req.RecordObj), err)
+		ds.m.abort(err)
 	}
 }
 
@@ -576,11 +566,6 @@ func (ds *dsorterMem) recvResp(hdr transport.ObjHdr, object io.Reader, err error
 		return err
 	}
 
-	var beforeSend int64
-	if ds.m.Metrics.extended {
-		beforeSend = mono.NanoTime()
-	}
-
 	if ds.m.aborted() {
 		return newDSortAbortedError(ds.m.ManagerUUID)
 	}
@@ -591,14 +576,6 @@ func (ds *dsorterMem) recvResp(hdr transport.ObjHdr, object io.Reader, err error
 		return err
 	}
 
-	if ds.m.Metrics.extended {
-		metrics := ds.m.Metrics.Creation
-		dur := mono.Since(beforeSend)
-		metrics.mu.Lock()
-		metrics.LocalRecvStats.updateTime(dur)
-		metrics.LocalRecvStats.updateThroughput(hdr.ObjAttrs.Size, dur)
-		metrics.mu.Unlock()
-	}
 	return nil
 }
 
@@ -612,7 +589,7 @@ func (ds *dsorterMem) onAbort()                    { _ = ds.cleanupStreams() }
 
 type dsmCreateShard struct {
 	ds    *dsorterMem
-	shard *extract.Shard
+	shard *shard.Shard
 	sa    *inmemShardAllocator
 }
 
@@ -631,27 +608,54 @@ func (cs *dsmCreateShard) do() (err error) {
 
 type dsmExtractShard struct {
 	ds    *dsorterMem
-	shard *extract.Shard
+	shard *shard.Shard
 }
 
 func (es *dsmExtractShard) do() error {
 	ds, shard := es.ds, es.shard
 	defer ds.creationPhase.adjuster.read.releaseGoroutineSema()
 
-	bck := meta.NewBck(ds.m.pars.OutputBck.Name, ds.m.pars.OutputBck.Provider, cmn.NsGlobal)
-	if err := bck.Init(ds.m.ctx.bmdOwner); err != nil {
+	bck := meta.NewBck(ds.m.Pars.OutputBck.Name, ds.m.Pars.OutputBck.Provider, cmn.NsGlobal)
+	if err := bck.Init(g.t.Bowner()); err != nil {
 		return err
 	}
-	toNode, err := cluster.HrwTarget(bck.MakeUname(shard.Name), ds.m.ctx.smapOwner.Get())
+	tsi, err := cluster.HrwTarget(bck.MakeUname(shard.Name), g.t.Sowner().Get())
 	if err != nil {
 		return err
 	}
 	for _, rec := range shard.Records.All() {
 		for _, obj := range rec.Objects {
-			if err := ds.sendRecordObj(rec, obj, toNode); err != nil {
+			if err := ds.connectOrSend(rec, obj, tsi); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+///////////
+// dsmCS //
+///////////
+
+type dsmCS struct {
+	ds     *dsorterMem
+	tsi    *meta.Snode
+	rsp    RemoteResponse
+	hdr    transport.ObjHdr
+	decRef bool
+}
+
+func (resp *dsmCS) connectOrSend(r cos.ReadOpenCloser) (err error) {
+	if resp.tsi.ID() == g.t.SID() {
+		uname := resp.rsp.Record.MakeUniqueName(resp.rsp.RecordObj)
+		err = resp.ds.creationPhase.connector.connectReader(uname, r, resp.hdr.ObjAttrs.Size)
+		cos.Close(r)
+	} else {
+		o := transport.AllocSend()
+		o.Hdr = resp.hdr
+		o.Callback, o.CmplArg = resp.ds.sentCallback, &resp.rsp
+		err = resp.ds.streams.records.Send(o, r, resp.tsi)
+		resp.decRef = true // sentCallback will call decrementRef
+	}
+	return
 }

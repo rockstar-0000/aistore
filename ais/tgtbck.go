@@ -35,7 +35,6 @@ import (
 
 // GET /v1/buckets[/bucket-name]
 func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
-	var bckName string
 	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathBuckets.L)
 	if err != nil {
 		return
@@ -46,6 +45,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 	}
 	t.ensureLatestBMD(msg, r)
 
+	var bckName string
 	if len(apiItems) > 0 {
 		bckName = apiItems[0]
 	}
@@ -237,7 +237,7 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 	if msg.SID != "" {
 		smap := t.owner.smap.get()
 		if smap.GetTarget(msg.SID) == nil {
-			err := &errNodeNotFound{"list-objects failure", msg.SID, t.si, smap}
+			err := &errNodeNotFound{"list-objects failure:", msg.SID, t.si, smap}
 			t.writeErr(w, r, err)
 			return
 		}
@@ -259,8 +259,7 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 	// run
 	xctn = rns.Entry.Get()
 	if !rns.IsRunning() {
-		go xctn.Run(nil)
-		runtime.Gosched()
+		xact.GoRunW(xctn)
 	}
 	xls := xctn.(*xs.LsoXact)
 
@@ -294,7 +293,6 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 func (t *target) bsumm(w http.ResponseWriter, r *http.Request, q url.Values, action string, bck *meta.Bck, msg *apc.BsummCtrlMsg) {
 	var (
 		taskAction = q.Get(apc.QparamTaskAction)
-		silent     = cos.IsParseBool(q.Get(apc.QparamSilent))
 	)
 	if taskAction == apc.TaskStart {
 		if action != apc.ActSummaryBck {
@@ -319,11 +317,7 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, q url.Values, act
 	// never started
 	if xctn == nil {
 		err := cos.NewErrNotFound("%s: x-%s[%s] (failed to start?)", t, apc.ActSummaryBck, msg.UUID)
-		if silent {
-			t.writeErr(w, r, err, http.StatusNotFound, Silent)
-		} else {
-			t.writeErr(w, r, err, http.StatusNotFound)
-		}
+		t._erris(w, r, q.Get(apc.QparamSilent), err, http.StatusNotFound)
 		return
 	}
 
@@ -512,11 +506,7 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 				t.writeErr(w, r, err, code, Silent)
 			} else {
 				err = cmn.NewErrFailedTo(t, "HEAD remote bucket", apireq.bck, err, code)
-				if cos.IsParseBool(apireq.query.Get(apc.QparamSilent)) {
-					t.writeErr(w, r, err, code, Silent)
-				} else {
-					t.writeErr(w, r, err, code)
-				}
+				t._erris(w, r, apireq.query.Get(apc.QparamSilent), err, code)
 			}
 			return
 		}

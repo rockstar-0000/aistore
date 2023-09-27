@@ -36,6 +36,16 @@ const (
 	// This query parameter can be used to override the default behavior.
 	QparamDontAddRemote = "dont_add_remote_bck_md"
 
+	// Add remote bucket to BMD _unconditionally_ and without executing HEAD request
+	// (to check access and load the bucket's properties)
+	// NOTE: usage is limited to setting up bucket properties with alternative
+	// profile and/or endpoint
+	// See also:
+	// - `LsDontHeadRemote`
+	// - docs/bucket.md
+	// - docs/cli/aws_profile_endpoint.md
+	QparamDontHeadRemote = "dont_head_remote_bck"
+
 	// When evicting, keep remote bucket in BMD (i.e., evict data only)
 	QparamKeepRemote = "keep_bck_md"
 
@@ -134,7 +144,7 @@ const (
 	QparamNonElectable     = "nel" // true: proxy is non-electable for the primary role
 	QparamUnixTime         = "utm" // Unix time since 01/01/70 UTC (nanoseconds)
 	QparamIsGFNRequest     = "gfn" // true if the request is a Get-From-Neighbor
-	QparamSilent           = "sln" // true: destination should not log errors (HEAD request)
+	QparamSilent           = "sln" // true: skip nlog.Error* (motivation: can be quite, multiple, and/or ignorable)
 	QparamRebStatus        = "rbs" // true: get detailed rebalancing status
 	QparamRebData          = "rbd" // true: get EC rebalance data (pulling data if push way fails)
 	QparamTaskAction       = "tac" // "start", "status", "result"

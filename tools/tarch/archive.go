@@ -18,7 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/ext/dsort/extract"
+	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/tools/cryptorand"
 )
 
@@ -41,15 +41,9 @@ func addBufferToArch(aw archive.Writer, path string, l int, buf []byte) error {
 		buf = newBuf(l)
 		defer freeBuf(buf)
 		buf = buf[:l]
-		if true {
-			_, errV := cryptorand.Read(buf)
-			debug.AssertNoErr(errV)
-		} else {
-			// TODO -- FIXME: leave some space empty to allow for compression
-			_, err := cryptorand.Read(buf[:l/3])
-			debug.AssertNoErr(err)
-			copy(buf[2*l/3:], buf)
-		}
+		_, err := cryptorand.Read(buf[:l/3])
+		debug.AssertNoErr(err)
+		copy(buf[2*l/3:], buf)
 	}
 	reader := bytes.NewBuffer(buf)
 	oah := cos.SimpleOAH{Size: int64(l)}
@@ -114,11 +108,11 @@ func CreateArchCustomFilesToW(w io.Writer, tarFormat tar.Format, ext string, fil
 			var buf []byte
 			// random content
 			switch customFileType {
-			case extract.ContentKeyInt:
+			case shard.ContentKeyInt:
 				buf = []byte(strconv.Itoa(rand.Int()))
-			case extract.ContentKeyString:
+			case shard.ContentKeyString:
 				buf = []byte(fmt.Sprintf("%d-%d", rand.Int(), rand.Int()))
-			case extract.ContentKeyFloat:
+			case shard.ContentKeyFloat:
 				buf = []byte(fmt.Sprintf("%d.%d", rand.Int(), rand.Int()))
 			default:
 				return fmt.Errorf("invalid custom file type: %q", customFileType)

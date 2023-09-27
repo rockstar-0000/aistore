@@ -15,7 +15,8 @@ import (
 
 const (
 	// Number of sync maps
-	MultiSyncMapCount = 0x40
+	MultiSyncMapCount = 0x40 // m.b. a power of two
+	MultiSyncMapMask  = MultiSyncMapCount - 1
 )
 
 type (
@@ -36,13 +37,13 @@ type (
 		postedFin atomic.Int32
 	}
 
-	// StopCh is specialized channel for stopping things.
+	// StopCh is a channel for stopping running things.
 	StopCh struct {
 		ch      chan struct{}
 		stopped atomic.Bool
 	}
 
-	// Semaphore implements sempahore which is just a nice wrapper on `chan struct{}`.
+	// Semaphore is a textbook _sempahore_ implemented as a wrapper on `chan struct{}`.
 	Semaphore struct {
 		s chan struct{}
 	}
@@ -123,7 +124,6 @@ func (twg *TimeoutGroup) WaitTimeoutWithStop(timeout time.Duration, stop <-chan 
 	select {
 	case <-twg.fin:
 		twg.postedFin.Store(0)
-		timed, stopped = false, false
 	case <-t.C:
 		timed, stopped = true, false
 	case <-stop:
@@ -244,9 +244,10 @@ func (s *DynSemaphore) Release(cnts ...int) {
 // LimitedWaitGroup //
 //////////////////////
 
-// usage: no more than `limit` goroutines in parallel
-func NewLimitedWaitGroup(limit, have int) WG {
-	if have == 0 || have > limit {
+// usage: no more than `limit` (e.g., sys.NumCPU()) goroutines in parallel
+func NewLimitedWaitGroup(limit, want int) WG {
+	debug.Assert(limit > 0 || want > 0)
+	if want == 0 || want > limit {
 		return &LimitedWaitGroup{wg: &sync.WaitGroup{}, sema: NewDynSemaphore(limit)}
 	}
 	return &sync.WaitGroup{}

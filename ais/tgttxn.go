@@ -153,7 +153,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if cmn.IsErrCapacityExceeded(err) {
+	if cmn.IsErrCapExceeded(err) {
 		cs := t.OOS(nil)
 		t.writeErrStatusf(w, r, http.StatusInsufficientStorage, "%s: %v", cs.String(), err)
 	} else {
@@ -269,8 +269,7 @@ func (t *target) validateMakeNCopies(bck *meta.Bck, msg *aisMsg) (curCopies, new
 	if err == nil {
 		err = fs.ValidateNCopies(t.si.Name(), int(newCopies))
 	}
-	// NOTE: #791 "limited coexistence" here and elsewhere
-	// TODO: support "force" option to ignore "limited coexistence" conflicts (see t.tcb)
+	// (consider adding "force" option similar to CopyBckMsg.Force)
 	if err == nil {
 		err = xreg.LimitedCoexistence(t.si, bck, msg.Action)
 	}
@@ -280,7 +279,7 @@ func (t *target) validateMakeNCopies(bck *meta.Bck, msg *aisMsg) (curCopies, new
 	// don't allow increasing num-copies when used cap is above high wm (let alone OOS)
 	if bck.Props.Mirror.Copies < newCopies {
 		cs := fs.Cap()
-		err = cs.Err
+		err = cs.Err()
 	}
 	return
 }
@@ -373,18 +372,19 @@ func (t *target) validateNprops(bck *meta.Bck, msg *aisMsg) (nprops *cmn.BucketP
 		err = fmt.Errorf(cmn.FmtErrUnmarshal, t, "new bucket props", cos.BHead(body), err)
 		return
 	}
+	err = cs.Err()
 	if nprops.Mirror.Enabled {
 		mpathCount := fs.NumAvail()
 		if int(nprops.Mirror.Copies) > mpathCount {
 			err = fmt.Errorf(fmtErrInsuffMpaths1, t, mpathCount, bck, nprops.Mirror.Copies)
 			return
 		}
-		if nprops.Mirror.Copies > bck.Props.Mirror.Copies && cs.Err != nil {
-			return nprops, cs.Err
+		if nprops.Mirror.Copies < bck.Props.Mirror.Copies {
+			err = nil
 		}
 	}
-	if nprops.EC.Enabled && !bck.Props.EC.Enabled {
-		err = cs.Err
+	if !nprops.EC.Enabled && bck.Props.EC.Enabled {
+		err = nil
 	}
 	return
 }
@@ -437,7 +437,7 @@ func (t *target) renameBucket(c *txnServerCtx) (string, error) {
 			return "", rns.Err // must not happen at commit time
 		}
 		xctn := rns.Entry.Get()
-		err = fs.RenameBucketDirs(txnRenB.bckFrom.Props.BID, txnRenB.bckFrom.Bucket(), txnRenB.bckTo.Bucket())
+		err = fs.RenameBucketDirs(txnRenB.bckFrom.Bucket(), txnRenB.bckTo.Bucket())
 		if err != nil {
 			return "", err // ditto
 		}
@@ -454,8 +454,9 @@ func (t *target) renameBucket(c *txnServerCtx) (string, error) {
 }
 
 func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *aisMsg) error {
-	if cs := fs.Cap(); cs.Err != nil {
-		return cs.Err
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return err
 	}
 	if err := xreg.LimitedCoexistence(t.si, bckFrom, msg.Action, bckTo); err != nil {
 		return err
@@ -509,8 +510,9 @@ func (t *target) tcb(c *txnServerCtx, msg *apc.TCBMsg, dp cluster.DP) (string, e
 		if err := bckFrom.Validate(); err != nil {
 			return "", err
 		}
-		if cs := fs.Cap(); cs.Err != nil {
-			return "", cs.Err
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
+			return "", err
 		}
 		if err := xreg.LimitedCoexistence(t.si, bckFrom, c.msg.Action); err != nil {
 			if !msg.Force {
@@ -629,8 +631,9 @@ func (t *target) tcobjs(c *txnServerCtx, msg *cmn.TCObjsMsg, dp cluster.DP) (str
 		if err := bckFrom.Validate(); err != nil {
 			return xid, err
 		}
-		if cs := fs.Cap(); cs.Err != nil {
-			return xid, cs.Err
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
+			return xid, err
 		}
 		if err := xreg.LimitedCoexistence(t.si, bckFrom, c.msg.Action); err != nil {
 			return xid, err
@@ -641,14 +644,13 @@ func (t *target) tcobjs(c *txnServerCtx, msg *cmn.TCObjsMsg, dp cluster.DP) (str
 		}
 		// begin
 		custom := &xreg.TCObjsArgs{BckFrom: bckFrom, BckTo: bckTo, DP: dp}
-		rns := xreg.RenewTCObjs(t, c.uuid, c.msg.Action /*kind*/, custom)
+		rns := xreg.RenewTCObjs(t, c.msg.Action /*kind*/, custom)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %q %+v %v", t, c.uuid, c.msg, rns.Err)
 			return xid, rns.Err
 		}
 		xctn := rns.Entry.Get()
 		xid = xctn.ID()
-		debug.Assert((!rns.IsRunning() && xid == c.uuid) || (rns.IsRunning() && xid == rns.UUID))
 
 		xtco := xctn.(*xs.XactTCObjs)
 		msg.TxnUUID = c.uuid
@@ -746,8 +748,9 @@ func (t *target) ecEncode(c *txnServerCtx) (string, error) {
 }
 
 func (t *target) validateECEncode(bck *meta.Bck, msg *aisMsg) error {
-	if cs := fs.Cap(); cs.Err != nil {
-		return cs.Err
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return err
 	}
 	return xreg.LimitedCoexistence(t.si, bck, msg.Action)
 }
@@ -785,18 +788,18 @@ func (t *target) createArchMultiObj(c *txnServerCtx) (string /*xaction uuid*/, e
 		}
 		archMsg.Mime = mime // set it for xarch
 
-		if cs := fs.Cap(); cs.Err != nil {
-			return xid, cs.Err
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
+			return xid, err
 		}
 
-		rns := xreg.RenewPutArchive(c.uuid, t, bckFrom, bckTo)
+		rns := xreg.RenewPutArchive(t, bckFrom, bckTo)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %q %+v %v", t, c.uuid, archMsg, rns.Err)
 			return xid, rns.Err
 		}
 		xctn := rns.Entry.Get()
 		xid = xctn.ID()
-		debug.Assert((!rns.IsRunning() && xid == c.uuid) || (rns.IsRunning() && xid == rns.UUID))
 
 		xarch := xctn.(*xs.XactArch)
 		// finalize the message and begin local transaction
@@ -1060,15 +1063,14 @@ func (t *target) prepTxnServer(r *http.Request, msg *aisMsg, bucket, phase strin
 	}
 
 	// latency = (network) +- (clock drift)
-	if phase == apc.ActBegin || phase == apc.ActCommit {
+	if phase == apc.ActBegin {
 		if ptime := query.Get(apc.QparamUnixTime); ptime != "" {
-			if delta := ptLatency(time.Now().UnixNano(), ptime); delta != 0 {
-				bound := cmn.GCO.Get().Timeout.CplaneOperation / 2
-				if delta > int64(bound) || delta < -int64(bound) {
-					nlog.Errorf("%s: txn %s[%s] latency=%v(!), caller %s, phase=%s, bucket %q",
-						t.si, msg.Action, c.msg.UUID, time.Duration(delta),
-						c.callerName, phase, bucket)
-				}
+			now := time.Now().UnixNano()
+			dur := ptLatency(now, ptime, r.Header.Get(apc.HdrCallerIsPrimary))
+			lim := int64(cmn.Timeout.CplaneOperation()) >> 1
+			if dur > lim || dur < -lim {
+				nlog.Errorf("Warning: clock drift %s <-> %s(self) = %v, txn %s[%s]",
+					c.callerName, t, time.Duration(dur), msg.Action, c.msg.UUID)
 			}
 		}
 	}

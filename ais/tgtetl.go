@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/ext/etl"
+	"github.com/NVIDIA/aistore/fs"
 )
 
 // [METHOD] /v1/etl
@@ -45,6 +46,12 @@ func (t *target) etlHandler(w http.ResponseWriter, r *http.Request) {
 // PUT /v1/etl
 // start ETL spec/code
 func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
+	// disallow to run when above high wm (let alone OOS)
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		t.writeErr(w, r, err, http.StatusInsufficientStorage)
+		return
+	}
 	if _, err := t.parseURL(w, r, 0, false, apc.URLPathETL.L); err != nil {
 		return
 	}
@@ -222,10 +229,11 @@ func etlParseObjectReq(_ http.ResponseWriter, r *http.Request) (secret string, b
 	var b cmn.Bck
 	b, objName = cmn.ParseUname(uname)
 	if err = b.Validate(); err != nil {
+		err = fmt.Errorf("%v, uname=%q", err, uname)
 		return
 	}
 	if objName == "" {
-		err = fmt.Errorf("etl-parse-req: object name is missing (bucket %s)", b)
+		err = fmt.Errorf("object name is missing (bucket=%s, uname=%q)", b, uname)
 		return
 	}
 	bck = meta.CloneBck(&b)
@@ -234,9 +242,10 @@ func etlParseObjectReq(_ http.ResponseWriter, r *http.Request) (secret string, b
 
 // GET /v1/etl/_objects/<secret>/<uname>
 // Handles GET requests from ETL containers (K8s Pods).
-// Validates the secret that was injected into a Pod during its initialization.
+// Validates the secret that was injected into a Pod during its initialization
+// (see boot.go `_setPodEnv`).
 //
-// NOTE: this is an internal URL with `_objects` in its path intended to avoid
+// NOTE: this is an internal URL with "_objects" in its path intended to avoid
 // conflicts with ETL name in `/v1/elts/<etl-name>/...`
 func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 	secret, bck, objName, err := etlParseObjectReq(w, r)

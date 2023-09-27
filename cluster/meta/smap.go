@@ -118,7 +118,7 @@ func (d *Snode) Digest() uint64 { return d.idDigest }
 
 func (d *Snode) setDigest() {
 	if d.idDigest == 0 {
-		d.idDigest = xxhash.ChecksumString64S(d.ID(), cos.MLCG32)
+		d.idDigest = xxhash.Checksum64S(cos.UnsafeB(d.ID()), cos.MLCG32)
 	}
 }
 
@@ -269,6 +269,26 @@ func (d *Snode) InMaintPostReb() bool {
 func (d *Snode) nonElectable() bool { return d.Flags.IsSet(SnodeNonElectable) }
 func (d *Snode) IsIC() bool         { return d.Flags.IsSet(SnodeIC) }
 
+func (d *Snode) Fl2S() string {
+	if d.Flags == 0 {
+		return "none"
+	}
+	var a = make([]string, 0, 2)
+	switch {
+	case d.Flags&SnodeNonElectable != 0:
+		a = append(a, "non-elect")
+	case d.Flags&SnodeIC != 0:
+		a = append(a, "ic")
+	case d.Flags&SnodeMaint != 0:
+		a = append(a, "maintenance-mode")
+	case d.Flags&SnodeDecomm != 0:
+		a = append(a, "decommission")
+	case d.Flags&SnodeMaintPostReb != 0:
+		a = append(a, "post-rebalance")
+	}
+	return strings.Join(a, ",")
+}
+
 /////////////
 // NetInfo //
 /////////////
@@ -393,7 +413,7 @@ func (m *Smap) GetTarget(sid string) *Snode {
 }
 
 func (m *Smap) IsPrimary(si *Snode) bool {
-	return m.Primary.Equals(si)
+	return m.Primary != nil && m.Primary.ID() == si.ID()
 }
 
 func (m *Smap) NewTmap(tids []string) (tmap NodeMap, err error) {
@@ -427,12 +447,15 @@ func (m *Smap) GetActiveNode(sid string) (si *Snode) {
 
 // (random active)
 func (m *Smap) GetRandTarget() (tsi *Snode, err error) {
+	var cnt int
 	for _, tsi = range m.Tmap {
 		if !tsi.InMaintOrDecomm() {
 			return
 		}
+		cnt++
 	}
-	return nil, cmn.NewErrNoNodes(apc.Target, len(m.Tmap))
+	err = fmt.Errorf("GetRandTarget failure: %s, in maintenance >= %d", m.StringEx(), cnt)
+	return
 }
 
 func (m *Smap) GetRandProxy(excludePrimary bool) (si *Snode, err error) {
@@ -446,8 +469,8 @@ func (m *Smap) GetRandProxy(excludePrimary bool) (si *Snode, err error) {
 			return psi, nil
 		}
 	}
-	return nil, fmt.Errorf("failed to find a random proxy (num=%d, in-maintenance=%d, exclude-primary=%t)",
-		len(m.Pmap), cnt, excludePrimary)
+	err = fmt.Errorf("GetRandProxy failure: %s, in maintenance >= %d, excl-primary %t", m.StringEx(), cnt, excludePrimary)
+	return
 }
 
 // whether IP is in use by a different node

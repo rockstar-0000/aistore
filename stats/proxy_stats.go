@@ -16,10 +16,12 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
+const numProxyStats = 24 // approx. initial
+
 // NOTE: currently, proxy's stats == common and hardcoded
 
 type Prunner struct {
-	statsRunner
+	runner
 }
 
 /////////////
@@ -29,9 +31,9 @@ type Prunner struct {
 // interface guard
 var _ cos.Runner = (*Prunner)(nil)
 
-func (r *Prunner) Run() error { return r.runcommon(r) }
+func (r *Prunner) Run() error { return r._run(r /*as statsLogger*/) }
 
-// NOTE: have only common metrics (see regCommon()) - init only the Prometheus part if used
+// have only common metrics - init only the Prometheus part if enabled
 func (r *Prunner) RegMetrics(node *meta.Snode) {
 	r.core.initProm(node)
 }
@@ -39,20 +41,23 @@ func (r *Prunner) RegMetrics(node *meta.Snode) {
 // All stats that proxy currently has are CoreStats which are registered at startup
 func (r *Prunner) Init(p cluster.Node) *atomic.Bool {
 	r.core = &coreStats{}
-	r.core.init(p.Snode(), 24)
+
+	r.core.init(numProxyStats)
+
+	r.regCommon(p.Snode()) // common metrics
+
 	r.core.statsTime = cmn.GCO.Get().Periodic.StatsTime.D()
-	r.ctracker = make(copyTracker, 24)
+	r.ctracker = make(copyTracker, numProxyStats)
 
-	r.statsRunner.name = "proxystats"
-	r.statsRunner.daemon = p
+	r.runner.name = "proxystats"
+	r.runner.daemon = p
 
-	r.statsRunner.stopCh = make(chan struct{}, 4)
-	r.statsRunner.workCh = make(chan cos.NamedVal64, 256)
+	r.runner.stopCh = make(chan struct{}, 4)
 
-	r.core.initMetricClient(p.Snode(), &r.statsRunner)
+	r.core.initMetricClient(p.Snode(), &r.runner)
 
-	r.sorted = make([]string, 0, 24)
-	return &r.statsRunner.startedUp
+	r.sorted = make([]string, 0, numProxyStats)
+	return &r.runner.startedUp
 }
 
 //
@@ -80,11 +85,6 @@ func (r *Prunner) log(now int64, uptime time.Duration, _ *cmn.Config) {
 			r.next = now + maxStatsLogInterval
 		}
 	}
-}
-
-func (r *Prunner) doAdd(nv cos.NamedVal64) {
-	s := r.core
-	s.doAdd(nv.Name, nv.NameSuffix, nv.Value)
 }
 
 func (r *Prunner) statsTime(newval time.Duration) {

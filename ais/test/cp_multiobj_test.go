@@ -63,7 +63,7 @@ func TestCopyMultiObjSimple(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		tlog.Logf("PUT %d => %s\n", len(objList), bckFrom.Cname(""))
 		for _, objName := range objList {
-			r, _ := readers.NewRandReader(objSize, cksumType)
+			r, _ := readers.NewRand(objSize, cksumType)
 			_, err := api.PutObject(api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        bckFrom,
@@ -121,7 +121,7 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 			ordered: true,
 		}
 		bckTo     = cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
-		numToCopy = cos.Min(m.num/2, 13)
+		numToCopy = min(m.num/2, 13)
 		fmtRange  = "%s{%d..%d}"
 		// test randomization
 		maybe    = mono.NanoTime()&0x1 != 0

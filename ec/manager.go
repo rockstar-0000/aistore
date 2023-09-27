@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"unsafe"
+	ratomic "sync/atomic"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cluster"
@@ -38,8 +38,10 @@ type Manager struct {
 	bundleEnabled atomic.Bool // to disable and enable on the fly
 	netReq        string      // network used to send object request
 	netResp       string      // network used to send/receive slices
-	reqBundle     atomic.Pointer
-	respBundle    atomic.Pointer
+
+	// streams
+	reqBundle  ratomic.Pointer[bundle.Streams]
+	respBundle ratomic.Pointer[bundle.Streams]
 }
 
 var (
@@ -69,22 +71,17 @@ func initManager(t cluster.Target) error {
 	return nil
 }
 
-func (mgr *Manager) req() *bundle.Streams {
-	return (*bundle.Streams)(mgr.reqBundle.Load())
-}
-
-func (mgr *Manager) resp() *bundle.Streams {
-	return (*bundle.Streams)(mgr.respBundle.Load())
-}
+func (mgr *Manager) req() *bundle.Streams  { return mgr.reqBundle.Load() }
+func (mgr *Manager) resp() *bundle.Streams { return mgr.respBundle.Load() }
 
 func (mgr *Manager) initECBundles() error {
 	if !mgr.bundleEnabled.CAS(false, true) {
 		return nil
 	}
-	if err := transport.HandleObjStream(ReqStreamName, ECM.recvRequest); err != nil {
+	if err := transport.Handle(ReqStreamName, ECM.recvRequest); err != nil {
 		return fmt.Errorf("failed to register recvRequest: %v", err)
 	}
-	if err := transport.HandleObjStream(RespStreamName, ECM.recvResponse); err != nil {
+	if err := transport.Handle(RespStreamName, ECM.recvResponse); err != nil {
 		return fmt.Errorf("failed to register respResponse: %v", err)
 	}
 	cbReq := func(hdr transport.ObjHdr, reader io.ReadCloser, _ any, err error) {
@@ -96,7 +93,7 @@ func (mgr *Manager) initECBundles() error {
 		client      = transport.NewIntraDataClient()
 		config      = cmn.GCO.Get()
 		compression = config.EC.Compression
-		extraReq    = transport.Extra{Callback: cbReq, Compression: compression}
+		extraReq    = transport.Extra{Callback: cbReq, Compression: compression, Config: config}
 	)
 	reqSbArgs := bundle.Args{
 		Multiplier: config.EC.SbundleMult,
@@ -108,12 +105,12 @@ func (mgr *Manager) initECBundles() error {
 		Multiplier: config.EC.SbundleMult,
 		Trname:     RespStreamName,
 		Net:        mgr.netResp,
-		Extra:      &transport.Extra{Compression: compression},
+		Extra:      &transport.Extra{Compression: compression, Config: config},
 	}
 
 	sowner := mgr.t.Sowner()
-	mgr.reqBundle.Store(unsafe.Pointer(bundle.New(sowner, mgr.t.Snode(), client, reqSbArgs)))
-	mgr.respBundle.Store(unsafe.Pointer(bundle.New(sowner, mgr.t.Snode(), client, respSbArgs)))
+	mgr.reqBundle.Store(bundle.New(sowner, mgr.t.Snode(), client, reqSbArgs))
+	mgr.respBundle.Store(bundle.New(sowner, mgr.t.Snode(), client, respSbArgs))
 
 	mgr.smap = sowner.Get()
 	mgr.targetCnt.Store(int32(mgr.smap.CountActiveTs()))
@@ -279,8 +276,9 @@ func (mgr *Manager) EncodeObject(lom *cluster.LOM, cb ...cluster.OnFinishObj) er
 	if !lom.Bprops().EC.Enabled {
 		return ErrorECDisabled
 	}
-	if cs := fs.Cap(); cs.Err != nil {
-		return cs.Err
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return err
 	}
 	isECCopy := IsECCopy(lom.SizeBytes(), &lom.Bprops().EC)
 	targetCnt := mgr.targetCnt.Load()
@@ -320,9 +318,9 @@ func (mgr *Manager) RestoreObject(lom *cluster.LOM) error {
 	if !lom.Bprops().EC.Enabled {
 		return ErrorECDisabled
 	}
-
-	if cs := fs.Cap(); cs.Err != nil {
-		return cs.Err
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return err
 	}
 	targetCnt := mgr.targetCnt.Load()
 	// NOTE: Restore replica object is done with GFN, safe to always abort.

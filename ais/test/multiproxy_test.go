@@ -357,7 +357,7 @@ func _addNodeDuplicateDaemonID(t *testing.T, nodeType string) {
 		tools.CleanupNode(t, pid)
 	})
 
-	err = tools.WaitForNodeToTerminate(pid)
+	err = tools.WaitForPID(pid)
 	tassert.CheckFatal(t, err)
 }
 
@@ -400,7 +400,7 @@ func _addNodeDuplicateIP(t *testing.T, nodeType string) {
 		tools.CleanupNode(t, pid)
 	})
 
-	err = tools.WaitForNodeToTerminate(pid)
+	err = tools.WaitForPID(pid)
 	tassert.CheckFatal(t, err)
 }
 
@@ -688,7 +688,7 @@ func concurrentPutGetDel(t *testing.T) {
 func proxyPutGetDelete(count int, proxyURL string, bck cmn.Bck, cksumType string) error {
 	baseParams := tools.BaseAPIParams(proxyURL)
 	for i := 0; i < count; i++ {
-		reader, err := readers.NewRandReader(fileSize, cksumType)
+		reader, err := readers.NewRand(fileSize, cksumType)
 		if err != nil {
 			return fmt.Errorf("error creating reader: %v", err)
 		}
@@ -756,7 +756,7 @@ loop:
 		default:
 		}
 
-		reader, err := readers.NewRandReader(fileSize, cksumType)
+		reader, err := readers.NewRand(fileSize, cksumType)
 		if err != nil {
 			errCh <- err
 			continue
@@ -1098,7 +1098,7 @@ func hrwProxyTest(smap *meta.Smap, idToSkip string) (pi string, err error) {
 			continue
 		}
 
-		cs := xxhash.ChecksumString64S(snode.ID(), cos.MLCG32)
+		cs := xxhash.Checksum64S(cos.UnsafeB(snode.ID()), cos.MLCG32)
 		if cs > max {
 			max = cs
 			pi = id
