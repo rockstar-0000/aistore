@@ -42,16 +42,19 @@ func (cpr *cprCtx) copyBucket(c *cli.Context, bckFrom, bckTo cmn.Bck, msg *apc.C
 	// 1. get from-bck summary
 	qbck := cmn.QueryBcks(bckFrom)
 	ctx := &bsummCtx{
-		qbck:    qbck,
-		timeout: longClientTimeout,
-	}
-	if flagIsSet(c, waitJobXactFinishedFlag) {
-		ctx.timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
+		qbck:         qbck,
+		longWaitTime: listObjectsWaitTime,
 	}
 	ctx.msg.Prefix = msg.Prefix
 	ctx.msg.ObjCached = apc.IsFltPresent(fltPresence)
 	ctx.msg.BckPresent = apc.IsFltPresent(fltPresence)
-	summaries, err := ctx.slow()
+
+	// compare w/ newBsummContext
+	ctx.args.DontWait = false
+	ctx.args.Callback = nil
+
+	// TODO -- FIXME: revisit
+	_ /*xid*/, summaries, err := ctx.slow()
 	if err != nil {
 		return err
 	}
@@ -151,7 +154,7 @@ outer:
 		var (
 			size, objs int64
 			nrun       int
-			xs, err    = queryXactions(xargs)
+			xs, err    = queryXactions(&xargs)
 		)
 		if err != nil {
 			if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {

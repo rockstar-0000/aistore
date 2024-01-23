@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -13,11 +13,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/stats"
 )
@@ -42,7 +42,7 @@ type singleTask struct {
 	totalSize   atomic.Int64       // total size (nonzero iff Content-Length header was provided by the source)
 	downloadCtx context.Context    // w/ cancel function
 	getCtx      context.Context    // w/ timeout and size
-	cancel      context.CancelFunc // to cancel the download after the request commences
+	cancel      context.CancelFunc // to cancel in-progress download
 }
 
 // List of HTTP status codes which we shouldn'task retry (just report the job failed).
@@ -66,7 +66,7 @@ func (task *singleTask) init() {
 	task.downloadCtx, task.cancel = context.WithCancel(context.Background())
 }
 
-func (task *singleTask) download(lom *cluster.LOM, config *cmn.Config) {
+func (task *singleTask) download(lom *core.LOM) {
 	err := lom.InitBck(task.job.Bck())
 	if err == nil {
 		err = lom.Load(true /*cache it*/, false /*locked*/)
@@ -76,7 +76,7 @@ func (task *singleTask) download(lom *cluster.LOM, config *cmn.Config) {
 		return
 	}
 
-	if config.FastV(4, cos.SmoduleDload) {
+	if cmn.Rom.FastV(4, cos.SmoduleDload) {
 		nlog.Infof("Starting download for %v", task)
 	}
 
@@ -94,16 +94,16 @@ func (task *singleTask) download(lom *cluster.LOM, config *cmn.Config) {
 		return
 	}
 
-	dlStore.incFinished(task.jobID())
+	g.store.incFinished(task.jobID())
 
-	task.xdl.statsT.AddMany(
+	g.tstats.AddMany(
 		cos.NamedVal64{Name: stats.DownloadSize, Value: task.currentSize.Load()},
 		cos.NamedVal64{Name: stats.DownloadLatency, Value: int64(task.ended.Load().Sub(task.started.Load()))},
 	)
 	task.xdl.ObjsAdd(1, task.currentSize.Load())
 }
 
-func (task *singleTask) _dlocal(lom *cluster.LOM, timeout time.Duration) (bool /*err is fatal*/, error) {
+func (task *singleTask) _dlocal(lom *core.LOM, timeout time.Duration) (bool /*err is fatal*/, error) {
 	ctx, cancel := context.WithTimeout(task.downloadCtx, timeout)
 	defer cancel()
 
@@ -130,7 +130,7 @@ func (task *singleTask) _dlocal(lom *cluster.LOM, timeout time.Duration) (bool /
 	return fatal, err
 }
 
-func (task *singleTask) _dput(lom *cluster.LOM, req *http.Request, resp *http.Response) (bool /*err is fatal*/, error) {
+func (task *singleTask) _dput(lom *core.LOM, req *http.Request, resp *http.Response) (bool /*err is fatal*/, error) {
 	if resp.StatusCode >= http.StatusBadRequest {
 		if resp.StatusCode == http.StatusNotFound {
 			return false, cmn.NewErrHTTP(req, fmt.Errorf("%q does not exist", task.obj.link), http.StatusNotFound)
@@ -144,16 +144,17 @@ func (task *singleTask) _dput(lom *cluster.LOM, req *http.Request, resp *http.Re
 	size := attrsFromLink(task.obj.link, resp, lom)
 	task.setTotalSize(size)
 
-	params := cluster.AllocPutObjParams()
+	params := core.AllocPutParams()
 	{
 		params.WorkTag = "dl"
 		params.Reader = r
 		params.OWT = cmn.OwtPut
 		params.Atime = task.started.Load()
+		params.Size = size
 		params.Xact = task.xdl
 	}
-	erp := task.xdl.t.PutObject(lom, params)
-	cluster.FreePutObjParams(params)
+	erp := core.T.PutObject(lom, params)
+	core.FreePutParams(params)
 	if erp != nil {
 		return true, erp
 	}
@@ -163,7 +164,7 @@ func (task *singleTask) _dput(lom *cluster.LOM, req *http.Request, resp *http.Re
 	return false, nil
 }
 
-func (task *singleTask) downloadLocal(lom *cluster.LOM) (err error) {
+func (task *singleTask) downloadLocal(lom *core.LOM) (err error) {
 	var (
 		timeout = task.initialTimeout()
 		fatal   bool
@@ -173,27 +174,25 @@ func (task *singleTask) downloadLocal(lom *cluster.LOM) (err error) {
 		if err == nil || fatal {
 			return err
 		}
+
+		// handle more
 		if errors.Is(err, context.Canceled) || errors.Is(err, errThrottlerStopped) {
-			// Download was canceled or stopped, so just return.
-			return err
+			return err // canceled or stopped, so just return
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			nlog.Warningf("%s [retries: %d/%d]: timeout (%v) - increasing and retrying...",
-				task, i, retryCnt, timeout)
+			nlog.Warningf("%s [retries: %d/%d]: timeout (%v) - increasing and retrying", task, i, retryCnt, timeout)
 			timeout = time.Duration(float64(timeout) * reqTimeoutFactor)
 		} else if herr := cmn.Err2HTTPErr(err); herr != nil {
 			nlog.Warningf("%s [retries: %d/%d]: failed to perform request: %v (code: %d)", task, i, retryCnt, err, herr.Status)
 			if _, exists := terminalStatuses[herr.Status]; exists {
-				// Nothing we can do...
-				return err
+				return err // nothing we can do
 			}
-			// Otherwise retry...
-		} else if cos.IsRetriableConnErr(err) {
-			nlog.Warningf("%s [retries: %d/%d]: connection failed with (%v), retrying...", task, i, retryCnt, err)
 		} else {
-			nlog.Warningf("%s [retries: %d/%d]: unexpected error (%v), retrying...", task, i, retryCnt, err)
+			if !cos.IsRetriableConnErr(err) {
+				return err // ditto
+			}
+			nlog.Warningf("%s [retries: %d/%d]: connection failed with (%v), retrying...", task, i, retryCnt, err)
 		}
-
 		task.reset()
 	}
 	return err
@@ -210,7 +209,7 @@ func (task *singleTask) reset() {
 	task.currentSize.Store(0)
 }
 
-func (task *singleTask) downloadRemote(lom *cluster.LOM) error {
+func (task *singleTask) downloadRemote(lom *core.LOM) error {
 	// Set custom context values (used by `ais/backend/*`).
 	ctx, cancel := context.WithTimeout(task.downloadCtx, task.initialTimeout())
 	defer cancel()
@@ -220,7 +219,7 @@ func (task *singleTask) downloadRemote(lom *cluster.LOM) error {
 	task.getCtx = ctx
 
 	// Do final GET (prefetch) request.
-	_, err := task.xdl.t.GetCold(ctx, lom, cmn.OwtGetTryLock)
+	_, err := core.T.GetCold(ctx, lom, cmn.OwtGetTryLock)
 	return err
 }
 
@@ -250,13 +249,15 @@ func (task *singleTask) wrapReader(r io.ReadCloser) io.ReadCloser {
 // Probably we need to extend the persistent database (db.go) so that it will contain
 // also information about specific tasks.
 func (task *singleTask) markFailed(statusMsg string) {
-	task.xdl.statsT.IncErr(stats.ErrDownloadCount)
-	dlStore.persistError(task.jobID(), task.obj.objName, statusMsg)
-	dlStore.incErrorCnt(task.jobID())
+	g.tstats.IncErr(stats.ErrDownloadCount)
+	g.store.persistError(task.jobID(), task.obj.objName, statusMsg)
+	g.store.incErrorCnt(task.jobID())
 }
 
 func (task *singleTask) persist() {
-	_ = dlStore.persistTaskInfo(task.jobID(), task.ToTaskDlInfo())
+	if err := g.store.persistTaskInfo(task); err != nil {
+		nlog.Errorln(err)
+	}
 }
 
 func (task *singleTask) jobID() string { return task.job.ID() }
@@ -273,7 +274,6 @@ func (task *singleTask) ToTaskDlInfo() TaskDlInfo {
 		Total:      task.totalSize.Load(),
 		StartTime:  task.started.Load(),
 		EndTime:    ended,
-		Running:    ended.IsZero(),
 	}
 }
 

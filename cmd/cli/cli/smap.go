@@ -12,8 +12,8 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/env"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/urfave/cli"
 )
 
@@ -37,7 +37,7 @@ func getClusterMap(c *cli.Context) (*meta.Smap, error) {
 	}
 	curSmap = smap
 	if smap.Primary.PubNet.URL != apiBP.URL {
-		if configuredVerbosity() {
+		if cliConfVerbose() {
 			what := env.AIS.Endpoint
 			if os.Getenv(env.AIS.Endpoint) == "" {
 				what = "CLI config URL"
@@ -81,7 +81,7 @@ func getNode(c *cli.Context, arg string) (node *meta.Snode, sname string, err er
 }
 
 // Gets Smap from a given node (`daemonID`) and displays it
-func smapFromNode(primarySmap *meta.Smap, sid string, usejs bool) error {
+func smapFromNode(c *cli.Context, primarySmap *meta.Smap, sid string, usejs bool) error {
 	var (
 		smap         = primarySmap
 		err          error
@@ -103,6 +103,9 @@ func smapFromNode(primarySmap *meta.Smap, sid string, usejs bool) error {
 	body := teb.SmapHelper{
 		Smap:         smap,
 		ExtendedURLs: extendedURLs,
+	}
+	if flagIsSet(c, noHeaderFlag) {
+		return teb.Print(body, teb.SmapTmplNoHdr, teb.Jopts(usejs))
 	}
 	return teb.Print(body, teb.SmapTmpl, teb.Jopts(usejs))
 }

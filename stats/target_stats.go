@@ -1,7 +1,7 @@
 // Package stats provides methods and functionality to register, track, log,
 // and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
@@ -12,13 +12,13 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/memsys"
@@ -35,6 +35,10 @@ import (
 //	-> "*.id" - ID
 const (
 	// KindCounter & KindSize - always incremented
+
+	// NOTE semantics:
+	// - counts all instances when remote GET is followed by storing of the new object (version) locally
+	// - does _not_ count assorted calls to `GetObjReader` (e.g., via tcb/tco -> LDP.Reader)
 	GetColdCount = "get.cold.n"
 	GetColdSize  = "get.cold.size"
 
@@ -58,7 +62,8 @@ const (
 	ErrCksumSize     = "err.cksum.size"
 	ErrMetadataCount = "err.md.n"
 	ErrIOCount       = "err.io.n"
-	// special
+
+	// target restarted (effectively, boolean)
 	RestartCount = "restart.n"
 
 	// KindLatency
@@ -68,13 +73,17 @@ const (
 	PutRedirLatency = "put.redir.ns"
 	DownloadLatency = "dl.ns"
 
-	// DSort
-	DSortCreationReqCount    = "dsort.creation.req.n"
-	DSortCreationRespCount   = "dsort.creation.resp.n"
-	DSortCreationRespLatency = "dsort.creation.resp.ns"
-	DSortExtractShardDskCnt  = "dsort.extract.shard.dsk.n"
-	DSortExtractShardMemCnt  = "dsort.extract.shard.mem.n"
-	DSortExtractShardSize    = "dsort.extract.shard.size" // uncompressed
+	// (read remote, write local) latency (and note that cold-GET's "pure"
+	// transmit-response latency = GetLatency - GetColdRwLatency)
+	GetColdRwLatency = "get.cold.rw.ns"
+
+	// Dsort
+	DsortCreationReqCount    = "dsort.creation.req.n"
+	DsortCreationRespCount   = "dsort.creation.resp.n"
+	DsortCreationRespLatency = "dsort.creation.resp.ns"
+	DsortExtractShardDskCnt  = "dsort.extract.shard.dsk.n"
+	DsortExtractShardMemCnt  = "dsort.extract.shard.mem.n"
+	DsortExtractShardSize    = "dsort.extract.shard.size" // uncompressed
 
 	// Downloader
 	DownloadSize = "dl.size"
@@ -86,18 +95,25 @@ const (
 	// same as above via `.cumulative`
 	GetSize = "get.size"
 	PutSize = "put.size"
+
+	// core
+	RemoteDeletedDelCount = core.RemoteDeletedDelCount // compare w/ common `DeleteCount`
+
+	LcacheCollisionCount = core.LcacheCollisionCount
+	LcacheEvictedCount   = core.LcacheEvictedCount
+	LcacheFlushColdCount = core.LcacheFlushColdCount
 )
 
 type (
 	Trunner struct {
-		t         cluster.NodeMemCap
+		t         core.NodeMemCap
 		TargetCDF fs.TargetCDF `json:"cdf"`
 		disk      ios.AllDiskStats
 		xln       string
 		runner    // the base (compare w/ Prunner)
 		lines     []string
 		mem       sys.MemStat
-		xallRun   cluster.AllRunningInOut
+		xallRun   core.AllRunningInOut
 		standby   bool
 	}
 )
@@ -115,12 +131,12 @@ const (
 // interface guard
 var _ cos.Runner = (*Trunner)(nil)
 
-func NewTrunner(t cluster.NodeMemCap) *Trunner { return &Trunner{t: t} }
+func NewTrunner(t core.NodeMemCap) *Trunner { return &Trunner{t: t} }
 
 func (r *Trunner) Run() error     { return r._run(r /*as statsLogger*/) }
 func (r *Trunner) Standby(v bool) { r.standby = v }
 
-func (r *Trunner) Init(t cluster.Target) *atomic.Bool {
+func (r *Trunner) Init(t core.Target) *atomic.Bool {
 	r.core = &coreStats{}
 
 	r.core.init(numTargetStats)
@@ -198,6 +214,7 @@ func (r *Trunner) RegMetrics(node *meta.Snode) {
 	r.reg(node, AppendLatency, KindLatency)
 	r.reg(node, GetRedirLatency, KindLatency)
 	r.reg(node, PutRedirLatency, KindLatency)
+	r.reg(node, GetColdRwLatency, KindLatency)
 
 	// bps
 	r.reg(node, GetThroughput, KindThroughput)
@@ -219,7 +236,7 @@ func (r *Trunner) RegMetrics(node *meta.Snode) {
 	r.reg(node, StreamsInObjCount, KindCounter)
 	r.reg(node, StreamsInObjSize, KindSize)
 
-	// special
+	// node restarted
 	r.reg(node, RestartCount, KindCounter)
 
 	// download
@@ -227,12 +244,18 @@ func (r *Trunner) RegMetrics(node *meta.Snode) {
 	r.reg(node, DownloadLatency, KindLatency)
 
 	// dsort
-	r.reg(node, DSortCreationReqCount, KindCounter)
-	r.reg(node, DSortCreationRespCount, KindCounter)
-	r.reg(node, DSortCreationRespLatency, KindLatency)
-	r.reg(node, DSortExtractShardDskCnt, KindCounter)
-	r.reg(node, DSortExtractShardMemCnt, KindCounter)
-	r.reg(node, DSortExtractShardSize, KindSize)
+	r.reg(node, DsortCreationReqCount, KindCounter)
+	r.reg(node, DsortCreationRespCount, KindCounter)
+	r.reg(node, DsortCreationRespLatency, KindLatency)
+	r.reg(node, DsortExtractShardDskCnt, KindCounter)
+	r.reg(node, DsortExtractShardMemCnt, KindCounter)
+	r.reg(node, DsortExtractShardSize, KindSize)
+
+	// core
+	r.reg(node, RemoteDeletedDelCount, KindCounter)
+	r.reg(node, LcacheCollisionCount, KindCounter)
+	r.reg(node, LcacheEvictedCount, KindCounter)
+	r.reg(node, LcacheFlushColdCount, KindCounter)
 
 	// Prometheus
 	r.core.initProm(node)
@@ -330,7 +353,7 @@ func (r *Trunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 	}
 
 	// 6. running xactions
-	verbose := config.FastV(4, cos.SmoduleStats)
+	verbose := cmn.Rom.FastV(4, cos.SmoduleStats)
 	if !idle {
 		var ln string
 		r.xallRun.Running = r.xallRun.Running[:0]

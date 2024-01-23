@@ -1,4 +1,4 @@
-// Package api provides AIStore API over HTTP(S)
+// Package api provides Go based AIStore API/SDK over HTTP(S)
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
@@ -11,9 +11,9 @@ import (
 	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 )
@@ -193,21 +193,6 @@ func GetDaemonStats(bp BaseParams, node *meta.Snode) (ds *stats.Node, err error)
 	return ds, err
 }
 
-// see also: ResetClusterStats
-func ResetDaemonStats(bp BaseParams, node *meta.Snode, errorsOnly bool) (err error) {
-	bp.Method = http.MethodPut
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathReverseDae.S
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActResetStats, Value: errorsOnly})
-		reqParams.Header = http.Header{apc.HdrNodeID: []string{node.ID()}}
-	}
-	err = reqParams.DoRequest()
-	FreeRp(reqParams)
-	return
-}
-
 func GetDiskStats(bp BaseParams, tid string) (res ios.AllDiskStats, err error) {
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
@@ -289,15 +274,27 @@ func SetDaemonConfig(bp BaseParams, nodeID string, nvs cos.StrKVs, transient ...
 	return err
 }
 
-// ResetDaemonConfig resets the configuration for a specific node to the cluster configuration.
-// TODO: revisit access control
+// see also: ResetClusterStats
+func ResetDaemonStats(bp BaseParams, node *meta.Snode, errorsOnly bool) error {
+	return _putDaemon(bp, node.ID(), apc.ActMsg{Action: apc.ActResetStats, Value: errorsOnly})
+}
+
+// reset node's configuration to cluster defaults
 func ResetDaemonConfig(bp BaseParams, nodeID string) error {
+	return _putDaemon(bp, nodeID, apc.ActMsg{Action: apc.ActResetConfig})
+}
+
+func RotateLogs(bp BaseParams, nodeID string) error {
+	return _putDaemon(bp, nodeID, apc.ActMsg{Action: apc.ActRotateLogs})
+}
+
+func _putDaemon(bp BaseParams, nodeID string, msg apc.ActMsg) error {
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathReverseDae.S
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActResetConfig})
+		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{
 			apc.HdrNodeID:      []string{nodeID},
 			cos.HdrContentType: []string{cos.ContentJSON},

@@ -7,9 +7,12 @@ redirect_from:
  - /docs/cli/archive.md/
 ---
 
-# When objects are, in fact, archives (shards)
+# When objects are _shards_
 
-In this document: commands to read, write, and list *archives* - objects formatted as TAR, TGZ, ZIP, etc. For the most recently updated archival types that AIS supports, please refer to [this source](/cmn/cos/archive.go).
+In this document:
+* commands to read, write, and list *archives* - objects formatted as `TAR`, `TGZ` (or `TAR.GZ`) , `ZIP`, `TAR.LZ4`.
+
+For the most recently updated list of supported archival formats, please refer to [this source](https://github.com/NVIDIA/aistore/blob/main/cmn/archive/mime.go).
 
 The corresponding subset of CLI commands starts with `ais archive`, from where you can `<TAB-TAB>` to the actual (reading, writing, listing) operation.
 
@@ -44,11 +47,6 @@ COMMANDS:
                (notice quotation marks in both cases)
 ```
 
-See also:
-
-> [Append file to archive](/docs/cli/object.md#append-file-to-archive)
-> [Archive multiple objects](/docs/cli/object.md#archive-multiple-objects)
-
 ## Table of Contents
 - [Archive files and directories](#archive-files-and-directories)
 - [Append files and directories to an existing archive](#append-files-and-directories-to-an-existing-archive)
@@ -58,7 +56,7 @@ See also:
 
 ## Archive files and directories
 
-Archive multiple objects from the source bucket.
+Archive multiple files.
 
 ```console
 $ ais archive put --help
@@ -81,17 +79,17 @@ USAGE:
    ais archive put [command options] [-|FILE|DIRECTORY[/PATTERN]] BUCKET/SHARD_NAME
 ```
 
-The operation accepts either an explicitly defined *list* or template-defined *range* of object names (to archive).
+The operation accepts either an explicitly defined *list* or template-defined *range* of file names (to archive).
 
-As such, `archive put` is one of the supported [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges).
+**NOTE:**
 
-Also note that `ais put` command with its `--archive` option provides an alternative way to archive multiple objects:
+* `ais archive put` works with locally accessible (source) files and shall _not_ be confused with `ais archive bucket` command (below).
 
-* [`ais put BUCKET/OBJECT --archive`](/docs/cli/object.md##archive-multiple-objects)
+Also, note that `ais put` command with its `--archpath` option provides an alternative way to archive multiple objects:
 
 For the most recently updated list of supported archival formats, please see:
 
-* [this source](https://github.com/NVIDIA/aistore/blob/master/cmn/cos/archive.go).
+* [this source](https://github.com/NVIDIA/aistore/blob/main/cmn/archive/mime.go).
 
 ## Append files and directories to an existing archive
 
@@ -102,28 +100,115 @@ APPEND operation provides for appending files to existing archives (shards). As 
 | `--append` | add newly archived content to the destination object (\"archive\", \"shard\") that **must** exist |
 | `--append-or-put` | **if** destination object (\"archive\", \"shard\") exists append to it, otherwise archive a new one |
 
-### Examples
+### Example 1: add file to archive
+
+#### step 1. create archive (by archiving a given source dir)
+
+```console
+$ ais archive put sys ais://nnn/sys.tar.lz4
+Warning: multi-file 'archive put' operation requires either '--append' or '--append-or-put' option
+Proceed to execute 'archive put --append-or-put'? [Y/N]: y
+Files to upload:
+EXTENSION        COUNT   SIZE
+.go              11      17.46KiB
+TOTAL            11      17.46KiB
+APPEND 11 files (one directory, non-recursive) => ais://nnn/sys.tar.lz4? [Y/N]: y
+Done
+```
+
+#### step 2. add a single file to existing archive
+
+```console
+$ ais archive put README.md ais://nnn/sys.tar.lz4 --archpath=docs/README --append
+APPEND README.md to ais://nnn/sys.tar.lz4 as "docs/README"
+```
+
+#### step 3. list entire bucket with an `--archive` option to show all archived entries
+
+```console
+$ ais ls ais://nnn --archive
+NAME                             SIZE
+sys.tar.lz4                      16.84KiB
+    sys.tar.lz4/api_linux.go     1.07KiB
+    sys.tar.lz4/cpu.go           1.07KiB
+    sys.tar.lz4/cpu_darwin.go    802B
+    sys.tar.lz4/cpu_linux.go     2.14KiB
+    sys.tar.lz4/docs/README      13.85KiB
+    sys.tar.lz4/mem.go           1.16KiB
+    sys.tar.lz4/mem_darwin.go    2.04KiB
+    sys.tar.lz4/mem_linux.go     2.81KiB
+    sys.tar.lz4/proc.go          784B
+    sys.tar.lz4/proc_darwin.go   369B
+    sys.tar.lz4/proc_linux.go    1.40KiB
+    sys.tar.lz4/sys_test.go      3.88KiB
+Listed: 13 names
+```
+
+Alternatively, use regex to select:
+
+```console
+$ ais ls ais://nnn --archive --regex docs
+NAME                             SIZE
+    sys.tar.lz4/docs/README      13.85KiB
+```
+
+### Example 2: use `--template` flag to add source files
+
+Generally, the `--template` option combines (an optional) prefix and/or one or more ranges (e.g., bash brace expansions).
+
+In this case, the template we use is a simple prefix with no ranges.
+
+```console
+$ ls -l /tmp/w
+total 32
+-rw-r--r-- 1 root root 14180 Dec 11 18:18 111
+-rw-r--r-- 1 root root 14180 Dec 11 18:18 222
+
+$ ais archive put ais://nnn/shard-001.tar --template /tmp/w/ --append
+Files to upload:
+EXTENSION        COUNT   SIZE
+                 2       27.70KiB
+TOTAL            2       27.70KiB
+APPEND 2 files (one directory, non-recursive) => ais://nnn/shard-001.tar? [Y/N]: y
+Done
+$ ais ls ais://nnn/shard-001.tar --archive
+NAME                                             SIZE
+shard-001.tar                                    37.50KiB
+    shard-001.tar/111                            13.85KiB
+    shard-001.tar/222                            13.85KiB
+    shard-001.tar/23ed44d8bf3952a35484-1.test    1.00KiB
+    shard-001.tar/452938788ebb87807043-4.test    1.00KiB
+    shard-001.tar/7925bc9b5eb1daa12ed0-2.test    1.00KiB
+    shard-001.tar/8264574b49bd188a4b27-0.test    1.00KiB
+    shard-001.tar/f1f25e52c5edd768e0ec-3.test    1.00KiB
+```
+
+### Example 3: add file to archive
+
+In this example, we assume that `arch.tar` already exists.
 
 ```console
 # contents _before_:
-$ ais archive ls ais://bck/arch.tar
+$ ais archive ls ais://abc/arch.tar
 NAME                SIZE
 arch.tar            4.5KiB
     arch.tar/obj1   1.0KiB
     arch.tar/obj2   1.0KiB
 
-# Do append:
-$ ais archive put /tmp/obj1.bin ais://bck/arch.tar --archpath bin/obj1
-APPEND "/tmp/obj1.bin" to object "ais://bck/arch.tar[/bin/obj1]"
+# add file to existing archive:
+$ ais archive put /tmp/obj1.bin ais://abc/arch.tar --archpath bin/obj1
+APPEND "/tmp/obj1.bin" to object "ais://abc/arch.tar[/bin/obj1]"
 
 # contents _after_:
-$ ais archive ls ais://bck/arch.tar
+$ ais archive ls ais://abc/arch.tar
 NAME                    SIZE
 arch.tar                6KiB
     arch.tar/bin/obj1   2.KiB
     arch.tar/obj1       1.0KiB
     arch.tar/obj2       1.0KiB
 ```
+
+### Example 4: add file to archive
 
 ```console
 # contents _before_:
@@ -135,8 +220,7 @@ shard-2.tar                                      5.50KiB
     shard-2.tar/504c563d14852368575b-5.test      1.00KiB
     shard-2.tar/c7bcb7014568b5e7d13b-4.test      1.00KiB
 
-# Do append
-# Note that `--archpath` can specify fully qualified name of the destination
+# append and note that `--archpath` can specify a fully qualified destination name
 
 $ ais archive put LICENSE ais://nnn/shard-2.tar --archpath shard-2.tar/license.test
 APPEND "/go/src/github.com/NVIDIA/aistore/LICENSE" to "ais://nnn/shard-2.tar[/shard-2.tar/license.test]"
@@ -152,6 +236,24 @@ shard-2.tar                                      7.50KiB
 ```
 
 ## Archive multiple objects
+
+This is a yet another archive-**creating** operation that:
+
+1. takes in multiple objects from a given **source bucket**, and
+2. archives them all as a shard in the specified destination bucket,
+
+   where:
+
+* source and destination buckets may not necessarily be different;
+* both `--list` and `--template` options are supported
+* supported archival formats include `.tar`, `.tar.gz` (or, same, `.tgz`), and `.zip`; more extensions may be added in the future.
+* archiving is carried out asynchronously, in parallel by all AIS targets.
+
+As such, `ais archive bucket` is one of the supported [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges).
+
+**NOTE:**
+
+* `ais archive bucket` multi-object bucket-to-bucket archiving shall _not_ be confused with `ais archive put` command - the latter is used to archive multiple source **files** from a local (or locally accessible) source **directory**.
 
 ```console
 $ ais archive bucket --help

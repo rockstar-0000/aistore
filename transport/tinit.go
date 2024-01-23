@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -21,12 +21,13 @@ import (
 const (
 	dfltBurstNum     = 128 // burst size (see: config.Transport.Burst)
 	dfltTick         = time.Second
+	dfltTickIdle     = dfltTick << 8   // (when there are no streams to _collect_)
 	dfltIdleTeardown = 4 * time.Second // (see config.Transport.IdleTeardown)
 )
 
 type global struct {
-	statsTracker cos.StatsUpdater // aka stats.Trunner
-	mm           *memsys.MMSA
+	tstats cos.StatsUpdater // subset of stats.Tracker interface, the minimum required
+	mm     *memsys.MMSA
 }
 
 var (
@@ -35,11 +36,11 @@ var (
 	verbose    bool
 )
 
-func Init(st cos.StatsUpdater, config *cmn.Config) *StreamCollector {
-	verbose = config.FastV(5 /*super-verbose*/, cos.SmoduleTransport)
+func Init(tstats cos.StatsUpdater, config *cmn.Config) *StreamCollector {
+	verbose = cmn.Rom.FastV(5 /*super-verbose*/, cos.SmoduleTransport)
 
 	g.mm = memsys.PageMM()
-	g.statsTracker = st
+	g.tstats = tstats
 
 	nextSessionID.Store(100)
 	for i := 0; i < numHmaps; i++ {

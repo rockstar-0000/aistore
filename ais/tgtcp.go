@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -12,18 +12,19 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/env"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
@@ -42,6 +43,11 @@ const (
 	bmdRecv  = "receive"
 	bmdReg   = "register"
 )
+
+type delb struct {
+	obck    *meta.Bck
+	present bool
+}
 
 func (t *target) joinCluster(action string, primaryURLs ...string) (status int, err error) {
 	res := t.join(nil, t, primaryURLs...)
@@ -138,7 +144,7 @@ func (t *target) daemonHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *target) httpdaeput(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathDae.L)
+	apiItems, err := t.parseURL(w, r, apc.URLPathDae.L, 0, true)
 	if err != nil {
 		return
 	}
@@ -161,6 +167,8 @@ func (t *target) daeputJSON(w http.ResponseWriter, r *http.Request) {
 		if err := t.owner.config.resetDaemonConfig(); err != nil {
 			t.writeErr(w, r, err)
 		}
+	case apc.ActRotateLogs:
+		nlog.Flush(nlog.ActRotate)
 	case apc.ActResetStats:
 		errorsOnly := msg.Value.(bool)
 		t.statsT.ResetStats(errorsOnly)
@@ -169,18 +177,18 @@ func (t *target) daeputJSON(w http.ResponseWriter, r *http.Request) {
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
 			return
 		}
-		t.termKaliveX(msg.Action)
+		t.termKaliveX(msg.Action, true)
 	case apc.ActShutdownCluster, apc.ActShutdownNode:
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
 			return
 		}
-		t.termKaliveX(msg.Action)
+		t.termKaliveX(msg.Action, false)
 		t.shutdown(msg.Action)
 	case apc.ActRmNodeUnsafe:
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
 			return
 		}
-		t.termKaliveX(msg.Action)
+		t.termKaliveX(msg.Action, true)
 	case apc.ActDecommissionCluster, apc.ActDecommissionNode:
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
 			return
@@ -190,7 +198,7 @@ func (t *target) daeputJSON(w http.ResponseWriter, r *http.Request) {
 			t.writeErr(w, r, err)
 			return
 		}
-		t.termKaliveX(msg.Action)
+		t.termKaliveX(msg.Action, opts.NoShutdown)
 		t.decommission(msg.Action, &opts)
 	case apc.ActCleanupMarkers:
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
@@ -247,7 +255,7 @@ func (t *target) daeSetPrimary(w http.ResponseWriter, r *http.Request, apiItems 
 	}
 
 	if prepare {
-		if cmn.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 			nlog.Infoln("Preparation step: do nothing")
 		}
 		return
@@ -287,7 +295,7 @@ func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
 	case apc.WhatMountpaths:
 		t.writeJSON(w, r, fs.MountpathsToLists(), httpdaeWhat)
 	case apc.WhatNodeStatsAndStatus:
-		var rebSnap *cluster.Snap
+		var rebSnap *core.Snap
 		if entry := xreg.GetLatest(xreg.Flt{Kind: apc.ActRebalance}); entry != nil {
 			if xctn := entry.Get(); xctn != nil {
 				rebSnap = xctn.Snap()
@@ -329,7 +337,7 @@ func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
 
 		anyConf := cmn.GCO.Get().Backend.Get(apc.AIS)
 		if anyConf == nil {
-			t.writeJSON(w, r, cluster.Remotes{}, httpdaeWhat)
+			t.writeJSON(w, r, meta.RemAisVec{}, httpdaeWhat)
 			return
 		}
 		aisConf, ok := anyConf.(cmn.BackendConfAIS)
@@ -343,7 +351,7 @@ func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
 
 // admin-join target | enable/disable mountpath
 func (t *target) httpdaepost(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathDae.L)
+	apiItems, err := t.parseURL(w, r, apc.URLPathDae.L, 0, true)
 	if err != nil {
 		return
 	}
@@ -393,7 +401,7 @@ func (t *target) httpdaepost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *target) httpdaedelete(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.parseURL(w, r, 1, false, apc.URLPathDae.L)
+	apiItems, err := t.parseURL(w, r, apc.URLPathDae.L, 1, false)
 	if err != nil {
 		return
 	}
@@ -454,6 +462,8 @@ func (t *target) handleMountpathReq(w http.ResponseWriter, r *http.Request) {
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
+
+	fs.ComputeDiskSize()
 }
 
 func (t *target) enableMpath(w http.ResponseWriter, r *http.Request, mpath string) {
@@ -636,24 +646,9 @@ func (t *target) _syncBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, psi 
 
 	// 3. delete, ignore errors
 	bmd.Range(nil, nil, func(obck *meta.Bck) bool {
-		var present bool
-		newBMD.Range(nil, nil, func(nbck *meta.Bck) bool {
-			if !obck.Equal(nbck, false /*ignore BID*/, false /* ignore backend */) {
-				return false
-			}
-			present = true
-			if obck.Props.Mirror.Enabled && !nbck.Props.Mirror.Enabled {
-				flt := xreg.Flt{Kind: apc.ActPutCopies, Bck: nbck}
-				xreg.DoAbort(flt, errors.New("apply-bmd"))
-				// NOTE: apc.ActMakeNCopies takes care of itself
-			}
-			if obck.Props.EC.Enabled && !nbck.Props.EC.Enabled {
-				flt := xreg.Flt{Kind: apc.ActECEncode, Bck: nbck}
-				xreg.DoAbort(flt, errors.New("apply-bmd"))
-			}
-			return true
-		})
-		if !present {
+		f := &delb{obck: obck}
+		newBMD.Range(nil, nil, f.do)
+		if !f.present {
 			rmbcks = append(rmbcks, obck)
 			if errD := fs.DestroyBucket("recv-bmd-"+msg.Action, obck.Bucket(), obck.Props.BID); errD != nil {
 				destroyErrs = append(destroyErrs, errD)
@@ -668,6 +663,25 @@ func (t *target) _syncBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, psi 
 	return
 }
 
+func (f *delb) do(nbck *meta.Bck) bool {
+	if !f.obck.Equal(nbck, false /*ignore BID*/, false /* ignore backend */) {
+		return false // keep going
+	}
+	f.present = true
+
+	// assorted props changed?
+	if f.obck.Props.Mirror.Enabled && !nbck.Props.Mirror.Enabled {
+		flt := xreg.Flt{Kind: apc.ActPutCopies, Bck: nbck}
+		xreg.DoAbort(flt, errors.New("apply-bmd"))
+		// NOTE: apc.ActMakeNCopies takes care of itself
+	}
+	if f.obck.Props.EC.Enabled && !nbck.Props.EC.Enabled {
+		flt := xreg.Flt{Kind: apc.ActECEncode, Bck: nbck}
+		xreg.DoAbort(flt, errors.New("apply-bmd"))
+	}
+	return true // break
+}
+
 func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {
 	// evict LOM cache
 	if len(rmbcks) > 0 {
@@ -675,13 +689,12 @@ func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {
 		xreg.AbortAllBuckets(errV, rmbcks...)
 		go func(bcks ...*meta.Bck) {
 			for _, b := range bcks {
-				cluster.EvictLomCache(b)
+				core.UncacheBck(b)
 			}
 		}(rmbcks...)
 	}
 	if tag != bmdReg {
-		// ecmanager will get updated BMD upon its init()
-		if err := ec.ECM.BucketsMDChanged(); err != nil {
+		if err := ec.ECM.BMDChanged(); err != nil {
 			nlog.Errorf("Failed to initialize EC manager: %v", err)
 		}
 	}
@@ -720,7 +733,7 @@ func (t *target) receiveRMD(newRMD *rebMD, msg *aisMsg) (err error) {
 		// run rebalance
 		//
 		notif := &xact.NotifXact{
-			Base: nl.Base{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+			Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
 		}
 		if msg.Action == apc.ActRebalance {
 			nlog.Infof("%s: starting user-requested rebalance[%s]", t, msg.UUID)
@@ -784,7 +797,7 @@ func (t *target) getPrimaryBMD(renamed string) (bmd *bucketMD, err error) {
 		psi     = smap.Primary
 		path    = apc.URLPathDae.S
 		url     = psi.URL(cmn.NetIntraControl)
-		timeout = cmn.Timeout.CplaneOperation()
+		timeout = cmn.Rom.CplaneOperation()
 	)
 	if renamed != "" {
 		q.Set(whatRenamedLB, renamed)
@@ -909,7 +922,7 @@ func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 		t.owner.rmd.Unlock()
 	}
 	if errEtlMD == nil && newEtlMD != nil {
-		errEtlMD = t.receiveEtlMD(newEtlMD, msgEtlMD, payload, caller, t._etlMDChange)
+		errEtlMD = t.receiveEtlMD(newEtlMD, msgEtlMD, payload, caller, _stopETLs)
 	}
 	// 3. respond
 	if errConf == nil && errSmap == nil && errBMD == nil && errRMD == nil && errEtlMD == nil {
@@ -920,14 +933,14 @@ func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 	t.writeErr(w, r, retErr, http.StatusConflict)
 }
 
-func (t *target) _etlMDChange(newEtlMD, oldEtlMD *etlMD, action string) {
-	for key := range oldEtlMD.ETLs {
-		if _, ok := newEtlMD.ETLs[key]; ok {
+func _stopETLs(newEtlMD, oldEtlMD *etlMD) {
+	for id := range oldEtlMD.ETLs {
+		if _, ok := newEtlMD.ETLs[id]; ok {
 			continue
 		}
 		// TODO: stop only when running
-		nlog.Infoln("ETL MD change resulting from action: " + action)
-		etl.Stop(t, key, nil)
+		nlog.Infof("stopping (removed from md) etl[%s] (old md v%d, new v%d)", id, oldEtlMD.Version, newEtlMD.Version)
+		etl.Stop(id, nil)
 	}
 }
 
@@ -990,7 +1003,7 @@ func (t *target) metasyncPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ntid := msg.UUID
-	if cmn.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		nlog.Infof("%s %s: %s, join %s", t, msg, newSmap, meta.Tname(ntid)) // "start-gfn" | "stop-gfn"
 	}
 	switch msg.Action {
@@ -1008,7 +1021,7 @@ func (t *target) metasyncPost(w http.ResponseWriter, r *http.Request) {
 // GET /v1/health (apc.Health)
 func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if t.regstate.disabled.Load() && daemon.cli.target.standby {
-		if cmn.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 			nlog.Warningf("[health] %s: standing by...", t)
 		}
 	} else if !t.NodeStarted() {
@@ -1114,7 +1127,7 @@ func (t *target) enable() error {
 
 // checks with a given target to see if it has the object.
 // target acts as a client - compare with api.HeadObject
-func (t *target) headt2t(lom *cluster.LOM, tsi *meta.Snode, smap *smapX) (ok bool) {
+func (t *target) headt2t(lom *core.LOM, tsi *meta.Snode, smap *smapX) (ok bool) {
 	q := lom.Bck().NewQuery()
 	q.Set(apc.QparamSilent, "true")
 	q.Set(apc.QparamFltPresence, strconv.Itoa(apc.FltPresent))
@@ -1131,7 +1144,7 @@ func (t *target) headt2t(lom *cluster.LOM, tsi *meta.Snode, smap *smapX) (ok boo
 			Path:  apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName),
 			Query: q,
 		}
-		cargs.timeout = cmn.Timeout.CplaneOperation()
+		cargs.timeout = cmn.Rom.CplaneOperation()
 	}
 	res := t.call(cargs, smap)
 	ok = res.err == nil
@@ -1142,7 +1155,7 @@ func (t *target) headt2t(lom *cluster.LOM, tsi *meta.Snode, smap *smapX) (ok boo
 
 // headObjBcast broadcasts to all targets to find out if anyone has the specified object.
 // NOTE: 1) apc.QparamCheckExistsAny to make an extra effort, 2) `ignoreMaintenance`
-func (t *target) headObjBcast(lom *cluster.LOM, smap *smapX) *meta.Snode {
+func (t *target) headObjBcast(lom *core.LOM, smap *smapX) *meta.Snode {
 	q := lom.Bck().NewQuery()
 	q.Set(apc.QparamSilent, "true")
 	// lookup across all mountpaths and copy (ie., restore) if misplaced
@@ -1176,11 +1189,13 @@ func (t *target) headObjBcast(lom *cluster.LOM, smap *smapX) *meta.Snode {
 // termination(s)
 //
 
-func (t *target) termKaliveX(action string) {
+func (t *target) termKaliveX(action string, abort bool) {
 	t.keepalive.ctrl(kaSuspendMsg)
 
-	err := fmt.Errorf("%s: term-kalive by %q", t, action)
-	xreg.AbortAll(err) // all xactions
+	if abort {
+		err := fmt.Errorf("%s: term-kalive by %q", t, action)
+		xreg.AbortAll(err) // all xactions
+	}
 }
 
 func (t *target) shutdown(action string) {
@@ -1218,10 +1233,19 @@ func (t *target) Stop(err error) {
 		t.regstate.mu.Unlock()
 	}
 	if err == nil {
-		nlog.Infoln("Stopping " + t.String())
+		nlog.Infoln("Stopping", t.String())
 	} else {
-		nlog.Warningf("Stopping %s: %v", t, err)
+		nlog.Warningln("Stopping", t.String()+":", err)
 	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		core.Term()
+		wg.Done()
+	}()
+
 	xreg.AbortAll(err)
-	t.htrun.stop(t.netServ.pub.s != nil && !isErrNoUnregister(err) /*rm from Smap*/)
+
+	t.htrun.stop(wg, g.netServ.pub.s != nil && !isErrNoUnregister(err) /*rm from Smap*/)
 }

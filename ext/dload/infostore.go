@@ -1,23 +1,20 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
 import (
+	"errors"
+	"net/http"
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/kvdb"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/hk"
-)
-
-var (
-	// global downloader info store
-	db          kvdb.Driver
-	dlStore     *infoStore
-	dlStoreOnce sync.Once
 )
 
 // TODO: stored only in memory, should be persisted at some point (powercycle)
@@ -25,14 +22,6 @@ type infoStore struct {
 	*downloaderDB
 	dljobs map[string]*dljob
 	sync.RWMutex
-}
-
-func SetDB(dbdrv kvdb.Driver) { db = dbdrv }
-
-func initInfoStore(db kvdb.Driver) {
-	dlStoreOnce.Do(func() {
-		dlStore = newInfoStore(db)
-	})
 }
 
 func newInfoStore(driver kvdb.Driver) *infoStore {
@@ -114,14 +103,14 @@ func (is *infoStore) setAllDispatched(id string, dispatched bool) {
 	dljob.allDispatched.Store(dispatched)
 }
 
-func (is *infoStore) markFinished(id string) error {
+func (is *infoStore) markFinished(id string) (error, bool /*aborted*/) {
 	dljob, err := is.getJob(id)
 	if err != nil {
 		debug.AssertNoErr(err)
-		return err
+		return err, false
 	}
 	dljob.finishedTime.Store(time.Now())
-	return dljob.valid()
+	return dljob.valid(), dljob.aborted.Load()
 }
 
 func (is *infoStore) setAborted(id string) {
@@ -150,4 +139,14 @@ func (is *infoStore) housekeep() time.Duration {
 	is.Unlock()
 
 	return interval
+}
+
+func (is *infoStore) checkExists(req *request) (dljob *dljob, err error) {
+	dljob, err = is.getJob(req.id)
+	if err != nil {
+		debug.Assert(errors.Is(err, errJobNotFound))
+		err = cos.NewErrNotFound(core.T, "download job "+req.id)
+		req.errRsp(err, http.StatusNotFound)
+	}
+	return
 }

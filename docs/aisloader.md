@@ -30,6 +30,7 @@ Detailed protocol-level tracing statistics are also available - see [HTTP tracin
 - [Setup](#Setup)
 - [Command line Options](#command-line-options)
     - [Often used options explanation](#often-used-options-explanation)
+- [Environment variables](#environment-variables)
 - [Examples](#examples)
 - [Collecting stats](#collecting-stats)
     - [Grafana](#grafana)
@@ -105,11 +106,6 @@ For the most recently updated command-line options and examples, please run `ais
 | -uniquegets | `bool` | true: GET objects randomly and equally. Meaning, make sure *not* to GET some objects more frequently than the others | `true` |
 | -usage | `bool` | Show command-line options, usage, and examples | `false` |
 | -verifyhash | `bool` | checksum-validate GET: recompute object checksums and validate it against the one received with the GET metadata | `true` |
-
-### Options via environment variables
-
-| Environment Variable | Type | Description |
-| `AIS_ENDPOINT` | `string` | Address of a cluster which aisloader will generate load on. Overrides `ip` and `port` flags. |
 
 ### Often used options explanation
 
@@ -232,6 +228,32 @@ Parameters in `aisLoader` that represent the number of bytes can be specified wi
 For example: `8M` would specify 8 MiB.
 The following multiplicative suffixes are supported: 't' or 'T' - TiB 'g' or 'G' - GiB, 'm' or 'M' - MiB, 'k' or 'K' - KiB.
 Note that this is entirely optional, and therefore an input such as `300` will be interpreted as 300 Bytes.
+
+## Environment variables
+
+| Environment Variable | Type | Description |
+| -- | -- | -- |
+| `AIS_ENDPOINT` | `string` | Cluster's endpoint: http or https address of any aistore gateway in this cluster. Overrides `ip` and `port` flags. |
+
+To state the same slightly differently, cluster endpoint can be defined in two ways:
+
+* as (plain) http://ip:port address, whereby '--ip' and '--port' are command-line options.
+* via `AIS_ENDPOINT` environment universally supported across all AIS clients, e.g.:
+
+```console
+$ export AIS_ENDPOINT=https://10.07.56.68:51080
+```
+
+In addition, environment can be used to specify client-side TLS (aka, HTTPS) configuration:
+
+| var name | description |
+| -- | -- |
+| `AIS_CRT`             | X509 certificate |
+| `AIS_CRT_KEY`         | X509 certificate's private key |
+| `AIS_CLIENT_CA`       | Certificate authority that authorized (signed) the certificate |
+| `AIS_SKIP_VERIFY_CRT` | true: skip X509 cert verification (usually enabled to circumvent limitations of self-signed certs) |
+
+* See also: [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
 
 ## Examples
 

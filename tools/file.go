@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
-	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/tools/cryptorand"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -48,7 +48,6 @@ type (
 
 	ObjectsOut struct {
 		Dir             string
-		T               cluster.Target
 		Bck             cmn.Bck
 		FQNs            map[string][]string // ContentType => FQN
 		MpathObjectsCnt map[string]int      // mpath -> # objects on the mpath
@@ -64,7 +63,7 @@ func RandomObjDir(dirLen, maxDepth int) (dir string) {
 }
 
 func SetXattrCksum(fqn string, bck cmn.Bck, cksum *cos.Cksum) error {
-	lom := &cluster.LOM{}
+	lom := &core.LOM{}
 	// NOTE: this is an intentional hack to go ahead and corrupt the checksum
 	//       - init and/or load errors are ignored on purpose
 	_ = lom.InitFQN(fqn, &bck)
@@ -136,13 +135,12 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 			Name:     trand.String(10),
 			Provider: apc.AIS,
 			Ns:       cmn.NsGlobal,
-			Props: &cmn.BucketProps{
+			Props: &cmn.Bprops{
 				Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash},
 				BID:   0xa5b6e7d8,
 			},
 		}
-		bmd   = mock.NewBaseBownerMock((*meta.Bck)(&bck))
-		tMock cluster.Target
+		bmd = mock.NewBaseBownerMock((*meta.Bck)(&bck))
 	)
 
 	mios := mock.NewIOS()
@@ -168,7 +166,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 		return nil
 	}
 
-	tMock = mock.NewTarget(bmd)
+	core.T = mock.NewTarget(bmd) // a.k.a. tMock
 
 	errs := fs.CreateBucket(&bck, false /*nilbmd*/)
 	if len(errs) > 0 {
@@ -177,7 +175,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 
 	for _, ct := range desc.CTs {
 		for i := 0; i < ct.ContentCnt; i++ {
-			fqn, _, err := cluster.HrwFQN(&bck, ct.Type, trand.String(15))
+			fqn, _, err := core.HrwFQN(&bck, ct.Type, trand.String(15))
 			tassert.CheckFatal(t, err)
 
 			fqns[ct.Type] = append(fqns[ct.Type], fqn)
@@ -195,7 +193,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 
 			switch ct.Type {
 			case fs.ObjectType:
-				lom := &cluster.LOM{}
+				lom := &core.LOM{}
 				err = lom.InitFQN(fqn, nil)
 				tassert.CheckFatal(t, err)
 
@@ -212,7 +210,6 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 
 	return &ObjectsOut{
 		Dir:             dir,
-		T:               tMock,
 		Bck:             bck,
 		FQNs:            fqns,
 		MpathObjectsCnt: mpathCnts,

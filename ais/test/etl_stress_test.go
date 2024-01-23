@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"math/rand"
@@ -27,7 +27,7 @@ import (
 const etlBucketTimeout = cos.Duration(3 * time.Minute)
 
 func TestETLConnectionError(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true})
 	tetl.CheckNoRunningETLContainers(t, baseParams)
 
 	// ETL should survive occasional failures and successfully transform all objects.
@@ -68,7 +68,7 @@ def transform(input_bytes):
 	}
 	msg.Funcs.Transform = "transform"
 
-	_ = tetl.InitCode(t, baseParams, msg)
+	_ = tetl.InitCode(t, baseParams, &msg)
 
 	bckTo := cmn.Bck{Name: "etldst_" + cos.GenTie(), Provider: apc.AIS}
 	testETLBucket(t, baseParams, msg.Name(), &m, bckTo, time.Duration(etlBucketTimeout),
@@ -76,7 +76,7 @@ def transform(input_bytes):
 }
 
 func TestETLBucketAbort(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true})
 	tetl.CheckNoRunningETLContainers(t, baseParams)
 
 	m := &ioContext{
@@ -87,13 +87,15 @@ func TestETLBucketAbort(t *testing.T) {
 	}
 
 	xid := etlPrepareAndStart(t, m, tetl.Echo, etl.Hpull)
-	args := xact.ArgsMsg{ID: xid, Kind: apc.ActETLBck}
+
 	time.Sleep(time.Duration(rand.Intn(5)) * time.Second)
 
-	tlog.Logf("Aborting ETL xaction %q\n", xid)
-	err := api.AbortXaction(baseParams, args)
+	tlog.Logf("Aborting etl[%s]\n", xid)
+	args := xact.ArgsMsg{ID: xid, Kind: apc.ActETLBck}
+	err := api.AbortXaction(baseParams, &args)
 	tassert.CheckFatal(t, err)
-	err = tetl.WaitForAborted(baseParams, xid, apc.ActETLBck, 5*time.Minute)
+
+	err = tetl.WaitForAborted(baseParams, xid, apc.ActETLBck, 2*time.Minute)
 	tassert.CheckFatal(t, err)
 	etls, err := api.ETLList(baseParams)
 	tassert.CheckFatal(t, err)
@@ -102,7 +104,7 @@ func TestETLBucketAbort(t *testing.T) {
 }
 
 func TestETLTargetDown(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, MinTargets: 2})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, MinTargets: 2})
 	tetl.CheckNoRunningETLContainers(t, baseParams)
 
 	m := &ioContext{
@@ -134,7 +136,7 @@ func TestETLTargetDown(t *testing.T) {
 		m.waitAndCheckCluState()
 
 		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-		_, _ = api.WaitForXactionIC(baseParams, args)
+		_, _ = api.WaitForXactionIC(baseParams, &args)
 
 		tetl.CheckNoRunningETLContainers(t, baseParams)
 	})
@@ -146,7 +148,7 @@ func TestETLTargetDown(t *testing.T) {
 
 func TestETLBigBucket(t *testing.T) {
 	// The test takes a lot of time if it's run against a single target deployment.
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true, MinTargets: 2})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true, MinTargets: 2})
 
 	const echoPythonTransform = `
 def transform(input_bytes):
@@ -160,7 +162,7 @@ def transform(input_bytes):
 		m = ioContext{
 			t:         t,
 			num:       200_000,
-			fileSize:  20 * cos.KiB, // 4Gib total
+			fileSize:  20 * cos.KiB, // 4GiB total
 			fixedSize: true,
 			bck:       bckFrom,
 		}
@@ -201,7 +203,8 @@ def transform(input_bytes):
 
 	m.puts()
 
-	for _, test := range tests {
+	for i := range tests {
+		test := tests[i]
 		t.Run(test.name, func(t *testing.T) {
 			tetl.CheckNoRunningETLContainers(t, baseParams)
 			var (
@@ -221,7 +224,7 @@ def transform(input_bytes):
 					test.etlCodeMsg.Timeout = etlBucketTimeout
 					test.etlCodeMsg.Funcs.Transform = "transform"
 				}
-				_ = tetl.InitCode(t, baseParams, test.etlCodeMsg)
+				_ = tetl.InitCode(t, baseParams, &test.etlCodeMsg)
 			default:
 				debug.Assert(false, test.ty)
 			}
@@ -246,7 +249,7 @@ def transform(input_bytes):
 			etlDoneCh.Close()
 			tassert.CheckFatal(t, err)
 
-			snaps, err := api.QueryXactionSnaps(baseParams, xact.ArgsMsg{ID: xid})
+			snaps, err := api.QueryXactionSnaps(baseParams, &xact.ArgsMsg{ID: xid})
 			tassert.CheckFatal(t, err)
 			total, err := snaps.TotalRunningTime(xid)
 			tassert.CheckFatal(t, err)

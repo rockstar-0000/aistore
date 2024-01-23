@@ -1,12 +1,14 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -16,13 +18,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/aistore/ais"
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/readers"
@@ -70,7 +74,7 @@ var (
 )
 
 func TestMultiProxy(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{
+	tools.CheckSkip(t, &tools.SkipTestArgs{
 		Long:               true,
 		RequiredDeployment: tools.ClusterTypeLocal,
 		MinProxies:         3,
@@ -153,7 +157,7 @@ func nodeCrashRestoreDifferentIP(t *testing.T) {
 
 func killRestoreDiffIP(t *testing.T, nodeType string) {
 	// NOTE: This function requires local deployment as it changes node config
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		proxyURL                      = tools.GetPrimaryURL()
@@ -185,7 +189,7 @@ killRestore:
 	tassert.CheckFatal(t, err)
 
 	// Update local config ports.
-	localConfPath := filepath.Join(cfg.ConfigDir, fname.PlaintextInitialConfig)
+	localConfPath := filepath.Join(cfg.ConfigDir, fname.PlainLocalConfig)
 	localConf := &cmn.LocalConfig{}
 	_, err = jsp.LoadMeta(localConfPath, localConf)
 	tassert.CheckFatal(t, err)
@@ -324,7 +328,7 @@ func addNodeDuplicateDaemonID(t *testing.T) {
 // TODO: add test for target that tries to join with duplicate DaemonID and contains user-data
 func _addNodeDuplicateDaemonID(t *testing.T, nodeType string) {
 	// NOTE: This function requires local deployment as it changes node config
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		proxyURL = tools.GetPrimaryURL()
@@ -375,7 +379,7 @@ func addNodeDuplicateIP(t *testing.T) {
 // NOTE: Test assumes that the randomly chosen node is healthy (i.e. doesn't terminate or restart)
 func _addNodeDuplicateIP(t *testing.T, nodeType string) {
 	// NOTE: This function requires local deployment as it changes node config
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		proxyURL = tools.GetPrimaryURL()
@@ -701,7 +705,7 @@ func proxyPutGetDelete(count int, proxyURL string, bck cmn.Bck, cksumType string
 			Cksum:      reader.Cksum(),
 			Reader:     reader,
 		}
-		if _, err = api.PutObject(putArgs); err != nil {
+		if _, err = api.PutObject(&putArgs); err != nil {
 			return fmt.Errorf("error executing put: %v", err)
 		}
 		if _, err = api.GetObject(baseParams, bck, keyname, nil); err != nil {
@@ -771,7 +775,7 @@ loop:
 			Cksum:      reader.Cksum(),
 			Reader:     reader,
 		}
-		_, err = api.PutObject(putArgs)
+		_, err = api.PutObject(&putArgs)
 		if err != nil {
 			errCh <- err
 			continue
@@ -1274,7 +1278,7 @@ func networkFailurePrimary(t *testing.T) {
 }
 
 func networkFailure(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeDocker})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeDocker})
 
 	t.Run("Target network disconnect", networkFailureTarget)
 	t.Run("Secondary proxy network disconnect", networkFailureProxy)
@@ -1343,7 +1347,7 @@ func primaryAndNextCrash(t *testing.T) {
 }
 
 func TestIC(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	proxyURL := tools.RandomProxyURL(t)
 	smap := tools.GetClusterMap(t, proxyURL)
@@ -1366,7 +1370,7 @@ func killRandNonPrimaryIC(t testing.TB, smap *meta.Smap) (tools.RestoreCmd, *met
 	primary := smap.Primary
 	var killNode *meta.Snode
 	for _, psi := range smap.Pmap {
-		if smap.IsIC(psi) && !psi.Equals(primary) {
+		if smap.IsIC(psi) && !psi.Eq(primary) {
 			killNode = psi
 			break
 		}
@@ -1427,7 +1431,7 @@ func icMemberLeaveAndRejoin(t *testing.T) {
 }
 
 func icKillAndRestorePrimary(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		proxyURL   = tools.RandomProxyURL(t)
 		smap       = tools.GetClusterMap(t, proxyURL)
@@ -1499,7 +1503,7 @@ func icSyncOwnershipTable(t *testing.T) {
 
 	baseParams = tools.BaseAPIParams(newICNode.URL(cmn.NetPublic))
 	xargs := xact.ArgsMsg{ID: xid, Kind: apc.ActCopyBck}
-	_, err = api.GetOneXactionStatus(baseParams, xargs)
+	_, err = api.GetOneXactionStatus(baseParams, &xargs)
 	tassert.CheckError(t, err)
 
 	err = tools.RestoreNode(cmd, false, "proxy")
@@ -1514,12 +1518,12 @@ func icSyncOwnershipTable(t *testing.T) {
 	tassert.Fatalf(t, smap.IsIC(cmd.Node), "primary (%s) should be a IC member, (were: %s)", primary, smap.StrIC(primary))
 
 	baseParams = tools.BaseAPIParams(cmd.Node.URL(cmn.NetPublic))
-	_, err = api.GetOneXactionStatus(baseParams, xargs)
+	_, err = api.GetOneXactionStatus(baseParams, &xargs)
 	tassert.CheckError(t, err)
 }
 
 func icSinglePrimaryRevamp(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		proxyURL       = tools.RandomProxyURL(t)
@@ -1570,7 +1574,7 @@ func icSinglePrimaryRevamp(t *testing.T) {
 		tassert.CheckFatal(t, err)
 
 		baseParams = tools.BaseAPIParams(cmd.Node.URL(cmn.NetPublic))
-		_, err = api.GetOneXactionStatus(baseParams, xargs)
+		_, err = api.GetOneXactionStatus(baseParams, &xargs)
 		tassert.CheckError(t, err)
 	}
 }
@@ -1630,7 +1634,7 @@ func startCPBckAndWait(t testing.TB, srcBck cmn.Bck, count int) *sync.WaitGroup 
 				wg.Done()
 			}()
 			xargs := xact.ArgsMsg{ID: xid, Timeout: tools.RebalanceTimeout}
-			_, err = api.WaitForXactionIC(baseParams, xargs)
+			_, err = api.WaitForXactionIC(baseParams, &xargs)
 			tassert.CheckError(t, err)
 		}(i)
 	}
@@ -1674,4 +1678,146 @@ func getNewICMember(t testing.TB, oldMap, newMap cos.StrSet) (daeID string) {
 	}
 	tassert.Fatalf(t, daeID != "", "should change at least one IC member")
 	return
+}
+
+//
+// mock target
+//
+
+const (
+	mockTargetPort = "8079"
+)
+
+type targetMocker interface {
+	filehdlr(w http.ResponseWriter, r *http.Request)
+	daemonhdlr(w http.ResponseWriter, r *http.Request)
+	votehdlr(w http.ResponseWriter, r *http.Request)
+	healthdlr(w http.ResponseWriter, r *http.Request)
+}
+
+type MockRegRequest struct {
+	SI *meta.Snode `json:"si"`
+}
+
+func runMockTarget(t *testing.T, proxyURL string, mocktgt targetMocker, stopch chan struct{}, smap *meta.Smap, wg *sync.WaitGroup) {
+	defer wg.Done()
+	mux := http.NewServeMux()
+
+	mux.HandleFunc(apc.URLPathBuckets.S, mocktgt.filehdlr)
+	mux.HandleFunc(apc.URLPathObjects.S, mocktgt.filehdlr)
+	mux.HandleFunc(apc.URLPathDae.S, mocktgt.daemonhdlr)
+	mux.HandleFunc(apc.URLPathVote.S, mocktgt.votehdlr)
+	mux.HandleFunc(apc.URLPathHealth.S, mocktgt.healthdlr)
+
+	target, _ := smap.GetRandTarget()
+	ip := target.PubNet.Hostname
+
+	s := &http.Server{
+		Addr:              ip + ":" + mockTargetPort,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go s.ListenAndServe()
+
+	err := registerMockTarget(proxyURL, smap)
+	if err != nil {
+		t.Errorf("failed to start http server for mock target: %v", err)
+		return
+	}
+	tlog.Logf("t[%s] is up\n", tools.MockDaemonID)
+
+	<-stopch
+
+	tlog.Logf("started unsafe removal of t[%s]\n", tools.MockDaemonID)
+	err = tools.RemoveNodeUnsafe(proxyURL, tools.MockDaemonID)
+	if err != nil {
+		tlog.Logf("Error: failed to unsafely remove t[%s]: %v\n", tools.MockDaemonID, err)
+	}
+	s.Shutdown(context.Background())
+}
+
+func registerMockTarget(proxyURL string, smap *meta.Smap) error {
+	var (
+		jsonDaemonInfo []byte
+		err            error
+	)
+
+	// borrow a random target's ip but using a different port to register the mock target
+	for _, v := range smap.Tmap {
+		v.DaeID = tools.MockDaemonID
+		v.PubNet = meta.NetInfo{
+			Hostname: v.PubNet.Hostname,
+			Port:     mockTargetPort,
+			URL:      "http://" + v.PubNet.Hostname + ":" + mockTargetPort,
+		}
+		v.ControlNet = v.PubNet
+		v.DataNet = v.PubNet
+		regReq := MockRegRequest{SI: v}
+		jsonDaemonInfo, err = jsoniter.Marshal(regReq)
+		if err != nil {
+			return err
+		}
+		break
+	}
+	baseParams := tools.BaseAPIParams(proxyURL)
+	baseParams.Method = http.MethodPost
+	reqParams := &api.ReqParams{
+		BaseParams: baseParams,
+		Path:       apc.URLPathCluAutoReg.S,
+		Body:       jsonDaemonInfo,
+		Header:     http.Header{cos.HdrContentType: []string{cos.ContentJSON}},
+	}
+	return reqParams.DoRequest()
+}
+
+type voteRetryMockTarget struct {
+	voteInProgress bool
+	errCh          chan error
+}
+
+type cluMetaRedux struct {
+	Smap           *meta.Smap
+	VoteInProgress bool `json:"voting"`
+}
+
+func newVoteMsg(inp bool) cluMetaRedux {
+	return cluMetaRedux{VoteInProgress: inp, Smap: &meta.Smap{Version: 1}}
+}
+
+func (*voteRetryMockTarget) filehdlr(http.ResponseWriter, *http.Request) {
+	// Ignore all file requests
+}
+
+func (p *voteRetryMockTarget) daemonhdlr(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		msg := newVoteMsg(p.voteInProgress) // treat all Get requests as requests for a VoteMsg
+		jsbytes, err := jsoniter.Marshal(msg)
+		if err == nil {
+			_, err = w.Write(jsbytes)
+		}
+		if err != nil {
+			p.errCh <- fmt.Errorf("error writing vote message: %v", err)
+		}
+	default:
+	}
+}
+
+func (*voteRetryMockTarget) votehdlr(w http.ResponseWriter, _ *http.Request) {
+	// Always vote yes.
+	w.Write([]byte(ais.VoteYes))
+}
+
+func (p *voteRetryMockTarget) healthdlr(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	getRebStatus := cos.IsParseBool(query.Get(apc.QparamRebStatus))
+	if getRebStatus {
+		status := &reb.Status{}
+		status.RebID = math.MaxInt64 // to abort t[MOCK] join triggered rebalance
+		body := cos.MustMarshal(status)
+		_, err := w.Write(body)
+		if err != nil {
+			p.errCh <- fmt.Errorf("error writing reb-status: %v", err)
+		}
+	}
 }

@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 
 // AIS loader (aisloader) is a tool to measure storage performance. It's a load
@@ -47,12 +47,12 @@ import (
 	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/bench/tools/aisloader/namegetter"
 	"github.com/NVIDIA/aistore/bench/tools/aisloader/stats"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
@@ -73,6 +73,9 @@ const (
 	wo2FreeDelay = 3*time.Second + time.Millisecond
 
 	ua = "aisloader"
+
+	defaultClusterIP   = "localhost"
+	defaultClusterIPv4 = "127.0.0.1"
 )
 
 type (
@@ -100,7 +103,7 @@ type (
 		smap *meta.Smap
 
 		bck    cmn.Bck
-		bProps cmn.BucketProps
+		bProps cmn.Bprops
 
 		loaderID             string // used with multiple loader instances generating objects in parallel
 		proxyURL             string
@@ -213,15 +216,17 @@ var _version, _buildtime string
 func Start(version, buildtime string) (err error) {
 	_version, _buildtime = version, buildtime
 
+	// global and parsed/validated
+	runParams = &params{}
+
 	// discard flags of imported packages
 	// define and add aisloader's own flags
 	// parse flags
-	runParams = &params{}
 	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	addCmdLine(f, runParams)
 
 	// validate and finish initialization
-	if err = validateCmdLine(runParams); err != nil {
+	if err = _init(runParams); err != nil {
 		return err
 	}
 
@@ -337,20 +342,20 @@ func Start(version, buildtime string) (err error) {
 	gmm.RegWithHK()
 
 	if etlInitSpec != nil {
-		fmt.Println(prettyTimestamp() + " Waiting for an ETL to start...")
+		fmt.Println(now(), "Starting ETL...")
 		etlName, err = api.ETLInit(runParams.bp, etlInitSpec)
 		if err != nil {
 			return fmt.Errorf("failed to initialize ETL: %v", err)
 		}
-		fmt.Println(prettyTimestamp() + " ETL started")
+		fmt.Println(now(), etlName, "started")
 
 		defer func() {
-			fmt.Println(prettyTimestamp() + " Stopping the ETL...")
+			fmt.Println(now(), "Stopping ETL", etlName)
 			if err := api.ETLStop(runParams.bp, etlName); err != nil {
-				fmt.Printf("%s Failed to stop the ETL: %v\n", prettyTimestamp(), err)
+				fmt.Printf("%s Failed to stop ETL %s: %v\n", now(), etlName, err)
 				return
 			}
-			fmt.Println(prettyTimestamp() + " ETL stopped")
+			fmt.Println(now(), etlName, "stopped")
 		}()
 	}
 
@@ -424,8 +429,8 @@ MainLoop:
 		// Prioritize showing stats otherwise we will dropping the stats intervals.
 		select {
 		case <-statsTicker.C:
-			accumulatedStats.aggregate(intervalStats)
-			writeStats(statsWriter, runParams.jsonFormat, false /* final */, intervalStats, accumulatedStats)
+			accumulatedStats.aggregate(&intervalStats)
+			writeStats(statsWriter, runParams.jsonFormat, false /* final */, &intervalStats, &accumulatedStats)
 			sendStatsdStats(&intervalStats)
 			intervalStats = newStats(time.Now())
 		default:
@@ -438,7 +443,7 @@ MainLoop:
 		case wo := <-resCh:
 			completeWorkOrder(wo, false)
 			if runParams.statsShowInterval == 0 && runParams.putSizeUpperBound != 0 {
-				accumulatedStats.aggregate(intervalStats)
+				accumulatedStats.aggregate(&intervalStats)
 				intervalStats = newStats(time.Now())
 			}
 			if err := postNewWorkOrder(); err != nil {
@@ -446,8 +451,8 @@ MainLoop:
 				break MainLoop
 			}
 		case <-statsTicker.C:
-			accumulatedStats.aggregate(intervalStats)
-			writeStats(statsWriter, runParams.jsonFormat, false /* final */, intervalStats, accumulatedStats)
+			accumulatedStats.aggregate(&intervalStats)
+			writeStats(statsWriter, runParams.jsonFormat, false /* final */, &intervalStats, &accumulatedStats)
 			sendStatsdStats(&intervalStats)
 			intervalStats = newStats(time.Now())
 		case sig := <-osSigChan:
@@ -495,13 +500,13 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.BoolVar(&flagUsage, "usage", false, "Show command-line options, usage, and examples")
 	f.BoolVar(&flagVersion, "version", false, "Show aisloader version")
 	f.BoolVar(&flagQuiet, "quiet", false, "When starting to run, do not print command line arguments, default settings, and usage examples")
-	f.DurationVar(&transportArgs.Timeout, "timeout", 10*time.Minute, "Client HTTP timeout - used in LIST/GET/PUT/DELETE")
+	f.DurationVar(&cargs.Timeout, "timeout", 10*time.Minute, "Client HTTP timeout - used in LIST/GET/PUT/DELETE")
 	f.IntVar(&p.statsShowInterval, "statsinterval", 10, "Interval in seconds to print performance counters; 0 - disabled")
 	f.StringVar(&p.bck.Name, "bucket", "", "Bucket name or bucket URI. If empty, a bucket with random name will be created")
 	f.StringVar(&p.bck.Provider, "provider", apc.AIS,
 		"ais - for AIS bucket, \"aws\", \"azure\", \"gcp\", \"hdfs\"  for Azure, Amazon, Google, and HDFS clouds respectively")
 
-	f.StringVar(&ip, "ip", "localhost", "AIS proxy/gateway IP address or hostname")
+	f.StringVar(&ip, "ip", defaultClusterIP, "AIS proxy/gateway IP address or hostname")
 	f.StringVar(&port, "port", "8080", "AIS proxy/gateway port")
 
 	//
@@ -604,8 +609,8 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	}
 }
 
-// validate and finish initialization
-func validateCmdLine(p *params) (err error) {
+// validate command line and finish initialization
+func _init(p *params) (err error) {
 	if p.bck.Name != "" {
 		if p.cleanUp.Val && isDirectS3() {
 			return errors.New("direct S3 access via '-s3endpoint': option '-cleanup' is not supported yet")
@@ -676,7 +681,7 @@ func validateCmdLine(p *params) (err error) {
 		if p.randomProxy {
 			return errors.New("command line options '-s3endpoint' and '-randomproxy' are mutually exclusive")
 		}
-		if ip != "" && ip != "localhost" && ip != "127.0.0.1" { // TODO: hardcoded default
+		if ip != "" && ip != defaultClusterIP && ip != defaultClusterIPv4 {
 			return errors.New("command line options '-s3endpoint' and '-ip' are mutually exclusive")
 		}
 		if port != "" && port != "8080" { // TODO: ditto
@@ -803,7 +808,7 @@ func validateCmdLine(p *params) (err error) {
 	}
 
 	if p.bPropsStr != "" {
-		var bprops cmn.BucketProps
+		var bprops cmn.Bprops
 		jsonStr := strings.TrimRight(p.bPropsStr, ",")
 		if !strings.HasPrefix(jsonStr, "{") {
 			jsonStr = "{" + strings.TrimRight(jsonStr, ",") + "}"
@@ -851,10 +856,18 @@ func validateCmdLine(p *params) (err error) {
 		}
 	}
 
+	var useHTTPS bool
 	if !isDirectS3() {
+		// AIS endpoint: http://ip:port _or_ AIS_ENDPOINT env
 		aisEndpoint := "http://" + ip + ":" + port
+
+		// see also: tlsArgs
 		envEndpoint = os.Getenv(env.AIS.Endpoint)
 		if envEndpoint != "" {
+			if ip != "" && ip != defaultClusterIP && ip != defaultClusterIPv4 {
+				return fmt.Errorf("'%s=%s' environment and '--ip=%s' command-line are mutually exclusive",
+					env.AIS.Endpoint, envEndpoint, ip)
+			}
 			aisEndpoint = envEndpoint
 		}
 
@@ -870,13 +883,19 @@ func validateCmdLine(p *params) (err error) {
 
 		// TODO: validate against cluster map (see api.GetClusterMap below)
 		p.proxyURL = scheme + "://" + address
-		transportArgs.UseHTTPS = scheme == "https"
+		useHTTPS = scheme == "https"
 	}
 
-	httpClient = cmn.NewClient(transportArgs)
+	p.bp = api.BaseParams{URL: p.proxyURL}
+	if useHTTPS {
+		// environment to override client config
+		cmn.EnvToTLS(&sargs)
+		p.bp.Client = cmn.NewClientTLS(cargs, sargs)
+	} else {
+		p.bp.Client = cmn.NewClient(cargs)
+	}
 
 	// NOTE: auth token is assigned below when we execute the very first API call
-	p.bp = api.BaseParams{Client: httpClient, URL: p.proxyURL}
 	return nil
 }
 
@@ -923,7 +942,7 @@ func newStats(t time.Time) sts {
 }
 
 // aggregate adds another sts to self
-func (s *sts) aggregate(other sts) {
+func (s *sts) aggregate(other *sts) {
 	s.get.Aggregate(other.get)
 	s.put.Aggregate(other.put)
 	s.getConfig.Aggregate(other.getConfig)
@@ -975,7 +994,7 @@ func setupBucket(runParams *params, created *bool) error {
 	if runParams.bPropsStr == "" {
 		return nil
 	}
-	propsToUpdate := cmn.BucketPropsToUpdate{}
+	propsToUpdate := cmn.BpropsToSet{}
 	// update bucket props if bPropsStr is set
 	oldProps, err := api.HeadBucket(runParams.bp, runParams.bck, true /* don't add */)
 	if err != nil {
@@ -983,19 +1002,19 @@ func setupBucket(runParams *params, created *bool) error {
 	}
 	change := false
 	if runParams.bProps.EC.Enabled != oldProps.EC.Enabled {
-		propsToUpdate.EC = &cmn.ECConfToUpdate{
-			Enabled:      api.Bool(runParams.bProps.EC.Enabled),
-			ObjSizeLimit: api.Int64(runParams.bProps.EC.ObjSizeLimit),
-			DataSlices:   api.Int(runParams.bProps.EC.DataSlices),
-			ParitySlices: api.Int(runParams.bProps.EC.ParitySlices),
+		propsToUpdate.EC = &cmn.ECConfToSet{
+			Enabled:      apc.Bool(runParams.bProps.EC.Enabled),
+			ObjSizeLimit: apc.Int64(runParams.bProps.EC.ObjSizeLimit),
+			DataSlices:   apc.Int(runParams.bProps.EC.DataSlices),
+			ParitySlices: apc.Int(runParams.bProps.EC.ParitySlices),
 		}
 		change = true
 	}
 	if runParams.bProps.Mirror.Enabled != oldProps.Mirror.Enabled {
-		propsToUpdate.Mirror = &cmn.MirrorConfToUpdate{
-			Enabled: api.Bool(runParams.bProps.Mirror.Enabled),
-			Copies:  api.Int64(runParams.bProps.Mirror.Copies),
-			Burst:   api.Int(runParams.bProps.Mirror.Burst),
+		propsToUpdate.Mirror = &cmn.MirrorConfToSet{
+			Enabled: apc.Bool(runParams.bProps.Mirror.Enabled),
+			Copies:  apc.Int64(runParams.bProps.Mirror.Copies),
+			Burst:   apc.Int(runParams.bProps.Mirror.Burst),
 		}
 		change = true
 	}
@@ -1022,7 +1041,7 @@ func sendStatsdStats(s *sts) {
 func cleanup() {
 	stopping.Store(true)
 	time.Sleep(time.Second)
-	fmt.Println(prettyTimestamp() + " Cleaning up...")
+	fmt.Println(now() + " Cleaning up...")
 	if bucketObjsNames != nil {
 		// `bucketObjsNames` has been actually assigned to/initialized.
 		var (
@@ -1045,7 +1064,7 @@ func cleanup() {
 	if runParams.bck.IsAIS() {
 		api.DestroyBucket(runParams.bp, runParams.bck)
 	}
-	fmt.Println(prettyTimestamp() + " Done")
+	fmt.Println(now() + " Done")
 }
 
 func cleanupObjs(objs []string, wg *sync.WaitGroup) {
@@ -1062,23 +1081,23 @@ func cleanupObjs(objs []string, wg *sync.WaitGroup) {
 		b := min(t, runParams.batchSize)
 		n := t / b
 		for i := 0; i < n; i++ {
-			xid, err := api.DeleteList(runParams.bp, runParams.bck, objs[i*b:(i+1)*b])
+			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, objs[i*b:(i+1)*b], "" /*template*/)
 			if err != nil {
 				fmt.Println("delete err ", err)
 			}
 			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
-			if _, err = api.WaitForXactionIC(runParams.bp, args); err != nil {
+			if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
 				fmt.Println("wait for xaction err ", err)
 			}
 		}
 
 		if t%b != 0 {
-			xid, err := api.DeleteList(runParams.bp, runParams.bck, objs[n*b:])
+			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, objs[n*b:], "" /*template*/)
 			if err != nil {
 				fmt.Println("delete err ", err)
 			}
 			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
-			if _, err = api.WaitForXactionIC(runParams.bp, args); err != nil {
+			if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
 				fmt.Println("wait for xaction err ", err)
 			}
 		}

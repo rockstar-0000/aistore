@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -10,10 +10,11 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/xact"
@@ -28,7 +29,6 @@ type (
 	}
 	XactBckEncode struct {
 		xact.Base
-		t    cluster.Target
 		bck  *meta.Bck
 		wg   *sync.WaitGroup // to wait for EC finishes all objects
 		smap *meta.Smap
@@ -37,7 +37,7 @@ type (
 
 // interface guard
 var (
-	_ cluster.Xact   = (*XactBckEncode)(nil)
+	_ core.Xact      = (*XactBckEncode)(nil)
 	_ xreg.Renewable = (*encFactory)(nil)
 )
 
@@ -52,12 +52,12 @@ func (*encFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 }
 
 func (p *encFactory) Start() error {
-	p.xctn = newXactBckEncode(p.Bck, p.T, p.UUID())
+	p.xctn = newXactBckEncode(p.Bck, p.UUID())
 	return nil
 }
 
-func (*encFactory) Kind() string        { return apc.ActECEncode }
-func (p *encFactory) Get() cluster.Xact { return p.xctn }
+func (*encFactory) Kind() string     { return apc.ActECEncode }
+func (p *encFactory) Get() core.Xact { return p.xctn }
 
 func (p *encFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, err error) {
 	prev := prevEntry.(*encFactory)
@@ -74,8 +74,8 @@ func (p *encFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, 
 // XactBckEncode //
 ///////////////////
 
-func newXactBckEncode(bck *meta.Bck, t cluster.Target, uuid string) (r *XactBckEncode) {
-	r = &XactBckEncode{t: t, bck: bck, wg: &sync.WaitGroup{}, smap: t.Sowner().Get()}
+func newXactBckEncode(bck *meta.Bck, uuid string) (r *XactBckEncode) {
+	r = &XactBckEncode{bck: bck, wg: &sync.WaitGroup{}, smap: core.T.Sowner().Get()}
 	r.InitBase(uuid, apc.ActECEncode, bck)
 	return
 }
@@ -83,25 +83,24 @@ func newXactBckEncode(bck *meta.Bck, t cluster.Target, uuid string) (r *XactBckE
 func (r *XactBckEncode) Run(wg *sync.WaitGroup) {
 	wg.Done()
 	bck := r.bck
-	if err := bck.Init(r.t.Bowner()); err != nil {
+	if err := bck.Init(core.T.Bowner()); err != nil {
 		r.AddErr(err)
 		r.Finish()
 		return
 	}
 	if !bck.Props.EC.Enabled {
-		r.AddErr(fmt.Errorf("bucket %q does not have EC enabled", r.bck.Name))
+		r.AddErr(fmt.Errorf("%s does not have EC enabled", r.bck.Cname("")))
 		r.Finish()
 		return
 	}
 
 	opts := &mpather.JgroupOpts{
-		T:        r.t,
 		CTs:      []string{fs.ObjectType},
 		VisitObj: r.bckEncode,
-		DoLoad:   mpather.Load,
+		DoLoad:   mpather.LoadUnsafe,
 	}
 	opts.Bck.Copy(r.bck.Bucket())
-	jg := mpather.NewJoggerGroup(opts)
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
 	jg.Run()
 
 	select {
@@ -109,7 +108,9 @@ func (r *XactBckEncode) Run(wg *sync.WaitGroup) {
 		jg.Stop()
 	case <-jg.ListenFinished():
 		err := jg.Stop()
-		r.AddErr(err)
+		if err != nil {
+			r.AddErr(err)
+		}
 	}
 	r.wg.Wait() // Need to wait for all async actions to finish.
 
@@ -118,7 +119,7 @@ func (r *XactBckEncode) Run(wg *sync.WaitGroup) {
 
 func (r *XactBckEncode) beforeECObj() { r.wg.Add(1) }
 
-func (r *XactBckEncode) afterECObj(lom *cluster.LOM, err error) {
+func (r *XactBckEncode) afterECObj(lom *core.LOM, err error) {
 	if err == nil {
 		r.LomAdd(lom)
 	} else if err != errSkipped {
@@ -131,7 +132,7 @@ func (r *XactBckEncode) afterECObj(lom *cluster.LOM, err error) {
 // Walks through all files in 'obj' directory, and calls EC.Encode for every
 // file whose HRW points to this file and the file does not have corresponding
 // metadata file in 'meta' directory
-func (r *XactBckEncode) bckEncode(lom *cluster.LOM, _ []byte) error {
+func (r *XactBckEncode) bckEncode(lom *core.LOM, _ []byte) error {
 	_, local, err := lom.HrwTarget(r.smap)
 	if err != nil {
 		nlog.Errorf("%s: %s", lom, err)
@@ -141,7 +142,7 @@ func (r *XactBckEncode) bckEncode(lom *cluster.LOM, _ []byte) error {
 	if !local {
 		return nil
 	}
-	mdFQN, _, err := cluster.HrwFQN(lom.Bck().Bucket(), fs.ECMetaType, lom.ObjName)
+	mdFQN, _, err := core.HrwFQN(lom.Bck().Bucket(), fs.ECMetaType, lom.ObjName)
 	if err != nil {
 		nlog.Warningf("metadata FQN generation failed %q: %v", lom, err)
 		return nil
@@ -170,8 +171,8 @@ func (r *XactBckEncode) bckEncode(lom *cluster.LOM, _ []byte) error {
 	return nil
 }
 
-func (r *XactBckEncode) Snap() (snap *cluster.Snap) {
-	snap = &cluster.Snap{}
+func (r *XactBckEncode) Snap() (snap *core.Snap) {
+	snap = &core.Snap{}
 	r.ToSnap(snap)
 
 	snap.IdleX = r.IsIdle()

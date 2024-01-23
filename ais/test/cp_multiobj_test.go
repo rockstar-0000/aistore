@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -13,10 +13,10 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -64,7 +64,7 @@ func TestCopyMultiObjSimple(t *testing.T) {
 		tlog.Logf("PUT %d => %s\n", len(objList), bckFrom.Cname(""))
 		for _, objName := range objList {
 			r, _ := readers.NewRand(objSize, cksumType)
-			_, err := api.PutObject(api.PutArgs{
+			_, err := api.PutObject(&api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        bckFrom,
 				ObjName:    objName,
@@ -80,12 +80,12 @@ func TestCopyMultiObjSimple(t *testing.T) {
 
 		msg := cmn.TCObjsMsg{ToBck: bckTo}
 		msg.Template = template
-		xid, err = api.CopyMultiObj(baseParams, bckFrom, msg)
+		xid, err = api.CopyMultiObj(baseParams, bckFrom, &msg)
 		tassert.CheckFatal(t, err)
 	}
 
 	wargs := xact.ArgsMsg{ID: xid, Kind: apc.ActCopyObjects}
-	api.WaitForXactionIdle(baseParams, wargs)
+	api.WaitForXactionIdle(baseParams, &wargs)
 
 	tlog.Logln("prefix: test/")
 	msg := &apc.LsoMsg{Prefix: "test/"}
@@ -194,9 +194,9 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 						)
 						msg.ObjNames = list
 						if m.bck.IsRemote() && test.evictRemoteSrc {
-							xid, err = api.CopyMultiObj(baseParams, m.bck, msg, apc.FltExists)
+							xid, err = api.CopyMultiObj(baseParams, m.bck, &msg, apc.FltExists)
 						} else {
-							xid, err = api.CopyMultiObj(baseParams, m.bck, msg)
+							xid, err = api.CopyMultiObj(baseParams, m.bck, &msg)
 						}
 						if err != nil {
 							erv.Store(err)
@@ -228,9 +228,9 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 						)
 						msg.Template = template
 						if m.bck.IsRemote() && test.evictRemoteSrc {
-							xid, err = api.CopyMultiObj(baseParams, m.bck, msg, apc.FltExists)
+							xid, err = api.CopyMultiObj(baseParams, m.bck, &msg, apc.FltExists)
 						} else {
-							xid, err = api.CopyMultiObj(baseParams, m.bck, msg)
+							xid, err = api.CopyMultiObj(baseParams, m.bck, &msg)
 						}
 						if err != nil {
 							erv.Store(err)
@@ -251,7 +251,7 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 				tassert.CheckFatal(t, erv.Load().(error))
 			}
 			wargs := xact.ArgsMsg{Kind: apc.ActCopyObjects, Bck: m.bck}
-			api.WaitForXactionIdle(baseParams, wargs)
+			api.WaitForXactionIdle(baseParams, &wargs)
 
 			msg := &apc.LsoMsg{Prefix: m.prefix}
 			msg.AddProps(apc.GetPropsName, apc.GetPropsSize)

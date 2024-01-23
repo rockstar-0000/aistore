@@ -32,6 +32,7 @@ const (
 	SmoduleDsort
 	SmoduleDload
 	SmoduleETL
+	SmoduleS3
 
 	// NOTE: the last
 	_smoduleLast
@@ -39,10 +40,11 @@ const (
 
 const maxLevel = 5
 
-// NOTE: keep in-sync
+// NOTE: keep in-sync with the above
 var Smodules = []string{
 	"transport", "ais", "memsys", "cluster", "fs", "reb", "ec", "stats",
 	"ios", "xs", "backend", "space", "mirror", "dsort", "downloader", "etl",
+	"s3",
 }
 
 type LogLevel string
@@ -72,11 +74,6 @@ func (l LogLevel) Validate() (err error) {
 		err = fmt.Errorf(ferl, string(l), level, modules)
 	}
 	return
-}
-
-func (l LogLevel) FastV(verbosity, fl int) bool {
-	level, modules := l.Parse()
-	return level >= verbosity || modules&fl != 0
 }
 
 func (l LogLevel) String() (s string) {

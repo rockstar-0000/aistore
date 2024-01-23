@@ -47,7 +47,7 @@ spec:
       # command: ["uvicorn", "main:app", "--reload"]
       env:
         - name: ARG_TYPE
-          value: "fqn"
+          value: "{arg_type}"
       readinessProbe:
         httpGet:
           path: /health
@@ -202,7 +202,7 @@ metadata:
   name: transformer-compress
   annotations:
     # Values `communication_type` can take are ["hpull://", "hrev://", "hpush://", "io://"].
-    # Visit https://github.com/NVIDIA/aistore/blob/master/docs/etl.md#communication-mechanisms 
+    # Visit https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#communication-mechanisms
     # for more details.
     communication_type: "{communication_type}://"
     wait_timeout: 5m
@@ -324,7 +324,7 @@ metadata:
   name: transformer-torchvision
   annotations:
     # Values `communication_type` can take are ["hpull://", "hrev://", "hpush://", "io://"].
-    # Visit https://github.com/NVIDIA/aistore/blob/master/docs/etl.md#communication-mechanisms 
+    # Visit https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#communication-mechanisms
     communication_type: "{communication_type}://"
     wait_timeout: 10m
 spec:
@@ -353,5 +353,42 @@ spec:
     - name: ais
       hostPath:
         path: /tmp/
+        type: Directory
+"""
+
+# pylint: disable=unused-variable
+FACE_DETECTION_TRANSFORMER = """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: transformer-face-detection
+  annotations:
+    communication_type: "{communication_type}://"
+    wait_timeout: 5m
+spec:
+  containers:
+    - name: server
+      image: aistorage/transformer_face_detection:latest
+      imagePullPolicy: Always
+      ports:
+        - name: default
+          containerPort: 8000
+      command:  ["gunicorn", "main:app", "--workers", "5", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: default
+      env:
+        - name: FORMAT
+          value: "{format}"
+        - name: ARG_TYPE
+          value: "{arg_type}"
+      volumeMounts:
+        - name: ais
+          mountPath: /tmp/ais
+  volumes:
+    - name: ais
+      hostPath:
+        path: /tmp/ais
         type: Directory
 """

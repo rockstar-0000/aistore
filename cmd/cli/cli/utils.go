@@ -1,7 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
-// This file contains util functions and types.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -25,15 +24,17 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/core/meta"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 )
+
+// This file contains common utilities and low-level helpers.
 
 const (
 	keyAndValueSeparator = "="
@@ -52,11 +53,10 @@ const (
 )
 
 var (
-	clusterURL        string
-	defaultHTTPClient *http.Client
-	authnHTTPClient   *http.Client
-	apiBP             api.BaseParams
-	authParams        api.BaseParams
+	clusterURL         string
+	clientH, clientTLS *http.Client
+	apiBP              api.BaseParams
+	authParams         api.BaseParams
 )
 
 type (
@@ -97,6 +97,13 @@ func arg0Node(c *cli.Context) (node *meta.Snode, sname string, err error) {
 	return
 }
 
+func errMisplacedFlag(c *cli.Context, arg string) (err error) {
+	if len(arg) > 1 && arg[0] == '-' {
+		err = incorrectUsageMsg(c, "missing command line argument (hint: flag '%s' misplaced?)", arg)
+	}
+	return err
+}
+
 func isWebURL(url string) bool { return cos.IsHTTP(url) || cos.IsHTTPS(url) }
 
 func jsonMarshalIndent(v any) ([]byte, error) { return jsoniter.MarshalIndent(v, "", "    ") }
@@ -118,13 +125,17 @@ func findClosestCommand(cmd string, candidates []cli.Command) (result string, di
 		closestName string
 	)
 	for i := 0; i < len(candidates); i++ {
-		dist := cos.DamerauLevenstheinDistance(cmd, candidates[i].Name)
+		dist := DamerauLevenstheinDistance(cmd, candidates[i].Name)
 		if dist < minDist {
 			minDist = dist
 			closestName = candidates[i].Name
 		}
 	}
 	return closestName, minDist
+}
+
+func briefPause(seconds time.Duration) {
+	time.Sleep(seconds * time.Second) //nolint:durationcheck // false positive
 }
 
 // Get config from a random target.
@@ -147,7 +158,7 @@ func getRandTargetConfig(c *cli.Context) (*cmn.Config, error) {
 func isConfigProp(s string) bool {
 	props := configPropList()
 	for _, p := range props {
-		if p == s || strings.HasPrefix(p, s+".") {
+		if p == s || strings.HasPrefix(p, s+cmn.IterFieldNameSepa) {
 			return true
 		}
 	}
@@ -315,7 +326,7 @@ func parseFeatureFlags(v string) (res feat.Flags, err error) {
 // TODO: support `allow` and `deny` verbs/operations on existing access permissions
 func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 	props := make([]string, 0, 20)
-	err = cmn.IterFields(&cmn.BucketPropsToUpdate{}, func(tag string, _ cmn.IterField) (error, bool) {
+	err = cmn.IterFields(&cmn.BpropsToSet{}, func(tag string, _ cmn.IterField) (error, bool) {
 		props = append(props, tag)
 		return nil, false
 	})
@@ -372,7 +383,7 @@ func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 	return
 }
 
-func parseBpropsFromContext(c *cli.Context) (props *cmn.BucketPropsToUpdate, err error) {
+func parseBpropsFromContext(c *cli.Context) (props *cmn.BpropsToSet, err error) {
 	propArgs := c.Args().Tail()
 
 	if c.Command.Name == commandCreate {
@@ -405,7 +416,7 @@ func parseBpropsFromContext(c *cli.Context) (props *cmn.BucketPropsToUpdate, err
 		return
 	}
 
-	props, err = cmn.NewBucketPropsToUpdate(nvs)
+	props, err = cmn.NewBpropsToSet(nvs)
 	return
 }
 
@@ -441,13 +452,13 @@ func bucketsFromArgsOrEnv(c *cli.Context) ([]cmn.Bck, error) {
 //
 // 3. On the client side, we currently resort to an intuitive convention
 // that all non-modifying operations (LIST, GET, HEAD) utilize `dontAddBckMD = true`.
-func headBucket(bck cmn.Bck, dontAddBckMD bool) (p *cmn.BucketProps, err error) {
+func headBucket(bck cmn.Bck, dontAddBckMD bool) (p *cmn.Bprops, err error) {
 	if p, err = api.HeadBucket(apiBP, bck, dontAddBckMD); err == nil {
 		return
 	}
 	if herr, ok := err.(*cmn.ErrHTTP); ok {
 		switch {
-		case configuredVerbosity():
+		case cliConfVerbose():
 			herr.Message = herr.StringEx()
 			err = errors.New(herr.Message)
 		case herr.Status == http.StatusNotFound:
@@ -458,15 +469,18 @@ func headBucket(bck cmn.Bck, dontAddBckMD bool) (p *cmn.BucketProps, err error) 
 			err = fmt.Errorf("failed to HEAD bucket %q: %s", bck, herr.Message)
 		}
 	} else {
-		err = fmt.Errorf("failed to HEAD bucket %q: %v", bck, err)
+		msg := strings.ToLower(err.Error())
+		if !strings.HasPrefix(msg, "head \"http") && !strings.HasPrefix(msg, "head http") {
+			err = fmt.Errorf("failed to HEAD bucket %q: %v", bck, err)
+		}
 	}
 	return
 }
 
 // Prints multiple lines of fmtStr to writer w.
 // For line number i, fmtStr is formatted with values of args at index i
-// if maxLines >= 0 prints at most maxLines, otherwise prints everything until
-// it reaches the end of one of args
+// - if maxLines >= 0 prints at most maxLines
+// - otherwise, prints everything until the end of one of the args
 func limitedLineWriter(w io.Writer, maxLines int, fmtStr string, args ...[]string) {
 	objs := make([]any, 0, len(args))
 	if fmtStr == "" || fmtStr[len(fmtStr)-1] != '\n' {
@@ -502,12 +516,12 @@ func limitedLineWriter(w io.Writer, maxLines int, fmtStr string, args ...[]strin
 	}
 }
 
-func bckPropList(props *cmn.BucketProps, verbose bool) (propList nvpairList) {
+func bckPropList(props *cmn.Bprops, verbose bool) (propList nvpairList) {
 	if !verbose { // i.e., compact
 		propList = nvpairList{
 			{"created", fmtBucketCreatedTime(props.Created)},
 			{"provider", props.Provider},
-			{"access", props.Access.Describe()},
+			{"access", props.Access.Describe(true /*incl. all*/)},
 			{"checksum", props.Cksum.String()},
 			{"mirror", props.Mirror.String()},
 			{"ec", props.EC.String()},
@@ -527,7 +541,7 @@ func bckPropList(props *cmn.BucketProps, verbose bool) (propList nvpairList) {
 			case cmn.PropBucketCreated:
 				value = fmtBucketCreatedTime(props.Created)
 			case cmn.PropBucketAccessAttrs:
-				value = props.Access.Describe()
+				value = props.Access.Describe(true /*incl. all*/)
 			default:
 				value = fmt.Sprintf("%v", field.Value())
 			}
@@ -535,6 +549,13 @@ func bckPropList(props *cmn.BucketProps, verbose bool) (propList nvpairList) {
 			return nil, false
 		})
 		debug.AssertNoErr(err)
+	}
+
+	// see also: listBucketsSummHdr & listBucketsSummNoHdr
+	if props.BID == 0 {
+		propList = append(propList, nvpair{Name: "present", Value: "no"})
+	} else {
+		propList = append(propList, nvpair{Name: "present", Value: "yes"})
 	}
 
 	sort.Slice(propList, func(i, j int) bool {
@@ -591,9 +612,11 @@ func confirm(c *cli.Context, prompt string, warning ...string) (ok bool) {
 }
 
 // (not to confuse with bck.IsEmpty())
-func isBucketEmpty(bck cmn.Bck) (bool, error) {
+func isBucketEmpty(bck cmn.Bck, cached bool) (bool, error) {
 	msg := &apc.LsoMsg{}
-	msg.SetFlag(apc.LsObjCached)
+	if cached {
+		msg.SetFlag(apc.LsObjCached)
+	}
 	msg.SetFlag(apc.LsNameOnly)
 	objList, err := api.ListObjectsPage(apiBP, bck, msg)
 	if err != nil {
@@ -602,11 +625,25 @@ func isBucketEmpty(bck cmn.Bck) (bool, error) {
 	return len(objList.Entries) == 0, nil
 }
 
-func ensureHasProvider(bck cmn.Bck) error {
+func ensureRemoteProvider(bck cmn.Bck) error {
 	if !apc.IsProvider(bck.Provider) {
-		return fmt.Errorf("missing backend provider in %q", bck)
+		return fmt.Errorf("invalid bucket %q: missing backend provider", bck)
 	}
-	return nil
+	if bck.IsRemote() {
+		return nil
+	}
+	if bck.Props == nil {
+		// double-take: ais:// bucket with remote backend?
+		p, err := headBucket(bck, true)
+		if err != nil {
+			return err
+		}
+		bck.Props = p
+		if bck.IsRemote() {
+			return nil // yes it is
+		}
+	}
+	return fmt.Errorf("invalid bucket %q: expecting remote backend", bck)
 }
 
 func parseURLtoBck(strURL string) (bck cmn.Bck) {
@@ -750,7 +787,7 @@ done:
 
 // First, request cluster's config from the primary node that contains
 // default Cksum type. Second, generate default list of properties.
-func defaultBckProps(bck cmn.Bck) (*cmn.BucketProps, error) {
+func defaultBckProps(bck cmn.Bck) (*cmn.Bprops, error) {
 	cfg, err := api.GetClusterConfig(apiBP)
 	if err != nil {
 		return nil, V(err)
@@ -798,6 +835,12 @@ func parseHexOrUint(s string) (uint64, error) {
 	return strconv.ParseUint(s, 10, 64)
 }
 
+// loosely, wildcard or range
+func isPattern(ptrn string) bool {
+	return strings.Contains(ptrn, "*") || strings.Contains(ptrn, "?") || strings.Contains(ptrn, "\\") ||
+		(strings.Contains(ptrn, "{") && strings.Contains(ptrn, "}"))
+}
+
 // NOTE: as provider, AIS can be (local cluster | remote cluster) -
 // return only the former and handle remote case separately
 func selectProvidersExclRais(bcks cmn.Bcks) (sorted []string) {
@@ -833,12 +876,12 @@ func actionCptn(c *cli.Context, prefix, msg string) {
 	}
 }
 
+func dryRunHeader() string {
+	return fcyan("[DRY RUN]")
+}
+
 func dryRunCptn(c *cli.Context) {
-	const (
-		dryRunHeader      = "[DRY RUN]"
-		dryRunExplanation = "with no modifications to the cluster"
-	)
-	fmt.Fprintln(c.App.Writer, fcyan(dryRunHeader)+" "+dryRunExplanation)
+	fmt.Fprintln(c.App.Writer, dryRunHeader()+" with no modifications to the cluster")
 }
 
 //////////////

@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -99,7 +99,6 @@ type (
 		Total      int64     `json:"total,string,omitempty"`
 		StartTime  time.Time `json:"start_time,omitempty"`
 		EndTime    time.Time `json:"end_time,omitempty"`
-		Running    bool      `json:"running"`
 	}
 	TaskInfoByName []TaskDlInfo
 
@@ -113,7 +112,7 @@ type (
 		Base
 		Prefix string `json:"prefix"`
 		Suffix string `json:"suffix"`
-		Sync   bool   `json:"sync"`
+		Sync   bool   `json:"synchronize"`
 	}
 
 	SingleBody struct {
@@ -269,14 +268,13 @@ func (d JobInfos) Swap(i, j int) {
 // StatusResp //
 ////////////////
 
-func (d *StatusResp) Aggregate(rhs StatusResp) *StatusResp {
+func (d *StatusResp) Aggregate(rhs *StatusResp) *StatusResp {
 	if d == nil {
 		r := StatusResp{}
 		err := cos.MorphMarshal(rhs, &r)
 		debug.AssertNoErr(err)
 		return &r
 	}
-
 	d.Job.Aggregate(&rhs.Job)
 	d.CurrentTasks = append(d.CurrentTasks, rhs.CurrentTasks...)
 	d.FinishedTasks = append(d.FinishedTasks, rhs.FinishedTasks...)

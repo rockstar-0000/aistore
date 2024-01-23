@@ -11,13 +11,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/transport"
 )
 
@@ -37,8 +37,7 @@ type (
 			trname  string
 			net     string // one of cmn.KnownNetworks, empty defaults to cmn.NetIntraControl
 		}
-		t           cluster.Node
-		xctn        cluster.Xact
+		xctn        core.Xact
 		config      *cmn.Config
 		compression string // enum { apc.CompressNever, ... }
 		multiplier  int
@@ -62,17 +61,16 @@ type (
 	}
 )
 
-// interface guard
-var _ cluster.DataMover = (*DataMover)(nil)
+var _ core.DM = (*DataMover)(nil) // via t.CopyObject()
 
 // In re `owt` (below): data mover passes it to the target's `PutObject`
 // to properly finalize received payload.
 // For DMs that do not create new objects (e.g, rebalance) `owt` should
-// be set to `OwtMigrate`; all others are expected to have `OwtPut` (see e.g, CopyBucket).
+// be set to `OwtMigrateRepl`; all others are expected to have `OwtPut` (see e.g, CopyBucket).
 
-func NewDataMover(t cluster.Target, trname string, recvCB transport.RecvObj, owt cmn.OWT, extra Extra) (*DataMover, error) {
+func NewDataMover(trname string, recvCB transport.RecvObj, owt cmn.OWT, extra Extra) (*DataMover, error) {
 	debug.Assert(extra.Config != nil)
-	dm := &DataMover{t: t, config: extra.Config}
+	dm := &DataMover{config: extra.Config}
 	dm.owt = owt
 	dm.multiplier = extra.Multiplier
 	dm.sizePDU, dm.maxHdrSize = extra.SizePDU, extra.MaxHdrSize
@@ -108,8 +106,8 @@ func (dm *DataMover) NetC() string  { return dm.ack.net }
 func (dm *DataMover) OWT() cmn.OWT  { return dm.owt }
 
 // xaction that drives and utilizes this data mover
-func (dm *DataMover) SetXact(xctn cluster.Xact) { dm.xctn = xctn }
-func (dm *DataMover) GetXact() cluster.Xact     { return dm.xctn }
+func (dm *DataMover) SetXact(xctn core.Xact) { dm.xctn = xctn }
+func (dm *DataMover) GetXact() core.Xact     { return dm.xctn }
 
 // register user's receive-data (and, optionally, receive-ack) wrappers
 func (dm *DataMover) RegRecv() (err error) {
@@ -133,26 +131,26 @@ func (dm *DataMover) Open() {
 			SizePDU:     dm.sizePDU,
 			MaxHdrSize:  dm.maxHdrSize,
 		},
-		Ntype:        cluster.Targets,
+		Ntype:        core.Targets,
 		Multiplier:   dm.multiplier,
 		ManualResync: true,
 	}
 	if dm.xctn != nil {
 		dataArgs.Extra.SenderID = dm.xctn.ID()
 	}
-	dm.data.streams = New(dm.t.Sowner(), dm.t.Snode(), dm.data.client, dataArgs)
+	dm.data.streams = New(dm.data.client, dataArgs)
 	if dm.useACKs() {
 		ackArgs := Args{
 			Net:          dm.ack.net,
 			Trname:       dm.ack.trname,
 			Extra:        &transport.Extra{Config: dm.config},
-			Ntype:        cluster.Targets,
+			Ntype:        core.Targets,
 			ManualResync: true,
 		}
 		if dm.xctn != nil {
 			ackArgs.Extra.SenderID = dm.xctn.ID()
 		}
-		dm.ack.streams = New(dm.t.Sowner(), dm.t.Snode(), dm.ack.client, ackArgs)
+		dm.ack.streams = New(dm.ack.client, ackArgs)
 	}
 	dm.stage.opened.Store(true)
 }
@@ -172,29 +170,22 @@ func (dm *DataMover) String() string {
 }
 
 // quiesce *local* Rx
-func (dm *DataMover) Quiesce(d time.Duration) cluster.QuiRes {
+func (dm *DataMover) Quiesce(d time.Duration) core.QuiRes {
 	return dm.xctn.Quiesce(d, dm.quicb)
 }
 
-func (dm *DataMover) CloseIf(err error) {
-	if dm.stage.opened.CAS(true, false) {
-		dm._close(err)
-	}
-}
-
 func (dm *DataMover) Close(err error) {
-	debug.Assert(dm.stage.opened.Load())
-	dm._close(err)
-	dm.stage.opened.Store(false)
-}
-
-func (dm *DataMover) _close(err error) {
-	if err == nil && dm.xctn != nil {
-		if dm.xctn.IsAborted() {
-			err = dm.xctn.AbortErr()
-		}
+	if dm == nil {
+		return
 	}
-	dm.data.streams.Close(err == nil) // err == nil: close gracefully via `fin`, otherwise abort
+	if !dm.stage.opened.CAS(true, false) {
+		return
+	}
+	if err == nil && dm.xctn != nil && dm.xctn.IsAborted() {
+		err = dm.xctn.AbortErr()
+	}
+	// nil: close gracefully via `fin`, otherwise abort
+	dm.data.streams.Close(err == nil)
 	if dm.useACKs() {
 		dm.ack.streams.Close(err == nil)
 	}
@@ -208,7 +199,10 @@ func (dm *DataMover) Abort() {
 }
 
 func (dm *DataMover) UnregRecv() {
-	if !dm.stage.regred.Load() {
+	if dm == nil {
+		return
+	}
+	if !dm.stage.regred.CAS(true, false) {
 		return // e.g., 2PC (begin => abort) sequence with no Open
 	}
 	if dm.xctn != nil {
@@ -222,7 +216,6 @@ func (dm *DataMover) UnregRecv() {
 			nlog.Errorln(err)
 		}
 	}
-	dm.stage.regred.Store(false)
 }
 
 func (dm *DataMover) Send(obj *transport.Obj, roc cos.ReadOpenCloser, tsi *meta.Snode) (err error) {
@@ -233,8 +226,8 @@ func (dm *DataMover) Send(obj *transport.Obj, roc cos.ReadOpenCloser, tsi *meta.
 	return
 }
 
-func (dm *DataMover) ACK(hdr transport.ObjHdr, cb transport.ObjSentCB, tsi *meta.Snode) error {
-	return dm.ack.streams.Send(&transport.Obj{Hdr: hdr, Callback: cb}, nil, tsi)
+func (dm *DataMover) ACK(hdr *transport.ObjHdr, cb transport.ObjSentCB, tsi *meta.Snode) error {
+	return dm.ack.streams.Send(&transport.Obj{Hdr: *hdr, Callback: cb}, nil, tsi)
 }
 
 func (dm *DataMover) Bcast(obj *transport.Obj, roc cos.ReadOpenCloser) error {
@@ -245,14 +238,14 @@ func (dm *DataMover) Bcast(obj *transport.Obj, roc cos.ReadOpenCloser) error {
 // private
 //
 
-func (dm *DataMover) quicb(_ time.Duration /*accum. sleep time*/) cluster.QuiRes {
+func (dm *DataMover) quicb(_ time.Duration /*accum. sleep time*/) core.QuiRes {
 	if dm.stage.laterx.CAS(true, false) {
-		return cluster.QuiActive
+		return core.QuiActive
 	}
-	return cluster.QuiInactiveCB
+	return core.QuiInactiveCB
 }
 
-func (dm *DataMover) wrapRecvData(hdr transport.ObjHdr, reader io.Reader, err error) error {
+func (dm *DataMover) wrapRecvData(hdr *transport.ObjHdr, reader io.Reader, err error) error {
 	if hdr.Bck.Name != "" && hdr.ObjName != "" && hdr.ObjAttrs.Size >= 0 {
 		dm.xctn.InObjsAdd(1, hdr.ObjAttrs.Size)
 	}
@@ -262,7 +255,7 @@ func (dm *DataMover) wrapRecvData(hdr transport.ObjHdr, reader io.Reader, err er
 	return dm.data.recv(hdr, reader, err)
 }
 
-func (dm *DataMover) wrapRecvACK(hdr transport.ObjHdr, reader io.Reader, err error) error {
+func (dm *DataMover) wrapRecvACK(hdr *transport.ObjHdr, reader io.Reader, err error) error {
 	dm.stage.laterx.Store(true)
 	return dm.ack.recv(hdr, reader, err)
 }

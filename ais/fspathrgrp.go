@@ -13,6 +13,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/res"
@@ -37,7 +38,7 @@ func (g *fsprungroup) init(t *target, newVol bool) {
 //
 
 // enableMpath enables mountpath and notifies necessary runners about the
-// change if mountpath actually was disabled.
+// change if mountpath actually was enabled.
 func (g *fsprungroup) enableMpath(mpath string) (enabledMi *fs.Mountpath, err error) {
 	enabledMi, err = fs.EnableMpath(mpath, g.t.SID(), g.redistributeMD)
 	if err != nil || enabledMi == nil {
@@ -71,7 +72,7 @@ func (g *fsprungroup) _postAdd(action string, mi *fs.Mountpath) {
 		if cmn.GCO.Get().Resilver.Enabled {
 			g.t.runResilver(res.Args{}, nil /*wg*/)
 		}
-		xreg.RenewMakeNCopies(g.t, cos.GenUUID(), action)
+		xreg.RenewMakeNCopies(cos.GenUUID(), action)
 	}()
 
 	g.checkEnable(action, mi.Path)
@@ -114,7 +115,7 @@ func (g *fsprungroup) doDD(action string, flags uint64, mpath string, dontResilv
 		return rmi, nil
 	}
 
-	rmi.EvictLomCache()
+	core.UncacheMountpath(rmi)
 
 	if noResil || dontResilver || !cmn.GCO.Get().Resilver.Enabled {
 		nlog.Infof("%s: %q %s: no resilvering (%t, %t, %t)", g.t, action, rmi,
@@ -203,11 +204,10 @@ func (g *fsprungroup) postDD(rmi *fs.Mountpath, action string, xres *xs.Resilver
 // store updated fspaths locally as part of the 'OverrideConfigFname'
 // and commit new version of the config
 func fspathsConfigAddDel(mpath string, add bool) {
-	config := cmn.GCO.Get()
-	if config.TestingEnv() { // since testing fspaths are counted, not enumerated
+	if cmn.Rom.TestingEnv() { // since testing fspaths are counted, not enumerated
 		return
 	}
-	config = cmn.GCO.BeginUpdate()
+	config := cmn.GCO.BeginUpdate()
 	localConfig := &config.LocalConfig
 	if add {
 		localConfig.AddPath(mpath)
@@ -225,7 +225,7 @@ func fspathsConfigAddDel(mpath string, add bool) {
 }
 
 func fspathsSave(config *cmn.Config) {
-	toUpdate := &cmn.ConfigToUpdate{FSP: &config.LocalConfig.FSP}
+	toUpdate := &cmn.ConfigToSet{FSP: &config.LocalConfig.FSP}
 	overrideConfig := cmn.GCO.SetLocalFSPaths(toUpdate)
 	if err := cmn.SaveOverrideConfig(config.ConfigDir, overrideConfig); err != nil {
 		debug.AssertNoErr(err)

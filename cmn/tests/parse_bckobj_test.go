@@ -1,8 +1,8 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package tests
+package tests_test
 
 import (
 	"testing"
@@ -122,8 +122,11 @@ func TestParseBckObjectURI(t *testing.T) {
 		},
 	}
 
-	for _, test := range positiveTests {
-		bck, obj, err := cmn.ParseBckObjectURI(test.uri, test.opts)
+	for i := range positiveTests {
+		var (
+			test          = positiveTests[i]
+			bck, obj, err = cmn.ParseBckObjectURI(test.uri, test.opts)
+		)
 		tassert.Errorf(t, err == nil, "unexpected error for input: %s, err: %v", test.uri, err)
 
 		if !bck.Equal(&test.expectedBck) {

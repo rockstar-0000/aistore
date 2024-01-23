@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -53,7 +53,7 @@ func (p *proxy) etlHandler(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/etl
 func (p *proxy) handleETLGet(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := p.parseURL(w, r, 0, true, apc.URLPathETL.L)
+	apiItems, err := p.parseURL(w, r, apc.URLPathETL.L, 0, true)
 	if err != nil {
 		return
 	}
@@ -93,7 +93,7 @@ func (p *proxy) handleETLGet(w http.ResponseWriter, r *http.Request) {
 //   - add the new ETL instance (represented by the user-specified `etl.InitMsg`) to cluster MD
 //   - return ETL UUID to the user.
 func (p *proxy) handleETLPut(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.parseURL(w, r, 0, false, apc.URLPathETL.L); err != nil {
+	if _, err := p.parseURL(w, r, apc.URLPathETL.L, 0, false); err != nil {
 		return
 	}
 	if p.forwardCP(w, r, nil, "init ETL") {
@@ -129,7 +129,7 @@ func (p *proxy) handleETLPut(w http.ResponseWriter, r *http.Request) {
 		p.writeErr(w, r, err)
 		return
 	}
-	if cmn.FastV(4, cos.SmoduleETL) {
+	if cmn.Rom.FastV(4, cos.SmoduleETL) {
 		nlog.Infoln(p.String() + ": " + initMsg.String())
 	}
 }
@@ -137,7 +137,7 @@ func (p *proxy) handleETLPut(w http.ResponseWriter, r *http.Request) {
 // POST /v1/etl/<etl-name>/stop (or) /v1/etl/<etl-name>/start
 // start/stop ETL pods
 func (p *proxy) handleETLPost(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := p.parseURL(w, r, 2, true, apc.URLPathETL.L)
+	apiItems, err := p.parseURL(w, r, apc.URLPathETL.L, 2, true)
 	if err != nil {
 		return
 	}
@@ -149,7 +149,7 @@ func (p *proxy) handleETLPost(w http.ResponseWriter, r *http.Request) {
 	etlMD := p.owner.etl.get()
 	etlMsg := etlMD.get(etlName)
 	if etlMsg == nil {
-		p.writeErr(w, r, cos.NewErrNotFound("%s: etl[%s]", p, etlName))
+		p.writeErr(w, r, cos.NewErrNotFound(p, "etl job "+etlName))
 		return
 	}
 
@@ -166,7 +166,7 @@ func (p *proxy) handleETLPost(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /v1/etl/<etl-name>
 func (p *proxy) handleETLDelete(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := p.parseURL(w, r, 1, true, apc.URLPathETL.L)
+	apiItems, err := p.parseURL(w, r, apc.URLPathETL.L, 1, true)
 	if err != nil {
 		return
 	}
@@ -193,7 +193,7 @@ func (p *proxy) handleETLDelete(w http.ResponseWriter, r *http.Request) {
 func (p *proxy) _deleteETLPre(ctx *etlMDModifier, clone *etlMD) (err error) {
 	debug.AssertNoErr(k8s.ValidateEtlName(ctx.etlName))
 	if exists := clone.del(ctx.etlName); !exists {
-		err = cos.NewErrNotFound("%s: etl[%s]", p, ctx.etlName)
+		err = cos.NewErrNotFound(p, "etl job "+ctx.etlName)
 	}
 	return
 }
@@ -275,7 +275,7 @@ func (p *proxy) infoETL(w http.ResponseWriter, r *http.Request, etlName string) 
 	etlMD := p.owner.etl.get()
 	initMsg := etlMD.get(etlName)
 	if initMsg == nil {
-		p.writeErr(w, r, cos.NewErrNotFound("%s: etl[%s]", p, etlName))
+		p.writeErr(w, r, cos.NewErrNotFound(p, "etl job "+etlName))
 		return
 	}
 	p.writeJSON(w, r, initMsg, "info-etl")

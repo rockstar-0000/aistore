@@ -6,6 +6,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -16,12 +17,12 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
@@ -30,7 +31,7 @@ import (
 type (
 	daemonTemplateXactSnaps struct {
 		DaemonID  string
-		XactSnaps []*cluster.Snap
+		XactSnaps []*core.Snap
 	}
 
 	targetMpath struct {
@@ -60,6 +61,7 @@ var (
 			objNotCachedPropsFlag,
 			noHeaderFlag,
 			jsonFlag,
+			silentFlag,
 		},
 		cmdCluster: append(
 			longRunFlags,
@@ -69,17 +71,22 @@ var (
 		cmdSmap: append(
 			longRunFlags,
 			jsonFlag,
+			noHeaderFlag,
 		),
 		cmdBMD: append(
 			longRunFlags,
 			jsonFlag,
+			noHeaderFlag,
 		),
 		cmdBucket: {
 			jsonFlag,
 			compactPropFlag,
+			noHeaderFlag,
+			addRemoteFlag,
 		},
 		cmdConfig: {
 			jsonFlag,
+			noHeaderFlag,
 		},
 		cmdShowRemoteAIS: {
 			noHeaderFlag,
@@ -174,7 +181,7 @@ var (
 		Usage:        "show CLI, cluster, or node configurations (nodes inherit cluster and have local)",
 		ArgsUsage:    showConfigArgument,
 		Flags:        showCmdsFlags[cmdConfig],
-		Action:       showConfigHandler,
+		Action:       showAnyConfigHandler,
 		BashComplete: showConfigCompletions,
 	}
 	showCmdRemoteAIS = cli.Command{
@@ -188,7 +195,7 @@ var (
 	showCmdJob = cli.Command{
 		Name:         commandJob,
 		Usage:        "show running and finished jobs ('--all' for all, or " + tabHelpOpt + ")",
-		ArgsUsage:    jobShowStopWaitArgument,
+		ArgsUsage:    jobAnyArg,
 		Flags:        showCmdsFlags[commandJob],
 		Action:       showJobsHandler,
 		BashComplete: runningJobCompletions,
@@ -318,7 +325,7 @@ func _showJobs(c *cli.Context, name, xid, daemonID string, bck cmn.Bck, caption 
 				return 0, nil
 			}
 		}
-		return xactList(c, xargs, caption)
+		return xactList(c, &xargs, caption)
 	}
 }
 
@@ -336,7 +343,7 @@ func showDsorts(c *cli.Context, id string, caption bool) (int, error) {
 		onlyActive = !flagIsSet(c, allJobsFlag)
 	)
 	if id == "" {
-		list, err := api.ListDSort(apiBP, parseStrFlag(c, regexJobsFlag), onlyActive)
+		list, err := api.ListDsort(apiBP, parseStrFlag(c, regexJobsFlag), onlyActive)
 		l := len(list)
 		if err != nil || l == 0 {
 			return l, V(err)
@@ -390,7 +397,7 @@ func showClusterHandler(c *cli.Context) error {
 	return cluDaeStatus(c, smap, tstatusMap, pstatusMap, cluConfig, what)
 }
 
-func xactList(c *cli.Context, xargs xact.ArgsMsg, caption bool) (int, error) {
+func xactList(c *cli.Context, xargs *xact.ArgsMsg, caption bool) (int, error) {
 	// override the caller's choice if explicitly identified
 	if xargs.ID != "" {
 		debug.Assert(xact.IsValidUUID(xargs.ID), xargs.ID)
@@ -427,7 +434,7 @@ func xactList(c *cli.Context, xargs xact.ArgsMsg, caption bool) (int, error) {
 	return ll, nil
 }
 
-func xlistByKindID(c *cli.Context, xargs xact.ArgsMsg, caption bool, xs xact.MultiSnap) (int, error) {
+func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.MultiSnap) (int, error) {
 	// first, extract snaps for: xargs.ID, Kind
 	filteredXs := make(xact.MultiSnap, 8)
 	for tid, snaps := range xs {
@@ -437,7 +444,7 @@ func xlistByKindID(c *cli.Context, xargs xact.ArgsMsg, caption bool, xs xact.Mul
 			}
 			debug.Assert(snap.Kind == xargs.Kind)
 			if _, ok := filteredXs[tid]; !ok {
-				filteredXs[tid] = make([]*cluster.Snap, 0, 8)
+				filteredXs[tid] = make([]*core.Snap, 0, 8)
 			}
 			filteredXs[tid] = append(filteredXs[tid], snap)
 		}
@@ -525,18 +532,27 @@ func xlistByKindID(c *cli.Context, xargs xact.ArgsMsg, caption bool, xs xact.Mul
 		if len(dts[0].XactSnaps) == 0 {
 			continue
 		}
-		props := flattenXactStats(di.XactSnaps[0], units)
-		_, name := xact.GetKindName(di.XactSnaps[0].Kind)
+		var (
+			props   = flattenXactStats(di.XactSnaps[0], units)
+			_, name = xact.GetKindName(di.XactSnaps[0].Kind)
+			err     error
+		)
 		debug.Assert(name != "", di.XactSnaps[0].Kind)
 		actionCptn(c, meta.Tname(di.DaemonID)+": ", fmt.Sprintf("%s[%s] stats", name, di.XactSnaps[0].ID))
-		if err := teb.Print(props, teb.PropsSimpleTmpl, teb.Jopts(usejs)); err != nil {
+
+		if hideHeader {
+			err = teb.Print(props, teb.PropValTmplNoHdr, teb.Jopts(usejs))
+		} else {
+			err = teb.Print(props, teb.PropValTmpl, teb.Jopts(usejs))
+		}
+		if err != nil {
 			return l, err
 		}
 	}
 	return l, nil
 }
 
-func showObjectHandler(c *cli.Context) (err error) {
+func showObjectHandler(c *cli.Context) error {
 	if c.NArg() < 1 {
 		return missingArgumentsError(c, "object name in the form "+objectArgument)
 	}
@@ -551,7 +567,7 @@ func showObjectHandler(c *cli.Context) (err error) {
 	return showObjProps(c, bck, object)
 }
 
-func showBckPropsHandler(c *cli.Context) (err error) {
+func showBckPropsHandler(c *cli.Context) error {
 	return showBucketProps(c)
 }
 
@@ -581,7 +597,7 @@ func showSmapHandler(c *cli.Context) error {
 	if err != nil {
 		return err // cannot happen
 	}
-	return smapFromNode(smap, sid, flagIsSet(c, jsonFlag))
+	return smapFromNode(c, smap, sid, flagIsSet(c, jsonFlag))
 }
 
 func showBMDHandler(c *cli.Context) error {
@@ -652,21 +668,21 @@ func showBMDHandler(c *cli.Context) error {
 	return nil
 }
 
-func showClusterConfigHandler(c *cli.Context) (err error) {
+func showClusterConfigHandler(c *cli.Context) error {
 	return showClusterConfig(c, c.Args().Get(0))
 }
 
-func showConfigHandler(c *cli.Context) (err error) {
-	if c.NArg() == 0 {
+func showAnyConfigHandler(c *cli.Context) error {
+	switch {
+	case c.NArg() == 0:
 		return incorrectUsageMsg(c, "missing arguments (hint: "+tabtab+")")
-	}
-	if c.Args().Get(0) == cmdCLI {
+	case c.Args().Get(0) == cmdCLI:
 		return showCfgCLI(c)
-	}
-	if c.Args().Get(0) == cmdCluster {
+	case c.Args().Get(0) == cmdCluster:
 		return showClusterConfig(c, c.Args().Get(1))
+	default:
+		return showNodeConfig(c)
 	}
-	return showNodeConfig(c)
 }
 
 func showClusterConfig(c *cli.Context, section string) error {
@@ -689,7 +705,11 @@ func showClusterConfig(c *cli.Context, section string) error {
 		return teb.Print(cluConfig, "", teb.Jopts(usejs))
 	}
 	flat := flattenJSON(cluConfig, section)
-	err = teb.Print(flat, teb.FlatTmpl)
+	if flagIsSet(c, noHeaderFlag) {
+		err = teb.Print(flat, teb.PropValTmplNoHdr)
+	} else {
+		err = teb.Print(flat, teb.PropValTmpl)
+	}
 	if err == nil && section == "" {
 		msg := fmt.Sprintf("(Tip: use '[SECTION] %s' to show config section(s), see %s for details)",
 			flprn(jsonFlag), qflprn(cli.HelpFlag))
@@ -811,6 +831,13 @@ func showNodeConfig(c *cli.Context) error {
 }
 
 func showRemoteAISHandler(c *cli.Context) error {
+	const (
+		warnRemAisOffline = `remote ais cluster at %s is currently unreachable.
+Run 'ais config cluster backend.conf --json' - to show the respective configuration;
+    'ais config cluster backend.conf <new JSON formatted value>' - to reconfigure or remove.
+For details and usage examples, see: docs/cli/config.md`
+	)
+
 	all, err := api.GetRemoteAIS(apiBP)
 	if err != nil {
 		return V(err)
@@ -823,10 +850,15 @@ func showRemoteAISHandler(c *cli.Context) error {
 	for _, ra := range all.A {
 		uptime := teb.UnknownStatusVal
 		bp := api.BaseParams{
-			Client: defaultHTTPClient,
-			URL:    ra.URL,
-			Token:  loggedUserToken,
-			UA:     ua,
+			URL:   ra.URL,
+			Token: loggedUserToken,
+			UA:    ua,
+		}
+		if cos.IsHTTPS(bp.URL) {
+			// NOTE: alternatively, cmn.NewClientTLS(..., TLSArgs{SkipVerify: true})
+			bp.Client = clientTLS
+		} else {
+			bp.Client = clientH
 		}
 		if clutime, _, err := api.HealthUptime(bp); err == nil {
 			ns, _ := strconv.ParseInt(clutime, 10, 64)
@@ -845,6 +877,12 @@ func showRemoteAISHandler(c *cli.Context) error {
 				teb.UnknownStatusVal, teb.UnknownStatusVal, teb.UnknownStatusVal, uptime)
 
 			warn := fmt.Sprintf(warnRemAisOffline, url)
+
+			if len(all.A) == 1 {
+				tw.Flush()
+				fmt.Fprintln(c.App.Writer)
+				return errors.New(warn)
+			}
 			actionWarn(c, warn+"\n")
 		}
 	}
@@ -857,7 +895,7 @@ func showRemoteAISHandler(c *cli.Context) error {
 			}
 			fmt.Fprintln(c.App.Writer)
 			actionCptn(c, ra.Alias+"["+ra.UUID+"]", " cluster map:")
-			err := smapFromNode(ra.Smap, "" /*daemonID*/, flagIsSet(c, jsonFlag))
+			err := smapFromNode(c, ra.Smap, "" /*daemonID*/, flagIsSet(c, jsonFlag))
 			if err != nil {
 				actionWarn(c, err.Error())
 			}

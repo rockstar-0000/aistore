@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -15,20 +15,20 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
 	jsoniter "github.com/json-iterator/go"
 )
 
 // context structure to gather all (or most) of the relevant state in one place
-// (compare with txnServerCtx)
-type txnClientCtx struct {
+// (compare with txnSrv)
+type txnCln struct {
 	p        *proxy
 	smap     *smapX
 	msg      *aisMsg
@@ -45,25 +45,47 @@ type txnClientCtx struct {
 // TODO: IC(c.uuid) vs _committed_ xid (currently asserted)
 // TODO: cleanup upon failures
 
-//////////////////
-// txnClientCtx //
-//////////////////
+////////////
+// txnCln //
+////////////
 
-func (c *txnClientCtx) begin(what fmt.Stringer) (err error) {
+func (c *txnCln) init(msg *apc.ActMsg, bck *meta.Bck, config *cmn.Config, waitmsync bool) *txnCln {
+	query := make(url.Values, 3)
+	if bck == nil {
+		c.path = apc.URLPathTxn.S
+	} else {
+		c.path = apc.URLPathTxn.Join(bck.Name)
+		query = bck.AddToQuery(query)
+	}
+	c.timeout.netw = 2 * config.Timeout.MaxKeepalive.D()
+	c.timeout.host = config.Timeout.MaxHostBusy.D()
+	if !waitmsync { // when commit does not block behind metasync
+		query.Set(apc.QparamNetwTimeout, cos.UnixNano2S(int64(c.timeout.netw)))
+	}
+	query.Set(apc.QparamHostTimeout, cos.UnixNano2S(int64(c.timeout.host)))
+
+	c.msg = c.p.newAmsg(msg, nil, c.uuid)
+	body := cos.MustMarshal(c.msg)
+	c.req = cmn.HreqArgs{Method: http.MethodPost, Query: query, Body: body}
+	return c
+}
+
+func (c *txnCln) begin(what fmt.Stringer) (err error) {
 	results := c.bcast(apc.ActBegin, c.timeout.netw)
 	for _, res := range results {
 		if res.err != nil {
-			err = c.bcastAbort(what, res.toErr())
+			err = res.toErr()
+			c.bcastAbort(what, err)
 			break
 		}
 	}
 	freeBcastRes(results)
-	return
+	return err
 }
 
 // returns cluster-wide (global) xaction UUID or - for assorted multi-object (list|range) xactions
 // that can be run concurrently - comma-separated list of UUIDs
-func (c *txnClientCtx) commit(what fmt.Stringer, timeout time.Duration) (xid string, all []string, err error) {
+func (c *txnCln) commit(what fmt.Stringer, timeout time.Duration) (xid string, all []string, err error) {
 	same4all := true
 	results := c.bcast(apc.ActCommit, timeout)
 	for _, res := range results {
@@ -99,14 +121,14 @@ func (c *txnClientCtx) commit(what fmt.Stringer, timeout time.Duration) (xid str
 	return
 }
 
-func (c *txnClientCtx) cmtTout(waitmsync bool) time.Duration {
+func (c *txnCln) cmtTout(waitmsync bool) time.Duration {
 	if waitmsync {
 		return c.timeout.host + c.timeout.netw
 	}
 	return c.timeout.netw
 }
 
-func (c *txnClientCtx) bcast(phase string, timeout time.Duration) (results sliceResults) {
+func (c *txnCln) bcast(phase string, timeout time.Duration) (results sliceResults) {
 	c.req.Path = cos.JoinWords(c.path, phase)
 	if phase != apc.ActAbort {
 		now := time.Now()
@@ -119,7 +141,7 @@ func (c *txnClientCtx) bcast(phase string, timeout time.Duration) (results slice
 	args.req = c.req
 	args.smap = c.smap
 	args.timeout = timeout
-	args.to = cluster.Targets // the (0) default
+	args.to = core.Targets // the (0) default
 	if args.selected = c.selected; args.selected == nil {
 		results = c.p.bcastGroup(args)
 	} else {
@@ -129,11 +151,10 @@ func (c *txnClientCtx) bcast(phase string, timeout time.Duration) (results slice
 	return
 }
 
-func (c *txnClientCtx) bcastAbort(what fmt.Stringer, err error) error {
+func (c *txnCln) bcastAbort(what fmt.Stringer, err error) {
 	nlog.Errorf("Abort %q %s: %v %s", c.msg.Action, what, err, c.msg)
 	results := c.bcast(apc.ActAbort, 0)
 	freeBcastRes(results)
-	return err
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -143,17 +164,17 @@ func (c *txnClientCtx) bcastAbort(what fmt.Stringer, err error) error {
 // 6 (plus/minus) steps as shown below:
 // - notice a certain symmetry between the client and the server sides whetreby
 //   the control flow looks as follows:
-//   	txnClientCtx =>
+//   	txnCln =>
 //   		(POST to /v1/txn) =>
 //   			switch msg.Action =>
-//   				txnServerCtx =>
+//   				txnSrv =>
 //   					concrete transaction, etc.
 ///////////////////////////////////////////////////////////////////////////////////////////
 
 // create-bucket: { check non-existence -- begin -- create locally -- metasync -- commit }
 func (p *proxy) createBucket(msg *apc.ActMsg, bck *meta.Bck, remoteHdr http.Header) error {
 	var (
-		bprops  *cmn.BucketProps
+		bprops  *cmn.Bprops
 		backend = bck.Backend()
 	)
 	if bck.Props != nil {
@@ -199,7 +220,7 @@ func (p *proxy) createBucket(msg *apc.ActMsg, bck *meta.Bck, remoteHdr http.Head
 	return p._createBucketWithProps(msg, bck, bprops)
 }
 
-func (p *proxy) _createBucketWithProps(msg *apc.ActMsg, bck *meta.Bck, bprops *cmn.BucketProps) error {
+func (p *proxy) _createBucketWithProps(msg *apc.ActMsg, bck *meta.Bck, bprops *cmn.Bprops) error {
 	var (
 		nlp = newBckNLP(bck)
 		bmd = p.owner.bmd.get()
@@ -235,7 +256,8 @@ func (p *proxy) _createBucketWithProps(msg *apc.ActMsg, bck *meta.Bck, bprops *c
 		setProps: bprops,
 	}
 	if _, err := p.owner.bmd.modify(ctx); err != nil {
-		return c.bcastAbort(bck, err)
+		c.bcastAbort(bck, err)
+		return err
 	}
 
 	// 4. commit
@@ -290,8 +312,8 @@ func (p *proxy) makeNCopies(msg *apc.ActMsg, bck *meta.Bck) (xid string, err err
 
 	// 3. update BMD locally & metasync updated BMD
 	mirrorEnabled := copies > 1
-	updateProps := &cmn.BucketPropsToUpdate{
-		Mirror: &cmn.MirrorConfToUpdate{
+	updateProps := &cmn.BpropsToSet{
+		Mirror: &cmn.MirrorConfToSet{
 			Enabled: &mirrorEnabled,
 			Copies:  &copies,
 		},
@@ -307,8 +329,8 @@ func (p *proxy) makeNCopies(msg *apc.ActMsg, bck *meta.Bck) (xid string, err err
 	}
 	bmd, err = p.owner.bmd.modify(ctx)
 	if err != nil {
-		err = c.bcastAbort(bck, err)
-		return
+		c.bcastAbort(bck, err)
+		return "", err
 	}
 	c.msg.BMDVersion = bmd.version()
 
@@ -321,9 +343,10 @@ func (p *proxy) makeNCopies(msg *apc.ActMsg, bck *meta.Bck) (xid string, err err
 	xid, _, err = c.commit(bck, c.cmtTout(waitmsync))
 	debug.Assertf(xid == "" || xid == c.uuid, "committed %q vs generated %q", xid, c.uuid)
 	if err != nil {
+		c.bcastAbort(bck, err) // cleanup
 		p.undoUpdateCopies(msg, bck, ctx.revertProps)
 	}
-	return
+	return xid, err
 }
 
 func bmodMirror(ctx *bmdModifier, clone *bucketMD) error {
@@ -334,8 +357,8 @@ func bmodMirror(ctx *bmdModifier, clone *bucketMD) error {
 	debug.Assert(present)
 	nprops := bprops.Clone()
 	nprops.Apply(ctx.propsToUpdate)
-	ctx.revertProps = &cmn.BucketPropsToUpdate{
-		Mirror: &cmn.MirrorConfToUpdate{
+	ctx.revertProps = &cmn.BpropsToSet{
+		Mirror: &cmn.MirrorConfToSet{
 			Copies:  &bprops.Mirror.Copies,
 			Enabled: &bprops.Mirror.Enabled,
 		},
@@ -345,7 +368,7 @@ func bmodMirror(ctx *bmdModifier, clone *bucketMD) error {
 }
 
 // set-bucket-props: { confirm existence -- begin -- apply props -- metasync -- commit }
-func (p *proxy) setBucketProps(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.BucketProps) (string /*xid*/, error) {
+func (p *proxy) setBprops(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.Bprops) (string /*xid*/, error) {
 	// 1. confirm existence
 	bprops, present := p.owner.bmd.get().Get(bck)
 	if !present {
@@ -398,8 +421,7 @@ func (p *proxy) setBucketProps(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.Bucke
 	}
 	bmd, err := p.owner.bmd.modify(ctx)
 	if err != nil {
-		debug.AssertNoErr(err)
-		err = c.bcastAbort(bck, err)
+		c.bcastAbort(bck, err)
 		return "", err
 	}
 	c.msg.BMDVersion = bmd.version()
@@ -418,6 +440,9 @@ func (p *proxy) setBucketProps(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.Bucke
 
 	// 5. commit
 	xid, _, rerr := c.commit(bck, c.cmtTout(waitmsync))
+	if rerr != nil {
+		c.bcastAbort(bck, rerr) // cleanup
+	}
 	return xid, rerr
 }
 
@@ -479,9 +504,8 @@ func (p *proxy) renameBucket(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg) (xid str
 
 	bmd, err = p.owner.bmd.modify(bmdCtx)
 	if err != nil {
-		debug.AssertNoErr(err)
-		err = c.bcastAbort(bckFrom, err)
-		return
+		c.bcastAbort(bckFrom, err)
+		return "", err
 	}
 	c.msg.BMDVersion = bmd.version()
 
@@ -508,8 +532,8 @@ func (p *proxy) renameBucket(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg) (xid str
 	xid, _, err = c.commit(bckFrom, c.cmtTout(waitmsync))
 	debug.Assertf(xid == "" || xid == c.uuid, "committed %q vs generated %q", xid, c.uuid)
 	if err != nil {
-		nlog.Errorf("%s: failed to commit %q, err: %v", p, msg.Action, err)
-		return
+		c.bcastAbort(bckFrom, err) // cleanup txn
+		return "", err
 	}
 
 	// 6. start rebalance and resilver
@@ -527,7 +551,7 @@ func (p *proxy) renameBucket(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg) (xid str
 	_ = p.notifs.add(nl)
 
 	wg.Wait()
-	return
+	return xid, nil
 }
 
 func bmodMv(ctx *bmdModifier, clone *bucketMD) error {
@@ -579,9 +603,8 @@ func (p *proxy) tcb(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (xid
 		}
 		bmd, err = p.owner.bmd.modify(ctx)
 		if err != nil {
-			debug.AssertNoErr(err)
-			err = c.bcastAbort(bckFrom, err)
-			return
+			c.bcastAbort(bckFrom, err)
+			return "", err
 		}
 		c.msg.BMDVersion = bmd.version()
 		if !ctx.terminate {
@@ -595,44 +618,48 @@ func (p *proxy) tcb(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (xid
 	// 4. IC
 	nl := xact.NewXactNL(c.uuid, msg.Action, &c.smap.Smap, nil, bckFrom.Bucket(), bckTo.Bucket())
 	nl.SetOwner(equalIC)
-	// cleanup upon failure via notification listener callback
-	// (note synchronous cleanup below)
-	r := &_rmbck{p, bckTo, existsTo}
+
+	// add abort-triggered cleanup via notifications
+	// (also, note immediate cleanup below on failure to commit)
+	r := &_tcbfin{p, bckTo, existsTo}
 	nl.F = r.cb
 	p.ic.registerEqual(regIC{nl: nl, smap: c.smap, query: c.req.Query})
 
 	// 5. commit
 	xid, _, err = c.commit(bckFrom, c.cmtTout(waitmsync))
 	debug.Assertf(xid == "" || xid == c.uuid, "committed %q vs generated %q", xid, c.uuid)
-	if err != nil && !existsTo {
-		// rm the one that we just created
-		_ = p.destroyBucket(&apc.ActMsg{Action: apc.ActDestroyBck}, bckTo)
+	if err != nil {
+		c.bcastAbort(bckFrom, err) // cleanup txn
+		if !existsTo {
+			_ = p.destroyBucket(&apc.ActMsg{Action: apc.ActDestroyBck}, bckTo) // rm the one that we have just created
+		}
 	}
-	return
+	return xid, err
 }
 
 // transform or copy a list or a range of objects
-// TODO: check dry-run
-func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (xid string, err error) {
-	// 1. confirm existence
-	bmd := p.owner.bmd.get()
-	if _, present := bmd.Get(bckFrom); !present {
-		err = cmn.NewErrBckNotFound(bckFrom.Bucket())
-		return
-	}
-	_, existsTo := bmd.Get(bckTo)
-	// 2. begin
+func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, config *cmn.Config, msg *apc.ActMsg, tcomsg *cmn.TCObjsMsg) (string, error) {
+	// 1. prep
 	var (
-		waitmsync = !dryRun && !existsTo
-		c         = p.prepTxnClient(msg, bckFrom, waitmsync)
+		_, existsTo = p.owner.bmd.get().Get(bckTo) // cleanup on fail: destroy if created
+		waitmsync   = !tcomsg.TCBMsg.DryRun && !existsTo
 	)
+	c := &txnCln{
+		p:    p,
+		uuid: cos.GenUUID(), // TODO -- FIXME tcomsg.TxnUUID, // (via target-local xreg.GenBEID)
+		smap: p.owner.smap.get(),
+	}
+	c.init(msg, bckFrom, config, waitmsync)
+
 	_ = bckTo.AddUnameToQuery(c.req.Query, apc.QparamBckTo)
-	if err = c.begin(bckFrom); err != nil {
-		return
+
+	// 2. begin
+	if err := c.begin(bckFrom); err != nil {
+		return "", err
 	}
 
 	// 3. create dst bucket if doesn't exist - clone bckFrom props
-	if !dryRun && !existsTo {
+	if !tcomsg.TCBMsg.DryRun && !existsTo {
 		ctx := &bmdModifier{
 			pre:   bmodCpProps,
 			final: p.bmodSync,
@@ -641,11 +668,10 @@ func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (
 			bcks:  []*meta.Bck{bckFrom, bckTo},
 			wait:  waitmsync,
 		}
-		bmd, err = p.owner.bmd.modify(ctx)
+		bmd, err := p.owner.bmd.modify(ctx)
 		if err != nil {
-			debug.AssertNoErr(err)
-			err = c.bcastAbort(bckFrom, err)
-			return
+			c.bcastAbort(bckFrom, err)
+			return "", err
 		}
 		c.msg.BMDVersion = bmd.version()
 		if !ctx.terminate {
@@ -656,28 +682,30 @@ func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (
 		}
 	}
 
-	// 4. commit
-	var all []string
-	xid, all, err = c.commit(bckFrom, c.cmtTout(waitmsync))
-	if err != nil && !existsTo {
-		// rm the one that we just created
-		_ = p.destroyBucket(&apc.ActMsg{Action: apc.ActDestroyBck}, bckTo)
-		return
+	// 4. commit - that is, execute xtco.Do(msg)
+	xid, all, err := c.commit(bckFrom, c.cmtTout(waitmsync))
+	if err != nil {
+		if !existsTo {
+			// rm the one that we just created
+			_ = p.destroyBucket(&apc.ActMsg{Action: apc.ActDestroyBck}, bckTo)
+		}
+		return "", err
 	}
-	if err != nil || xid != "" {
-		return
+
+	if xid == "" {
+		xid = strings.Join(all, xact.SepaID) // return comma-separated x-tco IDs
 	}
-	return strings.Join(all, xact.UUIDSepa), nil
+	return xid, nil
 }
 
-func parseECConf(value any) (*cmn.ECConfToUpdate, error) {
+func parseECConf(value any) (*cmn.ECConfToSet, error) {
 	switch v := value.(type) {
 	case string:
-		conf := &cmn.ECConfToUpdate{}
+		conf := &cmn.ECConfToSet{}
 		err := jsoniter.Unmarshal([]byte(v), conf)
 		return conf, err
 	case []byte:
-		conf := &cmn.ECConfToUpdate{}
+		conf := &cmn.ECConfToSet{}
 		err := jsoniter.Unmarshal(v, conf)
 		return conf, err
 	default:
@@ -711,8 +739,8 @@ func (p *proxy) ecEncode(bck *meta.Bck, msg *apc.ActMsg) (xid string, err error)
 			cmn.ErrNotEnoughTargets, dataSlices, paritySlices, bck, dataSlices+paritySlices+1, numTs, smap)
 		return
 	}
-	if !nlp.TryLock(cmn.Timeout.CplaneOperation() / 2) {
-		err = cmn.NewErrBckIsBusy(bck.Bucket())
+	if !nlp.TryLock(cmn.Rom.CplaneOperation() / 2) {
+		err = cmn.NewErrBusy("bucket", bck, "")
 		return
 	}
 	defer nlp.Unlock()
@@ -746,13 +774,12 @@ func (p *proxy) ecEncode(bck *meta.Bck, msg *apc.ActMsg) (xid string, err error)
 		wait:          waitmsync,
 		msg:           &c.msg.ActMsg,
 		txnID:         c.uuid,
-		propsToUpdate: &cmn.BucketPropsToUpdate{EC: ecConf},
+		propsToUpdate: &cmn.BpropsToSet{EC: ecConf},
 	}
 	bmd, err := p.owner.bmd.modify(ctx)
 	if err != nil {
-		debug.AssertNoErr(err)
-		err = c.bcastAbort(bck, err)
-		return
+		c.bcastAbort(bck, err)
+		return "", err
 	}
 	c.msg.BMDVersion = bmd.version()
 
@@ -764,7 +791,10 @@ func (p *proxy) ecEncode(bck *meta.Bck, msg *apc.ActMsg) (xid string, err error)
 	// 6. commit
 	xid, _, err = c.commit(bck, c.cmtTout(waitmsync))
 	debug.Assertf(xid == "" || xid == c.uuid, "committed %q vs generated %q", xid, c.uuid)
-	return
+	if err != nil {
+		c.bcastAbort(bck, err) // cleanup txn
+	}
+	return xid, err
 }
 
 // compare w/ bmodSetProps
@@ -799,7 +829,7 @@ func (p *proxy) createArchMultiObj(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg) (x
 	if err != nil || xid != "" {
 		return
 	}
-	return strings.Join(all, xact.UUIDSepa), nil
+	return strings.Join(all, xact.SepaID), nil
 }
 
 func (p *proxy) beginRmTarget(si *meta.Snode, msg *apc.ActMsg) error {
@@ -824,7 +854,7 @@ func (p *proxy) destroyBucket(msg *apc.ActMsg, bck *meta.Bck) error {
 		config    = cmn.GCO.Get()
 	)
 	// NOTE: testing only: to avoid premature aborts when loopback devices get 100% utilized
-	//       (under heavy writing)
+	// (under heavy writing)
 	if config.TestingEnv() {
 		c.timeout.netw = config.Timeout.MaxHostBusy.D() + config.Timeout.MaxHostBusy.D()/2
 		c.timeout.host = c.timeout.netw
@@ -843,11 +873,15 @@ func (p *proxy) destroyBucket(msg *apc.ActMsg, bck *meta.Bck) error {
 		bcks:  []*meta.Bck{bck},
 	}
 	if _, err := p.owner.bmd.modify(ctx); err != nil {
-		return c.bcastAbort(bck, err)
+		c.bcastAbort(bck, err)
+		return err
 	}
 
 	// 3. Commit
 	_, _, err := c.commit(bck, c.cmtTout(waitmsync))
+	if err != nil {
+		c.bcastAbort(bck, err) // cleanup txn
+	}
 	return err
 }
 
@@ -861,7 +895,7 @@ func (p *proxy) destroyBucketData(msg *apc.ActMsg, bck *meta.Bck) error {
 		Body:   cos.MustMarshal(msg),
 		Query:  query,
 	}
-	args.to = cluster.Targets
+	args.to = core.Targets
 	results := p.bcastGroup(args)
 	freeBcArgs(args)
 	for _, res := range results {
@@ -921,14 +955,15 @@ func (p *proxy) promote(bck *meta.Bck, msg *apc.ActMsg, tsi *meta.Snode) (xid st
 }
 
 // begin phase customized to (specifically) detect file share
-func prmBegin(c *txnClientCtx, bck *meta.Bck, singleT bool) (num int64, allAgree bool, err error) {
+func prmBegin(c *txnCln, bck *meta.Bck, singleT bool) (num int64, allAgree bool, err error) {
 	var cksumVal, totalN string
 	allAgree = !singleT
 
 	results := c.bcast(apc.ActBegin, c.timeout.netw)
 	for i, res := range results {
 		if res.err != nil {
-			err = c.bcastAbort(bck, res.toErr())
+			err = res.toErr()
+			c.bcastAbort(bck, err)
 			break
 		}
 		if singleT {
@@ -951,34 +986,16 @@ func prmBegin(c *txnClientCtx, bck *meta.Bck, singleT bool) (num int64, allAgree
 		num, err = strconv.ParseInt(totalN, 10, 64)
 	}
 	freeBcastRes(results)
-	return
+	return num, allAgree, err
 }
 
 //
-// misc helpers and utilities
+// misc
 ///
 
-func (p *proxy) prepTxnClient(msg *apc.ActMsg, bck *meta.Bck, waitmsync bool) *txnClientCtx {
-	c := &txnClientCtx{p: p, uuid: cos.GenUUID(), smap: p.owner.smap.get()}
-	c.msg = p.newAmsg(msg, nil, c.uuid)
-	body := cos.MustMarshal(c.msg)
-
-	query := make(url.Values, 2)
-	if bck == nil {
-		c.path = apc.URLPathTxn.S
-	} else {
-		c.path = apc.URLPathTxn.Join(bck.Name)
-		query = bck.AddToQuery(query)
-	}
-	config := cmn.GCO.Get()
-	c.timeout.netw = 2 * config.Timeout.MaxKeepalive.D()
-	c.timeout.host = config.Timeout.MaxHostBusy.D()
-	if !waitmsync { // when commit does not block behind metasync
-		query.Set(apc.QparamNetwTimeout, cos.UnixNano2S(int64(c.timeout.netw)))
-	}
-	query.Set(apc.QparamHostTimeout, cos.UnixNano2S(int64(c.timeout.host)))
-
-	c.req = cmn.HreqArgs{Method: http.MethodPost, Query: query, Body: body}
+func (p *proxy) prepTxnClient(msg *apc.ActMsg, bck *meta.Bck, waitmsync bool) *txnCln {
+	c := &txnCln{p: p, uuid: cos.GenUUID(), smap: p.owner.smap.get()}
+	c.init(msg, bck, cmn.GCO.Get(), waitmsync)
 	return c
 }
 
@@ -1032,7 +1049,7 @@ func (p *proxy) undoCreateBucket(msg *apc.ActMsg, bck *meta.Bck) {
 }
 
 // rollback make-n-copies
-func (p *proxy) undoUpdateCopies(msg *apc.ActMsg, bck *meta.Bck, propsToUpdate *cmn.BucketPropsToUpdate) {
+func (p *proxy) undoUpdateCopies(msg *apc.ActMsg, bck *meta.Bck, propsToUpdate *cmn.BpropsToSet) {
 	ctx := &bmdModifier{
 		pre:           bmodUpdateProps,
 		final:         p.bmodSync,
@@ -1046,8 +1063,8 @@ func (p *proxy) undoUpdateCopies(msg *apc.ActMsg, bck *meta.Bck, propsToUpdate *
 }
 
 // Make and validate new bucket props.
-func (p *proxy) makeNewBckProps(bck *meta.Bck, propsToUpdate *cmn.BucketPropsToUpdate,
-	creating ...bool) (nprops *cmn.BucketProps, err error) {
+func (p *proxy) makeNewBckProps(bck *meta.Bck, propsToUpdate *cmn.BpropsToSet,
+	creating ...bool) (nprops *cmn.Bprops, err error) {
 	var (
 		cfg    = cmn.GCO.Get()
 		bprops = bck.Props
@@ -1098,7 +1115,7 @@ func (p *proxy) makeNewBckProps(bck *meta.Bck, propsToUpdate *cmn.BucketPropsToU
 	remirror := _reMirror(bprops, nprops)
 	targetCnt, reec := _reEC(bprops, nprops, bck, p.owner.smap.get())
 	if len(creating) == 0 && remirror && reec {
-		err = cmn.NewErrBckIsBusy(bck.Bucket())
+		err = cmn.NewErrBusy("bucket", bck, "")
 		return
 	}
 	err = nprops.Validate(targetCnt)
@@ -1116,7 +1133,7 @@ func _versioning(v bool) string {
 	return "disabled"
 }
 
-func (p *proxy) initBackendProp(nprops *cmn.BucketProps) (err error) {
+func (p *proxy) initBackendProp(nprops *cmn.Bprops) (err error) {
 	if nprops.BackendBck.IsEmpty() {
 		return
 	}
@@ -1132,27 +1149,35 @@ func (p *proxy) initBackendProp(nprops *cmn.BucketProps) (err error) {
 	return
 }
 
-////////////
-// _rmbck //
-////////////
+/////////////
+// _tcbfin //
+/////////////
 
-type _rmbck struct {
+type _tcbfin struct {
 	p       *proxy
 	bck     *meta.Bck
 	existed bool
 }
 
-// TODO: revisit other cleanup
-func (r *_rmbck) cb(nl nl.Listener) {
-	err := nl.Err()
-	if err == nil {
+// NOTE: _may_ remove newly created destination bucket
+func (r *_tcbfin) cb(nl nl.Listener) {
+	var (
+		err     = nl.Err()
+		aborted = nl.Aborted()
+	)
+	switch {
+	case err == nil:
+		debug.Assert(!aborted, nl.String())
 		return
-	}
-	if err != cmn.ErrXactUserAbort {
-		nlog.Errorln(err)
-	}
-	if r.existed {
+	case !aborted:
+		nlog.Infoln("Warning:", err)
 		return
+	default:
+		nlog.Warningln("abort:", err)
+		if r.existed {
+			return
+		}
 	}
+	// when (tcb aborted) and (did not exist prior)
 	_ = r.p.destroyBucket(&apc.ActMsg{Action: apc.ActDestroyBck}, r.bck)
 }

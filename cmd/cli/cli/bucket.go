@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,12 +16,13 @@ import (
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
 )
 
 // Creates new ais bucket
-func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BucketPropsToUpdate, dontHeadRemote bool) (err error) {
+func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadRemote bool) (err error) {
 	if err = api.CreateBucket(apiBP, bck, props, dontHeadRemote); err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); ok {
 			if herr.Status == http.StatusConflict {
@@ -34,7 +33,7 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BucketPropsToUpdate, d
 				}
 				return errors.New(desc)
 			}
-			if configuredVerbosity() {
+			if cliConfVerbose() {
 				herr.Message = herr.StringEx()
 			}
 			return fmt.Errorf("failed to create %q: %w", bck, herr)
@@ -49,7 +48,7 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BucketPropsToUpdate, d
 // Destroy ais buckets
 func destroyBuckets(c *cli.Context, buckets []cmn.Bck) error {
 	for _, bck := range buckets {
-		empty, errEmp := isBucketEmpty(bck)
+		empty, errEmp := isBucketEmpty(bck, true /*cached*/)
 		if errEmp == nil && !empty {
 			if !flagIsSet(c, yesFlag) {
 				if ok := confirm(c, fmt.Sprintf("Proceed to destroy %s?", bck)); !ok {
@@ -99,7 +98,7 @@ func mvBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 	}
 	fmt.Fprintln(c.App.Writer, text+" ...")
 	xargs := xact.ArgsMsg{ID: xid, Kind: apc.ActMoveBck, Timeout: timeout}
-	if err := waitXact(apiBP, xargs); err != nil {
+	if err := waitXact(apiBP, &xargs); err != nil {
 		fmt.Fprintf(c.App.Writer, fmtXactFailed, "rename", bckFrom, bckTo)
 		return err
 	}
@@ -108,36 +107,57 @@ func mvBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 }
 
 // Evict remote bucket
-func evictBucket(c *cli.Context, bck cmn.Bck) (err error) {
+func evictBucket(c *cli.Context, bck cmn.Bck) error {
 	if flagIsSet(c, dryRunFlag) {
 		fmt.Fprintf(c.App.Writer, "Evict: %q\n", bck.Cname(""))
-		return
+		return nil
 	}
-	if err = ensureHasProvider(bck); err != nil {
-		return
+	bmd, err := api.GetBMD(apiBP)
+	if err != nil {
+		return err
 	}
-	if err = api.EvictRemoteBucket(apiBP, bck, flagIsSet(c, keepMDFlag)); err != nil {
-		return
+	if !bck.IsQuery() {
+		if _, present := bmd.Get((*meta.Bck)(&bck)); !present {
+			return fmt.Errorf("%s does not exist - nothing to do", bck)
+		}
+		return _evictBck(c, bck)
 	}
-	fmt.Fprintf(c.App.Writer, "%q bucket evicted\n", bck.Cname(""))
-	return
+
+	// evict multiple
+	var (
+		provider *string
+		ns       *cmn.Ns
+		qbck     = cmn.QueryBcks(bck)
+	)
+	if qbck.Provider != "" {
+		provider = &qbck.Provider
+	}
+	if !qbck.Ns.IsGlobal() {
+		ns = &qbck.Ns
+	}
+	bmd.Range(provider, ns, func(bck *meta.Bck) bool {
+		err = _evictBck(c, bck.Clone())
+		return err != nil
+	})
+
+	return err
 }
 
-func listBuckets(c *cli.Context, qbck cmn.QueryBcks, fltPresence int, countRemoteObjs bool) (err error) {
-	var (
-		regex  *regexp.Regexp
-		fmatch = func(_ cmn.Bck) bool { return true }
-	)
-	if regexStr := parseStrFlag(c, regexLsAnyFlag); regexStr != "" {
-		regex, err = regexp.Compile(regexStr)
-		if err != nil {
-			return
-		}
-		fmatch = func(bck cmn.Bck) bool { return regex.MatchString(bck.Name) }
+func _evictBck(c *cli.Context, bck cmn.Bck) (err error) {
+	if err = ensureRemoteProvider(bck); err != nil {
+		return err
 	}
-	bcks, errV := api.ListBuckets(apiBP, qbck, fltPresence)
-	if errV != nil {
-		return V(errV)
+	if err = api.EvictRemoteBucket(apiBP, bck, flagIsSet(c, keepMDFlag)); err != nil {
+		return V(err)
+	}
+	actionDone(c, "Evicted bucket "+bck.Cname("")+" from aistore")
+	return nil
+}
+
+func listOrSummBuckets(c *cli.Context, qbck cmn.QueryBcks, lsb lsbCtx) error {
+	bcks, err := api.ListBuckets(apiBP, qbck, lsb.fltPresence)
+	if err != nil {
+		return V(err)
 	}
 
 	// NOTE:
@@ -145,32 +165,53 @@ func listBuckets(c *cli.Context, qbck cmn.QueryBcks, fltPresence int, countRemot
 	// very obvious (albeit documented); thus, for the sake of usability making
 	// an exception - extending ais queries to include remote ais
 
-	if !qbck.IsRemoteAIS() && (qbck.Provider == apc.AIS || qbck.Provider == "") {
+	if lsb.all && qbck.Ns.IsGlobal() && (qbck.Provider == apc.AIS || qbck.Provider == "") {
 		if _, err := api.GetRemoteAIS(apiBP); err == nil {
 			qrais := qbck
 			qrais.Ns = cmn.NsAnyRemote
-			if brais, err := api.ListBuckets(apiBP, qrais, fltPresence); err == nil && len(brais) > 0 {
+			if brais, err := api.ListBuckets(apiBP, qrais, lsb.fltPresence); err == nil && len(brais) > 0 {
 				bcks = append(bcks, brais...)
 			}
 		}
 	}
 
-	if len(bcks) == 0 && apc.IsFltPresent(fltPresence) && !qbck.IsAIS() {
-		const hint = "Use %s option to list _all_ buckets.\n"
-		if qbck.IsEmpty() {
-			fmt.Fprintf(c.App.Writer, "No buckets in the cluster. "+hint, qflprn(allObjsOrBcksFlag))
-		} else {
-			fmt.Fprintf(c.App.Writer, "No %q matching buckets in the cluster. "+hint, qbck, qflprn(allObjsOrBcksFlag))
-		}
-		return
+	if len(bcks) == 0 && apc.IsFltPresent(lsb.fltPresence) && !qbck.IsAIS() {
+		_lsTip(c, qbck)
+		return nil
 	}
+
+	var nbcks cmn.Bcks
+	if lsb.regex == nil {
+		nbcks = bcks
+	} else {
+		for _, bck := range bcks {
+			if lsb.regex.MatchString(bck.Name) {
+				nbcks = append(nbcks, bck)
+			}
+		}
+		if len(nbcks) == 0 {
+			l := len(bcks)
+			if l < 5 {
+				fmt.Fprintf(c.App.Writer, "listed %v buckets with none matching %q regex",
+					bcks, lsb.regexStr)
+			} else {
+				fmt.Fprintf(c.App.Writer, "listed %d buckets with none matching %q regex",
+					len(bcks), lsb.regexStr)
+			}
+			return nil
+		}
+	}
+
+	//
+	// by provider
+	//
 	var total int
 	for _, provider := range selectProvidersExclRais(bcks) {
 		qbck = cmn.QueryBcks{Provider: provider}
 		if provider == apc.AIS {
 			qbck.Ns = cmn.NsGlobal // "local" cluster
 		}
-		cnt := listBckTable(c, qbck, bcks, fmatch, fltPresence, countRemoteObjs)
+		cnt := listBckTable(c, qbck, nbcks, lsb)
 		if cnt > 0 {
 			fmt.Fprintln(c.App.Writer)
 			total += cnt
@@ -178,11 +219,34 @@ func listBuckets(c *cli.Context, qbck cmn.QueryBcks, fltPresence int, countRemot
 	}
 	// finally, list remote ais buckets, if any
 	qbck = cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.NsAnyRemote}
-	cnt := listBckTable(c, qbck, bcks, fmatch, fltPresence, countRemoteObjs)
+	cnt := listBckTable(c, qbck, nbcks, lsb)
 	if cnt > 0 || total == 0 {
 		fmt.Fprintln(c.App.Writer)
 	}
-	return
+	return nil
+}
+
+func _lsTip(c *cli.Context, qbck cmn.QueryBcks) {
+	const (
+		what1 = "No buckets in the cluster. "
+		what2 = "No %q buckets in the cluster. "
+
+		h1 = "Use %s option to list matching remote buckets, if any"
+		h4 = "\n(optionally, use %s as well _not_ to add them on the fly).\n"
+	)
+	if flagIsSet(c, bckSummaryFlag) {
+		if qbck.IsEmpty() {
+			fmt.Fprintf(c.App.Writer, what1+h1+h4, qflprn(allObjsOrBcksFlag), qflprn(dontAddRemoteFlag))
+		} else {
+			fmt.Fprintf(c.App.Writer, what2+h1+h4, qbck, qflprn(allObjsOrBcksFlag), qflprn(dontAddRemoteFlag))
+		}
+	} else {
+		if qbck.IsEmpty() {
+			fmt.Fprintf(c.App.Writer, what1+h1+".\n", qflprn(allObjsOrBcksFlag))
+		} else {
+			fmt.Fprintf(c.App.Writer, what2+h1+".\n", qbck, qflprn(allObjsOrBcksFlag))
+		}
+	}
 }
 
 // If both backend_bck.name and backend_bck.provider are present, use them.
@@ -236,7 +300,7 @@ validate:
 func showBucketProps(c *cli.Context) (err error) {
 	var (
 		bck cmn.Bck
-		p   *cmn.BucketProps
+		p   *cmn.Bprops
 	)
 
 	if c.NArg() > 2 {
@@ -248,7 +312,7 @@ func showBucketProps(c *cli.Context) (err error) {
 	if bck, err = parseBckURI(c, c.Args().Get(0), false); err != nil {
 		return
 	}
-	if p, err = headBucket(bck, true /* don't add */); err != nil {
+	if p, err = headBucket(bck, !flagIsSet(c, addRemoteFlag) /* don't add */); err != nil {
 		return
 	}
 
@@ -281,10 +345,10 @@ func showBucketProps(c *cli.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	return HeadBckTable(c, p, defProps, section)
+	return headBckTable(c, p, defProps, section)
 }
 
-func HeadBckTable(c *cli.Context, props, defProps *cmn.BucketProps, section string) error {
+func headBckTable(c *cli.Context, props, defProps *cmn.Bprops, section string) error {
 	var (
 		defList nvpairList
 		colored = !cfg.NoColor
@@ -310,25 +374,35 @@ func HeadBckTable(c *cli.Context, props, defProps *cmn.BucketProps, section stri
 				if def.Name != p.Name {
 					continue
 				}
-				if def.Name == cmn.PropBucketCreated {
+				switch {
+				case def.Name == "present":
+					if p.Value == "yes" {
+						p.Value = fgreen(p.Value)
+					} else {
+						p.Value = fcyan(p.Value)
+					}
+				case def.Name == cmn.PropBucketCreated:
 					if p.Value != teb.NotSetVal {
 						created, err := cos.S2UnixNano(p.Value)
 						if err == nil {
 							p.Value = fmtBucketCreatedTime(created)
 						}
+						p.Value = fgreen(p.Value)
 					}
-					propList[idx] = p
-				}
-				if def.Value != p.Value {
+				case def.Value != p.Value:
 					p.Value = fcyan(p.Value)
-					propList[idx] = p
 				}
+
+				propList[idx] = p
 				break
 			}
 		}
 	}
 
-	return teb.Print(propList, teb.PropsSimpleTmpl)
+	if flagIsSet(c, noHeaderFlag) {
+		return teb.Print(propList, teb.PropValTmplNoHdr)
+	}
+	return teb.Print(propList, teb.PropValTmpl)
 }
 
 // Configure bucket as n-way mirror
@@ -356,34 +430,4 @@ func ecEncode(c *cli.Context, bck cmn.Bck, data, parity int) (err error) {
 	msg := fmt.Sprintf("Erasure-coding bucket %s. ", bck.Cname(""))
 	actionDone(c, msg+toMonitorMsg(c, xid, ""))
 	return
-}
-
-func printObjProps(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, props string, addCachedCol bool) error {
-	var (
-		hideHeader     = flagIsSet(c, noHeaderFlag)
-		matched, other = lstFilter.apply(entries)
-		units, errU    = parseUnitsFlag(c, unitsFlag)
-	)
-	if errU != nil {
-		return errU
-	}
-
-	propsList := splitCsv(props)
-	tmpl := teb.ObjPropsTemplate(propsList, hideHeader, addCachedCol)
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(units)}
-	if err := teb.Print(matched, tmpl, opts); err != nil {
-		return err
-	}
-	if len(matched) > 10 {
-		listed := fblue("Listed:")
-		fmt.Fprintln(c.App.Writer, listed, cos.FormatBigNum(len(matched)), "names")
-	}
-	if flagIsSet(c, showUnmatchedFlag) && len(other) > 0 {
-		unmatched := fcyan("\nNames that didn't match: ") + strconv.Itoa(len(other))
-		tmpl = unmatched + "\n" + tmpl
-		if err := teb.Print(other, tmpl, opts); err != nil {
-			return err
-		}
-	}
-	return nil
 }

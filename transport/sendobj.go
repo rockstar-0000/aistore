@@ -148,9 +148,9 @@ func (s *Stream) doCmpl(obj *Obj, err error) {
 	// SCQ completion callback
 	if rc == 0 {
 		if obj.Callback != nil {
-			obj.Callback(obj.Hdr, obj.Reader, obj.CmplArg, err)
+			obj.Callback(&obj.Hdr, obj.Reader, obj.CmplArg, err)
 		} else if s.callback != nil {
-			s.callback(obj.Hdr, obj.Reader, obj.CmplArg, err)
+			s.callback(&obj.Hdr, obj.Reader, obj.CmplArg, err)
 		}
 	}
 	freeSend(obj)
@@ -323,9 +323,10 @@ func (s *Stream) eoObj(err error) {
 	if verbose {
 		nlog.Infof("%s: sent %s (%d/%d)", s, obj, s.numCur, s.stats.Num.Load())
 	}
+
 	// target stats
-	g.statsTracker.Inc(OutObjCount)
-	g.statsTracker.Add(OutObjSize, objSize)
+	g.tstats.Inc(OutObjCount)
+	g.tstats.Add(OutObjSize, objSize)
 exit:
 	if err != nil {
 		nlog.Errorln(err)

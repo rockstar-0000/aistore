@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/urfave/cli"
 )
@@ -26,11 +26,12 @@ type (
 		metrics cos.StrKVs, mapBegin, mapEnd teb.StstMap, elapsed time.Duration) bool
 )
 
-// statically defined for `latency` tab (compare with counter and throughput tabs)
-var latabNames = []string{
-	stats.GetLatency, stats.GetSize, stats.GetCount, stats.GetColdCount, stats.GetColdSize,
-	stats.PutLatency, stats.PutSize, stats.PutCount,
-	stats.AppendLatency, stats.AppendCount}
+// _statically_ defined for `latency` table (compare with counter and throughput tabs)
+var selectedLatency = []string{
+	stats.GetLatency, stats.GetSize, stats.GetCount, stats.GetColdCount, stats.GetColdSize, stats.GetRedirLatency, stats.GetColdRwLatency,
+	stats.PutLatency, stats.PutSize, stats.PutCount, stats.PutRedirLatency,
+	stats.AppendLatency, stats.AppendCount,
+}
 
 // true when called by top-level handler
 var allPerfTabs bool
@@ -38,7 +39,6 @@ var allPerfTabs bool
 var (
 	showPerfFlags = append(
 		longRunFlags,
-		allColumnsFlag,
 		noHeaderFlag,
 		regexColsFlag,
 		unitsFlag,
@@ -138,7 +138,7 @@ func perfCptn(c *cli.Context, tab string) {
 	actionCptn(c, tab, s)
 }
 
-// show all non-zero counters _and_ sizes (unless `allColumnsFlag`)
+// show non-zero counters _and_ sizes (unless `allColumnsFlag`)
 func showCountersHandler(c *cli.Context) error {
 	metrics, err := getMetricNames(c)
 	if err != nil {
@@ -223,9 +223,10 @@ func showLatencyHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	selected := make(cos.StrKVs, len(latabNames))
+	// statically filter metrics (names)
+	selected := make(cos.StrKVs, len(selectedLatency))
 	for name, kind := range metrics {
-		if cos.StringInSlice(name, latabNames) {
+		if cos.StringInSlice(name, selectedLatency) {
 			selected[name] = kind
 		} else if stats.IsErrMetric(name) {
 			if strings.Contains(name, "get") || strings.Contains(name, "put") || strings.Contains(name, "append") {
@@ -254,9 +255,11 @@ func _latency(c *cli.Context, metrics cos.StrKVs, mapBegin, mapEnd teb.StstMap, 
 			vend := end.Tracker[name]
 			ncounter := name[:len(name)-1] // ".ns" => ".n"
 			switch name {
-			case stats.GetLatency:
+			case stats.GetLatency, stats.GetRedirLatency:
 				ncounter = stats.GetCount
-			case stats.PutLatency:
+			case stats.GetColdRwLatency:
+				ncounter = stats.GetColdCount
+			case stats.PutLatency, stats.PutRedirLatency:
 				ncounter = stats.PutCount
 			case stats.AppendLatency:
 				ncounter = stats.AppendCount
@@ -284,7 +287,6 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		regex       *regexp.Regexp
 		regexStr    = parseStrFlag(c, regexColsFlag)
 		hideHeader  = flagIsSet(c, noHeaderFlag)
-		allCols     = flagIsSet(c, allColumnsFlag)
 		units, errU = parseUnitsFlag(c, unitsFlag)
 	)
 	if errU != nil {
@@ -340,8 +342,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		}
 		setLongRunParams(c, lfooter)
 
-		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units,
-			AllCols: allCols, AvgSize: avgSize}
+		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units, AvgSize: avgSize}
 		table, num, err := teb.NewPerformanceTab(tstatusMap, &ctx)
 		if err != nil {
 			return err
@@ -353,8 +354,6 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		if num == 0 && tag == cmdShowCounters {
 			if regex == nil {
 				actionNote(c, "the cluster is completely idle: all collected counters have zero values\n")
-			} else {
-				actionNote(c, fmt.Sprintf("%q matching counters have zero values\n", regexStr))
 			}
 		}
 
@@ -410,8 +409,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		}
 
 		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units,
-			Totals: totals, TotalsHdr: totalsHdr,
-			AllCols: allCols, AvgSize: avgSize, Idle: idle}
+			Totals: totals, TotalsHdr: totalsHdr, AvgSize: avgSize, Idle: idle}
 		table, _, err := teb.NewPerformanceTab(mapBegin, &ctx)
 		if err != nil {
 			return err
@@ -422,7 +420,6 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		if err != nil || !refresh || allPerfTabs {
 			return err
 		}
-		printLongRunFooter(c.App.Writer, 36)
 	}
 	return nil
 }

@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"bytes"
@@ -50,7 +50,7 @@ func startTar2TfTransformer(t *testing.T) (etlName string) {
 }
 
 func TestETLTar2TFS3(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s})
 
 	const (
 		tarObjName   = "small-mnist-3.tar"
@@ -80,7 +80,7 @@ func TestETLTar2TFS3(t *testing.T) {
 		Cksum:      f.Cksum(),
 		Reader:     f,
 	}
-	_, err = api.PutObject(putArgs)
+	_, err = api.PutObject(&putArgs)
 	tassert.CheckFatal(t, err)
 	defer api.DeleteObject(baseParams, bck, tarObjName)
 
@@ -119,7 +119,7 @@ func TestETLTar2TFS3(t *testing.T) {
 
 func TestETLTar2TFRanges(t *testing.T) {
 	// TestETLTar2TFS3 already runs in short tests, no need for short here as well.
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s, Long: true})
 
 	type testCase struct {
 		start, end int64
@@ -158,7 +158,7 @@ func TestETLTar2TFRanges(t *testing.T) {
 		Cksum:      f.Cksum(),
 		Reader:     f,
 	}
-	_, err = api.PutObject(putArgs)
+	_, err = api.PutObject(&putArgs)
 	tassert.CheckFatal(t, err)
 
 	etlName := startTar2TfTransformer(t)

@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that control running jobs in the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -54,11 +54,11 @@ var (
 			etlExtFlag,
 			forceFlag,
 			copyPrependFlag,
-			copyObjPrefixFlag,
 			copyDryRunFlag,
 			etlBucketRequestTimeout,
-			templateFlag,
 			listFlag,
+			templateFlag,
+			verbObjPrefixFlag,
 			// TODO: progressFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
@@ -121,8 +121,8 @@ var (
 	}
 	bckCmdETL = cli.Command{
 		Name:         cmdBucket,
-		Usage:        "transform entire bucket or selected objects (to select, use '--list' or '--template')",
-		ArgsUsage:    etlNameArgument + " " + bucketSrcArgument + " " + bucketDstArgument,
+		Usage:        "transform entire bucket or selected objects (to select, use '--list', '--template', or '--prefix')",
+		ArgsUsage:    etlNameArgument + " " + bucketObjectSrcArgument + " " + bucketDstArgument,
 		Action:       etlBucketHandler,
 		Flags:        etlSubFlags[cmdBucket],
 		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{etlIDCompletions}, 1, 2),

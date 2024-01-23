@@ -26,6 +26,7 @@ from aistore.sdk.const import (
     HEADER_ACCEPT,
     HEADER_BUCKET_PROPS,
     HEADER_BUCKET_SUMM,
+    HEADER_XACTION_ID,
     HTTP_METHOD_DELETE,
     HTTP_METHOD_GET,
     HTTP_METHOD_HEAD,
@@ -33,14 +34,16 @@ from aistore.sdk.const import (
     MSGPACK_CONTENT_TYPE,
     PROVIDER_AIS,
     QPARAM_BCK_TO,
-    QPARAM_COUNT_REMOTE_OBJS,
+    QPARAM_BSUMM_REMOTE,
     QPARAM_FLT_PRESENCE,
     QPARAM_KEEP_REMOTE,
     QPARAM_NAMESPACE,
     QPARAM_PROVIDER,
+    QPARAM_UUID,
     URL_PATH_BUCKETS,
     STATUS_ACCEPTED,
     STATUS_OK,
+    STATUS_PARTIAL_CONTENT,
 )
 
 from aistore.sdk.errors import (
@@ -265,7 +268,6 @@ class Bucket(AISSource):
         self,
         uuid: str = "",
         prefix: str = "",
-        fast: bool = True,
         cached: bool = True,
         present: bool = True,
     ):
@@ -276,7 +278,6 @@ class Bucket(AISSource):
             uuid (str): Identifier for the bucket summary. Defaults to an empty string.
             prefix (str): Prefix for objects to be included in the bucket summary.
                           Defaults to an empty string (all objects).
-            fast (bool): If True, performs and returns a quick summary. Defaults to True.
             cached (bool): If True, summary entails cached entities. Defaults to True.
             present (bool): If True, summary entails present entities. Defaults to True.
 
@@ -289,7 +290,7 @@ class Bucket(AISSource):
             aistore.sdk.errors.AISError: All other types of errors with AIStore
         """
         bsumm_ctrl_msg = BsummCtrlMsg(
-            uuid=uuid, prefix=prefix, fast=fast, cached=cached, present=present
+            uuid=uuid, prefix=prefix, cached=cached, present=present
         )
 
         # Start the job and get the job ID
@@ -338,12 +339,11 @@ class Bucket(AISSource):
 
         return json.loads(resp.content.decode("utf-8"))[0]
 
-    def info(self, flt_presence: int = 0, count_remote_objs: bool = True):
+    def info(self, flt_presence: int = 0, bsumm_remote: bool = True):
         """
         Returns bucket summary and information/properties.
 
         Args:
-            count_remote_objs (bool): If True, returned bucket info will entail remote objects as well
             flt_presence (int): Describes the presence of buckets and objects with respect to their existence
                                 or non-existence in the AIS cluster. Defaults to 0.
 
@@ -354,6 +354,7 @@ class Bucket(AISSource):
                                 3 - same as 2 but no need to return summary
                                 4 - objects: present anywhere/anyhow _in_ the cluster as: replica, ec-slices, misplaced
                                 5 - not present - exists _outside_ cluster
+            bsumm_remote (bool): If True, returned bucket info will include remote objects as well
 
         Raises:
             requests.ConnectionError: Connection error
@@ -369,8 +370,7 @@ class Bucket(AISSource):
 
         params = self.qparam.copy()
         params.update({QPARAM_FLT_PRESENCE: flt_presence})
-        if count_remote_objs:
-            params.update({QPARAM_COUNT_REMOTE_OBJS: count_remote_objs})
+        params[QPARAM_BSUMM_REMOTE] = bsumm_remote
 
         response = self.client.request(
             HTTP_METHOD_HEAD,
@@ -378,10 +378,45 @@ class Bucket(AISSource):
             params=params,
         )
 
-        bucket_props = json.loads(response.headers.get(HEADER_BUCKET_PROPS, "{}"))
-        bucket_summ = json.loads(response.headers.get(HEADER_BUCKET_SUMM, "{}"))
+        bucket_props = response.headers.get(HEADER_BUCKET_PROPS, "{}")
+        uuid = response.headers.get(HEADER_XACTION_ID, "").strip('"')
+        params[QPARAM_UUID] = uuid
 
-        return bucket_props, bucket_summ
+        # Initial response status code should be 202
+        if response.status_code != int(STATUS_ACCEPTED):
+            raise UnexpectedHTTPStatusCode([STATUS_ACCEPTED], response.status_code)
+
+        # Sleep and request frequency in sec (starts at 2 s)
+        sleep_time = 2
+        time.sleep(sleep_time)
+        i = 0
+
+        # Poll async task for http.StatusOK completion
+        while True:
+            response = self.client.request(
+                HTTP_METHOD_HEAD,
+                path=f"{URL_PATH_BUCKETS}/{self.name}",
+                params=params,
+            )
+
+            bucket_summ = response.headers.get(HEADER_BUCKET_SUMM, "")
+
+            if bucket_summ != "":
+                result = json.loads(bucket_summ)
+
+            # If task completed successfully, break the loop
+            if response.status_code == STATUS_OK:
+                break
+
+            time.sleep(sleep_time)
+            i += 1
+
+            if i == 8 and response.status_code != STATUS_PARTIAL_CONTENT:
+                sleep_time *= 2
+            elif i == 16 and response.status_code != STATUS_PARTIAL_CONTENT:
+                sleep_time *= 2
+
+        return bucket_props, result
 
     # pylint: disable=too-many-arguments
     def copy(
@@ -391,6 +426,8 @@ class Bucket(AISSource):
         prepend: str = "",
         dry_run: bool = False,
         force: bool = False,
+        latest: bool = False,
+        sync: bool = False,
     ) -> str:
         """
         Returns job ID that can be used later to check the status of the asynchronous operation.
@@ -402,6 +439,8 @@ class Bucket(AISSource):
             dry_run (bool, optional): Determines if the copy should actually
                 happen or not
             force (bool, optional): Override existing destination bucket
+            latest (bool, optional): GET the latest object version from the associated remote bucket
+            sync (bool, optional): synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source
 
         Returns:
             Job ID (as str) that can be used to check the status of the operation
@@ -415,7 +454,12 @@ class Bucket(AISSource):
             requests.ReadTimeout: Timed out receiving response from AIStore
         """
         value = CopyBckMsg(
-            prefix=prefix_filter, prepend=prepend, dry_run=dry_run, force=force
+            prefix=prefix_filter,
+            prepend=prepend,
+            dry_run=dry_run,
+            force=force,
+            latest=latest,
+            sync=sync,
         ).as_dict()
         params = self.qparam.copy()
         params[QPARAM_BCK_TO] = to_bck.get_path()
@@ -611,6 +655,8 @@ class Bucket(AISSource):
         ext: Dict[str, str] = None,
         force: bool = False,
         dry_run: bool = False,
+        latest: bool = False,
+        sync: bool = False,
     ) -> str:
         """
         Visits all selected objects in the source bucket and for each object, puts the transformed
@@ -626,6 +672,8 @@ class Bucket(AISSource):
                 (i.e. {"jpg": "txt"})
             dry_run (bool, optional): determines if the copy should actually happen or not
             force (bool, optional): override existing destination bucket
+            latest (bool, optional): GET the latest object version from the associated remote bucket
+            sync (bool, optional): synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source
 
         Returns:
             Job ID (as str) that can be used to check the status of the operation
@@ -634,7 +682,12 @@ class Bucket(AISSource):
             ext=ext,
             transform_msg=TransformBckMsg(etl_name=etl_name, timeout=timeout),
             copy_msg=CopyBckMsg(
-                prefix=prefix_filter, prepend=prepend, force=force, dry_run=dry_run
+                prefix=prefix_filter,
+                prepend=prepend,
+                force=force,
+                dry_run=dry_run,
+                latest=latest,
+                sync=sync,
             ),
         ).as_dict()
 

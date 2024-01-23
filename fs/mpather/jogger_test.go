@@ -13,9 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/memsys"
@@ -38,17 +39,16 @@ func TestJoggerGroup(t *testing.T) {
 	)
 	defer os.RemoveAll(out.Dir)
 
-	jg := mpather.NewJoggerGroup(&mpather.JgroupOpts{
-		T:   out.T,
+	opts := &mpather.JgroupOpts{
 		Bck: out.Bck,
 		CTs: []string{fs.ObjectType},
-		VisitObj: func(lom *cluster.LOM, buf []byte) error {
+		VisitObj: func(lom *core.LOM, buf []byte) error {
 			tassert.Errorf(t, len(buf) == 0, "buffer expected to be empty")
 			counter.Inc()
 			return nil
 		},
-	})
-
+	}
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -85,11 +85,10 @@ func TestJoggerGroupParallel(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	baseJgOpts := &mpather.JgroupOpts{
-		T:    out.T,
 		Bck:  out.Bck,
 		CTs:  []string{fs.ObjectType},
 		Slab: slab,
-		VisitObj: func(lom *cluster.LOM, buf []byte) error {
+		VisitObj: func(lom *core.LOM, buf []byte) error {
 			b := bytes.NewBuffer(buf[:0])
 			_, err = b.WriteString(lom.FQN)
 			tassert.CheckFatal(t, err)
@@ -109,7 +108,7 @@ func TestJoggerGroupParallel(t *testing.T) {
 	for _, baseJgOpts.Parallel = range parallelOptions {
 		t.Run(fmt.Sprintf("TestJoggerGroupParallel/%d", baseJgOpts.Parallel), func(t *testing.T) {
 			counter = atomic.NewInt32(0)
-			jg := mpather.NewJoggerGroup(baseJgOpts)
+			jg := mpather.NewJoggerGroup(baseJgOpts, cmn.GCO.Get(), "")
 			jg.Run()
 			<-jg.ListenFinished()
 
@@ -139,18 +138,18 @@ func TestJoggerGroupLoad(t *testing.T) {
 	)
 	defer os.RemoveAll(out.Dir)
 
-	jg := mpather.NewJoggerGroup(&mpather.JgroupOpts{
-		T:   out.T,
+	opts := &mpather.JgroupOpts{
 		Bck: out.Bck,
 		CTs: []string{fs.ObjectType},
-		VisitObj: func(lom *cluster.LOM, buf []byte) error {
+		VisitObj: func(lom *core.LOM, buf []byte) error {
 			tassert.Errorf(t, lom.SizeBytes() == desc.ObjectSize, "incorrect object size (lom probably not loaded)")
 			tassert.Errorf(t, len(buf) == 0, "buffer expected to be empty")
 			counter.Inc()
 			return nil
 		},
 		DoLoad: mpather.Load,
-	})
+	}
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
 
 	jg.Run()
 	<-jg.ListenFinished()
@@ -178,16 +177,15 @@ func TestJoggerGroupError(t *testing.T) {
 	)
 	defer os.RemoveAll(out.Dir)
 
-	jg := mpather.NewJoggerGroup(&mpather.JgroupOpts{
-		T:   out.T,
+	opts := &mpather.JgroupOpts{
 		Bck: out.Bck,
 		CTs: []string{fs.ObjectType},
-		VisitObj: func(lom *cluster.LOM, buf []byte) error {
+		VisitObj: func(lom *core.LOM, buf []byte) error {
 			counter.Inc()
 			return fmt.Errorf("oops")
 		},
-	})
-
+	}
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -226,11 +224,10 @@ func TestJoggerGroupOneErrorStopsAll(t *testing.T) {
 		counters[failOnMpath.Path] = atomic.NewInt32(0)
 	}
 
-	jg := mpather.NewJoggerGroup(&mpather.JgroupOpts{
-		T:   out.T,
+	opts := &mpather.JgroupOpts{
 		Bck: out.Bck,
 		CTs: []string{fs.ObjectType},
-		VisitObj: func(lom *cluster.LOM, buf []byte) error {
+		VisitObj: func(lom *core.LOM, buf []byte) error {
 			cnt := counters[lom.Mountpath().Path].Inc()
 
 			// Fail only once, on one mpath.
@@ -240,8 +237,8 @@ func TestJoggerGroupOneErrorStopsAll(t *testing.T) {
 			}
 			return nil
 		},
-	})
-
+	}
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -249,9 +246,11 @@ func TestJoggerGroupOneErrorStopsAll(t *testing.T) {
 		// Expected at least one object to be skipped at each mountpath, when error occurred at 20% of objects jogged.
 		visitCount := counter.Load()
 		if mpath == failOnMpath.Path {
-			tassert.Fatalf(t, visitCount == failAt, "jogger on fail mpath %q expected to visit %d: visited %d", mpath, failAt, visitCount)
+			tassert.Fatalf(t, visitCount == failAt, "jogger on fail mpath %q expected to visit %d: visited %d",
+				mpath, failAt, visitCount)
 		}
-		tassert.Errorf(t, int(visitCount) <= out.MpathObjectsCnt[mpath], "jogger on mpath %q expected to visit at most %d, visited %d",
+		tassert.Errorf(t, int(visitCount) <= out.MpathObjectsCnt[mpath],
+			"jogger on mpath %q expected to visit at most %d, visited %d",
 			mpath, out.MpathObjectsCnt[mpath], counter.Load())
 	}
 
@@ -280,22 +279,21 @@ func TestJoggerGroupMultiContentTypes(t *testing.T) {
 	for _, ct := range cts {
 		counters[ct] = atomic.NewInt32(0)
 	}
-	jg := mpather.NewJoggerGroup(&mpather.JgroupOpts{
-		T:   out.T,
+	opts := &mpather.JgroupOpts{
 		Bck: out.Bck,
 		CTs: cts,
-		VisitObj: func(lom *cluster.LOM, buf []byte) error {
+		VisitObj: func(lom *core.LOM, buf []byte) error {
 			tassert.Errorf(t, len(buf) == 0, "buffer expected to be empty")
 			counters[fs.ObjectType].Inc()
 			return nil
 		},
-		VisitCT: func(ct *cluster.CT, buf []byte) error {
+		VisitCT: func(ct *core.CT, buf []byte) error {
 			tassert.Errorf(t, len(buf) == 0, "buffer expected to be empty")
 			counters[ct.ContentType()].Inc()
 			return nil
 		},
-	})
-
+	}
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
 	jg.Run()
 	<-jg.ListenFinished()
 

@@ -2,7 +2,6 @@
 # Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
 #
 
-HEADERS_KW = "headers"
 # Standard Header Keys
 HEADER_ACCEPT = "Accept"
 HEADER_USER_AGENT = "User-Agent"
@@ -22,6 +21,7 @@ AIS_CUSTOM_MD = "ais-custom-md"
 HEADER_PREFIX = "ais-"
 HEADER_BUCKET_PROPS = HEADER_PREFIX + "bucket-props"
 HEADER_BUCKET_SUMM = HEADER_PREFIX + "bucket-summ"
+HEADER_XACTION_ID = HEADER_PREFIX + "xaction-id"
 
 # URL Params
 # See api/apc/query.go
@@ -30,13 +30,15 @@ QPARAM_ETL_NAME = "etl_name"
 QPARAM_PROVIDER = "provider"
 QPARAM_BCK_TO = "bck_to"
 QPARAM_FLT_PRESENCE = "presence"
-QPARAM_COUNT_REMOTE_OBJS = "count_remote_objs"
+QPARAM_BSUMM_REMOTE = "bsumm_remote"
 QPARAM_KEEP_REMOTE = "keep_bck_md"
 QPARAM_ARCHPATH = "archpath"
 QPARAM_FORCE = "frc"
 QPARAM_PRIMARY_READY_REB = "prr"
 QPARAM_NAMESPACE = "namespace"
 DSORT_UUID = "uuid"
+QPARAM_UUID = "uuid"
+QPARAM_LATEST = "latest-ver"
 
 # URL Param values
 # See api/apc/query.go
@@ -105,3 +107,21 @@ UTF_ENCODING = "utf-8"
 STATUS_ACCEPTED = 202
 STATUS_OK = 200
 STATUS_BAD_REQUEST = 400
+STATUS_PARTIAL_CONTENT = 206
+
+# Environment Variables
+AIS_SERVER_CRT = "AIS_SERVER_CRT"
+
+# Content Constants
+LOREM = (
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod"
+    " tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim"
+    " veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea"
+    " commodo consequat."
+)
+DUIS = (
+    "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum"
+    " dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non"
+    " proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+    " Et harum quidem.."
+)

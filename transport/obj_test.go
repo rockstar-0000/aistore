@@ -141,7 +141,7 @@ func Example_headers() {
 
 func sendText(stream *transport.Stream, txt1, txt2 string) {
 	var wg sync.WaitGroup
-	cb := func(transport.ObjHdr, io.ReadCloser, any, error) {
+	cb := func(*transport.ObjHdr, io.ReadCloser, any, error) {
 		wg.Done()
 	}
 	sgl1 := memsys.PageMM().NewSGL(0)
@@ -189,7 +189,7 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 }
 
 func Example_obj() {
-	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
 		object, err := io.ReadAll(objReader)
 		if err != nil {
@@ -224,7 +224,7 @@ func Example_obj() {
 
 // test random streaming
 func TestOneStream(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	ts := httptest.NewServer(objmux)
 	defer ts.Close()
 
@@ -233,7 +233,7 @@ func TestOneStream(t *testing.T) {
 }
 
 func TestMultiStream(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	tlog.Logf("Duration %v\n", duration)
 	ts := httptest.NewServer(objmux)
@@ -390,7 +390,7 @@ func TestObjAttrs(t *testing.T) {
 	defer ts.Close()
 
 	var receivedCount atomic.Int64
-	recvFunc := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	recvFunc := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
 
 		idx := hdr.Opaque[0]
@@ -442,7 +442,7 @@ func TestObjAttrs(t *testing.T) {
 	}
 }
 
-func receive10G(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+func receive10G(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	cos.Assert(err == nil || cos.IsEOF(err))
 	written, _ := io.Copy(io.Discard, objReader)
 	cos.Assert(written == hdr.ObjAttrs.Size)
@@ -518,7 +518,7 @@ func TestCompressedOne(t *testing.T) {
 }
 
 func TestDryRun(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	t.Setenv("AIS_STREAM_DRY_RUN", "true")
 
@@ -563,20 +563,20 @@ func TestDryRun(t *testing.T) {
 }
 
 func TestCompletionCount(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		numSent                   int64
 		numCompleted, numReceived atomic.Int64
 	)
 
-	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
 		written, _ := io.Copy(io.Discard, objReader)
 		cos.Assert(written == hdr.ObjAttrs.Size)
 		numReceived.Inc()
 		return nil
 	}
-	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
+	callback := func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
 		numCompleted.Inc()
 	}
 
@@ -714,7 +714,7 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 
 func makeRecvFunc(t *testing.T) (*int64, transport.RecvObj) {
 	totalReceived := new(int64)
-	return totalReceived, func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	return totalReceived, func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil || cos.IsEOF(err))
 		written, err := io.Copy(io.Discard, objReader)
 		if err != nil && !cos.IsEOF(err) {
@@ -803,6 +803,7 @@ type randReader struct {
 	clone  bool
 }
 
+//nolint:gocritic // can do (hdr) hugeParam
 func newRandReader(random *rand.Rand, hdr transport.ObjHdr, slab *memsys.Slab) *randReader {
 	buf := slab.Alloc()
 	_, err := random.Read(buf)
@@ -876,7 +877,7 @@ type randReaderCtx struct {
 	idx    int
 }
 
-func (rrc *randReaderCtx) sentCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+func (rrc *randReaderCtx) sentCallback(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 	if err != nil {
 		rrc.t.Errorf("sent-callback %d(%s) returned an error: %v", rrc.idx, hdr.Cname(), err)
 	}

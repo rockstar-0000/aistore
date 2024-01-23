@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/NVIDIA/aistore/api"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/trand"
@@ -78,7 +78,7 @@ func opPut(objName, cksumType string, bck cmn.Bck) opRes {
 		Cksum:      r.Cksum(),
 		Reader:     r,
 	}
-	_, err = api.PutObject(putArgs)
+	_, err = api.PutObject(&putArgs)
 	return opRes{http.MethodPut, err}
 }
 
@@ -216,7 +216,7 @@ func TestRWStressShort(t *testing.T) {
 }
 
 func TestRWStress(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	numLoops = 30
 	numFiles = 1000

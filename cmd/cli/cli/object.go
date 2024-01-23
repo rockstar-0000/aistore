@@ -15,7 +15,6 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -32,20 +31,16 @@ func promote(c *cli.Context, bck cmn.Bck, objName, fqn string) error {
 		target = parseStrFlag(c, targetIDFlag)
 		recurs = flagIsSet(c, recursFlag)
 	)
-	promoteArgs := &api.PromoteArgs{
-		BaseParams: apiBP,
-		Bck:        bck,
-		PromoteArgs: cluster.PromoteArgs{
-			DaemonID:       target,
-			ObjName:        objName,
-			SrcFQN:         fqn,
-			Recursive:      recurs,
-			SrcIsNotFshare: flagIsSet(c, notFshareFlag),
-			OverwriteDst:   flagIsSet(c, overwriteFlag),
-			DeleteSrc:      flagIsSet(c, deleteSrcFlag),
-		},
+	args := apc.PromoteArgs{
+		DaemonID:       target,
+		ObjName:        objName,
+		SrcFQN:         fqn,
+		Recursive:      recurs,
+		SrcIsNotFshare: flagIsSet(c, notFshareFlag),
+		OverwriteDst:   flagIsSet(c, overwriteFlag),
+		DeleteSrc:      flagIsSet(c, deleteSrcFlag),
 	}
-	xid, err := api.Promote(promoteArgs)
+	xid, err := api.Promote(apiBP, bck, &args)
 	if err != nil {
 		return V(err)
 	}
@@ -78,7 +73,7 @@ func setCustomProps(c *cli.Context, bck cmn.Bck, objName string) (err error) {
 		for _, pair := range propArgs {
 			nv := strings.Split(pair, "=")
 			if len(nv) != 2 {
-				return fmt.Errorf("invalid custom property %q (Hint: use syntax key1=value1 key2=value2 ...)", nv)
+				return fmt.Errorf("invalid custom property %q (tip: use syntax key1=value1 key2=value2 ...)", nv)
 			}
 			nv[0] = strings.TrimSpace(nv[0])
 			nv[1] = strings.TrimSpace(nv[1])
@@ -197,7 +192,7 @@ func concatObject(c *cli.Context, bck cmn.Bck, objName string, fileNames []strin
 				Reader:     fh,
 				Handle:     handle,
 			}
-			handle, err = api.AppendObject(appendArgs)
+			handle, err = api.AppendObject(&appendArgs)
 			if err != nil {
 				return fmt.Errorf("%v. Object not created", err)
 			}
@@ -210,7 +205,7 @@ func concatObject(c *cli.Context, bck cmn.Bck, objName string, fileNames []strin
 	if progress != nil {
 		progress.Wait()
 	}
-	err := api.FlushObject(api.FlushArgs{
+	err := api.FlushObject(&api.FlushArgs{
 		BaseParams: apiBP,
 		Bck:        bck,
 		Object:     objName,
@@ -229,17 +224,18 @@ func concatObject(c *cli.Context, bck cmn.Bck, objName string, fileNames []strin
 	return nil
 }
 
-func isObjPresent(c *cli.Context, bck cmn.Bck, object string) error {
-	_, err := api.HeadObject(apiBP, bck, object, apc.FltPresentNoProps)
+func isObjPresent(c *cli.Context, bck cmn.Bck, objName string) error {
+	name := bck.Cname(objName)
+	_, err := api.HeadObject(apiBP, bck, objName, apc.FltPresentNoProps, true)
 	if err != nil {
 		if cmn.IsStatusNotFound(err) {
-			fmt.Fprintf(c.App.Writer, "Cached: %v\n", false)
+			fmt.Fprintf(c.App.Writer, "%s is not present (\"not cached\")\n", name)
 			return nil
 		}
 		return V(err)
 	}
 
-	fmt.Fprintf(c.App.Writer, "Cached: %v\n", true)
+	fmt.Fprintf(c.App.Writer, "%s is present (is cached)\n", name)
 	return nil
 }
 
@@ -261,24 +257,27 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) error {
 		selectedProps []string
 		fltPresence   = apc.FltPresentCluster
 	)
-	if flagIsSet(c, objNotCachedPropsFlag) {
+	if flagIsSet(c, objNotCachedPropsFlag) || flagIsSet(c, allObjsOrBcksFlag) {
 		fltPresence = apc.FltExists
 	}
-	objProps, err := api.HeadObject(apiBP, bck, objName, fltPresence)
+	objProps, err := api.HeadObject(apiBP, bck, objName, fltPresence, flagIsSet(c, silentFlag))
 	if err != nil {
 		if !cmn.IsStatusNotFound(err) {
 			return err
 		}
 		var hint string
 		if apc.IsFltPresent(fltPresence) && bck.IsRemote() {
-			hint = fmt.Sprintf(" (tip: try %s option)", qflprn(objNotCachedPropsFlag))
+			if actionIsHandler(c.Command.Action, listAnyHandler) {
+				hint = fmt.Sprintf(" (tip: try %s option)", qflprn(allObjsOrBcksFlag))
+			} else {
+				hint = fmt.Sprintf(" (tip: try %s option)", qflprn(objNotCachedPropsFlag))
+			}
 		}
 		return fmt.Errorf("%q not found in %s%s", objName, bck.Cname(""), hint)
 	}
 
 	if flagIsSet(c, jsonFlag) {
-		opts := teb.Jopts(true)
-		return teb.Print(objProps, teb.PropsSimpleTmpl, opts)
+		return teb.Print(objProps, teb.PropValTmpl, teb.Jopts(true))
 	}
 	if flagIsSet(c, allPropsFlag) {
 		propsFlag = apc.GetPropsAll
@@ -314,7 +313,10 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) error {
 		return propNVs[i].Name < propNVs[j].Name
 	})
 
-	return teb.Print(propNVs, teb.PropsSimpleTmpl)
+	if flagIsSet(c, noHeaderFlag) {
+		return teb.Print(propNVs, teb.PropValTmplNoHdr)
+	}
+	return teb.Print(propNVs, teb.PropValTmpl)
 }
 
 func propVal(op *cmn.ObjectProps, name string) (v string) {
@@ -350,8 +352,10 @@ func propVal(op *cmn.ObjectProps, name string) (v string) {
 		}
 	case apc.GetPropsLocation:
 		v = op.Location
+	case apc.GetPropsStatus:
+		// no "object status" in `cmn.ObjectProps` - nothing to do (see also: `cmn.LsoEntry`)
 	default:
-		debug.Assert(false, name)
+		debug.Assert(false, "obj prop name: \""+name+"\"")
 	}
 	return
 }

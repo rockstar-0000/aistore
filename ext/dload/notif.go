@@ -1,6 +1,6 @@
 // Package cmn provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/nl"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -30,8 +30,8 @@ type (
 
 // interface guard
 var (
-	_ nl.Listener   = (*NotifDownloadListerner)(nil)
-	_ cluster.Notif = (*NotifDownload)(nil)
+	_ nl.Listener = (*NotifDownloadListerner)(nil)
+	_ core.Notif  = (*NotifDownload)(nil)
 )
 
 func NewDownloadNL(jobID, kind string, smap *meta.Smap, progressInterval time.Duration) *NotifDownloadListerner {
@@ -69,8 +69,8 @@ func (nd *NotifDownloadListerner) QueryArgs() cmn.HreqArgs {
 // NotifDownloader
 //
 
-func (nd *NotifDownload) ToNotifMsg() cluster.NotifMsg {
-	msg := cluster.NotifMsg{UUID: nd.job.ID(), Kind: apc.ActDownload}
+func (nd *NotifDownload) ToNotifMsg(aborted bool) core.NotifMsg {
+	msg := core.NotifMsg{UUID: nd.job.ID(), Kind: apc.ActDownload, AbortedX: aborted}
 	stats, err := nd.job.ActiveStats()
 	if err != nil {
 		msg.ErrMsg = err.Error()

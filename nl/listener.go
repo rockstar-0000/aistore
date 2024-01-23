@@ -1,20 +1,21 @@
 // Package notifications provides interfaces for AIStore notifications
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package nl
 
 import (
-	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core/meta"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -43,18 +44,19 @@ type Listener interface {
 	SetAddedTime()
 	AddedTime() int64
 	Finished() bool
+	Name() string
 	String() string
 	GetOwner() string
 	SetOwner(string)
-	LastUpdated(si *meta.Snode) int64
+	LastUpdated(*meta.Snode) int64
 	ProgressInterval() time.Duration
 
 	// detailed ref-counting
 	ActiveNotifiers() meta.NodeMap
 	FinCount() int
 	ActiveCount() int
-	HasFinished(node *meta.Snode) bool
-	MarkFinished(node *meta.Snode)
+	HasFinished(*meta.Snode) bool
+	MarkFinished(*meta.Snode)
 	NodesTardy(periodicNotifTime time.Duration) (nodes meta.NodeMap, tardy bool)
 }
 
@@ -214,20 +216,37 @@ func (nlb *ListenerBase) Status() *Status {
 	return &Status{Kind: nlb.Kind(), UUID: nlb.UUID(), EndTimeX: nlb.EndTimeX.Load(), AbortedX: nlb.Aborted()}
 }
 
+func (nlb *ListenerBase) _name() *strings.Builder {
+	var sb strings.Builder
+	sb.WriteString("nl-")
+	sb.WriteString(nlb.Kind())
+	sb.WriteByte('[')
+	sb.WriteString(nlb.UUID())
+	sb.WriteByte(']')
+	return &sb
+}
+
+func (nlb *ListenerBase) Name() string {
+	sb := nlb._name()
+	return sb.String()
+}
+
 func (nlb *ListenerBase) String() string {
 	var (
 		tm, res  string
-		hdr      = fmt.Sprintf("nl-%s[%s]", nlb.Kind(), nlb.UUID())
+		sb       = nlb._name()
 		finCount = nlb.FinCount()
 	)
 	if nlb.Cause() != "" {
-		hdr += "-caused-by-" + nlb.Cause()
+		sb.WriteString("-caused-by-")
+		sb.WriteString(nlb.Cause())
 	}
 	if bcks := nlb.Bcks(); len(bcks) > 0 {
-		if len(bcks) == 1 {
-			hdr += "-" + bcks[0].String()
-		} else {
-			hdr += "-" + bcks[0].String() + "-" + bcks[1].String()
+		sb.WriteByte('-')
+		sb.WriteString(bcks[0].String())
+		if len(bcks) > 1 {
+			sb.WriteByte('-')
+			sb.WriteString(bcks[1].String())
 		}
 	}
 	if tfin := nlb.EndTimeX.Load(); tfin > 0 {
@@ -237,12 +256,20 @@ func (nlb *ListenerBase) String() string {
 			res = "-done"
 		}
 		tm = cos.FormatNanoTime(tfin, cos.StampMicro)
-		return fmt.Sprintf("%s-%s%s", hdr, tm, res)
+		sb.WriteByte('-')
+		sb.WriteString(tm)
+		sb.WriteString(res)
+		return sb.String()
 	}
 	if finCount > 0 {
-		return fmt.Sprintf("%s(cnt=%d/%d)", hdr, finCount, len(nlb.Srcs))
+		sb.WriteString("(cnt=")
+		sb.WriteString(strconv.Itoa(finCount))
+		sb.WriteByte('/')
+		sb.WriteString(strconv.Itoa(len(nlb.Srcs)))
+		sb.WriteByte(')')
+		return sb.String()
 	}
-	return hdr
+	return sb.String()
 }
 
 ////////////

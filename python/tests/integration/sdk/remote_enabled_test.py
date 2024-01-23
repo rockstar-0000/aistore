@@ -1,4 +1,9 @@
+#
+# Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+#
+
 import unittest
+import boto3
 
 from aistore.sdk.const import PROVIDER_AIS
 
@@ -11,6 +16,8 @@ from tests.integration import (
     TEST_TIMEOUT_LONG,
 )
 from tests.utils import random_string, destroy_bucket, create_and_put_objects
+from tests import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+from tests.integration.boto3 import AWS_REGION
 
 
 class RemoteEnabledTest(unittest.TestCase):
@@ -109,3 +116,35 @@ class RemoteEnabledTest(unittest.TestCase):
                 self.assertTrue(obj.is_cached())
             else:
                 self.assertFalse(obj.is_cached())
+
+    def _verify_cached_objects(self, expected_object_count, cached_range):
+        """
+        List each of the objects and verify the correct count and that all objects matching
+        the cached range are cached and all others are not
+
+        Args:
+            expected_object_count: expected number of objects to list
+            cached_range: object indices that should be cached, all others should not
+        """
+        objects = self.bucket.list_objects(
+            props="name,cached", prefix=self.obj_prefix
+        ).entries
+        self.assertEqual(expected_object_count, len(objects))
+        cached_names = {self.obj_prefix + str(x) + "-suffix" for x in cached_range}
+        cached_objs = []
+        evicted_objs = []
+        for obj in objects:
+            if obj.name in cached_names:
+                cached_objs.append(obj)
+            else:
+                evicted_objs.append(obj)
+        self._validate_objects_cached(cached_objs, True)
+        self._validate_objects_cached(evicted_objs, False)
+
+    def _get_boto3_client(self):
+        return boto3.client(
+            "s3",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )

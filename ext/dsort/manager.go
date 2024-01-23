@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -12,14 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dsort/ct"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
@@ -53,11 +53,9 @@ const (
 
 type (
 	global struct {
-		t      cluster.Target
 		tstats stats.Tracker
 		mm     *memsys.MMSA
 	}
-
 	buildingShardInfo struct {
 		shardName string
 	}
@@ -125,42 +123,39 @@ var g global
 
 // interface guard
 var (
-	_ meta.Slistener = (*Manager)(nil)
-	_ cos.Packer     = (*buildingShardInfo)(nil)
-	_ cos.Unpacker   = (*buildingShardInfo)(nil)
-	_ cluster.Xact   = (*xaction)(nil)
+	_ cos.Packer   = (*buildingShardInfo)(nil)
+	_ cos.Unpacker = (*buildingShardInfo)(nil)
+	_ core.Xact    = (*xaction)(nil)
 )
 
-func Pinit(si cluster.Node) {
+func Pinit(si core.Node, config *cmn.Config) {
 	psi = si
-	newClient()
+	newBcastClient(config)
 }
 
-func Tinit(t cluster.Target, stats stats.Tracker, db kvdb.Driver) {
+func Tinit(tstats stats.Tracker, db kvdb.Driver, config *cmn.Config) {
 	Managers = NewManagerGroup(db, false)
 
 	xreg.RegBckXact(&factory{})
 
 	debug.Assert(g.mm == nil) // only once
-	g.mm = t.PageMM()
-	g.t = t
-	g.tstats = stats
+	{
+		g.tstats = tstats
+		g.mm = core.T.PageMM()
+	}
+	fs.CSM.Reg(ct.DsortFileType, &ct.DsortFile{})
+	fs.CSM.Reg(ct.DsortWorkfileType, &ct.DsortFile{})
 
-	shard.T = t
-
-	fs.CSM.Reg(ct.DSortFileType, &ct.DSortFile{})
-	fs.CSM.Reg(ct.DSortWorkfileType, &ct.DSortFile{})
-
-	newClient()
+	newBcastClient(config)
 }
 
-func newClient() {
-	config := cmn.GCO.Get()
-	bcastClient = cmn.NewClient(cmn.TransportArgs{
-		Timeout:    config.Timeout.MaxHostBusy.D(),
-		UseHTTPS:   config.Net.HTTP.UseHTTPS,
-		SkipVerify: config.Net.HTTP.SkipVerify,
-	})
+func newBcastClient(config *cmn.Config) {
+	cargs := cmn.TransportArgs{Timeout: config.Timeout.MaxHostBusy.D()}
+	if config.Net.HTTP.UseHTTPS {
+		bcastClient = cmn.NewIntraClientTLS(cargs, config)
+	} else {
+		bcastClient = cmn.NewClient(cargs)
+	}
 }
 
 /////////////
@@ -174,7 +169,7 @@ func (m *Manager) unlock()        { m.mu.Unlock() }
 // init initializes all necessary fields.
 // PRECONDITION: `m.mu` must be locked.
 func (m *Manager) init(pars *parsedReqSpec) error {
-	m.smap = g.t.Sowner().Get()
+	m.smap = core.T.Sowner().Get()
 
 	targetCount := m.smap.CountActiveTs()
 
@@ -182,9 +177,7 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 	m.Metrics = newMetrics(pars.Description)
 	m.startShardCreation = make(chan struct{}, 1)
 
-	g.t.Sowner().Listeners().Reg(m)
-
-	if err := m.setDSorter(); err != nil {
+	if err := m.setDsorter(); err != nil {
 		return err
 	}
 
@@ -200,13 +193,15 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 	// and so this is why we need such a long timeout.
 	m.config = cmn.GCO.Get()
 
-	// TODO -- FIXME: must be a single instance (similar to streams)
-	m.client = cmn.NewClient(cmn.TransportArgs{
-		DialTimeout: 5 * time.Minute,
-		Timeout:     30 * time.Minute,
-		UseHTTPS:    m.config.Net.HTTP.UseHTTPS,
-		SkipVerify:  m.config.Net.HTTP.SkipVerify,
-	})
+	cargs := cmn.TransportArgs{
+		DialTimeout: m.config.Client.Timeout.D(),
+		Timeout:     m.config.Client.TimeoutLong.D(),
+	}
+	if m.config.Net.HTTP.UseHTTPS {
+		m.client = cmn.NewIntraClientTLS(cargs, m.config)
+	} else {
+		m.client = cmn.NewClient(cargs)
+	}
 
 	m.received.ch = make(chan int32, 10)
 
@@ -243,7 +238,7 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 	m.setAbortedTo(false)
 	m.state.cleanWait = sync.NewCond(&m.mu)
 
-	m.callTimeout = m.config.DSort.CallTimeout.D()
+	m.callTimeout = m.config.Dsort.CallTimeout.D()
 	return nil
 }
 
@@ -257,12 +252,12 @@ func (m *Manager) initStreams() error {
 	respNetwork := cmn.NetIntraData
 	trname := fmt.Sprintf(shardStreamNameFmt, m.ManagerUUID)
 	shardsSbArgs := bundle.Args{
-		Multiplier: config.DSort.SbundleMult,
+		Multiplier: config.Dsort.SbundleMult,
 		Net:        respNetwork,
 		Trname:     trname,
-		Ntype:      cluster.Targets,
+		Ntype:      core.Targets,
 		Extra: &transport.Extra{
-			Compression: config.DSort.Compression,
+			Compression: config.Dsort.Compression,
 			Config:      config,
 		},
 	}
@@ -270,7 +265,7 @@ func (m *Manager) initStreams() error {
 		return errors.WithStack(err)
 	}
 	client := transport.NewIntraDataClient()
-	m.streams.shards = bundle.New(g.t.Sowner(), g.t.Snode(), client, shardsSbArgs)
+	m.streams.shards = bundle.New(client, shardsSbArgs)
 	return nil
 }
 
@@ -319,10 +314,8 @@ func (m *Manager) cleanup() {
 	m.shardRW = nil
 	m.client = nil
 
-	g.t.Sowner().Listeners().Unreg(m)
-
 	if !m.aborted() {
-		m.updateFinishedAck(g.t.SID())
+		m.updateFinishedAck(core.T.SID())
 		m.xctn.Finish()
 	}
 }
@@ -339,7 +332,7 @@ func (m *Manager) cleanup() {
 // in goroutines (there is a possibility that finalCleanup would start before
 // cleanup) - this cannot happen with current ordering mechanism.
 func (m *Manager) finalCleanup() {
-	nlog.Infof("%s: [dsort] %s started final cleanup", g.t, m.ManagerUUID)
+	nlog.Infof("%s: [dsort] %s started final cleanup", core.T, m.ManagerUUID)
 
 	m.lock()
 	for m.state.cleaned != initiallyCleanedState {
@@ -385,7 +378,7 @@ func (m *Manager) finalCleanup() {
 	m.unlock()
 
 	m.mg.persist(m.ManagerUUID)
-	nlog.Infof("%s: [dsort] %s finished final cleanup in %v", g.t, m.ManagerUUID, time.Since(now))
+	nlog.Infof("%s: [dsort] %s finished final cleanup in %v", core.T, m.ManagerUUID, time.Since(now))
 }
 
 // stop this job and free associated resources
@@ -409,12 +402,12 @@ func (m *Manager) abort(err error) {
 	inProgress := m.inProgress()
 	m.unlock()
 
-	nlog.Infof("%s: [dsort] %s aborted", g.t, m.ManagerUUID)
+	nlog.Infof("%s: [dsort] %s aborted", core.T, m.ManagerUUID)
 
 	// If job has already finished we just free resources, otherwise we must wait
 	// for it to finish.
 	if inProgress {
-		if m.config.FastV(4, cos.SmoduleDsort) {
+		if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 			nlog.Infof("[dsort] %s is in progress, waiting for finish", m.ManagerUUID)
 		}
 		// Wait for dsorter to initialize all the resources.
@@ -422,7 +415,7 @@ func (m *Manager) abort(err error) {
 
 		m.dsorter.onAbort()
 		m.waitForFinish()
-		if m.config.FastV(4, cos.SmoduleDsort) {
+		if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 			nlog.Infof("[dsort] %s was in progress and finished", m.ManagerUUID)
 		}
 	}
@@ -433,15 +426,15 @@ func (m *Manager) abort(err error) {
 	}()
 }
 
-// setDSorter sets what type of dsorter implementation should be used
-func (m *Manager) setDSorter() (err error) {
-	switch m.Pars.DSorterType {
-	case DSorterGeneralType:
-		m.dsorter, err = newDSorterGeneral(m)
-	case DSorterMemType:
-		m.dsorter = newDSorterMem(m)
+// setDsorter sets what type of dsorter implementation should be used
+func (m *Manager) setDsorter() (err error) {
+	switch m.Pars.DsorterType {
+	case GeneralType:
+		m.dsorter, err = newDsorterGeneral(m)
+	case MemType:
+		m.dsorter = newDsorterMem(m)
 	default:
-		debug.Assertf(false, "dsorter type is invalid: %q", m.Pars.DSorterType)
+		debug.Assertf(false, "dsorter type is invalid: %q", m.Pars.DsorterType)
 	}
 	m.dsorterStarted.Add(1)
 	return
@@ -550,13 +543,13 @@ func (m *Manager) inFlightDec()     { m.inFlight.Dec() }
 func (m *Manager) inProgress() bool { return m.state.inProgress.Load() }
 func (m *Manager) aborted() bool    { return m.state.aborted.Load() }
 
-// listenAborted returns channel which is closed when DSort job was aborted.
+// listenAborted returns channel which is closed when Dsort job was aborted.
 // This allows for the listen to be notified when job is aborted.
 func (m *Manager) listenAborted() chan struct{} {
 	return m.state.doneCh
 }
 
-// waitForFinish waits for DSort job to be finished. Note that aborted is also
+// waitForFinish waits for Dsort job to be finished. Note that aborted is also
 // 'finished'.
 func (m *Manager) waitForFinish() {
 	m.state.wg.Wait()
@@ -604,17 +597,17 @@ func (m *Manager) setAbortedTo(aborted bool) {
 	m.Metrics.setAbortedTo(aborted)
 }
 
-func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	defer transport.DrainAndFreeReader(objReader)
 	if err != nil {
 		m.abort(err)
 		return err
 	}
 	if m.aborted() {
-		return newDSortAbortedError(m.ManagerUUID)
+		return m.newErrAborted()
 	}
-	lom := cluster.AllocLOM(hdr.ObjName)
-	defer cluster.FreeLOM(lom)
+	lom := core.AllocLOM(hdr.ObjName)
+	defer core.FreeLOM(lom)
 	if err = lom.InitBck(&hdr.Bck); err == nil {
 		err = lom.Load(false /*cache it*/, false /*locked*/)
 	}
@@ -624,7 +617,7 @@ func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error
 	}
 	if err == nil {
 		if lom.EqCksum(hdr.ObjAttrs.Cksum) {
-			if m.config.FastV(4, cos.SmoduleDsort) {
+			if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 				nlog.Infof("[dsort] %s shard (%s) already exists and checksums are equal, skipping",
 					m.ManagerUUID, lom)
 			}
@@ -636,36 +629,21 @@ func (m *Manager) recvShard(hdr transport.ObjHdr, objReader io.Reader, err error
 	lom.SetAtimeUnix(started.UnixNano())
 	rc := io.NopCloser(objReader)
 
-	params := cluster.AllocPutObjParams()
+	params := core.AllocPutParams()
 	{
 		params.WorkTag = ct.WorkfileRecvShard
 		params.Reader = rc
 		params.Cksum = nil
 		params.Atime = started
+		params.Size = hdr.ObjAttrs.Size
 	}
-	erp := g.t.PutObject(lom, params)
-	cluster.FreePutObjParams(params)
+	erp := core.T.PutObject(lom, params)
+	core.FreePutParams(params)
 	if erp != nil {
 		m.abort(err)
 		return erp
 	}
 	return nil
-}
-
-func (m *Manager) ListenSmapChanged() {
-	newSmap := g.t.Sowner().Get()
-	if newSmap.Version <= m.smap.Version {
-		return
-	}
-	if newSmap.CountActiveTs() != m.smap.CountActiveTs() {
-		// Currently adding new target as well as removing one is not
-		// supported during the run.
-		// TODO: dsort should survive adding new target. For now it is
-		// not possible as rebalance deletes moved object - dsort needs
-		// to use `GetObject` method instead of relaying on simple `os.Open`.
-		err := errors.Errorf("number of targets changed during run - aborting")
-		go m.abort(err)
-	}
 }
 
 func (m *Manager) freeMemory() uint64 {

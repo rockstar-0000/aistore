@@ -6,7 +6,6 @@
 package cmn
 
 import (
-	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
@@ -34,52 +33,13 @@ type (
 		Flags    uint16 `json:"flags,omitempty" msg:"f,omitempty"`       // enum { EntryIsCached, EntryIsDir, EntryInArch, ...}
 	}
 
+	LsoEntries []*LsoEntry
+
 	// LsoResult carries the results of `api.ListObjects`, `BackendProvider.ListObjects`, and friends
 	LsoResult struct {
-		UUID              string      `json:"uuid"`
-		ContinuationToken string      `json:"continuation_token"`
-		Entries           []*LsoEntry `json:"entries"`
-		Flags             uint32      `json:"flags"`
+		UUID              string     `json:"uuid"`
+		ContinuationToken string     `json:"continuation_token"`
+		Entries           LsoEntries `json:"entries"`
+		Flags             uint32     `json:"flags"`
 	}
 )
-
-//////////////
-// LsoEntry //
-//////////////
-
-// NOTE: the terms "cached" and "present" are interchangeable
-// ("object is cached" == "is present" and vice versa)
-func (be *LsoEntry) CheckExists() bool { return be.Flags&apc.EntryIsCached != 0 }
-func (be *LsoEntry) SetPresent()       { be.Flags |= apc.EntryIsCached }
-
-func (be *LsoEntry) IsStatusOK() bool   { return be.Status() == 0 }
-func (be *LsoEntry) Status() uint16     { return be.Flags & apc.EntryStatusMask }
-func (be *LsoEntry) IsInsideArch() bool { return be.Flags&apc.EntryInArch != 0 }
-func (be *LsoEntry) IsListedArch() bool { return be.Flags&apc.EntryIsArchive != 0 }
-func (be *LsoEntry) String() string     { return "{" + be.Name + "}" }
-
-func (be *LsoEntry) CopyWithProps(propsSet cos.StrSet) (ne *LsoEntry) {
-	ne = &LsoEntry{Name: be.Name}
-	if propsSet.Contains(apc.GetPropsSize) {
-		ne.Size = be.Size
-	}
-	if propsSet.Contains(apc.GetPropsChecksum) {
-		ne.Checksum = be.Checksum
-	}
-	if propsSet.Contains(apc.GetPropsAtime) {
-		ne.Atime = be.Atime
-	}
-	if propsSet.Contains(apc.GetPropsVersion) {
-		ne.Version = be.Version
-	}
-	if propsSet.Contains(apc.GetPropsLocation) {
-		ne.Location = be.Location
-	}
-	if propsSet.Contains(apc.GetPropsCustom) {
-		ne.Custom = be.Custom
-	}
-	if propsSet.Contains(apc.GetPropsCopies) {
-		ne.Copies = be.Copies
-	}
-	return
-}

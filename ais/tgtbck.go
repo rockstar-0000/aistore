@@ -1,25 +1,24 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
@@ -30,13 +29,17 @@ import (
 )
 
 //
-// httpbck* handlers
+// httpbck* handlers: list buckets/objects, summary (ditto), delete(bucket), head(bucket)
 //
 
 // GET /v1/buckets[/bucket-name]
-func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathBuckets.L)
+func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
+	apiItems, err := t.parseURL(w, r, apc.URLPathBuckets.L, 0, true)
 	if err != nil {
+		return
+	}
+	if err = t.isIntraCall(r.Header, false); err != nil {
+		t.writeErr(w, r, err)
 		return
 	}
 	msg, err := t.readAisMsg(w, r)
@@ -45,20 +48,18 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 	}
 	t.ensureLatestBMD(msg, r)
 
-	var bckName string
-	if len(apiItems) > 0 {
-		bckName = apiItems[0]
+	if err := dpq.parse(r.URL.RawQuery); err != nil {
+		t.writeErr(w, r, err)
+		return
 	}
+
 	switch msg.Action {
 	case apc.ActList:
-		dpq := dpqAlloc()
-		if err := dpq.fromRawQ(r.URL.RawQuery); err != nil {
-			dpqFree(dpq)
-			t.writeErr(w, r, err)
-			return
+		var bckName string
+		if len(apiItems) > 0 {
+			bckName = apiItems[0]
 		}
 		qbck, err := newQbckFromQ(bckName, nil, dpq)
-		dpqFree(dpq)
 		if err != nil {
 			t.writeErr(w, r, err)
 			return
@@ -73,8 +74,14 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 		bck := meta.CloneBck((*cmn.Bck)(qbck))
 		if err := bck.Init(t.owner.bmd); err != nil {
 			if cmn.IsErrRemoteBckNotFound(err) {
-				t.BMDVersionFixup(r)
-				err = bck.Init(t.owner.bmd)
+				if cos.IsParseBool(dpq.dontAddRemote) {
+					// don't add it - proceed anyway (TODO: assert(wantOnlyRemote) below)
+					err = nil
+				} else {
+					// in an inlikely case updated BMD's in flight
+					t.BMDVersionFixup(r)
+					err = bck.Init(t.owner.bmd)
+				}
 			}
 			if err != nil {
 				t.statsT.IncErr(stats.ListCount)
@@ -82,8 +89,20 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		begin := mono.NanoTime()
-		if ok := t.listObjects(w, r, bck, msg); !ok {
+		var (
+			begin = mono.NanoTime()
+			lsmsg *apc.LsoMsg
+		)
+		if err := cos.MorphMarshal(msg.Value, &lsmsg); err != nil {
+			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
+			return
+		}
+		if !cos.IsValidUUID(lsmsg.UUID) {
+			debug.Assert(false, lsmsg.UUID)
+			t.writeErrf(w, r, "list-objects: invalid UUID %q", lsmsg.UUID)
+			return
+		}
+		if ok := t.listObjects(w, r, bck, lsmsg); !ok {
 			t.statsT.IncErr(stats.ListCount)
 			return
 		}
@@ -93,15 +112,28 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 			cos.NamedVal64{Name: stats.ListLatency, Value: delta},
 		)
 	case apc.ActSummaryBck:
-		var (
-			bsumMsg apc.BsummCtrlMsg
-			query   = r.URL.Query()
-		)
-		qbck, err := newQbckFromQ(bckName, query, nil)
+		var bucket, phase string // txn
+		if len(apiItems) == 0 {
+			t.writeErrURL(w, r)
+			return
+		}
+		if len(apiItems) == 1 {
+			phase = apiItems[0]
+		} else {
+			bucket, phase = apiItems[0], apiItems[1]
+		}
+		if phase != apc.ActBegin && phase != apc.ActQuery {
+			t.writeErrURL(w, r)
+			return
+		}
+
+		qbck, err := newQbckFromQ(bucket, nil, dpq)
 		if err != nil {
 			t.writeErr(w, r, err)
 			return
 		}
+
+		var bsumMsg apc.BsummCtrlMsg
 		if err := cos.MorphMarshal(msg.Value, &bsumMsg); err != nil {
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
 			return
@@ -111,8 +143,13 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 		if qbck.IsBucket() {
 			if err := bck.Init(t.owner.bmd); err != nil {
 				if cmn.IsErrRemoteBckNotFound(err) {
-					t.BMDVersionFixup(r)
-					err = bck.Init(t.owner.bmd)
+					if bsumMsg.DontAddRemote || cos.IsParseBool(dpq.dontAddRemote) {
+						// don't add it - proceed anyway
+						err = nil
+					} else {
+						t.BMDVersionFixup(r)
+						err = bck.Init(t.owner.bmd)
+					}
 				}
 				if err != nil {
 					t.writeErr(w, r, err)
@@ -120,7 +157,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		t.bsumm(w, r, query, msg.Action, bck, &bsumMsg)
+		t.bsumm(w, r, phase, bck, &bsumMsg, dpq)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
@@ -214,43 +251,39 @@ func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config, bmd *bucketMD) (
 	return
 }
 
-// listObjects returns a list of objects in a bucket (with optional prefix).
-func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bck, actMsg *aisMsg) (ok bool) {
-	var msg *apc.LsoMsg
-	if err := cos.MorphMarshal(actMsg.Value, &msg); err != nil {
-		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, actMsg.Action, actMsg.Value, err)
-		return
-	}
-	if !bck.IsAIS() && !msg.IsFlagSet(apc.LsObjCached) {
+// returns `cmn.LsoResult` containing object names and (requested) props
+// control/scope - via `apc.LsoMsg`
+func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lsmsg *apc.LsoMsg) (ok bool) {
+	if !bck.IsAIS() && !lsmsg.IsFlagSet(apc.LsObjCached) {
 		maxRemotePageSize := t.Backend(bck).MaxPageSize()
-		if msg.PageSize > maxRemotePageSize {
-			t.writeErrf(w, r, "page size %d exceeds the supported maximum (%d)", msg.PageSize, maxRemotePageSize)
+		if lsmsg.PageSize > maxRemotePageSize {
+			t.writeErrf(w, r, "page size %d exceeds the supported maximum (%d)", lsmsg.PageSize, maxRemotePageSize)
 			return false
 		}
-		if msg.PageSize == 0 {
-			msg.PageSize = maxRemotePageSize
+		if lsmsg.PageSize == 0 {
+			lsmsg.PageSize = maxRemotePageSize
 		}
 	}
-	debug.Assert(msg.PageSize > 0 && msg.PageSize < 100000 && cos.IsValidUUID(msg.UUID))
+	debug.Assert(lsmsg.PageSize > 0 && lsmsg.PageSize < 100000)
 
 	// (advanced) user-selected target to execute remote ls
-	if msg.SID != "" {
+	if lsmsg.SID != "" {
 		smap := t.owner.smap.get()
-		if smap.GetTarget(msg.SID) == nil {
-			err := &errNodeNotFound{"list-objects failure:", msg.SID, t.si, smap}
+		if smap.GetTarget(lsmsg.SID) == nil {
+			err := &errNodeNotFound{"list-objects failure:", lsmsg.SID, t.si, smap}
 			t.writeErr(w, r, err)
 			return
 		}
 	}
 
 	var (
-		xctn cluster.Xact
-		rns  = xreg.RenewLso(t, bck, msg.UUID, msg)
+		xctn core.Xact
+		rns  = xreg.RenewLso(bck, lsmsg.UUID, lsmsg)
 	)
 	// check that xaction hasn't finished prior to this page read, restart if needed
 	if rns.Err == xs.ErrGone {
 		runtime.Gosched()
-		rns = xreg.RenewLso(t, bck, msg.UUID, msg)
+		rns = xreg.RenewLso(bck, lsmsg.UUID, lsmsg)
 	}
 	if rns.Err != nil {
 		t.writeErr(w, r, rns.Err)
@@ -263,23 +296,13 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 	}
 	xls := xctn.(*xs.LsoXact)
 
-	if config := cmn.GCO.Get(); config.FastV(4, cos.SmoduleAIS) {
-		var s string
-		if msg.ContinuationToken != "" {
-			s = " cont=" + msg.ContinuationToken
-		}
-		if msg.SID != "" {
-			s += " via t[" + msg.SID + "]"
-		}
-		nlog.Infoln(xls.Name() + s)
-	}
-
-	resp := xls.Do(msg) // NOTE: blocking request/response
+	// NOTE: blocking next-page request
+	resp := xls.Do(lsmsg)
 	if resp.Err != nil {
 		t.writeErr(w, r, resp.Err, resp.Status)
 		return false
 	}
-	debug.Assert(resp.Lst.UUID == msg.UUID)
+	debug.Assert(resp.Lst.UUID == lsmsg.UUID)
 
 	// TODO: `Flags` have limited usability, consider to remove
 	marked := xreg.GetRebMarked()
@@ -290,16 +313,9 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 	return t.writeMsgPack(w, resp.Lst, "list_objects")
 }
 
-func (t *target) bsumm(w http.ResponseWriter, r *http.Request, q url.Values, action string, bck *meta.Bck, msg *apc.BsummCtrlMsg) {
-	var (
-		taskAction = q.Get(apc.QparamTaskAction)
-	)
-	if taskAction == apc.TaskStart {
-		if action != apc.ActSummaryBck {
-			t.writeErrAct(w, r, action)
-			return
-		}
-		rns := xreg.RenewBckSummary(t, bck, msg)
+func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck *meta.Bck, msg *apc.BsummCtrlMsg, dpq *dpq) {
+	if phase == apc.ActBegin {
+		rns := xreg.RenewBckSummary(bck, msg)
 		if rns.Err != nil {
 			t.writeErr(w, r, rns.Err, http.StatusInternalServerError)
 			return
@@ -308,7 +324,8 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, q url.Values, act
 		return
 	}
 
-	xctn, err := xreg.GetXact(msg.UUID)
+	debug.Assert(phase == apc.ActQuery, phase)
+	xctn, err := xreg.GetXact(msg.UUID) // vs. hk.OldAgeX removal
 	if err != nil {
 		t.writeErr(w, r, err, http.StatusInternalServerError)
 		return
@@ -316,18 +333,13 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, q url.Values, act
 
 	// never started
 	if xctn == nil {
-		err := cos.NewErrNotFound("%s: x-%s[%s] (failed to start?)", t, apc.ActSummaryBck, msg.UUID)
-		t._erris(w, r, q.Get(apc.QparamSilent), err, http.StatusNotFound)
+		err := cos.NewErrNotFound(t, apc.ActSummaryBck+" job "+msg.UUID)
+		t._erris(w, r, dpq.silent, err, http.StatusNotFound)
 		return
 	}
 
-	// still running
-	if !xctn.Finished() {
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	// finished
-	result, err := xctn.Result()
+	xsumm := xctn.(*xs.XactNsumm)
+	result, err := xsumm.Result()
 	if err != nil {
 		if cmn.IsErrBucketNought(err) {
 			t.writeErr(w, r, err, http.StatusGone)
@@ -336,10 +348,14 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, q url.Values, act
 		}
 		return
 	}
-	if taskAction == apc.TaskResult {
-		// return the final result only if it is requested explicitly
-		t.writeJSON(w, r, result, "bucket-summary")
+	if !xctn.Finished() {
+		if len(result) == 0 {
+			w.WriteHeader(http.StatusAccepted)
+		} else {
+			w.WriteHeader(http.StatusPartialContent)
+		}
 	}
+	t.writeJSON(w, r, result, xsumm.Name())
 }
 
 // DELETE { action } /v1/buckets/bucket-name
@@ -372,6 +388,7 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 			nlp.Lock()
 			defer nlp.Unlock()
 
+			core.UncacheBck(apireq.bck)
 			err := fs.DestroyBucket(msg.Action, apireq.bck.Bucket(), apireq.bck.Props.BID)
 			if err != nil {
 				t.writeErr(w, r, err)
@@ -390,26 +407,24 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
 			return
 		}
+		// note extra safety check
 		for _, name := range lrMsg.ObjNames {
 			if !t.isValidObjname(w, r, name) {
 				return
 			}
 		}
-		rns := xreg.RenewEvictDelete(msg.UUID, t, msg.Action /*xaction kind*/, apireq.bck, lrMsg)
+		rns := xreg.RenewEvictDelete(msg.UUID, msg.Action /*xaction kind*/, apireq.bck, lrMsg)
 		if rns.Err != nil {
 			t.writeErr(w, r, rns.Err)
 			return
 		}
 		xctn := rns.Entry.Get()
-		xctn.AddNotif(&xact.NotifXact{
-			Base: nl.Base{
-				When: cluster.UponTerm,
-				Dsts: []string{equalIC},
-				F:    t.notifyTerm,
-			},
+		notif := &xact.NotifXact{
+			Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
 			Xact: xctn,
-		})
-		go xctn.Run(nil)
+		}
+		xctn.AddNotif(notif)
+		xact.GoRunW(xctn)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
@@ -421,44 +436,50 @@ func (t *target) httpbckpost(w http.ResponseWriter, r *http.Request, apireq *api
 	if err != nil {
 		return
 	}
+	if msg.Action != apc.ActPrefetchObjects {
+		t.writeErrAct(w, r, msg.Action)
+		return
+	}
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-
+	// extra check
 	t.ensureLatestBMD(msg, r)
-
 	if err := apireq.bck.Init(t.owner.bmd); err != nil {
-		if cmn.IsErrRemoteBckNotFound(err) {
-			t.BMDVersionFixup(r)
-			err = apireq.bck.Init(t.owner.bmd)
-		}
-		if err != nil {
-			t.writeErr(w, r, err)
-			return
-		}
+		t.writeErr(w, r, err)
+		return
 	}
 
-	switch msg.Action {
-	case apc.ActPrefetchObjects:
-		var (
-			err   error
-			lrMsg = &apc.ListRange{}
-		)
-		if !apireq.bck.IsRemote() {
-			t.writeErrf(w, r, "%s: expecting remote bucket, got %s, action=%s",
-				t.si, apireq.bck, msg.Action)
-			return
-		}
-		if err = cos.MorphMarshal(msg.Value, lrMsg); err != nil {
-			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
-			return
-		}
-		rns := xreg.RenewPrefetch(msg.UUID, t, apireq.bck, lrMsg)
-		xctn := rns.Entry.Get()
-		go xctn.Run(nil)
-	default:
-		t.writeErrAct(w, r, msg.Action)
+	prfMsg := &apc.PrefetchMsg{}
+	if err := cos.MorphMarshal(msg.Value, prfMsg); err != nil {
+		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
+		return
 	}
+	if errCode, err := t.runPrefetch(msg.UUID, apireq.bck, prfMsg); err != nil {
+		t.writeErr(w, r, err, errCode)
+	}
+}
+
+// handle apc.ActPrefetchObjects <-- via api.Prefetch* and api.StartX*
+func (t *target) runPrefetch(xactID string, bck *meta.Bck, prfMsg *apc.PrefetchMsg) (int, error) {
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return http.StatusInsufficientStorage, err
+	}
+	rns := xreg.RenewPrefetch(xactID, bck, prfMsg)
+	if rns.Err != nil {
+		return http.StatusBadRequest, rns.Err
+	}
+
+	xctn := rns.Entry.Get()
+	notif := &xact.NotifXact{
+		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+		Xact: xctn,
+	}
+	xctn.AddNotif(notif)
+
+	xact.GoRunW(xctn)
+	return 0, nil
 }
 
 // HEAD /v1/buckets/bucket-name
@@ -481,7 +502,7 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 		}
 		inBMD = false
 	}
-	if cmn.FastV(5, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 		pid := apireq.query.Get(apc.QparamProxyID)
 		nlog.Infof("%s %s <= %s", r.Method, apireq.bck, pid)
 	}

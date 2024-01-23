@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -34,10 +34,10 @@ type (
 	}
 
 	Bck struct {
-		Props    *BucketProps `json:"-"`
-		Name     string       `json:"name" yaml:"name"`
-		Provider string       `json:"provider" yaml:"provider"` // NOTE: see api/apc/provider.go for supported enum
-		Ns       Ns           `json:"namespace" yaml:"namespace" list:"omitempty"`
+		Props    *Bprops `json:"-"`
+		Name     string  `json:"name" yaml:"name"`
+		Provider string  `json:"provider" yaml:"provider"` // NOTE: see api/apc/provider.go for supported enum
+		Ns       Ns      `json:"namespace" yaml:"namespace" list:"omitempty"`
 	}
 
 	// Represents the AIS bucket, object and URL associated with a HTTP resource
@@ -283,14 +283,6 @@ func (b *Bck) ValidateName() (err error) {
 	return
 }
 
-// related, inlined
-func ValidateObjname(s string) error {
-	if !strings.Contains(s, "../") {
-		return nil
-	}
-	return fmt.Errorf("invalid object name %q", s)
-}
-
 // ditto
 func ValidatePrefix(s string) error {
 	if !strings.Contains(s, "../") {
@@ -398,6 +390,11 @@ func (b *Bck) IsCloud() bool {
 	return apc.IsCloudProvider(backend.Provider)
 }
 
+// A subset of remote backends that maintain assorted items of versioning information -
+// the items including ETag, checksum, etc. - that, in turn, can be used to populate `ObjAttrs`
+// * see related: `ObjAttrs.Equal`
+func (b *Bck) HasVersioningMD() bool { return b.IsCloud() || b.IsRemoteAIS() }
+
 func (b *Bck) HasProvider() bool { return b.Provider != "" }
 
 //
@@ -484,9 +481,9 @@ func (qbck *QueryBcks) NewQuery() url.Values {
 	return bck.NewQuery()
 }
 
-func (qbck *QueryBcks) AddToQuery(query url.Values) url.Values {
+func (qbck *QueryBcks) AddToQuery(query url.Values) {
 	bck := (*Bck)(qbck)
-	return bck.AddToQuery(query)
+	_ = bck.AddToQuery(query)
 }
 
 func (qbck *QueryBcks) Validate() (err error) {
@@ -545,9 +542,9 @@ func (bcks Bcks) Swap(i, j int) {
 }
 
 func (bcks Bcks) Select(query QueryBcks) (filtered Bcks) {
-	for _, bck := range bcks {
-		if query.Contains(&bck) {
-			filtered = append(filtered, bck)
+	for i := range bcks {
+		if query.Contains(&bcks[i]) {
+			filtered = append(filtered, bcks[i])
 		}
 	}
 	return filtered
@@ -557,10 +554,10 @@ func (bcks Bcks) Equal(other Bcks) bool {
 	if len(bcks) != len(other) {
 		return false
 	}
-	for _, b1 := range bcks {
+	for i := range bcks {
 		var found bool
-		for _, b2 := range other {
-			if b1.Equal(&b2) {
+		for j := range other {
+			if bcks[i].Equal(&other[j]) {
 				found = true
 				break
 			}

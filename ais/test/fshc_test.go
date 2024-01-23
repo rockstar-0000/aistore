@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -15,9 +15,9 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -135,7 +135,7 @@ func (md *checkerMD) runTestSync(method string, target *meta.Snode, mpath string
 		tassert.CheckFatal(md.t, err)
 		for _, objName := range objList {
 			r, _ := readers.NewRand(md.fileSize, p.Cksum.Type)
-			_, err := api.PutObject(api.PutArgs{
+			_, err := api.PutObject(&api.PutArgs{
 				BaseParams: md.baseParams,
 				Bck:        md.bck,
 				ObjName:    path.Join(fshcDir, objName),
@@ -297,7 +297,7 @@ func runAsyncJob(t *testing.T, bck cmn.Bck, wg *sync.WaitGroup, op, mpath string
 			switch op {
 			case "PUT":
 				r, _ := readers.NewRand(fileSize, p.Cksum.Type)
-				api.PutObject(api.PutArgs{
+				api.PutObject(&api.PutArgs{
 					BaseParams: baseParams,
 					Bck:        bck,
 					ObjName:    path.Join(fshcDir, fname),
@@ -325,7 +325,7 @@ func TestFSCheckerDetectionEnabled(t *testing.T) {
 	if true {
 		t.Skipf("skipping %s", t.Name())
 	}
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		md     = newCheckerMD(t)
@@ -378,7 +378,7 @@ func TestFSCheckerDetectionDisabled(t *testing.T) {
 	if true {
 		t.Skipf("skipping %s", t.Name())
 	}
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		md     = newCheckerMD(t)
@@ -426,7 +426,7 @@ func TestFSCheckerEnablingMountpath(t *testing.T) {
 	if true {
 		t.Skipf("skipping %s", t.Name())
 	}
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		proxyURL   = tools.RandomProxyURL()
 		baseParams = tools.BaseAPIParams(proxyURL)
@@ -488,7 +488,7 @@ func TestFSCheckerTargetDisableAllMountpaths(t *testing.T) {
 	if true {
 		t.Skipf("skipping %s", t.Name())
 	}
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		target *meta.Snode
 
@@ -521,7 +521,7 @@ func TestFSCheckerTargetDisableAllMountpaths(t *testing.T) {
 	tlog.Logf("Wait for rebalance (triggered by %s leaving the cluster after having lost all mountpaths)\n",
 		target.StringEx())
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	tlog.Logf("Restoring target %s mountpaths\n", target.ID())
 	for _, mpath := range oldMpaths.Available {
@@ -534,7 +534,7 @@ func TestFSCheckerTargetDisableAllMountpaths(t *testing.T) {
 
 	tlog.Logf("Wait for rebalance (when target %s that has previously lost all mountpaths joins back)\n", target.StringEx())
 	args = xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	tools.WaitForResilvering(t, baseParams, nil)
 
@@ -601,7 +601,7 @@ func TestFSAddMountpathRestartNode(t *testing.T) {
 	}
 	tlog.Logf("Wait for rebalance\n")
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	// Check if the node has newly added mountpath
 	newMpaths, err = api.GetMountpaths(baseParams, target)
@@ -614,7 +614,7 @@ func TestFSDisableAllExceptOneMountpathRestartNode(t *testing.T) {
 	if true {
 		t.Skipf("skipping %s", t.Name())
 	}
-	tools.CheckSkip(t, tools.SkipTestArgs{
+	tools.CheckSkip(t, &tools.SkipTestArgs{
 		Long:               true,
 		MinMountpaths:      3,
 		MinTargets:         2,
@@ -678,7 +678,7 @@ func TestFSDisableAllExceptOneMountpathRestartNode(t *testing.T) {
 	tassert.Fatalf(t, smap.GetTarget(target.ID()) != nil, "removed target didn't rejoin")
 
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	// Check if the the mountpaths are disabled after restart.
 	newMpaths, err := api.GetMountpaths(baseParams, target)

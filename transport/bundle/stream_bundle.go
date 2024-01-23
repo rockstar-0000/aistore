@@ -1,7 +1,7 @@
 // Package bundle provides multi-streaming transport with the functionality
 // to dynamically (un)register receive endpoints, establish long-lived flows, and more.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package bundle
 
@@ -10,13 +10,13 @@ import (
 	"sync"
 	ratomic "sync/atomic"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/transport"
 )
 
@@ -37,11 +37,9 @@ type (
 
 type (
 	Streams struct {
-		sowner       meta.Sowner
 		client       transport.Client
 		smap         *meta.Smap // current Smap
 		smaplock     *sync.Mutex
-		lsnode       *meta.Snode             // this node
 		streams      ratomic.Pointer[bundle] // stream bundle
 		trname       string
 		network      string
@@ -57,7 +55,7 @@ type (
 		Extra        *transport.Extra // additional parameters
 		Net          string           // one of cmn.KnownNetworks, empty defaults to cmn.NetIntraData
 		Trname       string           // transport endpoint name
-		Ntype        int              // cluster.Target (0) by default
+		Ntype        int              // core.Target (0) by default
 		Multiplier   int              // so-many TCP connections per Rx endpoint, with round-robin
 		ManualResync bool             // auto-resync by default
 	}
@@ -79,16 +77,13 @@ var _ meta.Slistener = (*Streams)(nil)
 func (sb *Streams) UsePDU() bool   { return sb.extra.UsePDU() }
 func (sb *Streams) Trname() string { return sb.trname }
 
-func New(sowner meta.Sowner, lsnode *meta.Snode, cl transport.Client, args Args) (sb *Streams) {
+func New(cl transport.Client, args Args) (sb *Streams) {
 	if args.Net == "" {
 		args.Net = cmn.NetIntraData
 	}
-	listeners := sowner.Listeners()
 	sb = &Streams{
-		sowner:       sowner,
 		smap:         &meta.Smap{}, // empty on purpose (see Resync)
 		smaplock:     &sync.Mutex{},
-		lsnode:       lsnode,
 		client:       cl,
 		network:      args.Net,
 		trname:       args.Trname,
@@ -105,9 +100,9 @@ func New(sowner meta.Sowner, lsnode *meta.Snode, cl transport.Client, args Args)
 		sb.extra.Config = cmn.GCO.Get()
 	}
 	if !sb.extra.Compressed() {
-		sb.lid = fmt.Sprintf("sb[%s-%s-%s]", sb.lsnode.ID(), sb.network, sb.trname)
+		sb.lid = fmt.Sprintf("sb[%s-%s-%s]", core.T.SID(), sb.network, sb.trname)
 	} else {
-		sb.lid = fmt.Sprintf("sb[%s-%s-%s[%s]]", sb.lsnode.ID(), sb.network, sb.trname,
+		sb.lid = fmt.Sprintf("sb[%s-%s-%s[%s]]", core.T.SID(), sb.network, sb.trname,
 			cos.ToSizeIEC(int64(sb.extra.Config.Transport.LZ4BlockMaxSize), 0))
 	}
 
@@ -118,6 +113,7 @@ func New(sowner meta.Sowner, lsnode *meta.Snode, cl transport.Client, args Args)
 
 	// register this stream-bundle as Smap listener
 	if !sb.manualResync {
+		listeners := core.T.Sowner().Listeners()
 		listeners.Reg(sb)
 	}
 	return
@@ -132,7 +128,7 @@ func (sb *Streams) Close(gracefully bool) {
 		sb.apply(closeStop)
 	}
 	if !sb.manualResync {
-		listeners := sb.sowner.Listeners()
+		listeners := core.T.Sowner().Listeners()
 		listeners.Unreg(sb)
 	}
 }
@@ -143,15 +139,15 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 	debug.Assert(!transport.ReservedOpcode(obj.Hdr.Opcode))
 	streams := sb.get()
 	if len(streams) == 0 {
-		err = fmt.Errorf("no streams %s => .../%s", sb.lsnode, sb.trname)
+		err = fmt.Errorf("no streams %s => .../%s", core.T.Snode(), sb.trname)
 	} else if nodes != nil && len(nodes) == 0 {
-		err = fmt.Errorf("no destinations %s => .../%s", sb.lsnode, sb.trname)
+		err = fmt.Errorf("no destinations %s => .../%s", core.T.Snode(), sb.trname)
 	} else if obj.IsUnsized() && sb.extra.SizePDU == 0 {
 		err = fmt.Errorf("[%s] sending unsized object supported only with PDUs", obj.Hdr.Cname())
 	}
 
 	if err != nil {
-		if sb.extra.Config.FastV(5, cos.SmoduleTransport) {
+		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
 			nlog.Warningln(err)
 		}
 		// compare w/ transport doCmpl()
@@ -174,7 +170,7 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 		// In other words, for the N object replicas over the N bundled streams, the
 		// original reader will get reopened (N-1) times.
 		for sid, robin := range streams {
-			if sb.lsnode.ID() == sid {
+			if core.T.SID() == sid {
 				continue
 			}
 			if err = sb.sendOne(obj, roc, robin, idx, cnt); err != nil {
@@ -210,7 +206,7 @@ func _doCmpl(obj *transport.Obj, roc cos.ReadOpenCloser, err error) {
 		cos.Close(roc)
 	}
 	if obj.Callback != nil {
-		obj.Callback(obj.Hdr, roc, obj.CmplArg, err)
+		obj.Callback(&obj.Hdr, roc, obj.CmplArg, err)
 	}
 }
 
@@ -219,7 +215,7 @@ func (sb *Streams) Smap() *meta.Smap { return sb.smap }
 
 // keep streams to => (clustered nodes as per rxNodeType) in sync at all times
 func (sb *Streams) ListenSmapChanged() {
-	smap := sb.sowner.Get()
+	smap := core.T.Sowner().Get()
 	if smap.Version <= sb.smap.Version {
 		return
 	}
@@ -254,7 +250,7 @@ func (sb *Streams) get() (bun bundle) {
 
 // one obj, one stream
 func (sb *Streams) sendOne(obj *transport.Obj, roc cos.ReadOpenCloser, robin *robin, idx, cnt int) error {
-	obj.Hdr.SID = sb.lsnode.ID()
+	obj.Hdr.SID = core.T.SID()
 	one := obj
 	one.Reader = roc
 	if cnt == 1 {
@@ -316,7 +312,7 @@ func (sb *Streams) apply(action int) {
 // Resync streams asynchronously
 // is a slowpath; is called under lock; NOTE: calls stream.Stop()
 func (sb *Streams) Resync() {
-	smap := sb.sowner.Get()
+	smap := core.T.Sowner().Get()
 	if smap.Version <= sb.smap.Version {
 		debug.Assertf(smap.Version == sb.smap.Version, "%s[%s]: %s vs %s", sb.trname, sb.lid, smap, sb.smap)
 		return
@@ -325,16 +321,16 @@ func (sb *Streams) Resync() {
 	var (
 		oldm []meta.NodeMap
 		newm []meta.NodeMap
-		node = smap.GetNode(sb.lsnode.ID()) // upd flags
+		node = smap.GetNode(core.T.SID()) // upd flags
 	)
 	switch sb.rxNodeType {
-	case cluster.Targets:
+	case core.Targets:
 		oldm = []meta.NodeMap{sb.smap.Tmap}
 		newm = []meta.NodeMap{smap.Tmap}
-	case cluster.Proxies:
+	case core.Proxies:
 		oldm = []meta.NodeMap{sb.smap.Pmap}
 		newm = []meta.NodeMap{smap.Pmap}
-	case cluster.AllNodes:
+	case core.AllNodes:
 		oldm = []meta.NodeMap{sb.smap.Tmap, sb.smap.Pmap}
 		newm = []meta.NodeMap{smap.Tmap, smap.Pmap}
 	default:
@@ -342,10 +338,10 @@ func (sb *Streams) Resync() {
 	}
 	if node == nil {
 		// extremely unlikely
-		debug.Assert(false, sb.lsnode.ID())
+		debug.Assert(false, core.T.SID())
 		newm = []meta.NodeMap{make(meta.NodeMap)}
 	} else {
-		sb.lsnode.Flags = node.Flags
+		core.T.Snode().Flags = node.Flags
 	}
 
 	added, removed := mdiff(oldm, newm)
@@ -360,7 +356,7 @@ func (sb *Streams) Resync() {
 		nbundle[id] = robin
 	}
 	for id, si := range added {
-		if id == sb.lsnode.ID() {
+		if id == core.T.SID() {
 			continue
 		}
 		// not connecting to the peer that's in maintenance and already rebalanced-out
@@ -378,7 +374,7 @@ func (sb *Streams) Resync() {
 		nbundle[id] = nrobin
 	}
 	for id := range removed {
-		if id == sb.lsnode.ID() {
+		if id == core.T.SID() {
 			continue
 		}
 		orobin := nbundle[id]

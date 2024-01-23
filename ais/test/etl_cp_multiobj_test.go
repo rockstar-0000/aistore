@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -25,7 +25,7 @@ import (
 )
 
 func TestETLMultiObj(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeK8s})
 	tetl.CheckNoRunningETLContainers(t, baseParams)
 
 	const (
@@ -86,7 +86,7 @@ func TestETLMultiObj(t *testing.T) {
 		tlog.Logf("PUT %d objects (size %d) => %s/test/a-*\n", objCnt, objSize, m.bck)
 		for i := 0; i < objCnt; i++ {
 			r, _ := readers.NewRand(objSize, cksumType)
-			_, err := api.PutObject(api.PutArgs{
+			_, err := api.PutObject(&api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        m.bck,
 				ObjName:    fmt.Sprintf("test/a-%04d", i),
@@ -159,16 +159,16 @@ func testETLMultiObj(t *testing.T, etlName string, bckFrom, bckTo cmn.Bck, fileR
 
 	tlog.Logf("Starting multi-object ETL[%s] ...\n", etlName)
 	if evictRemoteSrc {
-		xid, err = api.ETLMultiObj(baseParams, bckFrom, tcomsg, apc.FltExists)
+		xid, err = api.ETLMultiObj(baseParams, bckFrom, &tcomsg, apc.FltExists)
 	} else {
-		xid, err = api.ETLMultiObj(baseParams, bckFrom, tcomsg)
+		xid, err = api.ETLMultiObj(baseParams, bckFrom, &tcomsg)
 	}
 	tassert.CheckFatal(t, err)
 
 	tlog.Logf("Running x-etl[%s]: %s => %s ...\n", xid, bckFrom.Cname(""), bckTo.Cname(""))
 
 	wargs := xact.ArgsMsg{ID: xid, Kind: apc.ActETLObjects}
-	err = api.WaitForXactionIdle(baseParams, wargs)
+	err = api.WaitForXactionIdle(baseParams, &wargs)
 	tassert.CheckFatal(t, err)
 
 	list, err := api.ListObjects(baseParams, bckTo, nil, api.ListArgs{})

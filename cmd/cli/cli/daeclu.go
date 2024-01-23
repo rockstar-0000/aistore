@@ -9,9 +9,9 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/urfave/cli"
 )
 
@@ -57,6 +57,18 @@ func cluDaeStatus(c *cli.Context, smap *meta.Smap, tstatusMap, pstatusMap teb.St
 	if sid == "" {
 		tableP := teb.NewDaeMapStatus(&body.Status, smap, apc.Proxy, units)
 		tableT := teb.NewDaeMapStatus(&body.Status, smap, apc.Target, units)
+
+		// total num disks - compare with teb._sumupMpathsAvail()
+	outer:
+		for _, node := range body.Status.Tmap {
+			tcdf := node.TargetCDF
+			for _, mi := range tcdf.Mountpaths {
+				body.NumDisks += len(mi.Disks)
+				if node.DeploymentType == apc.DeploymentDev {
+					break outer // simplifying HACK that'll be true most of the time
+				}
+			}
+		}
 
 		out := tableP.Template(false) + "\n"
 		out += tableT.Template(false) + "\n"

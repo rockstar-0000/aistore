@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	ratomic "sync/atomic"
 	"syscall"
@@ -75,6 +76,7 @@ type (
 		// capacity
 		cs        CapStatus
 		csExpires atomic.Int64
+		totalSize atomic.Uint64
 
 		mu sync.RWMutex
 
@@ -110,7 +112,7 @@ func NewMountpath(mpath string) (mi *Mountpath, err error) {
 		return
 	}
 	if err = cos.Stat(cleanMpath); err != nil {
-		return nil, cos.NewErrNotFound("mountpath %q", mpath)
+		return nil, cos.NewErrNotFound(nil, "mountpath "+mpath)
 	}
 	if fsInfo, err = makeFsInfo(cleanMpath); err != nil {
 		return
@@ -153,30 +155,6 @@ func (mi *Mountpath) String() string {
 func (mi *Mountpath) LomCache(idx int) *sync.Map { return mi.lomCaches.Get(idx) }
 
 func LcacheIdx(digest uint64) int { return int(digest & cos.MultiSyncMapMask) }
-
-func (mi *Mountpath) EvictLomCache() {
-	for idx := 0; idx < cos.MultiSyncMapCount; idx++ {
-		cache := mi.LomCache(idx)
-		cache.Range(func(key any, _ any) bool {
-			cache.Delete(key)
-			return true
-		})
-	}
-}
-
-func (mi *Mountpath) evictLomBucketCache(bck *cmn.Bck) {
-	for idx := 0; idx < cos.MultiSyncMapCount; idx++ {
-		cache := mi.LomCache(idx)
-		cache.Range(func(hkey any, _ any) bool {
-			uname := hkey.(string)
-			b, _ := cmn.ParseUname(uname)
-			if b.Equal(bck) {
-				cache.Delete(hkey)
-			}
-			return true
-		})
-	}
-}
 
 func (mi *Mountpath) IsIdle(config *cmn.Config) bool {
 	curr := mfs.ios.GetMpathUtil(mi.Path)
@@ -471,6 +449,34 @@ func (mi *Mountpath) ClearDD() {
 	cos.ClearfAtomic(&mi.flags, FlagWaitingDD)
 }
 
+func (mi *Mountpath) diskSize() (size uint64) {
+	numBlocks, _, blockSize, err := ios.GetFSStats(mi.Path)
+	if err != nil {
+		nlog.Errorln(mi.String(), "total disk size err:", err, strings.Repeat("<", 50))
+	} else {
+		size = numBlocks * uint64(blockSize)
+	}
+	return
+}
+
+// bucket and bucket+prefix on-disk sizing (uses 'du')
+func (mi *Mountpath) onDiskSize(bck *cmn.Bck, prefix string) (uint64, error) {
+	var (
+		dirPath          string
+		withNonDirPrefix bool
+	)
+	if prefix == "" {
+		dirPath = mi.MakePathBck(bck)
+	} else {
+		dirPath = filepath.Join(mi.MakePathCT(bck, ObjectType), prefix)
+		if cos.Stat(dirPath) != nil {
+			dirPath += "*"          // prefix is _not_ a directory
+			withNonDirPrefix = true // ok to fail matching
+		}
+	}
+	return ios.DirSizeOnDisk(dirPath, withNonDirPrefix)
+}
+
 //
 // MountedFS & MPI
 //
@@ -504,12 +510,6 @@ func FillDiskStats(m ios.AllDiskStats)         { mfs.ios.FillDiskStats(m) }
 
 // TestDisableValidation disables fsid checking and allows mountpaths without disks (testing-only)
 func TestDisableValidation() { mfs.allowSharedDisksAndNoDisks = true }
-
-// Returns number of available mountpaths
-func NumAvail() int {
-	avail := mfs.available.Load()
-	return len(*avail)
-}
 
 func putAvailMPI(available MPI) { mfs.available.Store(&available) }
 func putDisabMPI(disabled MPI)  { mfs.disabled.Store(&disabled) }
@@ -605,7 +605,7 @@ func AddMpath(mpath, tid string, cb func(), force bool) (mi *Mountpath, err erro
 	return
 }
 
-// (used only in tests - compare with EnableMpath below)
+// (unit tests only - compare with EnableMpath below)
 func Enable(mpath string) (enabledMpath *Mountpath, err error) {
 	var cleanMpath string
 	if cleanMpath, err = cmn.ValidateMpath(mpath); err != nil {
@@ -658,7 +658,7 @@ func enable(mpath, cleanMpath, tid string, config *cmn.Config) (enabledMpath *Mo
 			cos.ClearfAtomic(&mi.flags, FlagWaitingDD)
 			enabledMpath = mi
 			putAvailMPI(availableCopy)
-		} else if config.FastV(4, cos.SmoduleFS) {
+		} else if cmn.Rom.FastV(4, cos.SmoduleFS) {
 			nlog.Infof("%s: %s is already available, nothing to do", tid, mi)
 		}
 		return
@@ -831,6 +831,11 @@ func Disable(mpath string, cb ...func()) (disabledMpath *Mountpath, err error) {
 	return nil, cmn.NewErrMountpathNotFound(mpath, "" /*fqn*/, false /*disabled*/)
 }
 
+func NumAvail() int {
+	avail := GetAvail()
+	return len(avail)
+}
+
 // returns both available and disabled mountpaths (compare with GetAvail)
 func Get() (MPI, MPI) {
 	var (
@@ -866,6 +871,7 @@ func CreateBucket(bck *cmn.Bck, nilbmd bool) (errs []error) {
 	return
 }
 
+// NOTE: caller must make sure to evict LOM cache
 func DestroyBucket(op string, bck *cmn.Bck, bid uint64) (err error) {
 	var (
 		n     int
@@ -892,7 +898,6 @@ func DestroyBucket(op string, bck *cmn.Bck, bid uint64) (err error) {
 			}
 		}
 
-		mi.evictLomBucketCache(bck)
 		dir := mi.makeDelPathBck(bck)
 		if errMv := mi.MoveToDeleted(dir); errMv != nil {
 			nlog.Errorf("%s %q: failed to rm dir %q: %v", op, bck, dir, errMv)
@@ -1036,8 +1041,40 @@ func (mpi MPI) toSlice() []string {
 }
 
 //
-// capacity management
+// capacity management/reporting
 //
+
+// total disk size
+func ComputeDiskSize() {
+	var (
+		totalSize uint64
+		avail     = GetAvail()
+	)
+	for _, mi := range avail {
+		totalSize += mi.diskSize()
+	}
+	mfs.totalSize.Store(totalSize)
+}
+
+func GetDiskSize() uint64 { return mfs.totalSize.Load() }
+
+// bucket and bucket+prefix on-disk sizing
+func OnDiskSize(bck *cmn.Bck, prefix string) (size uint64) {
+	avail := GetAvail()
+	for _, mi := range avail {
+		sz, err := mi.onDiskSize(bck, prefix)
+		if err != nil {
+			if cmn.Rom.FastV(4, cos.SmoduleFS) {
+				nlog.Warningln("failed to 'du':", err, "["+mi.String(), bck.String(), prefix+"]")
+			}
+			return 0
+		}
+		size += sz
+	}
+	return
+}
+
+// cap status: get, refresh, periodic
 
 func Cap() (cs CapStatus) {
 	// config

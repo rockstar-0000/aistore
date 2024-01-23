@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tlog"
@@ -91,6 +93,11 @@ func TestBundle(t *testing.T) {
 		}
 		tests = append(tests, testsLong...)
 	}
+
+	tMock := mock.NewTarget(nil)
+	tMock.SO = &sowner{}
+	core.T = tMock
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			testBundle(t, test.nvs)
@@ -106,10 +113,17 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 		network      = cmn.NetIntraData
 		trname       = "bundle" + nvs["block"]
 		tss          = make([]*httptest.Server, 0, 32)
-		lsnode       = meta.Snode{DaeID: "local"}
 	)
+
+	// init local target
+	tMock := mock.NewTarget(nil)
+	tMock.SO = &sowner{}
+	core.T = tMock
+	lsnode := tMock.Snode()
+
+	// add target nodes
 	smap.Tmap = make(meta.NodeMap, 100)
-	smap.Tmap[lsnode.ID()] = &lsnode
+	smap.Tmap[lsnode.ID()] = lsnode
 	for i := 0; i < 10; i++ {
 		ts := httptest.NewServer(objmux)
 		tss = append(tss, ts)
@@ -123,7 +137,7 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 	}()
 	smap.Version = 1
 
-	receive := func(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		if err != nil && !cos.IsEOF(err) {
 			tassert.CheckFatal(t, err)
 		}
@@ -131,7 +145,7 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 		cos.Assert(written == hdr.ObjAttrs.Size || hdr.IsUnsized())
 		return nil
 	}
-	callback := func(_ transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
+	callback := func(*transport.ObjHdr, io.ReadCloser, any, error) {
 		numCompleted.Inc()
 	}
 
@@ -142,7 +156,6 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 	var (
 		config         = cmn.GCO.Get()
 		httpclient     = transport.NewIntraDataClient()
-		sowner         = &sowner{}
 		random         = newRand(mono.NanoTime())
 		wbuf, slab     = mmsa.Alloc()
 		extra          = &transport.Extra{Compression: nvs["compression"]}
@@ -166,7 +179,7 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 	}
 	extra.Config = config
 	_, _ = random.Read(wbuf)
-	sb := bundle.New(sowner, &lsnode, httpclient,
+	sb := bundle.New(httpclient,
 		bundle.Args{Net: network, Trname: trname, Multiplier: multiplier, Extra: extra})
 	var numGs int64 = 6
 	if testing.Short() {

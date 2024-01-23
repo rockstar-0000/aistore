@@ -50,7 +50,7 @@ Usage examples:
 - ais config cluster checksum.type=xxhash
 - ais config cluster checksum.type=md5 checksum.validate_warm_get=true
 - ais config cluster checksum --json
-For more usage examples, see ` + cmn.GitHubHome + `/blob/master/docs/cli/config.md
+For more usage examples, see ` + cmn.GitHubHome + `/blob/main/docs/cli/config.md
 `
 
 const examplesNodeSetCfg = `
@@ -58,7 +58,7 @@ Usage examples:
 - ais config node [NODE_ID] inherited log.level=4
 - ais config node [NODE_ID] inherited log
 - ais config node [NODE_ID] inherited disk.disk_util_high_wm=93
-For more usage examples, see ` + cmn.GitHubHome + `/blob/master/docs/cli/config.md
+For more usage examples, see ` + cmn.GitHubHome + `/blob/main/docs/cli/config.md
 `
 
 const localNodeCfgErr = `All nodes in a cluster inherit global (cluster) configuration,
@@ -156,6 +156,9 @@ func setCluConfigHandler(c *cli.Context) error {
 	if len(kvs) == 0 {
 		return showClusterConfigHandler(c)
 	}
+	if len(kvs) == 1 && kvs[0] == confLogModules {
+		kvs[0] = "log"
+	}
 	if nvs, err = makePairs(kvs); err != nil {
 		if _, ok := err.(*errInvalidNVpair); ok {
 			if err = showClusterConfigHandler(c); err != nil {
@@ -209,7 +212,7 @@ func setCluConfigHandler(c *cli.Context) error {
 show:
 	var listed = make(cos.StrKVs)
 	for what := range nvs {
-		section := strings.Split(what, ".")[0]
+		section := strings.Split(what, cmn.IterFieldNameSepa)[0]
 		if listed.Contains(section) {
 			continue
 		}
@@ -258,7 +261,7 @@ func isFmtJSON(nvs cos.StrKVs) (val string, ans bool, err error) {
 
 // TODO: remove switch w/ assorted hardcoded sections - use reflection
 func setcfg(c *cli.Context, nvs cos.StrKVs) error {
-	toUpdate := &cmn.ConfigToUpdate{}
+	toUpdate := &cmn.ConfigToSet{}
 	for k, v := range nvs {
 		switch {
 		case k == "backend" || strings.HasPrefix(k, "backend."):
@@ -433,7 +436,10 @@ func showCfgCLI(c *cli.Context) (err error) {
 	sort.Slice(flat, func(i, j int) bool {
 		return flat[i].Name < flat[j].Name
 	})
-	return teb.Print(flat, teb.FlatTmpl)
+	if flagIsSet(c, noHeaderFlag) {
+		return teb.Print(flat, teb.PropValTmplNoHdr)
+	}
+	return teb.Print(flat, teb.PropValTmpl)
 }
 
 func setCfgCLI(c *cli.Context) (err error) {

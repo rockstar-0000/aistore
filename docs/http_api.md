@@ -81,7 +81,7 @@ and more.
 
 For the most recently updated **URL paths**, please see:
 
-* [`api/apc/urlpaths.go`](https://github.com/NVIDIA/aistore/blob/master/api/apc/urlpaths.go)
+* [`api/apc/urlpaths.go`](https://github.com/NVIDIA/aistore/blob/main/api/apc/urlpaths.go)
 
 5. **URL query**, e. g., `?what=config`.
 
@@ -97,8 +97,8 @@ In particular, all API requests that operate on a bucket carry the bucket's spec
 
 All supported query parameters and all HTTP headers are enumerated and commented in the following two sources, respectively:
 
-* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/master/api/apc/query.go)
-* [REST API Headers](https://github.com/NVIDIA/aistore/blob/master/api/apc/headers.go)
+* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/main/api/apc/query.go)
+* [REST API Headers](https://github.com/NVIDIA/aistore/blob/main/api/apc/headers.go)
 
 ## Easy URL
 
@@ -149,15 +149,15 @@ $ curl -s -L -X GET 'http://aistore/gs/my-google-bucket' | jq
 
 The entire AIStore RESTful API is substantial in size. It is also constantly growing, which is why this section is structured as several groups of related APIs.
 
-In addition, the rightmost column references AIS [api](https://github.com/NVIDIA/aistore/tree/master/api) package and the specific Go-based API in it that performs the same **operation**. Needless to say - simply because we use it ourselves across a variety of Go-based clients and apps, the [api](https://github.com/NVIDIA/aistore/tree/master/api) package will always contain the most recently updated version of the API.
+In addition, the rightmost column references AIS [api](https://github.com/NVIDIA/aistore/tree/main/api) package and the specific Go-based API in it that performs the same **operation**. Needless to say - simply because we use it ourselves across a variety of Go-based clients and apps, the [api](https://github.com/NVIDIA/aistore/tree/main/api) package will always contain the most recently updated version of the API.
 
-In other words, AIS [api](https://github.com/NVIDIA/aistore/tree/master/api) is always current and can be used to lookup the most recently updated version of the RESTful API.
+In other words, AIS [api](https://github.com/NVIDIA/aistore/tree/main/api) is always current and can be used to lookup the most recently updated version of the RESTful API.
 
 ### Cluster Operations
 
 This and the next section reference a variety of URL paths (e.g., `/v1/cluster`). For the most recently updated list of all URLs, see:
 
-* [`api/apc/urlpaths.go`](https://github.com/NVIDIA/aistore/blob/master/api/apc/urlpaths.go)
+* [`api/apc/urlpaths.go`](https://github.com/NVIDIA/aistore/blob/main/api/apc/urlpaths.go)
 
 | Operation | HTTP action | Example | Go API |
 |--- | --- | ---|--- |
@@ -246,8 +246,8 @@ Unless cluster rebalancing was previously interrupted, there's usually a few sec
 
 To the (fully expected) question of where the `prr` query comes from - all supported query parameters and all HTTP headers are enumerated and commented in the following two sources:
 
-* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/master/api/apc/query.go)
-* [REST API Headers](https://github.com/NVIDIA/aistore/blob/master/api/apc/headers.go)
+* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/main/api/apc/query.go)
+* [REST API Headers](https://github.com/NVIDIA/aistore/blob/main/api/apc/headers.go)
 
 ### Mountpaths and Disks
 
@@ -366,7 +366,7 @@ Remote buckets (such as, for instance, `s3://jonh-s3-bucket` above) may not be p
 
 Further, all supported query parameters are enumerated and commented in the following source:
 
-* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/master/api/apc/query.go)
+* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/main/api/apc/query.go)
 
 #### Examples 3.1 and 3.2. Listing buckets in remote namespaces
 
@@ -615,7 +615,7 @@ README.md        9.97KiB         a56d5e9f313480b7bbe41256012fb7b0        1658425
 
 A typical query is a GET request that includes `?what=<...>` (HTTP) query. For the most recently updated `what=` enumeration, see:
 
-* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/master/api/apc/query.go)
+* [REST API Query parameters](https://github.com/NVIDIA/aistore/blob/main/api/apc/query.go)
 
 Notice that many cluster-level operations can be designated to both the entire cluster or any specific node. For instance, for the current cluster map we can use `GET /v1/cluster?what=smap` and `GET /v1/daemon?what=smap`. This is because each node in the cluster would have a replica (of the map), and it also may be useful to find out the current cluster map of the node that's joining right now, and so on.
 
@@ -669,15 +669,16 @@ Date: Tue, 08 Nov 2022 17:03:03 GMT
 Content-Type: text/plain; charset=utf-8
 Transfer-Encoding: chunked
 
-Started up at 2022/11/08 11:33:54, host u2204, go1.19.3 for linux/amd64
-I 11:33:54.537821 config.go:1774 log.dir: "/tmp/ais/1/log"; l4.proto: tcp; pub port: 8081; verbosity: 3
-I 11:33:54.537990 config.go:1776 config: "/root/.ais1/.ais.conf"; stats_time: 10s; authentication: false; backends: [ais aws gcp]
-I 11:33:54.538001 daemon.go:177 Version 3.12-rc1.c5a523de4, build time 2022-11-08T11:33:50-0500, debug true
-I 11:33:54.538005 daemon.go:185 CPUs(16, runtime=16)
-I 11:33:54.538165 util.go:39 Verifying type of deployment (HOSTNAME: "", K8S_NODE_NAME: "")
-I 11:33:54.538169 util.go:46 Couldn't initiate a K8s client, assuming non-Kubernetes deployment
+Started up at 2023/11/08 02:34:35, host ais-target-13, go1.21.4 for linux/amd64
+W 02:34:35.701629 config:1238 control and data share one intra-cluster network (ais-target-13.ais.svc.cluster.local)
+I 02:34:35.701785 config:1755 log.dir: "/var/log/ais"; l4.proto: tcp; pub port: 51081; verbosity: 3
+I 02:34:35.701791 config:1757 config: "/etc/ais/.ais.conf"; stats_time: 10s; authentication: false; backends: [aws]
+I 02:34:35.701811 daemon:195 Version 3.21.1.4ce0e0b, build time 2023-11-08T00:05:16+0000, debug false, CPUs(256, runtime=256), containerized
+I 02:34:35.702060 init:42 Checking (HOSTNAME: "ais-target-13")
+I 02:34:35.721086 init:60 K8s spec: NodeName 10.0.140.13 Hostname ais-target-13 HostNetwork false
+
 ...
-I 11:33:55.564338 htrun.go:1637 t[CJet8081]: joined cluster via http://127.0.0.1:9080
+I 02:34:54.772574 htrun:1916 t[DfooZbarT] via primary health: cluster startup Ok, Smap v34[t=10, p=10]
 ...
 ```
 

@@ -1,15 +1,16 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
 import (
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/fs"
 )
 
 const (
@@ -23,8 +24,8 @@ const (
 
 type (
 	DiffResolverCtx interface {
-		CompareObjects(*cluster.LOM, *DstElement) (bool, error)
-		IsObjFromRemote(*cluster.LOM) (bool, error)
+		CompareObjects(*core.LOM, *DstElement) (bool, error)
+		IsObjFromRemote(*core.LOM) (bool, error)
 	}
 
 	defaultDiffResolverCtx struct{}
@@ -33,7 +34,7 @@ type (
 	// of objects. The streams are expected to be in sorted order.
 	DiffResolver struct {
 		ctx      DiffResolverCtx
-		srcCh    chan *cluster.LOM
+		srcCh    chan *core.LOM
 		dstCh    chan *DstElement
 		resultCh chan DiffResolverResult
 		err      cos.Errs
@@ -56,99 +57,102 @@ type (
 	}
 
 	DiffResolverResult struct {
-		Action uint8
-		Src    *cluster.LOM
-		Dst    *DstElement
 		Err    error
+		Src    *core.LOM
+		Dst    *DstElement
+		Action uint8
 	}
 )
 
+//////////////////
+// DiffResolver //
+//////////////////
+
+// TODO: configurable burst size of the channels, plus `chanFull` check
 func NewDiffResolver(ctx DiffResolverCtx) *DiffResolver {
-	if ctx == nil {
-		ctx = &defaultDiffResolverCtx{}
-	}
 	return &DiffResolver{
 		ctx:      ctx,
-		srcCh:    make(chan *cluster.LOM, 1000),
-		dstCh:    make(chan *DstElement, 1000),
-		resultCh: make(chan DiffResolverResult, 1000),
+		srcCh:    make(chan *core.LOM, 128),
+		dstCh:    make(chan *DstElement, 128),
+		resultCh: make(chan DiffResolverResult, 128),
 	}
 }
 
 func (dr *DiffResolver) Start() {
-	go func() {
-		defer close(dr.resultCh)
-		src, srcOk := <-dr.srcCh
-		dst, dstOk := <-dr.dstCh
-		for {
-			if !srcOk && !dstOk {
+	defer close(dr.resultCh)
+	src, srcOk := <-dr.srcCh
+	dst, dstOk := <-dr.dstCh
+	for {
+		if !srcOk && !dstOk {
+			dr.resultCh <- DiffResolverResult{
+				Action: DiffResolverEOF,
+			}
+			return
+		}
+
+		switch {
+		case !srcOk || (dstOk && src.ObjName > dst.ObjName):
+			dr.resultCh <- DiffResolverResult{
+				Action: DiffResolverRecv,
+				Dst:    dst,
+			}
+			dst, dstOk = <-dr.dstCh
+		case !dstOk || (srcOk && src.ObjName < dst.ObjName):
+			remote, err := dr.ctx.IsObjFromRemote(src)
+			if err != nil {
 				dr.resultCh <- DiffResolverResult{
-					Action: DiffResolverEOF,
+					Action: DiffResolverErr,
+					Src:    src,
+					Dst:    dst,
+					Err:    err,
 				}
 				return
-			} else if !srcOk || (dstOk && src.ObjName > dst.ObjName) {
+			}
+			if remote {
+				debug.Assert(!dstOk || dst.Link == "") // destination must be remote as well
+				dr.resultCh <- DiffResolverResult{
+					Action: DiffResolverDelete,
+					Src:    src,
+				}
+			} else {
+				dr.resultCh <- DiffResolverResult{
+					Action: DiffResolverSend,
+					Src:    src,
+				}
+			}
+			src, srcOk = <-dr.srcCh
+		default: /* s.ObjName == d.ObjName */
+			equal, err := dr.ctx.CompareObjects(src, dst)
+			if err != nil {
+				dr.resultCh <- DiffResolverResult{
+					Action: DiffResolverErr,
+					Src:    src,
+					Dst:    dst,
+					Err:    err,
+				}
+				return
+			}
+			if equal {
+				dr.resultCh <- DiffResolverResult{
+					Action: DiffResolverSkip,
+					Src:    src,
+					Dst:    dst,
+				}
+			} else {
 				dr.resultCh <- DiffResolverResult{
 					Action: DiffResolverRecv,
 					Dst:    dst,
 				}
-				dst, dstOk = <-dr.dstCh
-			} else if !dstOk || (srcOk && src.ObjName < dst.ObjName) {
-				remote, err := dr.ctx.IsObjFromRemote(src)
-				if err != nil {
-					dr.resultCh <- DiffResolverResult{
-						Action: DiffResolverErr,
-						Src:    src,
-						Dst:    dst,
-						Err:    err,
-					}
-					return
-				}
-				if remote {
-					debug.Assert(!dstOk || dst.Link == "") // destination must be remote as well
-					dr.resultCh <- DiffResolverResult{
-						Action: DiffResolverDelete,
-						Src:    src,
-					}
-				} else {
-					dr.resultCh <- DiffResolverResult{
-						Action: DiffResolverSend,
-						Src:    src,
-					}
-				}
-				src, srcOk = <-dr.srcCh
-			} else { /* s.ObjName == d.ObjName */
-				equal, err := dr.ctx.CompareObjects(src, dst)
-				if err != nil {
-					dr.resultCh <- DiffResolverResult{
-						Action: DiffResolverErr,
-						Src:    src,
-						Dst:    dst,
-						Err:    err,
-					}
-					return
-				}
-				if equal {
-					dr.resultCh <- DiffResolverResult{
-						Action: DiffResolverSkip,
-						Src:    src,
-						Dst:    dst,
-					}
-				} else {
-					dr.resultCh <- DiffResolverResult{
-						Action: DiffResolverRecv,
-						Dst:    dst,
-					}
-				}
-				src, srcOk = <-dr.srcCh
-				dst, dstOk = <-dr.dstCh
 			}
+			src, srcOk = <-dr.srcCh
+			dst, dstOk = <-dr.dstCh
 		}
-	}()
+	}
 }
 
 func (dr *DiffResolver) PushSrc(v any) {
 	switch x := v.(type) {
-	case *cluster.LOM:
+	case *core.LOM:
 		dr.srcCh <- x
 	default:
 		debug.FailTypeCast(v)
@@ -193,9 +197,94 @@ func (dr *DiffResolver) Stop()           { dr.stopped.Store(true) }
 func (dr *DiffResolver) Stopped() bool   { return dr.stopped.Load() }
 func (dr *DiffResolver) Abort(err error) { dr.err.Add(err) }
 
-func (*defaultDiffResolverCtx) CompareObjects(src *cluster.LOM, dst *DstElement) (bool, error) {
-	if err := src.Load(true /*cache it*/, false /*locked*/); err != nil {
-		if cmn.IsObjNotExist(err) {
+func (dr *DiffResolver) walk(job jobif) {
+	defer dr.CloseSrc()
+	opts := &fs.WalkBckOpts{
+		WalkOpts: fs.WalkOpts{CTs: []string{fs.ObjectType}, Sorted: true},
+	}
+	opts.WalkOpts.Bck.Copy(job.Bck())
+	opts.Callback = func(fqn string, _ fs.DirEntry) error { return dr.cb(fqn, job) }
+
+	err := fs.WalkBck(opts)
+	if err != nil && !cmn.IsErrAborted(err) {
+		dr.Abort(err)
+	}
+}
+
+func (dr *DiffResolver) cb(fqn string, job jobif) error {
+	if dr.Stopped() {
+		return cmn.NewErrAborted(job.String(), "diff-resolver stopped", nil)
+	}
+	lom := &core.LOM{}
+	if err := lom.InitFQN(fqn, job.Bck()); err != nil {
+		return err
+	}
+	if job.checkObj(lom.ObjName) {
+		dr.PushSrc(lom)
+	}
+	return nil
+}
+
+func (dr *DiffResolver) push(job jobif, d *dispatcher) {
+	defer func() {
+		dr.CloseDst()
+		if !job.Sync() {
+			dr.CloseSrc()
+		}
+	}()
+
+	for {
+		objs, ok, err := job.genNext()
+		if err != nil {
+			dr.Abort(err)
+			return
+		}
+		if !ok || dr.Stopped() {
+			return
+		}
+		for _, obj := range objs {
+			if d.checkAborted() {
+				err := cmn.NewErrAborted(job.String(), "", nil)
+				dr.Abort(err)
+				return
+			}
+			if d.checkAbortedJob(job) {
+				dr.Stop()
+				return
+			}
+			if !job.Sync() {
+				// When it is not a sync job, push LOM for a given object
+				// because we need to check if it exists.
+				lom := &core.LOM{ObjName: obj.objName}
+				if err := lom.InitBck(job.Bck()); err != nil {
+					dr.Abort(err)
+					return
+				}
+				dr.PushSrc(lom)
+			}
+			if obj.link != "" {
+				dr.PushDst(&WebResource{
+					ObjName: obj.objName,
+					Link:    obj.link,
+				})
+			} else {
+				dr.PushDst(&BackendResource{
+					ObjName: obj.objName,
+				})
+			}
+		}
+	}
+}
+
+////////////////////////////
+// defaultDiffResolverCtx //
+////////////////////////////
+
+func (*defaultDiffResolverCtx) CompareObjects(src *core.LOM, dst *DstElement) (bool, error) {
+	src.Lock(false)
+	defer src.Unlock(false)
+	if err := src.Load(true /*cache it*/, true /*locked*/); err != nil {
+		if cos.IsNotExist(err, 0) {
 			return false, nil
 		}
 		return false, err
@@ -203,9 +292,9 @@ func (*defaultDiffResolverCtx) CompareObjects(src *cluster.LOM, dst *DstElement)
 	return CompareObjects(src, dst)
 }
 
-func (*defaultDiffResolverCtx) IsObjFromRemote(src *cluster.LOM) (bool, error) {
+func (*defaultDiffResolverCtx) IsObjFromRemote(src *core.LOM) (bool, error) {
 	if err := src.Load(true /*cache it*/, false /*locked*/); err != nil {
-		if cmn.IsObjNotExist(err) {
+		if cos.IsNotExist(err, 0) {
 			return false, nil
 		}
 		return false, err

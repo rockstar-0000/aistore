@@ -16,15 +16,16 @@ redirect_from:
 
 AIStore Python SDK is a growing set of client-side objects and methods to access and utilize AIS clusters.
 
-> For PyTorch integration and usage examples, please refer to [AIS Python SDK](https://pypi.org/project/aistore) available via Python Package Index (PyPI), or see [https://github.com/NVIDIA/aistore/tree/master/python/aistore](https://github.com/NVIDIA/aistore/tree/master/python/aistore).
+> For PyTorch integration and usage examples, please refer to [AIS Python SDK](https://pypi.org/project/aistore) available via Python Package Index (PyPI), or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://github.com/NVIDIA/aistore/tree/main/python/aistore).
 
 endef
 export PREFIX
 BOTO_UNIT_TEST_COUNT := $(shell ls -1 tests/unit/botocore_patch/test*py | wc -l)
 export AWS_SESSION_TOKEN := testing
-export AWS_DEFAULT_REGION := us-east-1
-export AWS_SECRET_ACCESS_KEY := testing
-export AWS_ACCESS_KEY_ID := testing
+# will be fetched from CI pipeline secrets
+# export AWS_DEFAULT_REGION := us-east-1
+# export AWS_SECRET_ACCESS_KEY := testing
+# export AWS_ACCESS_KEY_ID := testing
 export AWS_SECURITY_TOKEN := testing
 BOTO_VERSION_ARGS := ""
 ifdef BOTO3_VERSION

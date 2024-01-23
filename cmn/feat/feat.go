@@ -1,6 +1,6 @@
 // Package feat: global runtime-configurable feature flags
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package feat
 
@@ -19,7 +19,6 @@ const FeaturesPropName = "features"
 
 const (
 	EnforceIntraClusterAccess = Flags(1 << iota)
-	DontHeadRemote            // see also api/apc/lsmsg.go, and in particular `LsDontHeadRemote`
 	SkipVC                    // skip loading existing object's metadata, Version and Checksum (VC) in particular
 	DontAutoDetectFshare      // do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 	ProvideS3APIviaRoot       // handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)
@@ -28,11 +27,11 @@ const (
 	LZ4FrameChecksum          // checksum lz4 frames (default: don't)
 	DontAllowPassingFQNtoETL  // do not allow passing fully-qualified name of a locally stored object to (local) ETL containers
 	IgnoreLimitedCoexistence  // run in presence of "limited coexistence" type conflicts (same as e.g. CopyBckMsg.Force but globally)
+	DisableFastColdGET        // use regular datapath to execute cold-GET operations
 )
 
 var All = []string{
 	"Enforce-IntraCluster-Access",
-	"Do-not-HEAD-Remote-Bucket",
 	"Skip-Loading-VersionChecksum-MD",
 	"Do-not-Auto-Detect-FileShare",
 	"Provide-S3-API-via-Root",
@@ -41,6 +40,7 @@ var All = []string{
 	"LZ4-Frame-Checksum",
 	"Dont-Allow-Passing-FQN-to-ETL",
 	"Ignore-LimitedCoexistence-Conflicts",
+	"Disable-Fast-Cold-GET",
 }
 
 func (f Flags) IsSet(flag Flags) bool { return cos.BitFlags(f).IsSet(cos.BitFlags(flag)) }

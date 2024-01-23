@@ -6,6 +6,8 @@ package ais
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	rdebug "runtime/debug"
 	"strings"
 	"sync"
@@ -21,12 +24,11 @@ import (
 
 	"github.com/NVIDIA/aistore/3rdparty/golang/mux"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/xact/xreg"
@@ -215,8 +217,10 @@ type (
 	}
 
 	nlogWriter struct{}
+)
 
-	// error types
+// error types
+type (
 	errTgtBmdUUIDDiffer struct{ detail string } // BMD & its uuid
 	errPrxBmdUUIDDiffer struct{ detail string }
 	errBmdUUIDSplit     struct{ detail string }
@@ -243,20 +247,6 @@ type (
 	}
 	errNoUnregister struct {
 		action string
-	}
-	apiRequest struct {
-		bck *meta.Bck // out: initialized bucket
-
-		// URL query: the conventional/slow and
-		// the fast alternative tailored exclusively for the datapath (either/or)
-		dpq   *dpq
-		query url.Values
-
-		prefix []string // in: URL must start with these items
-		items  []string // out: URL items after the prefix
-
-		after  int // in: the number of items after the prefix
-		bckIdx int // in: ordinal number of bucket in URL (some paths starts with extra items: EC & ETL)
 	}
 )
 
@@ -482,7 +472,7 @@ func (c cresSM) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jr
 func (cresND) newV() any                              { return &meta.Snode{} }
 func (c cresND) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
 
-func (cresBA) newV() any                              { return &cluster.Remotes{} }
+func (cresBA) newV() any                              { return &meta.RemAisVec{} }
 func (c cresBA) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
 
 func (cresEI) newV() any                              { return &etl.InfoList{} }
@@ -576,27 +566,31 @@ func (server *netServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go transfer(clientConn, destConn)
 }
 
-func (server *netServer) listen(addr string, logger *log.Logger) (err error) {
+func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Config, config *cmn.Config) (err error) {
 	var (
 		httpHandler = server.muxers
-		config      = cmn.GCO.Get()
 		tag         = "HTTP"
 		retried     bool
 	)
 	server.Lock()
 	server.s = &http.Server{
-		Addr:     addr,
-		Handler:  httpHandler,
-		ErrorLog: logger,
+		Addr:              addr,
+		Handler:           httpHandler,
+		ErrorLog:          logger,
+		ReadHeaderTimeout: apc.ReadHeaderTimeout,
+	}
+	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
+		server.s.ReadHeaderTimeout = timeout
 	}
 	if server.sndRcvBufSize > 0 && !config.Net.HTTP.UseHTTPS {
 		server.s.ConnState = server.connStateListener // setsockopt; see also cmn.NewTransport
 	}
+	server.s.TLSConfig = tlsConf
 	server.Unlock()
 retry:
 	if config.Net.HTTP.UseHTTPS {
 		tag = "HTTPS"
-		err = server.s.ListenAndServeTLS(config.Net.HTTP.Certificate, config.Net.HTTP.Key)
+		err = server.s.ListenAndServeTLS(config.Net.HTTP.Certificate, config.Net.HTTP.CertKey)
 	} else {
 		err = server.s.ListenAndServe()
 	}
@@ -613,6 +607,25 @@ retry:
 	return
 }
 
+func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
+	var (
+		pool       *x509.CertPool
+		caCert     []byte
+		clientAuth = tls.ClientAuthType(conf.ClientAuthTLS)
+	)
+	if clientAuth > tls.RequestClientCert {
+		if caCert, err = os.ReadFile(conf.ClientCA); err != nil {
+			return
+		}
+		pool = x509.NewCertPool()
+		if ok := pool.AppendCertsFromPEM(caCert); !ok {
+			return nil, fmt.Errorf("tls: failed to append CA certs from PEM: %q", conf.ClientCA)
+		}
+	}
+	tlsConf = &tls.Config{ServerName: conf.ServerNameTLS, ClientAuth: clientAuth, ClientCAs: pool}
+	return
+}
+
 func (server *netServer) connStateListener(c net.Conn, cs http.ConnState) {
 	if cs != http.StateNew {
 		return
@@ -624,16 +637,15 @@ func (server *netServer) connStateListener(c net.Conn, cs http.ConnState) {
 	rawconn.Control(args.ConnControl(rawconn))
 }
 
-func (server *netServer) shutdown() {
+func (server *netServer) shutdown(config *cmn.Config) {
 	server.Lock()
 	defer server.Unlock()
 	if server.s == nil {
 		return
 	}
-	config := cmn.GCO.Get()
 	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout.MaxHostBusy.D())
 	if err := server.s.Shutdown(ctx); err != nil {
-		nlog.Infof("Stopped server, err: %v", err)
+		nlog.Infoln("http server shutdown err:", err)
 	}
 	cancel()
 }
@@ -689,10 +701,12 @@ func (cii *clusterInfo) fill(h *htrun) {
 func (cii *clusterInfo) fillSmap(smap *smapX) {
 	cii.Smap.Version = smap.version()
 	cii.Smap.UUID = smap.UUID
-	cii.Smap.Primary.CtrlURL = smap.Primary.URL(cmn.NetIntraControl)
-	cii.Smap.Primary.PubURL = smap.Primary.URL(cmn.NetPublic)
-	cii.Smap.Primary.ID = smap.Primary.ID()
-	cii.Flags.VoteInProgress = voteInProgress() != nil
+	if smap.Primary != nil {
+		cii.Smap.Primary.CtrlURL = smap.Primary.URL(cmn.NetIntraControl)
+		cii.Smap.Primary.PubURL = smap.Primary.URL(cmn.NetPublic)
+		cii.Smap.Primary.ID = smap.Primary.ID()
+		cii.Flags.VoteInProgress = voteInProgress() != nil
+	}
 }
 
 func (cii *clusterInfo) smapEqual(other *clusterInfo) (ok bool) {
@@ -756,9 +770,25 @@ func extractCii(body []byte, smap *smapX, self, si *meta.Snode) *clusterInfo {
 	return &cii
 }
 
-// //////////////
+////////////////
 // apiRequest //
-// //////////////
+////////////////
+
+type apiRequest struct {
+	bck *meta.Bck // out: initialized bucket
+
+	// URL query: the conventional/slow and
+	// the fast alternative tailored exclusively for the datapath (either/or)
+	dpq   *dpq
+	query url.Values
+
+	prefix []string // in: URL must start with these items
+	items  []string // out: URL items after the prefix
+
+	after  int // in: the number of items after the prefix
+	bckIdx int // in: ordinal number of bucket in URL (some paths starts with extra items: EC & ETL)
+}
+
 var (
 	apiReqPool sync.Pool
 	apireq0    apiRequest
@@ -838,7 +868,7 @@ func newBckFromQuname(query url.Values, required bool) (*meta.Bck, error) {
 	return meta.CloneBck(&bck), nil
 }
 
-func _reMirror(bprops, nprops *cmn.BucketProps) bool {
+func _reMirror(bprops, nprops *cmn.Bprops) bool {
 	if !bprops.Mirror.Enabled && nprops.Mirror.Enabled {
 		return true
 	}
@@ -848,7 +878,7 @@ func _reMirror(bprops, nprops *cmn.BucketProps) bool {
 	return false
 }
 
-func _reEC(bprops, nprops *cmn.BucketProps, bck *meta.Bck, smap *smapX) (targetCnt int, yes bool) {
+func _reEC(bprops, nprops *cmn.Bprops, bck *meta.Bck, smap *smapX) (targetCnt int, yes bool) {
 	if !nprops.EC.Enabled {
 		if bprops.EC.Enabled {
 			// abort running ec-encode xaction, if exists

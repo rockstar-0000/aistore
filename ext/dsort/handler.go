@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -13,12 +13,12 @@ import (
 	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
@@ -39,7 +39,7 @@ type response struct {
 ///// PROXY //////
 //////////////////
 
-var psi cluster.Node
+var psi core.Node
 
 // POST /v1/sort
 func PstartHandler(w http.ResponseWriter, r *http.Request, parsc *ParsedReq) {
@@ -54,7 +54,7 @@ func PstartHandler(w http.ResponseWriter, r *http.Request, parsc *ParsedReq) {
 	// This would also be helpful for Downloader (in the middle of downloading
 	// large file the bucket can be easily deleted).
 
-	pars.DSorterType, err = dsorterType(pars)
+	pars.DsorterType, err = dsorterType(pars)
 	if err != nil {
 		cmn.WriteErr(w, r, err)
 		return
@@ -84,8 +84,7 @@ func PstartHandler(w http.ResponseWriter, r *http.Request, parsc *ParsedReq) {
 	// to not yet initialized target.
 
 	// phase 1
-	config := cmn.GCO.Get()
-	if config.FastV(4, cos.SmoduleDsort) {
+	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 		nlog.Infof("[dsort] %s broadcasting init request to all targets", managerUUID)
 	}
 	path := apc.URLPathdSortInit.Join(managerUUID)
@@ -95,7 +94,7 @@ func PstartHandler(w http.ResponseWriter, r *http.Request, parsc *ParsedReq) {
 	}
 
 	// phase 2
-	if config.FastV(4, cos.SmoduleDsort) {
+	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 		nlog.Infof("[dsort] %s broadcasting start request to all targets", managerUUID)
 	}
 	path = apc.URLPathdSortStart.Join(managerUUID)
@@ -210,7 +209,7 @@ func pmetricsHandler(w http.ResponseWriter, r *http.Request, query url.Values) {
 	}
 
 	if notFound == len(responses) && notFound > 0 {
-		msg := fmt.Sprintf("%s: [dsort] %s does not exist", g.t, managerUUID)
+		msg := fmt.Sprintf("%s: [dsort] %s does not exist", core.T, managerUUID)
 		cmn.WriteErrMsg(w, r, msg, http.StatusNotFound)
 		return
 	}
@@ -222,7 +221,7 @@ func PabortHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodDelete) {
 		return
 	}
-	_, err := checkRESTItems(w, r, 0, apc.URLPathdSortAbort.L)
+	_, err := parseURL(w, r, 0, apc.URLPathdSortAbort.L)
 	if err != nil {
 		return
 	}
@@ -246,7 +245,7 @@ func PabortHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if allNotFound {
-		err := cos.NewErrNotFound("%s job %q", apc.ActDsort, managerUUID)
+		err := cos.NewErrNotFound(core.T, "dsort job "+managerUUID)
 		cmn.WriteErr(w, r, err, http.StatusNotFound)
 		return
 	}
@@ -257,7 +256,7 @@ func PremoveHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodDelete) {
 		return
 	}
-	_, err := checkRESTItems(w, r, 0, apc.URLPathdSort.L)
+	_, err := parseURL(w, r, 0, apc.URLPathdSort.L)
 	if err != nil {
 		return
 	}
@@ -317,8 +316,8 @@ func PremoveHandler(w http.ResponseWriter, r *http.Request) {
 
 // Determine dsorter type. We need to make this decision based on (e.g.) size targets' memory.
 func dsorterType(pars *parsedReqSpec) (string, error) {
-	if pars.DSorterType != "" {
-		return pars.DSorterType, nil // in case the dsorter type is already set, we need to respect it
+	if pars.DsorterType != "" {
+		return pars.DsorterType, nil // in case the dsorter type is already set, we need to respect it
 	}
 
 	// Get memory stats from targets
@@ -329,7 +328,7 @@ func dsorterType(pars *parsedReqSpec) (string, error) {
 		moreThanThreshold = true
 	)
 
-	dsorterMemThreshold, err := cos.ParseSize(pars.DSorterMemThreshold, cos.UnitsIEC)
+	dsorterMemThreshold, err := cos.ParseSize(pars.DsorterMemThreshold, cos.UnitsIEC)
 	debug.AssertNoErr(err)
 
 	query := make(url.Values)
@@ -375,18 +374,18 @@ func dsorterType(pars *parsedReqSpec) (string, error) {
 	// if totalBucketSize < totalAvailMemory {
 	// 	// "general type" is capable of extracting whole dataset into memory
 	// 	// In this case the creation phase is super fast.
-	// 	return DSorterGeneralType, nil
+	// 	return GeneralType, nil
 	// }
 
 	if moreThanThreshold {
 		// If there is enough memory to use "memory type", we should do that.
 		// It behaves better for cases when we have a lot of memory available.
-		return DSorterMemType, nil
+		return MemType, nil
 	}
 
 	// For all other cases we should use "general type", as we don't know
 	// exactly what to expect, so we should prepare for the worst.
-	return DSorterGeneralType, nil
+	return GeneralType, nil
 }
 
 ///////////////////
@@ -395,7 +394,7 @@ func dsorterType(pars *parsedReqSpec) (string, error) {
 
 // [METHOD] /v1/sort
 func TargetHandler(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSort.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSort.L)
 	if err != nil {
 		return
 	}
@@ -413,7 +412,7 @@ func TargetHandler(w http.ResponseWriter, r *http.Request) {
 		tabortHandler(w, r)
 	case apc.Remove:
 		tremoveHandler(w, r)
-	case apc.List:
+	case apc.UList:
 		tlistHandler(w, r)
 	case apc.Metrics:
 		tmetricsHandler(w, r)
@@ -437,7 +436,7 @@ func tinitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiItems, errV := checkRESTItems(w, r, 1, apc.URLPathdSortInit.L)
+	apiItems, errV := parseURL(w, r, 1, apc.URLPathdSortInit.L)
 	if errV != nil {
 		return
 	}
@@ -486,7 +485,7 @@ func tstartHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodPost) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSortStart.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSortStart.L)
 	if err != nil {
 		return
 	}
@@ -499,22 +498,22 @@ func tstartHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go m.startDSort()
+	go m.startDsort()
 }
 
-func (m *Manager) startDSort() {
+func (m *Manager) startDsort() {
 	if err := m.start(); err != nil {
 		m.errHandler(err)
 		return
 	}
 
 	nlog.Infof("[dsort] %s broadcasting finished ack to other targets", m.ManagerUUID)
-	path := apc.URLPathdSortAck.Join(m.ManagerUUID, g.t.SID())
-	bcast(http.MethodPut, path, nil, nil, g.t.Sowner().Get(), g.t.Snode())
+	path := apc.URLPathdSortAck.Join(m.ManagerUUID, core.T.SID())
+	bcast(http.MethodPut, path, nil, nil, core.T.Sowner().Get(), core.T.Snode())
 }
 
 func (m *Manager) errHandler(err error) {
-	nlog.Errorf("%+v", err)
+	nlog.Infoln(err)
 
 	// If we were aborted by some other process this means that we do not
 	// broadcast abort (we assume that daemon aborted us, aborted also others).
@@ -530,7 +529,7 @@ func (m *Manager) errHandler(err error) {
 
 		nlog.Warningln("broadcasting abort to other targets")
 		path := apc.URLPathdSortAbort.Join(m.ManagerUUID)
-		bcast(http.MethodDelete, path, nil, nil, g.t.Sowner().Get(), g.t.Snode())
+		bcast(http.MethodDelete, path, nil, nil, core.T.Sowner().Get(), core.T.Snode())
 	}
 }
 
@@ -541,7 +540,7 @@ func (managers *ManagerGroup) shardsHandler(w http.ResponseWriter, r *http.Reque
 	if !checkHTTPMethod(w, r, http.MethodPost) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSortShards.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSortShards.L)
 	if err != nil {
 		return
 	}
@@ -590,7 +589,7 @@ func (managers *ManagerGroup) recordsHandler(w http.ResponseWriter, r *http.Requ
 	if !checkHTTPMethod(w, r, http.MethodPost) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSortRecords.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSortRecords.L)
 	if err != nil {
 		return
 	}
@@ -649,7 +648,7 @@ func (managers *ManagerGroup) recordsHandler(w http.ResponseWriter, r *http.Requ
 	m.recm.EnqueueRecords(records)
 	m.incrementReceived()
 
-	if m.config.FastV(4, cos.SmoduleDsort) {
+	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 		nlog.Infof(
 			"[dsort] %s total times received records from another target: %d",
 			m.ManagerUUID, m.received.count.Load(),
@@ -664,7 +663,7 @@ func tabortHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodDelete) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSortAbort.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSortAbort.L)
 	if err != nil {
 		return
 	}
@@ -672,17 +671,17 @@ func tabortHandler(w http.ResponseWriter, r *http.Request) {
 	managerUUID := apiItems[0]
 	m, exists := Managers.Get(managerUUID, true /*incl. archived*/)
 	if !exists {
-		s := fmt.Sprintf("%s: [dsort] %s does not exist", g.t, managerUUID)
+		s := fmt.Sprintf("%s: [dsort] %s does not exist", core.T, managerUUID)
 		cmn.WriteErrMsg(w, r, s, http.StatusNotFound)
 		return
 	}
 	if m.Metrics.Archived.Load() {
-		s := fmt.Sprintf("%s: [dsort] %s is already archived", g.t, managerUUID)
+		s := fmt.Sprintf("%s: [dsort] %s is already archived", core.T, managerUUID)
 		cmn.WriteErrMsg(w, r, s, http.StatusGone)
 		return
 	}
 
-	err = fmt.Errorf("%s: [dsort] %s aborted", g.t, managerUUID)
+	err = fmt.Errorf("%s: [dsort] %s aborted", core.T, managerUUID)
 	m.abort(err)
 }
 
@@ -690,7 +689,7 @@ func tremoveHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodDelete) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSortRemove.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSortRemove.L)
 	if err != nil {
 		return
 	}
@@ -729,7 +728,7 @@ func tmetricsHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodGet) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 1, apc.URLPathdSortMetrics.L)
+	apiItems, err := parseURL(w, r, 1, apc.URLPathdSortMetrics.L)
 	if err != nil {
 		return
 	}
@@ -737,7 +736,7 @@ func tmetricsHandler(w http.ResponseWriter, r *http.Request) {
 	managerUUID := apiItems[0]
 	m, exists := Managers.Get(managerUUID, true /*incl. archived*/)
 	if !exists {
-		s := fmt.Sprintf("%s: [dsort] %s does not exist", g.t, managerUUID)
+		s := fmt.Sprintf("%s: [dsort] %s does not exist", core.T, managerUUID)
 		cmn.WriteErrMsg(w, r, s, http.StatusNotFound)
 		return
 	}
@@ -758,7 +757,7 @@ func tfiniHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHTTPMethod(w, r, http.MethodPut) {
 		return
 	}
-	apiItems, err := checkRESTItems(w, r, 2, apc.URLPathdSortAck.L)
+	apiItems, err := parseURL(w, r, 2, apc.URLPathdSortAck.L)
 	if err != nil {
 		return
 	}
@@ -780,15 +779,15 @@ func tfiniHandler(w http.ResponseWriter, r *http.Request) {
 
 func checkHTTPMethod(w http.ResponseWriter, r *http.Request, expected string) bool {
 	if r.Method != expected {
-		s := fmt.Sprintf("invalid method: %s to %s, should be %s", r.Method, r.URL.String(), expected)
+		s := fmt.Sprintf("invalid method '%s %s', expecting '%s'", r.Method, r.URL.String(), expected)
 		cmn.WriteErrMsg(w, r, s)
 		return false
 	}
 	return true
 }
 
-func checkRESTItems(w http.ResponseWriter, r *http.Request, itemsAfter int, items []string) ([]string, error) {
-	items, err := cmn.ParseURL(r.URL.Path, itemsAfter, true, items)
+func parseURL(w http.ResponseWriter, r *http.Request, itemsAfter int, items []string) ([]string, error) {
+	items, err := cmn.ParseURL(r.URL.Path, items, itemsAfter, true)
 	if err != nil {
 		cmn.WriteErr(w, r, err)
 		return nil, err

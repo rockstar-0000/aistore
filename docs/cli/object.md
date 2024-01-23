@@ -10,6 +10,15 @@ redirect_from:
 # CLI Reference for Objects
 This document contains `ais object` commands - the commands to read (GET), write (PUT), APPEND, PROMOTE, PREFETCH, EVICT etc. user data.
 
+Namely:
+
+```console
+$ ais object <TAB-TAB>
+
+get          put          cp           set-custom   show         rm
+ls           promote      concat       evict        mv           cat
+```
+
 ## Table of Contents
 - [GET object](#get-object)
   - [Save object to local file](#save-object-to-local-file)
@@ -21,6 +30,7 @@ This document contains `ais object` commands - the commands to read (GET), write
 - [GET archived content](#get-archived-content)
 - [Print object content](#print-object-content)
 - [Show object properties](#show-object-properties)
+- [Out of band updates](/docs/out_of_band.md)
 - [PUT object](#put-object)
   - [Object names](#object-names)
   - [Put single file](#put-single-file)
@@ -28,7 +38,7 @@ This document contains `ais object` commands - the commands to read (GET), write
   - [Put single file with implicitly defined name](#put-single-file-with-implicitly-defined-name)
   - [Put content from STDIN](#put-content-from-stdin)
   - [Put directory](#put-directory)
-  - [Put directory with prefix added to destination object names](#put-directory-with-prefix-added-to-destination-object-names)
+  - [Put multiple files with prefix added to destination object names](#put-multiple-files-with-prefix-added-to-destination-object-names)
   - [PUT multiple files into virtual directory, track progress](#put-multiple-files-into-virtual-directory-track-progress)
   - [Put pattern-matching files from directory](#put-pattern-matching-files-from-directory)
   - [Put a range of files](#put-a-range-of-files)
@@ -36,7 +46,7 @@ This document contains `ais object` commands - the commands to read (GET), write
   - [Dry-Run option](#dry-run-option)
   - [Put multiple directories](#put-multiple-directories)
   - [Put multiple directories with the `--skip-vc` option](#put-multiple-directories-with-the-skip-vc-option)
-- [Append file to archive](#append-file-to-archive)
+- [APPEND object](#append-object)
 - [Delete object](#delete-object)
 - [Evict object](#evict-object)
 - [Promote files and directories](#promote-files-and-directories)
@@ -47,11 +57,10 @@ This document contains `ais object` commands - the commands to read (GET), write
   - [Prefetch objects](#prefetch-objects)
   - [Delete multiple objects](#delete-multiple-objects)
   - [Evict multiple objects](#evict-multiple-objects)
-  - [Archive multiple objects](#archive-multiple-objects)
 
 # GET object
 
-The command is very useful in terms getting your data out of the cluster. In its brief description:
+Use `ais object get` or, same, `ais get` to GET data from aistore. In other words, read data from the cluster and, optionally, save it locally.
 
 `ais get [command options] BUCKET[/OBJECT_NAME] [OUT_FILE|-]`
 
@@ -64,7 +73,7 @@ Here's in detail:
 
 ```console
 $ ais get --help
-
+NAME:
    ais get - (alias for "object get") get an object, a shard, an archived file, or a range of bytes from all of the above;
               write the content locally with destination options including: filename, directory, STDOUT ('-'), or '/dev/null' (discard);
               assorted options further include:
@@ -72,6 +81,7 @@ $ ais get --help
               - '--extract' or '--archpath' to extract archived content;
               - '--progress' and '--refresh' to watch progress bar;
               - '-v' to produce verbose output when getting multiple objects.
+
 USAGE:
    ais get [command options] BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-]
 
@@ -80,7 +90,11 @@ OPTIONS:
    --length value    object read length; default formatting: IEC (use '--units' to override)
    --checksum        validate checksum
    --yes, -y         assume 'yes' to all questions
-   --check-cached    check if a given object from a remote bucket is present ("cached") in AIS
+   --check-cached    instead of GET execute HEAD(object) to check if the object is present in aistore
+                     (applies only to buckets with remote backend)
+   --latest          GET, prefetch, or copy the latest object version from the associated remote bucket;
+                     allows operation-level control over object version synchronization _without_ changing bucket configuration
+                     (the latter can be done using 'ais bucket props set BUCKET versioning')
    --refresh value   interval for continuous monitoring;
                      valid time units: ns, us (or µs), ms, s (default), m, h
    --progress        show progress bar(s) and progress of execution in real time
@@ -88,16 +102,17 @@ OPTIONS:
    --extract, -x     extract all files from archive(s)
    --prefix value    get objects that start with the specified prefix, e.g.:
                      '--prefix a/b/c' - get objects from the virtual directory a/b/c and objects from the virtual directory
-                     a/b that have their names (relative to this directory) starting with c;
-                     '--prefix ""' - get entire bucket
-   --cached          get only those objects from a remote bucket that are present ("cached") in AIS
+                     a/b that have their names (relative to this directory) starting with 'c';
+                     '--prefix ""' - get entire bucket (all objects)
+   --cached          get only those objects from a remote bucket that are present ("cached") in aistore
    --archive         list archived content (see docs/archive.md for details)
    --limit value     limit object name count (0 - unlimited) (default: 0)
    --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
                      iec - IEC format, e.g.: KiB, MiB, GiB (default)
                      si  - SI (metric) format, e.g.: KB, MB, GB
                      raw - do not convert to (or from) human-readable format
-   --verbose, -v     verbose outout when getting multiple objects
+   --verbose, -v     verbose output
+   --silent          server-side flag, an indication for aistore _not_ to log assorted errors (e.g., HEAD(object) failures)
    --help, -h        show help
 ```
 
@@ -170,7 +185,7 @@ Read 1.00KiB (1024 B)
 
 ### Example: read-range multiple objects
 
-Let's say, bucket ais://src contains 4 copies of [aistore readme](https://github.com/NVIDIA/aistore/blob/master/README.md) in its virtual directory `docs/`:
+Let's say, bucket ais://src contains 4 copies of [aistore readme](https://github.com/NVIDIA/aistore/blob/main/README.md) in its virtual directory `docs/`:
 
 The following reads 10 bytes from each copy and prints the result:
 
@@ -403,7 +418,7 @@ ec          2:2[replicated]
 
 Briefly:
 
-`ais put [command options] [-|FILE|DIRECTORY[/PATTERN]] BUCKET[/OBJECT_NAME]`<sup>[1](#ft1)</sup>
+`ais put [command options] [-|FILE|DIRECTORY[/PATTERN]] BUCKET[/OBJECT_NAME_or_PREFIX]`<sup>[1](#ft1)</sup>
 
 writes a single file, an entire directory (of files), or a typed content directly from STDIN (`-`) - into the specified (destination) bucket.
 
@@ -421,30 +436,46 @@ Confirmation request can be disabled with the option `--yes` for use in scripts.
 
 When writing from `STDIN`, type Ctrl-D to terminate the input.
 
-## Options
+## Inline help
 
 ```console
 $ ais put --help
 NAME:
-   ais put - (alias for "object put") PUT or APPEND one file or one directory, or multiple files and/or directories.
-              - use optional shell filename pattern (wildcard) to match/select sources;
-              - request '--compute-checksum' to facilitate end-to-end protection;
-              - progress bar via '--progress' to show runtime execution (uploaded files count and size);
-              - when writing directly from standard input use Ctrl-D to terminate;
-              - use '--archpath' to APPEND to an existing tar-formatted object.
+   ais put - (alias for "object put") PUT or APPEND one file, one directory, or multiple files and/or directories.
+   Use optional shell filename PATTERN (wildcard) to match/select multiple sources.
+   Destination naming is consistent with 'ais object promote' command, whereby the optional OBJECT_NAME_or_PREFIX
+   becomes either a name, a prefix, or a virtual destination directory (if it ends with a forward '/').
+   Assorted examples and usage options follow (and see docs/cli/object.md for more):
+     - upload matching files: 'ais put "docs/*.md" ais://abc/markdown/'
+     - (notice quotation marks and a forward slash after 'markdown/' destination);
+     - '--compute-checksum': use '--compute-checksum' to facilitate end-to-end protection;
+     - '--progress': progress bar, to show running counts and sizes of uploaded files;
+     - Ctrl-D: when writing directly from standard input use Ctrl-D to terminate;
+     - '--dry-run': see the results without making any changes.
+     Notes:
+     - to write or append to (.tar, .tgz or .tar.gz, .zip, .tar.lz4)-formatted objects ("shards"), use 'ais archive'
 
 USAGE:
-   ais put [command options] [-|FILE|DIRECTORY[/PATTERN]] BUCKET[/OBJECT_NAME]
+   ais put [command options] [-|FILE|DIRECTORY[/PATTERN]] BUCKET[/OBJECT_NAME_or_PREFIX]
 
 OPTIONS:
-   --list value        comma-separated list of file names, e.g.:
-                       --list 'f1,f2,f3'
-                       --list "/home/abc/1.tar, /home/abc/1.cls, /home/abc/1.jpeg"
-   --template value    template to match file names; may contain prefix with zero or more ranges (with optional steps and gaps), e.g.:
-                       --template '/home/dir/subdir/'
+   --list value        comma-separated list of object or file names, e.g.:
+                       --list 'o1,o2,o3'
+                       --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                       or, when listing files and/or directories:
+                       --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value    template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                       (with optional steps and gaps), e.g.:
+                       --template "" # (an empty or '*' template matches eveything)
+                       --template 'dir/subdir/'
                        --template 'shard-{1000..9999}.tar'
                        --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
-                       --template "prefix-{0010..9999..2}-suffix"
+                       and similarly, when specifying files and directories:
+                       --template '/home/dir/subdir/'
+                       --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait              wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value     maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                       valid time units: ns, us (or µs), ms, s (default), m, h
    --progress          show progress bar(s) and progress of execution in real time
    --refresh value     interval for continuous monitoring;
                        valid time units: ns, us (or µs), ms, s (default), m, h
@@ -452,19 +483,16 @@ OPTIONS:
    --conc value        limits number of concurrent put requests and number of concurrent shards created (default: 10)
    --dry-run           preview the results without really running the action
    --recursive, -r     recursive operation
-   --verbose, -v       verbose
+   --verbose, -v       verbose output
    --yes, -y           assume 'yes' to all questions
-   --include-src-bck   prefix names of archived objects with the source bucket name
-   --cont-on-err       keep running archiving xaction in presence of errors in a any given multi-object transaction
+   --cont-on-err       keep running archiving xaction (job) in presence of errors in a any given multi-object transaction
    --units value       show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
                        si  - SI (metric) format, e.g.: KB, MB, GB
                        raw - do not convert to (or from) human-readable format
-   --archpath value    filename in archive
-   --archive           archive a given list ('--list') or range ('--template') of objects
-   --append-to-arch    add object(s) to an existing (.tar, .tgz, .tar.gz, .zip, .msgpack)-formatted object ("archive", "shard")
    --skip-vc           skip loading object metadata (and the associated checksum & version related processing)
    --compute-checksum  [end-to-end protection] compute client-side checksum configured for the destination bucket
+                       and provide it as part of the PUT request for subsequent validation on the server side
    --crc32c value      compute client-side crc32c checksum
                        and provide it as part of the PUT request for subsequent validation on the server side
    --md5 value         compute client-side md5 checksum
@@ -475,7 +503,7 @@ OPTIONS:
                        and provide it as part of the PUT request for subsequent validation on the server side
    --xxhash value      compute client-side xxhash checksum
                        and provide it as part of the PUT request for subsequent validation on the server side
-   --help, -h          show help
+
 ```
 
 <a name="ft1">1</a> `FILE|DIRECTORY` should point to a file or a directory. Wildcards are supported, but they work a bit differently from shell wildcards.
@@ -515,7 +543,21 @@ The current user HOME directory is `/home/user`.
 
 ## Put single file
 
-Put a single file `img1.tar` into local bucket `mybucket`, name it `img-set-1.tar`.
+First, compare two simple examples:
+
+```console
+$ ais put README.md ais://nnn/ccc/
+PUT "README.md" => ais://nnn/ccc/README.md
+
+$ ais put README.md ais://nnn/ccc
+PUT "README.md" => ais://nnn/ccc
+```
+
+In other words, a **trailing forward slash** in the destination name is interpreted as a destination directory
+
+> which is what one would expect from something like Bash: `cp README.md /nnn/ccc/`
+
+One other example: put a single file `img1.tar` into local bucket `mybucket`, name it `img-set-1.tar`.
 
 ```console
 $ ais put "/home/user/bck/img1.tar" ais://mybucket/img-set-1.tar
@@ -605,9 +647,77 @@ PUT 10 objects to "ais://vvv"
 
 > NOTE double quotes to denote the `"../../../../bin/g*"` source above. With pattern matching, using quotation marks is a MUST. Single quotes can be used as well.
 
-## Put directory with prefix added to destination object names
+## Put multiple files with prefix added to destination object names
 
-The same as above, but add `OBJECT_NAME` (`../subdir/`) prefix to object names.
+The multi-file source can be: a directory, a comma-separated list, a template-defined range - all of the above.
+
+Examples follow below, but also notice:
+* the flexibility in terms specifying source-matching templates, and
+* destination prefix - with or without trailing forward slash
+
+### Example 1.
+
+```console
+$ ais put ais://nnn/fff --template "/tmp/www/shard-{001..002}.tar"
+Warning: 'fff' will be used as the destination name prefix for all files matching '/tmp/www/shard-{001..002}.tar'
+Proceed anyway? [Y/N]: y
+Files to upload:
+EXTENSION        COUNT   SIZE
+.tar             2       17.00KiB
+TOTAL            2       17.00KiB
+PUT 2 files => ais://nnn/fff? [Y/N]: y
+Done
+$ ais ls ais://nnn
+NAME                     SIZE
+fffshard-001.tar         8.50KiB
+fffshard-002.tar         8.50KiB
+```
+
+### Example 2.
+
+Same as above, except now we make sure that destination is a virtual directory (notice trailing forward '/'):
+
+```console
+$ ais put ais://nnn/ggg/ --template "/tmp/www/shard-{003..004}.tar"
+Files to upload:
+EXTENSION        COUNT   SIZE
+.tar             2       17.00KiB
+TOTAL            2       17.00KiB
+PUT 2 files => ais://nnn/ggg/? [Y/N]: y
+Done
+$ ais ls ais://nnn
+NAME                     SIZE
+fffshard-001.tar         8.50KiB
+fffshard-002.tar         8.50KiB
+ggg/shard-003.tar        8.50KiB
+ggg/shard-004.tar        8.50KiB
+```
+
+### Example 3.
+
+Same as above, with `--template` embedded into the source argument:
+
+```console
+$ ais put "/tmp/www/shard-{005..006}.tar"  ais://nnn/hhh/
+Files to upload:
+EXTENSION        COUNT   SIZE
+.tar             2       17.00KiB
+TOTAL            2       17.00KiB
+PUT 2 files => ais://nnn/hhh/? [Y/N]: y
+Done
+$ ais ls ais://nnn
+NAME                     SIZE
+fffshard-001.tar         8.50KiB
+fffshard-002.tar         8.50KiB
+ggg/shard-003.tar        8.50KiB
+ggg/shard-004.tar        8.50KiB
+hhh/shard-005.tar        8.50KiB
+hhh/shard-006.tar        8.50KiB
+```
+
+And finally, we can certainly PUT source directory:
+
+### Example 4.
 
 ```console
 $ ais put /home/user/bck ais://mybucket/subdir/
@@ -785,6 +895,8 @@ subdir/README.md         11.24KiB
 
 Preview the files that would be sent to the cluster, without actually putting them.
 
+### Example 1
+
 ```bash
 $ for d1 in {0..2}; do for d2 in {0..2}; mkdir -p ~/dir/test${d1}/dir && do echo "0" > ~/dir/test${d1}/dir/test${d2}.txt; done; done
 $ ais put "~/dir/test{0..2}/dir/test{0..2}.txt" ais://mybucket --dry-run
@@ -793,6 +905,33 @@ $ ais put "~/dir/test{0..2}/dir/test{0..2}.txt" ais://mybucket --dry-run
 /home/user/dir/test0/dir/test0.txt => ais://mybucket/test0/dir/test0.txt
 (...)
 ```
+
+### Example 2
+
+Generally, the `--template` option combines (an optional) prefix and/or one or more ranges (e.g., bash brace expansions).
+
+In this example, we only use the "prefix" part of the `--template` to specify source directory.
+
+```console
+$ ls -l /tmp/w
+total 32
+-rw-r--r-- 1 root root 14180 Dec 11 18:18 111
+-rw-r--r-- 1 root root 14180 Dec 11 18:18 222
+
+$ ais put ais://nnn/fff --template /tmp/w --dry-run
+[DRY RUN] with no modifications to the cluster
+Warning: 'fff' will be used as the destination name prefix for all files from '/tmp/w' directory
+Proceed anyway? [Y/N]: y
+Files to upload:
+EXTENSION        COUNT   SIZE
+                 2       27.70KiB
+TOTAL            2       27.70KiB
+[DRY RUN] PUT 2 files (one directory, non-recursive) => ais://nnn/fff
+PUT /tmp/w/222 -> ais://nnn/fff222
+PUT /tmp/w/111 -> ais://nnn/fff111
+```
+
+> Note: to PUT files into a virtual destination directory, use trailing '/', e.g.: `ais put ais://nnn/fff/ ...`
 
 ## Put multiple directories
 
@@ -819,45 +958,37 @@ EXTENSION        COUNT   SIZE
 TOTAL            33      66B
 ```
 
-# Append file to archive
-
-> **NOTE**: for more "archival" options and examples, please see [docs/cli/archive.md](archive.md).
-
-`ais put FILE BUCKET/OBJECT_NAME --archpath ARCH_PATH --append`
-
-Append a file to an existing archive. `ARCH_PATH` here defines (destination) filename in archive.
-
-## Examples
-
-Add a file to an archive:
-
-```console
-# list archived content prior to appending new files
-$ ais ls ais://bck --prefix test --archive
-NAME                             SIZE
-test.tar                         42.00KiB
-    test.tar/main.c              40.00KiB
-
-# add a new file to the archive
-$ ais put readme.txt ais://bck/test.tar --archpath=doc/README --append
-APPEND "readme.txt" to object "ais://abc/test.tar[/doc/README]"
-
-$ # check that the archive is updated
-$ ais ls ais://bck --prefix test --archive
-NAME                             SIZE
-test.tar                         45.50KiB
-    test.tar/doc/README          3.11KiB
-    test.tar/main.c              40.00KiB
-```
-
-> **NOTE**: for more "archival" options and examples, please see [docs/cli/archive.md](archive.md).
-
 # Promote files and directories
 
-`ais object promote FILE|DIRECTORY BUCKET/[OBJECT_NAME]`<sup>[1](#ft1)</sup>
+Inline help follows below:
 
-Promote **AIS-colocated** files and directories to AIS objects in a specified bucket.
-Colocation in context means that the files in question are already located *inside* AIStore (bare-metal or virtual) storage servers (targets).
+```console
+$ ais object promote --help
+NAME:
+   ais object promote - PROMOTE target-accessible files and directories.
+   The operation is intended for copying NFS and SMB shares mounted on any/all targets
+   but can be also used to copy local files (again, on any/all targets in the cluster).
+   Copied files and directories become regular stored objects that can be further listed and operated upon.
+   Destination naming is consistent with 'ais put' command, e.g.:
+     - 'promote /tmp/subdir/f1 ais://nnn'        - ais://nnn/f1
+     - 'promote /tmp/subdir/f2 ais://nnn/aaa'    - ais://nnn/aaa
+     - 'promote /tmp/subdir/f3 ais://nnn/aaa/'   - ais://nnn/aaa/f3
+     - 'promote /tmp/subdir ais://nnn'           - ais://nnn/f1, ais://nnn/f2, ais://nnn/f3
+     - 'promote /tmp/subdir ais://nnn/aaa/'      - ais://nnn/aaa/f1, ais://nnn/aaa/f2, ais://nnn/aaa/f3
+   Other supported options follow below.
+
+USAGE:
+   ais object promote [command options] FILE|DIRECTORY[/PATTERN] BUCKET[/OBJECT_NAME_or_PREFIX]
+
+OPTIONS:
+   --recursive, -r      recursive operation
+   --overwrite-dst, -o  overwrite destination, if exists
+   --not-file-share     each target must act autonomously skipping file-share auto-detection and promoting the entire source (as seen from the target)
+   --delete-src         delete successfully promoted source
+   --target-id value    ais target designated to carry out the entire operation
+   --verbose, -v        verbose output
+   --help, -h           show help
+```
 
 ## Options
 
@@ -870,22 +1001,9 @@ Colocation in context means that the files in question are already located *insi
 | `--delete-src` | `bool` | Delete promoted source | `false` |
 | `--not-file-share` | `bool` | Each target must act autonomously, skipping file-share auto-detection and promoting the entire source (as seen from _the_ target) | `false` |
 
-## Object names
+## Destination naming
 
-When the specified source references a **directory, or a tree of nested directories**, object naming is set as follows:
-
-- For path `p` of source directory, resulting objects names are path to files with trimmed `p` prefix
-- `OBJECT_NAME` is prepended to each object name.
-- Abbreviations in source like `../` are not supported at the moment.
-
-If the source references a **single file**, the resulting object name is set as follows:
-
-- Object name is not provided: `ais object promote /path/to/(..)/file.go ais://bucket/` promotes to object `file.go` in `bucket`
-- Explicit object name is provided: `ais object promote /path/to/(..)/file.go ais://bucket/path/to/object.go` promotes object `path/to/object.go` in `bucket`
-
-Notice that `keep` option is required - it cannot be omitted.
-
-> The usual argument for **not keeping** the original file-based content (`keep=false`) is a) saving space on the target servers and b) optimizing time to promote (larger) files and directories.
+See above.
 
 ## Promote a single file
 
@@ -935,6 +1053,56 @@ TARGET          MEM USED %  MEM AVAIL   CAP USED %  CAP AVAIL   CPU USED %  REBA
 ...
 $ ais object promote /target/1014646t8081/nonexistent/dir/ ais://testbucket --target 1014646t8081 --keep=false
 (...) Bad Request: stat /target/1014646t8081/nonexistent/dir: no such file or directory
+```
+
+# APPEND object
+
+APPEND operation (not to confuse with appending or [adding to existing archive](/docs/cli/archive.md)) can be executed in 3 different ways:
+
+* using `ais put` with `--append` option;
+* using `ais object concat`;
+and finally
+* writing from standard input with chunk size (ie., `--chunk-size`) small enough to require (appending) multiple chunks.
+
+Here're some examples:
+
+```console
+## append all files from a given directory as a single object:
+
+$ ais put docs ais://nnn/all-docs --append
+
+Created ais://nnn/all-docs (size 571.45KiB)
+$ ais ls ais://nnn/all-docs -props all
+PROPERTY         VALUE
+atime            11 Dec 23 12:18 EST
+checksum         xxhash[f0eac0698e2489ff]
+copies           1 [/ais/mp1/7]
+custom           -
+ec               -
+location         t[VQWtTyuI]:mp[/ais/mp1/7, nvme0n1]
+name             ais://nnn/all-docs
+size             571.45KiB
+version          1
+```
+
+```console
+## overwrite existing object with 4KiB of random data;
+## note that the operation (below) will write about 410 chunks from standard input
+
+$ head -c 4096 /dev/urandom | ais object put - ais://nnn/all-docs --chunk-size 10
+PUT (standard input) => ais://nnn/all-docs
+
+$ ais ls ais://nnn/all-docs -props all
+PROPERTY         VALUE
+atime            11 Dec 23 12:21 EST
+checksum         xxhash[b5edf46a1b9459fb]
+copies           1 [/ais/mp1/7]
+custom           -
+ec               -
+location         t[VQWtTyuI]:mp[/ais/mp1/7, nvme0n1]
+name             ais://nnn/all-docs
+size             4.00KiB
+version          3
 ```
 
 # Delete object
@@ -1104,36 +1272,146 @@ The number of objects "involved" in a single operation does not have any designe
 
 ## Prefetch objects
 
-`ais start prefetch BUCKET/ --list|--template <value>`
+This is `ais start prefetch` or, same, `ais prefetch` command:
 
-[Prefetch](/docs/bucket.md#prefetchevict-objects) objects from a remote bucket.
+```console
+$ ais prefetch --help
+NAME:
+   ais prefetch - (alias for "object prefetch") prefetch one remote bucket, multiple remote buckets, or
+   selected objects in a given remote bucket or buckets, e.g.:
+     - 'prefetch gs://abc'                                          - prefetch entire bucket (all gs://abc objects that are _not_ present in the cluster);
+     - 'prefetch gs:'                                               - prefetch all visible/accessible GCP buckets;
+     - 'prefetch gs://abc --template images/'                       - prefetch all objects from the virtual subdirectory "images";
+     - 'prefetch gs://abc/images/'                                  - same as above;
+     - 'prefetch gs://abc --template "shard-{0000..9999}.tar.lz4"'  - prefetch the matching range (prefix + brace expansion);
+     - 'prefetch "gs://abc/shard-{0000..9999}.tar.lz4"'             - same as above (notice double quotes)
 
-### Options
+USAGE:
+   ais prefetch [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]
 
-| Flag | Type | Description | Default |
-| --- | --- | --- | --- |
-| `--list` | `string` | Comma separated list of objects for list deletion | `""` |
-| `--template` | `string` | The object name template with optional range parts | `""` |
-| `--dry-run` | `bool` | Do not actually perform PREFETCH. Shows a few objects to be prefetched |
+OPTIONS:
+   --list value      comma-separated list of object or file names, e.g.:
+                     --list 'o1,o2,o3'
+                     --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                     or, when listing files and/or directories:
+                     --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value  template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                     (with optional steps and gaps), e.g.:
+                     --template "" # (an empty or '*' template matches eveything)
+                     --template 'dir/subdir/'
+                     --template 'shard-{1000..9999}.tar'
+                     --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                     and similarly, when specifying files and directories:
+                     --template '/home/dir/subdir/'
+                     --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait            wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value   maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress        show progress bar(s) and progress of execution in real time
+   --refresh value   interval for continuous monitoring;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --dry-run         preview the results without really running the action
+   --prefix value    select objects that have names starting with the specified prefix, e.g.:
+                     '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+                     '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
+   --latest          GET, prefetch, or copy the latest object version from the associated remote bucket;
+                     allows operation-level control over object version synchronization _without_ changing bucket configuration
+                     (the latter can be done using 'ais bucket props set BUCKET versioning')
+   --help, -h        show help
+```
 
-Options `--list` and `--template` are mutually exclusive.
+Note usage examples above. You can always run `--help` option to see the most recently updated inline help.
 
-### Prefetch a list of objects
+### See also
+* [Prefetch/Evict objects](/docs/bucket.md#prefetchevict-objects)
+
+### Example: prefetch using prefix
+
+Initially:
+
+```console
+$ ais ls s3://abc --all --limit 10
+NAME     SIZE            CACHED  STATUS
+10000a2  10.00MiB        no      n/a
+10000b4  10.00MiB        no      n/a
+10000bd  10.00MiB        no      n/a
+10000d6  10.00MiB        no      n/a
+10000ea  10.00MiB        no      n/a
+10001a2  10.00MiB        no      n/a
+10001b4  10.00MiB        no      n/a
+10001bd  10.00MiB        no      n/a
+10001d6  10.00MiB        no      n/a
+10001ea  10.00MiB        no      n/a
+```
+
+Now, let's use `--prefix` option to - in this case - fetch a single object:
+
+```console
+$ ais prefetch s3://abc --prefix 10000a2
+prefetch-objects[E0e5mq9Kav]: prefetch "10000a2" from s3://abc. To monitor the progress, run 'ais show job E0e5mq9Kav'
+
+$ ais ls s3://abc --all --limit 10
+NAME     SIZE            CACHED  STATUS
+10000a2  10.00MiB        yes     ok     ### <<<<< in cluster
+10000b4  10.00MiB        no      n/a
+10000bd  10.00MiB        no      n/a
+10000d6  10.00MiB        no      n/a
+10000ea  10.00MiB        no      n/a
+10001a2  10.00MiB        no      n/a
+10001b4  10.00MiB        no      n/a
+10001bd  10.00MiB        no      n/a
+10001d6  10.00MiB        no      n/a
+10001ea  10.00MiB        no      n/a
+```
+
+### Example: prefetch using template
+
+Since `--template` can optionally contain prefix and zero or more _ranges_, we could execute the above example as follows:
+
+```console
+$ ais prefetch s3://abc --template 10000a2
+```
+
+This, in fact, would produce the same result (see previous section).
+
+But of course, "templated" match can also specify an actual range, for example:
+
+```console
+$ ais ls gs://nnn --all --limit 5
+NAME     SIZE            CACHED  STATUS
+shard-001  1.00MiB       no      n/a
+shard-002  1.00MiB       no      n/a
+shard-003  1.00MiB       no      n/a
+shard-004  1.00MiB       no      n/a
+shard-005  1.00MiB       no      n/a
+
+$ ais prefetch gs://nnn --template --template "shard-{001..003}"
+
+$ ais ls gs://nnn --all --limit 5
+NAME     SIZE            CACHED  STATUS
+shard-001  1.00MiB       yes     ok
+shard-002  1.00MiB       yes     ok
+shard-003  1.00MiB       yes     ok
+shard-004  1.00MiB       no      n/a
+shard-005  1.00MiB       no      n/a
+```
+
+### Example: prefetch a list of objects
 
 NOTE: make sure to use double or single quotations to specify the list, as shown below.
 
 ```console
 # Prefetch o1, o2, and o3 from AWS bucket `cloudbucket`:
-$ ais start prefetch aws://cloudbucket --list 'o1,o2,o3'
+$ ais prefetch aws://cloudbucket --list 'o1,o2,o3'
 ```
 
-### Prefetch a range of objects
+### Example: prefetch a range of objects
 
 ```console
 # Prefetch from AWS bucket `cloudbucket` all objects in the specified range.
 # NOTE: make sure to use double or single quotations to specify the template (aka "range")
 
-$ ais start prefetch aws://cloudbucket --template "shard-{001..999}.tar"
+$ ais prefetch aws://cloudbucket --template "shard-{001..999}.tar"
 ```
 
 ## Delete multiple objects
@@ -1183,50 +1461,64 @@ removed from ais://dsort-testing objects in the range "shard-{900..999}.tar", us
 
 ## Evict multiple objects
 
-`ais bucket evict BUCKET/[OBJECT_NAME]...`
+`ais evict [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]`
 
-[Evict](/docs/bucket.md#prefetchevict-objects) objects from a remote bucket.
+Command `ais evict` is a shorter version of `ais bucket evict`.
 
 ### Options
 
-| Flag | Type | Description | Default |
-| --- | --- | --- | --- |
-| `--list` | `string` | Comma separated list of objects for list deletion | `""` |
-| `--template` | `string` | The object name template with optional range parts | `""` |
-| `--dry-run` | `bool` | Do not actually perform EVICT. Shows a few objects to be evicted |
+Here's inline help, and specifically notice the _multi-object_ options: `--template`, `--list`, and `--prefix`:
 
-Note that options `--list` and `--template` are mutually exclusive.
+```concole
+$ ais evict --help
+NAME:
+   ais evict - (alias for "bucket evict") evict one remote bucket, multiple remote buckets, or
+   selected objects in a given remote bucket or buckets, e.g.:
+     - 'evict gs://abc'                                          - evict entire bucket (all gs://abc objects in aistore);
+     - 'evict gs:'                                               - evict all GCP buckets from the cluster;
+     - 'evict gs://abc --template images/'                       - evict all objects from the virtual subdirectory "images";
+     - 'evict gs://abc/images/'                                  - same as above;
+     - 'evict gs://abc --template "shard-{0000..9999}.tar.lz4"'  - evict the matching range (prefix + brace expansion);
+     - 'evict "gs://abc/shard-{0000..9999}.tar.lz4"'             - same as above (notice double quotes)
+
+USAGE:
+   ais evict [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]
+
+OPTIONS:
+   --list value         comma-separated list of object or file names, e.g.:
+                        --list 'o1,o2,o3'
+                        --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                        or, when listing files and/or directories:
+                        --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value     template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                        (with optional steps and gaps), e.g.:
+                        --template "" # (an empty or '*' template matches eveything)
+                        --template 'dir/subdir/'
+                        --template 'shard-{1000..9999}.tar'
+                        --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                        and similarly, when specifying files and directories:
+                        --template '/home/dir/subdir/'
+                        --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait               wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value      maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                        valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress           show progress bar(s) and progress of execution in real time
+   --refresh value      interval for continuous monitoring;
+                        valid time units: ns, us (or µs), ms, s (default), m, h
+   --keep-md            keep bucket metadata
+   --prefix value       select objects that have names starting with the specified prefix, e.g.:
+                        '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+                        '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
+   --dry-run            preview the results without really running the action
+   --verbose, -v        verbose output
+   --non-verbose, --nv  non-verbose (quiet) output, minimized reporting
+   --help, -h           show help
+```
+
+Note usage examples above. You can always run `--help` option to see the most recently updated inline help.
 
 ### Evict a range of objects
 
 ```console
 $ ais bucket evict aws://cloudbucket --template "shard-{900..999}.tar"
-```
-
-## Archive multiple objects
-
-> **NOTE**: for more "archival" options and examples, please see [docs/cli/archive.md](archive.md).
-
-This is an archive-**creating** operation that takes in multiple objects from a source bucket and archives them all into a destination bucket, where:
-
-* source and destination buckets may not necessarily be different;
-* both `--list` and `--template` options are supported
-* supported archival formats include `.tar`, `.tar.gz` (or, same, `.tgz`), and `.zip`; more extensions may be added in the future.
-* archiving is carried out asynchronously, in parallel by all AIS targets.
-
-Note that (alternatively) multi-object archives can be created using `ais create archive`:
-
-* [`ais archive create BUCKET/OBJECT`](/docs/cli/archive.md##archive-multiple-objects)
-
-```console
-# TAR objects `obj1`, `obj2` , `obj3` in a given (destination) bucket called `destbck`.
-# NOTE: when specifying `--list` or `--template`, make sure to use double or single quotation marks.
-
-$ ais put ais://abc ais://destbck/myarch.tar --list="obj1,  obj2,obj3" --archive
-```
-
-```console
-# ZIP objects `obj1`, `obj2` , `obj3`. Note that in this example source and destination are identical.
-
-$ ais put ais://mybck ais://mybck/myarch.zip --list="obj1,obj2, obj3" --archive
 ```

@@ -1,24 +1,26 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
 	"fmt"
+	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/urfave/cli"
 )
 
@@ -38,52 +40,45 @@ type (
 )
 
 // `ais ls`, `ais ls s3:` and similar
-func listBckTable(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, matches func(cmn.Bck) bool,
-	fltPresence int, countRemoteObjs bool) (cnt int) {
-	var (
-		filtered = make(cmn.Bcks, 0, len(bcks))
-		unique   = make(cos.StrSet, len(bcks))
-	)
-	for _, bck := range bcks {
-		if qbck.Contains(&bck) && matches(bck) {
-			uname := bck.MakeUname("")
-			if _, ok := unique[uname]; !ok {
-				filtered = append(filtered, bck)
-				unique[uname] = struct{}{}
-			}
-		}
-	}
-	if cnt = len(filtered); cnt == 0 {
-		return
-	}
+func listBckTable(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, lsb lsbCtx) (cnt int) {
 	if flagIsSet(c, bckSummaryFlag) {
-		listBckTableWithSummary(c, qbck, filtered, fltPresence, countRemoteObjs)
+		args := api.BinfoArgs{
+			FltPresence:   lsb.fltPresence,     // all-buckets part in the `allObjsOrBcksFlag`
+			WithRemote:    lsb.countRemoteObjs, // all-objects part --/--
+			Summarize:     true,
+			DontAddRemote: flagIsSet(c, dontAddRemoteFlag),
+		}
+		cnt = listBckTableWithSummary(c, qbck, bcks, args)
 	} else {
-		listBckTableNoSummary(c, qbck, filtered, fltPresence)
+		cnt = listBckTableNoSummary(c, qbck, bcks, lsb.fltPresence)
 	}
 	return
 }
 
-func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.Bck, fltPresence int) {
+func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fltPresence int) int {
 	var (
 		bmd        *meta.BMD
 		err        error
 		footer     lsbFooter
 		hideHeader = flagIsSet(c, noHeaderFlag)
 		hideFooter = flagIsSet(c, noFooterFlag)
-		data       = make([]teb.ListBucketsHelper, 0, len(filtered))
+		data       = make([]teb.ListBucketsHelper, 0, len(bcks))
 	)
 	if !apc.IsFltPresent(fltPresence) {
 		bmd, err = api.GetBMD(apiBP)
 		if err != nil {
 			fmt.Fprintln(c.App.ErrWriter, err)
-			return
+			return 0
 		}
 	}
-	for _, bck := range filtered {
+	for i := range bcks {
+		bck := bcks[i]
+		if !qbck.Contains(&bck) {
+			continue
+		}
 		var (
 			info  cmn.BsummResult
-			props *cmn.BucketProps
+			props *cmn.Bprops
 		)
 		if apc.IsFltPresent(fltPresence) {
 			info.IsBckPresent = true
@@ -99,7 +94,7 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.Bc
 				bmd, err = api.GetBMD(apiBP)
 				if err != nil {
 					fmt.Fprintln(c.App.ErrWriter, err)
-					return
+					return 0
 				}
 			}
 			props, _ = bmd.Get(meta.CloneBck(&bck))
@@ -107,13 +102,16 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.Bc
 		}
 		data = append(data, teb.ListBucketsHelper{Bck: bck, Props: props, Info: &info})
 	}
+	if footer.nb == 0 {
+		return 0
+	}
 	if hideHeader {
 		teb.Print(data, teb.ListBucketsBodyNoSummary)
 	} else {
 		teb.Print(data, teb.ListBucketsTmplNoSummary)
 	}
 	if hideFooter {
-		return
+		return footer.nb
 	}
 
 	var s string
@@ -122,19 +120,20 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.Bc
 	}
 	p := apc.DisplayProvider(qbck.Provider)
 	if qbck.IsRemoteAIS() {
-		p = qbck.DisplayProvider()
+		p = "Remote " + p
 	}
 	foot := fmt.Sprintf("Total: [%s bucket%s: %d%s] ========", p, cos.Plural(footer.nb), footer.nb, s)
 	fmt.Fprintln(c.App.Writer, fcyan(foot))
+	return footer.nb
 }
 
-// (compare with `showBucketSummary` and `bsummSlow`)
-func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.Bck, fltPresence int, countRemoteObjs bool) {
+// compare with `showBucketSummary`
+func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, args api.BinfoArgs) int {
 	var (
 		footer      lsbFooter
 		hideHeader  = flagIsSet(c, noHeaderFlag)
 		hideFooter  = flagIsSet(c, noFooterFlag)
-		data        = make([]teb.ListBucketsHelper, 0, len(filtered))
+		data        = make([]teb.ListBucketsHelper, 0, len(bcks))
 		units, errU = parseUnitsFlag(c, unitsFlag)
 	)
 	if errU != nil {
@@ -142,17 +141,39 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.
 		units = ""
 	}
 	var (
-		opts = teb.Opts{AltMap: teb.FuncMapUnits(units)}
-		prev = mono.NanoTime()
-		max  = listObjectsWaitTime
+		opts       = teb.Opts{AltMap: teb.FuncMapUnits(units)}
+		maxwait    = listObjectsWaitTime
+		bckPresent = apc.IsFltPresent(args.FltPresence) // all-buckets part in the `allObjsOrBcksFlag`
+		dontWait   = flagIsSet(c, dontWaitFlag)
+		ctx        = newBsummContext(c, units, qbck, bckPresent, dontWait)
+		prev       = ctx.started
 	)
-	for i, bck := range filtered {
-		props, info, err := api.GetBucketInfo(apiBP, bck, fltPresence, countRemoteObjs)
-		if err != nil {
-			err = V(err)
-			warn := fmt.Sprintf("%s: %v\n", bck.Cname(""), err)
-			actionWarn(c, warn)
+	debug.Assert(args.Summarize)
+	args.CallAfter = ctx.args.CallAfter
+	args.Callback = ctx.args.Callback // reusing bsummCtx.progress()
+
+	// one at a time
+	for i := range bcks {
+		bck := bcks[i]
+		if !qbck.Contains(&bck) {
 			continue
+		}
+		ctx.qbck = cmn.QueryBcks(bck)
+		xid, props, info, err := api.GetBucketInfo(apiBP, bck, args)
+		if err != nil {
+			var partial bool
+			if herr, ok := err.(*cmn.ErrHTTP); ok {
+				if herr.Status == http.StatusAccepted {
+					continue
+				}
+				partial = herr.Status == http.StatusPartialContent
+			}
+			actionWarn(c, notV(err).Error())
+			if !partial {
+				continue
+			}
+			warn := fmt.Sprintf("%s[%s] %s - still running, showing partial results", cmdSummary, xid, bck.Cname(""))
+			actionWarn(c, warn)
 		}
 		footer.nb++
 		if info.IsBckPresent {
@@ -165,10 +186,10 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.
 		if bck.IsHTTP() {
 			bck.Name += " (URL: " + props.Extra.HTTP.OrigURLBck + ")"
 		}
-		data = append(data, teb.ListBucketsHelper{Bck: bck, Props: props, Info: info})
+		data = append(data, teb.ListBucketsHelper{XactID: xid, Bck: bck, Props: props, Info: info})
 
 		now := mono.NanoTime()
-		if elapsed := time.Duration(now - prev); elapsed < max && i < len(filtered)-1 {
+		if elapsed := time.Duration(now - prev); elapsed < maxwait && i < len(bcks)-1 {
 			continue
 		}
 		// print
@@ -179,12 +200,15 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.
 		}
 		data = data[:0]
 		prev = now
-		if i < len(filtered)-1 {
+		if i < len(bcks)-1 {
 			fmt.Fprintln(c.App.Writer)
 		}
 	}
+	if footer.nb == 0 {
+		return 0
+	}
 
-	if footer.robj == 0 && apc.IsRemoteProvider(qbck.Provider) && !countRemoteObjs {
+	if footer.robj == 0 && apc.IsRemoteProvider(qbck.Provider) && !args.WithRemote {
 		fmt.Fprintln(c.App.Writer)
 		note := fmt.Sprintf("to count and size remote buckets and objects outside ais cluster, use %s switch, see %s for details",
 			qflprn(allObjsOrBcksFlag), qflprn(cli.HelpFlag))
@@ -192,16 +216,19 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.
 	}
 
 	if hideFooter || footer.nbp <= 1 {
-		return
+		return footer.nb
 	}
 
+	//
+	// totals
+	//
 	var s, foot string
-	if !apc.IsFltPresent(fltPresence) {
+	if !apc.IsFltPresent(args.FltPresence) {
 		s = fmt.Sprintf(" (%d present)", footer.nbp)
 	}
 	p := apc.DisplayProvider(qbck.Provider)
 	if qbck.IsRemoteAIS() {
-		p = qbck.DisplayProvider()
+		p = "Remote " + p
 	}
 	apparentSize := teb.FmtSize(int64(footer.size), units, 2)
 	if footer.pobj+footer.robj != 0 {
@@ -212,6 +239,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, filtered []cmn.
 			p, cos.Plural(footer.nb), footer.nb, s, apparentSize, footer.pct)
 	}
 	fmt.Fprintln(c.App.Writer, fcyan(foot))
+	return footer.nb
 }
 
 func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) error {
@@ -236,20 +264,49 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	}
 
 	// lsmsg
-	msg := &apc.LsoMsg{Prefix: prefix}
-	addCachedCol := bck.IsRemote()
-	if flagIsSet(c, listObjCachedFlag) {
-		msg.SetFlag(apc.LsObjCached)
-		addCachedCol = false
+	var (
+		msg          = &apc.LsoMsg{Prefix: prefix}
+		addCachedCol bool
+	)
+	if bck.IsRemote() {
+		addCachedCol = true
+		msg.SetFlag(apc.LsBckPresent) // default
 	}
-	if flagIsSet(c, listAnonymousFlag) {
-		msg.SetFlag(apc.LsTryHeadRemote)
+	if flagIsSet(c, verChangedFlag) {
+		if bck.IsAIS() {
+			return fmt.Errorf("flag %s requires remote bucket (have: %s)", qflprn(verChangedFlag), bck)
+		}
+		if !bck.HasVersioningMD() {
+			return fmt.Errorf("flag %s only applies to remote backends that maintain at least some form of versioning information (have: %s)",
+				qflprn(verChangedFlag), bck)
+		}
+		msg.SetFlag(apc.LsVerChanged)
+	}
+
+	if flagIsSet(c, listObjCachedFlag) {
+		if flagIsSet(c, verChangedFlag) {
+			actionWarn(c, "checking remote versions may take some time...\n")
+			briefPause(1)
+		}
+		msg.SetFlag(apc.LsObjCached)
+		addCachedCol = false // redundant
+	}
+
+	// NOTE: `--all` combines two separate meanings:
+	// - list missing obj-s (with existing copies)
+	// - list obj-s from a remote bucket outside cluster
+	if flagIsSet(c, allObjsOrBcksFlag) {
+		msg.SetFlag(apc.LsMissing)
+		msg.ClearFlag(apc.LsBckPresent)
+	}
+	if flagIsSet(c, dontHeadRemoteFlag) {
+		msg.SetFlag(apc.LsDontHeadRemote)
+	}
+	if flagIsSet(c, dontAddRemoteFlag) {
+		msg.SetFlag(apc.LsDontAddRemote)
 	}
 	if listArch {
 		msg.SetFlag(apc.LsArchDir)
-	}
-	if flagIsSet(c, allObjsOrBcksFlag) {
-		msg.SetFlag(apc.LsAll)
 	}
 
 	var (
@@ -260,17 +317,26 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 		debug.Assert(apc.LsPropsSepa == ",", "',' is documented in 'objPropsFlag' usage and elsewhere")
 		props = splitCsv(propsStr) // split apc.LsPropsSepa
 	}
-	// NOTE: compare w/ `showObjProps()`
+
+	// add _implied_ props into control lsmsg
 	if flagIsSet(c, nameOnlyFlag) {
+		if flagIsSet(c, verChangedFlag) {
+			return fmt.Errorf(errFmtExclusive, qflprn(verChangedFlag), qflprn(nameOnlyFlag))
+		}
 		if len(props) > 2 {
-			warn := fmt.Sprintf("flag %s is incompatible with the value of %s",
-				qflprn(nameOnlyFlag), qflprn(objPropsFlag))
+			warn := fmt.Sprintf("flag %s is incompatible with the value of %s", qflprn(nameOnlyFlag), qflprn(objPropsFlag))
 			actionWarn(c, warn)
 		}
 		msg.SetFlag(apc.LsNameOnly)
 		msg.Props = apc.GetPropsName
 	} else if len(props) == 0 {
-		msg.AddProps(apc.GetPropsMinimal...)
+		if flagIsSet(c, dontAddRemoteFlag) {
+			msg.AddProps(apc.GetPropsName)
+			msg.AddProps(apc.GetPropsSize)
+			msg.SetFlag(apc.LsNameSize)
+		} else {
+			msg.AddProps(apc.GetPropsMinimal...)
+		}
 	} else {
 		if cos.StringInSlice(allPropsFlag.GetName(), props) {
 			msg.AddProps(apc.GetPropsAll...)
@@ -284,10 +350,21 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 		// (due to mirroring, EC). The status helps to tell an object from its replica(s).
 		msg.AddProps(apc.GetPropsStatus)
 	}
+	propsStr = msg.Props // show these and _only_ these props
+	// finally:
+	if flagIsSet(c, verChangedFlag) {
+		if !msg.WantProp(apc.GetPropsCustom) {
+			msg.AddProps(apc.GetPropsCustom)
+		}
+		if !msg.WantProp(apc.GetPropsVersion) {
+			msg.AddProps(apc.GetPropsVersion)
+		}
+	}
+
+	// set page size, limit
 	if flagIsSet(c, startAfterFlag) {
 		msg.StartAfter = parseStrFlag(c, startAfterFlag)
 	}
-
 	pageSize, limit, err := _setPage(c, bck)
 	if err != nil {
 		return err
@@ -300,7 +377,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 		for {
 			objList, err := api.ListObjectsPage(apiBP, bck, msg)
 			if err != nil {
-				return V(err)
+				return lsoErr(msg, err)
 			}
 
 			// print exact number of objects if it is `limit`ed: in case of
@@ -311,7 +388,8 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 			} else {
 				toPrint = objList.Entries
 			}
-			err = printObjProps(c, toPrint, lstFilter, msg.Props, addCachedCol)
+			err = printLso(c, toPrint, lstFilter, propsStr,
+				addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsVerChanged))
 			if err != nil {
 				return err
 			}
@@ -344,12 +422,23 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	if flagIsSet(c, refreshFlag) {
 		callAfter = parseDurationFlag(c, refreshFlag)
 	}
-	ctx := api.NewProgressContext(u.cb, callAfter)
-	objList, err := api.ListObjects(apiBP, bck, msg, api.ListArgs{Num: uint(limit), Progress: ctx})
+	args := api.ListArgs{Callback: u.cb, CallAfter: callAfter, Limit: uint(limit)}
+	objList, err := api.ListObjects(apiBP, bck, msg, args)
 	if err != nil {
-		return V(err)
+		return lsoErr(msg, err)
 	}
-	return printObjProps(c, objList.Entries, lstFilter, msg.Props, addCachedCol)
+	return printLso(c, objList.Entries, lstFilter, propsStr,
+		addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsVerChanged))
+}
+
+func lsoErr(msg *apc.LsoMsg, err error) error {
+	if herr, ok := err.(*cmn.ErrHTTP); ok && msg.IsFlagSet(apc.LsBckPresent) {
+		if herr.TypeCode == "ErrRemoteBckNotFound" {
+			err = V(err)
+			return fmt.Errorf("%v\nTip: use %s to list all objects including remote", V(err), qflprn(allObjsOrBcksFlag))
+		}
+	}
+	return V(err)
 }
 
 func _setPage(c *cli.Context, bck cmn.Bck) (pageSize, limit int, err error) {
@@ -375,6 +464,50 @@ func _setPage(c *cli.Context, bck cmn.Bck) (pageSize, limit int, err error) {
 		pageSize = limit
 	}
 	return
+}
+
+// NOTE: in addition to CACHED, may also dynamically add STATUS column
+func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, props string,
+	addCachedCol, isRemote, addStatusCol bool) error {
+	var (
+		hideHeader     = flagIsSet(c, noHeaderFlag)
+		hideFooter     = flagIsSet(c, noFooterFlag)
+		matched, other = lstFilter.apply(entries)
+		units, errU    = parseUnitsFlag(c, unitsFlag)
+	)
+	if errU != nil {
+		return errU
+	}
+
+	propsList := splitCsv(props)
+	if isRemote && !addStatusCol {
+		if addCachedCol && !cos.StringInSlice(apc.GetPropsStatus, propsList) {
+			for _, e := range entries {
+				if e.IsVerChanged() {
+					addStatusCol = true
+					break
+				}
+			}
+		}
+	}
+
+	tmpl := teb.LsoTemplate(propsList, hideHeader, addCachedCol, addStatusCol)
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(units)}
+	if err := teb.Print(matched, tmpl, opts); err != nil {
+		return err
+	}
+	if !hideFooter && len(matched) > 10 {
+		listed := fblue("Listed:")
+		fmt.Fprintln(c.App.Writer, listed, cos.FormatBigNum(len(matched)), "names")
+	}
+	if flagIsSet(c, showUnmatchedFlag) && len(other) > 0 {
+		unmatched := fcyan("\nNames that didn't match: ") + strconv.Itoa(len(other))
+		tmpl = unmatched + "\n" + tmpl
+		if err := teb.Print(other, tmpl, opts); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 ///////////////
@@ -481,9 +614,12 @@ type _listed struct {
 	l   int
 }
 
-func (u *_listed) cb(ctx *api.ProgressContext) {
+func (u *_listed) cb(ctx *api.LsoCounter) {
+	if ctx.Count() < 0 {
+		return
+	}
 	if !ctx.IsFinished() {
-		s := "Listed " + cos.FormatBigNum(ctx.Info().Count) + " objects"
+		s := "Listed " + cos.FormatBigNum(ctx.Count()) + " objects"
 		if u.l == 0 {
 			u.l = len(s) + 3
 			if u.bck.IsRemote() && !flagIsSet(u.c, listObjCachedFlag) {
@@ -496,9 +632,9 @@ func (u *_listed) cb(ctx *api.ProgressContext) {
 		}
 		s += strings.Repeat(" ", u.l-len(s))
 		fmt.Fprintf(u.c.App.Writer, "\r%s", s)
-	} else {
-		fmt.Fprintf(u.c.App.Writer, "\rListed %s objects in %v\n",
-			cos.FormatBigNum(ctx.Info().Count), teb.FormatDuration(ctx.Elapsed()))
-		time.Sleep(time.Second)
+	} else if !flagIsSet(u.c, noFooterFlag) {
+		elapsed := teb.FormatDuration(ctx.Elapsed())
+		fmt.Fprintf(u.c.App.Writer, "\rListed %s objects in %v\n", cos.FormatBigNum(ctx.Count()), elapsed)
+		briefPause(1)
 	}
 }

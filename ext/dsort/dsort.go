@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -22,13 +22,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
@@ -43,12 +43,8 @@ import (
 const PrefixJobID = "srt-"
 
 type (
-	receiver interface {
-		recvReq(hdr transport.ObjHdr, objReader io.Reader, err error) error // aka transport.RecvObj
-	}
 	dsorter interface {
 		shard.ContentLoader
-		receiver
 
 		name() string
 		init() error
@@ -69,8 +65,8 @@ type (
 var js = jsoniter.ConfigFastest
 
 func (m *Manager) finish() {
-	if m.config.FastV(4, cos.SmoduleDsort) {
-		nlog.Infof("%s: %s finished", g.t, m.ManagerUUID)
+	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+		nlog.Infof("%s: %s finished", core.T, m.ManagerUUID)
 	}
 	m.lock()
 	m.setInProgressTo(false)
@@ -85,25 +81,25 @@ func (m *Manager) finish() {
 func (m *Manager) start() (err error) {
 	defer m.finish()
 
-	if err := m.startDSorter(); err != nil {
+	if err := m.startDsorter(); err != nil {
 		return err
 	}
 
 	// Phase 1.
-	nlog.Infof("%s: %s started extraction stage", g.t, m.ManagerUUID)
+	nlog.Infof("%s: %s started extraction stage", core.T, m.ManagerUUID)
 	if err := m.extractLocalShards(); err != nil {
 		return err
 	}
 
 	s := binary.BigEndian.Uint64(m.Pars.TargetOrderSalt)
 	targetOrder := _torder(s, m.smap.Tmap)
-	if m.config.FastV(4, cos.SmoduleDsort) {
-		nlog.Infof("%s: %s final target in targetOrder => URL: %s, tid %s", g.t, m.ManagerUUID,
+	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+		nlog.Infof("%s: %s final target in targetOrder => URL: %s, tid %s", core.T, m.ManagerUUID,
 			targetOrder[len(targetOrder)-1].PubNet.URL, targetOrder[len(targetOrder)-1].ID())
 	}
 
 	// Phase 2.
-	nlog.Infof("%s: %s started sort stage", g.t, m.ManagerUUID)
+	nlog.Infof("%s: %s started sort stage", core.T, m.ManagerUUID)
 	curTargetIsFinal, err := m.participateInRecordDistribution(targetOrder)
 	if err != nil {
 		return err
@@ -113,17 +109,17 @@ func (m *Manager) start() (err error) {
 	if curTargetIsFinal {
 		// assuming uniform distribution estimate avg. output shard size
 		ratio := m.compressionRatio()
-		if m.config.FastV(4, cos.SmoduleDsort) {
-			nlog.Infof("%s [dsort] %s phase3: ratio=%f", g.t, m.ManagerUUID, ratio)
+		if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+			nlog.Infof("%s [dsort] %s phase3: ratio=%f", core.T, m.ManagerUUID, ratio)
 		}
 		debug.Assertf(shard.IsCompressed(m.Pars.InputExtension) || ratio == 1, "tar ratio=%f, ext=%q",
 			ratio, m.Pars.InputExtension)
 
 		shardSize := int64(float64(m.Pars.OutputShardSize) / ratio)
 		nlog.Infof("%s: [dsort] %s started phase 3: ratio=%f, shard size (%d, %d)",
-			g.t, m.ManagerUUID, shardSize, m.Pars.OutputShardSize)
+			core.T, m.ManagerUUID, shardSize, m.Pars.OutputShardSize)
 		if err := m.phase3(shardSize); err != nil {
-			nlog.Errorf("%s: [dsort] %s phase3 err: %v", g.t, m.ManagerUUID, err)
+			nlog.Errorf("%s: [dsort] %s phase3 err: %v", core.T, m.ManagerUUID, err)
 			return err
 		}
 	}
@@ -134,17 +130,17 @@ func (m *Manager) start() (err error) {
 	case <-m.startShardCreation:
 		break
 	case <-m.listenAborted():
-		return newDSortAbortedError(m.ManagerUUID)
+		return m.newErrAborted()
 	}
 
 	// After each target participates in the cluster-wide record distribution,
 	// start listening for the signal to start creating shards locally.
-	nlog.Infof("%s: %s started creation stage", g.t, m.ManagerUUID)
+	nlog.Infof("%s: %s started creation stage", core.T, m.ManagerUUID)
 	if err := m.dsorter.createShardsLocally(); err != nil {
 		return err
 	}
 
-	nlog.Infof("%s: %s finished successfully", g.t, m.ManagerUUID)
+	nlog.Infof("%s: %s finished successfully", core.T, m.ManagerUUID)
 	return nil
 }
 
@@ -171,12 +167,12 @@ func _torder(salt uint64, tmap meta.NodeMap) []*meta.Snode {
 	return t
 }
 
-func (m *Manager) startDSorter() error {
+func (m *Manager) startDsorter() error {
 	defer m.markStarted()
 	if err := m.initStreams(); err != nil {
 		return err
 	}
-	nlog.Infof("%s: %s starting with dsorter: %q", g.t, m.ManagerUUID, m.dsorter.name())
+	nlog.Infof("%s: %s starting with dsorter: %q", core.T, m.ManagerUUID, m.dsorter.name())
 	return m.dsorter.start()
 }
 
@@ -219,7 +215,7 @@ outer:
 		select {
 		case <-m.listenAborted():
 			group.Wait()
-			return newDSortAbortedError(m.ManagerUUID)
+			return m.newErrAborted()
 		case <-ctx.Done():
 			break outer // context canceled: we have an error
 		default:
@@ -242,7 +238,7 @@ outer:
 		select {
 		case <-m.listenAborted():
 			group.Wait()
-			return newDSortAbortedError(m.ManagerUUID)
+			return m.newErrAborted()
 		case <-ctx.Done():
 			break outer // context canceled: we have an error
 		default:
@@ -255,7 +251,7 @@ outer:
 	return group.Wait()
 }
 
-func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
+func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 	var (
 		metrics   = m.Metrics.Creation
 		shardName = s.Name
@@ -267,7 +263,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 	lom.SetAtimeUnix(time.Now().UnixNano())
 
 	if m.aborted() {
-		return newDSortAbortedError(m.ManagerUUID)
+		return m.newErrAborted()
 	}
 
 	if err := m.dsorter.preShardCreation(s.Name, lom.Mountpath()); err != nil {
@@ -291,7 +287,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 	go func() {
 		var err error
 		if !m.Pars.DryRun {
-			params := cluster.AllocPutObjParams()
+			params := core.AllocPutParams()
 			{
 				params.WorkTag = "dsort"
 				params.Cksum = nil
@@ -303,9 +299,11 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 
 				// TODO: params.Xact - in part, to count PUTs and bytes in a generic fashion
 				// (vs metrics.ShardCreationStats.updateThroughput - see below)
+
+				// TODO: add params.Size = (size resulting from shardRW.Create below)
 			}
-			err = g.t.PutObject(lom, params)
-			cluster.FreePutObjParams(params)
+			err = core.T.PutObject(lom, params)
+			core.FreePutParams(params)
 		} else {
 			_, err = io.Copy(io.Discard, r)
 		}
@@ -338,7 +336,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 			w.CloseWithError(err)
 		}
 	case <-m.listenAborted():
-		err = newDSortAbortedError(m.ManagerUUID)
+		err = m.newErrAborted()
 		r.CloseWithError(err)
 		w.CloseWithError(err)
 	}
@@ -350,7 +348,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 		return err
 	}
 
-	si, err := cluster.HrwTarget(lom.Uname(), m.smap)
+	si, err := m.smap.HrwHash2T(lom.Digest())
 	if err != nil {
 		return err
 	}
@@ -359,7 +357,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 	// according to HRW, send it there. Since it doesn't really matter
 	// if we have an extra copy of the object local to this target, we
 	// optimize for performance by not removing the object now.
-	if si.ID() != g.t.SID() && !m.Pars.DryRun {
+	if si.ID() != core.T.SID() && !m.Pars.DryRun {
 		lom.Lock(false)
 		defer lom.Unlock(false)
 
@@ -387,7 +385,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 		// Make send synchronous.
 		streamWg := &sync.WaitGroup{}
 		errCh := make(chan error, 1)
-		o.Callback = func(_ transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+		o.Callback = func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 			errCh <- err
 			streamWg.Done()
 		}
@@ -405,7 +403,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *cluster.LOM) (err error) {
 exit:
 	metrics.mu.Lock()
 	metrics.CreatedCnt++
-	if si.ID() != g.t.SID() {
+	if si.ID() != core.T.SID() {
 		metrics.MovedShardCnt++
 	}
 	metrics.mu.Unlock()
@@ -454,7 +452,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 		}
 
 		for i, d = range targetOrder {
-			if d != dummyTarget && d.ID() == g.t.SID() {
+			if d != dummyTarget && d.ID() == core.T.SID() {
 				break
 			}
 		}
@@ -528,7 +526,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 			select {
 			case <-m.listenReceived():
 			case <-m.listenAborted():
-				err = newDSortAbortedError(m.ManagerUUID)
+				err = m.newErrAborted()
 				return
 			}
 		}
@@ -626,7 +624,7 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard,
 		return nil, err
 	}
 	// is intra-call
-	tsi := g.t.Snode()
+	tsi := core.T.Snode()
 	req.Header.Set(apc.HdrCallerID, tsi.ID())
 	req.Header.Set(apc.HdrCallerName, tsi.String())
 
@@ -748,7 +746,7 @@ func (m *Manager) phase3(maxSize int64) error {
 			continue
 		}
 		shardsToTarget[d] = nil
-		if m.dsorter.name() == DSorterMemType {
+		if m.dsorter.name() == MemType {
 			sendOrder[d.ID()] = make(map[string]*shard.Shard, 100)
 		}
 	}
@@ -762,17 +760,17 @@ func (m *Manager) phase3(maxSize int64) error {
 	}
 
 	bck := meta.CloneBck(&m.Pars.OutputBck)
-	if err := bck.Init(g.t.Bowner()); err != nil {
+	if err := bck.Init(core.T.Bowner()); err != nil {
 		return err
 	}
 	for _, s := range shards {
-		si, err := cluster.HrwTarget(bck.MakeUname(s.Name), m.smap)
+		si, err := m.smap.HrwName2T(bck.MakeUname(s.Name))
 		if err != nil {
 			return err
 		}
 		shardsToTarget[si] = append(shardsToTarget[si], s)
 
-		if m.dsorter.name() == DSorterMemType {
+		if m.dsorter.name() == MemType {
 			singleSendOrder := make(map[string]*shard.Shard)
 			for _, record := range s.Records.All() {
 				shrd, ok := singleSendOrder[record.DaemonID]
@@ -794,7 +792,7 @@ func (m *Manager) phase3(maxSize int64) error {
 
 	m.recm.Records.Drain()
 
-	wg := cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), len(shardsToTarget))
+	wg := cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), len(shardsToTarget))
 	for si, s := range shardsToTarget {
 		wg.Add(1)
 		go m._dist(si, s, sendOrder[si.ID()], errCh, wg)
@@ -804,10 +802,10 @@ func (m *Manager) phase3(maxSize int64) error {
 	close(errCh)
 
 	for err := range errCh {
-		nlog.Errorf("%s: [dsort] %s err while sending shards: %v", g.t, m.ManagerUUID, err)
+		nlog.Errorf("%s: [dsort] %s err while sending shards: %v", core.T, m.ManagerUUID, err)
 		return err
 	}
-	nlog.Infof("%s: [dsort] %s finished sending shards", g.t, m.ManagerUUID)
+	nlog.Infof("%s: [dsort] %s finished sending shards", core.T, m.ManagerUUID)
 	return nil
 }
 
@@ -863,9 +861,9 @@ func (m *Manager) _do(reqArgs *cmn.HreqArgs, tsi *meta.Snode, act string) error 
 		var b []byte
 		b, err = io.ReadAll(resp.Body)
 		if err == nil {
-			err = fmt.Errorf("%s: %s failed to %s: %s", g.t, m.ManagerUUID, act, strings.TrimSuffix(string(b), "\n"))
+			err = fmt.Errorf("%s: %s failed to %s: %s", core.T, m.ManagerUUID, act, strings.TrimSuffix(string(b), "\n"))
 		} else {
-			err = fmt.Errorf("%s: %s failed to %s: got %v(%d) from %s", g.t, m.ManagerUUID, act, err,
+			err = fmt.Errorf("%s: %s failed to %s: got %v(%d) from %s", core.T, m.ManagerUUID, act, err,
 				resp.StatusCode, tsi.StringEx())
 		}
 	}
@@ -891,8 +889,8 @@ func (es *extractShard) do() (err error) {
 		ext, errV := archive.Mime("", es.name) // from filename
 		if errV == nil {
 			if !archive.EqExt(ext, m.Pars.InputExtension) {
-				if m.config.FastV(4, cos.SmoduleDsort) {
-					nlog.Infof("%s: %s skipping %s: %q vs %q", g.t, m.ManagerUUID,
+				if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+					nlog.Infof("%s: %s skipping %s: %q vs %q", core.T, m.ManagerUUID,
 						es.name, ext, m.Pars.InputExtension)
 				}
 				return
@@ -901,17 +899,17 @@ func (es *extractShard) do() (err error) {
 			shardName = es.name + m.Pars.InputExtension
 		}
 	}
-	lom := cluster.AllocLOM(shardName)
+	lom := core.AllocLOM(shardName)
 
 	err = es._do(lom)
 
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 	phaseInfo := &m.extractionPhase
 	phaseInfo.adjuster.releaseGoroutineSema()
 	return
 }
 
-func (es *extractShard) _do(lom *cluster.LOM) error {
+func (es *extractShard) _do(lom *core.LOM) error {
 	var (
 		m                        = es.m
 		estimateTotalRecordsSize uint64
@@ -946,7 +944,7 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 	phaseInfo.adjuster.acquireSema(lom.Mountpath())
 	if m.aborted() {
 		phaseInfo.adjuster.releaseSema(lom.Mountpath())
-		return newDSortAbortedError(m.ManagerUUID)
+		return m.newErrAborted()
 	}
 
 	cs := fs.Cap()
@@ -981,11 +979,11 @@ func (es *extractShard) _do(lom *cluster.LOM) error {
 	}
 
 	if toDisk {
-		g.tstats.Add(stats.DSortExtractShardDskCnt, 1)
+		g.tstats.Add(stats.DsortExtractShardDskCnt, 1)
 	} else {
-		g.tstats.Add(stats.DSortExtractShardMemCnt, 1)
+		g.tstats.Add(stats.DsortExtractShardMemCnt, 1)
 	}
-	g.tstats.Add(stats.DSortExtractShardSize, extractedSize)
+	g.tstats.Add(stats.DsortExtractShardSize, extractedSize)
 
 	//
 	// update metrics, check OOM

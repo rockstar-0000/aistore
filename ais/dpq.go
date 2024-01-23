@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -26,10 +26,12 @@ type dpq struct {
 	appendTy, appendHdl string // APPEND { apc.AppendOp, ... }
 	owt                 string // object write transaction { OwtPut, ... }
 	fltPresence         string // QparamFltPresence
+	dontHeadRemote      string // QparamDontHeadRemote
 	dontAddRemote       string // QparamDontAddRemote
-	countRemoteObjs     string // QparamCountRemoteObjs
+	bsummRemote         string // QparamBsummRemote
 	etlName             string // QparamETLName
 	silent              string // QparamSilent
+	latestVer           string // QparamLatestVer
 }
 
 var (
@@ -53,16 +55,16 @@ func dpqFree(dpq *dpq) {
 // Parse URL query for a selected few parameters used in the datapath.
 // (This is a faster alternative to the conventional and RFC-compliant URL.Query()
 // to be used narrowly to handle those few (keys) and nothing else.)
-func (dpq *dpq) fromRawQ(rawQuery string) (err error) {
+func (dpq *dpq) parse(rawQuery string) (err error) {
 	query := rawQuery
 	for query != "" {
 		key, value := query, ""
-		if i := strings.IndexAny(key, "&"); i >= 0 {
+		if i := strings.IndexByte(key, '&'); i >= 0 {
 			key, query = key[:i], key[i+1:]
 		} else {
 			query = ""
 		}
-		if k, v, ok := strings.Cut(key, "="); ok {
+		if k, v, ok := keyEQval(key); ok {
 			key, value = k, v
 		}
 		// supported URL query parameters explicitly named below; attempt to parse anything
@@ -104,16 +106,22 @@ func (dpq *dpq) fromRawQ(rawQuery string) (err error) {
 			}
 		case apc.QparamOWT:
 			dpq.owt = value
+
 		case apc.QparamFltPresence:
 			dpq.fltPresence = value
+		case apc.QparamDontHeadRemote:
+			dpq.dontHeadRemote = value
 		case apc.QparamDontAddRemote:
 			dpq.dontAddRemote = value
-		case apc.QparamCountRemoteObjs:
-			dpq.countRemoteObjs = value
+		case apc.QparamBsummRemote:
+			dpq.bsummRemote = value
+
 		case apc.QparamETLName:
 			dpq.etlName = value
 		case apc.QparamSilent:
 			dpq.silent = value
+		case apc.QparamLatestVer:
+			dpq.latestVer = value
 
 		case s3.QparamMptUploadID, s3.QparamMptUploads, s3.QparamMptPartNo:
 			// TODO: ignore for now
@@ -123,4 +131,11 @@ func (dpq *dpq) fromRawQ(rawQuery string) (err error) {
 		}
 	}
 	return
+}
+
+func keyEQval(s string) (string, string, bool) {
+	if i := strings.IndexByte(s, '='); i > 0 {
+		return s[:i], s[i+1:], true
+	}
+	return s, "", false
 }

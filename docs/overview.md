@@ -27,16 +27,18 @@ The rest of this document is structured as follows:
 - [Design Philosophy](#design-philosophy)
 - [Key Concepts and Diagrams](#key-concepts-and-diagrams)
 - [Traffic Patterns](#traffic-patterns)
+- [Read-after-write consistency](#read-after-write-consistency)
 - [Open Format](#open-format)
 - [Existing Datasets](#existing-datasets)
 - [Data Protection](#data-protection)
   - [Erasure Coding vs IO Performance](#erasure-coding-vs-io-performance)
 - [Scale-Out](#scale-out)
+- [Networking](#networking)
 - [HA](#ha)
 - [Other Services](#other-services)
 - [dSort](#dsort)
 - [CLI](#cli)
-- [AIS no-limitations principle](#ais-no-limitations-principle)
+- [_No limitations_ principle](#no-limitations-principle)
 
 ## Terminology
 
@@ -128,6 +130,35 @@ As far as the datapath is concerned, there are no extra hops in the line of comm
 > For detailed traffic patterns diagrams, please refer to [this readme](traffic_patterns.md).
 
 Distribution of objects across AIS cluster is done via (lightning fast) two-dimensional consistent-hash whereby objects get distributed across all storage targets and, within each target, all local disks.
+
+## Read-after-write consistency
+
+`PUT(object)` is a transaction. New object (or new version of the object) becomes visible/accessible only when aistore finishes writing the first replica and its metadata.
+
+For S3 or any other remote [backend](/docs/providers.md), the latter includes:
+
+* remote PUT via vendor's SDK library;
+* local write under a temp name;
+* getting successful remote response that carries remote metadata;
+* simultaneously, computing checksum (per bucket config);
+* optionally, checksum validation, if configured;
+* finally, writing combined object metadata, at which point the object becomes visible and accessible.
+
+But _not_ prior to that point!
+
+If configured, additional copies and EC slices are added asynchronously. E.g., given a bucket with 3-way replication you may already read the first replica when the other two (copies) are still pending.
+
+It is worth emphasizing that the same rules of data protection and consistency are universally enforced across the board for all _data writing_ scenarios, including (but not limited to):
+
+* RESTful PUT (above);
+* cold GET (as in: `ais get s3://abc/xyz /dev/null` when S3 has `abc/xyz` while aistore doesn't);
+* copy bucket; transform bucket;
+* multi-object copy; multi-object transform; multi-object archive;
+* prefetch remote bucket;
+* rename bucket;
+* promote NFS share
+
+and more.
 
 ## Open Format
 
@@ -247,6 +278,68 @@ The scale-out category includes balanced and fair distribution of objects where 
 
 Similar to the AIS gateways, AIS storage targets can join and leave at any moment causing the cluster to rebalance itself in the background and without downtime.
 
+## Networking
+
+Architecture-wise, aistore is built to support 3 (three) logical networks:
+* user-facing public and, possibly, **multi-home**) network interface
+* intra-cluster control, and
+* intra-cluster data
+
+The way the corresponding config may look in production (e.g.) follows:
+
+```console
+$ ais config node t[nKfooBE] local h... <TAB-TAB>
+host_net.hostname                 host_net.port_intra_control       host_net.hostname_intra_control
+host_net.port                     host_net.port_intra_data          host_net.hostname_intra_data
+
+$ ais config node t[nKfooBE] local host_net --json
+
+    "host_net": {
+        "hostname": "10.50.56.205",
+        "hostname_intra_control": "ais-target-27.ais.svc.cluster.local",
+        "hostname_intra_data": "ais-target-27.ais.svc.cluster.local",
+        "port": "51081",
+        "port_intra_control": "51082",
+        "port_intra_data": "51083"
+    }
+```
+
+The fact that there are 3 logical networks is not a limitation - i.e, not a requirement to have exactly 3 (networks).
+
+Using the example above, here's a small deployment-time change to run a single one:
+
+```console
+    "host_net": {
+        "hostname": "10.50.56.205",
+        "hostname_intra_control": "ais-target-27.ais.svc.cluster.local",
+        "hostname_intra_data": "ais-target-27.ais.svc.cluster.local",
+        "port": "51081",
+        "port_intra_control": "51081,   # <<<<<< notice the same port
+        "port_intra_data": "51081"      # <<<<<< ditto
+    }
+```
+
+Ideally though, production clusters are deployed over 3 physically different and isolated networks, whereby intense data traffic, for instance, does not introduce additional latency for the control one, etc.
+
+Separately, there's a **multi-homing** capability motivated by the fact that today's server systems may often have, say, two 50Gbps network adapters. To deliver the entire 100Gbps _without_ LACP trunking and (static) teaming, we could simply have something like:
+
+```console
+    "host_net": {
+        "hostname": "10.50.56.205, 10.50.56.206",
+        "hostname_intra_control": "ais-target-27.ais.svc.cluster.local",
+        "hostname_intra_data": "ais-target-27.ais.svc.cluster.local",
+        "port": "51081",
+        "port_intra_control": "51082",
+        "port_intra_data": "51083"
+    }
+```
+
+And that's all: add the second NIC (second IPv4 addr `10.50.56.206` above) with **no** other changes.
+
+See also:
+
+* [aistore configuration](configuration.md)
+
 ## HA
 
 AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](http_api.md).
@@ -273,7 +366,7 @@ Most notably, AIStore provides **[dSort](/docs/dsort.md)** - a MapReduce layer t
 
 ## dSort
 
-DSort “views” AIS objects as named shards that comprise archived key/value data. In its 1.0 realization, dSort supports tar, zip, and tar-gzip formats and a variety of built-in sorting algorithms; it is designed, though, to incorporate other popular archival formats including `tf.Record` and `tf.Example` ([TensorFlow](https://www.tensorflow.org/tutorials/load_data/tfrecord)) and [MessagePack](https://msgpack.org/index.html). The user runs dSort by specifying an input dataset, by-key or by-value (i.e., by content) sorting algorithm, and a desired size of the resulting shards. The rest is done automatically and in parallel by the AIS storage targets, with no part of the processing that’d involve a single-host centralization and with dSort stage and progress-within-stage that can be monitored via user-friendly statistics.
+Dsort “views” AIS objects as named shards that comprise archived key/value data. In its 1.0 realization, dSort supports tar, zip, and tar-gzip formats and a variety of built-in sorting algorithms; it is designed, though, to incorporate other popular archival formats including `tf.Record` and `tf.Example` ([TensorFlow](https://www.tensorflow.org/tutorials/load_data/tfrecord)) and [MessagePack](https://msgpack.org/index.html). The user runs dSort by specifying an input dataset, by-key or by-value (i.e., by content) sorting algorithm, and a desired size of the resulting shards. The rest is done automatically and in parallel by the AIS storage targets, with no part of the processing that’d involve a single-host centralization and with dSort stage and progress-within-stage that can be monitored via user-friendly statistics.
 
 By design, dSort tightly integrates with the AIS-object to take full advantage of the combined clustered CPU and IOPS. Each dSort job (note that multiple jobs can execute in parallel) generates a massively-parallel intra-cluster workload where each AIS target communicates with all other targets and executes a proportional "piece" of a job. This ultimately results in a *transformed* dataset optimized for subsequent training and inference by deep learning apps.
 
@@ -294,7 +387,7 @@ One salient feature of AIS CLI is its Bash style [auto-completions](/docs/cli.md
 
 AIS CLI is currently quickly developing. For more information, please see the project's own [README](/docs/cli.md).
 
-## AIS no-limitations principle
+## _No limitations_ principle
 
 There are **no** designed-in limitations on the:
 

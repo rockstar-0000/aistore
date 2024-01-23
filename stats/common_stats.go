@@ -1,7 +1,7 @@
 // Package stats provides methods and functionality to register, track, log,
 // and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
@@ -19,13 +19,13 @@ import (
 	ratomic "sync/atomic"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats/statsd"
@@ -58,7 +58,7 @@ const (
 	// all basic counters are accompanied by the corresponding (errPrefix + kind) error count:
 	// e.g.: "get.n" => "err.get.n", "put.n" => "err.put.n", etc.
 	// See also: `IncErr`, `regCommon`
-	GetCount    = "get.n"    // counts GET(object)
+	GetCount    = "get.n"    // GET(object) count = (cold + warm)
 	PutCount    = "put.n"    // ditto PUT
 	AppendCount = "append.n" // ditto etc.
 	DeleteCount = "del.n"    // ditto
@@ -318,8 +318,8 @@ func (s *coreStats) update(nv cos.NamedVal64) {
 		ratomic.AddInt64(&v.numSamples, 1)
 		fallthrough
 	case KindThroughput:
-		ratomic.AddInt64(&v.cumulative, nv.Value)
 		ratomic.AddInt64(&v.Value, nv.Value)
+		ratomic.AddInt64(&v.cumulative, nv.Value)
 	case KindCounter, KindSize:
 		ratomic.AddInt64(&v.Value, nv.Value)
 		// - non-empty suffix forces an immediate Tx with no aggregation (see below);
@@ -778,7 +778,7 @@ waitStartup:
 				deadline = time.Hour
 
 				nlog.Infoln(r.Name() + ": standing by...")
-				nlog.Flush()
+				nlog.Flush(nlog.ActNone)
 				continue
 			}
 			j += sleep
@@ -828,7 +828,7 @@ waitStartup:
 				flushTime = config.Log.FlushTime.D()
 			}
 			if nlog.Since() > flushTime || nlog.OOB() {
-				nlog.Flush()
+				nlog.Flush(nlog.ActNone)
 			}
 
 			now = mono.NanoTime()
@@ -836,6 +836,9 @@ waitStartup:
 				nlog.Infoln(cos.FormatTime(time.Now(), "" /* RFC822 */) + " =============")
 				lastDateTimestamp = now
 			}
+
+			// refresh assorted read-mostly
+			cmn.Rom.Set(&config.ClusterConfig)
 		case <-r.stopCh:
 			r.ticker.Stop()
 			return nil
@@ -907,12 +910,12 @@ func removeLogs(config *cmn.Config) {
 			}
 		}
 		if tot > maxtotal {
-			removeOlderLogs(config, tot, maxtotal, config.LogDir, logtype, finfos)
+			removeOlderLogs(tot, maxtotal, config.LogDir, logtype, finfos)
 		}
 	}
 }
 
-func removeOlderLogs(config *cmn.Config, tot, maxtotal int64, logdir, logtype string, filteredInfos []rfs.FileInfo) {
+func removeOlderLogs(tot, maxtotal int64, logdir, logtype string, filteredInfos []rfs.FileInfo) {
 	const prefix = "GC logs"
 	l := len(filteredInfos)
 	if l <= 1 {
@@ -923,7 +926,7 @@ func removeOlderLogs(config *cmn.Config, tot, maxtotal int64, logdir, logtype st
 		return filteredInfos[i].ModTime().Before(filteredInfos[j].ModTime())
 	}
 
-	verbose := config.FastV(4, cos.SmoduleStats)
+	verbose := cmn.Rom.FastV(4, cos.SmoduleStats)
 	if verbose {
 		nlog.Infoln(prefix + ": started")
 	}

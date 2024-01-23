@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xact/xs"
 )
@@ -42,7 +42,7 @@ func (reb *Reb) logHdr(rebID int64, smap *meta.Smap, initializing ...bool) strin
 	if smap != nil {
 		smapv = "v" + strconv.FormatInt(smap.Version, 10)
 	}
-	s := fmt.Sprintf("%s[g%d,%s", reb.t, rebID, smapv)
+	s := fmt.Sprintf("%s[g%d,%s", core.T, rebID, smapv)
 	if len(initializing) > 0 {
 		return s + "]"
 	}
@@ -67,12 +67,12 @@ func (reb *Reb) _waitForSmap() (smap *meta.Smap, err error) {
 	}
 	var (
 		config = cmn.GCO.Get()
-		sleep  = cmn.Timeout.CplaneOperation()
+		sleep  = cmn.Rom.CplaneOperation()
 		maxwt  = config.Rebalance.DestRetryTime.D()
 		curwt  time.Duration
 	)
 	maxwt = min(maxwt, config.Timeout.SendFile.D()/3)
-	nlog.Warningf("%s: waiting to start...", reb.t)
+	nlog.Warningf("%s: waiting to start...", core.T)
 	time.Sleep(sleep)
 	for curwt < maxwt {
 		smap = reb.smap.Load()
@@ -82,7 +82,7 @@ func (reb *Reb) _waitForSmap() (smap *meta.Smap, err error) {
 		time.Sleep(sleep)
 		curwt += sleep
 	}
-	return nil, fmt.Errorf("%s: timed out waiting for usable Smap", reb.t)
+	return nil, fmt.Errorf("%s: timed out waiting for usable Smap", core.T)
 }
 
 // Rebalance moves to the next stage:
@@ -93,7 +93,7 @@ func (reb *Reb) changeStage(newStage uint32) {
 	reb.stages.stage.Store(newStage)
 	var (
 		req = stageNtfn{
-			daemonID: reb.t.SID(), stage: newStage, rebID: reb.rebID.Load(),
+			daemonID: core.T.SID(), stage: newStage, rebID: reb.rebID.Load(),
 		}
 		hdr = transport.ObjHdr{}
 	)
@@ -107,12 +107,15 @@ func (reb *Reb) changeStage(newStage uint32) {
 // Aborts global rebalance and notifies all other targets.
 // (compare with `Abort` above)
 func (reb *Reb) abortAndBroadcast(err error) {
-	if xreb := reb.xctn(); xreb == nil || !xreb.Abort(err) {
+	xreb := reb.xctn()
+	if xreb == nil || !xreb.Abort(err) {
 		return
 	}
+	nlog.InfoDepth(1, xreb.Name(), "abort-and-bcast", err)
+
 	var (
 		req = stageNtfn{
-			daemonID: reb.t.SID(),
+			daemonID: core.T.SID(),
 			rebID:    reb.RebID(),
 			stage:    rebStageAbort,
 		}
@@ -143,14 +146,14 @@ func (reb *Reb) isQuiescent() bool {
 
 func (reb *Reb) lomAcks() *[cos.MultiSyncMapCount]*lomAcks { return &reb.lomacks }
 
-func (reb *Reb) addLomAck(lom *cluster.LOM) {
+func (reb *Reb) addLomAck(lom *core.LOM) {
 	lomAck := reb.lomAcks()[lom.CacheIdx()]
 	lomAck.mu.Lock()
 	lomAck.q[lom.Uname()] = lom
 	lomAck.mu.Unlock()
 }
 
-func (reb *Reb) delLomAck(lom *cluster.LOM, rebID int64, freeLOM bool) {
+func (reb *Reb) delLomAck(lom *core.LOM, rebID int64, freeLOM bool) {
 	if rebID != 0 && rebID != reb.rebID.Load() {
 		return
 	}
@@ -164,7 +167,7 @@ func (reb *Reb) delLomAck(lom *cluster.LOM, rebID int64, freeLOM bool) {
 				xreb := reb.xctn()
 				xreb.ObjsAdd(1, lomOrig.SizeBytes())
 
-				cluster.FreeLOM(lomOrig)
+				core.FreeLOM(lomOrig)
 			}
 		}
 	}

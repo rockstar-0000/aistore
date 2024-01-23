@@ -6,10 +6,9 @@ package xreg
 
 import (
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
 )
 
@@ -23,7 +22,7 @@ func RenewRebalance(id int64) RenewRes {
 	return dreg.renew(e, nil)
 }
 
-func RenewResilver(id string) cluster.Xact {
+func RenewResilver(id string) core.Xact {
 	e := dreg.nonbckXacts[apc.ActResilver].New(Args{UUID: id}, nil)
 	rns := dreg.renew(e, nil)
 	debug.Assert(!rns.IsRunning()) // NOTE: resilver is always preempted
@@ -45,17 +44,17 @@ func RenewStoreCleanup(id string) RenewRes {
 	return dreg.renew(e, nil)
 }
 
-func RenewDownloader(t cluster.Target, statsT stats.Tracker, xid string) RenewRes {
-	e := dreg.nonbckXacts[apc.ActDownload].New(Args{T: t, UUID: xid, Custom: statsT}, nil)
+func RenewDownloader(xid string, bck *meta.Bck) RenewRes {
+	e := dreg.nonbckXacts[apc.ActDownload].New(Args{UUID: xid, Custom: bck}, nil)
 	return dreg.renew(e, nil)
 }
 
-func RenewETL(t cluster.Target, msg any, xid string) RenewRes {
-	e := dreg.nonbckXacts[apc.ActETLInline].New(Args{T: t, UUID: xid, Custom: msg}, nil)
+func RenewETL(msg any, xid string) RenewRes {
+	e := dreg.nonbckXacts[apc.ActETLInline].New(Args{UUID: xid, Custom: msg}, nil)
 	return dreg.renew(e, nil)
 }
 
-func RenewBckSummary(t cluster.Target, bck *meta.Bck, msg *apc.BsummCtrlMsg) RenewRes {
-	e := dreg.nonbckXacts[apc.ActSummaryBck].New(Args{T: t, UUID: msg.UUID, Custom: msg}, bck)
+func RenewBckSummary(bck *meta.Bck, msg *apc.BsummCtrlMsg) RenewRes {
+	e := dreg.nonbckXacts[apc.ActSummaryBck].New(Args{UUID: msg.UUID, Custom: msg}, bck)
 	return dreg.renew(e, bck)
 }

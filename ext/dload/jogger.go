@@ -1,15 +1,16 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
 import (
 	"sync"
 
-	"github.com/NVIDIA/aistore/cluster"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 )
 
 const queueChSize = 1000
@@ -18,9 +19,9 @@ type (
 	queueEntry = map[string]struct{}
 
 	queue struct {
-		sync.RWMutex
 		ch chan *singleTask      // for pending downloads
 		m  map[string]queueEntry // jobID -> set of request uid
+		mu sync.RWMutex
 	}
 
 	// Each jogger corresponds to an mpath. All types of download requests
@@ -32,8 +33,8 @@ type (
 		terminateCh cos.StopCh // synchronizes termination
 		parent      *dispatcher
 		q           *queue
-		mtx         sync.RWMutex
 		task        *singleTask // currently running download task
+		mtx         sync.Mutex
 		stopAgent   bool
 	}
 )
@@ -45,7 +46,6 @@ func newJogger(d *dispatcher, mpath string) (j *jogger) {
 }
 
 func (j *jogger) jog() {
-	nlog.Infof("[downloader] starting jogger for mpath %q", j.mpath)
 	for {
 		t := j.q.get()
 		if t == nil {
@@ -53,10 +53,10 @@ func (j *jogger) jog() {
 		}
 
 		j.mtx.Lock()
-		// Check if the tasks exists to ensure that the job wasn't removed while
-		// we waited on the queue. We must do it under jogger lock to ensure that
+		// Check if the task exists to ensure that the job wasn't removed while
+		// we waited on the queue. We must do it under the jogger's lock to ensure that
 		// there is no race between aborting job and marking it as being handled.
-		if !j.checkTaskExists(t) {
+		if !j.taskExists(t) {
 			t.job.throttler().release()
 			j.mtx.Unlock()
 			continue
@@ -77,9 +77,12 @@ func (j *jogger) jog() {
 		j.task.init()
 		j.mtx.Unlock()
 
-		lom := cluster.AllocLOM(t.obj.objName)
-		t.download(lom, j.parent.config)
-		cluster.FreeLOM(lom)
+		// do
+		lom := core.AllocLOM(t.obj.objName)
+		t.download(lom)
+
+		// finish, cleanup
+		core.FreeLOM(lom)
 		t.cancel()
 
 		t.job.throttler().release()
@@ -88,7 +91,7 @@ func (j *jogger) jog() {
 		j.task.persist()
 		j.task = nil
 		j.mtx.Unlock()
-		if exists := j.q.delete(t); exists {
+		if j.q.del(t) {
 			j.parent.xdl.DecPending()
 		}
 	}
@@ -114,7 +117,9 @@ func (j *jogger) stop() {
 
 // Returns channel which task should be put into.
 func (j *jogger) putCh(t *singleTask) chan<- *singleTask {
+	j.q.mu.Lock()
 	ok, ch := j.q.putCh(t)
+	j.q.mu.Unlock()
 	if ok {
 		j.parent.xdl.IncPending()
 	}
@@ -122,32 +127,42 @@ func (j *jogger) putCh(t *singleTask) chan<- *singleTask {
 }
 
 func (j *jogger) getTask(jobID string) (task *singleTask) {
-	j.mtx.RLock()
+	j.mtx.Lock()
 	if j.task != nil && j.task.jobID() == jobID {
 		task = j.task
 	}
-	j.mtx.RUnlock()
-	return
+	j.mtx.Unlock()
+	return task
 }
 
 func (j *jogger) abortJob(id string) {
-	j.mtx.RLock()
-	defer j.mtx.RUnlock()
+	var task *singleTask
 
-	// Remove pending tasks in queue.
-	cnt := j.q.removeJob(id)
+	j.mtx.Lock()
+
+	j.q.mu.Lock()
+	cnt := j.q.removeJob(id) // remove from pending
+	j.q.mu.Unlock()
 	j.parent.xdl.SubPending(cnt)
 
-	// Abort currently running task, if belongs to a given job.
 	if j.task != nil && j.task.jobID() == id {
+		task = j.task
+		// iff the task belongs to the specified job
 		j.task.cancel()
+	}
+
+	j.mtx.Unlock()
+
+	if task != nil && cmn.Rom.FastV(4, cos.SmoduleDload) /*verbose*/ {
+		nlog.Infof("%s: abort-job[%s, mpath=%s], task=%s", core.T.String(), id, j.mpath, j.task.String())
 	}
 }
 
-func (j *jogger) checkTaskExists(t *singleTask) (exists bool) {
-	j.q.RLock()
-	defer j.q.RUnlock()
-	return j.q.exists(t.jobID(), t.uid())
+func (j *jogger) taskExists(t *singleTask) (exists bool) {
+	j.q.mu.RLock()
+	exists = j.q.exists(t.jobID(), t.uid())
+	j.q.mu.RUnlock()
+	return exists
 }
 
 // Returns true if there is any pending task for a given job (either running or in queue),
@@ -164,9 +179,8 @@ func newQueue() *queue {
 	}
 }
 
+// PRECONDITION: `q.Lock()` must be taken.
 func (q *queue) putCh(t *singleTask) (ok bool, ch chan<- *singleTask) {
-	q.Lock()
-	defer q.Unlock()
 	if q.stopped() || q.exists(t.jobID(), t.uid()) {
 		// If task already exists or the queue was stopped we should just omit it
 		// hence return channel which immediately accepts and omits the task.
@@ -189,18 +203,18 @@ func (q *queue) get() (foundTask *singleTask) {
 	return t
 }
 
-func (q *queue) delete(t *singleTask) bool {
-	q.Lock()
+func (q *queue) del(t *singleTask) bool {
+	q.mu.Lock()
 	deleted := q.removeFromSet(t.jobID(), t.uid())
-	q.Unlock()
+	q.mu.Unlock()
 	return deleted
 }
 
 func (q *queue) cleanup() {
-	q.Lock()
+	q.mu.Lock()
 	q.ch = nil
 	q.m = nil
-	q.Unlock()
+	q.mu.Unlock()
 }
 
 // PRECONDITION: `q.RLock()` must be taken.
@@ -219,10 +233,10 @@ func (q *queue) exists(jobID, requestUID string) bool {
 	return ok
 }
 
-func (q *queue) pending(jobID string) bool {
-	q.RLock()
-	defer q.RUnlock()
-	_, exists := q.m[jobID]
+func (q *queue) pending(jobID string) (exists bool) {
+	q.mu.RLock()
+	_, exists = q.m[jobID]
+	q.mu.RUnlock()
 	return exists
 }
 
@@ -251,9 +265,8 @@ func (q *queue) removeFromSet(jobID, requestUID string) (deleted bool) {
 	return false
 }
 
+// PRECONDITION: `q.Lock()` must be taken.
 func (q *queue) removeJob(id string) int {
-	q.Lock()
-	defer q.Unlock()
 	if q.stopped() {
 		return 0
 	}

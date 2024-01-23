@@ -72,7 +72,7 @@ OPTIONS:
 
 ## Example
 
-This example simply runs [ais/test/scripts/dsort-ex1-spec.json](https://github.com/NVIDIA/aistore/blob/master/ais/test/scripts/dsort-ex1-spec.json) specification. The source and destination buckets - ais://src and ais://dst, respectively - must exist.
+This example simply runs [ais/test/scripts/dsort-ex1-spec.json](https://github.com/NVIDIA/aistore/blob/main/ais/test/scripts/dsort-ex1-spec.json) specification. The source and destination buckets - ais://src and ais://dst, respectively - must exist.
 
 Further, the source buckets must have at least 10 shards with names that match `input_format` (see below).
 
@@ -90,7 +90,6 @@ create_concurrency_max_limit     0
 description                      sort shards alphanumerically
 dry_run                          false
 dsorter_type                     -
-extended_metrics                 true
 extension                        .tar
 extract_concurrency_max_limit    0
 input_bck                        ais://src
@@ -150,7 +149,6 @@ The following table describes JSON/YAML keys which can be used in the specificat
 | `max_mem_usage` | `string` | limits the amount of total system memory allocated by both dSort and other running processes. Once and if this threshold is crossed, dSort will continue extracting onto local drives. Can be in format 60% or 10GB | no | same as in `/deploy/dev/local/aisnode_config.sh` |
 | `extract_concurrency_max_limit` | `int` | limits maximum number of concurrent shards extracted per disk | no | (calculated based on different factors) ~50 |
 | `create_concurrency_max_limit` | `int` | limits maximum number of concurrent shards created per disk| no | (calculated based on different factors) ~50 |
-| `extended_metrics` | `bool` | determines if dSort should collect extended statistics | no | `false` |
 
 There's also the possibility to override some of the values from global `distributed_sort` config via job specification.
 All values are optional - if empty, the value from global `distributed_sort` config will be used.
@@ -186,7 +184,6 @@ Assuming that `dsort_spec.json` contains:
     "algorithm": {
         "kind": "alphanumeric"
     },
-    "extended_metrics": true
 }
 ```
 
@@ -344,7 +341,7 @@ Save newly fetched metrics of the dSort job with ID `5JjIuGemR` to `/tmp/dsort_r
 
 ```console
 $ ais show job dsort 5JjIuGemR --refresh 500ms --log "/tmp/dsort_run.txt"
-DSort job has finished successfully in 21.948806ms:
+Dsort job has finished successfully in 21.948806ms:
   Longest extraction:	1.49907ms
   Longest sorting:	8.288299ms
   Longest creation:	4.553µs

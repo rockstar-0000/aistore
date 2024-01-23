@@ -17,11 +17,11 @@ Note:
 
 The directory usually contains plain-text `authn.json` configuration and tokens DB `authn.db`
 
-> For the most updated system filenames and configuration directories, please see [`fname/fname.go`](https://github.com/NVIDIA/aistore/blob/master/cmn/fname/fname.go) source.
+> For the most updated system filenames and configuration directories, please see [`fname/fname.go`](https://github.com/NVIDIA/aistore/blob/main/cmn/fname/fname.go) source.
 
 Examples below use AuthN specific environment variables. Note that all of them are enumerated in:
 
-* [`api/env/authn.go`](https://github.com/NVIDIA/aistore/blob/master/api/env/authn.go)
+* [`api/env/authn.go`](https://github.com/NVIDIA/aistore/blob/main/api/env/authn.go)
 
 ## Getting started with AuthN: local-playground session
 
@@ -49,7 +49,7 @@ Guest-myclu             Read-only access to buckets in WayZWN_f4[myclu]
 
 # 3. Create a bucket (to further demonstrate access permissions in action)
 $ ais create ais://nnn
-"ais://nnn" created (see https://github.com/NVIDIA/aistore/blob/master/docs/bucket.md#default-bucket-properties)
+"ais://nnn" created (see https://github.com/NVIDIA/aistore/blob/main/docs/bucket.md#default-bucket-properties)
 $ ais put README.md ais://nnn
 PUT "README.md" to ais://nnn
 
@@ -57,7 +57,7 @@ PUT "README.md" to ais://nnn
 #  and a (user-friendly) description. A given role can be assigned to multiple users.
 $ ais auth add role new-role myclu <TAB-TAB>
 ADMIN                  DESTROY-BUCKET         HEAD-OBJECT            MOVE-OBJECT            ro
-APPEND                 DISCONNECTED-BACKEND   LIST-BUCKETS           PATCH                  rw
+APPEND                 UPDATE-OBJECT          LIST-BUCKETS           PATCH                  rw
 CREATE-BUCKET          GET                    LIST-OBJECTS           PROMOTE                SET-BUCKET-ACL
 DELETE-OBJECT          HEAD-BUCKET            MOVE-BUCKET            PUT                    su
 
@@ -170,7 +170,7 @@ Environment variables used by the deployment script to setup AuthN server:
 | AIS_AUTHN_ENABLED | `false` | Set it to `true` to enable AuthN server and token-based access in AIStore proxy |
 | AIS_AUTHN_PORT | `52001` | Port on which AuthN listens to requests |
 | AIS_AUTHN_TTL | `24h` | A token expiration time. Can be set to 0 which means "no expiration time" |
-| AIS_AUTHN_USE_HTTPS | `false` | Enable secure HTTP for AuthN server. If `true`, AuthN server requires also `AIS_SERVER_CRT` and `AIS_SERVER_KEY` to be set |
+| AIS_AUTHN_USE_HTTPS | `false` | Enable HTTPS for AuthN server. If `true`, AuthN server requires also `AIS_SERVER_CRT` and `AIS_SERVER_KEY` to be set |
 | AIS_SERVER_CRT | ` ` | OpenSSL certificate. Optional: set it only when secure HTTP is enabled |
 | AIS_SERVER_KEY | ` ` | OpenSSL key. Optional: set it only when secure HTTP is enabled |
 

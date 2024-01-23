@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
 )
@@ -63,7 +63,7 @@ type (
 	}
 )
 
-func voteInProgress() (xele cluster.Xact) {
+func voteInProgress() (xele core.Xact) {
 	if e := xreg.GetRunning(xreg.Flt{Kind: apc.ActElection}); e != nil {
 		xele = e.Get()
 	}
@@ -80,7 +80,7 @@ func (p *proxy) voteHandler(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPut)
 		return
 	}
-	apiItems, err := p.parseURL(w, r, 1, false, apc.URLPathVote.L)
+	apiItems, err := p.parseURL(w, r, apc.URLPathVote.L, 1, false)
 	if err != nil {
 		return
 	}
@@ -114,7 +114,7 @@ func (p *proxy) voteHandler(w http.ResponseWriter, r *http.Request) {
 
 // PUT /v1/vote/init (via sendElectionRequest)
 func (p *proxy) httpelect(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.parseURL(w, r, 0, false, apc.URLPathVoteInit.L); err != nil {
+	if _, err := p.parseURL(w, r, apc.URLPathVoteInit.L, 0, false); err != nil {
 		return
 	}
 	msg := VoteInitiationMessage{}
@@ -140,7 +140,7 @@ func (p *proxy) httpelect(w http.ResponseWriter, r *http.Request) {
 		if isErrDowngrade(err) {
 			psi := newSmap.GetProxy(msg.Request.Candidate)
 			psi2 := p.owner.smap.get().GetProxy(msg.Request.Candidate)
-			if psi2.Equals(psi) {
+			if psi2.Eq(psi) {
 				err = nil
 			}
 		}
@@ -151,7 +151,7 @@ func (p *proxy) httpelect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	smap = p.owner.smap.get()
-	psi, err := cluster.HrwProxy(&smap.Smap, smap.Primary.ID())
+	psi, err := smap.HrwProxy(smap.Primary.ID())
 	if err != nil {
 		p.writeErr(w, r, err)
 		return
@@ -236,20 +236,21 @@ func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 		if err == nil {
 			nlog.Infof("%s: current primary %s is up, moving back to idle", p, curPrimary)
 		} else {
-			errV := fmt.Errorf("%s: current primary(?) %s responds but does not consider itself primary", p, curPrimary.StringEx())
-			nlog.Errorln(errV)
-			xele.AddErr(errV)
+			errV := fmt.Errorf("%s: current primary(?) %s responds but does not consider itself primary",
+				p, curPrimary.StringEx())
+			xele.AddErr(errV, 0)
 		}
 		return
 	}
-	nlog.Infof("%s: primary %s is confirmed down: [%v] - moving to election state phase 1 (prepare)", p, curPrimary.StringEx(), err)
+	nlog.Infof("%s: primary %s is confirmed down: [%v] - moving to election state phase 1 (prepare)",
+		p, curPrimary.StringEx(), err)
 
 	// 2. election phase 1
-	elected, votingErrors := p.electPhase1(vr, config)
+	elected, votingErrors := p.electPhase1(vr)
 	if !elected {
-		errV := fmt.Errorf("%s: election phase 1 (prepare) failed: primary still %s w/ status unknown", p, curPrimary.StringEx())
-		nlog.Errorln(errV)
-		xele.AddErr(errV)
+		errV := fmt.Errorf("%s: election phase 1 (prepare) failed: primary still %s w/ status unknown",
+			p, curPrimary.StringEx())
+		xele.AddErr(errV, 0)
 
 		smap = p.owner.smap.get()
 		if smap.version() > vr.Smap.version() {
@@ -261,11 +262,14 @@ func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 		svm, _, slowp := p.bcastMaxVer(smap, nil, nil)
 		if svm.Smap != nil && !slowp {
 			if svm.Smap.UUID == smap.UUID && svm.Smap.version() > smap.version() && svm.Smap.validate() == nil {
-				nlog.Warningf("%s: upgrading local %s to cluster max-ver %s", p, smap.StringEx(), svm.Smap.StringEx())
+				nlog.Warningf("%s: upgrading local %s to cluster max-ver %s",
+					p, smap.StringEx(), svm.Smap.StringEx())
 				if svm.Smap.Primary.ID() != smap.Primary.ID() {
-					nlog.Warningf("%s: new primary %s is already elected ...", p, svm.Smap.Primary.StringEx())
+					nlog.Warningf("%s: new primary %s is already elected ...",
+						p, svm.Smap.Primary.StringEx())
 				}
-				if errV := p.owner.smap.synchronize(p.si, svm.Smap, nil /*ms payload*/, p.smapUpdatedCB); errV != nil {
+				errV := p.owner.smap.synchronize(p.si, svm.Smap, nil /*ms payload*/, p.smapUpdatedCB)
+				if errV != nil {
 					cos.ExitLog(errV)
 				}
 			}
@@ -275,13 +279,12 @@ func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 	}
 
 	// 3. election phase 2
-	nlog.Infof("%s: moving to election state phase 2 (commit)", p)
+	nlog.Infoln(p.String()+":", "moving to election state phase 2 (commit)")
 	confirmationErrors := p.electPhase2(vr)
 	for sid := range confirmationErrors {
 		if !votingErrors.Contains(sid) {
 			errV := fmt.Errorf("%s: error confirming the election: %s was healthy when voting", p, sid)
-			nlog.Errorln(errV)
-			xele.AddErr(errV)
+			xele.AddErr(errV, 0)
 		}
 	}
 
@@ -291,7 +294,7 @@ func (p *proxy) elect(vr *VoteRecord, xele *xs.Election) {
 }
 
 // phase 1: prepare (via simple majority voting)
-func (p *proxy) electPhase1(vr *VoteRecord, config *cmn.Config) (winner bool, errors cos.StrSet) {
+func (p *proxy) electPhase1(vr *VoteRecord) (winner bool, errors cos.StrSet) {
 	var (
 		resCh = p.requestVotes(vr)
 		y, n  int
@@ -305,7 +308,7 @@ func (p *proxy) electPhase1(vr *VoteRecord, config *cmn.Config) (winner bool, er
 			}
 			n++
 		} else {
-			if config.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 				nlog.Infof("Node %s responded with (winner: %t)", res.daemonID, res.yes)
 			}
 			if res.yes {
@@ -334,7 +337,7 @@ func (p *proxy) requestVotes(vr *VoteRecord) chan voteResult {
 		Body:   cos.MustMarshal(&msg),
 		Query:  q,
 	}
-	args.to = cluster.AllNodes
+	args.to = core.AllNodes
 	results := p.bcastGroup(args)
 	freeBcArgs(args)
 	resCh := make(chan voteResult, len(results))
@@ -374,7 +377,7 @@ func (p *proxy) electPhase2(vr *VoteRecord) cos.StrSet {
 	)
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: apc.URLPathVoteVoteres.S, Body: cos.MustMarshal(msg)}
-	args.to = cluster.AllNodes
+	args.to = core.AllNodes
 	results := p.bcastGroup(args)
 	freeBcArgs(args)
 	for _, res := range results {
@@ -398,7 +401,7 @@ func (t *target) voteHandler(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPut)
 		return
 	}
-	apiItems, err := t.parseURL(w, r, 1, false, apc.URLPathVote.L)
+	apiItems, err := t.parseURL(w, r, apc.URLPathVote.L, 1, false)
 	if err != nil {
 		return
 	}
@@ -438,7 +441,7 @@ func (h *htrun) onPrimaryDown(self *proxy, callerID string) {
 			return
 		}
 		// use HRW ordering
-		nextPrimaryProxy, err := cluster.HrwProxy(&clone.Smap, clone.Primary.ID())
+		nextPrimaryProxy, err := clone.HrwProxy(clone.Primary.ID())
 		if err != nil {
 			if !daemon.stopping.Load() {
 				nlog.Errorf("%s failed to execute HRW selection: %v", h, err)
@@ -488,7 +491,7 @@ func (h *htrun) onPrimaryDown(self *proxy, callerID string) {
 
 // GET /v1/vote/proxy
 func (h *htrun) httpgetvote(w http.ResponseWriter, r *http.Request) {
-	if _, err := h.parseURL(w, r, 0, false, apc.URLPathVoteProxy.L); err != nil {
+	if _, err := h.parseURL(w, r, apc.URLPathVoteProxy.L, 0, false); err != nil {
 		return
 	}
 	msg := VoteMessage{}
@@ -526,7 +529,7 @@ func (h *htrun) httpgetvote(w http.ResponseWriter, r *http.Request) {
 		if isErrDowngrade(err) {
 			newSmap2 := h.owner.smap.get()
 			psi2 := newSmap2.GetProxy(candidate)
-			if psi2.Equals(psi) {
+			if psi2.Eq(psi) {
 				err = nil // not an error - can vote Yes
 			}
 		}
@@ -556,7 +559,7 @@ func (h *htrun) httpgetvote(w http.ResponseWriter, r *http.Request) {
 
 // PUT /v1/vote/result
 func (h *htrun) httpsetprimary(w http.ResponseWriter, r *http.Request) {
-	if _, err := h.parseURL(w, r, 0, false, apc.URLPathVoteVoteres.L); err != nil {
+	if _, err := h.parseURL(w, r, apc.URLPathVoteVoteres.L, 0, false); err != nil {
 		return
 	}
 	msg := VoteResultMessage{}
@@ -615,7 +618,7 @@ func (h *htrun) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *meta.S
 		return
 	}
 	// retry
-	sleep := cmn.Timeout.CplaneOperation() / 2
+	sleep := cmn.Rom.CplaneOperation() / 2
 	for i := 0; i < maxRetryElectReq; i++ {
 		time.Sleep(sleep)
 		res = h.call(cargs, vr.Smap)
@@ -637,11 +640,10 @@ func (h *htrun) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *meta.S
 }
 
 func (h *htrun) voteOnProxy(daemonID, currPrimaryID string) (bool, error) {
-	config := cmn.GCO.Get()
 	// First: Check last keepalive timestamp. If the proxy was recently successfully reached,
 	// this will always vote no, as we believe the original proxy is still alive.
 	if !h.keepalive.timeToPing(currPrimaryID) {
-		if config.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 			nlog.Warningf("Primary %s is still alive", currPrimaryID)
 		}
 		return false, nil
@@ -650,13 +652,13 @@ func (h *htrun) voteOnProxy(daemonID, currPrimaryID string) (bool, error) {
 	// Second: Vote according to whether or not the candidate is the Highest Random Weight remaining
 	// in the Smap
 	smap := h.owner.smap.get()
-	nextPrimaryProxy, err := cluster.HrwProxy(&smap.Smap, currPrimaryID)
+	nextPrimaryProxy, err := smap.HrwProxy(currPrimaryID)
 	if err != nil {
 		return false, fmt.Errorf("error executing HRW: %v", err)
 	}
 
 	vote := nextPrimaryProxy.ID() == daemonID
-	if config.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		nlog.Infof("%s: voting '%t' for %s", h, vote, daemonID)
 	}
 	return vote, nil

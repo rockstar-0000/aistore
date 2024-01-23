@@ -1,6 +1,6 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
@@ -11,12 +11,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,14 +27,13 @@ const appLabel = "app"
 
 type etlBootstrapper struct {
 	// construction
-	t      cluster.Target
 	errCtx *cmn.ETLErrCtx
 	config *cmn.Config
 	msg    InitSpecMsg
 	env    map[string]string
 
 	// runtime
-	xctn            cluster.Xact
+	xctn            core.Xact
 	pod             *corev1.Pod
 	svc             *corev1.Service
 	uri             string
@@ -54,7 +53,7 @@ func (b *etlBootstrapper) createPodSpec() (err error) {
 func (b *etlBootstrapper) _prepSpec() (err error) {
 	// Override pod name: append target ID
 	// (K8s doesn't allow `_` and uppercase)
-	b.pod.SetName(k8s.CleanName(b.msg.IDX + "-" + b.t.SID()))
+	b.pod.SetName(k8s.CleanName(b.msg.IDX + "-" + core.T.SID()))
 	b.errCtx.PodName = b.pod.GetName()
 	b.pod.APIVersion = "v1"
 
@@ -75,7 +74,7 @@ func (b *etlBootstrapper) _prepSpec() (err error) {
 
 	b._setPodEnv()
 
-	if b.config.FastV(4, cos.SmoduleETL) {
+	if cmn.Rom.FastV(4, cos.SmoduleETL) {
 		nlog.Infof("prep pod spec: %s, %+v", b.msg.String(), b.errCtx)
 	}
 	return
@@ -122,7 +121,7 @@ func (b *etlBootstrapper) setupConnection() (err error) {
 	// it is accessible from target.
 	etlSocketAddr := fmt.Sprintf("%s:%d", hostIP, nodePort)
 	if err = b._dial(etlSocketAddr); err != nil {
-		if b.config.FastV(4, cos.SmoduleETL) {
+		if cmn.Rom.FastV(4, cos.SmoduleETL) {
 			nlog.Warningf("failed to dial -> %s: %s, %+v, %s", etlSocketAddr, b.msg.String(), b.errCtx, b.uri)
 		}
 		err = cmn.NewErrETL(b.errCtx, err.Error())
@@ -130,14 +129,14 @@ func (b *etlBootstrapper) setupConnection() (err error) {
 	}
 
 	b.uri = "http://" + etlSocketAddr
-	if b.config.FastV(4, cos.SmoduleETL) {
+	if cmn.Rom.FastV(4, cos.SmoduleETL) {
 		nlog.Infof("setup connection -> %s, %+v, %s", b.uri, b.msg.String(), b.errCtx)
 	}
 	return nil
 }
 
 func (b *etlBootstrapper) _dial(socketAddr string) error {
-	probeInterval := cmn.Timeout.MaxKeepalive()
+	probeInterval := cmn.Rom.MaxKeepalive()
 	err := cmn.NetworkCallWithRetry(&cmn.RetryArgs{
 		Call: func() (int, error) {
 			conn, err := net.DialTimeout("tcp", socketAddr, probeInterval)
@@ -193,8 +192,9 @@ func (b *etlBootstrapper) waitPodReady() error {
 	if err != nil {
 		return cmn.NewErrETL(b.errCtx, "%v", err)
 	}
-	if b.config.FastV(4, cos.SmoduleETL) {
-		nlog.Infof("waiting pod %q ready (%+v, %s) timeout=%v ival=%v", b.pod.Name, b.msg.String(), b.errCtx, timeout, interval)
+	if cmn.Rom.FastV(4, cos.SmoduleETL) {
+		nlog.Infof("waiting pod %q ready (%+v, %s) timeout=%v ival=%v",
+			b.pod.Name, b.msg.String(), b.errCtx, timeout, interval)
 	}
 	// wait
 	err = wait.PollUntilContextTimeout(context.Background(), interval, timeout, false, /*immediate*/
@@ -213,13 +213,13 @@ func (b *etlBootstrapper) waitPodReady() error {
 	err = cmn.NewErrETL(b.errCtx,
 		`%v (pod phase: %q, pod conditions: %s; expected condition: %s)`,
 		err, pod.Status.Phase, podConditionsToString(pod.Status.Conditions),
-		podConditionToString(corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}),
+		podConditionToString(&corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}),
 	)
 	return err
 }
 
 func (b *etlBootstrapper) setupXaction(xid string) {
-	rns := xreg.RenewETL(b.t, b.msg, xid)
+	rns := xreg.RenewETL(b.msg, xid)
 	debug.AssertNoErr(rns.Err)
 	debug.Assert(!rns.IsRunning())
 	b.xctn = rns.Entry.Get()
@@ -297,7 +297,7 @@ func (b *etlBootstrapper) _updPodLabels() {
 	b.pod.Labels[appLabel] = "ais"
 	b.pod.Labels[podNameLabel] = b.pod.GetName()
 	b.pod.Labels[podNodeLabel] = k8s.NodeName
-	b.pod.Labels[podTargetLabel] = b.t.SID()
+	b.pod.Labels[podTargetLabel] = core.T.SID()
 	b.pod.Labels[appK8sNameLabel] = "etl"
 	b.pod.Labels[appK8sComponentLabel] = "server"
 }
@@ -332,7 +332,7 @@ func (b *etlBootstrapper) _setPodEnv() {
 	for idx := range containers {
 		containers[idx].Env = append(containers[idx].Env, corev1.EnvVar{
 			Name:  "AIS_TARGET_URL",
-			Value: b.t.Snode().URL(cmn.NetPublic) + apc.URLPathETLObject.Join(reqSecret),
+			Value: core.T.Snode().URL(cmn.NetPublic) + apc.URLPathETLObject.Join(reqSecret),
 		})
 		for k, v := range b.env {
 			containers[idx].Env = append(containers[idx].Env, corev1.EnvVar{

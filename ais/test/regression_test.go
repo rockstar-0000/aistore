@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -21,11 +21,11 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
@@ -76,7 +76,7 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 	m.puts()
 
 	msg := &apc.LsoMsg{Props: apc.GetPropsLocation}
-	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Num: uint(m.num)})
+	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: uint(m.num)})
 	tassert.CheckFatal(t, err)
 
 	if len(lst.Entries) != m.num {
@@ -91,7 +91,7 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 		if e.Location == "" {
 			t.Fatalf("[%#v]: location is empty", e)
 		}
-		tname, _ := cluster.ParseObjLoc(e.Location)
+		tname, _ := core.ParseObjLoc(e.Location)
 		tid := meta.N2ID(tname)
 		targets[tid] = struct{}{}
 		tsi := smap.GetTarget(tid)
@@ -114,11 +114,9 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 			})
 
 			_, err = api.GetObject(baseParams, m.bck, e.Name, nil)
-
-			// TODO -- FIXME: see cmn.ConfigRestartRequired and cmn.Features
-			// tassert.Errorf(t, err != nil, "expected intra-cluster access enforced")
-			tlog.Logf("TODO: updating feature flags requires cluster restart (err=%v)\n", err)
-
+			if err == nil {
+				tlog.Logln("Warning: expected error, got nil")
+			}
 			tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
 		}
 	}
@@ -130,7 +128,7 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 
 	// Ensure no target URLs are returned when the property is not requested
 	msg.Props = ""
-	lst, err = api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Num: uint(m.num)})
+	lst, err = api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: uint(m.num)})
 	tassert.CheckFatal(t, err)
 
 	if len(lst.Entries) != m.num {
@@ -159,7 +157,7 @@ func TestListObjectsCloudGetLocation(t *testing.T) {
 		smap       = tools.GetClusterMap(t, proxyURL)
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
 
 	m.initAndSaveState(true /*cleanup*/)
 	m.expectTargets(2)
@@ -201,9 +199,9 @@ func TestListObjectsCloudGetLocation(t *testing.T) {
 			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.Value()})
 			_, err = api.GetObject(baseParams, m.bck, e.Name, nil)
 
-			// TODO -- FIXME: see cmn.ConfigRestartRequired and cmn.Features
-			// tassert.Errorf(t, err != nil, "expected intra-cluster access enforced")
-			tlog.Logf("TODO: updating feature flags requires cluster restart (err=%v)\n", err)
+			if err == nil {
+				tlog.Logln("Warning: expected error, got nil")
+			}
 
 			tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
 		}
@@ -280,7 +278,7 @@ func TestRegressionBuckets(t *testing.T) {
 }
 
 func TestRenameBucket(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -317,6 +315,7 @@ func TestRenameBucket(t *testing.T) {
 // doBucketRe*
 //
 
+//nolint:gocritic // ignoring (regressionTestData) hugeParam
 func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestData) {
 	var (
 		m = ioContext{
@@ -364,9 +363,10 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 	}
 }
 
+//nolint:gocritic // ignoring (regressionTestData) hugeParam
 func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regressionTestData, numPuts int, objNames []string, xid string) {
 	xargs := xact.ArgsMsg{ID: xid, Kind: apc.ActMoveBck, Bck: rtd.renamedBck, Timeout: tools.RebalanceTimeout}
-	_, err := api.WaitForXactionIC(baseParams, xargs)
+	_, err := api.WaitForXactionIC(baseParams, &xargs)
 	if err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
 			smap := tools.GetClusterMap(t, proxyURL)
@@ -472,7 +472,7 @@ func TestObjectPrefix(t *testing.T) {
 }
 
 func TestReregisterMultipleTargets(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		filesSentOrig = make(map[string]int64)
@@ -635,7 +635,7 @@ func TestLRU(t *testing.T) {
 		}
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
 
 	m.init(true /*cleanup*/)
 	m.remotePuts(false /*evict*/)
@@ -700,11 +700,11 @@ func TestLRU(t *testing.T) {
 	})
 
 	tlog.Logln("starting LRU...")
-	xid, err := api.StartXaction(baseParams, xact.ArgsMsg{Kind: apc.ActLRU})
+	xid, err := api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActLRU})
 	tassert.CheckFatal(t, err)
 
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActLRU, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// Check results
@@ -737,40 +737,54 @@ func TestPrefetchList(t *testing.T) {
 		baseParams = tools.BaseAPIParams(proxyURL)
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RemoteBck: true, Bck: bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RemoteBck: true, Bck: bck})
 
 	m.initAndSaveState(true /*cleanup*/)
 	m.expectTargets(2)
 	m.puts()
 
 	// 2. Evict those objects from the cache and prefetch them
-	tlog.Logf("Evicting and Prefetching %d objects\n", len(m.objNames))
-	xid, err := api.EvictList(baseParams, bck, m.objNames)
+	tlog.Logf("Evicting and prefetching %d objects\n", len(m.objNames))
+	xid, err := api.EvictMultiObj(baseParams, bck, m.objNames, "" /*template*/)
 	if err != nil {
 		t.Error(err)
 	}
 
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// 3. Prefetch evicted objects
-	xid, err = api.PrefetchList(baseParams, bck, m.objNames)
-	if err != nil {
-		t.Error(err)
+	{
+		var msg apc.PrefetchMsg
+		msg.ObjNames = m.objNames
+		xid, err = api.Prefetch(baseParams, bck, msg)
+		if err != nil {
+			t.Error(err)
+		}
 	}
 
 	args = xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// 4. Ensure that all the prefetches occurred.
 	xargs := xact.ArgsMsg{ID: xid, Timeout: tools.RebalanceTimeout}
-	snaps, err := api.QueryXactionSnaps(baseParams, xargs)
+	snaps, err := api.QueryXactionSnaps(baseParams, &xargs)
 	tassert.CheckFatal(t, err)
 	locObjs, _, _ := snaps.ObjCounts(xid)
 	if locObjs != int64(m.num) {
 		t.Errorf("did not prefetch all files: missing %d of %d", int64(m.num)-locObjs, m.num)
+	}
+
+	msg := &apc.LsoMsg{}
+	msg.SetFlag(apc.LsObjCached)
+	lst, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
+	tassert.CheckFatal(t, err)
+	if len(lst.Entries) != m.num {
+		t.Errorf("list-objects %s: expected %d, got %d", bck, m.num, len(lst.Entries))
+	} else {
+		tlog.Logf("list-objects %s: %d is correct\n", bck, len(m.objNames))
 	}
 }
 
@@ -807,11 +821,11 @@ func TestDeleteList(t *testing.T) {
 		tlog.Logf("PUT done.\n")
 
 		// 2. Delete the objects
-		xid, err := api.DeleteList(baseParams, b, files)
+		xid, err := api.DeleteMultiObj(baseParams, b, files, "" /*template*/)
 		tassert.CheckError(t, err)
 
 		args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
-		_, err = api.WaitForXactionIC(baseParams, args)
+		_, err = api.WaitForXactionIC(baseParams, &args)
 		tassert.CheckFatal(t, err)
 
 		// 3. Check to see that all the files have been deleted
@@ -840,9 +854,10 @@ func TestPrefetchRange(t *testing.T) {
 		bck           = cliBck
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RemoteBck: true, Bck: bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RemoteBck: true, Bck: bck})
 
 	m.initAndSaveState(true /*cleanup*/)
+
 	m.expectTargets(2)
 	m.puts()
 	// 1. Parse arguments
@@ -862,27 +877,53 @@ func TestPrefetchRange(t *testing.T) {
 	}
 
 	// 3. Evict those objects from the cache, and then prefetch them
-	tlog.Logf("Evicting and Prefetching %d objects\n", len(files))
 	rng := fmt.Sprintf("%s%s", m.prefix, prefetchRange)
-	xid, err := api.EvictRange(baseParams, bck, rng)
+	tlog.Logf("Evicting and prefetching %d objects (range: %s)\n", len(files), rng)
+	xid, err := api.EvictMultiObj(baseParams, bck, nil /*lst objnames*/, rng)
 	tassert.CheckError(t, err)
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
-	xid, err = api.PrefetchRange(baseParams, bck, rng)
-	tassert.CheckError(t, err)
-	args = xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
-	tassert.CheckFatal(t, err)
+	{
+		var msg apc.PrefetchMsg
+		msg.Template = rng
+		xid, err = api.Prefetch(baseParams, bck, msg)
+		tassert.CheckError(t, err)
+		args = xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
+		_, err = api.WaitForXactionIC(baseParams, &args)
+		tassert.CheckFatal(t, err)
+	}
 
 	// 4. Ensure all done
 	xargs := xact.ArgsMsg{ID: xid, Timeout: tools.RebalanceTimeout}
-	snaps, err := api.QueryXactionSnaps(baseParams, xargs)
+	snaps, err := api.QueryXactionSnaps(baseParams, &xargs)
 	tassert.CheckFatal(t, err)
 	locObjs, _, _ := snaps.ObjCounts(xid)
 	if locObjs != int64(len(files)) {
 		t.Errorf("did not prefetch all files: missing %d of %d", int64(len(files))-locObjs, len(files))
+	}
+
+	msg := &apc.LsoMsg{Prefix: m.prefix}
+	msg.SetFlag(apc.LsObjCached)
+	lst, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
+	tassert.CheckFatal(t, err)
+	if len(lst.Entries) < len(files) {
+		t.Errorf("list-objects %s/%s: expected %d, got %d", bck, m.prefix, len(files), len(lst.Entries))
+	} else {
+		var count int
+		for _, e := range lst.Entries {
+			s := e.Name[len(m.prefix):] // "obj-"
+			idx, err := strconv.Atoi(s)
+			if err == nil && idx >= 1 && idx <= 150 {
+				count++
+			}
+		}
+		if count != len(files) {
+			t.Errorf("list-objects %s/%s: expected %d, got %d", bck, m.prefix, len(files), count)
+		} else {
+			tlog.Logf("list-objects %s/%s: %d is correct\n", bck, m.prefix, len(files))
+		}
 	}
 }
 
@@ -921,10 +962,10 @@ func TestDeleteRange(t *testing.T) {
 
 		// 2. Delete the small range of objects
 		tlog.Logf("Delete in range %s\n", smallrange)
-		xid, err := api.DeleteRange(baseParams, b, smallrange)
+		xid, err := api.DeleteMultiObj(baseParams, b, nil /*lst objnames*/, smallrange)
 		tassert.CheckError(t, err)
 		args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
-		_, err = api.WaitForXactionIC(baseParams, args)
+		_, err = api.WaitForXactionIC(baseParams, &args)
 		tassert.CheckFatal(t, err)
 
 		// 3. Check to see that the correct files have been deleted
@@ -950,10 +991,10 @@ func TestDeleteRange(t *testing.T) {
 
 		tlog.Logf("Delete in range %s\n", bigrange)
 		// 4. Delete the big range of objects
-		xid, err = api.DeleteRange(baseParams, b, bigrange)
+		xid, err = api.DeleteMultiObj(baseParams, b, nil /*lst objnames*/, bigrange)
 		tassert.CheckError(t, err)
 		args = xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
-		_, err = api.WaitForXactionIC(baseParams, args)
+		_, err = api.WaitForXactionIC(baseParams, &args)
 		tassert.CheckFatal(t, err)
 
 		// 5. Check to see that all the files have been deleted
@@ -967,7 +1008,7 @@ func TestDeleteRange(t *testing.T) {
 
 // Testing only ais bucket objects since generally not concerned with cloud bucket object deletion
 func TestStressDeleteRange(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	const (
 		numFiles   = 20000 // FIXME: must divide by 10 and by the numReaders
@@ -1014,7 +1055,7 @@ func TestStressDeleteRange(t *testing.T) {
 					Cksum:      reader.Cksum(),
 					Reader:     reader,
 				}
-				_, err = api.PutObject(putArgs)
+				_, err = api.PutObject(&putArgs)
 				if err != nil {
 					errCh <- err
 				}
@@ -1027,10 +1068,10 @@ func TestStressDeleteRange(t *testing.T) {
 
 	// 2. Delete a range of objects
 	tlog.Logf("Deleting objects in range: %s\n", partialRange)
-	xid, err := api.DeleteRange(baseParams, bck, partialRange)
+	xid, err := api.DeleteMultiObj(baseParams, bck, nil /*lst objnames*/, partialRange)
 	tassert.CheckError(t, err)
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// 3. Check to see that correct objects have been deleted
@@ -1059,10 +1100,10 @@ func TestStressDeleteRange(t *testing.T) {
 
 	// 4. Delete the entire range of objects
 	tlog.Logf("Deleting objects in range: %s\n", fullRange)
-	xid, err = api.DeleteRange(baseParams, bck, fullRange)
+	xid, err = api.DeleteMultiObj(baseParams, bck, nil /*lst objnames*/, fullRange)
 	tassert.CheckError(t, err)
 	args = xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// 5. Check to see that all files have been deleted

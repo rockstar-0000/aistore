@@ -37,7 +37,7 @@ func (ctx *unitsCtx) durMilli(dur cos.Duration) string {
 }
 
 func (ctx *unitsCtx) durHuman(dur time.Duration) string {
-	return fmtDuration(dur.Nanoseconds(), ctx.units)
+	return FmtDuration(dur.Nanoseconds(), ctx.units)
 }
 
 func FuncMapUnits(units string) (m template.FuncMap) {
@@ -96,7 +96,7 @@ func FmtStatValue(name, kind string, value int64, units string) string {
 	}
 	// uptime
 	if strings.HasSuffix(name, ".time") || kind == stats.KindLatency {
-		return fmtDuration(value, units)
+		return FmtDuration(value, units)
 	}
 	// units (enum)
 	switch units {
@@ -107,7 +107,7 @@ func FmtStatValue(name, kind string, value int64, units string) string {
 		case stats.KindThroughput, stats.KindComputedThroughput:
 			return fmt.Sprintf("%dB/s", value)
 		default:
-			return fmt.Sprintf("%d", value)
+			return strconv.FormatInt(value, 10)
 		}
 	case "", cos.UnitsIEC:
 		switch kind {
@@ -116,7 +116,7 @@ func FmtStatValue(name, kind string, value int64, units string) string {
 		case stats.KindThroughput, stats.KindComputedThroughput:
 			return cos.ToSizeIEC(value, 2) + "/s"
 		default:
-			return fmt.Sprintf("%d", value)
+			return strconv.FormatInt(value, 10)
 		}
 	case cos.UnitsSI:
 		switch kind {
@@ -125,14 +125,14 @@ func FmtStatValue(name, kind string, value int64, units string) string {
 		case stats.KindThroughput, stats.KindComputedThroughput:
 			return toSizeSI(value, 2) + "/s"
 		default:
-			return fmt.Sprintf("%d", value)
+			return strconv.FormatInt(value, 10)
 		}
 	}
 	debug.Assert(false, units)
 	return ""
 }
 
-func fmtDuration(ns int64, units string) string {
+func FmtDuration(ns int64, units string) string {
 	if units == cos.UnitsRaw {
 		return fmt.Sprintf("%dns", ns)
 	}

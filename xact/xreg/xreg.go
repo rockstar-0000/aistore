@@ -11,14 +11,14 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/xact"
 )
@@ -45,14 +45,13 @@ type (
 		New(args Args, bck *meta.Bck) Renewable // new xaction stub that can be `Start`-ed.
 		Start() error                           // starts an xaction, will be called when entry is stored into registry
 		Kind() string
-		Get() cluster.Xact
+		Get() core.Xact
 		WhenPrevIsRunning(prevEntry Renewable) (action WPR, err error)
 		Bucket() *meta.Bck
 		UUID() string
 	}
 	// used in constructions
 	Args struct {
-		T      cluster.Target
 		Custom any // Additional arguments that are specific for a given xact.
 		UUID   string
 	}
@@ -80,11 +79,12 @@ type (
 	}
 	// Selects subset of xactions to abort.
 	abortArgs struct {
-		bcks       []*meta.Bck // run on a slice of buckets
-		scope      []int       // one of { ScopeG, ScopeB, ... } enum
-		kind       string      // all of a kind
-		err        error       // original cause (or reason), e.g. cmn.ErrUserAbort
-		mountpaths bool        // mountpath xactions - see xact.Table
+		err error // original cause (or reason), e.g. cmn.ErrUserAbort
+		// criteria
+		bcks   []*meta.Bck // run on a slice of buckets
+		scope  []int       // one of { ScopeG, ScopeB, ... } enum
+		kind   string      // all of a kind
+		newreb bool        // (rebalance is starting) vs (dtor.AbortRebRes)
 	}
 
 	entries struct {
@@ -137,9 +137,9 @@ func RegWithHK() {
 	hk.Reg("x-prune-active"+hk.NameSuffix, dreg.hkPruneActive, 0)
 }
 
-func GetXact(uuid string) (cluster.Xact, error) { return dreg.getXact(uuid) }
+func GetXact(uuid string) (core.Xact, error) { return dreg.getXact(uuid) }
 
-func (r *registry) getXact(uuid string) (xctn cluster.Xact, err error) {
+func (r *registry) getXact(uuid string) (xctn core.Xact, err error) {
 	if !xact.IsValidUUID(uuid) {
 		err = fmt.Errorf("invalid UUID %q", uuid)
 		return
@@ -160,11 +160,11 @@ outer:
 	return
 }
 
-func GetAllRunning(inout *cluster.AllRunningInOut, periodic bool) {
+func GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	dreg.entries.getAllRunning(inout, periodic)
 }
 
-func (e *entries) getAllRunning(inout *cluster.AllRunningInOut, periodic bool) {
+func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	var roActive []Renewable
 	if periodic {
 		roActive = e.roActive
@@ -228,51 +228,43 @@ func GetLatest(flt Flt) Renewable {
 // are running on given bucket.
 
 func AbortAllBuckets(err error, bcks ...*meta.Bck) {
-	dreg.abort(abortArgs{bcks: bcks, err: err})
+	dreg.abort(&abortArgs{bcks: bcks, err: err})
 }
 
 // AbortAll waits until abort of all xactions is finished
 // Every abort is done asynchronously
 func AbortAll(err error, scope ...int) {
-	dreg.abort(abortArgs{scope: scope, err: err})
+	dreg.abort(&abortArgs{scope: scope, err: err})
 }
 
 func AbortKind(err error, kind string) {
-	dreg.abort(abortArgs{kind: kind, err: err})
+	dreg.abort(&abortArgs{kind: kind, err: err})
 }
 
-func AbortAllMountpathsXactions() { dreg.abort(abortArgs{mountpaths: true}) }
+func AbortByNewReb(err error) { dreg.abort(&abortArgs{err: err, newreb: true}) }
 
-func DoAbort(flt Flt, err error) (bool /*aborted*/, error) {
-	if flt.ID != "" {
+func DoAbort(flt Flt, err error) {
+	switch {
+	case flt.ID != "":
 		xctn, err := dreg.getXact(flt.ID)
 		if xctn == nil || err != nil {
-			return false, err
+			return
 		}
-		debug.Assertf(flt.Kind == "" || xctn.Kind() == flt.Kind,
-			"UUID must uniquely identify kind: %s vs %+v", xctn, flt)
-		return xctn.Abort(err), nil
-	}
-
-	if flt.Kind != "" {
+		debug.Assertf(flt.Kind == "" || xctn.Kind() == flt.Kind, "wrong xaction kind: %s vs %q", xctn.Cname(), flt.Kind)
+		xctn.Abort(err)
+	case flt.Kind != "" && flt.Bck != nil:
+		dreg.abort(&abortArgs{kind: flt.Kind, bcks: []*meta.Bck{flt.Bck}, err: err})
+	case flt.Kind != "":
 		debug.Assert(xact.IsValidKind(flt.Kind), flt.Kind)
-		entry := dreg.getRunning(flt)
-		if entry == nil {
-			return false, nil
-		}
-		return entry.Get().Abort(err), nil
-	}
-	if flt.Bck == nil {
-		// No bucket and no kind - request for all available xactions.
-		AbortAll(err)
-	} else {
-		// Bucket present and no kind - request for all available bucket's xactions.
+		AbortKind(err, flt.Kind)
+	case flt.Bck != nil:
 		AbortAllBuckets(err, flt.Bck)
+	default:
+		AbortAll(err)
 	}
-	return true, nil
 }
 
-func GetSnap(flt Flt) ([]*cluster.Snap, error) {
+func GetSnap(flt Flt) ([]*core.Snap, error) {
 	var onlyRunning bool
 	if flt.OnlyRunning != nil {
 		onlyRunning = *flt.OnlyRunning
@@ -289,14 +281,14 @@ func GetSnap(flt Flt) ([]*cluster.Snap, error) {
 			if flt.Kind != "" && xctn.Kind() != flt.Kind {
 				return nil, cmn.NewErrXactNotFoundError("[kind=" + flt.Kind + " vs " + xctn.String() + "]")
 			}
-			return []*cluster.Snap{xctn.Snap()}, nil
+			return []*core.Snap{xctn.Snap()}, nil
 		}
 		if onlyRunning || flt.Kind != apc.ActRebalance {
 			return nil, cmn.NewErrXactNotFoundError("ID=" + flt.ID)
 		}
 		// not running rebalance: include all finished (but not aborted) ones
 		// with ID at ot _after_ the specified
-		return dreg.matchingXactsStats(func(xctn cluster.Xact) bool {
+		return dreg.matchingXactsStats(func(xctn core.Xact) bool {
 			cmp := xact.CompareRebIDs(xctn.ID(), flt.ID)
 			return cmp >= 0 && xctn.Finished() && !xctn.IsAborted()
 		}), nil
@@ -311,7 +303,7 @@ func GetSnap(flt Flt) ([]*cluster.Snap, error) {
 		}
 
 		if onlyRunning {
-			matching := make([]*cluster.Snap, 0, 10)
+			matching := make([]*core.Snap, 0, 10)
 			if flt.Kind == "" {
 				dreg.entries.mtx.RLock()
 				for kind := range xact.Table {
@@ -334,43 +326,50 @@ func GetSnap(flt Flt) ([]*cluster.Snap, error) {
 	return dreg.matchingXactsStats(flt.Matches), nil
 }
 
-func (r *registry) abort(args abortArgs) {
-	r.entries.forEach(func(entry Renewable) bool {
-		xctn := entry.Get()
-		if xctn.Finished() {
-			return true
-		}
-
-		var abort bool
-		switch {
-		case args.mountpaths:
-			debug.Assertf(args.scope == nil && args.kind == "", "scope %v, kind %q", args.scope, args.kind)
-			if xact.IsMountpath(xctn.Kind()) {
-				abort = true
-			}
-		case len(args.bcks) > 0:
-			debug.Assertf(args.scope == nil && args.kind == "", "scope %v, kind %q", args.scope, args.kind)
-			for _, bck := range args.bcks {
-				if xctn.Bck() != nil && bck.Equal(xctn.Bck(), true /*sameID*/, true /*same backend*/) {
-					abort = true
-					break
-				}
-			}
-		case args.kind != "":
-			debug.Assertf(args.scope == nil && len(args.bcks) == 0, "scope %v, bcks %v", args.scope, args.bcks)
-			abort = args.kind == xctn.Kind()
-		default:
-			abort = args.scope == nil || xact.IsSameScope(xctn.Kind(), args.scope...)
-		}
-
-		if abort {
-			xctn.Abort(args.err)
-		}
-		return true
-	})
+func (r *registry) abort(args *abortArgs) {
+	r.entries.forEach(args.do)
 }
 
-func (r *registry) matchingXactsStats(match func(xctn cluster.Xact) bool) []*cluster.Snap {
+func (args *abortArgs) do(entry Renewable) bool {
+	xctn := entry.Get()
+	if xctn.Finished() {
+		return true
+	}
+
+	var abort bool
+	switch {
+	case args.newreb:
+		debug.Assertf(args.scope == nil && args.kind == "", "scope %v, kind %q", args.scope, args.kind)
+		_, dtor, err := xact.GetDescriptor(xctn.Kind())
+		debug.AssertNoErr(err)
+		if dtor.AbortRebRes {
+			abort = true
+		}
+	case len(args.bcks) > 0:
+		debug.Assertf(args.scope == nil, "scope %v", args.scope)
+		for _, bck := range args.bcks {
+			if xctn.Bck() != nil && bck.Equal(xctn.Bck(), true /*sameID*/, true /*same backend*/) {
+				abort = true
+				break
+			}
+		}
+		if abort && args.kind != "" {
+			abort = args.kind == xctn.Kind()
+		}
+	case args.kind != "":
+		debug.Assertf(args.scope == nil && len(args.bcks) == 0, "scope %v, bcks %v", args.scope, args.bcks)
+		abort = args.kind == xctn.Kind()
+	default:
+		abort = args.scope == nil || xact.IsSameScope(xctn.Kind(), args.scope...)
+	}
+
+	if abort {
+		xctn.Abort(args.err)
+	}
+	return true
+}
+
+func (r *registry) matchingXactsStats(match func(xctn core.Xact) bool) []*core.Snap {
 	matchingEntries := make([]Renewable, 0, 20)
 	r.entries.forEach(func(entry Renewable) bool {
 		if !match(entry.Get()) {
@@ -380,7 +379,7 @@ func (r *registry) matchingXactsStats(match func(xctn cluster.Xact) bool) []*clu
 		return true
 	})
 	// TODO: we cannot do this inside `forEach` because - nested locks
-	sts := make([]*cluster.Snap, 0, len(matchingEntries))
+	sts := make([]*core.Snap, 0, len(matchingEntries))
 	for _, entry := range matchingEntries {
 		sts = append(sts, entry.Get().Snap())
 	}
@@ -511,7 +510,7 @@ func (r *registry) _renewFlt(entry Renewable, flt Flt) (rns RenewRes) {
 }
 
 // reusing current (aka "previous") xaction: default policies
-func usePrev(xprev cluster.Xact, nentry Renewable, flt Flt) bool {
+func usePrev(xprev core.Xact, nentry Renewable, flt Flt) bool {
 	pkind, nkind := xprev.Kind(), nentry.Kind()
 	debug.Assertf(pkind == nkind && pkind != "", "%s != %s", pkind, nkind)
 	pdtor, ndtor := xact.Table[pkind], xact.Table[nkind]
@@ -549,7 +548,7 @@ func usePrev(xprev cluster.Xact, nentry Renewable, flt Flt) bool {
 
 func (r *registry) renewLocked(entry Renewable, flt Flt) (rns RenewRes) {
 	var (
-		xprev cluster.Xact
+		xprev core.Xact
 		wpr   WPR
 		err   error
 	)
@@ -678,7 +677,7 @@ func (e *entries) add(entry Renewable) {
 // of that sort. Further comments below.
 
 func LimitedCoexistence(tsi *meta.Snode, bck *meta.Bck, action string, otherBck ...*meta.Bck) (err error) {
-	if cmn.Features.IsSet(feat.IgnoreLimitedCoexistence) {
+	if cmn.Rom.Features().IsSet(feat.IgnoreLimitedCoexistence) {
 		return
 	}
 	const sleep = time.Second
@@ -702,7 +701,7 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 		admin bool             // admin-requested action that'd generate protential conflict
 	)
 	switch action {
-	case apc.ActStartMaintenance, apc.ActShutdownNode:
+	case apc.ActStartMaintenance, apc.ActStopMaintenance, apc.ActShutdownNode, apc.ActDecommissionNode:
 		nd = &xact.Descriptor{}
 		admin = true
 	default:
@@ -716,8 +715,8 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 	for kind, d := range xact.Table {
 		// rebalance-vs-rebalance and resilver-vs-resilver sort it out between themselves
 		// (by preempting)
-		conflict := (d.MassiveBck && admin) ||
-			(d.Rebalance && nd.MassiveBck) || (d.Resilver && nd.MassiveBck)
+		conflict := (d.ConflictRebRes && admin) ||
+			(d.Rebalance && nd.ConflictRebRes) || (d.Resilver && nd.ConflictRebRes)
 		if !conflict {
 			continue
 		}
@@ -742,7 +741,7 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 	}
 
 	// finally, bucket rename (apc.ActMoveBck) is a special case -
-	// incompatible with any MassiveBck type operation _on the same_ bucket
+	// incompatible with any ConflictRebRes type operation _on the same_ bucket
 	if action != apc.ActMoveBck {
 		return nil
 	}
@@ -754,7 +753,7 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 		}
 		d, ok := xact.Table[xctn.Kind()]
 		debug.Assert(ok, xctn.Kind())
-		if !d.MassiveBck {
+		if !d.ConflictRebRes {
 			continue
 		}
 		from, to := xctn.FromTo()
@@ -826,7 +825,7 @@ func (flt *Flt) String() string {
 	return msg.String()
 }
 
-func (flt Flt) Matches(xctn cluster.Xact) (yes bool) {
+func (flt Flt) Matches(xctn core.Xact) (yes bool) {
 	debug.Assert(xact.IsValidKind(xctn.Kind()), xctn.String())
 	// running?
 	if flt.OnlyRunning != nil {

@@ -53,7 +53,7 @@ type (
 	}
 
 	handler interface {
-		recv(hdr ObjHdr, objReader io.Reader, err error) error // RecvObj
+		recv(hdr *ObjHdr, objReader io.Reader, err error) error // RecvObj
 		stats(*http.Request, string) (rxStats, uint64, string)
 		unreg()
 		addOld(uint64)
@@ -197,7 +197,7 @@ func (h *hdlExtra) cl(key, value any) bool {
 	return true
 }
 
-func (h *hdl) recv(hdr ObjHdr, objReader io.Reader, err error) error {
+func (h *hdl) recv(hdr *ObjHdr, objReader io.Reader, err error) error {
 	return h.rxObj(hdr, objReader, err)
 }
 
@@ -264,8 +264,10 @@ func (it *iterator) rxloop(uid uint64, loghdr string, mm *memsys.MMSA) (err erro
 }
 
 func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
-	var obj *objReader
-	h := it.handler
+	var (
+		obj *objReader
+		h   = it.handler
+	)
 	obj, err = it.nextObj(loghdr, hlen)
 	if obj != nil {
 		if !obj.hdr.IsHeaderOnly() {
@@ -273,22 +275,23 @@ func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
 		}
 		err = eofOK(err)
 		size, off := obj.hdr.ObjAttrs.Size, obj.off
-		if errCb := h.recv(obj.hdr, obj, err); errCb != nil {
+		if errCb := h.recv(&obj.hdr, obj, err); errCb != nil {
 			err = errCb
 		}
 		// stats
 		if err == nil {
-			it.stats.incNum()              // this stream stats
-			g.statsTracker.Inc(InObjCount) // stats/target_stats.go
+			it.stats.incNum()        // 1. this stream stats
+			g.tstats.Inc(InObjCount) // 2. stats/target_stats.go
+
 			if size >= 0 {
-				g.statsTracker.Add(InObjSize, size)
+				g.tstats.Add(InObjSize, size)
 			} else {
 				debug.Assert(size == SizeUnknown)
-				g.statsTracker.Add(InObjSize, obj.off-off)
+				g.tstats.Add(InObjSize, obj.off-off)
 			}
 		}
 	} else if err != nil && err != io.EOF {
-		if errCb := h.recv(ObjHdr{}, nil, err); errCb != nil {
+		if errCb := h.recv(&ObjHdr{}, nil, err); errCb != nil {
 			err = errCb
 		}
 	}

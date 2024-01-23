@@ -1,25 +1,25 @@
 // Package xact provides core functionality for the AIStore eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xact
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	ratomic "sync/atomic"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/nl"
 )
@@ -30,6 +30,7 @@ type (
 		bck    meta.Bck
 		id     string
 		kind   string
+		_nam   string
 		sutime atomic.Int64
 		eutime atomic.Int64
 		abort  struct {
@@ -48,7 +49,7 @@ type (
 		err cos.Errs
 	}
 	Marked struct {
-		Xact        cluster.Xact
+		Xact        core.Xact
 		Interrupted bool // (rebalance | resilver) interrupted
 		Restarted   bool // node restarted
 	}
@@ -57,7 +58,7 @@ type (
 var IncFinished func()
 
 // common helper to go-run and wait until it actually starts running
-func GoRunW(xctn cluster.Xact) {
+func GoRunW(xctn core.Xact) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	go xctn.Run(wg)
@@ -67,7 +68,7 @@ func GoRunW(xctn cluster.Xact) {
 func IsValidUUID(id string) bool { return cos.IsValidUUID(id) || IsValidRebID(id) }
 
 //////////////
-// Base - partially implements `cluster.Xact` interface
+// Base - partially implements `core.Xact` interface
 //////////////
 
 func (xctn *Base) InitBase(id, kind string, bck *meta.Bck) {
@@ -79,6 +80,12 @@ func (xctn *Base) InitBase(id, kind string, bck *meta.Bck) {
 		xctn.bck = *bck
 	}
 	xctn.setStartTime(time.Now())
+
+	// name never changes
+	xctn._nam = "x-" + xctn.Kind() + LeftID + xctn.ID() + RightID
+	if !xctn.bck.IsEmpty() {
+		xctn._nam += "-" + xctn.bck.Cname("")
+	}
 }
 
 func (xctn *Base) ID() string   { return xctn.id }
@@ -106,9 +113,9 @@ func (xctn *Base) ChanAbort() <-chan error { return xctn.abort.ch }
 
 func (xctn *Base) IsAborted() bool { return xctn.abort.done.Load() }
 
-func (xctn *Base) AbortErr() (err error) {
+func (xctn *Base) AbortErr() error {
 	if !xctn.IsAborted() {
-		return
+		return nil
 	}
 	// (is aborted)
 	// normally, is expected to return `abort.err` without any sleep
@@ -122,7 +129,7 @@ func (xctn *Base) AbortErr() (err error) {
 		}
 		time.Sleep(sleep)
 	}
-	return
+	return cmn.NewErrAborted(xctn.Name(), "base.abort-err.timeout", nil)
 }
 
 func (xctn *Base) AbortedAfter(d time.Duration) (err error) {
@@ -136,9 +143,9 @@ func (xctn *Base) AbortedAfter(d time.Duration) (err error) {
 	return
 }
 
-func (xctn *Base) Abort(err error) (ok bool) {
+func (xctn *Base) Abort(err error) bool {
 	if xctn.Finished() || !xctn.abort.done.CAS(false, true) {
-		return
+		return false
 	}
 
 	if err == nil {
@@ -156,7 +163,7 @@ func (xctn *Base) Abort(err error) (ok bool) {
 	close(xctn.abort.ch)
 
 	if xctn.Kind() != apc.ActList {
-		nlog.Infof("%s aborted(%v)", xctn.Name(), err)
+		nlog.InfoDepth(1, xctn.Name(), err)
 	}
 	return true
 }
@@ -165,10 +172,27 @@ func (xctn *Base) Abort(err error) (ok bool) {
 // multi-error
 //
 
-func (xctn *Base) AddErr(err error) {
-	if err != nil && !xctn.IsAborted() { // no more errors once aborted
-		fs.CleanPathErr(err)
-		xctn.err.Add(err)
+func (xctn *Base) AddErr(err error, logExtra ...int) {
+	if xctn.IsAborted() { // no more errors once aborted
+		return
+	}
+	debug.Assert(err != nil)
+	fs.CleanPathErr(err)
+	xctn.err.Add(err)
+	// just add
+	if len(logExtra) == 0 {
+		return
+	}
+	// log error
+	level := logExtra[0]
+	if level == 0 {
+		nlog.ErrorDepth(1, err)
+		return
+	}
+	// finally, FastV
+	module := logExtra[1]
+	if cmn.Rom.FastV(level, module) {
+		nlog.InfoDepth(1, "Warning:", err)
 	}
 }
 
@@ -183,60 +207,63 @@ func (xctn *Base) JoinErr() (int, error) { return xctn.err.JoinErr() }
 func (xctn *Base) ErrCnt() int           { return xctn.err.Cnt() }
 
 // count all the way to duration; reset and adjust every time activity is detected
-func (xctn *Base) Quiesce(d time.Duration, cb cluster.QuiCB) cluster.QuiRes {
+func (xctn *Base) Quiesce(d time.Duration, cb core.QuiCB) core.QuiRes {
 	var (
 		idle, total time.Duration
 		sleep       = cos.ProbingFrequency(d)
 		dur         = d
 	)
 	if xctn.IsAborted() {
-		return cluster.QuiAborted
+		return core.QuiAborted
 	}
 	for idle < dur {
 		time.Sleep(sleep)
 		if xctn.IsAborted() {
-			return cluster.QuiAborted
+			return core.QuiAborted
 		}
 		total += sleep
 		switch res := cb(total); res {
-		case cluster.QuiInactiveCB: // NOTE: used by callbacks, converts to one of the returned codes
+		case core.QuiInactiveCB: // NOTE: used by callbacks, converts to one of the returned codes
 			idle += sleep
-		case cluster.QuiActive:
+		case core.QuiActive:
 			idle = 0                  // reset
 			dur = min(dur+sleep, 2*d) // bump up to 2x initial
-		case cluster.QuiActiveRet:
-			return cluster.QuiActiveRet
-		case cluster.QuiDone:
-			return cluster.QuiDone
-		case cluster.QuiTimeout:
-			return cluster.QuiTimeout
+		case core.QuiActiveRet:
+			return core.QuiActiveRet
+		case core.QuiDone:
+			return core.QuiDone
+		case core.QuiTimeout:
+			return core.QuiTimeout
 		}
 	}
-	return cluster.Quiescent
+	return core.Quiescent
 }
 
-func (xctn *Base) Name() (s string) {
-	var b string
-	if !xctn.bck.IsEmpty() {
-		b = "-" + xctn.bck.String()
-	}
-	s = "x-" + xctn.Kind() + "[" + xctn.ID() + "]" + b
-	return
-}
+// see also: xact.ParseCname (api.go)
+func (xctn *Base) Cname() string { return xctn.Kind() + LeftID + xctn.ID() + RightID }
 
-func (xctn *Base) String() string {
-	var (
-		name = xctn.Name()
-		s    = name + "-" + cos.FormatTime(xctn.StartTime(), cos.StampMicro)
-	)
+func (xctn *Base) Name() (s string) { return xctn._nam }
+
+func (xctn *Base) _sb() (sb strings.Builder) {
+	sb.WriteString(xctn._nam)
+	sb.WriteByte('-')
+	sb.WriteString(cos.FormatTime(xctn.StartTime(), cos.StampMicro))
+
 	if !xctn.Finished() { // ok to (rarely) miss _aborted_ state as this is purely informational
-		return s
+		return sb
 	}
 	etime := cos.FormatTime(xctn.EndTime(), cos.StampMicro)
 	if xctn.IsAborted() {
-		s = fmt.Sprintf("%s-[abrt: %v]", s, xctn.AbortErr())
+		sb.WriteString(fmt.Sprintf("-[abrt: %v]", xctn.AbortErr()))
 	}
-	return s + "-" + etime
+	sb.WriteByte('-')
+	sb.WriteString(etime)
+	return sb
+}
+
+func (xctn *Base) String() string {
+	sb := xctn._sb()
+	return sb.String()
 }
 
 func (xctn *Base) StartTime() time.Time {
@@ -258,10 +285,10 @@ func (xctn *Base) EndTime() time.Time {
 }
 
 // upon completion, all xactions optionally notify listener(s) and refresh local capacity stats
-func (xctn *Base) onFinished(err error) {
+func (xctn *Base) onFinished(err error, aborted bool) {
 	// notifications
 	if xctn.notif != nil {
-		nl.OnFinished(xctn.notif, err)
+		nl.OnFinished(xctn.notif, err, aborted)
 	}
 	xactRecord := Table[xctn.kind]
 	if xactRecord.RefreshCap {
@@ -273,17 +300,18 @@ func (xctn *Base) onFinished(err error) {
 	IncFinished() // in re: HK cleanup long-time finished
 }
 
-func (xctn *Base) AddNotif(n cluster.Notif) {
+func (xctn *Base) AddNotif(n core.Notif) {
 	xctn.notif = n.(*NotifXact)
-	debug.Assert(xctn.notif.Xact != nil && xctn.notif.F != nil)        // always fin-notif and points to self
-	debug.Assert(!n.Upon(cluster.UponProgress) || xctn.notif.P != nil) // progress notification is optional
+	debug.Assert(xctn.notif.Xact != nil && xctn.notif.F != nil)     // always fin-notif and points to self
+	debug.Assert(!n.Upon(core.UponProgress) || xctn.notif.P != nil) // progress notification is optional
 }
 
 // atomically set end-time
 func (xctn *Base) Finish() {
 	var (
-		err, infoErr error
-		aborted      bool
+		err     error
+		info    string
+		aborted bool
 	)
 	if !xctn.eutime.CAS(0, 1) {
 		return
@@ -299,25 +327,21 @@ func (xctn *Base) Finish() {
 			debug.Assert(!aborted)
 			err = xctn.Err()
 		} else {
-			infoErr = xctn.Err() // abort takes precedence
+			// abort takes precedence
+			info = "(" + xctn.Err().Error() + ")"
 		}
 	}
-	xctn.onFinished(err)
+	xctn.onFinished(err, aborted)
 	// log
-	if xctn.Kind() == apc.ActList {
-		return
+	switch {
+	case xctn.Kind() == apc.ActList:
+	case err == nil:
+		nlog.Infoln(xctn.String(), "finished")
+	case aborted:
+		nlog.Warningln(xctn.String(), "aborted:", err.Error(), info)
+	default:
+		nlog.Infoln("Warning:", xctn.String(), "finished w/err:", err.Error())
 	}
-	if err == nil {
-		nlog.Infof("%s finished", xctn)
-	} else if aborted {
-		nlog.Warningf("%s aborted: %v (%v)", xctn, err, infoErr)
-	} else {
-		nlog.Warningf("%s finished w/err: %v", xctn, infoErr)
-	}
-}
-
-func (*Base) Result() (any, error) {
-	return nil, errors.New("getting result is not implemented")
 }
 
 // base stats: locally processed
@@ -330,7 +354,7 @@ func (xctn *Base) ObjsAdd(cnt int, size int64) {
 }
 
 // oft. used
-func (xctn *Base) LomAdd(lom *cluster.LOM) { xctn.ObjsAdd(1, lom.SizeBytes(true)) }
+func (xctn *Base) LomAdd(lom *core.LOM) { xctn.ObjsAdd(1, lom.SizeBytes(true)) }
 
 // base stats: transmit
 func (xctn *Base) OutObjs() int64  { return xctn.stats.outobjs.Load() }
@@ -354,7 +378,7 @@ func (xctn *Base) InObjsAdd(cnt int, size int64) {
 }
 
 // provided for external use to fill-in xaction-specific `SnapExt` part
-func (xctn *Base) ToSnap(snap *cluster.Snap) {
+func (xctn *Base) ToSnap(snap *core.Snap) {
 	snap.ID = xctn.ID()
 	snap.Kind = xctn.Kind()
 	snap.StartTime = xctn.StartTime()
@@ -372,20 +396,13 @@ func (xctn *Base) ToSnap(snap *cluster.Snap) {
 	xctn.ToStats(&snap.Stats)
 }
 
-func (xctn *Base) ToStats(stats *cluster.Stats) {
+func (xctn *Base) ToStats(stats *core.Stats) {
 	stats.Objs = xctn.Objs()         // locally processed
 	stats.Bytes = xctn.Bytes()       //
 	stats.OutObjs = xctn.OutObjs()   // transmit
 	stats.OutBytes = xctn.OutBytes() //
 	stats.InObjs = xctn.InObjs()     // receive
 	stats.InBytes = xctn.InBytes()
-}
-
-func (xctn *Base) InMaintOrDecomm(smap *meta.Smap, tsi *meta.Snode) (err error) {
-	if smap.InMaintOrDecomm(tsi) {
-		err = cmn.NewErrXactTgtInMaint(xctn.String(), tsi.String())
-	}
-	return
 }
 
 // RebID helpers

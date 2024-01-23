@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,11 +16,10 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/fname"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/trand"
@@ -35,12 +33,14 @@ func GenerateNotConflictingObjectName(baseName, newNamePrefix string, bck cmn.Bc
 	newName := newNamePrefix
 
 	cbck := meta.CloneBck(&bck)
-	baseNameHrw, _ := cluster.HrwTarget(cbck.MakeUname(baseName), smap)
-	newNameHrw, _ := cluster.HrwTarget(cbck.MakeUname(newName), smap)
+	baseNameHrw, e1 := smap.HrwName2T(cbck.MakeUname(baseName))
+	newNameHrw, e2 := smap.HrwName2T(cbck.MakeUname(newName))
+	cos.Assert(e1 == nil && e2 == nil)
 
 	for i := 0; baseNameHrw == newNameHrw; i++ {
 		newName = newNamePrefix + strconv.Itoa(i)
-		newNameHrw, _ = cluster.HrwTarget(cbck.MakeUname(newName), smap)
+		newNameHrw, e1 = smap.HrwName2T(cbck.MakeUname(newName))
+		cos.AssertNoErr(e1)
 	}
 	return newName
 }
@@ -71,7 +71,8 @@ func GenerateNonexistentBucketName(prefix string, bp api.BaseParams) (string, er
 }
 
 func BucketsContain(bcks cmn.Bcks, qbck cmn.QueryBcks) bool {
-	for _, bck := range bcks {
+	for i := range bcks {
+		bck := bcks[i]
 		if qbck.Equal(&bck) || qbck.Contains(&bck) {
 			return true
 		}
@@ -140,7 +141,7 @@ func PutObjRR(bp api.BaseParams, bck cmn.Bck, objName string, objSize int64, cks
 		Cksum:      reader.Cksum(),
 		Reader:     reader,
 	}
-	_, err = api.PutObject(putArgs)
+	_, err = api.PutObject(&putArgs)
 	return err
 }
 
@@ -158,16 +159,6 @@ func PutRR(tb testing.TB, bp api.BaseParams, objSize int64, cksumType string,
 	}
 
 	return objNames
-}
-
-func NewClientWithProxy(proxyURL string) *http.Client {
-	transport := cmn.NewTransport(transportArgs)
-	prxURL, _ := url.Parse(proxyURL)
-	transport.Proxy = http.ProxyURL(prxURL)
-	return &http.Client{
-		Transport: transport,
-		Timeout:   transportArgs.Timeout,
-	}
 }
 
 func isClusterK8s() (isK8s bool, err error) {

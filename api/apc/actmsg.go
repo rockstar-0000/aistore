@@ -22,8 +22,8 @@ const (
 	ActSummaryBck = "summary-bck"
 
 	ActECEncode  = "ec-encode" // erasure code a bucket
-	ActECGet     = "ec-get"    // erasure decode objects
-	ActECPut     = "ec-put"    // erasure encode objects
+	ActECGet     = "ec-get"    // read erasure coded objects
+	ActECPut     = "ec-put"    // erasure code objects
 	ActECRespond = "ec-resp"   // respond to other targets' EC requests
 
 	ActCopyBck = "copy-bck"
@@ -55,9 +55,12 @@ const (
 	ActPromote        = "promote"
 	ActRenameObject   = "rename-obj"
 
+	// cp (reverse)
 	ActResetStats  = "reset-stats"
 	ActResetConfig = "reset-config"
 	ActSetConfig   = "set-config"
+
+	ActRotateLogs = "rotate-logs"
 
 	ActShutdownCluster = "shutdown" // see also: ActShutdownNode
 
@@ -117,20 +120,18 @@ const (
 	ActTransient = "transient" // transient - in-memory only
 )
 
-// xaction begin-commit phases
+// xaction begin-commit phases and related control
 const (
 	ActBegin  = "begin"
 	ActCommit = "commit"
 	ActAbort  = "abort"
+
+	ActQuery = "query"
 )
 
 const (
 	NodeMaintenance  = "maintenance"
 	NodeDecommission = "decommission"
-)
-
-const (
-	RemAisDefunct = "defunct" // uuid configured offline
 )
 
 // ActMsg is a JSON-formatted control structures used in a majority of API calls

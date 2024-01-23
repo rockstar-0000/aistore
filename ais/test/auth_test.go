@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"errors"
@@ -38,7 +38,7 @@ func expectUnauthorized(t *testing.T, err error) {
 }
 
 func TestAuthObj(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiresAuth: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresAuth: true})
 	var (
 		unAuthBP, authBP = createBaseParams()
 		bck              = cmn.Bck{Name: trand.String(10)}
@@ -54,7 +54,7 @@ func TestAuthObj(t *testing.T) {
 
 	r, _ := readers.NewRand(fileSize, cos.ChecksumNone)
 	objName := trand.String(10)
-	_, err = api.PutObject(api.PutArgs{
+	_, err = api.PutObject(&api.PutArgs{
 		BaseParams: unAuthBP,
 		Bck:        bck,
 		Reader:     r,
@@ -64,7 +64,7 @@ func TestAuthObj(t *testing.T) {
 	expectUnauthorized(t, err)
 
 	r, _ = readers.NewRand(fileSize, cos.ChecksumNone)
-	_, err = api.PutObject(api.PutArgs{
+	_, err = api.PutObject(&api.PutArgs{
 		BaseParams: authBP,
 		Bck:        bck,
 		Reader:     r,
@@ -76,7 +76,7 @@ func TestAuthObj(t *testing.T) {
 }
 
 func TestAuthBck(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiresAuth: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresAuth: true})
 	var (
 		unAuthBP, authBP = createBaseParams()
 		bck              = cmn.Bck{Name: trand.String(10)}

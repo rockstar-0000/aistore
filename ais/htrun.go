@@ -1,12 +1,13 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -22,8 +23,6 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
@@ -33,6 +32,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact/xreg"
@@ -52,16 +53,7 @@ type htrun struct {
 	si        *meta.Snode
 	keepalive keepaliver
 	statsT    stats.Tracker
-	netServ   struct {
-		pub     *netServer
-		control *netServer
-		data    *netServer
-	}
-	client struct {
-		control *http.Client // http client for intra-cluster comm
-		data    *http.Client // http client to execute target <=> target GET & PUT (object)
-	}
-	owner struct {
+	owner     struct {
 		smap   *smapOwner
 		bmd    bmdOwner // an interface with proxy and target impl-s
 		rmd    *rmdOwner
@@ -81,9 +73,9 @@ type htrun struct {
 ///////////
 
 // interface guard
-var _ cluster.Node = (*htrun)(nil)
+var _ core.Node = (*htrun)(nil)
 
-func (h *htrun) DataClient() *http.Client { return h.client.data }
+func (*htrun) DataClient() *http.Client { return g.client.data } // TODO: a better way
 
 func (h *htrun) Snode() *meta.Snode { return h.si }
 func (h *htrun) callerName() string { return h.si.String() }
@@ -102,7 +94,7 @@ func (h *htrun) smapUpdatedCB(_, _ *smapX, nfl, ofl cos.BitFlags) {
 
 func (h *htrun) parseReq(w http.ResponseWriter, r *http.Request, apireq *apiRequest) (err error) {
 	debug.Assert(len(apireq.prefix) != 0)
-	apireq.items, err = h.parseURL(w, r, apireq.after, false, apireq.prefix)
+	apireq.items, err = h.parseURL(w, r, apireq.prefix, apireq.after, false)
 	if err != nil {
 		return
 	}
@@ -110,14 +102,14 @@ func (h *htrun) parseReq(w http.ResponseWriter, r *http.Request, apireq *apiRequ
 	bckName := apireq.items[apireq.bckIdx]
 	if apireq.dpq == nil {
 		apireq.query = r.URL.Query()
-	} else if err = apireq.dpq.fromRawQ(r.URL.RawQuery); err != nil {
+	} else if err = apireq.dpq.parse(r.URL.RawQuery); err != nil {
 		return
 	}
 	apireq.bck, err = newBckFromQ(bckName, apireq.query, apireq.dpq)
 	if err != nil {
 		h.writeErr(w, r, err)
 	}
-	return
+	return err
 }
 
 func (h *htrun) cluMeta(opts cmetaFillOpt) (*cluMeta, error) {
@@ -185,7 +177,7 @@ func (h *htrun) regNetHandlers(networkHandlers []networkHandler) {
 	)
 	// common, debug
 	for r, nh := range debug.Handlers() {
-		h.registerPublicNetHandler(r, nh)
+		handlePub(r, nh)
 	}
 	// node type specific
 	for _, nh := range networkHandlers {
@@ -197,15 +189,15 @@ func (h *htrun) regNetHandlers(networkHandlers []networkHandler) {
 		}
 		debug.Assert(nh.net != 0)
 		if nh.net.isSet(accessNetPublic) {
-			h.registerPublicNetHandler(path, nh.h)
+			handlePub(path, nh.h)
 			reg = true
 		}
 		if config.HostNet.UseIntraControl && nh.net.isSet(accessNetIntraControl) {
-			h.registerIntraControlNetHandler(path, nh.h)
+			handleControl(path, nh.h)
 			reg = true
 		}
 		if config.HostNet.UseIntraData && nh.net.isSet(accessNetIntraData) {
-			h.registerIntraDataNetHandler(path, nh.h)
+			handleData(path, nh.h)
 			reg = true
 		}
 		if reg {
@@ -214,78 +206,27 @@ func (h *htrun) regNetHandlers(networkHandlers []networkHandler) {
 		// none of the above
 		if !config.HostNet.UseIntraControl && !config.HostNet.UseIntraData {
 			// no intra-cluster networks: default to pub net
-			h.registerPublicNetHandler(path, nh.h)
+			handlePub(path, nh.h)
 		} else if config.HostNet.UseIntraControl && nh.net.isSet(accessNetIntraData) {
 			// (not configured) data defaults to (configured) control
-			h.registerIntraControlNetHandler(path, nh.h)
+			handleControl(path, nh.h)
 		} else {
 			debug.Assert(config.HostNet.UseIntraData && nh.net.isSet(accessNetIntraControl))
 			// (not configured) control defaults to (configured) data
-			h.registerIntraDataNetHandler(path, nh.h)
+			handleData(path, nh.h)
 		}
 	}
 	// common Prometheus
 	if h.statsT.IsPrometheus() {
 		nh := networkHandler{r: "/" + apc.Metrics, h: promhttp.Handler().ServeHTTP}
 		path := nh.r // absolute
-		h.registerPublicNetHandler(path, nh.h)
-	}
-}
-
-func (h *htrun) registerPublicNetHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
-	for _, v := range allHTTPverbs {
-		h.netServ.pub.muxers[v].HandleFunc(path, handler)
-		if !strings.HasSuffix(path, "/") {
-			h.netServ.pub.muxers[v].HandleFunc(path+"/", handler)
-		}
-	}
-}
-
-func (h *htrun) registerIntraControlNetHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
-	for _, v := range allHTTPverbs {
-		h.netServ.control.muxers[v].HandleFunc(path, handler)
-		if !strings.HasSuffix(path, "/") {
-			h.netServ.control.muxers[v].HandleFunc(path+"/", handler)
-		}
-	}
-}
-
-func (h *htrun) registerIntraDataNetHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
-	for _, v := range allHTTPverbs {
-		h.netServ.data.muxers[v].HandleFunc(path, handler)
-		if !strings.HasSuffix(path, "/") {
-			h.netServ.data.muxers[v].HandleFunc(path+"/", handler)
-		}
+		handlePub(path, nh.h)
 	}
 }
 
 func (h *htrun) init(config *cmn.Config) {
-	const (
-		defaultControlWriteBufferSize = 16 * cos.KiB // for more defaults see cmn/network.go
-		defaultControlReadBufferSize  = 16 * cos.KiB
-	)
-	h.client.control = cmn.NewClient(cmn.TransportArgs{
-		Timeout:         config.Client.Timeout.D(),
-		WriteBufferSize: defaultControlWriteBufferSize,
-		ReadBufferSize:  defaultControlReadBufferSize,
-		UseHTTPS:        config.Net.HTTP.UseHTTPS,
-		SkipVerify:      config.Net.HTTP.SkipVerify,
-	})
-	wbuf, rbuf := config.Net.HTTP.WriteBufferSize, config.Net.HTTP.ReadBufferSize
-	// NOTE: when not configured use AIS defaults (to override the usual 4KB)
-	if wbuf == 0 {
-		wbuf = cmn.DefaultWriteBufferSize
-	}
-	if rbuf == 0 {
-		rbuf = cmn.DefaultReadBufferSize
-	}
-	h.client.data = cmn.NewClient(cmn.TransportArgs{
-		Timeout:         config.Client.TimeoutLong.D(),
-		WriteBufferSize: wbuf,
-		ReadBufferSize:  rbuf,
-		UseHTTPS:        config.Net.HTTP.UseHTTPS,
-		SkipVerify:      config.Net.HTTP.SkipVerify,
-	})
+	initCtrlClient(config)
+	initDataClient(config)
 
 	tcpbuf := config.Net.L4.SndRcvBufSize
 	if h.si.IsProxy() {
@@ -295,16 +236,16 @@ func (h *htrun) init(config *cmn.Config) {
 	}
 
 	muxers := newMuxers()
-	h.netServ.pub = &netServer{muxers: muxers, sndRcvBufSize: tcpbuf}
-	h.netServ.control = h.netServ.pub // if not separately configured, intra-control net is public
+	g.netServ.pub = &netServer{muxers: muxers, sndRcvBufSize: tcpbuf}
+	g.netServ.control = g.netServ.pub // if not separately configured, intra-control net is public
 	if config.HostNet.UseIntraControl {
 		muxers = newMuxers()
-		h.netServ.control = &netServer{muxers: muxers, sndRcvBufSize: 0}
+		g.netServ.control = &netServer{muxers: muxers, sndRcvBufSize: 0}
 	}
-	h.netServ.data = h.netServ.control // if not configured, intra-data net is intra-control
+	g.netServ.data = g.netServ.control // if not configured, intra-data net is intra-control
 	if config.HostNet.UseIntraData {
 		muxers = newMuxers()
-		h.netServ.data = &netServer{muxers: muxers, sndRcvBufSize: tcpbuf}
+		g.netServ.data = &netServer{muxers: muxers, sndRcvBufSize: tcpbuf}
 	}
 
 	h.owner.smap = newSmapOwner(config)
@@ -317,67 +258,78 @@ func (h *htrun) init(config *cmn.Config) {
 	h.smm.RegWithHK()
 }
 
-func (h *htrun) initNetworks() {
+// steps 1 thru 4
+func (h *htrun) initSnode(config *cmn.Config) {
 	var (
-		s                string
-		pubAddr          meta.NetInfo
-		intraControlAddr meta.NetInfo
-		intraDataAddr    meta.NetInfo
-		config           = cmn.GCO.Get()
-		port             = strconv.Itoa(config.HostNet.Port)
-		proto            = config.Net.HTTP.Proto
-		addrList, err    = getLocalIPv4List()
+		pubAddr  meta.NetInfo
+		pubExtra []meta.NetInfo
+		ctrlAddr meta.NetInfo
+		dataAddr meta.NetInfo
+		port     = strconv.Itoa(config.HostNet.Port)
+		proto    = config.Net.HTTP.Proto
 	)
+	addrList, err := getLocalIPv4s(config)
 	if err != nil {
 		cos.ExitLogf("failed to get local IP addr list: %v", err)
 	}
-	// NOTE in re K8S deployment:
-	// public hostname could be LoadBalancer external IP or a service DNS
-	k8sDetected := k8s.Detect() == nil
-	if k8sDetected && config.HostNet.Hostname != "" {
-		nlog.Infof("detected K8S deployment, skipping hostname validation for %q", config.HostNet.Hostname)
-		pubAddr = *meta.NewNetInfo(proto, config.HostNet.Hostname, port)
-	} else {
-		pubAddr, err = getNetInfo(config, addrList, proto, config.HostNet.Hostname, port)
-	}
-	if err != nil {
-		cos.ExitLogf("failed to get %s IPv4/hostname: %v", cmn.NetPublic, err)
-	}
-	if config.HostNet.Hostname != "" {
-		s = " (config: " + config.HostNet.Hostname + ")"
-	}
-	nlog.Infof("%s (user) access: %v%s", cmn.NetPublic, pubAddr, s)
 
-	intraControlAddr = pubAddr
+	// 1. pub net
+	pub, extra := multihome(config.HostNet.Hostname)
+
+	if k8s.IsK8s() && config.HostNet.Hostname != "" {
+		// K8s: skip IP addr validation
+		// public hostname could be a load balancer's external IP or a service DNS
+		nlog.Infof("K8s deployment: skipping hostname validation for %q", config.HostNet.Hostname)
+		pubAddr.Init(proto, pub, port)
+	} else {
+		if err = initNetInfo(&pubAddr, addrList, proto, config.HostNet.Hostname, port); err != nil {
+			cos.ExitLogf("failed to get %s IPv4/hostname: %v", cmn.NetPublic, err)
+		}
+	}
+	// multi-home (when config.HostNet.Hostname is a comma-separated list)
+	// using the same pub port
+	if l := len(extra); l > 0 {
+		pubExtra = make([]meta.NetInfo, l)
+		for i, addr := range extra {
+			pubExtra[i].Init(proto, addr, port)
+		}
+	} else {
+		nlog.Infof("%s (user) access: %v (%q)", cmn.NetPublic, pubAddr, config.HostNet.Hostname)
+	}
+
+	// 2. intra-cluster
+	ctrlAddr = pubAddr
 	if config.HostNet.UseIntraControl {
 		icport := strconv.Itoa(config.HostNet.PortIntraControl)
-		intraControlAddr, err = getNetInfo(config, addrList, proto, config.HostNet.HostnameIntraControl, icport)
+		err = initNetInfo(&ctrlAddr, addrList, proto, config.HostNet.HostnameIntraControl, icport)
 		if err != nil {
 			cos.ExitLogf("failed to get %s IPv4/hostname: %v", cmn.NetIntraControl, err)
 		}
-		s = ""
+		var s string
 		if config.HostNet.HostnameIntraControl != "" {
 			s = " (config: " + config.HostNet.HostnameIntraControl + ")"
 		}
-		nlog.Infof("%s access: %v%s", cmn.NetIntraControl, intraControlAddr, s)
+		nlog.Infof("%s access: %v%s", cmn.NetIntraControl, ctrlAddr, s)
 	}
-	intraDataAddr = pubAddr
+	dataAddr = pubAddr
 	if config.HostNet.UseIntraData {
 		idport := strconv.Itoa(config.HostNet.PortIntraData)
-		intraDataAddr, err = getNetInfo(config, addrList, proto, config.HostNet.HostnameIntraData, idport)
+		err = initNetInfo(&dataAddr, addrList, proto, config.HostNet.HostnameIntraData, idport)
 		if err != nil {
 			cos.ExitLogf("failed to get %s IPv4/hostname: %v", cmn.NetIntraData, err)
 		}
-		s = ""
+		var s string
 		if config.HostNet.HostnameIntraData != "" {
 			s = " (config: " + config.HostNet.HostnameIntraData + ")"
 		}
-		nlog.Infof("%s access: %v%s", cmn.NetIntraData, intraDataAddr, s)
+		nlog.Infof("%s access: %v%s", cmn.NetIntraData, dataAddr, s)
 	}
+
+	// 3. validate
 	mustDiffer(pubAddr,
 		config.HostNet.Port,
 		true,
-		intraControlAddr,
+		ctrlAddr,
 		config.HostNet.PortIntraControl,
 		config.HostNet.UseIntraControl,
 		"pub/ctl",
@@ -385,23 +337,30 @@ func (h *htrun) initNetworks() {
 	mustDiffer(pubAddr,
 		config.HostNet.Port,
 		true,
-		intraDataAddr,
+		dataAddr,
 		config.HostNet.PortIntraData,
 		config.HostNet.UseIntraData,
 		"pub/data",
 	)
-	mustDiffer(intraDataAddr,
+	mustDiffer(dataAddr,
 		config.HostNet.PortIntraData,
 		config.HostNet.UseIntraData,
-		intraControlAddr,
+		ctrlAddr,
 		config.HostNet.PortIntraControl,
 		config.HostNet.UseIntraControl,
 		"ctl/data",
 	)
+
+	// 4. new Snode
 	h.si = &meta.Snode{
 		PubNet:     pubAddr,
-		ControlNet: intraControlAddr,
-		DataNet:    intraDataAddr,
+		ControlNet: ctrlAddr,
+		DataNet:    dataAddr,
+	}
+	if l := len(pubExtra); l > 0 {
+		h.si.PubExtra = make([]meta.NetInfo, l)
+		copy(h.si.PubExtra, pubExtra)
+		nlog.Infof("%s (multihome) access: %v and %v", cmn.NetPublic, pubAddr, h.si.PubExtra)
 	}
 }
 
@@ -451,7 +410,7 @@ func (h *htrun) loadSmap() (smap *smapX, reliable bool) {
 func (h *htrun) setDaemonConfigMsg(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg, query url.Values) {
 	var (
 		transient = cos.IsParseBool(query.Get(apc.ActTransient))
-		toUpdate  = &cmn.ConfigToUpdate{}
+		toUpdate  = &cmn.ConfigToSet{}
 	)
 	if err := cos.MorphMarshal(msg.Value, toUpdate); err != nil {
 		h.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, h, msg.Action, msg.Value, err)
@@ -466,7 +425,7 @@ func (h *htrun) setDaemonConfigQuery(w http.ResponseWriter, r *http.Request) {
 	var (
 		query     = r.URL.Query()
 		transient = cos.IsParseBool(query.Get(apc.ActTransient))
-		toUpdate  = &cmn.ConfigToUpdate{}
+		toUpdate  = &cmn.ConfigToSet{}
 	)
 	if err := toUpdate.FillFromQuery(query); err != nil {
 		h.writeErr(w, r, err)
@@ -479,66 +438,79 @@ func (h *htrun) setDaemonConfigQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *htrun) run(config *cmn.Config) error {
-	logger := log.New(&nlogWriter{}, "net/http err: ", 0) // a wrapper to log http.Server errors
-	if config.HostNet.UseIntraControl {
-		go func() {
-			_ = h.netServ.control.listen(h.si.ControlNet.TCPEndpoint(), logger)
-		}()
-	}
-	if config.HostNet.UseIntraData {
-		go func() {
-			_ = h.netServ.data.listen(h.si.DataNet.TCPEndpoint(), logger)
-		}()
-	}
-	return h.netServ.pub.listen(h.pubListeningAddr(config), logger)
-}
-
-// testing environment excluding Kubernetes: listen on `host:port`
-// otherwise (including production):         listen on `*:port`
-func (h *htrun) pubListeningAddr(config *cmn.Config) string {
 	var (
-		testingEnv  = config.TestingEnv()
-		k8sDetected = k8s.Detect() == nil
+		tlsConf *tls.Config
+		logger  = log.New(&nlogWriter{}, "net/http err: ", 0) // a wrapper to log http.Server errors
 	)
-	if testingEnv && !k8sDetected {
-		return h.si.PubNet.TCPEndpoint()
+	if config.Net.HTTP.UseHTTPS {
+		c, err := newTLS(&config.Net.HTTP)
+		if err != nil {
+			cos.ExitLog(err)
+		}
+		tlsConf = c
 	}
-	return ":" + h.si.PubNet.Port
-}
-
-func (h *htrun) stopHTTPServer() {
-	h.netServ.pub.shutdown()
-	config := cmn.GCO.Get()
 	if config.HostNet.UseIntraControl {
-		h.netServ.control.shutdown()
+		go func() {
+			_ = g.netServ.control.listen(h.si.ControlNet.TCPEndpoint(), logger, tlsConf, config)
+		}()
 	}
 	if config.HostNet.UseIntraData {
-		h.netServ.data.shutdown()
+		go func() {
+			_ = g.netServ.data.listen(h.si.DataNet.TCPEndpoint(), logger, tlsConf, config)
+		}()
 	}
+
+	ep := h.si.PubNet.TCPEndpoint()
+	if h.pubAddrAny(config) {
+		ep = ":" + h.si.PubNet.Port
+	} else if len(h.si.PubExtra) > 0 {
+		pubAddr2 := h.si.PubExtra[0]
+		debug.Assert(pubAddr2.Port == h.si.PubNet.Port)
+		g.netServ.pub2 = &netServer{muxers: g.netServ.pub.muxers, sndRcvBufSize: g.netServ.pub.sndRcvBufSize}
+		go func() {
+			_ = g.netServ.pub2.listen(pubAddr2.TCPEndpoint(), logger, tlsConf, config)
+		}()
+	}
+
+	return g.netServ.pub.listen(ep, logger, tlsConf, config) // stay here
+}
+
+// return true to start listening on `INADDR_ANY:PubNet.Port`
+func (h *htrun) pubAddrAny(config *cmn.Config) (inaddrAny bool) {
+	switch {
+	case config.HostNet.UseIntraControl && h.si.ControlNet.Port == h.si.PubNet.Port:
+	case config.HostNet.UseIntraData && h.si.DataNet.Port == h.si.PubNet.Port:
+	default:
+		inaddrAny = true
+	}
+	return inaddrAny
 }
 
 // remove self from Smap (if required), terminate http, and wait (w/ timeout)
 // for running xactions to abort
-func (h *htrun) stop(rmFromSmap bool) {
+func (h *htrun) stop(wg *sync.WaitGroup, rmFromSmap bool) {
+	const sleep = time.Second >> 1
+
 	if rmFromSmap {
 		h.unregisterSelf(true)
 	}
-	nlog.Warningln("Shutting down HTTP")
-	wg := &sync.WaitGroup{}
+	nlog.Infoln("Shutting down HTTP")
+
 	wg.Add(1)
 	go func() {
-		time.Sleep(time.Second / 2)
-		h.stopHTTPServer()
+		time.Sleep(sleep)
+		shuthttp()
 		wg.Done()
 	}()
 	entry := xreg.GetRunning(xreg.Flt{})
 	if entry != nil {
-		time.Sleep(time.Second)
+		time.Sleep(sleep)
 		entry = xreg.GetRunning(xreg.Flt{})
 		if entry != nil {
-			nlog.Warningf("Timed out waiting for %q to finish aborting", entry.Kind())
+			nlog.Warningln("Timed out waiting for", entry.Kind(), "... to stop")
 		}
 	}
+
 	if h.si.IsTarget() {
 		wg.Wait()
 	}
@@ -600,17 +572,17 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 		if res.err != nil {
 			break
 		}
-		client = h.client.control
+		client = g.client.control
 	case apc.LongTimeout:
 		req, res.err = args.req.Req()
 		if res.err != nil {
 			break
 		}
-		client = h.client.data
+		client = g.client.data
 	default:
 		var cancel context.CancelFunc
 		if args.timeout == 0 {
-			args.timeout = cmn.Timeout.CplaneOperation()
+			args.timeout = cmn.Rom.CplaneOperation()
 		}
 		req, _, cancel, res.err = args.req.ReqWithTimeout(args.timeout)
 		if res.err != nil {
@@ -622,10 +594,10 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 		// - timeout causes context.deadlineExceededError, i.e. "context deadline exceeded"
 		// - the two knobs are configurable via "client_timeout" and "client_long_timeout",
 		// respectively (client section in the global config)
-		if args.timeout > h.client.control.Timeout {
-			client = h.client.data
+		if args.timeout > g.client.control.Timeout {
+			client = g.client.data
 		} else {
-			client = h.client.control
+			client = g.client.control
 		}
 	}
 	if res.err != nil {
@@ -693,14 +665,16 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 // intra-cluster IPC, control plane: notify another node
 //
 
-func (h *htrun) notifyTerm(n cluster.Notif, err error) { h._nfy(n, err, apc.Finished) }
-func (h *htrun) notifyProgress(n cluster.Notif)        { h._nfy(n, nil, apc.Progress) }
+func (h *htrun) notifyTerm(n core.Notif, err error, aborted bool) {
+	h._nfy(n, err, apc.Finished, aborted)
+}
+func (h *htrun) notifyProgress(n core.Notif) { h._nfy(n, nil, apc.Progress, false) }
 
-func (h *htrun) _nfy(n cluster.Notif, err error, upon string) {
+func (h *htrun) _nfy(n core.Notif, err error, upon string, aborted bool) {
 	var (
 		smap  = h.owner.smap.get()
 		dsts  = n.Subscribers()
-		msg   = n.ToNotifMsg()
+		msg   = n.ToNotifMsg(aborted)
 		args  = allocBcArgs()
 		nodes = args.selected
 	)
@@ -723,6 +697,7 @@ func (h *htrun) _nfy(n cluster.Notif, err error, upon string) {
 	}
 	if err != nil {
 		msg.ErrMsg = err.Error()
+		msg.AbortedX = aborted
 	}
 	msg.NodeID = h.si.ID()
 	if len(nodes) == 0 {
@@ -732,7 +707,7 @@ func (h *htrun) _nfy(n cluster.Notif, err error, upon string) {
 	path := apc.URLPathNotifs.Join(upon)
 	args.req = cmn.HreqArgs{Method: http.MethodPost, Path: path, Body: cos.MustMarshal(&msg)}
 	args.network = cmn.NetIntraControl
-	args.timeout = cmn.Timeout.MaxKeepalive()
+	args.timeout = cmn.Rom.MaxKeepalive()
 	args.selected = nodes
 	args.nodeCount = len(nodes)
 	args.smap = smap
@@ -756,24 +731,24 @@ func (h *htrun) bcastGroup(args *bcastArgs) sliceResults {
 	}
 	debug.Assert(cmn.NetworkIsKnown(args.network))
 	if args.timeout == 0 {
-		args.timeout = cmn.Timeout.CplaneOperation()
+		args.timeout = cmn.Rom.CplaneOperation()
 		debug.Assert(args.timeout != 0)
 	}
 
 	switch args.to {
-	case cluster.Targets:
+	case core.Targets:
 		args.nodes = []meta.NodeMap{args.smap.Tmap}
 		args.nodeCount = len(args.smap.Tmap)
 		if present && h.si.IsTarget() {
 			args.nodeCount--
 		}
-	case cluster.Proxies:
+	case core.Proxies:
 		args.nodes = []meta.NodeMap{args.smap.Pmap}
 		args.nodeCount = len(args.smap.Pmap)
 		if present && h.si.IsProxy() {
 			args.nodeCount--
 		}
-	case cluster.AllNodes:
+	case core.AllNodes:
 		args.nodes = []meta.NodeMap{args.smap.Pmap, args.smap.Tmap}
 		args.nodeCount = len(args.smap.Pmap) + len(args.smap.Tmap)
 		if present {
@@ -790,7 +765,7 @@ func (h *htrun) bcastGroup(args *bcastArgs) sliceResults {
 func (h *htrun) bcastNodes(bargs *bcastArgs) sliceResults {
 	var (
 		results bcastResults
-		wg      = cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), bargs.nodeCount)
+		wg      = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), bargs.nodeCount)
 		f       = func(si *meta.Snode) { h._call(si, bargs, &results); wg.Done() }
 	)
 	debug.Assert(len(bargs.selected) == 0)
@@ -816,7 +791,7 @@ func (h *htrun) bcastNodes(bargs *bcastArgs) sliceResults {
 func (h *htrun) bcastSelected(bargs *bcastArgs) sliceResults {
 	var (
 		results bcastResults
-		wg      = cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), bargs.nodeCount)
+		wg      = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), bargs.nodeCount)
 		f       = func(si *meta.Snode) { h._call(si, bargs, &results); wg.Done() }
 	)
 	debug.Assert(len(bargs.selected) > 0)
@@ -840,7 +815,7 @@ func (h *htrun) bcastAsyncIC(msg *aisMsg) {
 	)
 	args.req = cmn.HreqArgs{Method: http.MethodPost, Path: apc.URLPathIC.S, Body: cos.MustMarshal(msg)}
 	args.network = cmn.NetIntraControl
-	args.timeout = cmn.Timeout.MaxKeepalive()
+	args.timeout = cmn.Rom.MaxKeepalive()
 	for pid, psi := range smap.Pmap {
 		if pid == h.si.ID() || !smap.IsIC(psi) || smap.GetActiveNode(pid) == nil {
 			continue
@@ -863,8 +838,8 @@ func (h *htrun) bcastAsyncIC(msg *aisMsg) {
 	freeBcArgs(args)
 }
 
-func (h *htrun) bcastReqGroup(w http.ResponseWriter, r *http.Request, args *bcastArgs, to int) {
-	args.to = to
+func (h *htrun) bcastAllNodes(w http.ResponseWriter, r *http.Request, args *bcastArgs) {
+	args.to = core.AllNodes
 	results := h.bcastGroup(args)
 	for _, res := range results {
 		if res.err != nil {
@@ -880,14 +855,12 @@ func (h *htrun) bcastReqGroup(w http.ResponseWriter, r *http.Request, args *bcas
 //
 
 // remove validated fields and return the resulting slice
-func (h *htrun) parseURL(w http.ResponseWriter, r *http.Request, itemsAfter int,
-	splitAfter bool, items []string) ([]string, error) {
-	items, err := cmn.ParseURL(r.URL.Path, itemsAfter, splitAfter, items)
+func (h *htrun) parseURL(w http.ResponseWriter, r *http.Request, itemsPresent []string, itemsAfter int, splitAfter bool) ([]string, error) {
+	items, err := cmn.ParseURL(r.URL.Path, itemsPresent, itemsAfter, splitAfter)
 	if err != nil {
 		h.writeErr(w, r, err)
-		return nil, err
 	}
-	return items, nil
+	return items, err
 }
 
 func (h *htrun) writeMsgPack(w http.ResponseWriter, v msgp.Encodable, tag string) (ok bool) {
@@ -954,21 +927,21 @@ func isBrowser(userAgent string) bool {
 }
 
 func (h *htrun) logerr(tag string, v any, err error) {
-	const maxl = 32
+	const maxl = 48
+	var efmt, msg string
 	if daemon.stopping.Load() {
 		return
 	}
-
-	var s string
 	if v != nil {
-		s = fmt.Sprintf("[%+v", v)
-		if len(s) > maxl {
-			s = s[:maxl] + "...]"
+		efmt = fmt.Sprintf("message: {%+v", v)
+		if len(efmt) > maxl {
+			efmt = efmt[:maxl] + "...}"
 		} else {
-			s += "]"
+			efmt += "}"
 		}
 	}
-	msg := fmt.Sprintf("%s: failed to write bytes%s: %v (", s, tag, err)
+	efmt = tag + " response error: %v, " + efmt + " at "
+	msg = fmt.Sprintf(efmt, err)
 	for i := 1; i < 4; i++ {
 		_, file, line, ok := runtime.Caller(i)
 		if !ok {
@@ -980,7 +953,11 @@ func (h *htrun) logerr(tag string, v any, err error) {
 		f := filepath.Base(file)
 		msg += fmt.Sprintf("%s:%d", f, line)
 	}
-	nlog.Errorln(msg + ")")
+	if cos.IsErrBrokenPipe(err) { // client went away
+		nlog.Infoln("Warning: " + msg)
+	} else {
+		nlog.Errorln(msg)
+	}
 	h.statsT.IncErr(stats.ErrHTTPWriteCount)
 }
 
@@ -1255,7 +1232,7 @@ func (h *htrun) writeErrStatusf(w http.ResponseWriter, r *http.Request, errCode 
 
 func (h *htrun) writeErrf(w http.ResponseWriter, r *http.Request, format string, a ...any) {
 	err := fmt.Errorf(format, a...)
-	if cmn.IsNotExist(err) {
+	if cos.IsNotExist(err, 0) {
 		h.writeErrMsg(w, r, err.Error(), http.StatusNotFound)
 	} else {
 		h.writeErrMsg(w, r, err.Error())
@@ -1271,7 +1248,7 @@ func (h *htrun) writeErrURL(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/favicon.ico" || r.URL.Path == "favicon.ico" {
 		return
 	}
-	h.writeErrf(w, r, "invalid request: '%s %s'", r.Method, r.RequestURI)
+	h.writeErrf(w, r, "invalid request URI: '%s %s'", r.Method, r.RequestURI)
 }
 
 func (h *htrun) writeErrAct(w http.ResponseWriter, r *http.Request, action string) {
@@ -1290,8 +1267,8 @@ func (h *htrun) writeErrActf(w http.ResponseWriter, r *http.Request, action stri
 
 // also, validatePrefix
 func (h *htrun) isValidObjname(w http.ResponseWriter, r *http.Request, name string) bool {
-	if err := cmn.ValidateObjname(name); err != nil {
-		h.writeErr(w, r, err)
+	if cos.IsLastB(name, filepath.Separator) || strings.Contains(name, "../") {
+		h.writeErrf(w, r, "invalid object name %q", name)
 		return false
 	}
 	return true
@@ -1329,7 +1306,7 @@ func (h *htrun) bcastHealth(smap *smapX, checkAll bool) (*clusterInfo, int /*num
 		h:        h,
 		maxCii:   &clusterInfo{},
 		query:    url.Values{apc.QparamClusterInfo: []string{"true"}},
-		timeout:  cmn.Timeout.CplaneOperation(),
+		timeout:  cmn.Rom.CplaneOperation(),
 		checkAll: checkAll,
 	}
 	c.maxCii.fillSmap(smap)
@@ -1352,9 +1329,9 @@ func (h *htrun) _bch(c *getMaxCii, smap *smapX, nodeTy string) {
 		nodemap = smap.Tmap
 	}
 	if c.checkAll {
-		wg = cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), len(nodemap))
+		wg = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), len(nodemap))
 	} else {
-		count = min(meta.MaxBcastParallel(), maxVerConfirmations<<1)
+		count = min(cmn.MaxBcastParallel(), maxVerConfirmations<<1)
 		wg = cos.NewLimitedWaitGroup(count, len(nodemap) /*have*/)
 	}
 	for sid, si := range nodemap {
@@ -1412,7 +1389,7 @@ func (h *htrun) extractConfig(payload msPayload, caller string) (newConfig *glob
 		}
 	}
 	config := cmn.GCO.Get()
-	if config.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		logmsync(config.Version, newConfig, msg, caller)
 	}
 	if newConfig.version() <= config.Version {
@@ -1442,7 +1419,7 @@ func (h *htrun) extractEtlMD(payload msPayload, caller string) (newMD *etlMD, ms
 		}
 	}
 	etlMD := h.owner.etl.get()
-	if cmn.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		logmsync(etlMD.Version, newMD, msg, caller)
 	}
 	if newMD.version() <= etlMD.version() {
@@ -1495,7 +1472,7 @@ func (h *htrun) extractSmap(payload msPayload, caller string, skipValidation boo
 	if err = smap.validateUUID(h.si, newSmap, caller, 50 /* ciError */); err != nil {
 		return // FATAL: cluster integrity error
 	}
-	if cmn.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		logmsync(smap.Version, newSmap, msg, caller)
 	}
 	_, sameOrigin, _, eq := smap.Compare(&newSmap.Smap)
@@ -1528,7 +1505,7 @@ func (h *htrun) extractRMD(payload msPayload, caller string) (newRMD *rebMD, msg
 		}
 	}
 	rmd := h.owner.rmd.get()
-	if cmn.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		logmsync(rmd.Version, newRMD, msg, caller)
 	}
 	if newRMD.version() <= rmd.version() {
@@ -1558,7 +1535,7 @@ func (h *htrun) extractBMD(payload msPayload, caller string) (newBMD *bucketMD, 
 		}
 	}
 	bmd := h.owner.bmd.get()
-	if cmn.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		logmsync(bmd.Version, newBMD, msg, caller)
 	}
 	// skip older iff not transactional - see t.receiveBMD()
@@ -1587,8 +1564,7 @@ func (h *htrun) receiveSmap(newSmap *smapX, msg *aisMsg, payload msPayload, call
 	return h.owner.smap.synchronize(h.si, newSmap, payload, cb)
 }
 
-func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *aisMsg, payload msPayload,
-	caller string, cb func(newELT *etlMD, oldETL *etlMD, action string)) (err error) {
+func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *aisMsg, payload msPayload, caller string, cb func(ne, oe *etlMD)) (err error) {
 	if newEtlMD == nil {
 		return
 	}
@@ -1609,7 +1585,7 @@ func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *aisMsg, payload msPayload,
 	debug.AssertNoErr(err)
 
 	if cb != nil {
-		cb(newEtlMD, etlMD, msg.Action)
+		cb(newEtlMD, etlMD)
 	}
 	return
 }
@@ -1630,9 +1606,8 @@ func (h *htrun) _recvCfg(newConfig *globalConfig, payload msPayload) (err error)
 		return
 	}
 
-	// NOTE: update assorted read-mostly knobs
-	cmn.Features = newConfig.Features
-	cmn.Timeout.Set(&newConfig.ClusterConfig)
+	// update assorted read-mostly knobs
+	cmn.Rom.Set(&newConfig.ClusterConfig)
 	return
 }
 
@@ -1721,7 +1696,7 @@ func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res 
 	for _, u := range contactURLs {
 		addCandidate(u)
 	}
-	sleep := max(2*time.Second, cmn.Timeout.MaxKeepalive())
+	sleep := max(2*time.Second, cmn.Rom.MaxKeepalive())
 	for i := 0; i < 4; i++ {
 		for _, candidateURL := range candidates {
 			if daemon.stopping.Load() {
@@ -1867,7 +1842,7 @@ func (h *htrun) pollClusterStarted(config *cmn.Config, psi *meta.Snode) (maxCii 
 		query                    = url.Values{apc.QparamAskPrimary: []string{"true"}}
 	)
 	for {
-		sleep = min(cmn.Timeout.MaxKeepalive(), sleep+time.Second)
+		sleep = min(cmn.Rom.MaxKeepalive(), sleep+time.Second)
 		time.Sleep(sleep)
 		total += sleep
 		rediscover += sleep
@@ -1951,7 +1926,7 @@ func (h *htrun) externalWD(w http.ResponseWriter, r *http.Request) (responded bo
 	// external call
 	if callerID == "" && caller == "" {
 		readiness := cos.IsParseBool(r.URL.Query().Get(apc.QparamHealthReadiness))
-		if cmn.FastV(5, cos.SmoduleAIS) {
+		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 			nlog.Infof("%s: external health-ping from %s (readiness=%t)", h.si, r.RemoteAddr, readiness)
 		}
 		// respond with 503 as per https://tools.ietf.org/html/rfc7231#section-6.6.4

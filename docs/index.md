@@ -26,6 +26,8 @@ AIS consistently shows balanced I/O distribution and **linear scalability** acro
 * **Turn-key cache**. Can be used as a standalone highly-available protected storage and/or LRU-based fast cache. Eviction watermarks, as well as numerous other management policies, are per-bucket configurable.
 * **ETL offload**. The capability to run I/O intensive custom data transformations *close to data* - offline (dataset to dataset) and inline (on-the-fly).
 * **File datasets**. AIS can be immediately populated from any file-based data source (local or remote, ad-hoc/on-demand or via asynchronus batch).
+* **Read-after-write consistency**. Reading and writing (as well as all other control and data plane operations) can be performed via any (random, selected, or load-balanced) AIS gateway (a.k.a. "proxy"). Once the first replica of an object is written and _finalized_ subsequent reads are guaranteed to view the same content. Additional copies and/or EC slices, if configured, are added asynchronously via `put-copies` and `ec-put` jobs, respectively.
+* **Write-through**. In presence of any [remote backend](/docs/providers.md), AIS executes remote write (e.g., using vendor's SDK) as part of the [transaction](https://github.com/NVIDIA/aistore/blob/main/docs/overview.md#read-after-write-consistency) that places and _finalizes_ the first replica.
 * **Small file datasets.** To serialize small files and facilitate batch processing, AIS supports TAR, TAR.GZ (or TGZ), ZIP, and TAR.LZ4 formatted objects (often called _shards_). Resharding (for optimal sorting and sizing), listing contained files (samples), appending to existing shards, and generating new ones from existing objects and/or client-side files - is also fully supported.
 * **Kubernetes**. Provides for easy Kubernetes deployment via a separate GitHub [repo](https://github.com/NVIDIA/ais-k8s) and [AIS/K8s Operator](https://github.com/NVIDIA/ais-k8s/tree/master/operator).
 * **Command line management**. Integrated powerful [CLI](/docs/cli.md) for easy management and monitoring.
@@ -36,11 +38,11 @@ AIS consistently shows balanced I/O distribution and **linear scalability** acro
 AIS runs natively on Kubernetes and features open format - thus, the freedom to copy or move your data from AIS at any time using the familiar Linux `tar(1)`, `scp(1)`, `rsync(1)` and similar.
 
 For developers and data scientists, there's also:
-* native [Go (language) API](https://github.com/NVIDIA/aistore/tree/master/api) that we utilize in a variety of tools including [CLI](/docs/cli.md) and [Load Generator](/docs/aisloader.md);
-* native [Python SDK](https://github.com/NVIDIA/aistore/tree/master/python/aistore/sdk)
+* native [Go (language) API](https://github.com/NVIDIA/aistore/tree/main/api) that we utilize in a variety of tools including [CLI](/docs/cli.md) and [Load Generator](/docs/aisloader.md);
+* native [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk)
   - [Python SDK reference guide](/docs/python_sdk.md)
-* [PyTorch integration](https://github.com/NVIDIA/aistore/tree/master/python/aistore/pytorch) and usage examples
-* [Boto3 support](https://github.com/NVIDIA/aistore/tree/master/python/aistore/botocore_patch) for interoperability with AWS SDK for Python (aka [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html)) client
+* [PyTorch integration](https://github.com/NVIDIA/aistore/tree/main/python/aistore/pytorch) and usage examples
+* [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch) for interoperability with AWS SDK for Python (aka [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html)) client
   - and other [Botocore](https://github.com/boto/botocorehttps://github.com/boto/botocore) derivatives.
 
 For the original AIStore **white paper** and design philosophy, for introduction to large-scale deep learning and the most recently added features, please see [AIStore Overview](/docs/overview.md) (where you can also find six alternative ways to work with existing datasets). Videos and **animated presentations** can be found at [videos](/docs/videos.md).
@@ -57,12 +59,12 @@ Since prerequisites boil down to, essentially, having Linux with a disk the depl
 
 | Option | Objective |
 | --- | ---|
-| [Local playground](https://github.com/NVIDIA/aistore/blob/master/docs/getting_started.md#local-playground) | AIS developers and development, Linux or Mac OS |
+| [Local playground](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#local-playground) | AIS developers and development, Linux or Mac OS |
 | Minimal production-ready deployment | This option utilizes preinstalled docker image and is targeting first-time users or researchers (who could immediately start training their models on smaller datasets) |
-| [Easy automated GCP/GKE deployment](https://github.com/NVIDIA/aistore/blob/master/docs/getting_started.md#kubernetes-deployments) | Developers, first-time users, AI researchers |
+| [Easy automated GCP/GKE deployment](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#kubernetes-deployments) | Developers, first-time users, AI researchers |
 | [Large-scale production deployment](https://github.com/NVIDIA/ais-k8s) | Requires Kubernetes and is provided via a separate repository: [ais-k8s](https://github.com/NVIDIA/ais-k8s) |
 
-Further, there's the capability referred to as [global namespace](https://github.com/NVIDIA/aistore/blob/master/docs/providers.md#remote-ais-cluster): given HTTP(S) connectivity, AIS clusters can be easily interconnected to "see" each other's datasets. Hence, the idea to start "small" to gradually and incrementally build high-performance shared capacity.
+Further, there's the capability referred to as [global namespace](https://github.com/NVIDIA/aistore/blob/main/docs/providers.md#remote-ais-cluster): given HTTP(S) connectivity, AIS clusters can be easily interconnected to "see" each other's datasets. Hence, the idea to start "small" to gradually and incrementally build high-performance shared capacity.
 
 > For detailed discussion on supported deployments, please refer to [Getting Started](/docs/getting_started.md).
 
@@ -105,8 +107,8 @@ With a little effort, they all could be extracted and used outside.
 - [Getting Started](/docs/getting_started.md)
 - [Technical Blog](https://aiatscale.org/blog)
 - API and SDK
-  - [Go (language) API](https://github.com/NVIDIA/aistore/tree/master/api)
-  - [Python SDK](https://github.com/NVIDIA/aistore/tree/master/python/aistore), and also:
+  - [Go (language) API](https://github.com/NVIDIA/aistore/tree/main/api)
+  - [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore), and also:
     - [pip package](https://pypi.org/project/aistore/)
     - [reference guide](/docs/python_sdk.md)
   - [REST API](/docs/http_api.md)
@@ -114,10 +116,10 @@ With a little effort, they all could be extracted and used outside.
 - Amazon S3
   - [`s3cmd` client](/docs/s3cmd.md)
   - [S3 compatibility](/docs/s3compat.md)
-  - [Boto3 support](https://github.com/NVIDIA/aistore/tree/master/python/aistore/botocore_patch)
+  - [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch)
 - [CLI](/docs/cli.md)
   - [`ais help`](/docs/cli/help.md)
-  - [Reference guide](https://github.com/NVIDIA/aistore/blob/master/docs/cli.md#cli-reference)
+  - [Reference guide](https://github.com/NVIDIA/aistore/blob/main/docs/cli.md#cli-reference)
   - [Monitoring](/docs/cli/show.md)
     - [`ais show cluster`](/docs/cli/show.md)
     - [`ais show performance`](/docs/cli/show.md)
@@ -144,6 +146,7 @@ With a little effort, they all could be extracted and used outside.
   - [AIS Load Generator: integrated benchmark tool](/docs/aisloader.md)
   - [How to benchmark](/docs/howto_benchmark.md)
   - [Performance tuning and testing](/docs/performance.md)
+  - [Performance monitoring](/docs/cli/performance.md)
 - Buckets and Backend Providers
   - [Backend providers](/docs/providers.md)
   - [Buckets](/docs/bucket.md)
@@ -154,7 +157,7 @@ With a little effort, they all could be extracted and used outside.
   - [Checksumming: brief theory of operations](/docs/checksum.md)
   - [S3 compatibility](/docs/s3compat.md)
 - Cluster Management
-  - [Lifecycle management: maintenance mode, rebalance/rebuild, and more](/docs/lifecycle_node.md)
+  - [Node lifecycle: maintenance mode, rebalance/rebuild, shutdown, decommission](/docs/lifecycle_node.md)
   - [CLI: `ais cluster` and subcommands](/docs/cli/show.md)
   - [Joining AIS cluster](/docs/join_cluster.md)
   - [Leaving AIS cluster](/docs/leave_cluster.md)
@@ -162,7 +165,9 @@ With a little effort, they all could be extracted and used outside.
   - [Troubleshooting](/docs/troubleshooting.md)
 - Configuration
   - [Configuration](/docs/configuration.md)
+  - [Environment variables](/docs/environment-vars.md)
   - [CLI: `ais config`](/docs/cli/config.md)
+  - [Feature flags](/docs/feature_flags.md)
 - Observability
   - [Observability](/docs/metrics.md)
   - [Prometheus](/docs/prometheus.md)
@@ -172,18 +177,23 @@ With a little effort, they all could be extracted and used outside.
   - [Docker](/docs/docker_main.md)
   - [Useful scripts](/docs/development.md)
   - Profiling, race-detecting, and more
-- Batch operations
+- Batch jobs
   - [Batch operations](/docs/batch.md)
   - [eXtended Actions (xactions)](/xact/README.md)
   - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md)
-- Topics
+- Assorted Topics
   - [System files](/docs/sysfiles.md)
+  - [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)
+  - [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
+  - [Feature flags](/docs/feature_flags.md)
   - [`aisnode` command line](/docs/command_line.md)
   - [Traffic patterns](/docs/traffic_patterns.md)
   - [Highly available control plane](/docs/ha.md)
+  - [Start/stop maintenance mode, shutdown, decommission, and related operations](/docs/lifecycle_node.md)
   - [Downloader](/docs/downloader.md)
   - [On-disk layout](/docs/on_disk_layout.md)
-  - [AIS Buckets: definition, operations, properties](https://github.com/NVIDIA/aistore/blob/master/docs/bucket.md#bucket)
+  - [Buckets: definition, operations, properties](https://github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket)
+  - [Out of band updates](/docs/out_of_band.md)
 
 ## License
 

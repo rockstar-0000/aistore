@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"testing"
@@ -169,7 +169,7 @@ func TestNamespace(t *testing.T) {
 				}
 			)
 
-			tools.CheckSkip(t, tools.SkipTestArgs{
+			tools.CheckSkip(t, &tools.SkipTestArgs{
 				RequiresRemoteCluster: test.remote,
 			})
 
@@ -230,16 +230,19 @@ func TestNamespace(t *testing.T) {
 			)
 
 			// Test bucket summary
-			var summaries cmn.AllBsummResults
+			var (
+				summaries cmn.AllBsummResults
+				xids      []string
+			)
 			for _, bck := range locBuckets {
-				summ, err := api.GetBucketSummary(baseParams, cmn.QueryBcks(bck), nil /*bck present true*/)
+				xid, summ, err := api.GetBucketSummary(baseParams, cmn.QueryBcks(bck),
+					nil /*bck present true*/, api.BsummArgs{})
 				tassert.CheckFatal(t, err)
 				summaries = append(summaries, summ[0])
+				xids = append(xids, xid)
 			}
-			tassert.Errorf(
-				t, len(summaries) == len(locBuckets),
-				"number of summaries (%d) should be %d", len(summaries), len(locBuckets),
-			)
+			tassert.Errorf(t, len(summaries) == len(locBuckets), "%s-%v: number of summaries (%d) should be %d",
+				apc.ActSummaryBck, xids, len(summaries), len(locBuckets))
 
 			bck1Found, bck2Found := false, false
 			for _, summary := range summaries {
@@ -276,7 +279,7 @@ func TestNamespace(t *testing.T) {
 }
 
 func TestRemoteWithAliasAndUUID(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{
+	tools.CheckSkip(t, &tools.SkipTestArgs{
 		RequiresRemoteCluster: true,
 	})
 
@@ -335,7 +338,7 @@ func TestRemoteWithAliasAndUUID(t *testing.T) {
 }
 
 func TestRemoteWithSilentBucketDestroy(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{
+	tools.CheckSkip(t, &tools.SkipTestArgs{
 		RequiresRemoteCluster: true,
 	})
 

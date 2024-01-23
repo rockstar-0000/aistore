@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles object operations.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -38,7 +38,7 @@ func catHandler(c *cli.Context) error {
 		return err
 	}
 	archpath := parseStrFlag(c, archpathGetFlag)
-	return getObject(c, bck, objName, archpath, fileStdIO, true /*silent*/, false /*extract*/)
+	return getObject(c, bck, objName, archpath, fileStdIO, true /*quiet*/, false /*extract*/)
 }
 
 func getHandler(c *cli.Context) error {
@@ -48,6 +48,14 @@ func getHandler(c *cli.Context) error {
 	if flagIsSet(c, lengthFlag) != flagIsSet(c, offsetFlag) {
 		return fmt.Errorf("%s and %s must be both present (or not)", qflprn(lengthFlag), qflprn(offsetFlag))
 	}
+	if flagIsSet(c, latestVerFlag) {
+		if flagIsSet(c, headObjPresentFlag) {
+			return fmt.Errorf(errFmtExclusive, qflprn(latestVerFlag), qflprn(headObjPresentFlag))
+		}
+		if flagIsSet(c, getObjCachedFlag) {
+			return fmt.Errorf(errFmtExclusive, qflprn(latestVerFlag), qflprn(getObjCachedFlag))
+		}
+	}
 
 	// source
 	uri := c.Args().Get(0)
@@ -55,6 +63,17 @@ func getHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	if !bck.IsHTTP() {
+		if bck.Props, err = headBucket(bck, false /* don't add */); err != nil {
+			return err
+		}
+	}
+	if flagIsSet(c, latestVerFlag) && !bck.HasVersioningMD() {
+		return fmt.Errorf("option %s is incompatible with the specified bucket %s\n"+
+			"(tip: can only GET latest object's version from a bucket with Cloud or remote AIS backend)",
+			qflprn(latestVerFlag), bck.String())
+	}
+
 	// destination (empty "" implies using source `basename`)
 	outFile := c.Args().Get(1)
 
@@ -82,8 +101,8 @@ func getHandler(c *cli.Context) error {
 
 	// validate extract and archpath
 	if extract {
-		if flagIsSet(c, checkObjCachedFlag) {
-			return fmt.Errorf(errFmtExclusive, extractVia, qflprn(checkObjCachedFlag))
+		if flagIsSet(c, headObjPresentFlag) {
+			return fmt.Errorf(errFmtExclusive, extractVia, qflprn(headObjPresentFlag))
 		}
 		if flagIsSet(c, lengthFlag) {
 			return fmt.Errorf("read range (%s, %s) of archived files (%s) is not implemented yet",
@@ -94,9 +113,9 @@ func getHandler(c *cli.Context) error {
 		if flagIsSet(c, getObjPrefixFlag) {
 			return fmt.Errorf(errFmtExclusive, qflprn(getObjPrefixFlag), qflprn(archpathGetFlag))
 		}
-		if flagIsSet(c, checkObjCachedFlag) {
+		if flagIsSet(c, headObjPresentFlag) {
 			return fmt.Errorf("checking presence (%s) of archived files (%s) is not implemented yet",
-				qflprn(checkObjCachedFlag), qflprn(archpathGetFlag))
+				qflprn(headObjPresentFlag), qflprn(archpathGetFlag))
 		}
 		if flagIsSet(c, lengthFlag) {
 			return fmt.Errorf("read range (%s, %s) of archived files (%s) is not implemented yet",
@@ -118,12 +137,7 @@ func getHandler(c *cli.Context) error {
 	}
 
 	// GET
-	if !bck.IsHTTP() {
-		if _, err = headBucket(bck, false /* don't add */); err != nil {
-			return err
-		}
-	}
-	return getObject(c, bck, objName, archpath, outFile, false /*silent*/, extract)
+	return getObject(c, bck, objName, archpath, outFile, false /*quiet*/, extract)
 }
 
 // GET multiple -- currently, only prefix (TODO: list/range)
@@ -150,7 +164,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, archpath, outFile string, extract 
 	if flagIsSet(c, listArchFlag) || extract || archpath != "" {
 		msg.SetFlag(apc.LsArchDir)
 	}
-	if flagIsSet(c, checkObjCachedFlag) {
+	if flagIsSet(c, getObjCachedFlag) {
 		msg.SetFlag(apc.LsObjCached)
 	}
 	pageSize, limit, err := _setPage(c, bck)
@@ -160,7 +174,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, archpath, outFile string, extract 
 	msg.PageSize = uint(pageSize)
 
 	// list-objects
-	objList, err := api.ListObjects(apiBP, bck, msg, api.ListArgs{Num: uint(limit)})
+	objList, err := api.ListObjects(apiBP, bck, msg, api.ListArgs{Limit: uint(limit)})
 	if err != nil {
 		return V(err)
 	}
@@ -188,7 +202,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, archpath, outFile string, extract 
 	var (
 		discard, out string
 		verb         = "GET"
-		silent       = !flagIsSet(c, verboseFlag) // silent is non-verbose default
+		quiet        = !flagIsSet(c, verboseFlag) // quiet is non-verbose default
 		units, errU  = parseUnitsFlag(c, unitsFlag)
 	)
 	if errU != nil {
@@ -212,7 +226,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, archpath, outFile string, extract 
 	cptn := fmt.Sprintf("%s%s %d object%s from %s%s (total size %s)",
 		verb, discard, l, cos.Plural(l), bck.Cname(""), out, teb.FmtSize(totalSize, units, 2))
 
-	if flagIsSet(c, yesFlag) && (l > 1 || silent) {
+	if flagIsSet(c, yesFlag) && (l > 1 || quiet) {
 		fmt.Fprintln(c.App.Writer, cptn)
 	} else if ok := confirm(c, cptn); !ok {
 		return nil
@@ -267,7 +281,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, archpath, outFile string, extract 
 			}
 		}
 		u.wg.Add(1)
-		go u.get(c, bck, entry, shardName, outFile, silent, extract)
+		go u.get(c, bck, entry, shardName, outFile, quiet, extract)
 	}
 	u.wg.Wait()
 
@@ -285,7 +299,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, archpath, outFile string, extract 
 // uctx - "get" extension
 //////////
 
-func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEntry, shardName, outFile string, silent, extract bool) {
+func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEntry, shardName, outFile string, quiet, extract bool) {
 	var (
 		objName  = entry.Name
 		archpath string
@@ -302,7 +316,7 @@ func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEntry, shardName, 
 			}
 		}
 	}
-	err := getObject(c, bck, objName, archpath, outFile, silent, extract)
+	err := getObject(c, bck, objName, archpath, outFile, quiet, extract)
 	if err != nil {
 		u.errCount.Inc()
 	}
@@ -320,7 +334,7 @@ func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEntry, shardName, 
 }
 
 // get one (main function)
-func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, silent, extract bool) (err error) {
+func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, quiet, extract bool) (err error) {
 	var (
 		getArgs api.GetArgs
 		oah     api.ObjAttrs
@@ -339,7 +353,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 	}
 
 	// just check if a remote object is present (do not GET)
-	if flagIsSet(c, checkObjCachedFlag) {
+	if flagIsSet(c, headObjPresentFlag) {
 		return isObjPresent(c, bck, objName)
 	}
 
@@ -349,10 +363,10 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 		return err
 	}
 	if offset, err = parseSizeFlag(c, offsetFlag, units); err != nil {
-		return
+		return err
 	}
 	if length, err = parseSizeFlag(c, lengthFlag, units); err != nil {
-		return
+		return err
 	}
 
 	// where to
@@ -390,11 +404,11 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 	hdr := cmn.MakeRangeHdr(offset, length)
 	if outFile == fileStdIO {
 		getArgs = api.GetArgs{Writer: os.Stdout, Header: hdr}
-		silent = true
+		quiet = true
 	} else {
 		var file *os.File
 		if file, err = os.Create(outFile); err != nil {
-			return
+			return err
 		}
 		defer func() {
 			file.Close()
@@ -405,19 +419,12 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 		getArgs = api.GetArgs{Writer: file, Header: hdr}
 	}
 
-	if bck.IsHTTP() {
-		uri := c.Args().Get(0)
-		getArgs.Query = make(url.Values, 2)
-		getArgs.Query.Set(apc.QparamOrigURL, uri)
-	}
-	// TODO: validate
-	if archpath != "" {
-		if getArgs.Query == nil {
-			getArgs.Query = make(url.Values, 1)
-		}
-		getArgs.Query.Set(apc.QparamArchpath, archpath)
+	// finally, http query
+	if bck.IsHTTP() || archpath != "" || flagIsSet(c, silentFlag) || flagIsSet(c, latestVerFlag) {
+		getArgs.Query = _getQparams(c, &bck, archpath)
 	}
 
+	// do
 	if flagIsSet(c, cksumFlag) {
 		oah, err = api.GetObjectWithValidation(apiBP, bck, objName, &getArgs)
 	} else {
@@ -427,7 +434,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 		if cmn.IsStatusNotFound(err) && archpath == "" {
 			err = &errDoesNotExist{what: "object", name: bck.Cname(objName)}
 		}
-		return
+		return err
 	}
 
 	var (
@@ -437,14 +444,14 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 	if extract {
 		mime, err = doExtract(objName, outFile, objLen)
 		if err != nil {
-			if configuredVerbosity() {
+			if cliConfVerbose() {
 				return fmt.Errorf("failed to extract %s (from local %q): %v", bck.Cname(objName), outFile, err)
 			}
 			return fmt.Errorf("failed to extract %s: %v", bck.Cname(objName), err)
 		}
 	}
 
-	if silent {
+	if quiet {
 		return
 	}
 
@@ -485,6 +492,24 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, archpath, outFile string, s
 		fmt.Fprintf(c.App.Writer, "GET%s %s from %s%s (%s)\n", discard, objName, bn, out, sz)
 	}
 	return
+}
+
+func _getQparams(c *cli.Context, bck *cmn.Bck, archpath string) (q url.Values) {
+	q = make(url.Values, 2)
+	if bck.IsHTTP() {
+		uri := c.Args().Get(0)
+		q.Set(apc.QparamOrigURL, uri)
+	}
+	if archpath != "" {
+		q.Set(apc.QparamArchpath, archpath)
+	}
+	if flagIsSet(c, silentFlag) {
+		q.Set(apc.QparamSilent, "true")
+	}
+	if flagIsSet(c, latestVerFlag) {
+		q.Set(apc.QparamLatestVer, "true")
+	}
+	return q
 }
 
 //

@@ -1,6 +1,6 @@
 // Package xact provides core functionality for the AIStore eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xact
 
@@ -8,16 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 )
-
-const UUIDSepa = ","
 
 const (
 	ScopeG  = iota + 1 // cluster
@@ -27,6 +26,8 @@ const (
 )
 
 const (
+	SepaID = ","
+
 	LeftID  = "["
 	RightID = "]"
 )
@@ -40,7 +41,12 @@ const (
 	MinPollTime      = 2 * time.Second    // ditto
 	MaxPollTime      = 2 * time.Minute    // can grow up to
 
-	NumConsecutiveIdle = 3 // number of consecutive 'idle' states (to exclude false-positive "is idle")
+	// number of consecutive 'idle' xaction states, with possible numeric
+	// values translating as follows:
+	// 1: fully rely on xact.IsIdle() logic with no extra checks whatsoever
+	// 2: one additional IsIdle() call after MinPollTime
+	// 3: two additional IsIdle() calls spaced at MinPollTime interval, and so on.
+	NumConsecutiveIdle = 2
 )
 
 type (
@@ -70,7 +76,7 @@ type (
 	}
 
 	// primarily: `api.QueryXactionSnaps`
-	MultiSnap map[string][]*cluster.Snap // by target ID (tid)
+	MultiSnap map[string][]*core.Snap // by target ID (tid)
 )
 
 type (
@@ -85,16 +91,17 @@ type (
 		Mountpath   bool            // is a mountpath-traversing ("jogger") xaction
 
 		// see xreg for "limited coexistence"
-		Rebalance  bool // moves data between nodes
-		Resilver   bool // moves data between mountpaths
-		MassiveBck bool // massive data copying (transforming, encoding) operation on a bucket
+		Rebalance      bool // moves data between nodes
+		Resilver       bool // moves data between mountpaths
+		ConflictRebRes bool // conflicts with rebalance/resilver
+		AbortRebRes    bool // gets aborted upon rebalance/resilver - currently, all `ext`-ensions
 
 		// xaction has an intermediate `idle` state whereby it "idles" between requests
 		// (see related: xact/demand.go)
 		Idles bool
 
 		// xaction returns extended xaction-specific stats
-		// (see related: `Snap.Ext` in cluster/xaction.go)
+		// (see related: `Snap.Ext` in core/xaction.go)
 		ExtendedStats bool
 	}
 )
@@ -112,8 +119,8 @@ var Table = map[string]Descriptor{
 	// bucket-less xactions that will typically have a 'cluster' scope (with resilver being a notable exception)
 	apc.ActElection:  {DisplayName: "elect-primary", Scope: ScopeG, Startable: false},
 	apc.ActRebalance: {Scope: ScopeG, Startable: true, Metasync: true, Owned: false, Mountpath: true, Rebalance: true},
-	apc.ActDownload:  {Scope: ScopeG, Startable: false, Mountpath: true, Idles: true},
-	apc.ActETLInline: {Scope: ScopeG, Startable: false, Mountpath: false},
+
+	apc.ActETLInline: {Scope: ScopeG, Startable: false, Mountpath: false, AbortRebRes: true},
 
 	// (one bucket) | (all buckets)
 	apc.ActLRU:          {DisplayName: "lru-eviction", Scope: ScopeGB, Startable: true, Mountpath: true},
@@ -139,7 +146,7 @@ var Table = map[string]Descriptor{
 	apc.ActPutCopies: {Scope: ScopeB, Startable: false, Mountpath: true, RefreshCap: true, Idles: true},
 
 	//
-	// on-demand multi-object (TODO: consider MassiveBck: true)
+	// on-demand multi-object (consider setting ConflictRebRes = true)
 	//
 	apc.ActArchive: {Scope: ScopeB, Access: apc.AccessRW, Startable: false, RefreshCap: true, Idles: true},
 	apc.ActCopyObjects: {
@@ -157,18 +164,22 @@ var Table = map[string]Descriptor{
 		Startable:   false,
 		RefreshCap:  true,
 		Idles:       true,
+		AbortRebRes: true,
 	},
+
+	apc.ActDownload: {Access: apc.AccessRW, Scope: ScopeG, Startable: false, Mountpath: true, Idles: true, AbortRebRes: true},
 
 	// in its own class
 	apc.ActDsort: {
-		DisplayName:   "dsort",
-		Scope:         ScopeB,
-		Access:        apc.AccessRW,
-		Startable:     false,
-		RefreshCap:    true,
-		Mountpath:     true,
-		MassiveBck:    true,
-		ExtendedStats: true,
+		DisplayName:    "dsort",
+		Scope:          ScopeB,
+		Access:         apc.AccessRW,
+		Startable:      false,
+		RefreshCap:     true,
+		Mountpath:      true,
+		ConflictRebRes: true,
+		ExtendedStats:  true,
+		AbortRebRes:    true,
 	},
 
 	// multi-object
@@ -205,15 +216,15 @@ var Table = map[string]Descriptor{
 
 	// entire bucket (storage svcs)
 	apc.ActECEncode: {
-		DisplayName: "ec-bucket",
-		Scope:       ScopeB,
-		Access:      apc.AccessRW,
-		Startable:   true,
-		Metasync:    true,
-		Owned:       false,
-		RefreshCap:  true,
-		Mountpath:   true,
-		MassiveBck:  true,
+		DisplayName:    "ec-bucket",
+		Scope:          ScopeB,
+		Access:         apc.AccessRW,
+		Startable:      true,
+		Metasync:       true,
+		Owned:          false,
+		RefreshCap:     true,
+		Mountpath:      true,
+		ConflictRebRes: true,
 	},
 	apc.ActMakeNCopies: {
 		DisplayName: "mirror",
@@ -226,26 +237,26 @@ var Table = map[string]Descriptor{
 		Mountpath:   true,
 	},
 	apc.ActMoveBck: {
-		DisplayName: "rename-bucket",
-		Scope:       ScopeB,
-		Access:      apc.AceMoveBucket,
-		Startable:   false, // executing this one cannot be done via `api.StartXaction`
-		Metasync:    true,
-		Owned:       false,
-		Mountpath:   true,
-		Rebalance:   true,
-		MassiveBck:  true,
+		DisplayName:    "rename-bucket",
+		Scope:          ScopeB,
+		Access:         apc.AceMoveBucket,
+		Startable:      false, // executing this one cannot be done via `api.StartXaction`
+		Metasync:       true,
+		Owned:          false,
+		Mountpath:      true,
+		Rebalance:      true,
+		ConflictRebRes: true,
 	},
 	apc.ActCopyBck: {
-		DisplayName: "copy-bucket",
-		Scope:       ScopeB,
-		Access:      apc.AccessRW, // apc.AceCreateBucket ditto
-		Startable:   false,        // ditto
-		Metasync:    true,
-		Owned:       false,
-		RefreshCap:  true,
-		Mountpath:   true,
-		MassiveBck:  true,
+		DisplayName:    "copy-bucket",
+		Scope:          ScopeB,
+		Access:         apc.AccessRW, // apc.AceCreateBucket ditto
+		Startable:      false,        // ditto
+		Metasync:       true,
+		Owned:          false,
+		RefreshCap:     true,
+		Mountpath:      true,
+		ConflictRebRes: true,
 	},
 	apc.ActETLBck: {
 		DisplayName: "etl-bucket",
@@ -256,7 +267,7 @@ var Table = map[string]Descriptor{
 		Owned:       false,
 		RefreshCap:  true,
 		Mountpath:   true,
-		MassiveBck:  true,
+		AbortRebRes: true,
 	},
 
 	apc.ActList: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false, Metasync: false, Owned: true, Idles: true},
@@ -295,6 +306,20 @@ func GetKindName(kindOrName string) (kind, name string) {
 		name = kind
 	}
 	return
+}
+
+func ParseCname(cname string) (xactKind, xactID string, _ error) {
+	const efmt = "invalid name %q"
+	l := len(cname)
+	if l == 0 || cname[l-1] != RightID[0] {
+		return "", "", fmt.Errorf(efmt, cname)
+	}
+	i := strings.IndexByte(cname, LeftID[0])
+	if i < 0 {
+		return "", "", fmt.Errorf(efmt, cname)
+	}
+	xactKind, xactID = cname[:i], cname[i+1:l-1]
+	return xactKind, xactID, nil
 }
 
 func IdlesBeforeFinishing(kindOrName string) bool {
@@ -428,7 +453,7 @@ func (xs MultiSnap) GetUUIDs() []string {
 	return uuids.ToSlice()
 }
 
-func (xs MultiSnap) RunningTarget(xid string) (string /*tid*/, *cluster.Snap, error) {
+func (xs MultiSnap) RunningTarget(xid string) (string /*tid*/, *core.Snap, error) {
 	if err := xs.checkEmptyID(xid); err != nil {
 		return "", nil, err
 	}
@@ -457,35 +482,45 @@ func (xs MultiSnap) IsAborted(xid string) (bool, error) {
 }
 
 // (all targets, all xactions)
-func (xs MultiSnap) IsIdle(xid string) (found, idle bool) {
+func (xs MultiSnap) IsIdle(xid string) (aborted, running, notstarted bool) {
 	if xid != "" {
 		debug.Assert(IsValidUUID(xid), xid)
-		return xs._idle(xid)
+		return xs._get(xid)
 	}
 	uuids := xs.GetUUIDs()
-	idle = true
 	for _, xid = range uuids {
-		f, i := xs._idle(xid)
-		found = found || f
-		idle = idle && i
+		a, r, ns := xs._get(xid)
+		aborted = aborted || a
+		notstarted = notstarted || ns
+		running = running || r
 	}
-	return
+	return aborted, running, notstarted
 }
 
 // (all targets, given xaction)
-func (xs MultiSnap) _idle(xid string) (found, idle bool) {
+func (xs MultiSnap) _get(xid string) (aborted, running, notstarted bool) {
+	var nt, nr, ns, nf int
 	for _, snaps := range xs {
+		nt++
 		for _, xsnap := range snaps {
-			if xid == xsnap.ID {
-				found = true
-				// (one target, one xaction)
-				if xsnap.Started() && !xsnap.IsAborted() && !xsnap.IsIdle() {
-					return true, false
-				}
+			if xid != xsnap.ID {
+				continue
 			}
+			nf++
+			// (one target, one xaction)
+			switch {
+			case xsnap.IsAborted():
+				return true, false, false
+			case !xsnap.Started():
+				ns++
+			case !xsnap.IsIdle():
+				nr++
+			}
+			break
 		}
 	}
-	idle = true // (read: not-idle not found)
+	running = nr > 0
+	notstarted = ns > 0 || nf == 0
 	return
 }
 

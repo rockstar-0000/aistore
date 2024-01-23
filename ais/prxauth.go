@@ -12,12 +12,12 @@ import (
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
@@ -171,7 +171,7 @@ func (p *proxy) tokenHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxy) validateSecret(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.parseURL(w, r, 0, false, apc.URLPathTokens.L); err != nil {
+	if _, err := p.parseURL(w, r, apc.URLPathTokens.L, 0, false); err != nil {
 		return
 	}
 	cksum := cos.NewCksumHash(cos.ChecksumSHA256)
@@ -188,7 +188,7 @@ func (p *proxy) validateSecret(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxy) httpTokenDelete(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.parseURL(w, r, 0, false, apc.URLPathTokens.L); err != nil {
+	if _, err := p.parseURL(w, r, apc.URLPathTokens.L, 0, false); err != nil {
 		return
 	}
 	if p.forwardCP(w, r, nil, "revoke token") {
@@ -244,20 +244,18 @@ func aceErrToCode(err error) (status int) {
 	default:
 		status = http.StatusForbidden
 	}
-	return
+	return status
 }
 
-func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) error {
+func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err error) {
 	var (
 		tk     *tok.Token
 		bucket *cmn.Bck
-		err    error
-		cfg    = cmn.GCO.Get()
 	)
 	if p.isIntraCall(hdr, false /*from primary*/) == nil {
 		return nil
 	}
-	if cfg.Auth.Enabled {
+	if cmn.Rom.AuthEnabled() { // config.Auth.Enabled
 		tk, err = p.validateToken(hdr)
 		if err != nil {
 			// NOTE: making exception to allow 3rd party clients read remote ht://bucket
@@ -278,18 +276,17 @@ func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) erro
 		// cluster ACL: create/list buckets, node management, etc.
 		return nil
 	}
-	if !cfg.Auth.Enabled || tk.IsAdmin {
-		// PATCH and ACL are always allowed in two cases:
-		// - a user is a superuser
-		// - AuthN is disabled
+
+	// bucket access conventions:
+	// - without AuthN: read-only access, PATCH, and ACL
+	// - with AuthN:    superuser can PATCH and change ACL
+	if !cmn.Rom.AuthEnabled() {
+		ace &^= (apc.AcePATCH | apc.AceBckSetACL | apc.AccessRO)
+	} else if tk.IsAdmin {
 		ace &^= (apc.AcePATCH | apc.AceBckSetACL)
 	}
 	if ace == 0 {
 		return nil
-	}
-	if !cfg.Auth.Enabled {
-		// Without AuthN, read-only access is always OK
-		ace &^= apc.AccessRO
 	}
 	return bck.Allow(ace)
 }

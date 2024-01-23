@@ -17,13 +17,13 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
 	"github.com/NVIDIA/aistore/api/env"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/config"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/fatih/color"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
@@ -218,7 +218,7 @@ var (
 // and augments API errors if needed.
 func wrapAuthN(f cli.ActionFunc) cli.ActionFunc {
 	return func(c *cli.Context) error {
-		if authnHTTPClient == nil {
+		if authParams.Client == nil {
 			return errors.New(env.AuthN.URL + " is not set")
 		}
 		err := f(c)
@@ -357,7 +357,7 @@ func loginUserHandler(c *cli.Context) (err error) {
 		cluID    = parseStrFlag(c, clusterTokenFlag)
 	)
 	if flagIsSet(c, expireFlag) {
-		expireIn = api.Duration(parseDurationFlag(c, expireFlag))
+		expireIn = apc.Duration(parseDurationFlag(c, expireFlag))
 	}
 	if cluID != "" {
 		if _, err := authn.GetRegisteredClusters(authParams, authn.CluACL{ID: cluID}); err != nil {
@@ -411,15 +411,18 @@ func addAuthClusterHandler(c *cli.Context) (err error) {
 		cluSpec.URLs = append(cluSpec.URLs, clusterURL)
 	} else {
 		bp := api.BaseParams{
-			Client: defaultHTTPClient,
-			URL:    cluSpec.URLs[0],
-			Token:  loggedUserToken,
-			UA:     ua,
+			URL:   cluSpec.URLs[0],
+			Token: loggedUserToken,
+			UA:    ua,
+		}
+		if cos.IsHTTPS(bp.URL) {
+			bp.Client = clientTLS
+		} else {
+			bp.Client = clientH
 		}
 		smap, err = api.GetClusterMap(bp)
 		if err != nil {
-			err = fmt.Errorf("failed to add cluster %q(%q, %s): %v",
-				cluSpec.ID, cluSpec.Alias, cluSpec.URLs[0], err)
+			err = fmt.Errorf("failed to add cluster %q(%q, %s): %v", cluSpec.ID, cluSpec.Alias, cluSpec.URLs[0], err)
 		}
 	}
 	if err != nil {
@@ -706,14 +709,18 @@ func showAuthConfigHandler(c *cli.Context) (err error) {
 		return err
 	}
 	usejs := flagIsSet(c, jsonFlag)
-	if usejs {
-		return teb.Print(conf, teb.PropsSimpleTmpl, teb.Jopts(usejs))
+	switch {
+	case usejs:
+		return teb.Print(conf, teb.PropValTmpl, teb.Jopts(usejs))
+	case flagIsSet(c, noHeaderFlag):
+		return teb.Print(list, teb.PropValTmplNoHdr)
+	default:
+		return teb.Print(list, teb.PropValTmpl)
 	}
-	return teb.Print(list, teb.PropsSimpleTmpl, teb.Jopts(usejs))
 }
 
 func authNConfigFromArgs(c *cli.Context) (conf *authn.ConfigToUpdate, err error) {
-	conf = &authn.ConfigToUpdate{Server: &authn.ServerConfToUpdate{}}
+	conf = &authn.ConfigToUpdate{Server: &authn.ServerConfToSet{}}
 	items := c.Args()
 	for i := 0; i < len(items); {
 		name, value := items.Get(i), items.Get(i+1)

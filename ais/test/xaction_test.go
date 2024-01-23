@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"testing"
@@ -24,7 +24,7 @@ func TestXactionNotFound(t *testing.T) {
 		proxyURL   = tools.RandomProxyURL(t)
 		baseParams = tools.BaseAPIParams(proxyURL)
 	)
-	_, err := api.QueryXactionSnaps(baseParams, xact.ArgsMsg{ID: "dummy-" + cos.GenUUID()})
+	_, err := api.QueryXactionSnaps(baseParams, &xact.ArgsMsg{ID: "dummy-" + cos.GenUUID()})
 	tools.CheckErrIsNotFound(t, err)
 }
 
@@ -40,12 +40,12 @@ func TestXactionAllStatus(t *testing.T) {
 	}
 	for _, test := range tests {
 		for kind := range xact.Table {
-			xargs := xact.ArgsMsg{Kind: kind, OnlyRunning: test.running}
+			xargs := xact.ArgsMsg{Kind: kind, OnlyRunning: test.running, Force: test.force}
 			if mono.NanoTime()&0x1 == 0x1 {
 				_, xname := xact.GetKindName(kind)
 				xargs.Kind = xname
 			}
-			vec, err := api.GetAllXactionStatus(baseParams, xargs, test.force)
+			vec, err := api.GetAllXactionStatus(baseParams, &xargs)
 			tassert.CheckFatal(t, err)
 			if len(vec) == 0 {
 				continue
@@ -79,8 +79,8 @@ func TestXactionAllStatus(t *testing.T) {
 			// re-check after a while
 			time.Sleep(2 * time.Second)
 
-			xargs = xact.ArgsMsg{Kind: kind, OnlyRunning: false}
-			vec, err = api.GetAllXactionStatus(baseParams, xargs, test.force)
+			xargs = xact.ArgsMsg{Kind: kind, OnlyRunning: false, Force: test.force}
+			vec, err = api.GetAllXactionStatus(baseParams, &xargs)
 			tassert.CheckFatal(t, err)
 			for _, a := range aborted {
 				found := false

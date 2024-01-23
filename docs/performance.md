@@ -90,11 +90,24 @@ Once the packages are installed (the step that will depend on your Linux distrib
 
 ## Network
 
+AIStore supports 3 (three) logical networks:
+
+* public (default port `51081`)
+* intra-cluster control (`51082`), and
+* intra-cluster data (`51083`)
+
+Ideally, all 3 are provisioned (physically) separately - to reduce contention, avoid HoL, and ultimately optimize intra-cluster performance.
+
+Separately, and in addition:
+
 * MTU should be set to `9000` (Jumbo frames) - this is one of the most important configurations
 * Optimize TCP send buffer sizes on the target side (`net.core.rmem_max`, `net.ipv4.tcp_rmem`)
 * Optimize TCP receive buffer on the client (reading) side (`net.core.wmem_max`, `net.ipv4.tcp_wmem`)
-* `net.ipv4.tcp_mtu_probing = 2` # especially important in communication between client <-> proxy or client <-> target and if client has `mtu` set > 1500
-* Wait.. there is more: [all ip-sysctl configurations](https://wiki.linuxfoundation.org/networking/ip-sysctl)
+* Set `net.ipv4.tcp_mtu_probing = 2`
+
+> The last setting is especially important when client's MTU is greater than 1500.
+
+> The list of tunables (above) cannot be considered _exhaustive_. Optimal (high-performance) choices always depend on the hardware, Linux kernel, and a variety of factors outside the scope.
 
 ## Smoke test
 
@@ -115,7 +128,7 @@ The corresponding system configuration file is `/etc/security/limits.conf`.
 
 > In Linux, the default per-process maximum is 1024. It is **strongly recommended** to raise it to at least `100,000`.
 
-Here's a full replica of [/etc/security/limits.conf](https://github.com/NVIDIA/aistore/blob/master/deploy/conf/limits.conf) that we use for development _and_ production.
+Here's a full replica of [/etc/security/limits.conf](https://github.com/NVIDIA/aistore/blob/main/deploy/conf/limits.conf) that we use for development _and_ production.
 
 To check your current settings, run `ulimit -n` or `tail /etc/security/limits.conf`.
 
@@ -331,7 +344,7 @@ AIS loader (aisloader v1.3, build ...) is a tool to measure storage performance.
 It's a load generator that has been developed to benchmark and stress-test AIStore
 but can be easily extended to benchmark any S3-compatible backend.
 For usage, run: `aisloader`, or `aisloader usage`, or `aisloader --help`.
-Further details at https://github.com/NVIDIA/aistore/blob/master/docs/howto_benchmark.md
+Further details at https://github.com/NVIDIA/aistore/blob/main/docs/howto_benchmark.md
 
 Command-line options
 ====================

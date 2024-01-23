@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -10,10 +10,10 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/urfave/cli"
@@ -50,14 +50,16 @@ const (
 	smapHdr = "NODE\t TYPE\t PUBLIC URL" +
 		"{{ if (eq $.ExtendedURLs true) }}\t INTRA CONTROL URL\t INTRA DATA URL{{end}}" +
 		"\n"
-	smapBody = "{{FormatDaemonID $value.ID $.Smap \"\"}}\t {{$value.DaeType}}\t {{$value.PubNet.URL}}" +
+	smapNode = "{{FormatDaemonID $value.ID $.Smap \"\"}}\t {{$value.DaeType}}\t {{$value.PubNet.URL}}" +
 		"{{ if (eq $.ExtendedURLs true) }}\t {{$value.ControlNet.URL}}\t {{$value.DataNet.URL}}{{end}}" +
 		"\n"
 
-	SmapTmpl = smapHdr +
-		"{{ range $key, $value := .Smap.Pmap }}" + smapBody + "{{end}}\n" +
-		smapHdr +
-		"{{ range $key, $value := .Smap.Tmap }}" + smapBody + "{{end}}\n" +
+	SmapTmpl = smapHdr + "{{ range $key, $value := .Smap.Pmap }}" + smapNode + "{{end}}\n" +
+		smapHdr + smapBody
+
+	SmapTmplNoHdr = "{{ range $key, $value := .Smap.Pmap }}" + smapNode + "{{end}}\n" + smapBody
+
+	smapBody = "{{ range $key, $value := .Smap.Tmap }}" + smapNode + "{{end}}\n" +
 		"Non-Electable:\n" +
 		"{{ range $key, $si := .Smap.Pmap }} " +
 		"{{ $nonElect := $.Smap.NonElectable $si }}" +
@@ -70,7 +72,7 @@ const (
 	indent1 = "   "
 
 	ClusterSummary = indent1 + "Proxies:\t{{FormatProxiesSumm .Smap}}\n" +
-		indent1 + "Targets:\t{{FormatTargetsSumm .Smap}}\n" +
+		indent1 + "Targets:\t{{FormatTargetsSumm .Smap .NumDisks}}\n" +
 		indent1 + "Cluster Map:\t{{FormatSmap .Smap}}\n" +
 		indent1 + "Deployment:\t{{ ( Deployments .Status) }}\n" +
 		indent1 + "Status:\t{{ ( OnlineStatus .Status) }}\n" +
@@ -78,11 +80,6 @@ const (
 		indent1 + "Authentication:\t{{if .CluConfig.Auth.Enabled}}enabled{{else}}disabled{{end}}\n" +
 		indent1 + "Version:\t{{ ( Versions .Status) }}\n" +
 		indent1 + "Build:\t{{ ( BuildTimes .Status) }}\n"
-
-	// any JSON struct (e.g. config)
-	FlatTmpl = "PROPERTY\t VALUE\n{{range $item := .}}" +
-		"{{ $item.Name }}\t {{ $item.Value }}\n" +
-		"{{end}}\n"
 
 	// Config
 	DaemonConfigTmpl = "{{ if .ClusterConfigDiff }}PROPERTY\t VALUE\t DEFAULT\n{{range $item := .ClusterConfigDiff }}" +
@@ -93,10 +90,10 @@ const (
 		"{{ $item.Name }}\t {{ $item.Value }}\n" +
 		"{{end}}\n{{end}}"
 
-	PropsSimpleTmpl = "PROPERTY\t VALUE\n" +
-		"{{range $p := . }}" +
-		"{{$p.Name}}\t {{$p.Value}}\n" +
-		"{{end}}"
+	// generic prop/val (name/val, key/val)
+	propValTmplHdr   = "PROPERTY\t VALUE\n"
+	PropValTmpl      = propValTmplHdr + PropValTmplNoHdr
+	PropValTmplNoHdr = "{{range $p := . }}" + "{{$p.Name}}\t {{$p.Value}}\n" + "{{end}}"
 
 	//
 	// special xactions & dsort
@@ -119,10 +116,10 @@ const (
 		"{{FormatBckName $value.SrcBck}}\t " +
 		"{{FormatBckName $value.DstBck}}\t " +
 		"{{if (eq $value.Objs 0) }}-{{else}}{{$value.Objs}}{{end}}\n"
-	DSortListNoHdrTmpl = "{{ range $value := . }}" + dsortListBody + "{{end}}"
-	DSortListTmpl      = dsortListHdr + DSortListNoHdrTmpl
+	DsortListNoHdrTmpl = "{{ range $value := . }}" + dsortListBody + "{{end}}"
+	DsortListTmpl      = dsortListHdr + DsortListNoHdrTmpl
 
-	DSortListVerboseTmpl = dsortListHdr +
+	DsortListVerboseTmpl = dsortListHdr +
 		"{{ range $value := . }}" + dsortListBody +
 		indent1 + "Total Extracted Bytes:\t{{if (eq $value.Bytes 0) }}-{{else}}{{FormatBytesSig $value.Bytes 2}}{{end}}\n" +
 		indent1 + "Extraction Time:\t{{if (eq $value.ExtractedDuration 0) }}-{{else}}{{FormatDuration $value.ExtractedDuration}}{{end}}\n" +
@@ -265,7 +262,7 @@ const (
 		"{{end}}" +
 		"TOTAL\t "
 
-	ShortUsageTmpl = "{{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}}{{if .VisibleFlags}} [command options]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}} - {{.Usage}}\n" +
+	ExtendedUsageTmpl = "{{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}}{{if .VisibleFlags}} [command options]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}} - {{.Usage}}\n" +
 		"\n\tCOMMANDS:\t" +
 		"{{range .VisibleCategories}}" +
 		"{{ range $index, $element := .VisibleCommands}}" +
@@ -280,8 +277,11 @@ const (
 		"--{{FlagName $flag }}" +
 		"{{end}}{{end}}\n"
 
-	UsageOnlyTmpl = `{{.HelpName}} - {{.Usage}}
+	ShortUsageTmpl = `{{.HelpName}} - {{.Usage}}
    {{.UsageText}}
+USAGE:
+   {{.HelpName}} {{.ArgsUsage}}
+
 See '--help' and docs/cli for details.`
 
 	AuthNClusterTmpl = "CLUSTER ID\tALIAS\tURLs\n" +
@@ -384,11 +384,13 @@ type (
 		Smap      *meta.Smap           `json:"smap"`
 		CluConfig *cmn.ClusterConfig   `json:"config"`
 		Status    StatsAndStatusHelper `json:"status"`
+		NumDisks  int                  `json:"-"`
 	}
 	ListBucketsHelper struct {
-		Bck   cmn.Bck
-		Props *cmn.BucketProps
-		Info  *cmn.BsummResult
+		XactID string
+		Bck    cmn.Bck
+		Props  *cmn.Bprops
+		Info   *cmn.BsummResult
 	}
 )
 
@@ -399,28 +401,28 @@ var (
 	// - `altMap template.FuncMap` below
 	funcMap = template.FuncMap{
 		// formatting
-		"FormatBytesSig":    func(size int64, digits int) string { return FmtSize(size, cos.UnitsIEC, digits) },
-		"FormatBytesUns":    func(size uint64, digits int) string { return FmtSize(int64(size), cos.UnitsIEC, digits) },
-		"FormatMAM":         func(u int64) string { return fmt.Sprintf("%-10s", FmtSize(u, cos.UnitsIEC, 2)) },
-		"FormatMilli":       func(dur cos.Duration) string { return fmtMilli(dur, cos.UnitsIEC) },
-		"FormatDuration":    FormatDuration,
-		"FormatStart":       func(s, e time.Time) string { res, _ := FmtStartEnd(s, e); return res },
-		"FormatEnd":         func(s, e time.Time) string { _, res := FmtStartEnd(s, e); return res },
-		"FormatDsortStatus": dsortJobInfoStatus,
-		"FormatObjStatus":   fmtObjStatus,
-		"FormatObjCustom":   fmtObjCustom,
-		"FormatObjIsCached": fmtObjIsCached,
-		"FormatDaemonID":    fmtDaemonID,
-		"FormatSmap":        fmtSmap,
-		"FormatProxiesSumm": fmtProxiesSumm,
-		"FormatTargetsSumm": fmtTargetsSumm,
-		"FormatCapPctMAM":   fmtCapPctMAM,
-		"FormatFloat":       func(f float64) string { return fmt.Sprintf("%.2f", f) },
-		"FormatBool":        FmtBool,
-		"FormatBckName":     func(bck cmn.Bck) string { return bck.Cname("") },
-		"FormatACL":         fmtACL,
-		"FormatNameArch":    fmtNameArch,
-		"FormatXactState":   FmtXactStatus,
+		"FormatBytesSig":      func(size int64, digits int) string { return FmtSize(size, cos.UnitsIEC, digits) },
+		"FormatBytesUns":      func(size uint64, digits int) string { return FmtSize(int64(size), cos.UnitsIEC, digits) },
+		"FormatMAM":           func(u int64) string { return fmt.Sprintf("%-10s", FmtSize(u, cos.UnitsIEC, 2)) },
+		"FormatMilli":         func(dur cos.Duration) string { return fmtMilli(dur, cos.UnitsIEC) },
+		"FormatDuration":      FormatDuration,
+		"FormatStart":         func(s, e time.Time) string { res, _ := FmtStartEnd(s, e); return res },
+		"FormatEnd":           func(s, e time.Time) string { _, res := FmtStartEnd(s, e); return res },
+		"FormatDsortStatus":   dsortJobInfoStatus,
+		"FormatLsObjStatus":   fmtLsObjStatus,
+		"FormatLsObjIsCached": fmtLsObjIsCached,
+		"FormatObjCustom":     fmtObjCustom,
+		"FormatDaemonID":      fmtDaemonID,
+		"FormatSmap":          fmtSmap,
+		"FormatProxiesSumm":   fmtProxiesSumm,
+		"FormatTargetsSumm":   fmtTargetsSumm,
+		"FormatCapPctMAM":     fmtCapPctMAM,
+		"FormatFloat":         func(f float64) string { return fmt.Sprintf("%.2f", f) },
+		"FormatBool":          FmtBool,
+		"FormatBckName":       func(bck cmn.Bck) string { return bck.Cname("") },
+		"FormatACL":           fmtACL,
+		"FormatNameArch":      fmtNameArch,
+		"FormatXactState":     FmtXactStatus,
 		//  misc. helpers
 		"IsUnsetTime":   isUnsetTime,
 		"IsEqS":         func(a, b string) bool { return a == b },

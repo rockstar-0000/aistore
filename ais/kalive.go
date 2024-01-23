@@ -11,13 +11,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 )
 
@@ -237,7 +237,7 @@ func (pkr *palive) updateSmap(config *cmn.Config) (stopped bool) {
 		cnt  = smap.Count()
 	)
 	pkr.openCh(cnt)
-	wg := cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), cnt) // limit parallelism
+	wg := cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), cnt) // limit parallelism
 	for _, nm := range []meta.NodeMap{smap.Tmap, smap.Pmap} {
 		for sid, si := range nm {
 			if sid == p.SID() {

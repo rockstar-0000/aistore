@@ -1,6 +1,6 @@
 // Package apc: API messages and constants
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -21,47 +21,38 @@ const (
 	// See related Flt* enum
 	LsObjCached = 1 << iota
 
-	LsAll      // include misplaced objects and replicas
-	LsDeleted  // include obj-s marked for deletion (TODO)
-	LsArchDir  // expand archives as directories
-	LsNameOnly // return only object names and statuses (for faster listing)
-	LsNameSize // same as above plus size
+	LsMissing // include missing main obj (with copy existing)
 
-	// The following two flags have to do with listing objects in those remote
-	// buckets that we don't yet have in the cluster's BMD. As far as AIS is concerned,
-	// adding a (confirmed to exist) remote bucket (and its properties) to the metadata
-	// is equivalent to creating the bucket *on the fly*.
-	//
-	// For this, we need or, more exactly, we would like to execute HEAD request
-	// against the remote backend in question, in order to:
-	//    1) confirm the bucket's existence, and
-	//    2) obtain its properties (e.g., versioning - for Cloud backends)
-	//
-	// Note: this is done only once.
-	//
-	// There are scenarios and cases, however, when HEAD(remote bucket) when
-	// would rather be avoided or, alternatively, when an error it returns
-	// (if it returns one) can be disregarded.
+	LsDeleted // include obj-s marked for deletion (TODO: not implemented yet)
 
-	// LsDontHeadRemote tells AIS _not_ to execute HEAD request on the remote bucket.
-	// The reasons may include cleanup/eviction of any kind, prior knowledge that the bucket
-	// must simply exist in AIS, and more.
-	// See also:
-	// * `cmn/feat/feat.go` source, and the (configurable) capability
-	//    to disable on-the-fly creation of remote buckets altogether.
-	LsDontHeadRemote
+	LsArchDir // expand archives as directories
 
-	// LsTryHeadRemote is introduced primarily to support GCP buckets with
+	LsNameOnly // return only object names and, spearately, statuses
+	LsNameSize // same as above and size (minor speedup)
+
+	// Background: ============================================================
+	// as far as AIS is concerned, adding a (confirmed to exist)
+	// remote bucket (and its properties) to the cluster metadata is equivalent
+	// to creating the bucket on the fly. =====================================
+
+	// same as fltPresence == apc.Present (see query.go)
+	LsBckPresent
+
+	// LsDontHeadRemote is introduced primarily to support GCP buckets with
 	// ACL policies that allow public _anonymous_ access.
 	//
 	// It appears that sometimes those policies do honor HEAD(bucket),
 	// while other times they don't, failing the request with 401 or 403 status.
 	// See also:
-	// * at https://cloud.google.com/storage/docs/access-control/making-data-public
-	LsTryHeadRemote
+	// * https://cloud.google.com/storage/docs/access-control/making-data-public
+	// * cmd/cli/cli/const.go for `dontHeadRemoteFlag`
+	// * `QparamDontHeadRemote` (this package)
+	LsDontHeadRemote
 
-	// To list remote buckets that, if not be present in AIS, shall not be added to AIS
-	// (TODO: reserved for future use)
+	// To list remote buckets without adding them to aistore
+	// See also:
+	// * cmd/cli/cli/const.go for `dontAddRemoteFlag`
+	// * `QparamDontAddRemote` (this package)
 	LsDontAddRemote
 
 	// cache list-objects results and use this cache to speed-up
@@ -80,6 +71,12 @@ const (
 	// - update AIS CLI to support non-recursive list-objects operation
 	// - when listing remote bucket, call backend (`Backend()`) to list non-recursively
 	LsNoRecursion
+
+	// For remote metadata-capable buckets (ie., bck.HasVersioningMD() == true):
+	// - check whether remote version exists,
+	// and if it does:
+	// - check whether remote version differs from its in-cluster copy
+	LsVerChanged
 )
 
 // List objects default page size
@@ -97,10 +94,12 @@ const (
 	LocIsCopyMissingObj
 
 	// LsoEntry Flags
-	EntryIsCached  = 1 << (EntryStatusBits + 1)
-	EntryInArch    = 1 << (EntryStatusBits + 2)
-	EntryIsDir     = 1 << (EntryStatusBits + 3)
-	EntryIsArchive = 1 << (EntryStatusBits + 4)
+	EntryIsCached   = 1 << (EntryStatusBits + 1)
+	EntryInArch     = 1 << (EntryStatusBits + 2)
+	EntryIsDir      = 1 << (EntryStatusBits + 3)
+	EntryIsArchive  = 1 << (EntryStatusBits + 4)
+	EntryVerChanged = 1 << (EntryStatusBits + 5) // see also: QparamLatestVer, et al.
+	EntryVerRemoved = 1 << (EntryStatusBits + 6) // ditto
 )
 
 // ObjEntry.Flags field
@@ -123,6 +122,8 @@ const (
 	GetPropsCustom   = "custom"
 	GetPropsLocation = "location" // advanced usage
 )
+
+const GetPropsNameSize = GetPropsName + LsPropsSepa + GetPropsSize
 
 // NOTE: update when changing any of the above :NOTE
 var (
@@ -173,14 +174,6 @@ func (lsmsg *LsoMsg) WantOnlyRemoteProps() bool {
 	return true
 }
 
-// NOTE: internal usage
-func (lsmsg *LsoMsg) WantOnlyName() bool {
-	if lsmsg.IsFlagSet(LsNameOnly) || lsmsg.Props == GetPropsName {
-		return true
-	}
-	return strings.IndexByte(lsmsg.Props, LsPropsSepa[0]) < 0 && strings.Contains(lsmsg.Props, GetPropsName)
-}
-
 // WantProp returns true if msg request requires to return propName property.
 func (lsmsg *LsoMsg) WantProp(propName string) bool {
 	return strings.Contains(lsmsg.Props, propName)
@@ -209,6 +202,7 @@ func (lsmsg *LsoMsg) PropsSet() (s cos.StrSet) {
 
 // LsoMsg flags enum: LsObjCached, ...
 func (lsmsg *LsoMsg) SetFlag(flag uint64)         { lsmsg.Flags |= flag }
+func (lsmsg *LsoMsg) ClearFlag(flag uint64)       { lsmsg.Flags &= ^flag }
 func (lsmsg *LsoMsg) IsFlagSet(flags uint64) bool { return lsmsg.Flags&flags == flags }
 
 func (lsmsg *LsoMsg) Clone() *LsoMsg {

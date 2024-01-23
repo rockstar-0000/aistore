@@ -114,9 +114,9 @@ cli: ## Build CLI binary. NOTE: 1) a separate go.mod, 2) static linkage with cgo
 	@echo "Building ais (CLI) => $(BUILD_DEST)/ais [build tags:$(BUILD_TAGS)]"
 ifdef CROSS_COMPILE_CLI
 	cd $(BUILD_DIR)/cli && \
-	$(CROSS_COMPILE_CLI) go build -o ./ais $(BUILD_FLAGS) $(LDFLAGS) *.go && mv ./ais $(BUILD_DEST)/.
+	$(CROSS_COMPILE_CLI) go build -o ./ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(LDFLAGS) *.go && mv ./ais $(BUILD_DEST)/.
 else
-	@cd $(BUILD_DIR)/cli && $(CGO_DISABLE) go build -o $(BUILD_DEST)/ais $(BUILD_FLAGS) $(LDFLAGS) *.go
+	@cd $(BUILD_DIR)/cli && $(CGO_DISABLE) go build -o $(BUILD_DEST)/ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(LDFLAGS) *.go
 endif
 	@echo "*** To enable autocompletions in your current shell, run:"
 ifeq ($(AISTORE_PATH),$(PWD))
@@ -257,7 +257,7 @@ lint-update:
 ## See also: .github/workflows/lint.yml
 lint-update-ci:
 	@rm -f $(GOPATH)/bin/golangci-lint
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.54.2
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.55.0
 
 lint:
 	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true

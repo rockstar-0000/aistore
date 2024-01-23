@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with objects in the cluster
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -185,7 +185,11 @@ func startDsortHandler(c *cli.Context) (err error) {
 
 	if flagIsSet(c, verboseFlag) {
 		flat, config := _flattenSpec(&spec)
-		err = teb.Print(flat, teb.FlatTmpl)
+		if flagIsSet(c, noHeaderFlag) {
+			err = teb.Print(flat, teb.PropValTmplNoHdr)
+		} else {
+			err = teb.Print(flat, teb.PropValTmpl)
+		}
 		if err != nil {
 			actionWarn(c, err.Error())
 		}
@@ -193,14 +197,18 @@ func startDsortHandler(c *cli.Context) (err error) {
 			fmt.Fprintln(c.App.Writer, "Config override:\t\t none")
 		} else {
 			fmt.Fprintln(c.App.Writer, "Config override:")
-			_ = teb.Print(config, teb.FlatTmpl)
+			if flagIsSet(c, noHeaderFlag) {
+				_ = teb.Print(config, teb.PropValTmplNoHdr)
+			} else {
+				_ = teb.Print(config, teb.PropValTmpl)
+			}
 		}
-		time.Sleep(time.Second / 2)
+		briefPause(1)
 		fmt.Fprintln(c.App.Writer)
 	}
 
 	// execute
-	if id, err = api.StartDSort(apiBP, &spec); err == nil {
+	if id, err = api.StartDsort(apiBP, &spec); err == nil {
 		fmt.Fprintln(c.App.Writer, id)
 	}
 	return
@@ -320,7 +328,7 @@ func newPhases() map[string]*dsortPhaseState {
 	return phases
 }
 
-func newDSortPB(baseParams api.BaseParams, id string, refreshTime time.Duration) *dsortPB {
+func newDsortPB(baseParams api.BaseParams, id string, refreshTime time.Duration) *dsortPB {
 	return &dsortPB{
 		id:          id,
 		apiBP:       baseParams,
@@ -344,7 +352,7 @@ func (b *dsortPB) run() (dsortResult, error) {
 	for !finished {
 		time.Sleep(b.refreshTime)
 
-		jmetrics, err := api.MetricsDSort(b.apiBP, b.id)
+		jmetrics, err := api.MetricsDsort(b.apiBP, b.id)
 		if err != nil {
 			b.cleanBars()
 			return dsortResult{}, V(err)
@@ -373,7 +381,7 @@ func (b *dsortPB) run() (dsortResult, error) {
 }
 
 func (b *dsortPB) start() (bool, error) {
-	metrics, err := api.MetricsDSort(b.apiBP, b.id)
+	metrics, err := api.MetricsDsort(b.apiBP, b.id)
 	if err != nil {
 		return false, V(err)
 	}
@@ -464,7 +472,7 @@ func (b *dsortPB) result() dsortResult {
 }
 
 func printMetrics(w io.Writer, jobID string, daemonIds []string) (aborted, finished bool, errV error) {
-	resp, err := api.MetricsDSort(apiBP, jobID)
+	resp, err := api.MetricsDsort(apiBP, jobID)
 	if err != nil {
 		return false, false, V(err)
 	}
@@ -499,15 +507,8 @@ func printMetrics(w io.Writer, jobID string, daemonIds []string) (aborted, finis
 	return
 }
 
-func printCondensedStats(w io.Writer, id, units string, errhint bool) error {
-	var (
-		elapsedTime       time.Duration
-		extractionTime    time.Duration
-		sortingTime       time.Duration
-		creationTime      time.Duration
-		finished, aborted bool
-	)
-	resp, err := api.MetricsDSort(apiBP, id)
+func printCondensedStats(c *cli.Context, id, units string, errhint bool) error {
+	resp, err := api.MetricsDsort(apiBP, id)
 	if err != nil {
 		return V(err)
 	}
@@ -522,14 +523,29 @@ func printCondensedStats(w io.Writer, id, units string, errhint bool) error {
 		jobInfo.Aggregate(job)
 	}
 	opts := teb.Opts{AltMap: teb.FuncMapUnits(units)}
-	err = teb.Print([]*dsort.JobInfo{&jobInfo}, teb.DSortListTmpl, opts)
+	err = teb.Print([]*dsort.JobInfo{&jobInfo}, teb.DsortListTmpl, opts)
 	if err != nil {
 		return err
 	}
 
-	finished = true
+	var (
+		elapsedTime    time.Duration
+		extractionTime time.Duration
+		sortingTime    time.Duration
+		creationTime   time.Duration
+		description    string
+		aborted        bool
+		finished       = true
+	)
 	for _, jmetrics := range resp {
 		tm := jmetrics.Metrics
+		if description != "" {
+			if description != tm.Description {
+				fmt.Fprintf(c.App.ErrWriter, "dsort[%s] has two descriptions? (%q, %q)\n", id, description, tm.Description)
+			}
+		} else {
+			description = tm.Description
+		}
 		aborted = aborted || tm.Aborted.Load()
 		finished = finished && tm.Creation.Finished
 
@@ -553,31 +569,33 @@ func printCondensedStats(w io.Writer, id, units string, errhint bool) error {
 		}
 	}
 
-	if aborted {
-		fmt.Fprintf(w, "DSort job %s aborted.", id)
+	fmt.Fprintf(c.App.Writer, "DESCRIPTION: [%s]\n", description)
+	switch {
+	case aborted:
+		fmt.Fprintf(c.App.Writer, "dsort[%s] aborted.", id)
 		if errhint {
-			fmt.Fprintf(w, " For details, run 'ais show job %s -v'\n", id)
-		} else {
-			fmt.Fprintln(w)
+			fmt.Fprintf(c.App.Writer, " For details, run 'ais show job %s -v'\n", id)
 		}
-		return nil
-	}
-	if finished {
-		fmt.Fprintf(w, "DSort job successfully finished in %v:\n  "+
-			"Longest extraction:\t%v\n  Longest sorting:\t%v\n  Longest creation:\t%v\n",
-			elapsedTime, extractionTime, sortingTime, creationTime,
+	case finished:
+		fmt.Fprintf(c.App.Writer, "dsort[%s] successfully finished in %v:\n"+
+			indent1+"Longest extraction:\t%v\n"+
+			indent1+"Longest sorting:\t%v\n"+
+			indent1+"Longest creation:\t%v\n",
+			id, elapsedTime, extractionTime, sortingTime, creationTime,
 		)
-		return nil
+	default:
+		fmt.Fprintf(c.App.Writer, "dsort[%s] is currently running:\n"+
+			id, indent1+"Extraction:\t%v", extractionTime)
+		if sortingTime.Seconds() > 0 {
+			fmt.Fprintln(c.App.Writer)
+			fmt.Fprintf(c.App.Writer, indent1+"Sorting:\t%v", sortingTime)
+		}
+		if creationTime.Seconds() > 0 {
+			fmt.Fprintln(c.App.Writer)
+			fmt.Fprintf(c.App.Writer, indent1+"Creation:\t%v", creationTime)
+		}
 	}
-
-	fmt.Fprintf(w, "DSort job currently running:\n  Extraction:\t%v", extractionTime)
-	if sortingTime.Seconds() > 0 {
-		fmt.Fprintf(w, "\n  Sorting:\t%v", sortingTime)
-	}
-	if creationTime.Seconds() > 0 {
-		fmt.Fprintf(w, "\n  Creation:\t%v", creationTime)
-	}
-	fmt.Fprint(w, "\n")
+	fmt.Fprintln(c.App.Writer)
 	return nil
 }
 
@@ -609,19 +627,19 @@ func dsortJobsList(c *cli.Context, list []*dsort.JobInfo, usejs bool) error {
 
 	if !verbose {
 		if hideHeader {
-			return teb.Print(list, teb.DSortListNoHdrTmpl, opts)
+			return teb.Print(list, teb.DsortListNoHdrTmpl, opts)
 		}
-		return teb.Print(list, teb.DSortListTmpl, opts)
+		return teb.Print(list, teb.DsortListTmpl, opts)
 	}
 	// verbose - one at a time, each with header and an extra
 	for _, j := range list {
-		if err := teb.Print([]*dsort.JobInfo{j}, teb.DSortListVerboseTmpl, opts); err != nil {
+		if err := teb.Print([]*dsort.JobInfo{j}, teb.DsortListVerboseTmpl, opts); err != nil {
 			return err
 		}
 		// super-verbose
-		if configuredVerbosity() {
+		if cliConfVerbose() {
 			xargs := xact.ArgsMsg{ID: j.ID, Kind: apc.ActDsort}
-			if _, err := xactList(c, xargs, false /*caption*/); err != nil {
+			if _, err := xactList(c, &xargs, false /*caption*/); err != nil {
 				return err
 			}
 		}
@@ -643,7 +661,7 @@ func dsortJobStatus(c *cli.Context, id string) error {
 	// Show progress bar.
 	if !verbose && refresh && !logging {
 		refreshRate := _refreshRate(c)
-		dsortResult, err := newDSortPB(apiBP, id, refreshRate).run()
+		dsortResult, err := newDsortPB(apiBP, id, refreshRate).run()
 		if err != nil {
 			return err
 		}
@@ -664,9 +682,9 @@ func dsortJobStatus(c *cli.Context, id string) error {
 			}
 
 			fmt.Fprintf(c.App.Writer, "\n")
-			return printCondensedStats(c.App.Writer, id, units, false)
+			return printCondensedStats(c, id, units, false)
 		}
-		return printCondensedStats(c.App.Writer, id, units, true)
+		return printCondensedStats(c, id, units, true)
 	}
 
 	// Show metrics once in a while.
@@ -700,5 +718,5 @@ func dsortJobStatus(c *cli.Context, id string) error {
 	}
 
 	fmt.Fprintln(c.App.Writer)
-	return printCondensedStats(c.App.Writer, id, units, false)
+	return printCondensedStats(c, id, units, false)
 }

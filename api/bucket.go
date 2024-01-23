@@ -1,11 +1,10 @@
-// Package api provides AIStore API over HTTP(S)
+// Package api provides Go based AIStore API/SDK over HTTP(S)
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
 import (
-	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,15 +16,9 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-// additional and optional list-objets args (see also: GetArgs, PutArgs)
-type ListArgs struct {
-	Progress *ProgressContext // with a callback
-	Num      uint             // aka limit
-}
-
 // SetBucketProps sets the properties of a bucket.
 // Validation of the properties passed in is performed by AIStore Proxy.
-func SetBucketProps(bp BaseParams, bck cmn.Bck, props *cmn.BucketPropsToUpdate) (string, error) {
+func SetBucketProps(bp BaseParams, bck cmn.Bck, props *cmn.BpropsToSet) (string, error) {
 	b := cos.MustMarshal(apc.ActMsg{Action: apc.ActSetBprops, Value: props})
 	return patchBprops(bp, bck, b)
 }
@@ -52,10 +45,10 @@ func patchBprops(bp BaseParams, bck cmn.Bck, body []byte) (xid string, err error
 	return
 }
 
-// HEAD(bucket): apc.HdrBucketProps => cmn.BucketProps{} and apc.HdrBucketInfo => BucketInfo{}
+// HEAD(bucket): apc.HdrBucketProps => cmn.Bprops{} and apc.HdrBucketInfo => BucketInfo{}
 //
 // Converts the string type fields returned from the HEAD request to their
-// corresponding counterparts in the cmn.BucketProps struct.
+// corresponding counterparts in the cmn.Bprops struct.
 //
 // By default, AIStore adds remote buckets to the cluster metadata on the fly.
 // Remote bucket that was never accessed before just "shows up" when user performs
@@ -64,11 +57,12 @@ func patchBprops(bp BaseParams, bck cmn.Bck, body []byte) (xid string, err error
 // and doesn't require any action from the user.
 // Use `dontAddRemote` to override the default behavior: as the name implies, setting
 // `dontAddRemote = true` prevents AIS from adding remote bucket to the cluster's metadata.
-func HeadBucket(bp BaseParams, bck cmn.Bck, dontAddRemote bool) (p *cmn.BucketProps, err error) {
+func HeadBucket(bp BaseParams, bck cmn.Bck, dontAddRemote bool) (p *cmn.Bprops, err error) {
 	var (
-		hdr  http.Header
-		path = apc.URLPathBuckets.Join(bck.Name)
-		q    = make(url.Values, 4)
+		hdr    http.Header
+		path   = apc.URLPathBuckets.Join(bck.Name)
+		q      = make(url.Values, 4)
+		status int
 	)
 	if dontAddRemote {
 		q.Set(apc.QparamDontAddRemote, "true")
@@ -77,100 +71,56 @@ func HeadBucket(bp BaseParams, bck cmn.Bck, dontAddRemote bool) (p *cmn.BucketPr
 
 	bp.Method = http.MethodHead
 	reqParams := AllocRp()
-	defer FreeRp(reqParams)
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = path
 		reqParams.Query = q
 	}
-	if hdr, err = reqParams.doReqHdr(); err == nil {
-		p = &cmn.BucketProps{}
+	if hdr, status, err = reqParams.doReqHdr(); err == nil {
+		p = &cmn.Bprops{}
 		err = jsoniter.Unmarshal([]byte(hdr.Get(apc.HdrBucketProps)), p)
-		return
+	} else {
+		err = hdr2msg(bck, status, err)
 	}
-	err = hdr2msg(bck, err)
-	return
-}
-
-// Bucket information - a runtime addendum to `BucketProps`.
-//
-// `fltPresence` - as per QparamFltPresence enum (see api/apc/query.go)
-//
-// Unlike `cmn.BucketProps` properties (which are user configurable), bucket runtime info:
-// - includes usage, capacity, other statistics
-// - is obtained via GetBucketInfo() API
-// - delivered via apc.HdrBucketInfo header (compare with GetBucketSummary)
-//
-// NOTE:
-//   - the API utilizes HEAD method (compare with HeadBucket) and by default executes the (cached-only, fast)
-//     version of the bucket summary. To override, provide the last (optional) parameter.
-func GetBucketInfo(bp BaseParams, bck cmn.Bck, fltPresence int, countRemoteObjs ...bool) (*cmn.BucketProps, *cmn.BsummResult, error) {
-	q := make(url.Values, 4)
-	q = bck.AddToQuery(q)
-	q.Set(apc.QparamFltPresence, strconv.Itoa(fltPresence))
-	if len(countRemoteObjs) > 0 && countRemoteObjs[0] {
-		q.Set(apc.QparamCountRemoteObjs, "true")
-	}
-	bp.Method = http.MethodHead
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
-		reqParams.Query = q
-	}
-	p, info, err := _binfo(reqParams, bck)
 	FreeRp(reqParams)
-	return p, info, err
-}
-
-func _binfo(reqParams *ReqParams, bck cmn.Bck) (p *cmn.BucketProps, info *cmn.BsummResult, err error) {
-	var hdr http.Header
-	if hdr, err = reqParams.doReqHdr(); err != nil {
-		err = hdr2msg(bck, err)
-		return
-	}
-	hdrProps := hdr.Get(apc.HdrBucketProps)
-	if hdrProps != "" {
-		p = &cmn.BucketProps{}
-		if err = jsoniter.Unmarshal([]byte(hdrProps), p); err != nil {
-			return
-		}
-	}
-	hdrSumm := hdr.Get(apc.HdrBucketSumm)
-	if hdrSumm != "" {
-		info = &cmn.BsummResult{}
-		err = jsoniter.Unmarshal([]byte(hdrSumm), info)
-	}
 	return
 }
 
-// fill-in error message (HEAD response will never contain one)
-func hdr2msg(bck cmn.Bck, err error) error {
-	herr := cmn.Err2HTTPErr(err)
-	if herr == nil {
-		debug.FailTypeCast(err)
+// fill-in herr message (HEAD response will never contain one)
+func hdr2msg(bck cmn.Bck, status int, err error) error {
+	herr, ok := err.(*cmn.ErrHTTP)
+	if !ok {
 		return err
 	}
-	switch herr.Status {
-	case http.StatusUnauthorized:
-		herr.Message = fmt.Sprintf("Bucket %q unauthorized access", bck)
-	case http.StatusForbidden:
-		herr.Message = fmt.Sprintf("Bucket %q access denied", bck)
-	case http.StatusGone:
-		herr.Message = fmt.Sprintf("Bucket %q has been removed from the backend", bck)
+	debug.Assert(herr.Status == status)
+
+	quoted := "\"" + bck.Cname("") + "\""
+	if !bck.IsQuery() && status == http.StatusNotFound {
+		herr.Message = "bucket " + quoted + " does not exist"
+		return herr
 	}
+	// common
+	herr.Message = "http error code '" + http.StatusText(status) + "'"
+	if status == http.StatusGone {
+		herr.Message += " (removed from the backend)"
+	}
+	herr.Message += ", bucket "
+	if bck.IsQuery() {
+		herr.Message += "query "
+	}
+	herr.Message += quoted
 	return herr
 }
 
 // CreateBucket sends request to create an AIS bucket with the given name and,
-// optionally, specific non-default properties (via cmn.BucketPropsToUpdate).
+// optionally, specific non-default properties (via cmn.BpropsToSet).
 //
 // See also:
-//   - github.com/NVIDIA/aistore/blob/master/docs/bucket.md#default-bucket-properties
-//   - cmn.BucketPropsToUpdate (cmn/api.go)
+//   - github.com/NVIDIA/aistore/blob/main/docs/bucket.md#default-bucket-properties
+//   - cmn.BpropsToSet (cmn/api.go)
 //
 // Bucket properties can be also changed at any time via SetBucketProps (above).
-func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BucketPropsToUpdate, dontHeadRemote ...bool) error {
+func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadRemote ...bool) error {
 	if err := bck.Validate(); err != nil {
 		return err
 	}
@@ -319,10 +269,10 @@ func MakeNCopies(bp BaseParams, bck cmn.Bck, copies int) (xid string, err error)
 func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int) (xid string, err error) {
 	bp.Method = http.MethodPost
 	// Without `string` conversion it makes base64 from []byte in `Body`.
-	ecConf := string(cos.MustMarshal(&cmn.ECConfToUpdate{
+	ecConf := string(cos.MustMarshal(&cmn.ECConfToSet{
 		DataSlices:   &data,
 		ParitySlices: &parity,
-		Enabled:      Bool(true),
+		Enabled:      apc.Bool(true),
 	}))
 	reqParams := AllocRp()
 	{

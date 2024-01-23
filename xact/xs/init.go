@@ -11,8 +11,12 @@ import (
 )
 
 // for additional startup-time reg-s see lru, downloader, ec
-func Xreg() {
+func Xreg(xeleOnly bool) {
 	xreg.RegNonBckXact(&eleFactory{})
+	if xeleOnly {
+		return
+	}
+
 	xreg.RegNonBckXact(&resFactory{})
 	xreg.RegNonBckXact(&rebFactory{})
 	xreg.RegNonBckXact(&etlFactory{})
@@ -22,10 +26,13 @@ func Xreg() {
 	xreg.RegBckXact(&evdFactory{kind: apc.ActDeleteObjects})
 	xreg.RegBckXact(&prfFactory{})
 
-	xreg.RegNonBckXact(&bsummFactory{})
+	xreg.RegNonBckXact(&nsummFactory{})
 
 	xreg.RegBckXact(&proFactory{})
 	xreg.RegBckXact(&llcFactory{})
+
+	xreg.RegBckXact(&tcbFactory{kind: apc.ActCopyBck})
+	xreg.RegBckXact(&tcbFactory{kind: apc.ActETLBck})
 
 	xreg.RegBckXact(&tcoFactory{streamingF: streamingF{kind: apc.ActETLObjects}})
 	xreg.RegBckXact(&tcoFactory{streamingF: streamingF{kind: apc.ActCopyObjects}})

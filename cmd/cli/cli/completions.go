@@ -13,11 +13,11 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/xact"
@@ -168,7 +168,7 @@ func configSectionCompletions(_ *cli.Context, cfgScope string) {
 		v = &config.LocalConfig
 	}
 	err = cmn.IterFields(v, func(uniqueTag string, _ cmn.IterField) (err error, b bool) {
-		section := strings.Split(uniqueTag, ".")[0]
+		section := strings.Split(uniqueTag, cmn.IterFieldNameSepa)[0]
 		props.Set(section)
 		return nil, false
 	})
@@ -389,15 +389,18 @@ func bucketCompletions(opts bcmplop) cli.BashCompleteFunc {
 	return opts.buckets
 }
 
-func printNotUsedBuckets(c *cli.Context, buckets []cmn.Bck, separator, multiple bool) {
+func printNotUsedBuckets(c *cli.Context, bcks cmn.Bcks, separator, multiple bool) {
 	var sep string
 	if separator {
 		sep = "/"
 	}
 mloop:
-	for _, b := range buckets {
+	for i := range bcks {
+		b := bcks[i]
 		if multiple {
-			for _, argBck := range c.Args() {
+			args := c.Args()
+			for a := range args {
+				argBck := args[a]
 				parsedArgBck, err := parseBckURI(c, argBck, false)
 				if err != nil {
 					return
@@ -427,7 +430,7 @@ func manyBucketsCompletions(additionalCompletions []cli.BashCompleteFunc, firstB
 }
 
 func bpropCompletions(c *cli.Context) {
-	err := cmn.IterFields(&cmn.BucketPropsToUpdate{}, func(tag string, _ cmn.IterField) (error, bool) {
+	err := cmn.IterFields(&cmn.BpropsToSet{}, func(tag string, _ cmn.IterField) (error, bool) {
 		if !cos.AnyHasPrefixInSlice(tag, c.Args()) {
 			if bpropsFilterExtra(c, tag) {
 				fmt.Println(tag)
@@ -460,8 +463,8 @@ func bucketAndPropsCompletions(c *cli.Context) {
 		return
 	} else if c.NArg() == 1 {
 		var props []string
-		err := cmn.IterFields(cmn.BucketProps{}, func(uniqueTag string, _ cmn.IterField) (err error, b bool) {
-			section := strings.Split(uniqueTag, ".")[0]
+		err := cmn.IterFields(cmn.Bprops{}, func(uniqueTag string, _ cmn.IterField) (err error, b bool) {
+			section := strings.Split(uniqueTag, cmn.IterFieldNameSepa)[0]
 			props = append(props, section)
 			if flagIsSet(c, verboseFlag) {
 				props = append(props, uniqueTag)
@@ -528,7 +531,7 @@ func runningJobCompletions(c *cli.Context) {
 			}
 		}
 		// NOTE: dsort is the only exception - not an xaction
-		list, err := api.ListDSort(apiBP, "", true /*onlyActive*/)
+		list, err := api.ListDsort(apiBP, "", true /*onlyActive*/)
 		if err != nil {
 			completionErr(c, err)
 			return
@@ -625,7 +628,7 @@ func suggestDsortID(c *cli.Context, filter func(*dsort.JobInfo) bool, shift int)
 	if c.NArg() > shift {
 		return
 	}
-	list, _ := api.ListDSort(apiBP, "", false /*onlyActive*/)
+	list, _ := api.ListDsort(apiBP, "", false /*onlyActive*/)
 	for _, job := range list {
 		if filter(job) {
 			fmt.Println(job.ID)
@@ -726,7 +729,7 @@ func oneClusterCompletions(c *cli.Context) {
 
 func authNConfigPropList() []string {
 	propList := []string{}
-	emptyCfg := authn.ConfigToUpdate{Server: &authn.ServerConfToUpdate{}}
+	emptyCfg := authn.ConfigToUpdate{Server: &authn.ServerConfToSet{}}
 	cmn.IterFields(emptyCfg, func(tag string, field cmn.IterField) (error, bool) {
 		propList = append(propList, tag)
 		return nil, false

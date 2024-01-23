@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,13 +18,13 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
@@ -70,7 +71,7 @@ type ecOptions struct {
 // If initial dataCnt value is negative, it sets the number of data and
 // parity slices to maximum possible for the cluster.
 //
-//nolint:revive // modifies-value-receiver on purpose
+//nolint:revive,gocritic // modifies-value-receiver on purpose
 func (o ecOptions) init(t *testing.T, proxyURL string) *ecOptions {
 	o.smap = tools.GetClusterMap(t, proxyURL)
 	if cnt := o.smap.CountActiveTs(); cnt < o.minTargets {
@@ -105,13 +106,13 @@ var ecTests = []ecTest{
 	{"EC 2:2", 2, 2},
 }
 
-func defaultECBckProps(o *ecOptions) *cmn.BucketPropsToUpdate {
-	return &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{
-			Enabled:      api.Bool(true),
-			ObjSizeLimit: api.Int64(ecObjLimit),
-			DataSlices:   api.Int(o.dataCnt),
-			ParitySlices: api.Int(o.parityCnt),
+func defaultECBckProps(o *ecOptions) *cmn.BpropsToSet {
+	return &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{
+			Enabled:      apc.Bool(true),
+			ObjSizeLimit: apc.Int64(ecObjLimit),
+			DataSlices:   apc.Int(o.dataCnt),
+			ParitySlices: apc.Int(o.parityCnt),
 		},
 	}
 }
@@ -132,7 +133,7 @@ func ecGetAllSlices(t *testing.T, bck cmn.Bck, objName string) (map[string]ecSli
 		if de.IsDir() {
 			return nil
 		}
-		ct, err := cluster.NewCTFromFQN(fqn, nil)
+		ct, err := core.NewCTFromFQN(fqn, nil)
 		tassert.CheckFatal(t, err)
 		if !strings.Contains(ct.ObjectName(), objName) {
 			return nil
@@ -179,7 +180,7 @@ func ecCheckSlices(t *testing.T, sliceList map[string]ecSliceMD,
 
 	metaCnt := 0
 	for k, md := range sliceList {
-		ct, err := cluster.NewCTFromFQN(k, nil)
+		ct, err := core.NewCTFromFQN(k, nil)
 		tassert.CheckFatal(t, err)
 
 		if ct.ContentType() == fs.ECMetaType {
@@ -207,7 +208,7 @@ func waitForECFinishes(t *testing.T, totalCnt int, objSize, sliceSize int64, doE
 		if len(foundParts) == totalCnt {
 			same := true
 			for nm, md := range foundParts {
-				ct, err := cluster.NewCTFromFQN(nm, nil)
+				ct, err := core.NewCTFromFQN(nm, nil)
 				tassert.CheckFatal(t, err)
 				if doEC {
 					if ct.ContentType() == fs.ECSliceType {
@@ -341,7 +342,7 @@ func doECPutsAndCheck(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, o *e
 			}()
 			tassert.CheckFatal(t, err)
 			putArgs := api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r}
-			_, err = api.PutObject(putArgs)
+			_, err = api.PutObject(&putArgs)
 			tassert.CheckFatal(t, err)
 
 			foundParts, _ := waitForECFinishes(t, totalCnt, objSize, sliceSize, doEC, bck, objPath)
@@ -353,7 +354,7 @@ func doECPutsAndCheck(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, o *e
 			}
 			metaCnt, sliceCnt, replCnt := 0, 0, 0
 			for k, md := range foundParts {
-				ct, err := cluster.NewCTFromFQN(k, nil)
+				ct, err := core.NewCTFromFQN(k, nil)
 				tassert.CheckFatal(t, err)
 				if ct.ContentType() == fs.ECMetaType {
 					metaCnt++
@@ -448,7 +449,7 @@ func bucketSize(t *testing.T, baseParams api.BaseParams, bck cmn.Bck) int {
 func putRandomFile(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPath string, size int) {
 	r, err := readers.NewRand(int64(size), cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
-	_, err = api.PutObject(api.PutArgs{
+	_, err = api.PutObject(&api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bck,
 		ObjName:    objPath,
@@ -457,7 +458,7 @@ func putRandomFile(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPath
 	tassert.CheckFatal(t, err)
 }
 
-func newLocalBckWithProps(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, bckProps *cmn.BucketPropsToUpdate, o *ecOptions) {
+func newLocalBckWithProps(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, bckProps *cmn.BpropsToSet, o *ecOptions) {
 	proxyURL := tools.RandomProxyURL()
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
@@ -467,7 +468,7 @@ func newLocalBckWithProps(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, 
 	tassert.CheckFatal(t, err)
 }
 
-func setBucketECProps(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, bckProps *cmn.BucketPropsToUpdate) {
+func setBucketECProps(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, bckProps *cmn.BpropsToSet) {
 	tlog.Logf("Changing EC %d:%d\n", *bckProps.EC.DataSlices, *bckProps.EC.ParitySlices)
 	_, err := api.SetBucketProps(baseParams, bck, bckProps)
 	tassert.CheckFatal(t, err)
@@ -509,7 +510,7 @@ func clearAllECObjects(t *testing.T, bck cmn.Bck, failOnDelErr bool, o *ecOption
 	}
 	wg.Wait()
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-	api.WaitForXactionIdle(tools.BaseAPIParams(proxyURL), reqArgs)
+	api.WaitForXactionIdle(tools.BaseAPIParams(proxyURL), &reqArgs)
 }
 
 func objectsExist(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPatt string, objCount int) {
@@ -532,7 +533,7 @@ func objectsExist(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPatt 
 
 // Simulates damaged slice by changing slice's checksum in metadata file
 func damageMetadataCksum(t *testing.T, slicePath string) {
-	ct, err := cluster.NewCTFromFQN(slicePath, nil)
+	ct, err := core.NewCTFromFQN(slicePath, nil)
 	tassert.CheckFatal(t, err)
 	metaFQN := ct.Make(fs.ECMetaType)
 	md, err := ec.LoadMetadata(metaFQN)
@@ -545,7 +546,7 @@ func damageMetadataCksum(t *testing.T, slicePath string) {
 // Short test to make sure that EC options cannot be changed after
 // EC is enabled
 func TestECChange(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3})
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3})
 
 	var (
 		proxyURL = tools.RandomProxyURL()
@@ -557,12 +558,12 @@ func TestECChange(t *testing.T) {
 
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
-	bucketProps := &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{
-			Enabled:      api.Bool(true),
-			ObjSizeLimit: api.Int64(ecObjLimit),
-			DataSlices:   api.Int(1),
-			ParitySlices: api.Int(1),
+	bucketProps := &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{
+			Enabled:      apc.Bool(true),
+			ObjSizeLimit: apc.Int64(ecObjLimit),
+			DataSlices:   apc.Int(1),
+			ParitySlices: apc.Int(1),
 		},
 	}
 	baseParams := tools.BaseAPIParams(proxyURL)
@@ -572,14 +573,14 @@ func TestECChange(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	tlog.Logln("Trying to set too many slices")
-	bucketProps.EC.DataSlices = api.Int(25)
-	bucketProps.EC.ParitySlices = api.Int(25)
+	bucketProps.EC.DataSlices = apc.Int(25)
+	bucketProps.EC.ParitySlices = apc.Int(25)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err != nil, "Enabling EC must fail in case of the number of targets fewer than the number of slices")
 
 	tlog.Logln("Enabling EC")
-	bucketProps.EC.DataSlices = api.Int(1)
-	bucketProps.EC.ParitySlices = api.Int(1)
+	bucketProps.EC.DataSlices = apc.Int(1)
+	bucketProps.EC.ParitySlices = apc.Int(1)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.CheckFatal(t, err)
 
@@ -588,18 +589,18 @@ func TestECChange(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	tlog.Logln("Trying to disable EC")
-	bucketProps.EC.Enabled = api.Bool(false)
+	bucketProps.EC.Enabled = apc.Bool(false)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err == nil, "Disabling EC failed: %v", err)
 
 	tlog.Logln("Trying to re-enable EC")
-	bucketProps.EC.Enabled = api.Bool(true)
+	bucketProps.EC.Enabled = apc.Bool(true)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err == nil, "Enabling EC failed: %v", err)
 
 	tlog.Logln("Trying to modify EC options when EC is enabled")
-	bucketProps.EC.Enabled = api.Bool(true)
-	bucketProps.EC.ObjSizeLimit = api.Int64(300000)
+	bucketProps.EC.Enabled = apc.Bool(true)
+	bucketProps.EC.ObjSizeLimit = apc.Int64(300000)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err != nil, "Modifiying EC properties must fail")
 
@@ -621,7 +622,7 @@ func createECReplicas(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objN
 	tlog.Logf("Creating %s, size %8d\n", objPath, objSize)
 	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
-	_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
+	_, err = api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 	tassert.CheckFatal(t, err)
 
 	tlog.Logf("waiting for %s\n", objPath)
@@ -649,7 +650,7 @@ func createECObject(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objNam
 	tlog.LogfCond(!o.silent, "Creating %s, size %8d [%2s]\n", objPath, objSize, ecStr)
 	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
-	_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
+	_, err = api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 	tassert.CheckFatal(t, err)
 
 	tlog.LogfCond(!o.silent, "waiting for %s\n", objPath)
@@ -688,7 +689,7 @@ func createDamageRestoreECFile(t *testing.T, baseParams api.BaseParams, bck cmn.
 	tlog.LogfCond(!o.silent, "Creating %s, size %8d [%2s] [%s]\n", objPath, objSize, ecStr, delStr)
 	r, err := readers.NewRand(objSize, cos.ChecksumNone)
 	tassert.CheckFatal(t, err)
-	_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
+	_, err = api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 	tassert.CheckFatal(t, err)
 
 	tlog.LogfCond(!o.silent, "waiting for %s\n", objPath)
@@ -703,7 +704,7 @@ func createDamageRestoreECFile(t *testing.T, baseParams api.BaseParams, bck cmn.
 	tlog.LogfCond(!o.silent, "Damaging %s [removing %s]\n", objPath, mainObjPath)
 	tassert.CheckFatal(t, os.Remove(mainObjPath))
 
-	ct, err := cluster.NewCTFromFQN(mainObjPath, nil)
+	ct, err := core.NewCTFromFQN(mainObjPath, nil)
 	tassert.CheckFatal(t, err)
 	metafile := ct.Make(fs.ECMetaType)
 	tlog.LogfCond(!o.silent, "Damaging %s [removing %s]\n", objPath, metafile)
@@ -711,7 +712,7 @@ func createDamageRestoreECFile(t *testing.T, baseParams api.BaseParams, bck cmn.
 	if delSlice {
 		sliceToDel := ""
 		for k := range foundParts {
-			ct, err := cluster.NewCTFromFQN(k, nil)
+			ct, err := core.NewCTFromFQN(k, nil)
 			tassert.CheckFatal(t, err)
 			if k != mainObjPath && ct.ContentType() == fs.ECSliceType && doEC {
 				sliceToDel = k
@@ -728,7 +729,7 @@ func createDamageRestoreECFile(t *testing.T, baseParams api.BaseParams, bck cmn.
 		tlog.LogfCond(!o.silent, "Removing slice/replica: %s\n", sliceToDel)
 		tassert.CheckFatal(t, os.Remove(sliceToDel))
 
-		ct, err := cluster.NewCTFromFQN(sliceToDel, nil)
+		ct, err := core.NewCTFromFQN(sliceToDel, nil)
 		tassert.CheckFatal(t, err)
 		metafile := ct.Make(fs.ECMetaType)
 		if doEC {
@@ -792,7 +793,7 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 		pattern:     "obj-rest-remote-%04d",
 	}.init(t, proxyURL)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
 
 	initMountpaths(t, proxyURL)
 	if testing.Short() {
@@ -805,7 +806,7 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 			t.Run(testName, func(t *testing.T) {
 				if useDisk {
 					tools.SetClusterConfig(t, cos.StrKVs{
-						"ec.disk_only": fmt.Sprintf("%t", useDisk),
+						"ec.disk_only": strconv.FormatBool(useDisk),
 					})
 					defer tools.SetClusterConfig(t, cos.StrKVs{
 						"ec.disk_only": "false",
@@ -817,19 +818,19 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 				o.parityCnt = test.parity
 				o.dataCnt = test.data
 				setBucketECProps(t, baseParams, bck, defaultECBckProps(o))
-				defer api.SetBucketProps(baseParams, bck, &cmn.BucketPropsToUpdate{
-					EC: &cmn.ECConfToUpdate{Enabled: api.Bool(false)},
+				defer api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
+					EC: &cmn.ECConfToSet{Enabled: apc.Bool(false)},
 				})
 
 				defer func() {
 					tlog.Logln("Wait for PUTs to finish...")
 					args := xact.ArgsMsg{Kind: apc.ActECPut}
-					err := api.WaitForXactionIdle(baseParams, args)
+					err := api.WaitForXactionIdle(baseParams, &args)
 					tassert.CheckError(t, err)
 
 					clearAllECObjects(t, bck, true, o)
 					reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-					err = api.WaitForXactionIdle(baseParams, reqArgs)
+					err = api.WaitForXactionIdle(baseParams, &reqArgs)
 					tassert.CheckError(t, err)
 				}()
 
@@ -887,7 +888,7 @@ func TestECRestoreObjAndSlice(t *testing.T) {
 			t.Run(testName, func(t *testing.T) {
 				if useDisk {
 					tools.SetClusterConfig(t, cos.StrKVs{
-						"ec.disk_only": fmt.Sprintf("%t", useDisk),
+						"ec.disk_only": strconv.FormatBool(useDisk),
 					})
 					defer tools.SetClusterConfig(t, cos.StrKVs{
 						"ec.disk_only": "false",
@@ -928,7 +929,7 @@ func putECFile(baseParams api.BaseParams, bck cmn.Bck, objName string) error {
 	if err != nil {
 		return err
 	}
-	_, err = api.PutObject(api.PutArgs{
+	_, err = api.PutObject(&api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bck,
 		ObjName:    objPath,
@@ -995,7 +996,7 @@ func TestECChecksum(t *testing.T) {
 
 	// Corrupt just one slice, EC should be able to restore the original object
 	for k := range foundParts1 {
-		ct, err := cluster.NewCTFromFQN(k, nil)
+		ct, err := core.NewCTFromFQN(k, nil)
 		tassert.CheckFatal(t, err)
 
 		if k != mainObjPath1 && ct.ContentType() == fs.ECSliceType {
@@ -1012,7 +1013,7 @@ func TestECChecksum(t *testing.T) {
 
 	// Corrupt all slices, EC should not be able to restore
 	for k := range foundParts2 {
-		ct, err := cluster.NewCTFromFQN(k, nil)
+		ct, err := core.NewCTFromFQN(k, nil)
 		tassert.CheckFatal(t, err)
 
 		if k != mainObjPath2 && ct.ContentType() == fs.ECSliceType {
@@ -1025,7 +1026,7 @@ func TestECChecksum(t *testing.T) {
 }
 
 func TestECEnabledDisabledEnabled(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1072,8 +1073,8 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 	assertBucketSize(t, baseParams, bck, o.objCount)
 
 	// Disable EC, put normal files, check if were created properly
-	_, err := api.SetBucketProps(baseParams, bck, &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{Enabled: api.Bool(false)},
+	_, err := api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{Enabled: apc.Bool(false)},
 	})
 	tassert.CheckError(t, err)
 
@@ -1095,8 +1096,8 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 	assertBucketSize(t, baseParams, bck, o.objCount*2)
 
 	// Enable EC again, check if EC was started properly and creates files with EC correctly
-	_, err = api.SetBucketProps(baseParams, bck, &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{Enabled: api.Bool(true)},
+	_, err = api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{Enabled: apc.Bool(true)},
 	})
 	tassert.CheckError(t, err)
 
@@ -1122,7 +1123,7 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 }
 
 func TestECDisableEnableDuringLoad(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1194,19 +1195,19 @@ func TestECDisableEnableDuringLoad(t *testing.T) {
 	time.Sleep(time.Second)
 
 	tlog.Logf("Disabling EC for the bucket %s\n", bck)
-	_, err := api.SetBucketProps(baseParams, bck, &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{Enabled: api.Bool(false)},
+	_, err := api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{Enabled: apc.Bool(false)},
 	})
 	tassert.CheckError(t, err)
 
 	time.Sleep(15 * time.Millisecond)
 	tlog.Logf("Enabling EC for the bucket %s\n", bck)
-	_, err = api.SetBucketProps(baseParams, bck, &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{Enabled: api.Bool(true)},
+	_, err = api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{Enabled: apc.Bool(true)},
 	})
 	tassert.CheckError(t, err)
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck}
-	_, err = api.WaitForXactionIC(baseParams, reqArgs)
+	_, err = api.WaitForXactionIC(baseParams, &reqArgs)
 	tassert.CheckError(t, err)
 
 	abortCh.Close()
@@ -1231,7 +1232,7 @@ func TestECDisableEnableDuringLoad(t *testing.T) {
 //   - The target restores the original object from slices/copies and returns it
 //   - No errors must occur
 func TestECStress(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1271,7 +1272,7 @@ func TestECStress(t *testing.T) {
 
 // Stress 2 buckets at the same time
 func TestECStressManyBuckets(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck1 = cmn.Bck{
@@ -1339,7 +1340,7 @@ func TestECStressManyBuckets(t *testing.T) {
 //   - filepath.Walk checks that the number of metafiles at the end is correct
 //   - No errors must occur
 func TestECExtraStress(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	const (
 		objStart = "obj-extra-"
@@ -1415,7 +1416,7 @@ func ecStressCore(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 			r, err := readers.NewRand(objSize, cos.ChecksumNone)
 			tassert.Errorf(t, err == nil, "Failed to create reader: %v", err)
 			putArgs := api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r}
-			_, err = api.PutObject(putArgs)
+			_, err = api.PutObject(&putArgs)
 			tassert.Errorf(t, err == nil, "PUT failed: %v", err)
 
 			totalSlices.Add(int64(totalCnt))
@@ -1469,7 +1470,7 @@ func TestECXattrs(t *testing.T) {
 		smallEvery       = 4
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1491,8 +1492,8 @@ func TestECXattrs(t *testing.T) {
 
 	baseParams := tools.BaseAPIParams(proxyURL)
 	bckProps := defaultECBckProps(o)
-	bckProps.Versioning = &cmn.VersionConfToUpdate{
-		Enabled: api.Bool(true),
+	bckProps.Versioning = &cmn.VersionConfToSet{
+		Enabled: apc.Bool(true),
 	}
 
 	newLocalBckWithProps(t, baseParams, bck, bckProps, o)
@@ -1507,7 +1508,7 @@ func TestECXattrs(t *testing.T) {
 		tlog.Logf("Creating %s, size %8d [%2s] [%s]\n", objPath, objSize, ecStr, delStr)
 		r, err := readers.NewRand(objSize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
-		_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
+		_, err = api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 		tassert.CheckFatal(t, err)
 
 		tlog.Logf("waiting for %s\n", objPath)
@@ -1521,7 +1522,7 @@ func TestECXattrs(t *testing.T) {
 		tlog.Logf("Damaging %s [removing %s]\n", objPath, mainObjPath)
 		tassert.CheckFatal(t, os.Remove(mainObjPath))
 
-		ct, err := cluster.NewCTFromFQN(mainObjPath, nil)
+		ct, err := core.NewCTFromFQN(mainObjPath, nil)
 		tassert.CheckFatal(t, err)
 		metafile := ct.Make(fs.ECMetaType)
 		tlog.Logf("Damaging %s [removing %s]\n", objPath, metafile)
@@ -1586,7 +1587,7 @@ func TestECXattrs(t *testing.T) {
 // 4. create bucket with the same name
 // 5. check that EC is working properly for this bucket
 func TestECDestroyBucket(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1653,7 +1654,7 @@ func TestECDestroyBucket(t *testing.T) {
 	wg.Wait()
 	tlog.Logf("EC put files resulted in error in %d out of %d files\n", errCnt.Load(), o.objCount)
 	args := xact.ArgsMsg{Kind: apc.ActECPut}
-	api.WaitForXactionIC(baseParams, args)
+	api.WaitForXactionIC(baseParams, &args)
 
 	// create bucket with the same name and check if puts are successful
 	newLocalBckWithProps(t, baseParams, bck, bckProps, o)
@@ -1677,7 +1678,7 @@ func TestECEmergencyTargetForSlices(t *testing.T) {
 		smallEvery = 4
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1729,7 +1730,7 @@ func TestECEmergencyTargetForSlices(t *testing.T) {
 		tlog.Logf("Creating %s, size %8d [%2s]\n", objPath, objSize, ecStr)
 		r, err := readers.NewRand(objSize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
-		_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
+		_, err = api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 		tassert.CheckFatal(t, err)
 		t.Logf("Object %s put in %v", objName, time.Since(start))
 		start = time.Now()
@@ -1774,7 +1775,7 @@ func TestECEmergencyTargetForSlices(t *testing.T) {
 }
 
 func TestECEmergencyTargetForReplica(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1866,7 +1867,7 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 		objName := fmt.Sprintf(o.pattern, i)
 		// 1) hack: calculate which targets stored a replica
 		cbck := meta.NewBck(bck.Name, bck.Provider, cmn.NsGlobal)
-		targets, err := cluster.HrwTargetList(cbck.MakeUname(ecTestDir+objName), o.smap, o.parityCnt+1)
+		targets, err := o.smap.HrwTargetList(cbck.MakeUname(ecTestDir+objName), o.parityCnt+1)
 		tassert.CheckFatal(t, err)
 
 		mainTarget := targets[0]
@@ -1921,7 +1922,7 @@ func TestECEmergencyMountpath(t *testing.T) {
 		smallEvery = 4
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -1977,7 +1978,7 @@ func TestECEmergencyMountpath(t *testing.T) {
 		tlog.Logf("Creating %s, size %8d [%2s]\n", objPath, objSize, ecStr)
 		r, err := readers.NewRand(objSize, cos.ChecksumNone)
 		tassert.CheckFatal(t, err)
-		_, err = api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
+		_, err = api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objPath, Reader: r})
 		tassert.CheckFatal(t, err)
 
 		foundParts, mainObjPath := waitForECFinishes(t, totalCnt, objSize, sliceSize, doEC, bck, objPath)
@@ -2030,11 +2031,11 @@ func TestECEmergencyMountpath(t *testing.T) {
 
 	// Wait for ec to finish
 	flt := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-	_ = api.WaitForXactionIdle(baseParams, flt)
+	_ = api.WaitForXactionIdle(baseParams, &flt)
 }
 
 func TestECRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		bck = cmn.Bck{
@@ -2064,7 +2065,7 @@ func TestECRebalance(t *testing.T) {
 }
 
 func TestECMountpaths(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		bck = cmn.Bck{
@@ -2093,7 +2094,7 @@ func TestECMountpaths(t *testing.T) {
 	}
 
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-	api.WaitForXactionIdle(tools.BaseAPIParams(proxyURL), reqArgs)
+	api.WaitForXactionIdle(tools.BaseAPIParams(proxyURL), &reqArgs)
 }
 
 // The test only checks that the number of object after rebalance equals
@@ -2202,12 +2203,12 @@ func TestECBucketEncode(t *testing.T) {
 	}
 
 	tlog.Logf("Enabling EC\n")
-	bckPropsToUpate := &cmn.BucketPropsToUpdate{
-		EC: &cmn.ECConfToUpdate{
-			Enabled:      api.Bool(true),
-			ObjSizeLimit: api.Int64(1),
-			DataSlices:   api.Int(1),
-			ParitySlices: api.Int(parityCnt),
+	bckPropsToUpate := &cmn.BpropsToSet{
+		EC: &cmn.ECConfToSet{
+			Enabled:      apc.Bool(true),
+			ObjSizeLimit: apc.Int64(1),
+			DataSlices:   apc.Int(1),
+			ParitySlices: apc.Int(parityCnt),
 		},
 	}
 	_, err = api.SetBucketProps(baseParams, m.bck, bckPropsToUpate)
@@ -2215,7 +2216,7 @@ func TestECBucketEncode(t *testing.T) {
 
 	tlog.Logf("Wait for EC %s\n", m.bck)
 	xargs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: m.bck, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, xargs)
+	_, err = api.WaitForXactionIC(baseParams, &xargs)
 	tassert.CheckFatal(t, err)
 
 	objList, err = api.ListObjects(baseParams, m.bck, nil, api.ListArgs{})
@@ -2233,7 +2234,7 @@ func TestECBucketEncode(t *testing.T) {
 // Creates two buckets (with EC enabled and disabled), fill them with data,
 // and then runs two parallel rebalances
 func TestECAndRegularRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		bckReg = cmn.Bck{
@@ -2366,7 +2367,7 @@ func ecAndRegularRebalance(t *testing.T, o *ecOptions, proxyURL string, bckReg, 
 //     slices in HEAD response
 //  7. Extra check: the number of objects after rebalance equals initial number
 func TestECResilver(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck = cmn.Bck{
@@ -2444,7 +2445,7 @@ func ecResilver(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 
 	for i := 0; i < o.objCount; i++ {
 		objName := ecTestDir + fmt.Sprintf(o.pattern, i)
-		props, err := api.HeadObject(baseParams, bck, objName, apc.FltPresent)
+		props, err := api.HeadObject(baseParams, bck, objName, apc.FltPresent, false /*silent*/)
 		if err != nil {
 			t.Errorf("HEAD for %s failed: %v", objName, err)
 		} else if props.EC.DataSlices == 0 || props.EC.ParitySlices == 0 {
@@ -2463,7 +2464,7 @@ func ecResilver(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 // 8. Stop reading loop and read all objects once more (nothing should fail)
 // 9. Get the number of objects in the bucket (must be the same as at start)
 func TestECAndRegularUnregisterWhileRebalancing(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		bckEC = cmn.Bck{
@@ -2582,10 +2583,10 @@ func ecAndRegularUnregisterWhileRebalancing(t *testing.T, o *ecOptions, bckEC cm
 		}
 	}()
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: startTimeout}
-	err = api.WaitForXactionNode(baseParams, xargs, xactSnapRunning)
+	err = api.WaitForXactionNode(baseParams, &xargs, xactSnapRunning)
 	tassert.CheckError(t, err)
 
-	err = api.AbortXaction(baseParams, xargs)
+	err = api.AbortXaction(baseParams, &xargs)
 	tassert.CheckError(t, err)
 	tools.WaitForRebalAndResil(t, baseParams)
 	tassert.CheckError(t, err)
@@ -2753,7 +2754,7 @@ func TestECGenerations(t *testing.T) {
 			currentTime := mono.NanoTime()
 			for i := 0; i < o.objCount; i++ {
 				objName := ecTestDir + fmt.Sprintf(o.pattern, i)
-				props, err := api.HeadObject(baseParams, bck, objName, apc.FltPresent)
+				props, err := api.HeadObject(baseParams, bck, objName, apc.FltPresent, false /*silent*/)
 				tassert.CheckError(t, err)
 				if err == nil && props.EC.Generation > lastWrite[i] && props.EC.Generation < currentTime {
 					t.Errorf("Object %s, generation %d expected between %d and %d",

@@ -13,17 +13,17 @@ redirect_from:
 - [In-depth overview](/docs/overview.md)
 - [Getting started](/docs/getting_started.md)
 - [CLI: overview, getting started](/docs/cli.md)
-- [CLI: reference guide](https://github.com/NVIDIA/aistore/blob/master/docs/cli.md#cli-reference)
+- [CLI: reference guide](https://github.com/NVIDIA/aistore/blob/main/docs/cli.md#cli-reference)
 - [Blogs](https://aiatscale.org/blog)
-- [Deployment](https://github.com/NVIDIA/aistore/tree/master/deploy)
+- [Deployment](https://github.com/NVIDIA/aistore/tree/main/deploy)
 
-### Guides and References
+## Guides and References
 
 - [Getting Started](/docs/getting_started.md)
 - [Technical Blog](https://aiatscale.org/blog)
 - API and SDK
-  - [Go (language) API](https://github.com/NVIDIA/aistore/tree/master/api)
-  - [Python SDK](https://github.com/NVIDIA/aistore/tree/master/python/aistore), and also:
+  - [Go (language) API](https://github.com/NVIDIA/aistore/tree/main/api)
+  - [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore), and also:
     - [pip package](https://pypi.org/project/aistore/)
     - [reference guide](/docs/python_sdk.md)
   - [REST API](/docs/http_api.md)
@@ -31,10 +31,10 @@ redirect_from:
 - Amazon S3
   - [`s3cmd` client](/docs/s3cmd.md)
   - [S3 compatibility](/docs/s3compat.md)
-  - [Boto3 support](https://github.com/NVIDIA/aistore/tree/master/python/aistore/botocore_patch)
+  - [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch)
 - [CLI](/docs/cli.md)
   - [`ais help`](/docs/cli/help.md)
-  - [Reference guide](https://github.com/NVIDIA/aistore/blob/master/docs/cli.md#cli-reference)
+  - [Reference guide](https://github.com/NVIDIA/aistore/blob/main/docs/cli.md#cli-reference)
   - [Monitoring](/docs/cli/show.md)
     - [`ais show cluster`](/docs/cli/show.md)
     - [`ais show performance`](/docs/cli/show.md)
@@ -61,6 +61,7 @@ redirect_from:
   - [AIS Load Generator: integrated benchmark tool](/docs/aisloader.md)
   - [How to benchmark](/docs/howto_benchmark.md)
   - [Performance tuning and testing](/docs/performance.md)
+  - [Performance monitoring](/docs/cli/performance.md)
 - Buckets and Backend Providers
   - [Backend providers](/docs/providers.md)
   - [Buckets](/docs/bucket.md)
@@ -71,7 +72,7 @@ redirect_from:
   - [Checksumming: brief theory of operations](/docs/checksum.md)
   - [S3 compatibility](/docs/s3compat.md)
 - Cluster Management
-  - [Lifecycle management: maintenance mode, rebalance/rebuild, and more](/docs/lifecycle_node.md)
+  - [Node lifecycle: maintenance mode, rebalance/rebuild, shutdown, decommission](/docs/lifecycle_node.md)
   - [CLI: `ais cluster` and subcommands](/docs/cli/show.md)
   - [Joining AIS cluster](/docs/join_cluster.md)
   - [Leaving AIS cluster](/docs/leave_cluster.md)
@@ -79,7 +80,9 @@ redirect_from:
   - [Troubleshooting](/docs/troubleshooting.md)
 - Configuration
   - [Configuration](/docs/configuration.md)
+  - [Environment variables](/docs/environment-vars.md)
   - [CLI: `ais config`](/docs/cli/config.md)
+  - [Feature flags](/docs/feature_flags.md)
 - Observability
   - [Observability](/docs/metrics.md)
   - [Prometheus](/docs/prometheus.md)
@@ -89,15 +92,20 @@ redirect_from:
   - [Docker](/docs/docker_main.md)
   - [Useful scripts](/docs/development.md)
   - Profiling, race-detecting, and more
-- Batch operations
+- Batch jobs
   - [Batch operations](/docs/batch.md)
   - [eXtended Actions (xactions)](/xact/README.md)
   - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md)
-- Topics
+- Assorted Topics
   - [System files](/docs/sysfiles.md)
+  - [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)
+  - [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
+  - [Feature flags](/docs/feature_flags.md)
   - [`aisnode` command line](/docs/command_line.md)
   - [Traffic patterns](/docs/traffic_patterns.md)
   - [Highly available control plane](/docs/ha.md)
+  - [Start/stop maintenance mode, shutdown, decommission, and related operations](/docs/lifecycle_node.md)
   - [Downloader](/docs/downloader.md)
   - [On-disk layout](/docs/on_disk_layout.md)
-  - [AIS Buckets: definition, operations, properties](https://github.com/NVIDIA/aistore/blob/master/docs/bucket.md#bucket)
+  - [Buckets: definition, operations, properties](https://github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket)
+  - [Out of band updates](/docs/out_of_band.md)

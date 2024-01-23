@@ -15,9 +15,9 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
 )
@@ -28,7 +28,7 @@ const (
 
 type targetRebSnap struct {
 	tid  string
-	snap *cluster.Snap
+	snap *core.Snap
 }
 
 var (
@@ -89,7 +89,7 @@ func showRebalanceHandler(c *cli.Context) error {
 	)
 	longRun.init(c, true /*run once unless*/)
 	for countdown := longRun.count; countdown > 0 || longRun.isForever(); countdown-- {
-		rebSnaps, err := api.QueryXactionSnaps(apiBP, xargs)
+		rebSnaps, err := api.QueryXactionSnaps(apiBP, &xargs)
 		if err != nil {
 			if herr, ok := err.(*cmn.ErrHTTP); ok {
 				if herr.Status == http.StatusNotFound {

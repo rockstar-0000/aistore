@@ -5,7 +5,6 @@
 package dload
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"regexp"
@@ -13,13 +12,10 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
@@ -116,25 +112,15 @@ const (
 	actList   = "LIST"
 )
 
-// Downloader cannot use global HTTP client because it must work with
-// an arbitrary (HTTP) server. Downloader selects client by
-// server's URL. Certification check is disabled always for now and
-// does not depend on cluster settings.
-var (
-	httpClient  = cmn.NewClient(cmn.TransportArgs{})
-	httpsClient = cmn.NewClient(cmn.TransportArgs{UseHTTPS: true, SkipVerify: true})
-)
-
 type (
 	factory struct {
 		xreg.RenewBase
-		xctn   *Xact
-		statsT stats.Tracker
+		xctn *Xact
+		bck  *meta.Bck
 	}
 	Xact struct {
 		xact.DemandBase
-		t          cluster.Target
-		statsT     stats.Tracker
+		p          *factory
 		dispatcher *dispatcher
 	}
 
@@ -172,27 +158,23 @@ var (
 	_ io.ReadCloser  = (*progressReader)(nil)
 )
 
-func Xreg() {
-	xreg.RegNonBckXact(&factory{})
-}
-
 /////////////
 // factory //
 /////////////
 
 func (*factory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
-	return &factory{RenewBase: xreg.RenewBase{Args: args}, statsT: args.Custom.(stats.Tracker)}
+	return &factory{RenewBase: xreg.RenewBase{Args: args}, bck: args.Custom.(*meta.Bck)}
 }
 
 func (p *factory) Start() error {
-	xdl := newXact(p.T, p.statsT, p.Args.UUID)
+	xdl := newXact(p)
 	p.xctn = xdl
 	go xdl.Run(nil)
 	return nil
 }
 
-func (*factory) Kind() string        { return apc.ActDownload }
-func (p *factory) Get() cluster.Xact { return p.xctn }
+func (*factory) Kind() string     { return apc.ActDownload }
+func (p *factory) Get() core.Xact { return p.xctn }
 
 func (*factory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 	return xreg.WprKeepAndStartNew, nil
@@ -202,17 +184,19 @@ func (*factory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 // Xact //
 //////////
 
-func newXact(t cluster.Target, statsT stats.Tracker, xid string) (xld *Xact) {
-	xld = &Xact{t: t, statsT: statsT}
+func newXact(p *factory) (xld *Xact) {
+	xld = &Xact{p: p}
 	xld.dispatcher = newDispatcher(xld)
-	xld.DemandBase.Init(xid, apc.Download, nil /*bck*/, 0 /*use default*/)
+	xld.DemandBase.Init(p.UUID(), apc.Download, p.bck, 0 /*use default*/)
 	return
 }
 
 func (xld *Xact) Run(*sync.WaitGroup) {
-	nlog.Infof("starting %s", xld.Name())
+	nlog.Infoln("starting", xld.Name())
 	err := xld.dispatcher.run()
-	xld.AddErr(err)
+	if err != nil {
+		xld.AddErr(err)
+	}
 	xld.stop()
 }
 
@@ -226,7 +210,7 @@ func (xld *Xact) Download(job jobif) (resp any, statusCode int, err error) {
 	xld.IncPending()
 	defer xld.DecPending()
 
-	dljob := dlStore.setJob(job)
+	dljob := g.store.setJob(job)
 
 	select {
 	case xld.dispatcher.workCh <- job:
@@ -235,7 +219,7 @@ func (xld *Xact) Download(job jobif) (resp any, statusCode int, err error) {
 		select {
 		case xld.dispatcher.workCh <- job:
 			return dljob.id, http.StatusOK, nil
-		case <-time.After(cmn.Timeout.CplaneOperation()):
+		case <-time.After(cmn.Rom.CplaneOperation()):
 			return "downloader job queue is full", http.StatusTooManyRequests, nil
 		}
 	}
@@ -265,19 +249,8 @@ func (xld *Xact) JobStatus(id string, onlyActive bool) (resp any, statusCode int
 	return
 }
 
-func (xld *Xact) checkJob(req *request) (*dljob, error) {
-	dljob, err := dlStore.getJob(req.id)
-	if err != nil {
-		debug.Assert(errors.Is(err, errJobNotFound))
-		errV := cos.NewErrNotFound("%s: download job %q", xld.t, req.id)
-		req.errRsp(errV, http.StatusNotFound)
-		return nil, errV
-	}
-	return dljob, nil
-}
-
-func (xld *Xact) Snap() (snap *cluster.Snap) {
-	snap = &cluster.Snap{}
+func (xld *Xact) Snap() (snap *core.Snap) {
+	snap = &core.Snap{}
 	xld.ToSnap(snap)
 
 	snap.IdleX = xld.IsIdle()

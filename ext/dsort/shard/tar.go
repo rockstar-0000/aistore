@@ -10,10 +10,10 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/memsys"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -35,13 +35,8 @@ type (
 	}
 )
 
-var (
-	// Predefined padding buffer (zero-initialized).
-	padBuf [archive.TarBlockSize]byte
-
-	// interface guard
-	_ RW = (*tarRW)(nil)
-)
+// interface guard
+var _ RW = (*tarRW)(nil)
 
 /////////////////////////
 // tarRecordDataReader //
@@ -49,7 +44,7 @@ var (
 
 func newTarRecordDataReader() *tarRecordDataReader {
 	rd := &tarRecordDataReader{}
-	rd.metadataBuf, rd.slab = T.ByteMM().Alloc()
+	rd.metadataBuf, rd.slab = core.T.ByteMM().Alloc()
 	return rd
 }
 
@@ -107,13 +102,13 @@ func (*tarRW) IsCompressed() bool   { return false }
 func (*tarRW) SupportsOffset() bool { return true }
 func (*tarRW) MetadataSize() int64  { return archive.TarBlockSize } // size of tar header with padding
 
-func (trw *tarRW) Extract(lom *cluster.LOM, r cos.ReadReaderAt, extractor RecordExtractor, toDisk bool) (int64, int, error) {
+func (trw *tarRW) Extract(lom *core.LOM, r cos.ReadReaderAt, extractor RecordExtractor, toDisk bool) (int64, int, error) {
 	ar, err := archive.NewReader(trw.ext, r)
 	if err != nil {
 		return 0, 0, err
 	}
 	c := &rcbCtx{parent: trw, tw: nil, extractor: extractor, shardName: lom.ObjName, toDisk: toDisk}
-	buf, slab := T.PageMM().AllocSize(lom.SizeBytes())
+	buf, slab := core.T.PageMM().AllocSize(lom.SizeBytes())
 	c.buf = buf
 
 	_, err = ar.Range("", c.xtar)

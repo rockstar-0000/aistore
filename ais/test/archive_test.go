@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"archive/tar"
@@ -17,12 +17,12 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tarch"
@@ -177,7 +177,12 @@ func TestGetFromArch(t *testing.T) {
 							tassert.Errorf(t, err != nil, "expecting error reading corrupted arch %q", archName)
 							break
 						}
-						tassert.CheckFatal(t, err)
+						if err != nil {
+							tlog.Logf("Error reading %s?%s=%s(%dB), where randomName=%q, objname=%q, mime=%q, archName=%q\n",
+								m.bck.Cname(objname), apc.QparamArchpath, randomName, oah.Size(),
+								randomName, objname, mime, archName)
+							tassert.CheckFatal(t, err)
+						}
 					}
 				})
 			}
@@ -187,7 +192,7 @@ func TestGetFromArch(t *testing.T) {
 
 // archive multple obj-s with an option to append if exists
 func TestArchMultiObj(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	runProviderTests(t, func(t *testing.T, bck *meta.Bck) {
 		testArch(t, bck)
 	})
@@ -317,7 +322,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 						msg.ListRange.ObjNames = list
 						msg.InclSrcBname = test.inclSrcBckName
 
-						xids, err := api.ArchiveMultiObj(baseParams, m.bck, msg)
+						xids, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 						tassert.CheckFatal(t, err)
 						tlog.Logf("[%s] %2d: arch list %d objects %s => %s\n", xids, i, len(list), m.bck, bckTo)
 					}(archName, list, i)
@@ -334,7 +339,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 						msg.ListRange.Template = fmt.Sprintf(fmtRange, m.prefix, start, start+numInArch-1)
 						msg.InclSrcBname = test.inclSrcBckName
 
-						xids, err := api.ArchiveMultiObj(baseParams, m.bck, msg)
+						xids, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 						tassert.CheckFatal(t, err)
 						tlog.Logf("[%s] %2d: arch range %s %s => %s\n",
 							xids, i, msg.ListRange.Template, m.bck, bckTo)
@@ -346,12 +351,12 @@ func testArch(t *testing.T, bck *meta.Bck) {
 			if test.abrt {
 				time.Sleep(time.Duration(rand.Intn(5)+1) * time.Second)
 				tlog.Logln("Aborting...")
-				api.AbortXaction(baseParams, flt)
+				api.AbortXaction(baseParams, &flt)
 			}
 
 			var lstToAppend *cmn.LsoResult
 			for ii := 0; ii < 2; ii++ {
-				api.WaitForXactionIdle(baseParams, flt)
+				api.WaitForXactionIdle(baseParams, &flt)
 
 				tlog.Logf("List %s\n", bckTo)
 				msg := &apc.LsoMsg{Prefix: "test_"}
@@ -396,7 +401,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 
 						msg.AppendIfExists = true // here
 
-						xids, err := api.ArchiveMultiObj(baseParams, m.bck, msg)
+						xids, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 						tassert.CheckFatal(t, err)
 						tlog.Logf("[%s] APPEND %s/%s => %s/%s\n",
 							xids, m.bck, msg.ListRange.Template, bckTo, archName)
@@ -405,7 +410,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 
 				time.Sleep(10 * time.Second)
 				flt := xact.ArgsMsg{Kind: apc.ActArchive, Bck: m.bck}
-				api.WaitForXactionIdle(baseParams, flt)
+				api.WaitForXactionIdle(baseParams, &flt)
 			}
 
 			var (
@@ -525,13 +530,13 @@ func TestAppendToArch(t *testing.T) {
 					}
 					msg.ListRange.ObjNames = list
 
-					_, err := api.ArchiveMultiObj(baseParams, m.bck, msg)
+					_, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 					tassert.CheckFatal(t, err)
 				}(archName, list)
 			}
 
 			wargs := xact.ArgsMsg{Kind: apc.ActArchive, Bck: m.bck}
-			api.WaitForXactionIdle(baseParams, wargs)
+			api.WaitForXactionIdle(baseParams, &wargs)
 
 			lsmsg := &apc.LsoMsg{Prefix: "test_lst"}
 			lsmsg.AddProps(apc.GetPropsName, apc.GetPropsSize)
@@ -556,7 +561,7 @@ func TestAppendToArch(t *testing.T) {
 					msg.AppendIfExists = true
 					msg.ListRange.ObjNames = list
 					go func() {
-						_, err = api.ArchiveMultiObj(baseParams, bckFrom, msg)
+						_, err = api.ArchiveMultiObj(baseParams, bckFrom, &msg)
 						tassert.CheckError(t, err)
 					}()
 				} else {
@@ -578,14 +583,14 @@ func TestAppendToArch(t *testing.T) {
 						if sparsePrint.Inc()%13 == 0 {
 							tlog.Logf("APPEND local rand => %s/%s/%s\n", bckTo, archName, archpath)
 						}
-						err = api.PutApndArch(appendArchArgs)
+						err = api.PutApndArch(&appendArchArgs)
 						tassert.CheckError(t, err)
 					}
 				}
 			}
 			if test.multi {
 				wargs := xact.ArgsMsg{Kind: apc.ActArchive, Bck: m.bck}
-				api.WaitForXactionIdle(baseParams, wargs)
+				api.WaitForXactionIdle(baseParams, &wargs)
 			}
 
 			lsmsg.SetFlag(apc.LsArchDir)

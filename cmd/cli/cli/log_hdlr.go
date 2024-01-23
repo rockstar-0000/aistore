@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -12,13 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/urfave/cli"
 )
@@ -120,13 +119,25 @@ func getLogHandler(c *cli.Context) error {
 		node, sname, errV := getNode(c, c.Args().Get(0))
 		if errV != nil {
 			if isErrDoesNotExist(errV) {
+				var hint string
+				// not a node but maybe OUT_DIR
+				if all {
+					finfo, errEx := os.Stat(c.Args().Get(0))
+					if errEx == nil && finfo.IsDir() {
+						err = _getAllClusterLogs(c, sev, outFile)
+						goto ret
+					}
+				}
+
 				// with a hint
-				errV = fmt.Errorf("%v\n(Hint: did you mean 'ais log get %s %s'?)", errV, clusterCompletion, c.Args().Get(0))
+				hint = "Hint:  "
+				errV = fmt.Errorf("%v\n"+hint+"did you mean 'ais log get %s %s'?", errV, clusterCompletion, c.Args().Get(0))
 			}
 			return errV
 		}
 		err = _getAllNodeLogs(c, node, sev, outFile, sname)
 	}
+ret:
 	if err == nil {
 		actionDone(c, "Done")
 	}
@@ -251,7 +262,7 @@ func _currentLog(c *cli.Context) error {
 			warn := fmt.Sprintf("run 'ais config node %s inherited %s %s' to change it back",
 				sname, nodeLogFlushName, config.Log.FlushTime)
 			actionWarn(c, warn)
-			time.Sleep(2 * time.Second)
+			briefPause(2)
 			fmt.Fprintln(c.App.Writer)
 		}
 	}

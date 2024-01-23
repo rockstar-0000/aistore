@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,7 +62,7 @@ var examples = `# 1. Cleanup (i.e., destroy) an existing bucket:
      $ aisloader -bucket=s3://xyz -cleanup=false -minsize=16B -maxsize=16B -numworkers=8 -pctput=100 -totalputsize=128k -s3endpoint=https://s3.amazonaws.com -quiet
 `
 
-const readme = cmn.GitHubHome + "/blob/master/docs/howto_benchmark.md"
+const readme = cmn.GitHubHome + "/blob/main/docs/howto_benchmark.md"
 
 func printUsage(f *flag.FlagSet) {
 	fmt.Printf("aisloader v%s (build %s)\n", _version, _buildtime)
@@ -86,7 +87,7 @@ func printUsage(f *flag.FlagSet) {
 // prettyNumber converts a number to format like 1,234,567
 func prettyNumber(n int64) string {
 	if n < 1000 {
-		return fmt.Sprintf("%d", n)
+		return strconv.FormatInt(n, 10)
 	}
 	return fmt.Sprintf("%s,%03d", prettyNumber(n/1000), n%1000)
 }
@@ -130,7 +131,7 @@ func prettyLatency(min, avg, max int64) string {
 	return fmt.Sprintf("%-11s%-11s%-11s", prettyDuration(min), prettyDuration(avg), prettyDuration(max))
 }
 
-func prettyTimestamp() string {
+func now() string {
 	return time.Now().Format(cos.StampSec)
 }
 
@@ -152,15 +153,15 @@ func postWriteStats(to io.Writer, jsonFormat bool) {
 }
 
 func finalizeStats(to io.Writer) {
-	accumulatedStats.aggregate(intervalStats)
-	writeStats(to, runParams.jsonFormat, true /* final */, intervalStats, accumulatedStats)
+	accumulatedStats.aggregate(&intervalStats)
+	writeStats(to, runParams.jsonFormat, true /* final */, &intervalStats, &accumulatedStats)
 	postWriteStats(to, runParams.jsonFormat)
 
 	// reset gauges, otherwise they would stay at last send value
 	stats.ResetMetricsGauges(statsdC)
 }
 
-func writeFinalStats(to io.Writer, jsonFormat bool, s sts) {
+func writeFinalStats(to io.Writer, jsonFormat bool, s *sts) {
 	if !jsonFormat {
 		writeHumanReadibleFinalStats(to, s)
 	} else {
@@ -168,7 +169,7 @@ func writeFinalStats(to io.Writer, jsonFormat bool, s sts) {
 	}
 }
 
-func writeIntervalStats(to io.Writer, jsonFormat bool, s, t sts) {
+func writeIntervalStats(to io.Writer, jsonFormat bool, s, t *sts) {
 	if !jsonFormat {
 		writeHumanReadibleIntervalStats(to, s, t)
 	} else {
@@ -192,7 +193,7 @@ func jsonStatsFromReq(r stats.HTTPReq) *jsonStats {
 	return jStats
 }
 
-func writeStatsJSON(to io.Writer, s sts, withcomma ...bool) {
+func writeStatsJSON(to io.Writer, s *sts, withcomma ...bool) {
 	jStats := struct {
 		Get *jsonStats `json:"get"`
 		Put *jsonStats `json:"put"`
@@ -217,13 +218,13 @@ func fprintf(w io.Writer, format string, a ...any) {
 	debug.AssertNoErr(err)
 }
 
-func writeHumanReadibleIntervalStats(to io.Writer, s, t sts) {
+func writeHumanReadibleIntervalStats(to io.Writer, s, t *sts) {
 	p := fprintf
 	pn := prettyNumber
 	pb := prettyBytes
 	ps := prettySpeed
 	pl := prettyLatency
-	pt := prettyTimestamp
+	pt := now
 
 	workOrderResLen := int64(len(resCh))
 	// show interval stats; some fields are shown of both interval and total, for example, gets, puts, etc
@@ -261,13 +262,13 @@ func writeHumanReadibleIntervalStats(to io.Writer, s, t sts) {
 	}
 }
 
-func writeHumanReadibleFinalStats(to io.Writer, t sts) {
+func writeHumanReadibleFinalStats(to io.Writer, t *sts) {
 	p := fprintf
 	pn := prettyNumber
 	pb := prettyBytes
 	ps := prettySpeed
 	pl := prettyLatency
-	pt := prettyTimestamp
+	pt := now
 	preWriteStats(to, false)
 
 	sput := &t.put
@@ -301,7 +302,7 @@ func writeHumanReadibleFinalStats(to io.Writer, t sts) {
 
 // writeStatus writes stats to the writter.
 // if final = true, writes the total; otherwise writes the interval stats
-func writeStats(to io.Writer, jsonFormat, final bool, s, t sts) {
+func writeStats(to io.Writer, jsonFormat, final bool, s, t *sts) {
 	if final {
 		writeFinalStats(to, jsonFormat, t)
 	} else {

@@ -22,11 +22,11 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/env"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tlog"
@@ -78,7 +78,7 @@ func WaitNodePubAddrNotInUse(si *meta.Snode, timeout time.Duration) error {
 // Add an alive node that is not in SMap to the cluster.
 // Use to add a new node to the cluster or get back a node removed by `RemoveNodeUnsafe`
 func JoinCluster(proxyURL string, node *meta.Snode) (string, error) {
-	return _joinCluster(gctx, proxyURL, node, registerTimeout)
+	return _joinCluster(proxyURL, node, registerTimeout)
 }
 
 // Restore a node put into maintenance: in this case the node is in
@@ -259,7 +259,7 @@ func WaitForClusterState(proxyURL, reason string, origVer int64, pcnt, tcnt int,
 			proxyID := pidFromURL(smap, proxyURL)
 			idsToIgnore := cos.NewStrSet(MockDaemonID, proxyID)
 			idsToIgnore.Add(ignoreIDs...)
-			err = waitSmapSync(bp, gctx, deadline, syncedSmap, origVer, idsToIgnore)
+			err = waitSmapSync(bp, deadline, syncedSmap, origVer, idsToIgnore)
 			if err != nil {
 				tlog.Logf("Failed waiting for cluster state condition: %v (%s, %s, %v, %v)\n",
 					err, smap, syncedSmap, origVer, idsToIgnore)
@@ -312,7 +312,7 @@ func WaitForResilvering(t *testing.T, bp api.BaseParams, target *meta.Snode) {
 		}
 		return true, true
 	}
-	err := api.WaitForXactionNode(bp, args, allFinished)
+	err := api.WaitForXactionNode(bp, &args, allFinished)
 	tassert.CheckFatal(t, err)
 }
 
@@ -459,7 +459,7 @@ func DeployNode(t *testing.T, node *meta.Snode, conf *cmn.Config, localConf *cmn
 		localConf.HostNet.PortIntraData = conf.HostNet.PortIntraData
 	}
 
-	localConfFile := filepath.Join(conf.ConfigDir, fname.PlaintextInitialConfig)
+	localConfFile := filepath.Join(conf.ConfigDir, fname.PlainLocalConfig)
 	err := jsp.SaveMeta(localConfFile, localConf, nil)
 	tassert.CheckFatal(t, err)
 
@@ -510,7 +510,11 @@ func getAISNodeCmd(t *testing.T) string {
 
 // getPID uses 'lsof' to find the pid of the ais process listening on a port
 func getPID(port string) (int, error) {
-	output, err := exec.Command("lsof", []string{"-sTCP:LISTEN", "-i", ":" + port}...).CombinedOutput()
+	var (
+		sport = ":" + port
+		cmd   = exec.Command("lsof", "-sTCP:LISTEN", "-i", sport)
+	)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("error executing LSOF command: %v", err)
 	}
@@ -536,8 +540,11 @@ func getProcess(port string) (pid int, cmd string, args []string, err error) {
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("error getting pid on port: %v", err)
 	}
-
-	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command").CombinedOutput()
+	var (
+		spid = strconv.Itoa(pid)
+		ps   = exec.Command("ps", "-p", spid, "-o", "command")
+	)
+	output, err := ps.CombinedOutput()
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("error executing PS command: %v", err)
 	}
@@ -639,7 +646,7 @@ retry:
 		}
 		node := smap.GetNode(cmd.Node.ID())
 		if node != nil {
-			tassert.Errorf(t, node.Equals(cmd.Node),
+			tassert.Errorf(t, node.Eq(cmd.Node),
 				"%s %s changed, before %+v, after %+v", cmd.Node.Type(), node.ID(), cmd.Node, node)
 		} else {
 			tassert.Errorf(t, false, "%s %s not found in %s", cmd.Node.Type(), cmd.Node.ID(), smap.StringEx())
@@ -727,8 +734,8 @@ while503:
 	goto while503
 }
 
-func _joinCluster(ctx *Ctx, proxyURL string, node *meta.Snode, timeout time.Duration) (rebID string, err error) {
-	bp := api.BaseParams{Client: ctx.Client, URL: proxyURL, Token: LoggedUserToken}
+func _joinCluster(proxyURL string, node *meta.Snode, timeout time.Duration) (rebID string, err error) {
+	bp := api.BaseParams{Client: gctx.Client, URL: proxyURL, Token: LoggedUserToken}
 	smap, err := api.GetClusterMap(bp)
 	if err != nil {
 		return "", err
@@ -740,7 +747,7 @@ func _joinCluster(ctx *Ctx, proxyURL string, node *meta.Snode, timeout time.Dura
 	// If node is already in cluster we should not wait for map version
 	// sync because update will not be scheduled
 	if node := smap.GetNode(node.ID()); node == nil {
-		err = waitSmapSync(bp, ctx, time.Now().Add(timeout), smap, smap.Version, cos.NewStrSet())
+		err = waitSmapSync(bp, time.Now().Add(timeout), smap, smap.Version, cos.NewStrSet())
 		return
 	}
 	return
@@ -764,7 +771,7 @@ func _nextNode(smap *meta.Smap, idsToIgnore cos.StrSet) (sid string, isproxy, ex
 	return
 }
 
-func waitSmapSync(bp api.BaseParams, ctx *Ctx, timeout time.Time, smap *meta.Smap, ver int64, ignore cos.StrSet) error {
+func waitSmapSync(bp api.BaseParams, timeout time.Time, smap *meta.Smap, ver int64, ignore cos.StrSet) error {
 	var (
 		prevSid string
 		orig    = ignore.Clone()
@@ -789,15 +796,15 @@ func waitSmapSync(bp api.BaseParams, ctx *Ctx, timeout time.Time, smap *meta.Sma
 		if err == nil && newSmap.Version > ver {
 			ignore.Add(sid)
 			if newSmap.Version > smap.Version {
-				ctx.Log("Updating %s to %s from %s\n", smap, newSmap.StringEx(), sname)
+				gctx.Log("Updating %s to %s from %s\n", smap, newSmap.StringEx(), sname)
 				cos.CopyStruct(smap, newSmap)
 			}
 			if newSmap.Version > ver+1 {
 				// reset
 				if ver <= 0 {
-					ctx.Log("Received %s from %s\n", newSmap, sname)
+					gctx.Log("Received %s from %s\n", newSmap, sname)
 				} else {
-					ctx.Log("Received newer %s from %s, updated wait-for condition (%d => %d)\n",
+					gctx.Log("Received newer %s from %s, updated wait-for condition (%d => %d)\n",
 						newSmap, sname, ver, newSmap.Version)
 				}
 				ver = newSmap.Version - 1
@@ -811,10 +818,10 @@ func waitSmapSync(bp api.BaseParams, ctx *Ctx, timeout time.Time, smap *meta.Sma
 		}
 		if newSmap != nil {
 			if snode := newSmap.GetNode(sid); snode != nil {
-				ctx.Log("Waiting for %s(%s) to sync Smap > v%d\n", snode.StringEx(), newSmap, ver)
+				gctx.Log("Waiting for %s(%s) to sync Smap > v%d\n", snode.StringEx(), newSmap, ver)
 			} else {
-				ctx.Log("Waiting for %s(%s) to sync Smap > v%d\n", sname, newSmap, ver)
-				ctx.Log("(Warning: %s hasn't joined yet - not present)\n", sname)
+				gctx.Log("Waiting for %s(%s) to sync Smap > v%d\n", sname, newSmap, ver)
+				gctx.Log("(Warning: %s hasn't joined yet - not present)\n", sname)
 			}
 		}
 		prevSid = sid
@@ -826,9 +833,9 @@ func waitSmapSync(bp api.BaseParams, ctx *Ctx, timeout time.Time, smap *meta.Sma
 }
 
 // remove node unsafe
-func _removeNodeFromSmap(ctx *Ctx, proxyURL, sid string, timeout time.Duration) error {
+func _removeNodeFromSmap(proxyURL, sid string, timeout time.Duration) error {
 	var (
-		bp        = api.BaseParams{Client: ctx.Client, URL: proxyURL, Token: LoggedUserToken}
+		bp        = api.BaseParams{Client: gctx.Client, URL: proxyURL, Token: LoggedUserToken}
 		smap, err = api.GetClusterMap(bp)
 		node      = smap.GetNode(sid)
 	)
@@ -848,7 +855,7 @@ func _removeNodeFromSmap(ctx *Ctx, proxyURL, sid string, timeout time.Duration) 
 	// If node does not exist in cluster we should not wait for map version
 	// sync because update will not be scheduled.
 	if node != nil {
-		return waitSmapSync(bp, ctx, time.Now().Add(timeout), smap, smap.Version, cos.NewStrSet(node.ID()))
+		return waitSmapSync(bp, time.Now().Add(timeout), smap, smap.Version, cos.NewStrSet(node.ID()))
 	}
 	return nil
 }

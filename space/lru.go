@@ -2,7 +2,7 @@
 // least recently used cache replacement). It also serves as a built-in garbage-collection
 // mechanism for orphaned workfiles.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package space
 
@@ -14,12 +14,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/ios"
@@ -51,7 +51,6 @@ const (
 
 type (
 	IniLRU struct {
-		T                   cluster.Target
 		Xaction             *XactLRU
 		Config              *cmn.Config
 		StatsT              stats.Tracker
@@ -69,7 +68,7 @@ type (
 // private
 type (
 	// minHeap keeps fileInfo sorted by access time with oldest on top of the heap.
-	minHeap []*cluster.LOM
+	minHeap []*core.LOM
 
 	// parent (contains mpath joggers)
 	lruP struct {
@@ -109,7 +108,7 @@ type (
 // interface guard
 var (
 	_ xreg.Renewable = (*lruFactory)(nil)
-	_ cluster.Xact   = (*XactLRU)(nil)
+	_ core.Xact      = (*XactLRU)(nil)
 )
 
 ////////////////
@@ -126,8 +125,8 @@ func (p *lruFactory) Start() error {
 	return nil
 }
 
-func (*lruFactory) Kind() string        { return apc.ActLRU }
-func (p *lruFactory) Get() cluster.Xact { return p.xctn }
+func (*lruFactory) Kind() string     { return apc.ActLRU }
+func (p *lruFactory) Get() core.Xact { return p.xctn }
 
 func (*lruFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, err error) {
 	return xreg.WprUse, cmn.NewErrXactUsePrev(prevEntry.Get().String())
@@ -148,8 +147,7 @@ func RunLRU(ini *IniLRU) {
 		}
 	}()
 	if num == 0 {
-		nlog.Warningln(cmn.ErrNoMountpaths)
-		xlru.AddErr(cmn.ErrNoMountpaths)
+		xlru.AddErr(cmn.ErrNoMountpaths, 0)
 		xlru.Finish()
 		return
 	}
@@ -189,8 +187,8 @@ func RunLRU(ini *IniLRU) {
 
 func (*XactLRU) Run(*sync.WaitGroup) { debug.Assert(false) }
 
-func (r *XactLRU) Snap() (snap *cluster.Snap) {
-	snap = &cluster.Snap{}
+func (r *XactLRU) Snap() (snap *core.Snap) {
+	snap = &core.Snap{}
 	r.ToSnap(snap)
 
 	snap.IdleX = r.IsIdle()
@@ -228,11 +226,11 @@ ex:
 	if err == nil || cmn.IsErrBucketNought(err) || cmn.IsErrObjNought(err) {
 		return
 	}
-	nlog.Errorf("%s: exited with err %v", j, err)
+	nlog.Errorln(j.String()+":", "exited with err:", err)
 }
 
 func (j *lruJ) jog(providers []string) (err error) {
-	nlog.Infof("%s: freeing-up %s", j, cos.ToSizeIEC(j.totalSize, 2))
+	nlog.Infoln(j.String()+":", "freeing-up", cos.ToSizeIEC(j.totalSize, 2))
 	for _, provider := range providers { // for each provider (NOTE: ordering is random)
 		var (
 			bcks []cmn.Bck
@@ -307,17 +305,17 @@ func (j *lruJ) jogBck() (size int64, err error) {
 	return
 }
 
-func (j *lruJ) visitLOM(parsedFQN fs.ParsedFQN) {
+func (j *lruJ) visitLOM(parsedFQN *fs.ParsedFQN) {
 	if !j.allowDelObj {
 		return
 	}
-	lom := cluster.AllocLOM(parsedFQN.ObjName)
+	lom := core.AllocLOM(parsedFQN.ObjName)
 	if pushed := j._visit(lom); !pushed {
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 	}
 }
 
-func (j *lruJ) _visit(lom *cluster.LOM) (pushed bool) {
+func (j *lruJ) _visit(lom *core.LOM) (pushed bool) {
 	if err := lom.InitBck(&j.bck); err != nil {
 		return
 	}
@@ -350,12 +348,12 @@ func (j *lruJ) walk(fqn string, de fs.DirEntry) error {
 	if err := j.yieldTerm(); err != nil {
 		return err
 	}
-	parsedFQN, _, err := cluster.ResolveFQN(fqn)
+	parsedFQN, _, err := core.ResolveFQN(fqn)
 	if err != nil {
 		return nil
 	}
 	if parsedFQN.ContentType == fs.ObjectType {
-		j.visitLOM(parsedFQN)
+		j.visitLOM(&parsedFQN)
 	}
 
 	return nil
@@ -371,13 +369,13 @@ func (j *lruJ) evict() (size int64, err error) {
 
 	// evict(sic!) and house-keep
 	for h.Len() > 0 && j.totalSize > 0 {
-		lom := heap.Pop(h).(*cluster.LOM)
+		lom := heap.Pop(h).(*core.LOM)
 		if !j.evictObj(lom) {
-			cluster.FreeLOM(lom)
+			core.FreeLOM(lom)
 			continue
 		}
 		objSize := lom.SizeBytes(true /*not loaded*/)
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 		bevicted += objSize
 		size += objSize
 		fevicted++
@@ -432,7 +430,7 @@ func (j *lruJ) _throttle(usedPct int64) (err error) {
 }
 
 // remove local copies that "belong" to different LRU joggers (space accounting may be temporarily not precise)
-func (j *lruJ) evictObj(lom *cluster.LOM) bool {
+func (j *lruJ) evictObj(lom *core.LOM) bool {
 	lom.Lock(true)
 	err := lom.Remove()
 	lom.Unlock(true)
@@ -440,7 +438,7 @@ func (j *lruJ) evictObj(lom *cluster.LOM) bool {
 		nlog.Errorf("%s: failed to evict %s: %v", j, lom, err)
 		return false
 	}
-	if j.ini.Config.FastV(5, cos.SmoduleSpace) {
+	if cmn.Rom.FastV(5, cos.SmoduleSpace) {
 		nlog.Infof("%s: evicted %s, size=%d", j, lom, lom.SizeBytes(true /*not loaded*/))
 	}
 	return true
@@ -502,7 +500,7 @@ func (j *lruJ) sortBsize(bcks []cmn.Bck) {
 
 func (j *lruJ) allow() (ok bool, err error) {
 	var (
-		bowner = j.ini.T.Bowner()
+		bowner = core.T.Bowner()
 		b      = meta.CloneBck(&j.bck)
 	)
 	if err = b.Init(bowner); err != nil {
@@ -519,7 +517,7 @@ func (j *lruJ) allow() (ok bool, err error) {
 func (h minHeap) Len() int           { return len(h) }
 func (h minHeap) Less(i, j int) bool { return h[i].Atime().Before(h[j].Atime()) }
 func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *minHeap) Push(x any)        { *h = append(*h, x.(*cluster.LOM)) }
+func (h *minHeap) Push(x any)        { *h = append(*h, x.(*core.LOM)) }
 func (h *minHeap) Pop() any {
 	old := *h
 	n := len(old)

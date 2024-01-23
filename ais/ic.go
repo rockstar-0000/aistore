@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -14,12 +14,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
 	jsoniter "github.com/json-iterator/go"
@@ -88,7 +87,7 @@ begin:
 			return true
 		}
 		if retry {
-			withRetry(cmn.Timeout.CplaneOperation(), func() bool {
+			withRetry(cmn.Rom.CplaneOperation(), func() bool {
 				owner, exists = ic.p.notifs.getOwner(uuid)
 				return exists
 			})
@@ -99,7 +98,7 @@ begin:
 			}
 		}
 	} else {
-		hrwOwner, err := cluster.HrwIC(&smap.Smap, uuid)
+		hrwOwner, err := smap.HrwIC(uuid)
 		if err != nil {
 			ic.p.writeErr(w, r, err, http.StatusInternalServerError)
 			return true
@@ -127,7 +126,7 @@ outer:
 		psi = smap.GetProxy(owner)
 		if psi == nil || !smap.IsIC(psi) {
 			var err error
-			if psi, err = cluster.HrwIC(&smap.Smap, uuid); err != nil {
+			if psi, err = smap.HrwIC(uuid); err != nil {
 				ic.p.writeErr(w, r, err, http.StatusInternalServerError)
 				return true
 			}
@@ -174,10 +173,11 @@ func (ic *ic) xstatusAll(w http.ResponseWriter, r *http.Request, query url.Value
 	if !msg.Bck.IsEmpty() {
 		flt.Bck = (*meta.Bck)(&msg.Bck)
 	}
-	nls := ic.p.notifs.findAll(flt)
 
-	var vec nl.StatusVec
-
+	var (
+		vec nl.StatusVec
+		nls = ic.p.notifs.findAll(flt)
+	)
 	if cos.IsParseBool(query.Get(apc.QparamForce)) {
 		// (force just-in-time)
 		// for each args-selected xaction:
@@ -236,7 +236,7 @@ func (ic *ic) xstatusOne(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	flt := nlFilter{ID: msg.ID, Kind: msg.Kind, Bck: bck, OnlyRunning: msg.OnlyRunning}
-	withRetry(cmn.Timeout.CplaneOperation(), func() bool {
+	withRetry(cmn.Rom.CplaneOperation(), func() bool {
 		nl = ic.p.notifs.find(flt)
 		return nl != nil
 	})
@@ -262,10 +262,6 @@ func (ic *ic) xstatusOne(w http.ResponseWriter, r *http.Request) {
 	status := nl.Status()
 	if err := nl.Err(); err != nil {
 		status.ErrMsg = err.Error()
-		if !nl.Aborted() {
-			ic.p.writeErrf(w, r, "%v: %v", nl, err)
-			return
-		}
 	}
 	b := cos.MustMarshal(status) // TODO: include stats, e.g., progress when ready
 	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(b)))
@@ -314,7 +310,7 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !smap.IsIC(ic.p.si) {
-		if !withRetry(cmn.Timeout.CplaneOperation(), func() bool {
+		if !withRetry(cmn.Rom.CplaneOperation(), func() bool {
 			smap = ic.p.owner.smap.get()
 			return smap.IsIC(ic.p.si)
 		}) {
@@ -351,7 +347,7 @@ func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		debug.Assert(len(regMsg.Srcs) != 0)
-		withRetry(cmn.Timeout.CplaneOperation(), func() bool {
+		withRetry(cmn.Rom.CplaneOperation(), func() bool {
 			smap = ic.p.owner.smap.get()
 			tmap, err = smap.NewTmap(regMsg.Srcs)
 			return err == nil && callerSver == smap.vstr
@@ -393,7 +389,7 @@ func (ic *ic) bcastListenIC(nl nl.Listener) {
 
 func (ic *ic) sendOwnershipTbl(si *meta.Snode, smap *smapX) error {
 	if ic.p.notifs.size() == 0 {
-		if cmn.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 			nlog.Infof("%s: notifs empty, not sending to %s", ic.p, si)
 		}
 		return nil
@@ -403,7 +399,7 @@ func (ic *ic) sendOwnershipTbl(si *meta.Snode, smap *smapX) error {
 	{
 		cargs.si = si
 		cargs.req = cmn.HreqArgs{Method: http.MethodPost, Path: apc.URLPathIC.S, Body: cos.MustMarshal(msg)}
-		cargs.timeout = cmn.Timeout.CplaneOperation()
+		cargs.timeout = cmn.Rom.CplaneOperation()
 	}
 	res := ic.p.call(cargs, smap)
 	freeCargs(cargs)
@@ -421,7 +417,7 @@ func (ic *ic) syncICBundle() error {
 		}
 	}
 
-	if si.Equals(ic.p.si) {
+	if si.Eq(ic.p.si) {
 		return nil
 	}
 	cargs := allocCargs()
@@ -432,7 +428,7 @@ func (ic *ic) syncICBundle() error {
 			Path:   apc.URLPathIC.S,
 			Query:  url.Values{apc.QparamWhat: []string{apc.WhatICBundle}},
 		}
-		cargs.timeout = cmn.Timeout.CplaneOperation()
+		cargs.timeout = cmn.Rom.CplaneOperation()
 		cargs.cresv = cresIC{} // -> icBundle
 	}
 	res := ic.p.call(cargs, smap)

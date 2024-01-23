@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
@@ -72,8 +72,8 @@ func (p *putFactory) Start() error {
 	return nil
 }
 
-func (*putFactory) Kind() string        { return apc.ActECPut }
-func (p *putFactory) Get() cluster.Xact { return p.xctn }
+func (*putFactory) Kind() string     { return apc.ActECPut }
+func (p *putFactory) Get() core.Xact { return p.xctn }
 
 func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	debug.Assertf(false, "%s vs %s", p.Str(p.Kind()), xprev) // xreg.usePrev() must've returned true
@@ -84,30 +84,28 @@ func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 // XactPut //
 /////////////
 
-func NewPutXact(t cluster.Target, bck *cmn.Bck, mgr *Manager) *XactPut {
+func newPutXact(bck *cmn.Bck, mgr *Manager) *XactPut {
 	var (
-		availablePaths, disabledPaths = fs.Get()
-		totalPaths                    = len(availablePaths) + len(disabledPaths)
-		smap, si                      = t.Sowner(), t.Snode()
-		config                        = cmn.GCO.Get()
+		avail, disabled = fs.Get()
+		totalPaths      = len(avail) + len(disabled)
+		config          = cmn.GCO.Get()
+		xctn            = &XactPut{
+			putJoggers: make(map[string]*putJogger, totalPaths),
+		}
 	)
-	runner := &XactPut{
-		putJoggers:  make(map[string]*putJogger, totalPaths),
-		xactECBase:  newXactECBase(t, smap, si, config, bck, mgr),
-		xactReqBase: newXactReqECBase(),
-	}
+	xctn.xactECBase.init(config, bck, mgr)
+	xctn.xactReqBase.init()
 
 	// create all runners but do not start them until Run is called
-	for mpath := range availablePaths {
-		putJog := runner.newPutJogger(mpath)
-		runner.putJoggers[mpath] = putJog
+	for mpath := range avail {
+		putJog := xctn.newPutJogger(mpath)
+		xctn.putJoggers[mpath] = putJog
 	}
-	for mpath := range disabledPaths {
-		putJog := runner.newPutJogger(mpath)
-		runner.putJoggers[mpath] = putJog
+	for mpath := range disabled {
+		putJog := xctn.newPutJogger(mpath)
+		xctn.putJoggers[mpath] = putJog
 	}
-
-	return runner
+	return xctn
 }
 
 func (r *XactPut) newPutJogger(mpath string) *putJogger {
@@ -121,7 +119,7 @@ func (r *XactPut) newPutJogger(mpath string) *putJogger {
 	return j
 }
 
-func (r *XactPut) dispatchRequest(req *request, lom *cluster.LOM) error {
+func (r *XactPut) dispatchRequest(req *request, lom *core.LOM) error {
 	debug.Assert(req.Action == ActDelete || req.Action == ActSplit, req.Action)
 	debug.Assert(req.ErrCh == nil, "ec-put does not support ErrCh")
 	if !r.ecRequestsEnabled() {
@@ -140,7 +138,7 @@ func (r *XactPut) dispatchRequest(req *request, lom *cluster.LOM) error {
 	if !ok {
 		debug.Assert(false, "invalid "+lom.Mountpath().String())
 	}
-	if r.config.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("ECPUT (bg queue = %d): dispatching object %s....", len(jogger.putCh), lom)
 	}
 	if req.rebuild {
@@ -174,7 +172,7 @@ func (r *XactPut) mainLoop(ticker *time.Ticker) {
 	for {
 		select {
 		case <-ticker.C:
-			if r.config.FastV(4, cos.SmoduleEC) {
+			if cmn.Rom.FastV(4, cos.SmoduleEC) {
 				if s := fmt.Sprintf("%v", r.Snap()); s != "" {
 					nlog.Infoln(s)
 				}
@@ -213,9 +211,9 @@ func (r *XactPut) stop() {
 }
 
 // Encode schedules FQN for erasure coding process
-func (r *XactPut) encode(req *request, lom *cluster.LOM) {
-	req.putTime = time.Now()
-	req.tm = time.Now()
+func (r *XactPut) encode(req *request, lom *core.LOM) {
+	now := time.Now()
+	req.putTime, req.tm = now, now
 	if err := r.dispatchRequest(req, lom); err != nil {
 		nlog.Errorf("Failed to encode %s: %v", lom, err)
 		freeReq(req)
@@ -223,9 +221,9 @@ func (r *XactPut) encode(req *request, lom *cluster.LOM) {
 }
 
 // Cleanup deletes all object slices or copies after the main object is removed
-func (r *XactPut) cleanup(req *request, lom *cluster.LOM) {
-	req.putTime = time.Now()
-	req.tm = time.Now()
+func (r *XactPut) cleanup(req *request, lom *core.LOM) {
+	now := time.Now()
+	req.putTime, req.tm = now, now
 
 	if err := r.dispatchRequest(req, lom); err != nil {
 		nlog.Errorf("Failed to cleanup %s: %v", lom, err)
@@ -233,7 +231,7 @@ func (r *XactPut) cleanup(req *request, lom *cluster.LOM) {
 	}
 }
 
-func (r *XactPut) Snap() (snap *cluster.Snap) {
+func (r *XactPut) Snap() (snap *core.Snap) {
 	snap = r.baseSnap()
 	st := r.stats.stats()
 	snap.Ext = &ExtECPutStats{

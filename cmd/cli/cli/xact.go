@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains util functions and types.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -14,19 +14,18 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
 )
 
 const (
-	fmtXactFailed      = "Failed to %s (%q => %q)\n"
-	fmtXactSucceeded   = "Done.\n"
-	fmtXactWaitStarted = "%s %s => %s ...\n"
+	fmtXactFailed    = "Failed to %s (%q => %q)\n"
+	fmtXactSucceeded = "Done.\n"
 )
 
 func toMonitorMsg(c *cli.Context, xjid, suffix string) (out string) {
@@ -61,8 +60,8 @@ func toShowMsg(c *cli.Context, xjid, prompt string, verbose bool) string {
 
 // Wait for the caller's started xaction to run until finished _or_ idle (NOTE),
 // warn if aborted
-func waitXact(apiBP api.BaseParams, args xact.ArgsMsg) error {
-	debug.Assert(xact.IsValidUUID(args.ID))
+func waitXact(apiBP api.BaseParams, args *xact.ArgsMsg) error {
+	debug.Assert(args.ID == "" || xact.IsValidUUID(args.ID))
 	kind, xname := xact.GetKindName(args.Kind)
 	debug.Assert(kind != "") // relying on it to decide between APIs
 	if xact.IdlesBeforeFinishing(kind) {
@@ -81,15 +80,15 @@ func waitXact(apiBP api.BaseParams, args xact.ArgsMsg) error {
 
 func getKindNameForID(xid string, otherKind ...string) (kind, xname string, rerr error) {
 	xargs := xact.ArgsMsg{ID: xid}
-	status, err := api.GetOneXactionStatus(apiBP, xargs) // via IC
+	status, err := api.GetOneXactionStatus(apiBP, &xargs) // via IC
 	if err == nil {
 		kind, xname = xact.GetKindName(status.Kind)
 		return
 	}
 	if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
 		// 2nd attempt assuming xaction in question `IdlesBeforeFinishing`
-		time.Sleep(time.Second)
-		xs, err := queryXactions(xargs)
+		briefPause(1)
+		xs, err := queryXactions(&xargs)
 		if err != nil {
 			rerr = err
 			return
@@ -111,7 +110,7 @@ func getKindNameForID(xid string, otherKind ...string) (kind, xname string, rerr
 	return
 }
 
-func flattenXactStats(snap *cluster.Snap, units string) nvpairList {
+func flattenXactStats(snap *core.Snap, units string) nvpairList {
 	props := make(nvpairList, 0, 16)
 	if snap == nil {
 		return props
@@ -133,27 +132,27 @@ func flattenXactStats(snap *cluster.Snap, units string) nvpairList {
 		nvpair{Name: ".bck", Value: snap.Bck.String()},
 		nvpair{Name: ".start", Value: fmtTime(snap.StartTime)},
 		nvpair{Name: ".end", Value: fmtTime(snap.EndTime)},
-		nvpair{Name: ".aborted", Value: fmt.Sprintf("%t", snap.AbortedX)},
+		nvpair{Name: ".aborted", Value: strconv.FormatBool(snap.AbortedX)},
 		nvpair{Name: ".state", Value: teb.FmtXactStatus(snap)},
 	)
 	if snap.Stats.Objs != 0 || snap.Stats.Bytes != 0 {
 		printtedVal := teb.FmtSize(snap.Stats.Bytes, units, 2)
 		props = append(props,
-			nvpair{Name: "loc.obj.n", Value: fmt.Sprintf("%d", snap.Stats.Objs)},
+			nvpair{Name: "loc.obj.n", Value: strconv.FormatInt(snap.Stats.Objs, 10)},
 			nvpair{Name: "loc.obj.size", Value: printtedVal},
 		)
 	}
 	if snap.Stats.InObjs != 0 || snap.Stats.InBytes != 0 {
 		printtedVal := teb.FmtSize(snap.Stats.InBytes, units, 2)
 		props = append(props,
-			nvpair{Name: "in.obj.n", Value: fmt.Sprintf("%d", snap.Stats.InObjs)},
+			nvpair{Name: "in.obj.n", Value: strconv.FormatInt(snap.Stats.InObjs, 10)},
 			nvpair{Name: "in.obj.size", Value: printtedVal},
 		)
 	}
 	if snap.Stats.Objs != 0 || snap.Stats.Bytes != 0 {
 		printtedVal := teb.FmtSize(snap.Stats.OutBytes, units, 2)
 		props = append(props,
-			nvpair{Name: "out.obj.n", Value: fmt.Sprintf("%d", snap.Stats.OutObjs)},
+			nvpair{Name: "out.obj.n", Value: strconv.FormatInt(snap.Stats.OutObjs, 10)},
 			nvpair{Name: "out.obj.size", Value: printtedVal},
 		)
 	}
@@ -185,7 +184,7 @@ func flattenXactStats(snap *cluster.Snap, units string) nvpairList {
 	return props
 }
 
-func getXactSnap(xargs xact.ArgsMsg) (*cluster.Snap, error) {
+func getXactSnap(xargs *xact.ArgsMsg) (*core.Snap, error) {
 	xs, err := api.QueryXactionSnaps(apiBP, xargs)
 	if err != nil {
 		return nil, V(err)
@@ -198,7 +197,7 @@ func getXactSnap(xargs xact.ArgsMsg) (*cluster.Snap, error) {
 	return nil, nil
 }
 
-func queryXactions(xargs xact.ArgsMsg) (xs xact.MultiSnap, err error) {
+func queryXactions(xargs *xact.ArgsMsg) (xs xact.MultiSnap, err error) {
 	orig := apiBP.Client.Timeout
 	if !xargs.OnlyRunning {
 		apiBP.Client.Timeout = min(orig, longClientTimeout)

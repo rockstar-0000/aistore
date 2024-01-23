@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -19,7 +19,7 @@ import (
 // LOM custom metadata stored under `lomCustomMD`.
 const (
 	// source of the cold-GET and download; the values include all
-	// 3rd party backend providers (remote AIS not including)
+	// 3rd party backend providers
 	SourceObjMD = "source"
 
 	// downloader' source is "web"
@@ -93,6 +93,31 @@ func (oa *ObjAttrs) SetSize(size int64) {
 
 func CustomMD2S(md cos.StrKVs) string { return fmt.Sprintf("%+v", md) }
 
+func S2CustomMD(custom, version string) (md cos.StrKVs) {
+	if len(custom) < 8 || !strings.HasPrefix(custom, "map[") { // Sprintf above
+		return nil
+	}
+	s := custom[4 : len(custom)-1]
+	lst := strings.Split(s, " ")
+	md = make(cos.StrKVs, len(lst))
+	md[VersionObjMD] = version
+	parseCustom(md, lst, SourceObjMD)
+	parseCustom(md, lst, CRC32CObjMD)
+	parseCustom(md, lst, MD5ObjMD)
+	parseCustom(md, lst, ETag)
+	return md
+}
+
+func parseCustom(md cos.StrKVs, lst []string, key string) {
+	keyX := key + ":"
+	for _, kv := range lst {
+		if strings.HasPrefix(kv, keyX) {
+			md[key] = kv[len(keyX):]
+			return
+		}
+	}
+}
+
 func (oa *ObjAttrs) GetCustomMD() cos.StrKVs   { return oa.CustomMD }
 func (oa *ObjAttrs) SetCustomMD(md cos.StrKVs) { oa.CustomMD = md }
 
@@ -116,13 +141,13 @@ func (oa *ObjAttrs) DelCustomKeys(keys ...string) {
 }
 
 // clone OAH => ObjAttrs (see also lom.CopyAttrs)
-func (oa *ObjAttrs) CopyFrom(oah cos.OAH, skipCksum ...bool) {
+func (oa *ObjAttrs) CopyFrom(oah cos.OAH, skipCksum bool) {
 	oa.Atime = oah.AtimeUnix()
 	oa.Size = oah.SizeBytes()
 	oa.Ver = oah.Version()
-	if len(skipCksum) == 0 || !skipCksum[0] {
-		debug.Assert(oah.Checksum() != nil)
-		oa.Cksum = oah.Checksum().Clone() // TODO: checksum by value (***)
+	if !skipCksum {
+		debug.Assert(oah.Checksum() != nil, oah.String())
+		oa.Cksum = oah.Checksum().Clone() // checksum by value (***)
 	}
 	for k, v := range oah.GetCustomMD() {
 		oa.SetCustomKey(k, v)
@@ -183,6 +208,14 @@ func (oa *ObjAttrs) FromHeader(hdr http.Header) (cksum *cos.Cksum) {
 	return
 }
 
+func (oa *ObjAttrs) FromLsoEntry(e *LsoEntry) {
+	oa.Size = e.Size
+	oa.Ver = e.Version
+
+	// entry.Custom = cmn.CustomMD2S(custom)
+	_ = CustomMD2S(nil)
+}
+
 // local <=> remote equality in the context of cold-GET and download. This function
 // decides whether we need to go ahead and re-read the object from its remote location.
 //
@@ -193,79 +226,105 @@ func (oa *ObjAttrs) FromHeader(hdr http.Header) (cksum *cos.Cksum) {
 //
 // Note that mismatch in any given checksum type immediately renders inequality and return
 // from the function.
-func (oa *ObjAttrs) Equal(rem cos.OAH) (equal bool) {
+func (oa *ObjAttrs) Equal(rem cos.OAH) (eq bool) {
 	var (
-		count   int
-		sameVer bool
+		ver      string
+		md5      string
+		etag     string
+		cksumVal string
+		count    int
+		sameEtag bool
 	)
-	if oa.Size != 0 && rem.SizeBytes(true) != 0 && oa.Size != rem.SizeBytes(true) {
-		return
+	// size check
+	if remSize := rem.SizeBytes(true); oa.Size != 0 && remSize != 0 && oa.Size != remSize {
+		return false
 	}
+
 	// version check
-	var ver string
-	if oa.Ver != "" && rem.Version(true) != "" {
-		if oa.Ver != rem.Version(true) {
-			return
+	if remVer := rem.Version(true); oa.Ver != "" && remVer != "" {
+		if oa.Ver != remVer {
+			return false
 		}
-		sameVer = true
 		ver = oa.Ver
+		// NOTE: ais own version is, currently, a nonunique sequence number - not counting
+		if remSrc, _ := rem.GetCustomKey(SourceObjMD); remSrc != apc.AIS {
+			count++
+		}
 	} else if remMeta, ok := rem.GetCustomKey(VersionObjMD); ok && remMeta != "" {
 		if locMeta, ok := oa.GetCustomKey(VersionObjMD); ok && locMeta != "" {
 			if remMeta != locMeta {
-				return
+				return false
 			}
-			sameVer = true
+			count++
 			ver = locMeta
 		}
 	}
-	// AIS checksum check
-	if rem.Checksum().Equal(oa.Cksum) {
+
+	// checksum check
+	if a, b := rem.Checksum(), oa.Cksum; !a.IsEmpty() && !b.IsEmpty() && a.Ty() == b.Ty() {
+		if !a.Equal(b) {
+			return false
+		}
+		cksumVal = a.Val()
 		count++
 	}
-	// MD5 check
-	var md5 string
-	if remMeta, ok := rem.GetCustomKey(MD5ObjMD); ok && remMeta != "" {
-		if locMeta, ok := oa.GetCustomKey(MD5ObjMD); ok {
-			if remMeta != locMeta {
-				return
-			}
-			md5 = locMeta
-			count++
-		}
-	}
-	// ETag check
+
+	// custom MD: ETag check
 	if remMeta, ok := rem.GetCustomKey(ETag); ok && remMeta != "" {
-		if locMeta, ok := oa.GetCustomKey(ETag); ok {
+		if locMeta, ok := oa.GetCustomKey(ETag); ok && locMeta != "" {
 			if remMeta != locMeta {
-				return
+				return false
 			}
-			if md5 != locMeta && ver != locMeta { // against double-counting
+			etag = locMeta
+			if ver != locMeta && cksumVal != locMeta { // against double-counting
 				count++
+				sameEtag = true
 			}
 		}
 	}
-	// CRC check
+	// custom MD: CRC check
 	if remMeta, ok := rem.GetCustomKey(CRC32CObjMD); ok && remMeta != "" {
-		if locMeta, ok := oa.GetCustomKey(CRC32CObjMD); ok {
+		if locMeta, ok := oa.GetCustomKey(CRC32CObjMD); ok && locMeta != "" {
 			if remMeta != locMeta {
-				return
+				return false
 			}
-			count++
-		}
-	}
-	// NOTE: this is not good enough - need config knob (w/ default=false) to
-	//       explicitly allow the "source" to play such role.
-	if count == 1 {
-		if sameVer {
-			count++
-		}
-		// remote source check
-		if remMeta, ok := rem.GetCustomKey(SourceObjMD); ok {
-			if locMeta, ok := oa.GetCustomKey(SourceObjMD); ok && remMeta == locMeta {
+			if cksumVal != locMeta {
 				count++
 			}
 		}
 	}
-	equal = count >= 2
-	return
+
+	// custom MD: MD5 check iff count < 2
+	// (ETag ambiguity, see: https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.htm)
+	if !sameEtag {
+		if remMeta, ok := rem.GetCustomKey(MD5ObjMD); ok && remMeta != "" {
+			if locMeta, ok := oa.GetCustomKey(MD5ObjMD); ok && locMeta != "" {
+				if remMeta != locMeta {
+					return
+				}
+				md5 = locMeta
+				if etag != md5 && cksumVal != md5 {
+					count++ //  (ditto)
+				}
+			}
+		}
+	}
+
+	switch {
+	case count >= 2: // e.g., equal because they have the same (version & md5, where version != md5)
+		return true
+	case count == 0:
+		return false
+	default:
+		// same version or ETag from the same (remote) backend
+		// (arguably, must be configurable)
+		if remMeta, ok := rem.GetCustomKey(SourceObjMD); ok && remMeta != "" {
+			if locMeta, ok := oa.GetCustomKey(SourceObjMD); ok && locMeta != "" {
+				if (ver != "" || etag != "") && remMeta == locMeta {
+					return true
+				}
+			}
+		}
+	}
+	return eq
 }

@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -24,15 +24,15 @@ type (
 	syncCallback func(tsi *meta.Snode, rargs *rebArgs) (ok bool)
 
 	Status struct {
-		Targets     meta.Nodes    `json:"targets"`             // targets I'm waiting for ACKs from
-		SmapVersion int64         `json:"smap_version,string"` // current Smap version (via smapOwner)
-		RebVersion  int64         `json:"reb_version,string"`  // Smap version of *this* rebalancing op
-		RebID       int64         `json:"reb_id,string"`       // rebalance ID
-		Stats       cluster.Stats `json:"stats"`               // transmitted/received totals
-		Stage       uint32        `json:"stage"`               // the current stage - see enum above
-		Aborted     bool          `json:"aborted"`             // aborted?
-		Running     bool          `json:"running"`             // running?
-		Quiescent   bool          `json:"quiescent"`           // true when queue is empty
+		Targets     meta.Nodes `json:"targets"`             // targets I'm waiting for ACKs from
+		SmapVersion int64      `json:"smap_version,string"` // current Smap version (via smapOwner)
+		RebVersion  int64      `json:"reb_version,string"`  // Smap version of *this* rebalancing op
+		RebID       int64      `json:"reb_id,string"`       // rebalance ID
+		Stats       core.Stats `json:"stats"`               // transmitted/received totals
+		Stage       uint32     `json:"stage"`               // the current stage - see enum above
+		Aborted     bool       `json:"aborted"`             // aborted?
+		Running     bool       `json:"running"`             // running?
+		Quiescent   bool       `json:"quiescent"`           // true when queue is empty
 	}
 )
 
@@ -41,11 +41,13 @@ type (
 ////////////////////////////////////////////
 
 // main method
-func (reb *Reb) bcast(rargs *rebArgs, cb syncCallback) (errCnt int) {
-	var cnt atomic.Int32
-	wg := cos.NewLimitedWaitGroup(meta.MaxBcastParallel(), len(rargs.smap.Tmap))
+func bcast(rargs *rebArgs, cb syncCallback) (errCnt int) {
+	var (
+		cnt atomic.Int32
+		wg  = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), len(rargs.smap.Tmap))
+	)
 	for _, tsi := range rargs.smap.Tmap {
-		if tsi.ID() == reb.t.SID() {
+		if tsi.ID() == core.T.SID() {
 			continue
 		}
 		wg.Add(1)
@@ -66,12 +68,12 @@ func (reb *Reb) bcast(rargs *rebArgs, cb syncCallback) (errCnt int) {
 func (reb *Reb) pingTarget(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 	var (
 		ver    = rargs.smap.Version
-		sleep  = cmn.Timeout.CplaneOperation()
+		sleep  = cmn.Rom.CplaneOperation()
 		logHdr = reb.logHdr(rargs.id, rargs.smap)
 		tname  = tsi.StringEx()
 	)
 	for i := 0; i < 4; i++ {
-		_, code, err := reb.t.Health(tsi, cmn.Timeout.MaxKeepalive(), nil)
+		_, code, err := core.T.Health(tsi, cmn.Rom.MaxKeepalive(), nil)
 		if err == nil {
 			if i > 0 {
 				nlog.Infof("%s: %s is online", logHdr, tname)
@@ -84,7 +86,7 @@ func (reb *Reb) pingTarget(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 		}
 		nlog.Warningf("%s: waiting for %s, err %v(%d)", logHdr, tname, err, code)
 		time.Sleep(sleep)
-		nver := reb.t.Sowner().Get().Version
+		nver := core.T.Sowner().Get().Version
 		if nver > ver {
 			return
 		}
@@ -96,13 +98,11 @@ func (reb *Reb) pingTarget(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 // wait for target to get ready to receive objects (type syncCallback)
 func (reb *Reb) rxReady(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 	var (
-		sleep  = cmn.Timeout.CplaneOperation() * 2
-		maxwt  = rargs.config.Rebalance.DestRetryTime.D() + rargs.config.Rebalance.DestRetryTime.D()/2
-		curwt  time.Duration
-		logHdr = reb.logHdr(rargs.id, rargs.smap)
-		xreb   = reb.xctn()
+		curwt time.Duration
+		sleep = cmn.Rom.CplaneOperation() * 2
+		maxwt = rargs.config.Rebalance.DestRetryTime.D() + rargs.config.Rebalance.DestRetryTime.D()/2
+		xreb  = reb.xctn()
 	)
-	debug.Assertf(reb.RebID() == xreb.RebID(), "%s (rebID=%d) vs %s", logHdr, reb.RebID(), xreb)
 	for curwt < maxwt {
 		if reb.stages.isInStage(tsi, rebStageTraverse) {
 			// do not request the node stage if it has sent stage notification
@@ -112,12 +112,12 @@ func (reb *Reb) rxReady(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 			return
 		}
 		if err := xreb.AbortedAfter(sleep); err != nil {
-			nlog.Infof("%s: abort rx-ready (%v)", logHdr, err)
 			return
 		}
 		curwt += sleep
 	}
-	nlog.Errorf("%s: timed out waiting for %s to reach %s state", logHdr, tsi.StringEx(), stages[rebStageTraverse])
+	logHdr, tname := reb.logHdr(rargs.id, rargs.smap), tsi.StringEx()
+	nlog.Errorf("%s: timed out waiting for %s to reach %s state", logHdr, tname, stages[rebStageTraverse])
 	return
 }
 
@@ -157,7 +157,7 @@ func (reb *Reb) waitFinExtended(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 		//
 		var w4me bool // true: this target is waiting for ACKs from me
 		for _, si := range status.Targets {
-			if si.ID() == reb.t.SID() {
+			if si.ID() == core.T.SID() {
 				nlog.Infof("%s: keep wack <= %s[%s]", logHdr, tsi.StringEx(), stages[status.Stage])
 				w4me = true
 				break
@@ -191,13 +191,13 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 		return
 	}
 	debug.Assertf(reb.RebID() == xreb.RebID(), "%s (rebID=%d) vs %s", logHdr, reb.RebID(), xreb)
-	body, code, err := reb.t.Health(tsi, apc.DefaultTimeout, query)
+	body, code, err := core.T.Health(tsi, apc.DefaultTimeout, query)
 	if err != nil {
 		if errAborted := xreb.AbortedAfter(sleepRetry); errAborted != nil {
-			nlog.Infof("%s: abort check status (%v)", logHdr, errAborted)
+			nlog.Infoln(logHdr, "abort check status", errAborted)
 			return
 		}
-		body, code, err = reb.t.Health(tsi, apc.DefaultTimeout, query) // retry once
+		body, code, err = core.T.Health(tsi, apc.DefaultTimeout, query) // retry once
 	}
 	if err != nil {
 		ctx := fmt.Sprintf("health(%s) failure: %v(%d)", tname, err, code)
@@ -205,6 +205,7 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 		reb.abortAndBroadcast(err)
 		return
 	}
+
 	status = &Status{}
 	err = jsoniter.Unmarshal(body, status)
 	if err != nil {
@@ -214,8 +215,7 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 	}
 	// enforce global transaction ID
 	if status.RebID > reb.rebID.Load() {
-		err := fmt.Errorf("%s runs newer g%d", tname, status.RebID)
-		err = cmn.NewErrAborted(xreb.Name(), "", err)
+		err := cmn.NewErrAborted(xreb.Name(), logHdr, fmt.Errorf("%s runs newer g%d", tname, status.RebID))
 		reb.abortAndBroadcast(err)
 		return
 	}
@@ -230,11 +230,8 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 	// Remote target has aborted its running rebalance with the same ID.
 	// Do not call `reb.abortAndBroadcast()` - no need.
 	if status.RebID == reb.RebID() && status.Aborted {
-		err := fmt.Errorf("status 'aborted' from %s", tname)
-		err = cmn.NewErrAborted(xreb.Name(), "", err)
-		if xreb.Abort(err) {
-			nlog.Warningf("%s: %v", logHdr, err)
-		}
+		err := cmn.NewErrAborted(xreb.Name(), logHdr, fmt.Errorf("status 'aborted' from %s", tname))
+		xreb.Abort(err)
 		return
 	}
 	if status.Stage >= desiredStage {

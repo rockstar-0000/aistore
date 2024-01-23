@@ -75,19 +75,19 @@ func BenchmarkECEncode(b *testing.B) {
 			fillBucket(b, proxyURL, bck, uint64(size), objCount)
 
 			b.Run(test.name, func(b *testing.B) {
-				bckProps := &cmn.BucketPropsToUpdate{
-					EC: &cmn.ECConfToUpdate{
-						Enabled:      api.Bool(true),
-						ObjSizeLimit: api.Int64(ecObjLimit),
-						DataSlices:   api.Int(test.data),
-						ParitySlices: api.Int(test.parity),
+				bckProps := &cmn.BpropsToSet{
+					EC: &cmn.ECConfToSet{
+						Enabled:      apc.Bool(true),
+						ObjSizeLimit: apc.Int64(ecObjLimit),
+						DataSlices:   apc.Int(test.data),
+						ParitySlices: apc.Int(test.parity),
 					},
 				}
 				_, err := api.SetBucketProps(baseParams, bck, bckProps)
 				tassert.CheckFatal(b, err)
 
 				reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck, Timeout: ecTime}
-				_, err = api.WaitForXactionIC(baseParams, reqArgs)
+				_, err = api.WaitForXactionIC(baseParams, &reqArgs)
 				tassert.CheckFatal(b, err)
 			})
 		}
@@ -126,19 +126,19 @@ func BenchmarkECRebalance(b *testing.B) {
 			fillBucket(b, proxyURL, bck, uint64(size), objCount)
 
 			b.Run("rebalance", func(b *testing.B) {
-				bckProps := &cmn.BucketPropsToUpdate{
-					EC: &cmn.ECConfToUpdate{
-						Enabled:      api.Bool(true),
-						ObjSizeLimit: api.Int64(ecObjLimit),
-						DataSlices:   api.Int(test.data),
-						ParitySlices: api.Int(test.parity),
+				bckProps := &cmn.BpropsToSet{
+					EC: &cmn.ECConfToSet{
+						Enabled:      apc.Bool(true),
+						ObjSizeLimit: apc.Int64(ecObjLimit),
+						DataSlices:   apc.Int(test.data),
+						ParitySlices: apc.Int(test.parity),
 					},
 				}
 				_, err := api.SetBucketProps(baseParams, bck, bckProps)
 				tassert.CheckFatal(b, err)
 
 				reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck, Timeout: ecTime}
-				_, err = api.WaitForXactionIC(baseParams, reqArgs)
+				_, err = api.WaitForXactionIC(baseParams, &reqArgs)
 				tassert.CheckFatal(b, err)
 
 				args := &apc.ActValRmNode{DaemonID: tgtLost.ID()}

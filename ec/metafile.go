@@ -9,9 +9,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/OneOfOne/xxhash"
 )
@@ -74,14 +74,14 @@ func MetaFromReader(reader io.Reader) (*Metadata, error) {
 
 // RemoteTargets returns list of Snodes that contain a slice or replica.
 // This target(`t`) is removed from the list.
-func (md *Metadata) RemoteTargets(t cluster.Target) []*meta.Snode {
+func (md *Metadata) RemoteTargets() []*meta.Snode {
 	if len(md.Daemons) == 0 {
 		return nil
 	}
 	nodes := make([]*meta.Snode, 0, len(md.Daemons))
-	smap := t.Sowner().Get()
+	smap := core.T.Sowner().Get()
 	for tid := range md.Daemons {
-		if tid == t.SID() {
+		if tid == core.T.SID() {
 			continue
 		}
 		tsi := smap.GetTarget(tid)
@@ -92,9 +92,7 @@ func (md *Metadata) RemoteTargets(t cluster.Target) []*meta.Snode {
 	return nodes
 }
 
-// Do not use MM.SGL for a byte buffer: as the buffer is sent via
-// HTTP, it can result in hard to debug errors when SGL is freed.
-// For details:  https://gitlab-master.nvidia.com/aistorage/aistore/issues/472#note_4212419
+// TODO: use 'buf, slab = smm.Alloc()'
 func (md *Metadata) NewPack() []byte {
 	var (
 		buf []byte
@@ -113,7 +111,7 @@ func (md *Metadata) Clone() *Metadata {
 
 // ObjectMetadata returns metadata for an object or its slice if any exists
 func ObjectMetadata(bck *meta.Bck, objName string) (*Metadata, error) {
-	fqn, _, err := cluster.HrwFQN(bck.Bucket(), fs.ECMetaType, objName)
+	fqn, _, err := core.HrwFQN(bck.Bucket(), fs.ECMetaType, objName)
 	if err != nil {
 		return nil, err
 	}

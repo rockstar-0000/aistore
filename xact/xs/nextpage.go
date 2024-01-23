@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -9,10 +9,10 @@ package xs
 
 import (
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 )
 
@@ -23,15 +23,14 @@ type npgCtx struct {
 	idx  int
 }
 
-func newNpgCtx(t cluster.Target, bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb) (npg *npgCtx) {
+func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb) (npg *npgCtx) {
 	npg = &npgCtx{
 		bck: bck,
 		wi: walkInfo{
-			t:            t,
 			msg:          msg.Clone(),
 			lomVisitedCb: cb,
 			wanted:       wanted(msg),
-			smap:         t.Sowner().Get(),
+			smap:         core.T.Sowner().Get(),
 		},
 	}
 	return
@@ -66,7 +65,7 @@ func (npg *npgCtx) cb(fqn string, de fs.DirEntry) error {
 		return nil
 	}
 	if err != nil {
-		return cmn.NewErrAborted(npg.wi.t.String()+" ResultSetXact", "query", err)
+		return cmn.NewErrAborted(core.T.String()+" ResultSetXact", "query", err)
 	}
 	if npg.idx < len(npg.page.Entries) {
 		*npg.page.Entries[npg.idx] = *entry
@@ -79,50 +78,53 @@ func (npg *npgCtx) cb(fqn string, de fs.DirEntry) error {
 }
 
 // Returns the next page from the remote bucket's "list-objects" result set.
-func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries) (*cmn.LsoResult, error) {
+func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries, inclStatusLocalMD bool) (*cmn.LsoResult, error) {
 	debug.Assert(!npg.wi.msg.IsFlagSet(apc.LsObjCached))
 	lst := &cmn.LsoResult{Entries: nentries}
-	_, err := npg.wi.t.Backend(npg.bck).ListObjects(npg.bck, npg.wi.msg, lst)
+	_, err := core.T.Backend(npg.bck).ListObjects(npg.bck, npg.wi.msg, lst)
 	if err != nil {
 		freeLsoEntries(nentries)
 		return nil, err
 	}
 	debug.Assert(lst.UUID == "" || lst.UUID == npg.wi.msg.UUID)
 	lst.UUID = npg.wi.msg.UUID
-	err = npg.populate(lst)
+
+	if inclStatusLocalMD {
+		err = npg.populate(lst)
+	}
 	return lst, err
 }
 
 func (npg *npgCtx) populate(lst *cmn.LsoResult) error {
 	post := npg.wi.lomVisitedCb
 	for _, obj := range lst.Entries {
-		si, err := cluster.HrwTarget(npg.bck.MakeUname(obj.Name), npg.wi.smap)
+		si, err := npg.wi.smap.HrwName2T(npg.bck.MakeUname(obj.Name))
 		if err != nil {
 			return err
 		}
-		if si.ID() != npg.wi.t.SID() {
+		if si.ID() != core.T.SID() {
 			continue
 		}
-		lom := cluster.AllocLOM(obj.Name)
+		lom := core.AllocLOM(obj.Name)
 		if err := lom.InitBck(npg.bck.Bucket()); err != nil {
-			cluster.FreeLOM(lom)
+			core.FreeLOM(lom)
 			if cmn.IsErrBucketNought(err) {
 				return err
 			}
 			continue
 		}
 		if err := lom.Load(true /* cache it*/, false /*locked*/); err != nil {
-			cluster.FreeLOM(lom)
+			core.FreeLOM(lom)
 			continue
 		}
 
-		setWanted(obj, lom, npg.wi.msg.TimeFormat, npg.wi.wanted)
+		npg.wi.setWanted(obj, lom)
 		obj.SetPresent()
 
 		if post != nil {
 			post(lom)
 		}
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 	}
 	return nil
 }

@@ -12,7 +12,6 @@ import (
 	ratomic "sync/atomic"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -20,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
@@ -237,8 +237,8 @@ func (m *rmdModifier) log(nl nl.Listener) {
 		nlog.InfoDepth(1, name, "done")
 	case abrt:
 		debug.Assert(err != nil, nl.String()+" - aborted w/ no errors")
-		nlog.ErrorDepth(1, err)
+		nlog.ErrorDepth(1, name, err)
 	default:
-		nlog.ErrorDepth(1, name, "failed: ", err)
+		nlog.ErrorDepth(1, name, "failed:", err)
 	}
 }

@@ -1,6 +1,6 @@
-// Package api provides AIStore API over HTTP(S)
+// Package api provides Go based AIStore API/SDK over HTTP(S)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -20,7 +20,7 @@ import (
 // (not necessarily distinct)
 // For supported archiving formats, see `archive.FileExtensions`.
 // See also: api.PutApndArch
-func ArchiveMultiObj(bp BaseParams, bckFrom cmn.Bck, msg cmn.ArchiveBckMsg) (string, error) {
+func ArchiveMultiObj(bp BaseParams, bckFrom cmn.Bck, msg *cmn.ArchiveBckMsg) (string, error) {
 	bp.Method = http.MethodPut
 	q := bckFrom.NewQuery()
 	return dolr(bp, bckFrom, apc.ActArchive, msg, q)
@@ -29,7 +29,7 @@ func ArchiveMultiObj(bp BaseParams, bckFrom cmn.Bck, msg cmn.ArchiveBckMsg) (str
 // `fltPresence` applies exclusively to remote `bckFrom` (is ignored if the source is ais://)
 // and is one of: { apc.FltExists, apc.FltPresent, ... } - for complete enum, see api/apc/query.go
 
-func CopyMultiObj(bp BaseParams, bckFrom cmn.Bck, msg cmn.TCObjsMsg, fltPresence ...int) (xid string, err error) {
+func CopyMultiObj(bp BaseParams, bckFrom cmn.Bck, msg *cmn.TCObjsMsg, fltPresence ...int) (xid string, err error) {
 	bp.Method = http.MethodPost
 	q := bckFrom.NewQuery()
 	if len(fltPresence) > 0 {
@@ -38,7 +38,7 @@ func CopyMultiObj(bp BaseParams, bckFrom cmn.Bck, msg cmn.TCObjsMsg, fltPresence
 	return dolr(bp, bckFrom, apc.ActCopyObjects, msg, q)
 }
 
-func ETLMultiObj(bp BaseParams, bckFrom cmn.Bck, msg cmn.TCObjsMsg, fltPresence ...int) (xid string, err error) {
+func ETLMultiObj(bp BaseParams, bckFrom cmn.Bck, msg *cmn.TCObjsMsg, fltPresence ...int) (xid string, err error) {
 	bp.Method = http.MethodPost
 	q := bckFrom.NewQuery()
 	if len(fltPresence) > 0 {
@@ -47,51 +47,23 @@ func ETLMultiObj(bp BaseParams, bckFrom cmn.Bck, msg cmn.TCObjsMsg, fltPresence 
 	return dolr(bp, bckFrom, apc.ActETLObjects, msg, q)
 }
 
-// DeleteList sends request to remove a list of objects from a bucket.
-func DeleteList(bp BaseParams, bck cmn.Bck, filesList []string) (string, error) {
+func DeleteMultiObj(bp BaseParams, bck cmn.Bck, objNames []string, template string) (string, error) {
 	bp.Method = http.MethodDelete
 	q := bck.NewQuery()
-	msg := apc.ListRange{ObjNames: filesList}
+	msg := apc.ListRange{ObjNames: objNames, Template: template}
 	return dolr(bp, bck, apc.ActDeleteObjects, msg, q)
 }
 
-// DeleteRange sends request to remove a range of objects from a bucket.
-func DeleteRange(bp BaseParams, bck cmn.Bck, rng string) (string, error) {
+func EvictMultiObj(bp BaseParams, bck cmn.Bck, objNames []string, template string) (string, error) {
 	bp.Method = http.MethodDelete
 	q := bck.NewQuery()
-	msg := apc.ListRange{Template: rng}
-	return dolr(bp, bck, apc.ActDeleteObjects, msg, q)
-}
-
-// EvictList sends request to evict a list of objects from a remote bucket.
-func EvictList(bp BaseParams, bck cmn.Bck, fileslist []string) (string, error) {
-	bp.Method = http.MethodDelete
-	q := bck.NewQuery()
-	msg := apc.ListRange{ObjNames: fileslist}
+	msg := apc.ListRange{ObjNames: objNames, Template: template}
 	return dolr(bp, bck, apc.ActEvictObjects, msg, q)
 }
 
-// EvictRange sends request to evict a range of objects from a remote bucket.
-func EvictRange(bp BaseParams, bck cmn.Bck, rng string) (string, error) {
-	bp.Method = http.MethodDelete
-	q := bck.NewQuery()
-	msg := apc.ListRange{Template: rng}
-	return dolr(bp, bck, apc.ActEvictObjects, msg, q)
-}
-
-// PrefetchList sends request to prefetch a list of objects from a remote bucket.
-func PrefetchList(bp BaseParams, bck cmn.Bck, fileslist []string) (string, error) {
+func Prefetch(bp BaseParams, bck cmn.Bck, msg apc.PrefetchMsg) (string, error) {
 	bp.Method = http.MethodPost
 	q := bck.NewQuery()
-	msg := apc.ListRange{ObjNames: fileslist}
-	return dolr(bp, bck, apc.ActPrefetchObjects, msg, q)
-}
-
-// PrefetchRange sends request to prefetch a range of objects from a remote bucket.
-func PrefetchRange(bp BaseParams, bck cmn.Bck, rng string) (string, error) {
-	bp.Method = http.MethodPost
-	q := bck.NewQuery()
-	msg := apc.ListRange{Template: rng}
 	return dolr(bp, bck, apc.ActPrefetchObjects, msg, q)
 }
 

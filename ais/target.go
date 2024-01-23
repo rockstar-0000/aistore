@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -21,8 +21,6 @@ import (
 	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
@@ -31,7 +29,10 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/kvdb"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/ext/dsort"
@@ -58,7 +59,7 @@ type (
 		disabled atomic.Bool // true: standing by
 		prevbmd  atomic.Bool // special
 	}
-	backends map[string]cluster.BackendProvider
+	backends map[string]core.BackendProvider
 	// main
 	target struct {
 		htrun
@@ -94,17 +95,12 @@ func (*target) interruptedRestarted() (interrupted, restarted bool) {
 	return
 }
 
-func sparseVerbStats(tm int64) bool  { return tm&7 == 1 }
-func sparseRedirStats(tm int64) bool { return tm&3 == 2 }
-
 //
 // target
 //
 
 func (t *target) initBackends() {
 	config := cmn.GCO.Get()
-	backend.Init(config)
-
 	aisBackend := backend.NewAIS(t)
 	t.backend[apc.AIS] = aisBackend                  // always present
 	t.backend[apc.HTTP] = backend.NewHTTP(t, config) // ditto
@@ -132,7 +128,7 @@ func (t *target) _initBuiltin() error {
 	)
 	for provider := range apc.Providers {
 		var (
-			add cluster.BackendProvider
+			add core.BackendProvider
 			err error
 		)
 		switch provider {
@@ -163,7 +159,7 @@ func (t *target) _initBuiltin() error {
 	}
 	switch {
 	case len(notlinked) > 0:
-		nlog.Errorf("%s backends: enabled %v, disabled %v, missing in the build %v", t, enabled, disabled, notlinked)
+		return fmt.Errorf("%s backends: enabled %v, disabled %v, missing in the build %v", t, enabled, disabled, notlinked)
 	case len(disabled) > 0:
 		nlog.Warningf("%s backends: enabled %v, disabled %v", t, enabled, disabled)
 	default:
@@ -178,7 +174,7 @@ func (t *target) aisBackend() *backend.AISBackendProvider {
 }
 
 func (t *target) init(config *cmn.Config) {
-	t.initNetworks()
+	t.initSnode(config)
 
 	// (a) get node ID from command-line or env var (see envDaemonID())
 	// (b) load existing node ID (replicated xattr at roots of respective mountpaths)
@@ -195,10 +191,12 @@ func (t *target) init(config *cmn.Config) {
 
 	memsys.Init(t.SID(), t.SID(), config)
 
+	// new fs, check and add mountpaths
 	newVol := volume.Init(t, config, daemon.cli.target.allowSharedDisksAndNoDisks,
 		daemon.cli.target.useLoopbackDevs, daemon.cli.target.startWithLostMountpath)
+	fs.ComputeDiskSize()
 
-	t.initHostIP()
+	t.initHostIP(config)
 	daemon.rg.add(t)
 
 	ts := stats.NewTrunner(t) // iostat below
@@ -219,7 +217,7 @@ func (t *target) init(config *cmn.Config) {
 	daemon.rg.add(fshc)
 	t.fshc = fshc
 
-	if err := ts.InitCDF(); err != nil { // goes after fs.New
+	if err := ts.InitCDF(); err != nil {
 		cos.ExitLog(err)
 	}
 	fs.Clblk()
@@ -227,17 +225,17 @@ func (t *target) init(config *cmn.Config) {
 	s3.Init() // s3 multipart
 }
 
-func (t *target) initHostIP() {
-	var hostIP string
-	if hostIP = os.Getenv("AIS_HOST_IP"); hostIP == "" {
+func (t *target) initHostIP(config *cmn.Config) {
+	hostIP := os.Getenv("AIS_HOST_IP")
+	if hostIP == "" {
 		return
 	}
-	var (
-		config  = cmn.GCO.Get()
-		port    = config.HostNet.Port
-		extAddr = net.ParseIP(hostIP)
-		extPort = port
-	)
+	extAddr := net.ParseIP(hostIP)
+	if extAddr == nil {
+		cos.AssertMsg(false, "invalid IP addr via 'AIS_HOST_IP' env: "+hostIP)
+	}
+
+	extPort := config.HostNet.Port
 	if portStr := os.Getenv("AIS_HOST_PORT"); portStr != "" {
 		portNum, err := cmn.ParsePort(portStr)
 		cos.AssertNoErr(err)
@@ -246,6 +244,7 @@ func (t *target) initHostIP() {
 	t.si.PubNet.Hostname = extAddr.String()
 	t.si.PubNet.Port = strconv.Itoa(extPort)
 	t.si.PubNet.URL = fmt.Sprintf("%s://%s:%d", config.Net.HTTP.Proto, extAddr.String(), extPort)
+
 	nlog.Infof("AIS_HOST_IP=%s; PubNetwork=%s", hostIP, t.si.URL(cmn.NetPublic))
 
 	// applies to intra-cluster networks unless separately defined
@@ -296,11 +295,11 @@ func (t *target) Run() error {
 	config := cmn.GCO.Get()
 	t.htrun.init(config)
 
-	cluster.Init(t)
-	cluster.RegLomCacheWithHK(t)
+	tstats := t.statsT.(*stats.Trunner)
+
+	core.Tinit(t, tstats, true /*run hk*/)
 
 	// metrics, disks first
-	tstats := t.statsT.(*stats.Trunner)
 	availablePaths, disabledPaths := fs.Get()
 	if len(availablePaths) == 0 {
 		cos.ExitLog(cmn.ErrNoMountpaths)
@@ -363,20 +362,15 @@ func (t *target) Run() error {
 		return err
 	}
 
-	dload.SetDB(db)
-
-	archive.Init(config.Features)
-
-	// transactions
 	t.transactions.init(t)
 
-	t.reb = reb.New(t, config)
-	t.res = res.New(t)
+	t.reb = reb.New(config)
+	t.res = res.New()
 
 	// register storage target's handler(s) and start listening
 	t.initRecvHandlers()
 
-	ec.Init(t)
+	ec.Init()
 	mirror.Init()
 
 	xreg.RegWithHK()
@@ -386,11 +380,12 @@ func (t *target) Run() error {
 		go t.goreslver(marked.Interrupted)
 	}
 
-	dsort.Tinit(t, t.statsT, db)
+	dsort.Tinit(t.statsT, db, config)
+	dload.Init(t.statsT, db, &config.Client)
 
 	err = t.htrun.run(config)
 
-	etl.StopAll(t)                             // stop all running ETLs if any
+	etl.StopAll()                              // stop all running ETLs if any
 	cos.Close(db)                              // close kv db
 	fs.RemoveMarker(fname.NodeRestartedMarker) // exit gracefully
 	return err
@@ -566,7 +561,9 @@ func (t *target) errURL(w http.ResponseWriter, r *http.Request) {
 func (t *target) bucketHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		t.httpbckget(w, r)
+		dpq := dpqAlloc()
+		t.httpbckget(w, r, dpq)
+		dpqFree(dpq)
 	case http.MethodDelete:
 		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, false)
 		t.httpbckdelete(w, r, apireq)
@@ -598,9 +595,9 @@ func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true /*dpq*/)
 		if err := t.parseReq(w, r, apireq); err == nil {
-			lom := cluster.AllocLOM(apireq.items[1])
+			lom := core.AllocLOM(apireq.items[1])
 			t.httpobjput(w, r, apireq, lom)
-			cluster.FreeLOM(lom)
+			core.FreeLOM(lom)
 		}
 		apiReqFree(apireq)
 	case http.MethodDelete:
@@ -648,26 +645,24 @@ func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiR
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	if err := apireq.dpq.fromRawQ(r.URL.RawQuery); err != nil {
+	if err := apireq.dpq.parse(r.URL.RawQuery); err != nil {
 		debug.AssertNoErr(err)
 		t.writeErr(w, r, err)
 		return
 	}
-	if cmn.Features.IsSet(feat.EnforceIntraClusterAccess) {
+	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
 		if apireq.dpq.ptime == "" /*isRedirect*/ && t.isIntraCall(r.Header, false /*from primary*/) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
 		}
 	}
-	lom := cluster.AllocLOM(apireq.items[1])
+	lom := core.AllocLOM(apireq.items[1])
 	lom = t.getObject(w, r, apireq.dpq, apireq.bck, lom)
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 }
 
-// getObject is main function to get the object. It doesn't check request origin,
-// so it must be done by the caller (if necessary).
-func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck *meta.Bck, lom *cluster.LOM) *cluster.LOM {
+func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck *meta.Bck, lom *core.LOM) *core.LOM {
 	if err := lom.InitBck(bck.Bucket()); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
@@ -679,7 +674,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		}
 	}
 
-	debug.Assert(dpq.uuid == "", dpq.uuid)
+	debug.Assert(dpq.uuid == "", dpq.uuid+" vs "+dpq.etlName) // expecting etlName or none of the above
 	if dpq.etlName != "" {
 		t.doETL(w, r, dpq.etlName, bck, lom.ObjName)
 		return lom
@@ -695,7 +690,8 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 	goi := allocGOI()
 	{
 		goi.atime = time.Now().UnixNano()
-		if dpq.ptime != "" && sparseRedirStats(goi.atime) {
+		goi.ltime = mono.NanoTime()
+		if dpq.ptime != "" {
 			if d := ptLatency(goi.atime, dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
 				t.statsT.Add(stats.GetRedirLatency, d)
 			}
@@ -707,10 +703,10 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		goi.ranges = byteRanges{Range: r.Header.Get(cos.HdrRange), Size: 0}
 		goi.archive = archiveQuery{
 			filename: filename,
-			mime:     dpq.archmime, // query.Get(apc.QparamArchmime)
+			mime:     dpq.archmime, // apc.QparamArchmime
 		}
-		goi.isGFN = cos.IsParseBool(dpq.isGFN) // query.Get(apc.QparamIsGFNRequest)
-		// goi.chunked = cmn.GCO.Get().Net.HTTP.Chunked NOTE: disabled - no need
+		goi.isGFN = cos.IsParseBool(dpq.isGFN)                 // query.Get(apc.QparamIsGFNRequest)
+		goi.latestVer = goi.lom.ValidateWarmGet(dpq.latestVer) // apc.QparamLatestVer || versioning.*_warm_get
 	}
 	if bck.IsHTTP() {
 		originalURL := dpq.origURL // query.Get(apc.QparamOrigURL)
@@ -738,12 +734,15 @@ func (t *target) _erris(w http.ResponseWriter, r *http.Request, silent string /*
 
 // PUT /v1/objects/bucket-name/object-name; does:
 // 1) append object 2) append to archive 3) PUT
-func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRequest, lom *cluster.LOM) {
+func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRequest, lom *core.LOM) {
 	var (
 		config  = cmn.GCO.Get()
 		started = time.Now().UnixNano()
 		t2tput  = isT2TPut(r.Header)
 	)
+	if !t.isValidObjname(w, r, lom.ObjName) {
+		return
+	}
 	if apireq.dpq.ptime == "" && !t2tput {
 		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
 		return
@@ -771,18 +770,9 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 	}
 
 	// load (maybe)
-	var (
-		errdb  error
-		skipVC = cmn.Features.IsSet(feat.SkipVC) || cos.IsParseBool(apireq.dpq.skipVC) // apc.QparamSkipVC
-	)
-	if skipVC {
-		errdb = lom.AllowDisconnectedBackend(false)
-	} else if lom.Load(true, false) == nil {
-		errdb = lom.AllowDisconnectedBackend(true)
-	}
-	if errdb != nil {
-		t.writeErr(w, r, errdb)
-		return
+	skipVC := cmn.Rom.Features().IsSet(feat.SkipVC) || cos.IsParseBool(apireq.dpq.skipVC)
+	if !skipVC {
+		_ = lom.Load(true, false)
 	}
 
 	// do
@@ -802,8 +792,20 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		errCode, err = t.putApndArch(r, lom, started, apireq.dpq)
 		lom.Unlock(true)
 	case apireq.dpq.appendTy != "": // apc.QparamAppendType
-		handle, errCode, err = t.appendObj(r, lom, started, apireq.dpq)
-		if err == nil {
+		a := &apndOI{
+			started: started,
+			t:       t,
+			config:  config,
+			lom:     lom,
+			r:       r.Body,
+			op:      apireq.dpq.appendTy, // apc.QparamAppendType
+		}
+		if err := a.parse(apireq.dpq.appendHdl /*apc.QparamAppendHandle*/); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		handle, errCode, err = a.do(r)
+		if err == nil && handle != "" {
 			w.Header().Set(apc.HdrAppendHandle, handle)
 			return
 		}
@@ -812,7 +814,7 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		poi := allocPOI()
 		{
 			poi.atime = started
-			if apireq.dpq.ptime != "" && sparseRedirStats(poi.atime) {
+			if apireq.dpq.ptime != "" {
 				if d := ptLatency(poi.atime, apireq.dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
 					t.statsT.Add(stats.PutRedirLatency, d)
 				}
@@ -820,7 +822,7 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 			poi.t = t
 			poi.lom = lom
 			poi.config = config
-			poi.skipVC = skipVC
+			poi.skipVC = skipVC // feat.SkipVC || apc.QparamSkipVC
 			poi.restful = true
 			poi.t2t = t2tput
 		}
@@ -852,15 +854,15 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	}
 
 	evict := msg.Action == apc.ActEvictObjects
-	lom := cluster.AllocLOM(objName)
+	lom := core.AllocLOM(objName)
 	if err := lom.InitBck(apireq.bck.Bucket()); err != nil {
 		t.writeErr(w, r, err)
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 		return
 	}
 
 	errCode, err := t.DeleteObject(lom, evict)
-	if err == nil {
+	if err == nil && errCode == 0 {
 		// EC cleanup if EC is enabled
 		ec.ECM.CleanupObject(lom)
 	} else {
@@ -870,7 +872,7 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 			t.writeErr(w, r, err, errCode)
 		}
 	}
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 }
 
 // POST /v1/objects/bucket-name/object-name
@@ -891,7 +893,10 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 		return
 	}
 
-	lom := cluster.AllocLOM(apireq.items[1])
+	lom := core.AllocLOM(apireq.items[1])
+	if !t.isValidObjname(w, r, lom.ObjName) {
+		return
+	}
 	err = lom.InitBck(apireq.bck.Bucket())
 	if err == nil {
 		err = t.objMv(lom, msg)
@@ -902,7 +907,7 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 		t.statsT.IncErr(stats.RenameCount)
 		t.writeErr(w, r, err)
 	}
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 }
 
 // HEAD /v1/objects/<bucket-name>/<object-name>
@@ -911,7 +916,7 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 		return
 	}
 	query, bck, objName := apireq.query, apireq.bck, apireq.items[1]
-	if cmn.Features.IsSet(feat.EnforceIntraClusterAccess) {
+	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
 		// validates that the request is internal (by a node in the same cluster)
 		if isRedirect(query) == "" && t.isIntraCall(r.Header, false) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
@@ -919,15 +924,15 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 			return
 		}
 	}
-	lom := cluster.AllocLOM(objName)
+	lom := core.AllocLOM(objName)
 	errCode, err := t.objhead(w.Header(), query, bck, lom)
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 	if err != nil {
 		t._erris(w, r, query.Get(apc.QparamSilent), err, errCode)
 	}
 }
 
-func (t *target) objhead(hdr http.Header, query url.Values, bck *meta.Bck, lom *cluster.LOM) (errCode int, err error) {
+func (t *target) objhead(hdr http.Header, query url.Values, bck *meta.Bck, lom *core.LOM) (errCode int, err error) {
 	var (
 		fltPresence int
 		exists      = true
@@ -954,8 +959,7 @@ func (t *target) objhead(hdr http.Header, query url.Values, bck *meta.Bck, lom *
 			return
 		}
 	} else {
-		if !cmn.IsObjNotExist(err) {
-			errCode = http.StatusNotFound
+		if !cmn.IsErrObjNought(err) {
 			return
 		}
 		exists = false
@@ -966,7 +970,7 @@ func (t *target) objhead(hdr http.Header, query url.Values, bck *meta.Bck, lom *
 
 	if !exists {
 		if bck.IsAIS() || apc.IsFltPresent(fltPresence) {
-			err = cos.NewErrNotFound("%s: object %s", t, lom.Cname())
+			err = cos.NewErrNotFound(t, lom.Cname())
 			return http.StatusNotFound, err
 		}
 	}
@@ -1037,7 +1041,7 @@ func (t *target) objhead(hdr http.Header, query url.Values, bck *meta.Bck, lom *
 		if v == "" {
 			return nil, false
 		}
-		name := cmn.PropToHeader(tag)
+		name := apc.PropToHeader(tag)
 		debug.Func(func() {
 			vv := hdr.Get(name)
 			debug.Assertf(vv == "", "not expecting duplications: %s=(%q, %q)", name, v, vv)
@@ -1056,7 +1060,7 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	if cmn.Features.IsSet(feat.EnforceIntraClusterAccess) {
+	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
 		if isRedirect(apireq.query) == "" && t.isIntraCall(r.Header, false) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
@@ -1072,14 +1076,17 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, "set-custom", msg.Value, err)
 		return
 	}
-	lom := cluster.AllocLOM(apireq.items[1] /*objName*/)
-	defer cluster.FreeLOM(lom)
+	lom := core.AllocLOM(apireq.items[1] /*objName*/)
+	defer core.FreeLOM(lom)
+	if !t.isValidObjname(w, r, lom.ObjName) {
+		return
+	}
 	if err := lom.InitBck(apireq.bck.Bucket()); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
 	if err := lom.Load(true /*cache it*/, false /*locked*/); err != nil {
-		if cmn.IsObjNotExist(err) {
+		if cos.IsNotExist(err, 0) {
 			t.writeErr(w, r, err, http.StatusNotFound)
 		} else {
 			t.writeErr(w, r, err)
@@ -1143,8 +1150,8 @@ func (t *target) sendECMetafile(w http.ResponseWriter, r *http.Request, bck *met
 }
 
 func (t *target) sendECCT(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string) {
-	lom := cluster.AllocLOM(objName)
-	defer cluster.FreeLOM(lom)
+	lom := core.AllocLOM(objName)
+	defer core.FreeLOM(lom)
 	if err := lom.InitBck(bck.Bucket()); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
@@ -1176,64 +1183,8 @@ func (t *target) sendECCT(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 	}
 }
 
-//
-// supporting methods
-//
-
-// CheckRemoteVersion sets `vchanged` to true if object versions differ between
-// remote object and local cache.
-// NOTE: Should be called only if the local copy exists.
-func (t *target) CompareObjects(ctx context.Context, lom *cluster.LOM) (equal bool, errCode int, err error) {
-	var objAttrs *cmn.ObjAttrs
-	objAttrs, errCode, err = t.Backend(lom.Bck()).HeadObj(ctx, lom)
-	if err != nil {
-		err = cmn.NewErrFailedTo(t, "head metadata of", lom, err)
-		return
-	}
-	if lom.Bck().IsHDFS() {
-		equal = true // no versioning in HDFS
-		return
-	}
-	equal = lom.Equal(objAttrs)
-	return
-}
-
-func (t *target) appendObj(r *http.Request, lom *cluster.LOM, started int64, dpq *dpq) (string, int, error) {
-	var (
-		cksumValue    = r.Header.Get(apc.HdrObjCksumVal)
-		cksumType     = r.Header.Get(apc.HdrObjCksumType)
-		contentLength = r.Header.Get(cos.HdrContentLength)
-	)
-	hdl, err := parseAppendHandle(dpq.appendHdl) // apc.QparamAppendHandle
-	if err != nil {
-		return "", http.StatusBadRequest, err
-	}
-	a := &apndOI{
-		started: started,
-		t:       t,
-		lom:     lom,
-		r:       r.Body,
-		op:      dpq.appendTy, // apc.QparamAppendType
-		hdl:     hdl,
-	}
-	if a.op != apc.AppendOp && a.op != apc.FlushOp {
-		err = fmt.Errorf("invalid operation %q (expecting either %q or %q) - check %q query",
-			a.op, apc.AppendOp, apc.FlushOp, apc.QparamAppendType)
-		return "", http.StatusBadRequest, err
-	}
-	if contentLength != "" {
-		if size, ers := strconv.ParseInt(contentLength, 10, 64); ers == nil {
-			a.size = size
-		}
-	}
-	if cksumValue != "" {
-		a.cksum = cos.NewCksum(cksumType, cksumValue)
-	}
-	return a.do()
-}
-
 // called under lock
-func (t *target) putApndArch(r *http.Request, lom *cluster.LOM, started int64, dpq *dpq) (int, error) {
+func (t *target) putApndArch(r *http.Request, lom *core.LOM, started int64, dpq *dpq) (int, error) {
 	var (
 		mime     = dpq.archmime // apc.QparamArchmime
 		filename = dpq.archpath // apc.QparamArchpath
@@ -1283,7 +1234,7 @@ func (t *target) putApndArch(r *http.Request, lom *cluster.LOM, started int64, d
 	return a.do()
 }
 
-func (t *target) DeleteObject(lom *cluster.LOM, evict bool) (code int, err error) {
+func (t *target) DeleteObject(lom *core.LOM, evict bool) (code int, err error) {
 	var isback bool
 	lom.Lock(true)
 	code, err, isback = t.delobj(lom, evict)
@@ -1307,24 +1258,26 @@ func (t *target) DeleteObject(lom *cluster.LOM, evict bool) (code int, err error
 	return
 }
 
-func (t *target) delobj(lom *cluster.LOM, evict bool) (int, error, bool) {
+func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 	var (
 		aisErr, backendErr         error
 		aisErrCode, backendErrCode int
 		delFromAIS, delFromBackend bool
 	)
 	delFromBackend = lom.Bck().IsRemote() && !evict
-	if err := lom.Load(false /*cache it*/, true /*locked*/); err == nil {
-		delFromAIS = true
-	} else if !cmn.IsObjNotExist(err) {
-		return 0, err, false
-	} else {
-		aisErrCode = http.StatusNotFound
+	err := lom.Load(false /*cache it*/, true /*locked*/)
+	if err != nil {
+		if !cos.IsNotExist(err, 0) {
+			return 0, err, false
+		}
 		if !delFromBackend {
 			return http.StatusNotFound, err, false
 		}
+	} else {
+		delFromAIS = true
 	}
 
+	// do
 	if delFromBackend {
 		backendErrCode, backendErr = t.Backend(lom.Bck()).DeleteObj(lom)
 	}
@@ -1355,7 +1308,7 @@ func (t *target) delobj(lom *cluster.LOM, evict bool) (int, error, bool) {
 }
 
 // rename obj
-func (t *target) objMv(lom *cluster.LOM, msg *apc.ActMsg) error {
+func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) (err error) {
 	if lom.Bck().IsRemote() {
 		return fmt.Errorf("%s: cannot rename object %s from a remote bucket", t.si, lom)
 	}
@@ -1367,16 +1320,19 @@ func (t *target) objMv(lom *cluster.LOM, msg *apc.ActMsg) error {
 	}
 
 	buf, slab := t.gmm.Alloc()
-	coi := allocCOI()
+	coiParams := core.AllocCOI()
 	{
-		coi.CopyObjectParams = cluster.CopyObjectParams{BckTo: lom.Bck(), Buf: buf}
-		coi.t = t
-		coi.owt = cmn.OwtMigrate
-		coi.finalize = true
+		coiParams.BckTo = lom.Bck()
+		coiParams.ObjnameTo = msg.Name /* new object name */
+		coiParams.Buf = buf
+		coiParams.Config = cmn.GCO.Get()
+		coiParams.OWT = cmn.OwtCopy
+		coiParams.Finalize = true
 	}
-	_, err := coi.copyObject(lom, msg.Name /* new object name */)
+	coi := (*copyOI)(coiParams)
+	_, err = coi.do(t, nil /*DM*/, lom)
+	core.FreeCOI(coiParams)
 	slab.Free(buf)
-	freeCOI(coi)
 	if err != nil {
 		return err
 	}

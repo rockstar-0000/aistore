@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ type (
 	here struct {
 		arg     string
 		abspath string
+		tmpl    string
 		finfo   os.FileInfo
 		fdnames []string // files and directories (names)
 		isdir   bool
@@ -71,7 +73,14 @@ var (
 
 func (*putargs) verb() string { return "PUT" }
 
-func (a *putargs) dest() string       { return a.dst.bck.Cname("") }
+func (a *putargs) dest() string {
+	if a.dst.oname == "" {
+		return a.dst.bck.Cname("")
+	}
+	// if len(a.src.fdnames) < 2 {
+	return a.dst.bck.Cname(a.dst.oname)
+}
+
 func (a *putargs) srcIsRegular() bool { return a.src.finfo != nil && !a.src.isdir }
 
 func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
@@ -95,25 +104,25 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 		if err != nil {
 			return
 		}
-		// src via local filenames
-		if !flagIsSet(c, listFlag) && !flagIsSet(c, templateFlag) {
-			return fmt.Errorf("missing source arg in %q", c.Command.ArgsUsage)
-		}
-		if flagIsSet(c, listFlag) {
+
+		// source files via '--list' or '--template'
+		switch {
+		case flagIsSet(c, listFlag):
 			csv := parseStrFlag(c, listFlag)
 			a.src.fdnames = splitCsv(csv)
-			return
+			return nil
+		case flagIsSet(c, templateFlag):
+			a.src.tmpl = parseStrFlag(c, templateFlag)
+			pt, err := cos.NewParsedTemplate(a.src.tmpl)
+			if err == nil {
+				a.pt = &pt
+			} else if err == cos.ErrEmptyTemplate {
+				err = errors.New("template to select source files cannot be empty")
+			}
+			return err
+		default:
+			return fmt.Errorf("missing source arg in %q", c.Command.ArgsUsage)
 		}
-		// optional template to select local source(s)
-		var (
-			pt   cos.ParsedTemplate
-			tmpl = parseStrFlag(c, templateFlag)
-		)
-		pt, err = cos.NewParsedTemplate(tmpl)
-		if err == nil {
-			a.pt = &pt
-		}
-		return
 
 	case c.NArg() == 2: // FILE|DIRECTORY|DIRECTORY/PATTERN   BUCKET/[OBJECT_NAME]
 		a.src.arg = c.Args().Get(0) // src
@@ -194,7 +203,7 @@ func (a *archbck) dest() string { return a.dst.bck.Cname(a.dst.oname) }
 func (a *archbck) parse(c *cli.Context) (err error) {
 	err = a.putargs.parse(c, false /*empty dst oname ok*/)
 	if a.dst.bck.IsEmpty() || err == nil {
-		return
+		return err
 	}
 	//
 	// parse a.rsrc (TODO -- FIXME: support archiving local a.src)
@@ -208,15 +217,26 @@ func (a *archbck) parse(c *cli.Context) (err error) {
 		return incorrectUsageMsg(c, fmt.Sprintf("%s and %s options are mutually exclusive",
 			flprn(listFlag), flprn(templateFlag)))
 	}
-	uri := c.Args().Get(0) // remote source
-	if a.rsrc.bck, err = parseBckURI(c, uri, false); err != nil {
-		return
+
+	// source bucket[/obj-or-range]
+	var (
+		objNameOrTmpl string
+		uri           = c.Args().Get(0)
+	)
+	if a.rsrc.bck, objNameOrTmpl, err = parseBckObjURI(c, uri, true /*emptyObjnameOK*/); err != nil {
+		return err
 	}
-	if flagIsSet(c, listFlag) {
-		list := parseStrFlag(c, listFlag)
-		a.rsrc.lr.ObjNames = splitCsv(list)
+	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	if err != nil {
+		return err
+	}
+	if listObjs == "" && tmplObjs == "" {
+		listObjs = objName // NOTE: "pure" prefix comment in parseObjListTemplate (above)
+	}
+	if listObjs != "" {
+		a.rsrc.lr.ObjNames = splitCsv(listObjs)
 	} else {
-		a.rsrc.lr.Template = parseStrFlag(c, templateFlag)
+		a.rsrc.lr.Template = tmplObjs
 	}
 	return
 }

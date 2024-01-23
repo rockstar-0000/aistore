@@ -1,7 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
-// This file handles CLI commands that pertain to AIS objects.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -9,21 +8,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/urfave/cli"
 )
 
+// in this file: operations on objects
+
 var (
 	objectCmdsFlags = map[string][]cli.Flag{
 		commandRemove: append(
-			listrangeFlags,
+			listRangeProgressWaitFlags,
+			verbObjPrefixFlag, // to disambiguate bucket/prefix vs bucket/objName
 			rmrfFlag,
-			verboseFlag,
+			verboseFlag, // rm -rf
+			nonverboseFlag,
 			yesFlag,
 		),
 		commandRename: {},
@@ -32,7 +37,8 @@ var (
 			lengthFlag,
 			cksumFlag,
 			yesFlag,
-			checkObjCachedFlag,
+			headObjPresentFlag,
+			latestVerFlag,
 			refreshFlag,
 			progressFlag,
 			// archive
@@ -44,11 +50,12 @@ var (
 			listArchFlag,
 			objLimitFlag,
 			unitsFlag,
-			verboseFlag,
+			verboseFlag, // client side
+			silentFlag,  // server side
 		},
 
 		commandPut: append(
-			listrangeFlags,
+			listRangeProgressWaitFlags,
 			chunkSizeFlag,
 			concurrencyFlag,
 			dryRunFlag,
@@ -60,6 +67,8 @@ var (
 			// cksum
 			skipVerCksumFlag,
 			putObjDfltCksumFlag,
+			// append
+			appendConcatFlag,
 		),
 		commandSetCustom: {
 			setNewCustomMDFlag,
@@ -104,18 +113,51 @@ var (
 
 	objectCmdPut = cli.Command{
 		Name: commandPut,
-		Usage: "PUT or APPEND one file, one directory, or multiple files and/or directories.\n" +
-			indent4 + "\t- use optional shell filename pattern (wildcard) to match/select multiple sources, for example:\n" +
-			indent4 + "\t\t$ ais put 'docs/*.md' ais://abc/markdown/  # notice single quotes\n" +
-			indent4 + "\t- '--compute-checksum' to facilitate end-to-end protection;\n" +
-			indent4 + "\t- progress bar via '--progress' to show runtime execution (uploaded files count and size);\n" +
-			indent4 + "\t- when writing directly from standard input use Ctrl-D to terminate;\n" +
-			indent4 + "\t- '--archpath' to APPEND to an existing " + archExts + "-formatted object (\"shard\");\n" +
-			indent4 + "\t(tip: use '--dry-run' to see the results without making any changes)",
+		Usage: "PUT or append one file, one directory, or multiple files and/or directories.\n" +
+			indent1 + "Use optional shell filename PATTERN (wildcard) to match/select multiple sources.\n" +
+			indent1 + "Destination naming is consistent with 'ais object promote' command, whereby the optional OBJECT_NAME_or_PREFIX\n" +
+			indent1 + "becomes either a name, a prefix, or a virtual destination directory (if it ends with a forward '/').\n" +
+			indent1 + "Assorted examples and usage options follow (and see docs/cli/object.md for more):\n" +
+			indent1 + "\t- upload matching files: 'ais put \"docs/*.md\" ais://abc/markdown/'\n" +
+			indent1 + "\t- (notice quotation marks and a forward slash after 'markdown/' destination);\n" +
+			indent1 + "\t- '--compute-checksum': use '--compute-checksum' to facilitate end-to-end protection;\n" +
+			indent1 + "\t- '--progress': progress bar, to show running counts and sizes of uploaded files;\n" +
+			indent1 + "\t- Ctrl-D: when writing directly from standard input use Ctrl-D to terminate;\n" +
+			indent1 + "\t- '--append' to append (concatenate) files, e.g.: 'ais put docs ais://nnn/all-docs --append';\n" +
+			indent1 + "\t- '--dry-run': see the results without making any changes.\n" +
+			indent1 + "\tNotes:\n" +
+			indent1 + "\t- to write or add files to " + archExts + "-formatted objects (\"shards\"), use 'ais archive'",
 		ArgsUsage:    putObjectArgument,
 		Flags:        append(objectCmdsFlags[commandPut], putObjCksumFlags...),
 		Action:       putHandler,
 		BashComplete: putPromApndCompletions,
+	}
+	objectCmdPromote = cli.Command{
+		Name: commandPromote,
+		Usage: "PROMOTE target-accessible files and directories.\n" +
+			indent1 + "The operation is intended for copying NFS and SMB shares mounted on any/all targets\n" +
+			indent1 + "but can be also used to copy local files (again, on any/all targets in the cluster).\n" +
+			indent1 + "Copied files and directories become regular stored objects that can be further listed and operated upon.\n" +
+			indent1 + "Destination naming is consistent with 'ais put' command, e.g.:\n" +
+			indent1 + "\t- 'promote /tmp/subdir/f1 ais://nnn'\t - ais://nnn/f1\n" +
+			indent1 + "\t- 'promote /tmp/subdir/f2 ais://nnn/aaa'\t - ais://nnn/aaa\n" +
+			indent1 + "\t- 'promote /tmp/subdir/f3 ais://nnn/aaa/'\t - ais://nnn/aaa/f3\n" +
+			indent1 + "\t- 'promote /tmp/subdir ais://nnn'\t - ais://nnn/f1, ais://nnn/f2, ais://nnn/f3\n" +
+			indent1 + "\t- 'promote /tmp/subdir ais://nnn/aaa/'\t - ais://nnn/aaa/f1, ais://nnn/aaa/f2, ais://nnn/aaa/f3\n" +
+			indent1 + "Other supported options follow below.",
+		ArgsUsage:    promoteObjectArgument,
+		Flags:        objectCmdsFlags[commandPromote],
+		Action:       promoteHandler,
+		BashComplete: putPromApndCompletions,
+	}
+	objectCmdConcat = cli.Command{
+		Name: commandConcat,
+		Usage: "append a file, a directory, or multiple files and/or directories\n" +
+			indent1 + "as a new " + objectArgument + " if doesn't exists, and to an existing " + objectArgument + " otherwise, e.g.:\n" +
+			indent1 + "$ ais object concat docs ais://nnn/all-docs ### concatenate all files from docs/ directory.",
+		ArgsUsage: concatObjectArgument,
+		Flags:     objectCmdsFlags[commandConcat],
+		Action:    concatHandler,
 	}
 
 	objectCmdSetCustom = cli.Command{
@@ -126,6 +168,30 @@ var (
 		Action:    setCustomPropsHandler,
 	}
 
+	objectCmdPrefetch = cli.Command{
+		Name:         commandPrefetch,
+		Usage:        prefetchUsage,
+		ArgsUsage:    bucketObjectOrTemplateMultiArg,
+		Flags:        startSpecialFlags[commandPrefetch],
+		Action:       startPrefetchHandler,
+		BashComplete: bucketCompletions(bcmplop{multiple: true}),
+	}
+
+	objectCmdRemove = cli.Command{
+		Name: commandRemove,
+		Usage: "remove object or selected objects from the specified bucket, or buckets - e.g.:\n" +
+			indent1 + "\t- 'rm ais://nnn --all'\t- remove all objects from the bucket ais://nnn;\n" +
+			indent1 + "\t- 'rm s3://abc' --all\t- remove all objects including those that are not _present_ in the cluster;\n" +
+			indent1 + "\t- 'rm gs://abc --template images/'\t- remove all objects from the virtual subdirectory \"images\";\n" +
+			indent1 + "\t- 'rm gs://abc/images/'\t- same as above;\n" +
+			indent1 + "\t- 'rm gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- remove the matching range (prefix + brace expansion);\n" +
+			indent1 + "\t- 'rm \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)",
+		ArgsUsage:    bucketObjectOrTemplateMultiArg,
+		Flags:        objectCmdsFlags[commandRemove],
+		Action:       rmHandler,
+		BashComplete: bucketCompletions(bcmplop{multiple: true, separator: true}),
+	}
+
 	objectCmd = cli.Command{
 		Name:  commandObject,
 		Usage: "put, get, list, rename, remove, and other operations on objects",
@@ -133,7 +199,12 @@ var (
 			objectCmdGet,
 			bucketsObjectsCmdList,
 			objectCmdPut,
+			objectCmdPromote,
+			makeAlias(bucketCmdCopy, "", true, commandCopy), // alias for `ais [bucket] cp`
+			objectCmdConcat,
 			objectCmdSetCustom,
+			objectCmdRemove,
+			objectCmdPrefetch,
 			bucketObjCmdEvict,
 			makeAlias(showCmdObject, "", true, commandShow), // alias for `ais show`
 			{
@@ -143,29 +214,6 @@ var (
 				Flags:        objectCmdsFlags[commandRename],
 				Action:       mvObjectHandler,
 				BashComplete: bucketCompletions(bcmplop{multiple: true, separator: true}),
-			},
-			{
-				Name:         commandRemove,
-				Usage:        "remove object(s) from the specified bucket",
-				ArgsUsage:    optionalObjectsArgument,
-				Flags:        objectCmdsFlags[commandRemove],
-				Action:       removeObjectHandler,
-				BashComplete: bucketCompletions(bcmplop{multiple: true, separator: true}),
-			},
-			{
-				Name:         commandPromote,
-				Usage:        "promote files and directories (i.e., replicate files and convert them to objects)",
-				ArgsUsage:    promoteObjectArgument,
-				Flags:        objectCmdsFlags[commandPromote],
-				Action:       promoteHandler,
-				BashComplete: putPromApndCompletions,
-			},
-			{
-				Name:      commandConcat,
-				Usage:     "concatenate multiple files and/or directories (with or without matching pattern) as a new single object",
-				ArgsUsage: concatObjectArgument,
-				Flags:     objectCmdsFlags[commandConcat],
-				Action:    concatHandler,
 			},
 			{
 				Name:         commandCat,
@@ -226,74 +274,49 @@ func mvObjectHandler(c *cli.Context) (err error) {
 	return
 }
 
-func removeObjectHandler(c *cli.Context) (err error) {
-	if c.NArg() == 0 {
-		return missingArgumentsError(c, c.Command.ArgsUsage)
+// main PUT handler: cases 1 through 4
+func putHandler(c *cli.Context) error {
+	if flagIsSet(c, appendConcatFlag) {
+		return concatHandler(c)
 	}
 
-	if c.NArg() == 1 {
-		uri := c.Args().Get(0)
-		bck, objName, err := parseBckObjURI(c, uri, true /*is optional*/)
-		if err != nil {
-			return err
-		}
-		if flagIsSet(c, listFlag) || flagIsSet(c, templateFlag) {
-			// List or range operation on a given bucket.
-			return listrange(c, bck)
-		}
-		if flagIsSet(c, rmrfFlag) {
-			if !flagIsSet(c, yesFlag) {
-				warn := fmt.Sprintf("will remove all objects from %s. The operation cannot be undone!", bck)
-				if ok := confirm(c, "Proceed?", warn); !ok {
-					return nil
-				}
-			}
-			return rmRfAllObjects(c, bck)
-		}
-
-		if objName == "" {
-			return incorrectUsageMsg(c, "use one of: (%s or %s or %s) to indicate _which_ objects to remove",
-				qflprn(listFlag), qflprn(templateFlag), qflprn(rmrfFlag))
-		}
-
-		// ais rm BUCKET/OBJECT_NAME - pass, multiObjOp will handle it
-	}
-
-	// List and range flags are invalid with object argument(s).
-	if flagIsSet(c, listFlag) || flagIsSet(c, templateFlag) {
-		return incorrectUsageMsg(c, "flags %q, %q cannot be used together with object name arguments",
-			listFlag.Name, templateFlag.Name)
-	}
-
-	// Object argument(s) given by the user; operation on given object(s).
-	return multiobjArg(c, commandRemove)
-}
-
-func putHandler(c *cli.Context) (err error) {
-	// main PUT switch
 	var a putargs
-	if err = a.parse(c, true /*empty dst oname*/); err != nil {
-		return
+	if err := a.parse(c, true /*empty dst oname*/); err != nil {
+		return err
 	}
 	if flagIsSet(c, dryRunFlag) {
 		dryRunCptn(c)
 	}
+
+	// 1. one file
 	if a.srcIsRegular() {
 		debug.Assert(a.src.abspath != "")
+		if cos.IsLastB(a.dst.oname, '/') {
+			a.dst.oname += a.src.arg
+		}
 		if err := putRegular(c, a.dst.bck, a.dst.oname, a.src.abspath, a.src.finfo); err != nil {
 			return err
 		}
 		actionDone(c, fmt.Sprintf("%s %q => %s\n", a.verb(), a.src.arg, a.dst.bck.Cname(a.dst.oname)))
 		return nil
 	}
-	// multi-file cases
+
+	// 2. multi-file list & range
 	incl := flagIsSet(c, inclSrcDirNameFlag)
 	switch {
 	case len(a.src.fdnames) > 0:
+		if len(a.src.fdnames) > 1 {
+			if ok := warnMultiSrcDstPrefix(c, &a, fmt.Sprintf("from [%s ...]", a.src.fdnames[0])); !ok {
+				return nil
+			}
+		}
 		// a) csv of files and/or directories (names) embedded into the first arg, e.g. "f1[,f2...]" dst-bucket[/prefix]
 		// b) csv from '--list' flag
 		return verbList(c, &a, a.src.fdnames, a.dst.bck, a.dst.oname /*virt subdir*/, incl)
-	case a.pt != nil:
+	case a.pt != nil && len(a.pt.Ranges) > 0:
+		if ok := warnMultiSrcDstPrefix(c, &a, fmt.Sprintf("matching '%s'", a.src.tmpl)); !ok {
+			return nil
+		}
 		// a) range via the first arg, e.g. "/tmp/www/test{0..2}{0..2}.txt" dst-bucket/www
 		// b) range and prefix from the parsed '--template'
 		var trimPrefix string
@@ -301,18 +324,55 @@ func putHandler(c *cli.Context) (err error) {
 			trimPrefix = rangeTrimPrefix(a.pt)
 		}
 		return verbRange(c, &a, a.pt, a.dst.bck, trimPrefix, a.dst.oname, incl)
-	case a.src.stdin:
-		return putStdin(c, &a)
-	default: // one directory
-		var ndir int
-
-		fobjs, err := lsFobj(c, a.src.abspath, "", a.dst.oname, &ndir, a.src.recurs, incl)
-		if err != nil {
-			return err
-		}
-		debug.Assert(ndir == 1)
-		return verbFobjs(c, &a, fobjs, a.dst.bck, ndir, a.src.recurs)
 	}
+
+	// 3. STDIN
+	if a.src.stdin {
+		return putStdin(c, &a)
+	}
+
+	// 4. directory
+	var (
+		s       string
+		ndir    int
+		srcpath = a.src.arg
+	)
+	if a.pt != nil {
+		debug.Assert(srcpath == "", srcpath)
+		srcpath = a.pt.Prefix
+	}
+	if !strings.HasSuffix(srcpath, "/") {
+		s = "/"
+	}
+	if ok := warnMultiSrcDstPrefix(c, &a, fmt.Sprintf("from '%s%s'", srcpath, s)); !ok {
+		return nil
+	}
+	fobjs, err := lsFobj(c, srcpath, "", a.dst.oname, &ndir, a.src.recurs, incl)
+	if err != nil {
+		return err
+	}
+	debug.Assert(ndir == 1)
+	return verbFobjs(c, &a, fobjs, a.dst.bck, ndir, a.src.recurs)
+}
+
+func warnMultiSrcDstPrefix(c *cli.Context, a *putargs, from string) bool {
+	if a.dst.oname == "" || cos.IsLastB(a.dst.oname, '/') {
+		return true
+	}
+	warn := fmt.Sprintf("'%s' will be used as the destination name prefix for all files %s",
+		a.dst.oname, from)
+	actionWarn(c, warn)
+	if _, err := archive.Mime(a.dst.oname, ""); err == nil {
+		warn := fmt.Sprintf("did you want to use 'archive put' instead, with %q as the destination shard?",
+			a.dst.oname)
+		actionWarn(c, warn)
+	}
+	if !flagIsSet(c, yesFlag) {
+		if ok := confirm(c, "Proceed anyway?"); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func putStdin(c *cli.Context, a *putargs) error {

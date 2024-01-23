@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/nl"
@@ -99,9 +99,8 @@ func (n *notifs) init(p *proxy) {
 // verb /v1/notifs/[progress|finished] - apc.Progress and apc.Finished, respectively
 func (n *notifs) handler(w http.ResponseWriter, r *http.Request) {
 	var (
-		notifMsg = &cluster.NotifMsg{}
+		notifMsg = &core.NotifMsg{}
 		nl       nl.Listener
-		errMsg   error
 		uuid     string
 		tid      = r.Header.Get(apc.HdrCallerID) // sender node ID
 	)
@@ -109,7 +108,7 @@ func (n *notifs) handler(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErr405(w, r, http.MethodPost)
 		return
 	}
-	apiItems, err := n.p.parseURL(w, r, 1, false, apc.URLPathNotifs.L)
+	apiItems, err := n.p.parseURL(w, r, apc.URLPathNotifs.L, 1, false)
 	if err != nil {
 		return
 	}
@@ -126,7 +125,7 @@ func (n *notifs) handler(w http.ResponseWriter, r *http.Request) {
 	// which is why we consider `not-found`, `already-finished`,
 	// and `unknown-notifier` benign non-error conditions
 	uuid = notifMsg.UUID
-	if !withRetry(cmn.Timeout.CplaneOperation(), func() bool {
+	if !withRetry(cmn.Rom.CplaneOperation(), func() bool {
 		nl = n.entry(uuid)
 		return nl != nil
 	}) {
@@ -152,57 +151,55 @@ func (n *notifs) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	nl.RUnlock()
 
-	if notifMsg.ErrMsg != "" {
-		errMsg = errors.New(notifMsg.ErrMsg)
-	}
-
-	// NOTE: Default case is not required - will reach here only for valid types.
 	switch apiItems[0] {
-	// TODO: implement on Started notification
 	case apc.Progress:
-		err = n.handleProgress(nl, tsi, notifMsg.Data, errMsg)
+		nl.Lock()
+		n._progress(nl, tsi, notifMsg)
+		nl.Unlock()
 	case apc.Finished:
-		err = n.handleFinished(nl, tsi, notifMsg.Data, errMsg)
-	}
-
-	if err != nil {
-		n.p.writeErr(w, r, err)
-	}
+		n._finished(nl, tsi, notifMsg)
+	} // default not needed - cannot happen
 }
 
-func (*notifs) handleProgress(nl nl.Listener, tsi *meta.Snode, data []byte, srcErr error) (err error) {
-	nl.Lock()
-	defer nl.Unlock()
-
-	if srcErr != nil {
-		nl.AddErr(srcErr)
+func (*notifs) _progress(nl nl.Listener, tsi *meta.Snode, msg *core.NotifMsg) {
+	if msg.ErrMsg != "" {
+		nl.AddErr(errors.New(msg.ErrMsg))
 	}
-	if data != nil {
-		stats, _, _, err := nl.UnmarshalStats(data)
+	// when defined, `data must be valid encoded stats
+	if msg.Data != nil {
+		stats, _, _, err := nl.UnmarshalStats(msg.Data)
 		debug.AssertNoErr(err)
 		nl.SetStats(tsi.ID(), stats)
 	}
-	return
 }
 
-func (n *notifs) handleFinished(nl nl.Listener, tsi *meta.Snode, data []byte, srcErr error) (err error) {
+func (n *notifs) _finished(nl nl.Listener, tsi *meta.Snode, msg *core.NotifMsg) {
 	var (
-		stats   any
-		aborted bool
+		srcErr  error
+		done    bool
+		aborted = msg.AbortedX
 	)
 	nl.Lock()
-	// data can either be `nil` or a valid encoded stats
-	if data != nil {
-		stats, _, aborted, err = nl.UnmarshalStats(data)
+	if msg.Data != nil {
+		// ditto
+		stats, _, abortedSnap, err := nl.UnmarshalStats(msg.Data)
 		debug.AssertNoErr(err)
 		nl.SetStats(tsi.ID(), stats)
+
+		if abortedSnap != msg.AbortedX && cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			nlog.Infof("Warning: %s: %t vs %t [%s]", msg, abortedSnap, msg.AbortedX, nl.String())
+		}
+		aborted = aborted || abortedSnap
 	}
-	done := n.markFinished(nl, tsi, srcErr, aborted)
+	if msg.ErrMsg != "" {
+		srcErr = errors.New(msg.ErrMsg)
+	}
+	done = n.markFinished(nl, tsi, srcErr, aborted)
 	nl.Unlock()
+
 	if done {
 		n.done(nl)
 	}
-	return
 }
 
 // start listening
@@ -215,16 +212,16 @@ func (n *notifs) add(nl nl.Listener) (err error) {
 		return
 	}
 	nl.SetAddedTime()
-	if cmn.FastV(5, cos.SmoduleAIS) {
-		nlog.Infoln("add " + nl.String())
+	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+		nlog.Infoln("add", nl.Name())
 	}
 	return
 }
 
 func (n *notifs) del(nl nl.Listener, locked bool) (ok bool) {
 	ok = n.nls.del(nl, locked /*locked*/)
-	if ok && cmn.FastV(5, cos.SmoduleAIS) {
-		nlog.Infoln("del " + nl.String())
+	if ok && cmn.Rom.FastV(5, cos.SmoduleAIS) {
+		nlog.Infoln("del", nl.Name())
 	}
 	return
 }
@@ -318,7 +315,7 @@ func (n *notifs) done(nl nl.Listener) {
 			args := allocBcArgs()
 			args.req = abortReq(nl)
 			args.network = cmn.NetIntraControl
-			args.timeout = cmn.Timeout.MaxKeepalive()
+			args.timeout = cmn.Rom.MaxKeepalive()
 			args.nodes = []meta.NodeMap{nl.Notifiers()}
 			args.nodeCount = len(args.nodes[0])
 			args.smap = smap
@@ -430,7 +427,7 @@ func (n *notifs) bcastGetStats(nl nl.Listener, dur time.Duration) {
 			nl.Lock()
 			done = done || n.markFinished(nl, res.si, err, true) // NOTE: not-found at one ==> all done
 			nl.Unlock()
-		} else if config.FastV(4, cos.SmoduleAIS) {
+		} else if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 			nlog.Errorf("%s: %s, node %s: %v", n.p, nl, res.si.StringEx(), res.unwrap())
 		}
 	}

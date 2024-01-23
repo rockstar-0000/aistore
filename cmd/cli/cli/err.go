@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains error handlers and utilities.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -53,7 +53,7 @@ func (e *errUsage) Error() string {
 	msg := helpMessage(e.helpTemplate, e.helpData)
 
 	// remove "alias for" (simplify)
-	reg := regexp.MustCompile(`\s+\(alias for ".+"\)`)
+	reg := regexp.MustCompile(aliasForRegex)
 	if loc := reg.FindStringIndex(msg); loc != nil {
 		msg = msg[:loc[0]] + msg[loc[1]:]
 	}
@@ -80,7 +80,7 @@ func newAdditionalInfoError(err error, info string) error {
 }
 
 func (e *errAdditionalInfo) Error() string {
-	return fmt.Sprintf("%s.\n%s\n", e.baseErr.Error(), cos.StrToSentence(e.additionalInfo))
+	return fmt.Sprintf("%s.\n%s\n", e.baseErr.Error(), strToSentence(e.additionalInfo))
 }
 
 /////////////////////
@@ -104,7 +104,7 @@ func isUnreachableError(err error) (msg string, unreachable bool) {
 	switch err := err.(type) {
 	case *cmn.ErrHTTP:
 		herr := cmn.Err2HTTPErr(err)
-		if configuredVerbosity() {
+		if cliConfVerbose() {
 			herr.Message = herr.StringEx()
 		}
 		msg = herr.Message
@@ -147,7 +147,7 @@ func commandNotFoundError(c *cli.Context, cmd string) *errUsage {
 		context:       c,
 		message:       msg,
 		helpData:      c.App,
-		helpTemplate:  teb.ShortUsageTmpl,
+		helpTemplate:  teb.ExtendedUsageTmpl,
 		bottomMessage: didYouMeanMessage(c, cmd, similar, closestCommand, distance, trailingShow),
 	}
 }
@@ -235,14 +235,16 @@ func cannotExecuteError(c *cli.Context, err error, bottomMessage string) *errUsa
 	}
 }
 
-func incorrectUsageMsg(c *cli.Context, fmtString string, args ...any) *errUsage {
-	const incorrectUsageFmt = "too many arguments or unrecognized (or misplaced) option '%+v'"
-
-	if fmtString == "" {
-		fmtString = incorrectUsageFmt
+func incorrectUsageMsg(c *cli.Context, fmtMsg string, args ...any) *errUsage {
+	const dfltMsg = "too many arguments or unrecognized (misplaced?) option '%+v'"
+	if fmtMsg == "" {
+		fmtMsg = dfltMsg
 	}
-	msg := fmt.Sprintf(fmtString, args...)
-	return _errUsage(c, msg)
+	if len(args) == 0 {
+		debug.Assert(!strings.Contains(fmtMsg, "%"))
+		return _errUsage(c, fmtMsg)
+	}
+	return _errUsage(c, fmt.Sprintf(fmtMsg, args...))
 }
 
 func missingArgumentsError(c *cli.Context, missingArgs ...string) *errUsage {
@@ -268,19 +270,13 @@ func objectNameArgNotExpected(c *cli.Context, objectName string) *errUsage {
 	return _errUsage(c, msg)
 }
 
-func _errUsage(c *cli.Context, msg string) (err *errUsage) {
-	err = &errUsage{
+func _errUsage(c *cli.Context, msg string) *errUsage {
+	return &errUsage{
 		context:      c,
 		message:      msg,
 		helpData:     c.Command,
-		helpTemplate: cli.CommandHelpTemplate,
+		helpTemplate: teb.ShortUsageTmpl,
 	}
-	switch c.Command.Name {
-	// long list of options makes it difficult to see the actual error
-	case commandList, commandPut, commandCopy:
-		err.helpTemplate = teb.UsageOnlyTmpl
-	}
-	return
 }
 
 func mistypedFlag(extraArgs []string) error {
@@ -302,8 +298,16 @@ func completionErr(c *cli.Context, err error) {
 // ais errors -- formatting
 //
 
+func notV(err error) error {
+	if err != nil && !cliConfVerbose() {
+		if herr, ok := err.(*cmn.ErrHTTP); ok {
+			return errors.New(herr.Message)
+		}
+	}
+	return err
+}
 func V(err error) error {
-	if err != nil && configuredVerbosity() {
+	if err != nil && cliConfVerbose() {
 		if herr, ok := err.(*cmn.ErrHTTP); ok {
 			herr.Message = herr.StringEx()
 			return herr

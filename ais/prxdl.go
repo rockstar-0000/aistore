@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/nl"
 	jsoniter "github.com/json-iterator/go"
@@ -56,7 +56,7 @@ func (p *proxy) httpdladm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodDelete {
-		items, err := cmn.ParseURL(r.URL.Path, 1, false, apc.URLPathDownload.L)
+		items, err := cmn.ParseURL(r.URL.Path, apc.URLPathDownload.L, 1, false)
 		if err != nil {
 			p.writeErr(w, r, err)
 			return
@@ -81,7 +81,7 @@ func (p *proxy) httpdladm(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/download
 func (p *proxy) httpdlpost(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.parseURL(w, r, 0, false, apc.URLPathDownload.L); err != nil {
+	if _, err := p.parseURL(w, r, apc.URLPathDownload.L, 0, false); err != nil {
 		return
 	}
 
@@ -207,7 +207,7 @@ func (p *proxy) dladm(method, path string, msg *dload.AdminBody) ([]byte, int, e
 			if err := jsoniter.Unmarshal(resp.bytes, &status); err != nil {
 				return nil, http.StatusInternalServerError, err
 			}
-			stResp = stResp.Aggregate(status)
+			stResp = stResp.Aggregate(&status)
 		}
 		body := cos.MustMarshal(stResp)
 		return body, http.StatusOK, nil
@@ -238,7 +238,7 @@ func (p *proxy) dlstatus(nl nl.Listener, config *cmn.Config) ([]byte, int, error
 				return false
 			}
 		}
-		resp = resp.Aggregate(*dlStatus)
+		resp = resp.Aggregate(dlStatus)
 		return true
 	})
 
@@ -283,7 +283,7 @@ func (p *proxy) validateDownload(w http.ResponseWriter, r *http.Request, body []
 		return
 	}
 	bck := meta.CloneBck(&dlBase.Bck)
-	args := bckInitArgs{p: p, w: w, r: r, reqBody: body, bck: bck, perms: apc.AccessRW}
+	args := bctx{p: p, w: w, r: r, reqBody: body, bck: bck, perms: apc.AccessRW}
 	args.createAIS = true
 	if _, err := args.initAndTry(); err == nil {
 		ok = true

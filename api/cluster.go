@@ -1,4 +1,4 @@
-// Package api provides AIStore API over HTTP(S)
+// Package api provides Go based AIStore API/SDK over HTTP(S)
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
@@ -10,10 +10,9 @@ import (
 	"net/url"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -43,7 +42,7 @@ func Health(bp BaseParams, readyToRebalance ...bool) error {
 
 func HealthUptime(bp BaseParams, readyToRebalance ...bool) (string, string, error) {
 	reqParams := mkhealth(bp, readyToRebalance...)
-	hdr, err := reqParams.doReqHdr()
+	hdr, _, err := reqParams.doReqHdr()
 	if err != nil {
 		return "", "", err
 	}
@@ -67,7 +66,7 @@ func mkhealth(bp BaseParams, readyToRebalance ...bool) (reqParams *ReqParams) {
 	return
 }
 
-// GetClusterMap retrieves AIStore cluster map.
+// get cluster map from a BaseParams-referenced node
 func GetClusterMap(bp BaseParams) (smap *meta.Smap, err error) {
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
@@ -78,10 +77,10 @@ func GetClusterMap(bp BaseParams) (smap *meta.Smap, err error) {
 	}
 	_, err = reqParams.DoReqAny(&smap)
 	FreeRp(reqParams)
-	return
+	return smap, err
 }
 
-// GetNodeClusterMap retrieves AIStore cluster map from a specific node.
+// GetNodeClusterMap retrieves cluster map from the specified node.
 func GetNodeClusterMap(bp BaseParams, sid string) (smap *meta.Smap, err error) {
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
@@ -94,6 +93,22 @@ func GetNodeClusterMap(bp BaseParams, sid string) (smap *meta.Smap, err error) {
 	_, err = reqParams.DoReqAny(&smap)
 	FreeRp(reqParams)
 	return
+}
+
+// get bucket metadata (BMD) from a BaseParams-referenced node
+func GetBMD(bp BaseParams) (bmd *meta.BMD, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathDae.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatBMD}}
+	}
+
+	bmd = &meta.BMD{}
+	_, err = reqParams.DoReqAny(bmd)
+	FreeRp(reqParams)
+	return bmd, err
 }
 
 // - get (smap, bmd, config) *cluster-level* metadata from the spec-ed node
@@ -129,7 +144,7 @@ func GetNodeMeta(bp BaseParams, sid, what string) (out any, err error) {
 	return
 }
 
-// GetClusterSysInfo retrieves AIStore system info.
+// GetClusterSysInfo retrieves cluster's system information
 func GetClusterSysInfo(bp BaseParams) (info apc.ClusterSysInfo, err error) {
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
@@ -183,20 +198,7 @@ func GetClusterStats(bp BaseParams) (res stats.Cluster, err error) {
 	return
 }
 
-func ResetClusterStats(bp BaseParams, errorsOnly bool) (err error) {
-	bp.Method = http.MethodPut
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathClu.S
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActResetStats, Value: errorsOnly})
-	}
-	err = reqParams.DoRequest()
-	FreeRp(reqParams)
-	return
-}
-
-func GetRemoteAIS(bp BaseParams) (remais cluster.Remotes, err error) {
+func GetRemoteAIS(bp BaseParams) (remais meta.RemAisVec, err error) {
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
 	{
@@ -265,8 +267,8 @@ func SetClusterConfig(bp BaseParams, nvs cos.StrKVs, transient bool) error {
 }
 
 // SetClusterConfigUsingMsg sets the cluster-wide configuration
-// using the `cmn.ConfigToUpdate` parameter provided.
-func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToUpdate, transient bool) error {
+// using the `cmn.ConfigToSet` parameter provided.
+func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToSet, transient bool) error {
 	var (
 		q   url.Values
 		msg = apc.ActMsg{Action: apc.ActSetConfig, Value: configToUpdate}
@@ -288,14 +290,27 @@ func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToUpdate,
 	return err
 }
 
-// ResetClusterConfig resets the configuration of all nodes to the cluster configuration
+// zero out: all metrics _or_ only error counters
+func ResetClusterStats(bp BaseParams, errorsOnly bool) (err error) {
+	return _putCluster(bp, apc.ActMsg{Action: apc.ActResetStats, Value: errorsOnly})
+}
+
+// all nodes: reset configuration to cluster defaults
 func ResetClusterConfig(bp BaseParams) error {
+	return _putCluster(bp, apc.ActMsg{Action: apc.ActResetConfig})
+}
+
+func RotateClusterLogs(bp BaseParams) error {
+	return _putCluster(bp, apc.ActMsg{Action: apc.ActRotateLogs})
+}
+
+func _putCluster(bp BaseParams, msg apc.ActMsg) error {
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathClu.S
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActResetConfig})
+		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 	}
 	err := reqParams.DoRequest()
@@ -321,25 +336,6 @@ func GetClusterConfig(bp BaseParams) (*cmn.ClusterConfig, error) {
 		return nil, err
 	}
 	return cluConfig, nil
-}
-
-// GetBMD returns bucket metadata
-func GetBMD(bp BaseParams) (*meta.BMD, error) {
-	bp.Method = http.MethodGet
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathClu.S
-		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatBMD}}
-	}
-
-	bmd := &meta.BMD{}
-	_, err := reqParams.DoReqAny(bmd)
-	FreeRp(reqParams)
-	if err != nil {
-		return nil, err
-	}
-	return bmd, nil
 }
 
 func AttachRemoteAIS(bp BaseParams, alias, u string) error {

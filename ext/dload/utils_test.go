@@ -1,16 +1,17 @@
 // Package dloader_test is a unit test
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package dload_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/tools"
@@ -44,13 +45,18 @@ func TestNormalizeObjName(t *testing.T) {
 }
 
 func TestCompareObject(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		src = prepareObject(t)
 		dst = &dload.DstElement{
 			Link: "https://storage.googleapis.com/minikube/iso/minikube-v0.23.2.iso.sha256",
 		}
+		clientConf cmn.ClientConf
 	)
+	// initialize http clients
+	clientConf.Timeout = 5 * cos.Duration(time.Second)
+	clientConf.TimeoutLong = 15 * cos.Duration(time.Second)
+	dload.Init(nil, nil, &clientConf)
 
 	// Modify local object to contain invalid (meta)data.
 	customMD := cos.StrKVs{
@@ -92,7 +98,7 @@ func TestCompareObject(t *testing.T) {
 	tassert.Errorf(t, equal, "expected the objects to be equal")
 }
 
-func prepareObject(t *testing.T) *cluster.LOM {
+func prepareObject(t *testing.T) *core.LOM {
 	out := tools.PrepareObjects(t, tools.ObjectsDesc{
 		CTs: []tools.ContentTypeDesc{{
 			Type:       fs.ObjectType,
@@ -101,7 +107,7 @@ func prepareObject(t *testing.T) *cluster.LOM {
 		MountpathsCnt: 1,
 		ObjectSize:    1024,
 	})
-	lom := &cluster.LOM{}
+	lom := &core.LOM{}
 	err := lom.InitFQN(out.FQNs[fs.ObjectType][0], &out.Bck)
 	tassert.CheckFatal(t, err)
 	err = lom.Load(false, false)

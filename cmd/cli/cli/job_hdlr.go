@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that control running jobs in the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -14,15 +14,26 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/xact"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
+)
+
+const (
+	prefetchUsage = "prefetch one remote bucket, multiple remote buckets, or\n" +
+		indent1 + "selected objects in a given remote bucket or buckets, e.g.:\n" +
+		indent1 + "\t- 'prefetch gs://abc'\t- prefetch entire bucket (all gs://abc objects that are _not_ present in the cluster);\n" +
+		indent1 + "\t- 'prefetch gs:'\t- prefetch all visible/accessible GCP buckets;\n" +
+		indent1 + "\t- 'prefetch gs://abc --template images/'\t- prefetch all objects from the virtual subdirectory \"images\";\n" +
+		indent1 + "\t- 'prefetch gs://abc/images/'\t- same as above;\n" +
+		indent1 + "\t- 'prefetch gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- prefetch the matching range (prefix + brace expansion);\n" +
+		indent1 + "\t- 'prefetch \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)"
 )
 
 // top-level job command
@@ -67,8 +78,10 @@ var (
 			verboseFlag,
 		},
 		commandPrefetch: append(
-			listrangeFlags,
+			listRangeProgressWaitFlags,
 			dryRunFlag,
+			verbObjPrefixFlag, // to disambiguate bucket/prefix vs bucket/objName
+			latestVerFlag,
 		),
 		cmdLRU: {
 			lruBucketsFlag,
@@ -85,18 +98,21 @@ var (
 		Action:       startResilverHandler,
 		BashComplete: suggestTargets,
 	}
+
+	prefetchStartCmd = cli.Command{
+		Name:         commandPrefetch,
+		Usage:        prefetchUsage,
+		ArgsUsage:    bucketObjectOrTemplateMultiArg,
+		Flags:        startSpecialFlags[commandPrefetch],
+		Action:       startPrefetchHandler,
+		BashComplete: bucketCompletions(bcmplop{multiple: true}),
+	}
+
 	jobStartSub = cli.Command{
 		Name:  commandStart,
 		Usage: "run batch job",
 		Subcommands: []cli.Command{
-			{
-				Name:         commandPrefetch,
-				Usage:        "prefetch objects from remote buckets",
-				ArgsUsage:    bucketArgument,
-				Flags:        startSpecialFlags[commandPrefetch],
-				Action:       startPrefetchHandler,
-				BashComplete: bucketCompletions(bcmplop{multiple: true}),
-			},
+			prefetchStartCmd,
 			{
 				Name:      cmdDownload,
 				Usage:     "download files and objects from remote sources",
@@ -139,11 +155,17 @@ var (
 	stopCmdsFlags = []cli.Flag{
 		allRunningJobsFlag,
 		regexJobsFlag,
+		yesFlag,
 	}
 	jobStopSub = cli.Command{
-		Name:         commandStop,
-		Usage:        "terminate a single batch job or multiple jobs (" + tabHelpOpt + ")",
-		ArgsUsage:    jobShowStopWaitArgument,
+		Name: commandStop,
+		Usage: "terminate a single batch job or multiple jobs, e.g.:\n" +
+			indent1 + "\t- 'stop tco-cysbohAGL'\t- terminate a given job identified by its unique ID;\n" +
+			indent1 + "\t- 'stop copy-listrange'\t- terminate all multi-object copies;\n" +
+			indent1 + "\t- 'stop copy-objects'\t- same as above (using display name);\n" +
+			indent1 + "\t- 'stop --all'\t- terminate all running jobs\n" +
+			indent1 + strToSentence(tabHelpOpt),
+		ArgsUsage:    jobAnyArg,
 		Flags:        stopCmdsFlags,
 		Action:       stopJobHandler,
 		BashComplete: runningJobCompletions,
@@ -160,7 +182,7 @@ var (
 	jobWaitSub = cli.Command{
 		Name:         commandWait,
 		Usage:        "wait for a specific batch job to complete (" + tabHelpOpt + ")",
-		ArgsUsage:    jobShowStopWaitArgument,
+		ArgsUsage:    jobAnyArg,
 		Flags:        waitCmdsFlags,
 		Action:       waitJobHandler,
 		BashComplete: runningJobCompletions,
@@ -221,9 +243,18 @@ outer:
 			kind, _ := xact.GetKindName(xname)
 			// CLI is allowed to make it even shorter..
 			if strings.HasPrefix(xname, cmd.Name) || strings.HasPrefix(kind, cmd.Name) {
+				// the following x-s, even through startable, have their own custom CLI handlers:
+				// - cleanup-store
+				// - ec-encode
+				// - lru
+				// - make-n-copies
+				// - prefetch-listrange
+				// - rebalance
+				// - resilver
 				continue outer
 			}
 		}
+		// add generic start handler on the fly
 		cmd := cli.Command{
 			Name:   xname,
 			Usage:  fmt.Sprintf("start %s", xname),
@@ -298,7 +329,7 @@ func startXaction(c *cli.Context, xname string, bck cmn.Bck, sid string) error {
 	}
 
 	xargs := xact.ArgsMsg{Kind: xname, Bck: bck, DaemonID: sid}
-	xid, err := api.StartXaction(apiBP, xargs)
+	xid, err := api.StartXaction(apiBP, &xargs)
 	if err != nil {
 		return V(err)
 	}
@@ -624,39 +655,12 @@ func startLRUHandler(c *cli.Context) (err error) {
 		id    string
 		xargs = xact.ArgsMsg{Kind: apc.ActLRU, Buckets: buckets, Force: flagIsSet(c, forceFlag)}
 	)
-	if id, err = api.StartXaction(apiBP, xargs); err != nil {
+	if id, err = api.StartXaction(apiBP, &xargs); err != nil {
 		return
 	}
 
 	fmt.Fprintf(c.App.Writer, "Started %s %s. %s\n", apc.ActLRU, id, toMonitorMsg(c, id, ""))
 	return
-}
-
-func startPrefetchHandler(c *cli.Context) (err error) {
-	if flagIsSet(c, dryRunFlag) {
-		dryRunCptn(c)
-	}
-	if c.NArg() == 0 {
-		return incorrectUsageMsg(c, c.Command.ArgsUsage)
-	}
-	if c.NArg() > 1 {
-		return incorrectUsageMsg(c, "", c.Args()[1:])
-	}
-	bck, err := parseBckURI(c, c.Args().Get(0), false)
-	if err != nil {
-		return
-	}
-	if bck.IsAIS() {
-		return fmt.Errorf("cannot prefetch from ais buckets (the operation applies to remote buckets only)")
-	}
-	if _, err = headBucket(bck, false /* don't add */); err != nil {
-		return
-	}
-
-	if flagIsSet(c, listFlag) || flagIsSet(c, templateFlag) {
-		return listrange(c, bck)
-	}
-	return missingArgumentsError(c, "object list or range")
 }
 
 //
@@ -672,7 +676,7 @@ func stopJobHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if name == "" && xid == "" {
+	if name == "" && xid == "" && !flagIsSet(c, allRunningJobsFlag) {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
 	if daemonID != "" {
@@ -703,27 +707,41 @@ func stopJobHandler(c *cli.Context) error {
 		}
 	}
 
-	var otherID string
+	var (
+		otherID         string
+		xactID          = xid
+		xname, xactKind string
+	)
 	if name == "" && xid != "" {
 		name, otherID = xid2Name(xid)
+	}
+	if name != "" {
+		xactKind, xname = xact.GetKindName(name)
+		if xactKind == "" {
+			return incorrectUsageMsg(c, "unrecognized or misplaced option '%s'", name)
+		}
+	}
+
+	// confirm unless
+	if xactID == "" && name != "" {
+		if name != commandRebalance && !flagIsSet(c, yesFlag) && !flagIsSet(c, allRunningJobsFlag) {
+			prompt := fmt.Sprintf("Stop all '%s' jobs?", name)
+			if ok := confirm(c, prompt); !ok {
+				return nil
+			}
+		}
 	}
 
 	// specialized stop
 	switch name {
 	case cmdDownload:
 		if xid == "" {
-			if flagIsSet(c, allRunningJobsFlag) || regex != "" {
-				return stopDownloadRegex(c, regex)
-			}
-			return missingArgumentsError(c, jobIDArgument)
+			return stopDownloadRegex(c, regex)
 		}
 		return stopDownloadHandler(c, xid)
 	case cmdDsort:
 		if xid == "" {
-			if flagIsSet(c, allRunningJobsFlag) || regex != "" {
-				return stopDsortRegex(c, regex)
-			}
-			return missingArgumentsError(c, jobIDArgument)
+			return stopDsortRegex(c, regex)
 		}
 		return stopDsortHandler(c, xid)
 	case commandETL:
@@ -732,39 +750,16 @@ func stopJobHandler(c *cli.Context) error {
 		return stopClusterRebalanceHandler(c)
 	}
 
-	// common stop
-	var (
-		xactID          = xid
-		xname, xactKind string
-	)
-	if name != "" {
-		xactKind, xname = xact.GetKindName(name)
-		if xactKind == "" {
-			return incorrectUsageMsg(c, "unrecognized or misplaced option '%s'", name)
-		}
-	}
+	// generic xstop
 
 	if xactID == "" {
-		// NOTE: differentiate global (cluster-wide) xactions from non-global
-		// (the latter require --all to confirm stopping potentially many...)
-		var isGlobal bool
-		if _, dtor, err := xact.GetDescriptor(xactKind); err == nil {
-			isGlobal = dtor.Scope == xact.ScopeG || dtor.Scope == xact.ScopeGB
-		}
-		if !isGlobal && !flagIsSet(c, allRunningJobsFlag) {
-			msg := fmt.Sprintf("Expecting either %s argument or %s option (with or without regular expression)",
-				jobIDArgument, qflprn(allRunningJobsFlag))
-			return cannotExecuteError(c, errors.New("missing "+jobIDArgument), msg)
-		}
-
-		// stop all xactions of a given kind (TODO: bck)
-		return stopXactionKind(c, xactKind, xname, bck)
+		return stopXactionKindOrAll(c, xactKind, xname, bck)
 	}
 
 	// query
 	msg := formatXactMsg(xactID, xname, bck)
 	xargs := xact.ArgsMsg{ID: xactID, Kind: xactKind}
-	snap, err := getXactSnap(xargs)
+	snap, err := getXactSnap(&xargs)
 	if err != nil {
 		return fmt.Errorf("cannot stop %s: %v", msg, err)
 	}
@@ -795,34 +790,39 @@ func stopJobHandler(c *cli.Context) error {
 
 	// abort
 	args := xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: snap.Bck}
-	if err := api.AbortXaction(apiBP, args); err != nil {
+	if err := api.AbortXaction(apiBP, &args); err != nil {
 		return V(err)
 	}
 	actionDone(c, fmt.Sprintf("Stopped %s\n", msg))
 	return nil
 }
 
-// TODO: `bck` must provide additional filtering (NIY)
-func stopXactionKind(c *cli.Context, xactKind, xname string, bck cmn.Bck) error {
-	xactIDs, err := api.GetAllRunningXactions(apiBP, xactKind)
+// NOTE: the '--all' case when both (xactKind == "" && xname == "") - is also handled here
+// TODO: aistore supports `bck` for additional filtering (NIY)
+func stopXactionKindOrAll(c *cli.Context, xactKind, xname string, bck cmn.Bck) error {
+	cnames, err := api.GetAllRunningXactions(apiBP, xactKind)
 	if err != nil {
 		return V(err)
 	}
-	if len(xactIDs) == 0 {
-		actionDone(c, fmt.Sprintf("No running '%s' jobs, nothing to do", xname))
+	if len(cnames) == 0 {
+		var what string
+		if xname != "" {
+			what = " '" + xname + "'"
+		}
+		actionDone(c, fmt.Sprintf("No running%s jobs, nothing to do", what))
 		return nil
 	}
-	for _, ki := range xactIDs {
-		var (
-			i      = strings.IndexByte(ki, xact.LeftID[0])
-			xactID = ki[i+1 : len(ki)-1] // extract UUID from "name[UUID]"
-			args   = xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: bck}
-			msg    = formatXactMsg(xactID, xname, bck)
-		)
-		if err := api.AbortXaction(apiBP, args); err != nil {
-			actionWarn(c, fmt.Sprintf("failed to stop %s: %v", msg, err))
+	for _, cname := range cnames {
+		xactKind, xactID, err := xact.ParseCname(cname)
+		if err != nil {
+			debug.AssertNoErr(err)
+			continue
+		}
+		args := xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: bck}
+		if err := api.AbortXaction(apiBP, &args); err != nil {
+			actionWarn(c, fmt.Sprintf("failed to stop %s: %v", cname, err))
 		} else {
-			actionDone(c, "Stopped "+msg)
+			actionDone(c, "Stopped "+cname)
 		}
 	}
 	return nil
@@ -835,13 +835,13 @@ func formatXactMsg(xactID, xactKind string, bck cmn.Bck) string {
 	}
 	switch {
 	case xactKind != "" && xactID != "":
-		return fmt.Sprintf("%s[%s%s]", xactKind, xactID, sb)
+		return fmt.Sprintf("%s[%s]%s", xactKind, xactID, sb)
 	case xactKind != "" && sb != "":
-		return fmt.Sprintf("%s[%s]", xactKind, sb)
+		return fmt.Sprintf("%s%s", xactKind, sb)
 	case xactKind != "":
 		return xactKind
 	default:
-		return fmt.Sprintf("job[%s%s]", xactID, sb)
+		return fmt.Sprintf("[%s]%s", xactID, sb)
 	}
 }
 
@@ -878,14 +878,14 @@ func stopDownloadHandler(c *cli.Context, id string) (err error) {
 }
 
 func stopDsortRegex(c *cli.Context, regex string) error {
-	dsortLst, err := api.ListDSort(apiBP, regex, true /*onlyActive*/)
+	dsortLst, err := api.ListDsort(apiBP, regex, true /*onlyActive*/)
 	if err != nil {
 		return V(err)
 	}
 
 	var cnt int
 	for _, dsort := range dsortLst {
-		if err = api.AbortDSort(apiBP, dsort.ID); err == nil {
+		if err = api.AbortDsort(apiBP, dsort.ID); err == nil {
 			actionDone(c, fmt.Sprintf("Stopped dsort job %s", dsort.ID))
 			cnt++
 		} else {
@@ -902,7 +902,7 @@ func stopDsortRegex(c *cli.Context, regex string) error {
 }
 
 func stopDsortHandler(c *cli.Context, id string) (err error) {
-	if err = api.AbortDSort(apiBP, id); err != nil {
+	if err = api.AbortDsort(apiBP, id); err != nil {
 		return
 	}
 	actionDone(c, fmt.Sprintf("Stopped dsort job %s\n", id))
@@ -976,7 +976,7 @@ func waitJob(c *cli.Context, name, xid string, bck cmn.Bck) error {
 	}
 	msg := formatXactMsg(xactID, xname, bck)
 	fmt.Fprintf(c.App.Writer, "Waiting for "+msg+" ...")
-	err := waitXact(apiBP, xargs)
+	err := waitXact(apiBP, &xargs)
 	if err == nil {
 		actionDone(c, " done.")
 	}
@@ -1030,7 +1030,7 @@ func waitDownloadHandler(c *cli.Context, id string) error {
 func waitDsortHandler(c *cli.Context, id string) error {
 	refreshRate := _refreshRate(c)
 	if flagIsSet(c, progressFlag) {
-		dsortResult, err := newDSortPB(apiBP, id, refreshRate).run()
+		dsortResult, err := newDsortPB(apiBP, id, refreshRate).run()
 		if err != nil {
 			return err
 		}
@@ -1048,7 +1048,7 @@ func waitDsortHandler(c *cli.Context, id string) error {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
 	for {
-		resp, err := api.MetricsDSort(apiBP, id)
+		resp, err := api.MetricsDsort(apiBP, id)
 		if err != nil {
 			return V(err)
 		}
@@ -1143,7 +1143,7 @@ func removeDsortHandler(c *cli.Context) error {
 		return cannotExecuteError(c, errors.New("missing "+jobIDArgument), msg)
 	}
 	id := c.Args().Get(0)
-	if err := api.RemoveDSort(apiBP, id); err != nil {
+	if err := api.RemoveDsort(apiBP, id); err != nil {
 		return V(err)
 	}
 
@@ -1152,7 +1152,7 @@ func removeDsortHandler(c *cli.Context) error {
 }
 
 func removeDsortRegex(c *cli.Context, regex string) error {
-	dsortLst, err := api.ListDSort(apiBP, regex, false /*onlyActive*/)
+	dsortLst, err := api.ListDsort(apiBP, regex, false /*onlyActive*/)
 	if err != nil {
 		return V(err)
 	}
@@ -1162,7 +1162,7 @@ func removeDsortRegex(c *cli.Context, regex string) error {
 		if dsort.IsRunning() {
 			continue
 		}
-		err = api.RemoveDSort(apiBP, dsort.ID)
+		err = api.RemoveDsort(apiBP, dsort.ID)
 		if err == nil {
 			actionDone(c, fmt.Sprintf("Removed dsort job %q", dsort.ID))
 			cnt++
@@ -1238,7 +1238,7 @@ func xid2Name(xid string) (name, otherID string) {
 			name = cmdDownload
 		}
 	case strings.HasPrefix(xid, dsort.PrefixJobID):
-		if _, err := api.MetricsDSort(apiBP, xid); err == nil {
+		if _, err := api.MetricsDsort(apiBP, xid); err == nil {
 			name = cmdDsort
 		}
 	// NOTE: not to confuse ETL xaction ID with its name (`etl-name`)

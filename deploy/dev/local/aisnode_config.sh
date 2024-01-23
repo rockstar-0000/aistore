@@ -1,5 +1,5 @@
 # NOTE: system environment variables are listed in the `env` package,
-# see https://github.com/NVIDIA/aistore/blob/master/api/env/README.md
+# see https://github.com/NVIDIA/aistore/blob/main/api/env/README.md
 
 backend_desc=()
 for backend in ${AIS_BACKEND_PROVIDERS}; do
@@ -50,7 +50,7 @@ cat > $AIS_CONF_FILE <<EOL
 	},
 	"client": {
 		"client_timeout":      "10s",
-		"client_long_timeout": "30m",
+		"client_long_timeout": "10m",
 		"list_timeout":        "3m"
 	},
 	"proxy": {
@@ -88,7 +88,7 @@ cat > $AIS_CONF_FILE <<EOL
 	},
 	"checksum": {
 		"type":			"xxhash",
-		"validate_cold_get":	true,
+		"validate_cold_get":	false,
 		"validate_warm_get":	false,
 		"validate_obj_move":	false,
 		"enable_read_range":	false
@@ -122,6 +122,9 @@ cat > $AIS_CONF_FILE <<EOL
 			"use_https":         ${AIS_USE_HTTPS:-false},
 			"server_crt":        "${AIS_SERVER_CRT:-server.crt}",
 			"server_key":        "${AIS_SERVER_KEY:-server.key}",
+			"domain_tls":        "${AIS_DOMAIN_TLS:-localhost}",
+			"client_ca_tls":     "${AIS_CLIENT_CA_TLS}",
+			"client_auth_tls":   ${AIS_CLIENT_AUTH_TLS:-0},
 			"write_buffer_size": ${HTTP_WRITE_BUFFER_SIZE:-0},
 			"read_buffer_size":  ${HTTP_READ_BUFFER_SIZE:-0},
 			"chunked_transfer":  ${AIS_HTTP_CHUNKED_TRANSFER:-true},
@@ -162,7 +165,7 @@ cat > $AIS_CONF_FILE <<EOL
 		"call_timeout":          "10m",
 		"dsorter_mem_threshold": "100GB",
 		"compression":           "${AIS_DSORT_COMPRESSION:-never}",
-		"bundle_multiplier":	${AIS_DSORT_BUNDLE_MULTIPLIER:-4}
+		"bundle_multiplier":	 ${AIS_DSORT_BUNDLE_MULTIPLIER:-4}
 	},
 	"tcb": {
 		"compression":		"never",

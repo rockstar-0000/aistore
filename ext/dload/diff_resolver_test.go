@@ -1,14 +1,14 @@
 // Package dloader_test is a unit test
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
 package dload_test
 
 import (
 	"testing"
 
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/tools/tassert"
 )
@@ -33,11 +33,11 @@ type (
 	}
 )
 
-func (*mockDiffResolverCtx) CompareObjects(*cluster.LOM, *dload.DstElement) (bool, error) {
+func (*mockDiffResolverCtx) CompareObjects(*core.LOM, *dload.DstElement) (bool, error) {
 	return true, nil
 }
 
-func (*mockDiffResolverCtx) IsObjFromRemote(lom *cluster.LOM) (bool, error) {
+func (*mockDiffResolverCtx) IsObjFromRemote(lom *core.LOM) (bool, error) {
 	return lom.FQN == fromRemoteFQN, nil
 }
 
@@ -149,9 +149,9 @@ func TestDiffResolver(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := &mockDiffResolverCtx{}
 			dr := dload.NewDiffResolver(ctx)
-			dr.Start()
+			go dr.Start()
 			for _, s := range test.src {
-				lom := &cluster.LOM{ObjName: s.name}
+				lom := &core.LOM{ObjName: s.name}
 				if s.remote {
 					lom.FQN = fromRemoteFQN
 				}

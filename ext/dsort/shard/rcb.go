@@ -73,12 +73,12 @@ func (c *rcbCtx) xtar(_ string, reader cos.ReadCloseSizer, hdr any) (bool /*stop
 		if err := c.tw.WriteHeader(header); err != nil {
 			return true, err
 		}
-		args.fileType = ct.DSortFileType
+		args.fileType = ct.DsortFileType
 		args.extractMethod.Set(ExtractToWriter)
 		args.w = c.tw
 	}
 
-	size, err := c.extractor.RecordWithBuffer(args)
+	size, err := c.extractor.RecordWithBuffer(&args)
 	reader.Close()
 	if err != nil {
 		return true /*stop*/, err
@@ -113,7 +113,7 @@ func (c *rcbCtx) xzip(_ string, reader cos.ReadCloseSizer, hdr any) (bool /*stop
 	}
 	args.fileType = fs.ObjectType
 
-	size, err := c.extractor.RecordWithBuffer(args)
+	size, err := c.extractor.RecordWithBuffer(&args)
 	if err == nil {
 		c.extractedSize += size
 		c.extractedCount++

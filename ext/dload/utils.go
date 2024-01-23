@@ -14,12 +14,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -29,15 +29,16 @@ var errInvalidTarget = errors.New("downloader: invalid target")
 
 func clientForURL(u string) *http.Client {
 	if cos.IsHTTPS(u) {
-		return httpsClient
+		return g.clientTLS
 	}
-	return httpClient
+	return g.clientH
 }
 
-func countObjects(t cluster.Target, pt cos.ParsedTemplate, dir string, bck *meta.Bck) (cnt int, err error) {
+//nolint:gocritic // need a copy of cos.ParsedTemplate
+func countObjects(pt cos.ParsedTemplate, dir string, bck *meta.Bck) (cnt int, err error) {
 	var (
-		smap = t.Sowner().Get()
-		sid  = t.SID()
+		smap = core.T.Sowner().Get()
+		sid  = core.T.SID()
 		si   *meta.Snode
 	)
 	pt.InitIter()
@@ -47,7 +48,7 @@ func countObjects(t cluster.Target, pt cos.ParsedTemplate, dir string, bck *meta
 		if err != nil {
 			return
 		}
-		si, err = cluster.HrwTarget(bck.MakeUname(name), smap)
+		si, err = smap.HrwName2T(bck.MakeUname(name))
 		if err != nil {
 			return
 		}
@@ -59,10 +60,10 @@ func countObjects(t cluster.Target, pt cos.ParsedTemplate, dir string, bck *meta
 }
 
 // buildDlObjs returns list of objects that must be downloaded by target.
-func buildDlObjs(t cluster.Target, bck *meta.Bck, objects cos.StrKVs) ([]dlObj, error) {
+func buildDlObjs(bck *meta.Bck, objects cos.StrKVs) ([]dlObj, error) {
 	var (
-		smap = t.Sowner().Get()
-		sid  = t.SID()
+		smap = core.T.Sowner().Get()
+		sid  = core.T.SID()
 	)
 
 	objs := make([]dlObj, 0, len(objects))
@@ -85,7 +86,7 @@ func makeDlObj(smap *meta.Smap, sid string, bck *meta.Bck, objName, link string)
 		return dlObj{}, err
 	}
 
-	si, err := cluster.HrwTarget(bck.MakeUname(objName), smap)
+	si, err := smap.HrwName2T(bck.MakeUname(objName))
 	if err != nil {
 		return dlObj{}, err
 	}
@@ -116,7 +117,7 @@ func NormalizeObjName(objName string) (string, error) {
 	return url.PathUnescape(u.Path)
 }
 
-func ParseStartRequest(t cluster.Target, bck *meta.Bck, id string, dlb Body, xdl *Xact) (jobif, error) {
+func ParseStartRequest(bck *meta.Bck, id string, dlb Body, xdl *Xact) (jobif, error) {
 	switch dlb.Type {
 	case TypeBackend:
 		dp := &BackendBody{}
@@ -127,7 +128,7 @@ func ParseStartRequest(t cluster.Target, bck *meta.Bck, id string, dlb Body, xdl
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newBackendDlJob(t, id, bck, dp, xdl)
+		return newBackendDlJob(id, bck, dp, xdl)
 	case TypeMulti:
 		dp := &MultiBody{}
 		err := jsoniter.Unmarshal(dlb.RawMessage, dp)
@@ -137,7 +138,7 @@ func ParseStartRequest(t cluster.Target, bck *meta.Bck, id string, dlb Body, xdl
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newMultiDlJob(t, id, bck, dp, xdl)
+		return newMultiDlJob(id, bck, dp, xdl)
 	case TypeRange:
 		dp := &RangeBody{}
 		err := jsoniter.Unmarshal(dlb.RawMessage, dp)
@@ -147,7 +148,7 @@ func ParseStartRequest(t cluster.Target, bck *meta.Bck, id string, dlb Body, xdl
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newRangeDlJob(t, id, bck, dp, xdl)
+		return newRangeDlJob(id, bck, dp, xdl)
 	case TypeSingle:
 		dp := &SingleBody{}
 		err := jsoniter.Unmarshal(dlb.RawMessage, dp)
@@ -157,7 +158,7 @@ func ParseStartRequest(t cluster.Target, bck *meta.Bck, id string, dlb Body, xdl
 		if err := dp.Validate(); err != nil {
 			return nil, err
 		}
-		return newSingleDlJob(t, id, bck, dp, xdl)
+		return newSingleDlJob(id, bck, dp, xdl)
 	default:
 		return nil, errors.New("input does not match any of the supported formats (single, range, multi, backend)")
 	}
@@ -225,38 +226,37 @@ func parseGoogleCksumHeader(hdr []string) cos.StrKVs {
 	return cksums
 }
 
-func headLink(link string) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), headReqTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, link, http.NoBody)
-	if err != nil {
-		return nil, err
+func headLink(link string) (resp *http.Response, err error) {
+	var (
+		req         *http.Request
+		ctx, cancel = context.WithTimeout(context.Background(), headReqTimeout)
+	)
+	req, err = http.NewRequestWithContext(ctx, http.MethodHead, link, http.NoBody)
+	if err == nil {
+		resp, err = clientForURL(link).Do(req)
 	}
-	return clientForURL(link).Do(req)
+	cancel()
+	return
 }
 
 // Use all available metadata including {size, version, ETag, MD5, CRC}
-// to compare local object with its remote counterpart.
-func CompareObjects(lom *cluster.LOM, dst *DstElement) (equal bool, err error) {
-	var oa *cmn.ObjAttrs
-	if dst.Link != "" {
-		resp, errHead := headLink(dst.Link) //nolint:bodyclose // cos.Close
-		if errHead != nil {
-			return false, errHead
-		}
-		cos.Close(resp.Body)
-		oa = &cmn.ObjAttrs{}
-		oa.Size = attrsFromLink(dst.Link, resp, oa)
-	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), headReqTimeout)
-		defer cancel()
-		oa, _, err = cluster.T.Backend(lom.Bck()).HeadObj(ctx, lom)
-		if err != nil {
-			return false, err
-		}
+// to compare local object with its remote counterpart (source).
+func CompareObjects(lom *core.LOM, dst *DstElement) (bool /*equal*/, error) {
+	if dst.Link == "" {
+		eq, _, err := lom.CheckRemoteMD(true /*rlocked*/, false /*sync*/) // TODO: use job.Sync()
+		return eq, err
 	}
-	equal = lom.Equal(oa)
-	return
+
+	resp, err := headLink(dst.Link) //nolint:bodyclose // cos.Close
+	if err != nil {
+		return false, err
+	}
+	cos.Close(resp.Body)
+
+	oa := &cmn.ObjAttrs{}
+	oa.Size = attrsFromLink(dst.Link, resp, oa) // fill in from resp
+
+	return lom.Equal(oa), nil
 }
 
 // called via ais/prxnotifs generic mechanism

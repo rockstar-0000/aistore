@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles object operations.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -23,8 +23,13 @@ import (
 
 const dryRunExamplesCnt = 10
 
+type lrCtx struct {
+	listObjs, tmplObjs string
+	bck                cmn.Bck
+}
+
 // x-TCO: multi-object transform or copy
-func multiobjTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName string) error {
+func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName string) error {
 	var (
 		lrMsg        apc.ListRange
 		numObjs      int64
@@ -60,6 +65,8 @@ func multiobjTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etl
 		if flagIsSet(c, etlBucketRequestTimeout) {
 			msg.Timeout = cos.Duration(etlBucketRequestTimeout.Value)
 		}
+		msg.LatestVer = flagIsSet(c, latestVerFlag)
+		msg.Sync = flagIsSet(c, syncFlag)
 		msg.ContinueOnError = flagIsSet(c, continueOnErrorFlag)
 	}
 	// 3. start copying/transforming
@@ -73,10 +80,10 @@ func multiobjTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etl
 		msg.Name = etlName
 		text = "Transforming objects"
 		xkind = apc.ActETLObjects
-		xid, err = api.ETLMultiObj(apiBP, bckFrom, msg)
+		xid, err = api.ETLMultiObj(apiBP, bckFrom, &msg)
 	} else {
 		xkind = apc.ActCopyObjects
-		xid, err = api.CopyMultiObj(apiBP, bckFrom, msg)
+		xid, err = api.CopyMultiObj(apiBP, bckFrom, &msg)
 	}
 	if err != nil {
 		return err
@@ -97,21 +104,20 @@ func multiobjTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etl
 
 	// done
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
-		baseMsg := fmt.Sprintf("%s %s => %s. ", text, bckFrom, bckTo)
-		actionDone(c, baseMsg+toMonitorMsg(c, xid, ""))
+		actionDone(c, tcbtcoCptn(text, bckFrom, bckTo)+". "+toMonitorMsg(c, xid, ""))
 		return nil
 	}
 
 	// or wait
 	var timeout time.Duration
 
-	fmt.Fprintf(c.App.Writer, fmtXactWaitStarted, text, bckFrom, bckTo)
+	fmt.Fprintf(c.App.Writer, tcbtcoCptn(text, bckFrom, bckTo)+" ...")
 
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
 	xargs := xact.ArgsMsg{ID: xid, Kind: xkind, Timeout: timeout}
-	if err = waitXact(apiBP, xargs); err != nil {
+	if err = waitXact(apiBP, &xargs); err != nil {
 		fmt.Fprintf(c.App.Writer, fmtXactFailed, text, bckFrom, bckTo)
 	} else {
 		fmt.Fprint(c.App.Writer, fmtXactSucceeded)
@@ -119,45 +125,261 @@ func multiobjTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etl
 	return err
 }
 
-func listrange(c *cli.Context, bck cmn.Bck) (err error) {
-	var (
-		xid, xname string
-		text       string
-		num        int64
-	)
-	if flagIsSet(c, listFlag) && flagIsSet(c, templateFlag) {
-		return incorrectUsageMsg(c, errFmtExclusive, qflprn(listFlag), qflprn(templateFlag))
+//
+// evict, rm, prefetch ------------------------------------------------------------------------
+//
+
+func evictHandler(c *cli.Context) error {
+	if flagIsSet(c, verboseFlag) && flagIsSet(c, nonverboseFlag) {
+		return incorrectUsageMsg(c, errFmtExclusive, qflprn(verboseFlag), qflprn(nonverboseFlag))
 	}
-	debug.Assert(flagIsSet(c, listFlag) || flagIsSet(c, templateFlag))
-	if flagIsSet(c, listFlag) {
-		xid, xname, text, num, err = _listOp(c, bck)
-	} else {
-		xid, xname, text, num, err = _rangeOp(c, bck)
+	if flagIsSet(c, dryRunFlag) {
+		dryRunCptn(c)
 	}
+	if c.NArg() == 0 {
+		return missingArgumentsError(c, c.Command.ArgsUsage)
+	}
+	for shift := range c.Args() {
+		if err := _evictOne(c, shift); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handle one BUCKET[/OBJECT_NAME_or_TEMPLATE] (command line may contain multiple of those)
+func _evictOne(c *cli.Context, shift int) error {
+	uri := preparseBckObjURI(c.Args().Get(shift))
+	bck, objNameOrTmpl, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
 	if err != nil {
+		return err
+	}
+	if !bck.IsRemote() {
+		const msg = "evicting objects from AIS buckets (ie., buckets with no remote backends) is not allowed."
+		return errors.New(msg + "\n(Tip:  consider 'ais object rm' or 'ais rmb', see --help for details)")
+	}
+	if _, err := headBucket(bck, false /* don't add */); err != nil {
+		return err
+	}
+	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case listObjs != "" || tmplObjs != "": // 1. multi-obj
+		lrCtx := &lrCtx{listObjs, tmplObjs, bck}
+		return lrCtx.do(c)
+	case objName == "": // 2. entire bucket
+		return evictBucket(c, bck)
+	default: // 3. one(?) obj to evict
+		err := api.EvictObject(apiBP, bck, objName)
+		if err == nil {
+			if !flagIsSet(c, nonverboseFlag) {
+				fmt.Fprintf(c.App.Writer, "evicted %q from %s\n", objName, bck.Cname(""))
+			}
+			return nil
+		}
+		herr, ok := err.(*cmn.ErrHTTP)
+		if !ok || herr.Status != http.StatusNotFound {
+			return V(err)
+		}
+		// not found
+		suffix := " (not \"cached\")"
+		if c.NArg() > 1 {
+			suffix = " (hint: missing double or single quotes?)"
+		}
+		return &errDoesNotExist{what: "object", name: bck.Cname(objName), suffix: suffix}
+	}
+}
+
+func rmHandler(c *cli.Context) error {
+	if flagIsSet(c, verboseFlag) && flagIsSet(c, nonverboseFlag) {
+		return incorrectUsageMsg(c, errFmtExclusive, qflprn(verboseFlag), qflprn(nonverboseFlag))
+	}
+	if c.NArg() == 0 {
+		return missingArgumentsError(c, c.Command.ArgsUsage)
+	}
+	for shift := range c.Args() {
+		if err := _rmOne(c, shift); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handle one BUCKET[/OBJECT_NAME_or_TEMPLATE] (command line may contain multiple of those)
+func _rmOne(c *cli.Context, shift int) error {
+	uri := preparseBckObjURI(c.Args().Get(shift))
+	bck, objNameOrTmpl, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
+	if err != nil {
+		return err
+	}
+	if _, err := headBucket(bck, false /* don't add */); err != nil {
+		return err
+	}
+	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case listObjs != "" || tmplObjs != "": // 1. multi-obj
+		lrCtx := &lrCtx{listObjs, tmplObjs, bck}
+		return lrCtx.do(c)
+	case objName == "": // 2. all objects
+		if flagIsSet(c, rmrfFlag) {
+			if !flagIsSet(c, yesFlag) {
+				warn := fmt.Sprintf("will remove all objects from %s. The operation cannot be undone!", bck)
+				if ok := confirm(c, "Proceed?", warn); !ok {
+					return nil
+				}
+			}
+			return rmRfAllObjects(c, bck)
+		}
+		return incorrectUsageMsg(c, "use one of: (%s or %s or %s) to indicate _which_ objects to remove",
+			qflprn(listFlag), qflprn(templateFlag), qflprn(rmrfFlag))
+	default: // 3. one obj
+		err := api.DeleteObject(apiBP, bck, objName)
+		if err == nil {
+			if !flagIsSet(c, nonverboseFlag) {
+				fmt.Fprintf(c.App.Writer, "deleted %q from %s\n", objName, bck.Cname(""))
+			}
+			return nil
+		}
+		herr, ok := err.(*cmn.ErrHTTP)
+		if !ok || herr.Status != http.StatusNotFound {
+			return V(err)
+		}
+		// not found
+		var suffix string
+		if c.NArg() > 1 {
+			suffix = " (hint: missing double or single quotes?)"
+		}
+		return &errDoesNotExist{what: "object", name: bck.Cname(objName), suffix: suffix}
+	}
+}
+
+func startPrefetchHandler(c *cli.Context) error {
+	if flagIsSet(c, dryRunFlag) {
+		dryRunCptn(c)
+	}
+	if c.NArg() == 0 {
+		return incorrectUsageMsg(c, c.Command.ArgsUsage)
+	}
+	for shift := range c.Args() {
+		if err := _prefetchOne(c, shift); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ditto
+func _prefetchOne(c *cli.Context, shift int) error {
+	uri := preparseBckObjURI(c.Args().Get(shift))
+	bck, objNameOrTmpl, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
+	if err != nil {
+		return err
+	}
+	if bck.IsAIS() {
+		return fmt.Errorf("cannot prefetch from ais buckets (the operation applies to remote buckets only)")
+	}
+	if _, err = headBucket(bck, false /* don't add */); err != nil {
+		return err
+	}
+	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	if err != nil {
+		return err
+	}
+
+	if listObjs == "" && tmplObjs == "" {
+		listObjs = objName
+	}
+	lrCtx := &lrCtx{listObjs, tmplObjs, bck}
+	return lrCtx.do(c)
+}
+
+//
+// lrCtx: evict, rm, prefetch
+//
+
+func (lr *lrCtx) do(c *cli.Context) (err error) {
+	var (
+		fileList      []string
+		kind          string
+		pt            cos.ParsedTemplate
+		emptyTemplate bool
+	)
+	// 1. parse
+	if lr.listObjs != "" {
+		fileList = splitCsv(lr.listObjs)
+	} else {
+		pt, err = cos.NewParsedTemplate(lr.tmplObjs) // NOTE: prefix w/ no range is fine
+		if err != nil {
+			if err != cos.ErrEmptyTemplate {
+				fmt.Fprintf(c.App.Writer, "invalid template %q: %v\n", lr.tmplObjs, err)
+				return
+			}
+			err, emptyTemplate = nil, true // NOTE: empty tmplObjs means "all objects"
+		}
+	}
+
+	// 2. [DRY-RUN]
+	if flagIsSet(c, dryRunFlag) {
+		lr.dry(c, fileList, &pt)
 		return
 	}
 
-	// progress bar
-	var showProgress = flagIsSet(c, progressFlag)
+	// 3. do
+	xid, kind, action, errV := lr._do(c, fileList)
+	if err != nil {
+		return V(errV)
+	}
+
+	// 4. format
+	var (
+		xname, text string
+		num         int64
+	)
+	if lr.listObjs != "" {
+		num = int64(len(fileList))
+		s := fmt.Sprintf("%v", fileList)
+		if num > 4 {
+			s = fmt.Sprintf("%v...", fileList[:4])
+		}
+		_, xname = xact.GetKindName(kind)
+		text = fmt.Sprintf("%s[%s]: %s %s from %s", xname, xid, s, action, lr.bck.Cname(""))
+	} else {
+		num = pt.Count()
+		_, xname = xact.GetKindName(kind)
+		if emptyTemplate {
+			text = fmt.Sprintf("%s[%s]: %s entire bucket %s", xname, xid, action, lr.bck.Cname(""))
+		} else {
+			text = fmt.Sprintf("%s[%s]: %s %q from %s", xname, xid, action, lr.tmplObjs, lr.bck.Cname(""))
+		}
+	}
+
+	// 5. progress
+	showProgress := flagIsSet(c, progressFlag)
 	if showProgress {
 		var cpr = cprCtx{
 			xname:  xname,
 			xid:    xid,
-			from:   bck.Cname(""),
+			from:   lr.bck.Cname(""),
 			loghdr: text,
 		}
 		cpr.totals.objs = num
 		return cpr.multiobj(c, text)
 	}
 
-	// otherwise, wait or exit
+	// 6. otherwise, wait or exit
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
 		if xid != "" {
 			text += ". " + toMonitorMsg(c, xid, "")
 		}
 		fmt.Fprintln(c.App.Writer, text)
-		return
+		return nil
 	}
 
 	// wait
@@ -167,154 +389,60 @@ func listrange(c *cli.Context, bck cmn.Bck) (err error) {
 	}
 	fmt.Fprintln(c.App.Writer, text+" ...")
 	xargs := xact.ArgsMsg{ID: xid, Kind: xname, Timeout: timeout}
-	if err := waitXact(apiBP, xargs); err != nil {
+	if err := waitXact(apiBP, &xargs); err != nil {
 		return err
 	}
 	fmt.Fprint(c.App.Writer, fmtXactSucceeded)
-	return
-}
-
-// `--list` flag
-func _listOp(c *cli.Context, bck cmn.Bck) (xid, xname, text string, num int64, err error) {
-	var (
-		kind     string
-		arg      = parseStrFlag(c, listFlag)
-		fileList = splitCsv(arg)
-	)
-	if flagIsSet(c, dryRunFlag) {
-		limitedLineWriter(c.App.Writer,
-			dryRunExamplesCnt, strings.ToUpper(c.Command.Name)+" "+bck.Cname("")+"/%s\n", fileList)
-		return
-	}
-	var action string
-	switch c.Command.Name {
-	case commandRemove:
-		xid, err = api.DeleteList(apiBP, bck, fileList)
-		kind = apc.ActDeleteObjects
-		action = "rm"
-	case commandPrefetch:
-		if err = ensureHasProvider(bck); err != nil {
-			return
-		}
-		xid, err = api.PrefetchList(apiBP, bck, fileList)
-		kind = apc.ActPrefetchObjects
-		action = "prefetch"
-	case commandEvict:
-		if err = ensureHasProvider(bck); err != nil {
-			return
-		}
-		xid, err = api.EvictList(apiBP, bck, fileList)
-		kind = apc.ActEvictObjects
-		action = "evict"
-	default:
-		debug.Assert(false, c.Command.Name)
-		return
-	}
-	if err != nil {
-		return
-	}
-	num = int64(len(fileList))
-	s := fmt.Sprintf("%v", fileList)
-	if num > 4 {
-		s = fmt.Sprintf("%v...", fileList[:4])
-	}
-	_, xname = xact.GetKindName(kind)
-	text = fmt.Sprintf("%s[%s]: %s %s from %s", xname, xid, s, action, bck.Cname(""))
-	return
-}
-
-// `--range` flag
-func _rangeOp(c *cli.Context, bck cmn.Bck) (xid, xname, text string, num int64, err error) {
-	var (
-		kind     string
-		rangeStr = parseStrFlag(c, templateFlag)
-		pt       cos.ParsedTemplate
-	)
-	pt, err = cos.NewParsedTemplate(rangeStr)      // NOTE: prefix w/ no range is fine
-	if err != nil && err != cos.ErrEmptyTemplate { // NOTE: empty ok
-		fmt.Fprintf(c.App.Writer, "invalid template %q: %v\n", rangeStr, err)
-		return
-	}
-	// [DRY-RUN]
-	if flagIsSet(c, dryRunFlag) {
-		objs := pt.ToSlice(dryRunExamplesCnt)
-		limitedLineWriter(c.App.Writer,
-			dryRunExamplesCnt, strings.ToUpper(c.Command.Name)+" "+bck.Cname("")+"/%s", objs)
-		if pt.Count() > dryRunExamplesCnt {
-			fmt.Fprintf(c.App.Writer, "(and %d more)\n", pt.Count()-dryRunExamplesCnt)
-		}
-		return
-	}
-
-	var action string
-	switch c.Command.Name {
-	case commandRemove:
-		xid, err = api.DeleteRange(apiBP, bck, rangeStr)
-		kind = apc.ActDeleteObjects
-		action = "rm"
-	case commandPrefetch:
-		if err = ensureHasProvider(bck); err != nil {
-			return
-		}
-		xid, err = api.PrefetchRange(apiBP, bck, rangeStr)
-		kind = apc.ActPrefetchObjects
-		action = "prefetch"
-	case commandEvict:
-		if err = ensureHasProvider(bck); err != nil {
-			return
-		}
-		xid, err = api.EvictRange(apiBP, bck, rangeStr)
-		kind = apc.ActEvictObjects
-		action = "evict"
-	default:
-		debug.Assert(false, c.Command.Name)
-		return
-	}
-	if err != nil {
-		return
-	}
-	num = pt.Count()
-	_, xname = xact.GetKindName(kind)
-	text = fmt.Sprintf("%s[%s]: %s %q from %s", xname, xid, action, rangeStr, bck.Cname(""))
-	return
-}
-
-// Multiple objects in the command line - multiobj _argument_ handler
-func multiobjArg(c *cli.Context, command string) error {
-	// stops iterating if encounters error
-	for _, uri := range c.Args() {
-		bck, objName, err := parseBckObjURI(c, uri, false)
-		if err != nil {
-			return err
-		}
-		if _, err = headBucket(bck, false /* don't add */); err != nil {
-			return err
-		}
-
-		switch command {
-		case commandRemove:
-			if err := api.DeleteObject(apiBP, bck, objName); err != nil {
-				return V(err)
-			}
-			fmt.Fprintf(c.App.Writer, "deleted %q from %s\n", objName, bck.Cname(""))
-		case commandEvict:
-			if !bck.IsRemote() {
-				const msg = "evicting objects from AIS buckets (ie., buckets with no remote backends) is not allowed."
-				return errors.New(msg + "\n(Hint: use 'ais object rm' command to delete)")
-			}
-			if flagIsSet(c, dryRunFlag) {
-				fmt.Fprintf(c.App.Writer, "Evict: %s\n", bck.Cname(objName))
-				continue
-			}
-			if err := api.EvictObject(apiBP, bck, objName); err != nil {
-				if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
-					err = &errDoesNotExist{what: "object", name: bck.Cname(objName),
-						suffix: " (not \"cached\")"}
-				}
-				return V(err)
-			}
-			fmt.Fprintf(c.App.Writer, "evicted %q from %s\n", objName, bck.Cname(""))
-		}
-	}
 	return nil
+}
+
+// [DRY-RUN]
+func (lr *lrCtx) dry(c *cli.Context, fileList []string, pt *cos.ParsedTemplate) {
+	if len(fileList) > 0 {
+		limitedLineWriter(c.App.Writer,
+			dryRunExamplesCnt, strings.ToUpper(c.Command.Name)+" "+lr.bck.Cname("")+"/%s\n", fileList)
+		return
+	}
+	objs := pt.ToSlice(dryRunExamplesCnt)
+	limitedLineWriter(c.App.Writer,
+		dryRunExamplesCnt, strings.ToUpper(c.Command.Name)+" "+lr.bck.Cname("")+"/%s", objs)
+	if pt.Count() > dryRunExamplesCnt {
+		fmt.Fprintf(c.App.Writer, "(and %d more)\n", pt.Count()-dryRunExamplesCnt)
+	}
+}
+
+func (lr *lrCtx) _do(c *cli.Context, fileList []string) (xid, kind, action string, err error) {
+	verb := c.Command.Name
+	if isAlias(c) {
+		verb = lastAliasedWord(c)
+	}
+	switch verb {
+	case commandRemove:
+		xid, err = api.DeleteMultiObj(apiBP, lr.bck, fileList, lr.tmplObjs)
+		kind = apc.ActDeleteObjects
+		action = "rm"
+	case commandPrefetch:
+		if err = ensureRemoteProvider(lr.bck); err != nil {
+			return
+		}
+		var msg apc.PrefetchMsg
+		{
+			msg.ObjNames = fileList
+			msg.Template = lr.tmplObjs
+			msg.LatestVer = flagIsSet(c, latestVerFlag)
+		}
+		xid, err = api.Prefetch(apiBP, lr.bck, msg)
+		kind = apc.ActPrefetchObjects
+		action = "prefetch"
+	case commandEvict:
+		if err = ensureRemoteProvider(lr.bck); err != nil {
+			return
+		}
+		xid, err = api.EvictMultiObj(apiBP, lr.bck, fileList, lr.tmplObjs)
+		kind = apc.ActEvictObjects
+		action = "evict"
+	default:
+		debug.Assert(false, verb)
+	}
+	return xid, kind, action, err
 }

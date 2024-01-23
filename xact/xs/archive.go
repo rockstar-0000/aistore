@@ -1,12 +1,13 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
 	"archive/tar"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,14 +17,14 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xact"
@@ -41,7 +42,7 @@ type (
 		r       *XactArch
 		msg     *cmn.ArchiveBckMsg
 		tsi     *meta.Snode
-		archlom *cluster.LOM
+		archlom *core.LOM
 		fqn     string   // workFQN --/--
 		wfh     *os.File // --/--
 		cksum   cos.CksumHashSize
@@ -65,7 +66,7 @@ type (
 
 // interface guard
 var (
-	_ cluster.Xact   = (*XactArch)(nil)
+	_ core.Xact      = (*XactArch)(nil)
 	_ xreg.Renewable = (*archFactory)(nil)
 	_ lrwi           = (*archwi)(nil)
 )
@@ -90,7 +91,7 @@ func (p *archFactory) Start() (err error) {
 	}
 	p.Args.UUID, err = p.genBEID(p.Bck, bckTo)
 	if err != nil {
-		return
+		return err
 	}
 	//
 	// new x-archive
@@ -101,12 +102,13 @@ func (p *archFactory) Start() (err error) {
 	p.xctn = r
 	r.DemandBase.Init(p.UUID() /*== p.Args.UUID above*/, p.kind, p.Bck /*from*/, xact.IdleDefault)
 
-	if err = p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, 0 /*pdu*/); err != nil {
-		return
+	if err := p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, cmn.OwtPut, 0 /*pdu*/); err != nil {
+		return err
 	}
-	r.p.dm.SetXact(r)
-	r.p.dm.Open()
-
+	if r.p.dm != nil {
+		r.p.dm.SetXact(r)
+		r.p.dm.Open()
+	}
 	xact.GoRunW(r)
 	return
 }
@@ -115,10 +117,10 @@ func (p *archFactory) Start() (err error) {
 // XactArch //
 //////////////
 
-func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *cluster.LOM) (err error) {
+func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) {
 	if err = archlom.InitBck(&msg.ToBck); err != nil {
-		r.addErr(err, false)
-		return
+		r.AddErr(err, 4, cos.SmoduleXs)
+		return err
 	}
 	debug.Assert(archlom.Cname() == msg.Cname()) // relying on it
 
@@ -127,21 +129,21 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *cluster.LOM) (err erro
 	wi.cksum.Init(archlom.CksumType())
 
 	// here and elsewhere: an extra check to make sure this target is active (ref: ignoreMaintenance)
-	smap := r.p.T.Sowner().Get()
-	if err = r.InMaintOrDecomm(smap, r.p.T.Snode()); err != nil {
+	smap := core.T.Sowner().Get()
+	if err = core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
 		return
 	}
 	nat := smap.CountActiveTs()
 	wi.refc.Store(int32(nat - 1))
 
-	wi.tsi, err = cluster.HrwTarget(msg.ToBck.MakeUname(msg.ArchName), smap)
+	wi.tsi, err = smap.HrwName2T(msg.ToBck.MakeUname(msg.ArchName))
 	if err != nil {
-		r.addErr(err, false)
+		r.AddErr(err, 4, cos.SmoduleXs)
 		return
 	}
 
 	// fcreate at BEGIN time
-	if r.p.T.SID() == wi.tsi.ID() {
+	if core.T.SID() == wi.tsi.ID() {
 		var (
 			s           string
 			lmfh        *os.File
@@ -157,7 +159,7 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *cluster.LOM) (err erro
 		if err != nil {
 			return
 		}
-		if r.config.FastV(5, cos.SmoduleXs) {
+		if cmn.Rom.FastV(5, cos.SmoduleXs) {
 			nlog.Infof("%s: begin%s %s", r.Base.Name(), s, msg.Cname())
 		}
 
@@ -210,21 +212,23 @@ func (r *XactArch) Run(wg *sync.WaitGroup) {
 				goto fin
 			}
 			var (
-				smap = r.p.T.Sowner().Get()
+				smap = core.T.Sowner().Get()
 				lrit = &lriterator{}
 			)
-			lrit.init(r, r.p.T, &msg.ListRange)
-			if msg.IsList() {
-				err = lrit.iterList(wi, smap)
-			} else {
-				err = lrit.rangeOrPref(wi, smap)
+			err = lrit.init(r, &msg.ListRange, r.Bck())
+			if err != nil {
+				r.Abort(err)
+				goto fin
 			}
-			r.AddErr(err)
+			err = lrit.run(wi, smap)
+			if err != nil {
+				r.AddErr(err)
+			}
 			if r.Err() != nil {
 				wi.cleanup()
 				goto fin
 			}
-			if r.p.T.SID() == wi.tsi.ID() {
+			if core.T.SID() == wi.tsi.ID() {
 				go r.finalize(wi) // async finalize this shard
 			} else {
 				r.sendTerm(wi.msg.TxnUUID, wi.tsi, nil)
@@ -234,7 +238,7 @@ func (r *XactArch) Run(wg *sync.WaitGroup) {
 				r.pending.Unlock()
 				r.DecPending()
 
-				cluster.FreeLOM(wi.archlom)
+				core.FreeLOM(wi.archlom)
 			}
 		case <-r.IdleTimer():
 			goto fin
@@ -257,27 +261,28 @@ fin:
 	r.pending.Unlock()
 }
 
-func (r *XactArch) doSend(lom *cluster.LOM, wi *archwi, fh cos.ReadOpenCloser) {
+func (r *XactArch) doSend(lom *core.LOM, wi *archwi, fh cos.ReadOpenCloser) {
+	debug.Assert(r.p.dm != nil)
 	o := transport.AllocSend()
 	hdr := &o.Hdr
 	{
 		hdr.Bck = wi.msg.ToBck
 		hdr.ObjName = lom.ObjName
-		hdr.ObjAttrs.CopyFrom(lom.ObjAttrs())
+		hdr.ObjAttrs.CopyFrom(lom.ObjAttrs(), false /*skip cksum*/)
 		hdr.Opaque = []byte(wi.msg.TxnUUID)
 	}
 	// o.Callback nil on purpose (lom is freed by the iterator)
 	r.p.dm.Send(o, fh, wi.tsi)
 }
 
-func (r *XactArch) recv(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+func (r *XactArch) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	if err != nil && !cos.IsEOF(err) {
-		r.addErr(err, false /*contOnErr*/)
+		r.AddErr(err, 5, cos.SmoduleXs)
 		return err
 	}
 
 	r.IncPending()
-	err = r._recv(&hdr, objReader)
+	err = r._recv(hdr, objReader)
 	r.DecPending()
 	transport.DrainAndFreeReader(objReader)
 	return err
@@ -296,7 +301,7 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 		debug.Assert(cnt > 0) // see cleanup
 		return err
 	}
-	debug.Assert(wi.tsi.ID() == r.p.T.SID() && wi.msg.TxnUUID == txnUUID)
+	debug.Assert(wi.tsi.ID() == core.T.SID() && wi.msg.TxnUUID == txnUUID)
 
 	// NOTE: best-effort via ref-counting
 	if hdr.Opcode == opcodeDone {
@@ -310,7 +315,7 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 	if err == nil {
 		wi.cnt.Inc()
 	} else {
-		r.addErr(err, wi.msg.ContinueOnError)
+		r.AddErr(err, 5, cos.SmoduleXs)
 	}
 	return nil
 }
@@ -318,9 +323,9 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 // NOTE: in goroutine
 func (r *XactArch) finalize(wi *archwi) {
 	q := wi.quiesce()
-	if q == cluster.QuiTimeout {
+	if q == core.QuiTimeout {
 		err := fmt.Errorf("%s: %v", r, cmn.ErrQuiesceTimeout)
-		r.addErr(err, wi.msg.ContinueOnError)
+		r.AddErr(err, 4, cos.SmoduleXs)
 	}
 
 	r.pending.Lock()
@@ -330,7 +335,7 @@ func (r *XactArch) finalize(wi *archwi) {
 
 	errCode, err := r.fini(wi)
 	r.DecPending()
-	if r.config.FastV(5, cos.SmoduleXs) {
+	if cmn.Rom.FastV(5, cos.SmoduleXs) {
 		var s string
 		if err != nil {
 			s = fmt.Sprintf(": %v(%d)", err, errCode)
@@ -340,10 +345,10 @@ func (r *XactArch) finalize(wi *archwi) {
 	if err == nil || r.IsAborted() { // done ok (unless aborted)
 		return
 	}
-	debug.Assert(q != cluster.QuiAborted)
+	debug.Assert(q != core.QuiAborted)
 
 	wi.cleanup()
-	r.addErr(err, wi.msg.ContinueOnError, errCode)
+	r.AddErr(err, 5, cos.SmoduleXs)
 }
 
 func (r *XactArch) fini(wi *archwi) (errCode int, err error) {
@@ -351,7 +356,7 @@ func (r *XactArch) fini(wi *archwi) (errCode int, err error) {
 
 	if r.IsAborted() {
 		wi.cleanup()
-		cluster.FreeLOM(wi.archlom)
+		core.FreeLOM(wi.archlom)
 		return
 	}
 
@@ -371,7 +376,7 @@ func (r *XactArch) fini(wi *archwi) (errCode int, err error) {
 	}
 	if err != nil {
 		wi.cleanup()
-		cluster.FreeLOM(wi.archlom)
+		core.FreeLOM(wi.archlom)
 		errCode = http.StatusInternalServerError
 		return
 	}
@@ -380,8 +385,8 @@ func (r *XactArch) fini(wi *archwi) (errCode int, err error) {
 	cos.Close(wi.wfh)
 	wi.wfh = nil
 
-	errCode, err = r.p.T.FinalizeObj(wi.archlom, wi.fqn, r) // cmn.OwtFinalize
-	cluster.FreeLOM(wi.archlom)
+	errCode, err = core.T.FinalizeObj(wi.archlom, wi.fqn, r) // cmn.OwtFinalize
+	core.FreeLOM(wi.archlom)
 	r.ObjsAdd(1, size-wi.appendPos)
 	return
 }
@@ -409,8 +414,8 @@ func (r *XactArch) FromTo() (src, dst *meta.Bck) {
 	return
 }
 
-func (r *XactArch) Snap() (snap *cluster.Snap) {
-	snap = &cluster.Snap{}
+func (r *XactArch) Snap() (snap *core.Snap) {
+	snap = &core.Snap{}
 	r.ToSnap(snap)
 
 	snap.IdleX = r.IsIdle()
@@ -471,40 +476,39 @@ roll:
 }
 
 // multi-object iterator i/f: "handle work item"
-func (wi *archwi) do(lom *cluster.LOM, lrit *lriterator) {
+func (wi *archwi) do(lom *core.LOM, lrit *lriterator) {
 	var coldGet bool
 	if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
-		if !cmn.IsObjNotExist(err) {
-			wi.r.addErr(err, wi.msg.ContinueOnError)
+		if !cos.IsNotExist(err, 0) {
+			wi.r.AddErr(err, 5, cos.SmoduleXs)
 			return
 		}
 		if coldGet = lom.Bck().IsRemote(); !coldGet {
 			if lrit.lrp == lrpList {
 				// listed, not found
-				wi.r.addErr(err, wi.msg.ContinueOnError)
+				wi.r.AddErr(err, 5, cos.SmoduleXs)
 			}
 			return
 		}
 	}
 
-	t := lrit.t
 	if coldGet {
 		// cold
-		if errCode, err := t.GetCold(lrit.ctx, lom, cmn.OwtGetLock); err != nil {
-			if lrit.lrp != lrpList && (errCode == http.StatusNotFound || cmn.IsObjNotExist(err)) {
-				return
+		if errCode, err := core.T.GetCold(context.Background(), lom, cmn.OwtGetLock); err != nil {
+			if lrit.lrp != lrpList && cos.IsNotExist(err, errCode) {
+				return // range or prefix, not found
 			}
-			wi.r.addErr(err, wi.msg.ContinueOnError)
+			wi.r.AddErr(err, 5, cos.SmoduleXs)
 			return
 		}
 	}
 
 	fh, err := cos.NewFileHandle(lom.FQN)
 	if err != nil {
-		wi.r.addErr(err, wi.msg.ContinueOnError)
+		wi.r.AddErr(err, 5, cos.SmoduleXs)
 		return
 	}
-	if t.SID() != wi.tsi.ID() {
+	if core.T.SID() != wi.tsi.ID() {
 		wi.r.doSend(lom, wi, fh)
 		return
 	}
@@ -514,15 +518,15 @@ func (wi *archwi) do(lom *cluster.LOM, lrit *lriterator) {
 	if err == nil {
 		wi.cnt.Inc()
 	} else {
-		wi.r.addErr(err, wi.msg.ContinueOnError)
+		wi.r.AddErr(err, 5, cos.SmoduleXs)
 	}
 }
 
-func (wi *archwi) quiesce() cluster.QuiRes {
-	timeout := cmn.Timeout.CplaneOperation()
-	return wi.r.Quiesce(timeout, func(total time.Duration) cluster.QuiRes {
+func (wi *archwi) quiesce() core.QuiRes {
+	timeout := cmn.Rom.CplaneOperation()
+	return wi.r.Quiesce(timeout, func(total time.Duration) core.QuiRes {
 		if wi.refc.Load() == 0 && wi.r.wiCnt.Load() == 1 /*the last wi (so far) about to `fini`*/ {
-			return cluster.QuiDone
+			return core.QuiDone
 		}
 		return xact.RefcntQuiCB(&wi.refc, wi.r.config.Timeout.SendFile.D()/2, total)
 	})

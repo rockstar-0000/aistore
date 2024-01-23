@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -13,14 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/transport"
@@ -29,7 +29,7 @@ import (
 
 type (
 	encodeCtx struct {
-		lom          *cluster.LOM     // replica
+		lom          *core.LOM        // replica
 		meta         *Metadata        //
 		fh           *cos.FileHandle  // file handle for the replica
 		sliceSize    int64            // calculated slice size
@@ -79,7 +79,7 @@ func (ctx *encodeCtx) freeReplica() {
 // putJogger //
 ///////////////
 
-func (*putJogger) newCtx(lom *cluster.LOM, meta *Metadata) (ctx *encodeCtx, err error) {
+func (*putJogger) newCtx(lom *core.LOM, meta *Metadata) (ctx *encodeCtx, err error) {
 	ctx = allocCtx()
 	ctx.lom = lom
 	ctx.dataSlices = lom.Bprops().EC.DataSlices
@@ -117,7 +117,7 @@ func (c *putJogger) processRequest(req *request) {
 		if req.Callback != nil {
 			req.Callback(lom, err)
 		}
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 		c.parent.DecPending()
 	}()
 
@@ -133,16 +133,15 @@ func (c *putJogger) processRequest(req *request) {
 	c.parent.stats.updateWaitTime(time.Since(req.tm))
 	req.tm = time.Now()
 	if err = c.ec(req, lom); err != nil {
-		err = fmt.Errorf("%s: failed to %s %s: %w", c.parent.t, req.Action, lom.StringEx(), err)
-		nlog.Errorln(err)
-		c.parent.AddErr(err)
+		err = cmn.NewErrFailedTo(core.T, req.Action, lom, err)
+		c.parent.AddErr(err, 0)
 	}
 }
 
 func (c *putJogger) run(wg *sync.WaitGroup) {
 	nlog.Infof("Started EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
 	defer wg.Done()
-	c.buffer, c.slab = mm.Alloc()
+	c.buffer, c.slab = g.pmm.Alloc()
 	for {
 		select {
 		case req := <-c.putCh:
@@ -163,11 +162,11 @@ func (c *putJogger) stop() {
 	c.stopCh.Close()
 }
 
-func (c *putJogger) ec(req *request, lom *cluster.LOM) (err error) {
+func (c *putJogger) ec(req *request, lom *core.LOM) (err error) {
 	switch req.Action {
 	case ActSplit:
 		if err = c.encode(req, lom); err != nil {
-			ctMeta := cluster.NewCTFromLOM(lom, fs.ECMetaType)
+			ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
 			errRm := cos.RemoveFile(ctMeta.FQN())
 			debug.AssertNoErr(errRm)
 		}
@@ -210,30 +209,29 @@ func (c *putJogger) splitAndDistribute(ctx *encodeCtx) error {
 }
 
 // calculates and stores data and parity slices
-func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
+func (c *putJogger) encode(req *request, lom *core.LOM) error {
+	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		nlog.Infof("Encoding %q...", lom)
+	}
 	var (
-		cksumValue, cksumType string
-		ecConf                = lom.Bprops().EC
+		ecConf     = lom.Bprops().EC
+		reqTargets = ecConf.ParitySlices + 1
+		smap       = core.T.Sowner().Get()
 	)
-	if c.parent.config.FastV(4, cos.SmoduleEC) {
-		nlog.Infof("Encoding %q...", lom.FQN)
-	}
-	if lom.Checksum() != nil {
-		cksumType, cksumValue = lom.Checksum().Get()
-	}
-	reqTargets := ecConf.ParitySlices + 1
 	if !req.IsCopy {
 		reqTargets += ecConf.DataSlices
 	}
-	smap := c.parent.smap.Get()
 	targetCnt := smap.CountActiveTs()
 	if targetCnt < reqTargets {
 		return fmt.Errorf("%v: given EC config (d=%d, p=%d), %d targets required to encode %s (have %d, %s)",
 			cmn.ErrNotEnoughTargets, ecConf.DataSlices, ecConf.ParitySlices, reqTargets, lom, targetCnt, smap.StringEx())
 	}
 
-	ctMeta := cluster.NewCTFromLOM(lom, fs.ECMetaType)
-	generation := mono.NanoTime()
+	var (
+		ctMeta                = core.NewCTFromLOM(lom, fs.ECMetaType)
+		generation            = mono.NanoTime()
+		cksumType, cksumValue = lom.Checksum().Get()
+	)
 	meta := &Metadata{
 		MDVersion:   MDVersionLast,
 		Generation:  generation,
@@ -243,7 +241,7 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 		IsCopy:      req.IsCopy,
 		ObjCksum:    cksumValue,
 		CksumType:   cksumType,
-		FullReplica: c.parent.t.SID(),
+		FullReplica: core.T.SID(),
 		Daemons:     make(cos.MapStrUint16, reqTargets),
 	}
 
@@ -254,8 +252,7 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 	if err != nil {
 		return err
 	}
-
-	targets, err := cluster.HrwTargetList(ctx.lom.Uname(), c.parent.smap.Get(), reqTargets)
+	targets, err := smap.HrwTargetList(ctx.lom.Uname(), reqTargets)
 	if err != nil {
 		return err
 	}
@@ -278,10 +275,10 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 		return err
 	}
 	metaBuf := bytes.NewReader(meta.NewPack())
-	if err := ctMeta.Write(c.parent.t, metaBuf, -1); err != nil {
+	if err := ctMeta.Write(metaBuf, -1); err != nil {
 		return err
 	}
-	if _, exists := c.parent.t.Bowner().Get().Get(ctMeta.Bck()); !exists {
+	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
 		if errRm := cos.RemoveFile(ctMeta.FQN()); errRm != nil {
 			nlog.Errorf("nested error: encode -> remove metafile: %v", errRm)
 		}
@@ -290,8 +287,8 @@ func (c *putJogger) encode(req *request, lom *cluster.LOM) error {
 	return nil
 }
 
-func (c *putJogger) ctSendCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
-	c.parent.t.ByteMM().Free(hdr.Opaque)
+func (c *putJogger) ctSendCallback(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+	g.smm.Free(hdr.Opaque)
 	if err != nil {
 		nlog.Errorf("failed to send o[%s]: %v", hdr.Cname(), err)
 	}
@@ -300,8 +297,8 @@ func (c *putJogger) ctSendCallback(hdr transport.ObjHdr, _ io.ReadCloser, _ any,
 
 // Remove slices and replicas across the cluster: remove local metafile
 // if exists and broadcast the request to other targets
-func (c *putJogger) cleanup(lom *cluster.LOM) error {
-	ctMeta := cluster.NewCTFromLOM(lom, fs.ECMetaType)
+func (c *putJogger) cleanup(lom *core.LOM) error {
+	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
 	md, err := LoadMetadata(ctMeta.FQN())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -310,13 +307,12 @@ func (c *putJogger) cleanup(lom *cluster.LOM) error {
 		}
 		return err
 	}
-	nodes := md.RemoteTargets(c.parent.t)
+	nodes := md.RemoteTargets()
 	if err := cos.RemoveFile(ctMeta.FQN()); err != nil {
 		return err
 	}
 
-	mm := c.parent.t.ByteMM()
-	request := newIntraReq(reqDel, nil, lom.Bck()).NewPack(mm)
+	request := newIntraReq(reqDel, nil, lom.Bck()).NewPack(g.smm)
 	o := transport.AllocSend()
 	o.Hdr = transport.ObjHdr{ObjName: lom.ObjName, Opaque: request, Opcode: reqDel}
 	o.Hdr.Bck.Copy(lom.Bucket())
@@ -365,7 +361,7 @@ func generateSlicesToMemory(ctx *encodeCtx) error {
 		sliceWriters = make([]io.Writer, ctx.paritySlices)
 	)
 	for i := 0; i < ctx.paritySlices; i++ {
-		writer := mm.NewSGL(initSize)
+		writer := g.pmm.NewSGL(initSize)
 		ctx.slices[i+ctx.dataSlices] = &slice{obj: writer}
 		if cksumType == cos.ChecksumNone {
 			sliceWriters[i] = writer
@@ -494,12 +490,12 @@ func (c *putJogger) sendSlice(ctx *encodeCtx, data *slice, node *meta.Snode, idx
 		isSlice:  true,
 		reqType:  reqPut,
 	}
-	sentCB := func(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+	sentCB := func(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 		if data != nil {
 			data.release()
 		}
 		if err != nil {
-			nlog.Errorf("Failed to send %s: %v", hdr.Cname(), err)
+			nlog.Errorln("Failed to send", hdr.Cname()+": ", err)
 		}
 	}
 
@@ -542,7 +538,7 @@ func (c *putJogger) sendSlices(ctx *encodeCtx) (err error) {
 		nlog.Errorf("Error while copying (data=%d, parity=%d) for %q: %v",
 			ctx.dataSlices, ctx.paritySlices, ctx.lom.ObjName, copyErr)
 		err = errSliceSendFailed
-	} else if c.parent.config.FastV(4, cos.SmoduleEC) {
+	} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("EC created (data=%d, parity=%d) for %q",
 			ctx.dataSlices, ctx.paritySlices, ctx.lom.ObjName)
 	}

@@ -16,10 +16,10 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/k8s"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -188,7 +188,7 @@ func WaitForContainersStopped(t *testing.T, bp api.BaseParams) {
 func WaitForAborted(bp api.BaseParams, xid, kind string, timeout time.Duration) error {
 	tlog.Logf("Waiting for ETL x-%s[%s] to abort...\n", kind, xid)
 	args := xact.ArgsMsg{ID: xid, Kind: kind, Timeout: timeout /* total timeout */}
-	status, err := api.WaitForXactionIC(bp, args)
+	status, err := api.WaitForXactionIC(bp, &args)
 	if err == nil {
 		if !status.Aborted() {
 			err = fmt.Errorf("expected ETL x-%s[%s] status to indicate 'abort', got: %+v", kind, xid, status)
@@ -196,7 +196,7 @@ func WaitForAborted(bp api.BaseParams, xid, kind string, timeout time.Duration) 
 		return err
 	}
 	tlog.Logf("Aborting ETL x-%s[%s]\n", kind, xid)
-	if abortErr := api.AbortXaction(bp, args); abortErr != nil {
+	if abortErr := api.AbortXaction(bp, &args); abortErr != nil {
 		tlog.Logf("Nested error: failed to abort upon api.wait failure: %v\n", abortErr)
 	}
 	return err
@@ -208,15 +208,15 @@ func WaitForFinished(bp api.BaseParams, xid, kind string, timeout time.Duration)
 	tlog.Logf("Waiting for ETL x-%s[%s] to finish...\n", kind, xid)
 	args := xact.ArgsMsg{ID: xid, Kind: kind, Timeout: timeout /* total timeout */}
 	if xact.IdlesBeforeFinishing(kind) {
-		err = api.WaitForXactionIdle(bp, args)
+		err = api.WaitForXactionIdle(bp, &args)
 	} else {
-		_, err = api.WaitForXactionIC(bp, args)
+		_, err = api.WaitForXactionIC(bp, &args)
 	}
 	if err == nil {
 		return
 	}
 	tlog.Logf("Aborting ETL x-%s[%s]\n", kind, xid)
-	if abortErr := api.AbortXaction(bp, args); abortErr != nil {
+	if abortErr := api.AbortXaction(bp, &args); abortErr != nil {
 		tlog.Logf("Nested error: failed to abort upon api.wait failure: %v\n", abortErr)
 	}
 	return err
@@ -233,7 +233,7 @@ func ReportXactionStatus(bp api.BaseParams, xid string, stopCh *cos.StopCh, inte
 			select {
 			case <-etlTicker.C:
 				// Check number of objects transformed.
-				xs, err := api.QueryXactionSnaps(bp, xact.ArgsMsg{ID: xid})
+				xs, err := api.QueryXactionSnaps(bp, &xact.ArgsMsg{ID: xid})
 				if err != nil {
 					tlog.Logf("Failed to get x-etl[%s] stats: %v\n", xid, err)
 					continue
@@ -282,8 +282,8 @@ func InitSpec(t *testing.T, bp api.BaseParams, etlName, comm string) (xid string
 	return
 }
 
-func InitCode(t *testing.T, bp api.BaseParams, msg etl.InitCodeMsg) (xid string) {
-	id, err := api.ETLInit(bp, &msg)
+func InitCode(t *testing.T, bp api.BaseParams, msg *etl.InitCodeMsg) (xid string) {
+	id, err := api.ETLInit(bp, msg)
 	tassert.CheckFatal(t, err)
 	tassert.Errorf(t, cos.IsValidUUID(id), "expected valid xaction ID, got %q", xid)
 	xid = id

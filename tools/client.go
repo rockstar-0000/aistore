@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -9,16 +9,17 @@ import (
 	"math/rand"
 	"net/http"
 	"path"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -56,11 +57,6 @@ const (
 	controlPlaneSleep = 2 * time.Second
 )
 
-type Ctx struct {
-	Client *http.Client
-	Log    func(format string, a ...any)
-}
-
 type PutObjectsArgs struct {
 	ProxyURL  string
 	Bck       cmn.Bck
@@ -91,7 +87,7 @@ func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh 
 
 func CheckObjIsPresent(proxyURL string, bck cmn.Bck, objName string) bool {
 	bp := BaseAPIParams(proxyURL)
-	_, err := api.HeadObject(bp, bck, objName, apc.FltPresent)
+	_, err := api.HeadObject(bp, bck, objName, apc.FltPresent, true /*silent*/)
 	return err == nil
 }
 
@@ -105,7 +101,7 @@ func Put(proxyURL string, bck cmn.Bck, objName string, reader readers.Reader, er
 		Cksum:      reader.Cksum(),
 		Reader:     reader,
 	}
-	_, err := api.PutObject(putArgs)
+	_, err := api.PutObject(&putArgs)
 	if err == nil {
 		return
 	}
@@ -135,7 +131,7 @@ func ListObjectNames(proxyURL string, bck cmn.Bck, prefix string, objectCountLim
 	if cached {
 		msg.Flags = apc.LsObjCached
 	}
-	data, err := api.ListObjects(bp, bck, msg, api.ListArgs{Num: objectCountLimit})
+	data, err := api.ListObjects(bp, bck, msg, api.ListArgs{Limit: objectCountLimit})
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +184,7 @@ func GetProxyReadiness(proxyURL string) error {
 	return api.GetProxyReadiness(BaseAPIParams(proxyURL))
 }
 
-func CreateBucket(tb testing.TB, proxyURL string, bck cmn.Bck, props *cmn.BucketPropsToUpdate, cleanup bool) {
+func CreateBucket(tb testing.TB, proxyURL string, bck cmn.Bck, props *cmn.BpropsToSet, cleanup bool) {
 	bp := BaseAPIParams(proxyURL)
 	err := api.CreateBucket(bp, bck, props)
 	tassert.CheckFatal(tb, err)
@@ -238,10 +234,10 @@ func CleanupRemoteBucket(t *testing.T, proxyURL string, bck cmn.Bck, prefix stri
 	}
 
 	bp := BaseAPIParams(proxyURL)
-	xid, err := api.DeleteList(bp, bck, toDelete)
+	xid, err := api.DeleteMultiObj(bp, bck, toDelete, "" /*template*/)
 	tassert.CheckFatal(t, err)
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: BucketCleanupTimeout}
-	_, err = api.WaitForXactionIC(bp, args)
+	_, err = api.WaitForXactionIC(bp, &args)
 	tassert.CheckFatal(t, err)
 }
 
@@ -250,10 +246,10 @@ func SetBackendBck(t *testing.T, bp api.BaseParams, srcBck, dstBck cmn.Bck) {
 	p, err := api.HeadBucket(bp, dstBck, false /* don't add to cluster MD */)
 	tassert.CheckFatal(t, err)
 
-	_, err = api.SetBucketProps(bp, srcBck, &cmn.BucketPropsToUpdate{
-		BackendBck: &cmn.BackendBckToUpdate{
-			Name:     api.String(dstBck.Name),
-			Provider: api.String(p.Provider),
+	_, err = api.SetBucketProps(bp, srcBck, &cmn.BpropsToSet{
+		BackendBck: &cmn.BackendBckToSet{
+			Name:     apc.String(dstBck.Name),
+			Provider: apc.String(p.Provider),
 		},
 	})
 	tassert.CheckFatal(t, err)
@@ -285,7 +281,7 @@ func RmTargetSkipRebWait(t *testing.T, proxyURL string, smap *meta.Smap) (*meta.
 // Internal API to remove a node from Smap: use it to unregister MOCK targets/proxies.
 // Use `JoinCluster` to attach node back.
 func RemoveNodeUnsafe(proxyURL, sid string) error {
-	return _removeNodeFromSmap(gctx, proxyURL, sid, MaxCplaneTimeout)
+	return _removeNodeFromSmap(proxyURL, sid, MaxCplaneTimeout)
 }
 
 func WaitForObjectToBeDowloaded(bp api.BaseParams, bck cmn.Bck, objName string, timeout time.Duration) error {
@@ -316,6 +312,7 @@ func EnsureObjectsExist(t *testing.T, params api.BaseParams, bck cmn.Bck, object
 	}
 }
 
+//nolint:gocritic // need a copy of PutObjectsArgs
 func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 	var (
 		errCnt = atomic.NewInt32(0)
@@ -334,7 +331,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 
 	for i := 0; i < args.ObjCnt; i++ {
 		if args.Ordered {
-			objNames = append(objNames, path.Join(args.ObjPath, fmt.Sprintf("%d", i)))
+			objNames = append(objNames, path.Join(args.ObjPath, strconv.Itoa(i)))
 		} else {
 			objNames = append(objNames, path.Join(args.ObjPath, trand.String(16)))
 		}
@@ -361,7 +358,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 					// We could PUT while creating files, but that makes it
 					// begin all the puts immediately (because creating random files is fast
 					// compared to the list objects call that getRandomFiles does)
-					_, err = api.PutObject(api.PutArgs{
+					_, err = api.PutObject(&api.PutArgs{
 						BaseParams: bp,
 						Bck:        args.Bck,
 						ObjName:    objName,
@@ -393,7 +390,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 func PutObjectInRemoteBucketWithoutCachingLocally(t *testing.T, bck cmn.Bck, object string, objContent cos.ReadOpenCloser) {
 	bp := BaseAPIParams()
 
-	_, err := api.PutObject(api.PutArgs{
+	_, err := api.PutObject(&api.PutArgs{
 		BaseParams: bp,
 		Bck:        bck,
 		ObjName:    object,
@@ -422,15 +419,15 @@ func GetObjectAtime(t *testing.T, bp api.BaseParams, bck cmn.Bck, object, timeFo
 	return time.Time{}, ""
 }
 
-// WaitForDSortToFinish waits until all dSorts jobs finished without failure or
+// WaitForDsortToFinish waits until all dSorts jobs finished without failure or
 // all jobs abort.
-func WaitForDSortToFinish(proxyURL, managerUUID string) (allAborted bool, err error) {
+func WaitForDsortToFinish(proxyURL, managerUUID string) (allAborted bool, err error) {
 	tlog.Logf("waiting for dsort[%s]\n", managerUUID)
 
 	bp := BaseAPIParams(proxyURL)
 	deadline := time.Now().Add(DsortFinishTimeout)
 	for time.Now().Before(deadline) {
-		all, err := api.MetricsDSort(bp, managerUUID)
+		all, err := api.MetricsDsort(bp, managerUUID)
 		if err != nil {
 			return false, err
 		}
@@ -467,42 +464,15 @@ func BaseAPIParams(urls ...string) api.BaseParams {
 	return api.BaseParams{Client: gctx.Client, URL: u, Token: LoggedUserToken, UA: "tools/test"}
 }
 
-// waitForBucket waits until all targets ack having ais bucket created or deleted
-func WaitForBucket(proxyURL string, query cmn.QueryBcks, exists bool) error {
-	bp := BaseAPIParams(proxyURL)
-	smap, err := api.GetClusterMap(bp)
-	if err != nil {
-		return err
-	}
-	to := time.Now().Add(bucketTimeout)
-	for _, s := range smap.Tmap {
-		for {
-			bp := BaseAPIParams(s.URL(cmn.NetPublic))
-			bucketExists, err := api.QueryBuckets(bp, query, apc.FltExists)
-			if err != nil {
-				return err
-			}
-			if bucketExists == exists {
-				break
-			}
-			if time.Now().After(to) {
-				return fmt.Errorf("wait for ais bucket timed out, target = %s", bp.URL)
-			}
-			time.Sleep(time.Second)
-		}
-	}
-	return nil
-}
-
 func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList []string) {
 	bp := BaseAPIParams(proxyURL)
-	xid, err := api.EvictList(bp, bck, objList)
+	xid, err := api.EvictMultiObj(bp, bck, objList, "" /*template*/)
 	if err != nil {
 		t.Errorf("Evict bucket %s failed, err = %v", bck, err)
 	}
 
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: EvictPrefetchTimeout}
-	if _, err := api.WaitForXactionIC(bp, args); err != nil {
+	if _, err := api.WaitForXactionIC(bp, &args); err != nil {
 		t.Errorf("Wait for xaction to finish failed, err = %v", err)
 	}
 }
@@ -539,7 +509,7 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 	go func() {
 		defer wg.Done()
 		xargs := xact.ArgsMsg{Kind: apc.ActRebalance, OnlyRunning: true, Timeout: timeout}
-		if _, err := api.WaitForXactionIC(bp, xargs); err != nil {
+		if _, err := api.WaitForXactionIC(bp, &xargs); err != nil {
 			if cmn.IsStatusNotFound(err) {
 				return
 			}
@@ -550,7 +520,7 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 	go func() {
 		defer wg.Done()
 		xargs := xact.ArgsMsg{Kind: apc.ActResilver, OnlyRunning: true, Timeout: timeout}
-		if _, err := api.WaitForXactionIC(bp, xargs); err != nil {
+		if _, err := api.WaitForXactionIC(bp, &xargs); err != nil {
 			if cmn.IsStatusNotFound(err) {
 				return
 			}
@@ -569,14 +539,14 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 // compare w/ `tools.WaitForResilvering`
 func _waitResil(t testing.TB, bp api.BaseParams, timeout time.Duration) {
 	xargs := xact.ArgsMsg{Kind: apc.ActResilver, OnlyRunning: true, Timeout: timeout}
-	_, err := api.WaitForXactionIC(bp, xargs)
+	_, err := api.WaitForXactionIC(bp, &xargs)
 	if err == nil {
 		return
 	}
 	if herr, ok := err.(*cmn.ErrHTTP); ok {
 		if herr.Status == http.StatusNotFound { // double check iff not found
 			time.Sleep(xactPollSleep)
-			_, err = api.WaitForXactionIC(bp, xargs)
+			_, err = api.WaitForXactionIC(bp, &xargs)
 		}
 	}
 	if err == nil {
@@ -601,7 +571,7 @@ func WaitForRebalanceByID(t *testing.T, bp api.BaseParams, rebID string, timeout
 	}
 	tlog.Logf("Wait for rebalance %s\n", rebID)
 	xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, OnlyRunning: true, Timeout: timeout}
-	_, err := api.WaitForXactionIC(bp, xargs)
+	_, err := api.WaitForXactionIC(bp, &xargs)
 	tassert.CheckFatal(t, err)
 }
 
@@ -610,12 +580,11 @@ func _waitReToStart(bp api.BaseParams) {
 		kinds   = []string{apc.ActRebalance, apc.ActResilver}
 		timeout = max(10*xactPollSleep, MaxCplaneTimeout)
 		retries = int(timeout / xactPollSleep)
-		args    = xact.ArgsMsg{Timeout: xactPollSleep, OnlyRunning: true}
 	)
 	for i := 0; i < retries; i++ {
 		for _, kind := range kinds {
-			args.Kind = kind
-			status, err := api.GetOneXactionStatus(bp, args)
+			args := xact.ArgsMsg{Timeout: xactPollSleep, OnlyRunning: true, Kind: kind}
+			status, err := api.GetOneXactionStatus(bp, &args)
 			if err == nil {
 				if !status.Finished() {
 					return
@@ -679,7 +648,7 @@ func SetClusterConfig(t *testing.T, nvs cos.StrKVs) {
 	tassert.CheckError(t, err)
 }
 
-func SetClusterConfigUsingMsg(t *testing.T, toUpdate *cmn.ConfigToUpdate) {
+func SetClusterConfigUsingMsg(t *testing.T, toUpdate *cmn.ConfigToSet) {
 	proxyURL := GetPrimaryURL()
 	bp := BaseAPIParams(proxyURL)
 	err := api.SetClusterConfigUsingMsg(bp, toUpdate, false /*transient*/)

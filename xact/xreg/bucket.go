@@ -6,16 +6,16 @@ package xreg
 
 import (
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
 )
 
 type (
 	TCBArgs struct {
-		DP      cluster.DP
+		DP      core.DP
 		BckFrom *meta.Bck
 		BckTo   *meta.Bck
 		Msg     *apc.TCBMsg
@@ -24,7 +24,7 @@ type (
 	TCObjsArgs struct {
 		BckFrom *meta.Bck
 		BckTo   *meta.Bck
-		DP      cluster.DP
+		DP      core.DP
 	}
 	DsortArgs struct {
 		BckFrom *meta.Bck
@@ -34,7 +34,6 @@ type (
 		Phase string
 	}
 	BckRenameArgs struct {
-		T       cluster.TargetExt
 		BckFrom *meta.Bck
 		BckTo   *meta.Bck
 		RebID   string
@@ -64,30 +63,31 @@ func RenewBucketXact(kind string, bck *meta.Bck, args Args, buckets ...*meta.Bck
 	return dreg.renew(e, bck, buckets...)
 }
 
-func RenewECEncode(t cluster.Target, bck *meta.Bck, uuid, phase string) RenewRes {
-	return RenewBucketXact(apc.ActECEncode, bck, Args{T: t, Custom: &ECEncodeArgs{Phase: phase}, UUID: uuid})
+func RenewECEncode(bck *meta.Bck, uuid, phase string) RenewRes {
+	return RenewBucketXact(apc.ActECEncode, bck, Args{Custom: &ECEncodeArgs{Phase: phase}, UUID: uuid})
 }
 
-func RenewMakeNCopies(t cluster.Target, uuid, tag string) {
+func RenewMakeNCopies(uuid, tag string) {
 	var (
 		cfg      = cmn.GCO.Get()
-		bmd      = t.Bowner().Get()
+		bmd      = core.T.Bowner().Get()
 		provider = apc.AIS
 	)
 	bmd.Range(&provider, nil, func(bck *meta.Bck) bool {
 		if bck.Props.Mirror.Enabled {
-			rns := RenewBckMakeNCopies(t, bck, uuid, tag, int(bck.Props.Mirror.Copies))
+			rns := RenewBckMakeNCopies(bck, uuid, tag, int(bck.Props.Mirror.Copies))
 			if rns.Err == nil && !rns.IsRunning() {
 				xact.GoRunW(rns.Entry.Get())
 			}
 		}
 		return false
 	})
-	// TODO: remote ais
-	for name, ns := range cfg.Backend.Providers {
+	// TODO: remais
+	for name := range cfg.Backend.Providers {
+		ns := cfg.Backend.Providers[name]
 		bmd.Range(&name, &ns, func(bck *meta.Bck) bool {
 			if bck.Props.Mirror.Enabled {
-				rns := RenewBckMakeNCopies(t, bck, uuid, tag, int(bck.Props.Mirror.Copies))
+				rns := RenewBckMakeNCopies(bck, uuid, tag, int(bck.Props.Mirror.Copies))
 				if rns.Err == nil && !rns.IsRunning() {
 					xact.GoRunW(rns.Entry.Get())
 				}
@@ -97,28 +97,28 @@ func RenewMakeNCopies(t cluster.Target, uuid, tag string) {
 	}
 }
 
-func RenewBckMakeNCopies(t cluster.Target, bck *meta.Bck, uuid, tag string, copies int) (res RenewRes) {
-	e := dreg.bckXacts[apc.ActMakeNCopies].New(Args{T: t, Custom: &MNCArgs{tag, copies}, UUID: uuid}, bck)
+func RenewBckMakeNCopies(bck *meta.Bck, uuid, tag string, copies int) (res RenewRes) {
+	e := dreg.bckXacts[apc.ActMakeNCopies].New(Args{Custom: &MNCArgs{tag, copies}, UUID: uuid}, bck)
 	return dreg.renew(e, bck)
 }
 
-func RenewPromote(t cluster.Target, uuid string, bck *meta.Bck, args *cluster.PromoteArgs) RenewRes {
-	return RenewBucketXact(apc.ActPromote, bck, Args{T: t, Custom: args, UUID: uuid})
+func RenewPromote(uuid string, bck *meta.Bck, args *apc.PromoteArgs) RenewRes {
+	return RenewBucketXact(apc.ActPromote, bck, Args{Custom: args, UUID: uuid})
 }
 
-func RenewBckLoadLomCache(t cluster.Target, uuid string, bck *meta.Bck) RenewRes {
-	return RenewBucketXact(apc.ActLoadLomCache, bck, Args{T: t, UUID: uuid})
+func RenewBckLoadLomCache(uuid string, bck *meta.Bck) RenewRes {
+	return RenewBucketXact(apc.ActLoadLomCache, bck, Args{UUID: uuid})
 }
 
-func RenewPutMirror(t cluster.Target, lom *cluster.LOM) RenewRes {
-	return RenewBucketXact(apc.ActPutCopies, lom.Bck(), Args{T: t, Custom: lom})
+func RenewPutMirror(lom *core.LOM) RenewRes {
+	return RenewBucketXact(apc.ActPutCopies, lom.Bck(), Args{Custom: lom})
 }
 
-func RenewTCB(t cluster.Target, uuid, kind string, custom *TCBArgs) RenewRes {
+func RenewTCB(uuid, kind string, custom *TCBArgs) RenewRes {
 	return RenewBucketXact(
 		kind,
 		custom.BckTo, // prevent concurrent copy/transform => same dst
-		Args{T: t, Custom: custom, UUID: uuid},
+		Args{Custom: custom, UUID: uuid},
 		custom.BckFrom, custom.BckTo, // find when renewing
 	)
 }
@@ -132,18 +132,17 @@ func RenewDsort(id string, custom *DsortArgs) RenewRes {
 	)
 }
 
-func RenewBckRename(t cluster.TargetExt, bckFrom, bckTo *meta.Bck, uuid string, rmdVersion int64, phase string) RenewRes {
+func RenewBckRename(bckFrom, bckTo *meta.Bck, uuid string, rmdVersion int64, phase string) RenewRes {
 	custom := &BckRenameArgs{
-		T:       t,
 		Phase:   phase,
 		RebID:   xact.RebID2S(rmdVersion),
 		BckFrom: bckFrom,
 		BckTo:   bckTo,
 	}
-	return RenewBucketXact(apc.ActMoveBck, bckTo, Args{T: t, Custom: custom, UUID: uuid})
+	return RenewBucketXact(apc.ActMoveBck, bckTo, Args{Custom: custom, UUID: uuid})
 }
 
-func RenewLso(t cluster.Target, bck *meta.Bck, uuid string, msg *apc.LsoMsg) RenewRes {
-	e := dreg.bckXacts[apc.ActList].New(Args{T: t, UUID: uuid, Custom: msg}, bck)
+func RenewLso(bck *meta.Bck, uuid string, msg *apc.LsoMsg) RenewRes {
+	e := dreg.bckXacts[apc.ActList].New(Args{UUID: uuid, Custom: msg}, bck)
 	return dreg.renewByID(e, bck)
 }

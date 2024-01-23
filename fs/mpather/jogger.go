@@ -12,29 +12,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"golang.org/x/sync/errgroup"
 )
 
+// walk all or selected buckets, one at a time
+
 const (
-	throttleNumObjects = 16 // unit of self-throttling
+	throttleNumObjects = 64 // unit of self-throttling
 )
 
 type LoadType int
 
 const (
 	noLoad LoadType = iota
+	LoadUnsafe
 	Load
-	LoadRLock
-	LoadLock
 )
 
 const (
@@ -45,17 +46,18 @@ const (
 
 type (
 	JgroupOpts struct {
-		T                     cluster.Target
 		onFinish              func()
-		VisitObj              func(lom *cluster.LOM, buf []byte) error
-		VisitCT               func(ct *cluster.CT, buf []byte) error
+		VisitObj              func(lom *core.LOM, buf []byte) error
+		VisitCT               func(ct *core.CT, buf []byte) error
 		Slab                  *memsys.Slab
 		Bck                   cmn.Bck
+		Buckets               cmn.Bcks
 		Prefix                string
 		CTs                   []string
 		DoLoad                LoadType // if specified, lom.Load(lock type)
 		Parallel              int      // num parallel calls
 		IncludeCopy           bool     // visit copies (aka replicas)
+		PerBucket             bool     // num joggers = (num mountpaths) x (num buckets)
 		SkipGloballyMisplaced bool     // skip globally misplaced
 		Throttle              bool     // true: pace itself depending on disk utilization
 	}
@@ -92,41 +94,51 @@ type (
 	}
 )
 
-func NewJoggerGroup(opts *JgroupOpts, selectedMpaths ...string) *Jgroup {
+func NewJoggerGroup(opts *JgroupOpts, config *cmn.Config, mpath string) *Jgroup {
 	var (
-		joggers             map[string]*jogger
-		available, disabled = fs.Get()
-		wg, ctx             = errgroup.WithContext(context.Background())
-		l                   = len(selectedMpaths)
+		joggers map[string]*jogger
+		avail   = fs.GetAvail()
+		wg, ctx = errgroup.WithContext(context.Background())
 	)
 	debug.Assert(!opts.IncludeCopy || (opts.IncludeCopy && opts.DoLoad > noLoad))
 
-	if l == 0 {
-		joggers = make(map[string]*jogger, len(available))
-	} else {
-		joggers = make(map[string]*jogger, l)
-	}
-	for _, mi := range available {
-		if l == 0 {
-			joggers[mi.Path] = newJogger(ctx, opts, mi)
-			continue
-		}
-		for _, mpath := range selectedMpaths {
-			if mi, ok := available[mpath]; ok {
-				joggers[mi.Path] = newJogger(ctx, opts, mi)
-			}
-		}
-	}
-	jg := &Jgroup{wg: wg, joggers: joggers}
-	jg.finishedCh.Init()
+	jg := &Jgroup{wg: wg}
 	opts.onFinish = jg.markFinished
 
-	// NOTE: this jogger group is a no-op
-	if len(joggers) == 0 {
-		nlog.Errorf("%v: avail=%v, disabled=%v, selected=%v",
-			cmn.ErrNoMountpaths, available, disabled, selectedMpaths)
-		jg.finishedCh.Close()
+	switch {
+	case mpath != "":
+		joggers = make(map[string]*jogger, 1)
+		if mi, ok := avail[mpath]; ok {
+			joggers[mi.Path] = newJogger(ctx, opts, mi, config)
+		}
+	case opts.PerBucket:
+		debug.Assert(len(opts.Buckets) > 1)
+		joggers = make(map[string]*jogger, len(avail)*len(opts.Buckets))
+		for _, bck := range opts.Buckets {
+			nopts := *opts
+			nopts.Buckets = nil
+			nopts.Bck = bck
+			uname := bck.MakeUname("")
+			for _, mi := range avail {
+				joggers[mi.Path+"|"+uname] = newJogger(ctx, &nopts, mi, config)
+			}
+		}
+	default:
+		joggers = make(map[string]*jogger, len(avail))
+		for _, mi := range avail {
+			joggers[mi.Path] = newJogger(ctx, opts, mi, config)
+		}
 	}
+
+	// this jogger group is a no-op (unlikely)
+	if len(joggers) == 0 {
+		_, disabled := fs.Get()
+		nlog.Errorf("%v: avail=%v, disabled=%v, selected=%q", cmn.ErrNoMountpaths, avail, disabled, mpath)
+	}
+
+	jg.joggers = joggers
+	jg.finishedCh.Init()
+
 	return jg
 }
 
@@ -155,7 +167,7 @@ func (jg *Jgroup) markFinished() {
 	}
 }
 
-func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath) (j *jogger) {
+func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath, config *cmn.Config) (j *jogger) {
 	var syncGroup *joggerSyncGroup
 	if opts.Parallel > 1 {
 		var (
@@ -177,7 +189,7 @@ func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath) (j *jogg
 		ctx:       ctx,
 		opts:      opts,
 		mi:        mi,
-		config:    cmn.GCO.Get(),
+		config:    config,
 		syncGroup: syncGroup,
 	}
 	if opts.Prefix != "" {
@@ -188,8 +200,7 @@ func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath) (j *jogg
 	return
 }
 
-func (j *jogger) run() error {
-	defer j.opts.onFinish()
+func (j *jogger) run() (err error) {
 	if j.opts.Slab != nil {
 		if j.opts.Parallel <= 1 {
 			j.bufs = [][]byte{j.opts.Slab.Alloc()}
@@ -199,32 +210,70 @@ func (j *jogger) run() error {
 				j.bufs[i] = j.opts.Slab.Alloc()
 			}
 		}
-
-		defer func() {
-			for _, buf := range j.bufs {
-				j.opts.Slab.Free(buf)
-			}
-		}()
 	}
 
-	var (
-		aborted bool
-		err     error
-	)
-	// walk all buckets, one at a time
-	if j.opts.Bck.IsEmpty() {
-		bmd := j.opts.T.Bowner().Get()
-		bmd.Range(nil, nil, func(bck *meta.Bck) bool {
-			aborted, err = j.runBck(bck.Bucket())
-			return err != nil || aborted
-		})
-		return err
+	// 3 running options
+	switch {
+	case len(j.opts.Buckets) > 0:
+		debug.Assert(j.opts.Bck.IsEmpty())
+		err = j.runSelected()
+	case j.opts.Bck.IsQuery():
+		err = j.runQbck(cmn.QueryBcks(j.opts.Bck))
+	default:
+		_, err = j.runBck(&j.opts.Bck)
 	}
-	// walk the specified bucket
-	_, err = j.runBck(&j.opts.Bck)
-	return err
+
+	// cleanup
+	if j.opts.Slab != nil {
+		for _, buf := range j.bufs {
+			j.opts.Slab.Free(buf)
+		}
+	}
+	j.opts.onFinish()
+	return
 }
 
+// run selected buckets, one at a time
+func (j *jogger) runSelected() error {
+	var errs cos.Errs
+	for i := range j.opts.Buckets {
+		aborted, err := j.runBck(&j.opts.Buckets[i])
+		if err != nil {
+			errs.Add(err)
+		}
+		if aborted {
+			return &errs
+		}
+	}
+	return nil
+}
+
+// run matching, one at a time
+func (j *jogger) runQbck(qbck cmn.QueryBcks) (err error) {
+	var (
+		bmd      = core.T.Bowner().Get()
+		provider *string
+		ns       *cmn.Ns
+		errs     cos.Errs
+	)
+	if qbck.Provider != "" {
+		provider = &qbck.Provider
+	}
+	if !qbck.Ns.IsGlobal() {
+		ns = &qbck.Ns
+	}
+	bmd.Range(provider, ns, func(bck *meta.Bck) bool {
+		aborted, errV := j.runBck(bck.Bucket())
+		if err != nil {
+			errs.Add(errV)
+			err = &errs
+		}
+		return aborted
+	})
+	return
+}
+
+// run single (see also: `PerBucket` above)
 func (j *jogger) runBck(bck *cmn.Bck) (aborted bool, err error) {
 	opts := &fs.WalkOpts{
 		Mi:       j.mi,
@@ -307,30 +356,30 @@ func (j *jogger) jog(fqn string, de fs.DirEntry) error {
 }
 
 func (j *jogger) visitFQN(fqn string, buf []byte) error {
-	ct, err := cluster.NewCTFromFQN(fqn, j.opts.T.Bowner())
+	ct, err := core.NewCTFromFQN(fqn, core.T.Bowner())
 	if err != nil {
 		return err
 	}
 
 	if j.opts.SkipGloballyMisplaced {
-		uname := ct.Bck().MakeUname(ct.ObjectName())
-		tsi, err := cluster.HrwTarget(uname, j.opts.T.Sowner().Get())
+		smap := core.T.Sowner().Get()
+		tsi, err := smap.HrwHash2T(ct.Digest())
 		if err != nil {
 			return err
 		}
-		if tsi.ID() != j.opts.T.SID() {
+		if tsi.ID() != core.T.SID() {
 			return nil
 		}
 	}
 
 	switch ct.ContentType() {
 	case fs.ObjectType:
-		lom := cluster.AllocLOM("")
+		lom := core.AllocLOM("")
 		lom.InitCT(ct)
 		err := j.visitObj(lom, buf)
 		// NOTE: j.visitObj() callback impl-s must either finish the entire
 		//       operation synchronously OR pass lom.LIF to other gorouine(s)
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 		return err
 	default:
 		if err := j.visitCT(ct, buf); err != nil {
@@ -340,29 +389,28 @@ func (j *jogger) visitFQN(fqn string, buf []byte) error {
 	return nil
 }
 
-func (j *jogger) visitObj(lom *cluster.LOM, buf []byte) error {
-	var locked bool
-	if j.opts.DoLoad > noLoad {
-		if j.opts.DoLoad == LoadRLock {
-			lom.Lock(false)
-			locked = true
-			defer lom.Unlock(false)
-		} else if j.opts.DoLoad == LoadLock {
-			lom.Lock(true)
-			locked = true
-			defer lom.Unlock(true)
-		}
-		if err := lom.Load(false /*cache it*/, locked); err != nil {
-			return err
-		}
-		if !j.opts.IncludeCopy && lom.IsCopy() {
-			return nil
-		}
+func (j *jogger) visitObj(lom *core.LOM, buf []byte) (err error) {
+	switch j.opts.DoLoad {
+	case noLoad:
+		goto visit
+	case LoadUnsafe:
+		err = lom.LoadUnsafe()
+	case Load:
+		err = lom.Load(false, false)
+	default:
+		debug.Assert(false, "invalid 'opts.DoLoad'", j.opts.DoLoad)
 	}
+	if err != nil {
+		return
+	}
+	if !j.opts.IncludeCopy && lom.IsCopy() {
+		return nil
+	}
+visit:
 	return j.opts.VisitObj(lom, buf)
 }
 
-func (j *jogger) visitCT(ct *cluster.CT, buf []byte) error { return j.opts.VisitCT(ct, buf) }
+func (j *jogger) visitCT(ct *core.CT, buf []byte) error { return j.opts.VisitCT(ct, buf) }
 
 func (j *jogger) getBuf(position int) []byte {
 	if j.bufs == nil {

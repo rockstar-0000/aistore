@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
 #
 import hashlib
 import unittest
@@ -8,8 +8,8 @@ import io
 
 import pytest
 
-from aistore.sdk.const import PROVIDER_AIS
-from aistore.sdk.errors import InvalidBckProvider
+from aistore.sdk.const import PROVIDER_AIS, LOREM, DUIS
+from aistore.sdk.errors import InvalidBckProvider, AISError
 from tests.integration import REMOTE_SET, TEST_TIMEOUT, OBJECT_COUNT
 from tests.integration.sdk.remote_enabled_test import RemoteEnabledTest
 from tests.utils import random_string
@@ -20,6 +20,8 @@ class TestObjectGroupOps(RemoteEnabledTest):
     def setUp(self) -> None:
         super().setUp()
         self.obj_names = self._create_objects(suffix="-suffix")
+        if REMOTE_SET:
+            self.s3_client = self._get_boto3_client()
 
     def test_delete(self):
         object_group = self.bucket.objects(obj_names=self.obj_names[1:])
@@ -78,6 +80,108 @@ class TestObjectGroupOps(RemoteEnabledTest):
         self.assertEqual(
             4, len(to_bck.list_all_objects(prefix=new_prefix + self.obj_prefix))
         )
+
+    @unittest.skipIf(
+        not REMOTE_SET,
+        "Remote bucket is not set",
+    )
+    def test_copy_objects_latest_flag(self):
+        obj_name = random_string()
+        self.cloud_objects.append(obj_name)
+        to_bck_name = "dst-bck-cp-latest"
+        to_bck = self._create_bucket(to_bck_name)
+
+        # out-of-band PUT: first version
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=LOREM)
+
+        # copy, and check
+        self._copy_and_check_with_latest(self.bucket, to_bck, obj_name, LOREM, False)
+        # create a cached copy in src bucket
+        content = self.bucket.object(obj_name).get().read_all()
+        self.assertEqual(LOREM, content.decode("utf-8"))
+
+        # out-of-band PUT: 2nd version (overwrite)
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=DUIS)
+
+        # copy and check (expecting the first version)
+        self._copy_and_check_with_latest(self.bucket, to_bck, obj_name, LOREM, False)
+
+        # copy latest: update in-cluster copy
+        self._copy_and_check_with_latest(self.bucket, to_bck, obj_name, DUIS, True)
+        # check if cached copy is src bck is still on prev version
+        content = self.bucket.object(obj_name).get().read_all()
+        self.assertEqual(LOREM, content.decode("utf-8"))
+
+        # out-of-band DELETE
+        self.s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
+
+        # copy and check (expecting no changes)
+        self._copy_and_check_with_latest(self.bucket, to_bck, obj_name, DUIS, True)
+
+        # run copy with '--sync' one last time, and make sure the object "disappears"
+        copy_job = self.bucket.objects(obj_names=[obj_name]).copy(
+            self.bucket, sync=True
+        )
+        self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        with self.assertRaises(AISError):
+            self.bucket.object(obj_name).get()
+
+        # TODO: add check for different dst bucket (after delete)
+
+    @unittest.skipIf(
+        not REMOTE_SET,
+        "Remote bucket is not set",
+    )
+    def test_prefetch_objects_latest_flag(self):
+        obj_name = random_string()
+        self.cloud_objects.append(obj_name)
+        to_bck_name = "dst-bck-prefetch-latest"
+
+        # out-of-band PUT: first version
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=LOREM)
+
+        # prefetch, and check
+        self._prefetch_and_check_with_latest(self.bucket, obj_name, LOREM, False)
+
+        # out-of-band PUT: 2nd version (overwrite)
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=DUIS)
+
+        # prefetch and check (expecting the first version)
+        self._prefetch_and_check_with_latest(self.bucket, obj_name, LOREM, False)
+
+        # prefetch latest: update in-cluster copy
+        self._prefetch_and_check_with_latest(self.bucket, obj_name, DUIS, True)
+
+        # out-of-band DELETE
+        self.s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
+
+        # prefetch without '--latest': expecting no changes
+        self._prefetch_and_check_with_latest(self.bucket, obj_name, DUIS, False)
+
+        # run prefetch with '--latest' one last time, and make sure the object "disappears"
+        prefetch_job = self.bucket.objects(obj_names=[obj_name]).prefetch(latest=True)
+        self.client.job(job_id=prefetch_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        with self.assertRaises(AISError):
+            self.bucket.object(obj_name).get()
+
+    def _prefetch_and_check_with_latest(self, bucket, obj_name, expected, latest_flag):
+        prefetch_job = bucket.objects(obj_names=[obj_name]).prefetch(latest=latest_flag)
+        self.client.job(job_id=prefetch_job).wait_for_idle(timeout=TEST_TIMEOUT)
+
+        content = bucket.object(obj_name).get().read_all()
+        self.assertEqual(expected, content.decode("utf-8"))
+
+    # pylint: disable=too-many-arguments
+    def _copy_and_check_with_latest(
+        self, from_bck, to_bck, obj_name, expected, latest_flag
+    ):
+        copy_job = from_bck.objects(obj_names=[obj_name]).copy(
+            to_bck, latest=latest_flag
+        )
+        self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertEqual(1, len(to_bck.list_all_objects()))
+        content = to_bck.object(obj_name).get().read_all()
+        self.assertEqual(expected, content.decode("utf-8"))
 
     def test_archive_objects_without_copy(self):
         arch_name = self.obj_prefix + "-archive-without-copy.tar"
@@ -153,27 +257,3 @@ class TestObjectGroupOps(RemoteEnabledTest):
         job_id = self.bucket.objects(obj_names=self.obj_names).evict()
         self.client.job(job_id).wait(timeout=TEST_TIMEOUT)
         self._check_all_objects_cached(OBJECT_COUNT, expected_cached=False)
-
-    def _verify_cached_objects(self, expected_object_count, cached_range):
-        """
-        List each of the objects and verify the correct count and that all objects matching
-        the cached range are cached and all others are not
-
-        Args:
-            expected_object_count: expected number of objects to list
-            cached_range: object indices that should be cached, all others should not
-        """
-        objects = self.bucket.list_objects(
-            props="name,cached", prefix=self.obj_prefix
-        ).entries
-        self.assertEqual(expected_object_count, len(objects))
-        cached_names = {self.obj_prefix + str(x) + "-suffix" for x in cached_range}
-        cached_objs = []
-        evicted_objs = []
-        for obj in objects:
-            if obj.name in cached_names:
-                cached_objs.append(obj)
-            else:
-                evicted_objs.append(obj)
-        self._validate_objects_cached(cached_objs, True)
-        self._validate_objects_cached(evicted_objs, False)

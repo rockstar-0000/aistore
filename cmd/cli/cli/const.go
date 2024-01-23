@@ -1,9 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
-//
-// This file contains common constants and global variables
-// (including all command-line options aka flags).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -16,6 +13,8 @@ import (
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/urfave/cli"
 )
+
+// Contains common constants and global variables (including all command-line options aka flags).
 
 // top-level commands (categories - nouns)
 const (
@@ -48,6 +47,7 @@ const (
 	cmdRmSmap        = "remove-from-smap"
 	cmdRandNode      = "random-node"
 	cmdRandMountpath = "random-mountpath"
+	cmdRotateLogs    = "rotate-logs"
 )
 
 // - 2nd level subcommands (mostly, verbs)
@@ -210,7 +210,7 @@ const nodeLogFlushName = "log.flush_time"
 
 const (
 	tabtab     = "press <TAB-TAB> to select"
-	tabHelpOpt = "press <TAB-TAB> to select, '--help' for options"
+	tabHelpOpt = "press <TAB-TAB> to select, '--help' for more options"
 	tabHelpDet = "press <TAB-TAB> to select, '--help' for details"
 )
 
@@ -223,7 +223,7 @@ const (
 	optionalJobIDArgument         = "[JOB_ID]"
 	optionalJobIDDaemonIDArgument = "[JOB_ID [NODE_ID]]"
 
-	jobShowStopWaitArgument  = "[NAME] [JOB_ID] [NODE_ID] [BUCKET]"
+	jobAnyArg                = "[NAME] [JOB_ID] [NODE_ID] [BUCKET]"
 	jobShowRebalanceArgument = "[REB_ID] [NODE_ID]"
 
 	// Perf
@@ -243,27 +243,33 @@ const (
 	bucketsArgument        = "BUCKET [BUCKET...]"
 	bucketPropsArgument    = bucketArgument + " " + jsonKeyValueArgument + " | " + keyValuePairsArgument
 	bucketAndPropsArgument = "BUCKET [PROP_PREFIX]"
-	bucketSrcArgument      = "SRC_BUCKET"
-	bucketDstArgument      = "DST_BUCKET"
-	bucketNewArgument      = "NEW_BUCKET"
+
+	bucketObjectOrTemplateMultiArg = "BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]"
+
+	bucketSrcArgument       = "SRC_BUCKET"
+	bucketObjectSrcArgument = "SRC_BUCKET[/OBJECT_NAME_or_TEMPLATE]"
+	bucketDstArgument       = "DST_BUCKET"
+	bucketNewArgument       = "NEW_BUCKET"
 
 	dsortSpecArgument = "[JSON_SPECIFICATION|YAML_SPECIFICATION|-] [SRC_BUCKET] [DST_BUCKET]"
 
 	// Objects
 	objectArgument          = "BUCKET/OBJECT_NAME"
-	optionalObjArgument     = "BUCKET[/OBJECT_NAME]"
 	optionalObjectsArgument = "BUCKET[/OBJECT_NAME] ..."
-	shardArgument           = "BUCKET/SHARD_NAME"
-	optionalShardArgument   = "BUCKET[/SHARD_NAME]"
 	dstShardArgument        = bucketDstArgument + "/SHARD_NAME"
 
-	getObjectArgument   = optionalObjArgument + " [OUT_FILE|OUT_DIR|-]"
-	getShardArgument    = optionalShardArgument + " [OUT_FILE|OUT_DIR|-]"
-	putObjectArgument   = "[-|FILE|DIRECTORY[/PATTERN]] " + optionalObjArgument
-	putApndArchArgument = "[-|FILE|DIRECTORY[/PATTERN]] " + shardArgument
+	getObjectArgument = "BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-]"
 
-	promoteObjectArgument = "FILE|DIRECTORY[/PATTERN] " + optionalObjArgument
-	concatObjectArgument  = "FILE|DIRECTORY[/PATTERN] [ FILE|DIRECTORY[/PATTERN] ...] " + objectArgument
+	optionalPrefixArgument = "BUCKET[/OBJECT_NAME_or_PREFIX]"
+	putObjectArgument      = "[-|FILE|DIRECTORY[/PATTERN]] " + optionalPrefixArgument
+	promoteObjectArgument  = "FILE|DIRECTORY[/PATTERN] " + optionalPrefixArgument
+
+	shardArgument         = "BUCKET/SHARD_NAME"
+	optionalShardArgument = "BUCKET[/SHARD_NAME]"
+	putApndArchArgument   = "[-|FILE|DIRECTORY[/PATTERN]] " + shardArgument
+	getShardArgument      = optionalShardArgument + " [OUT_FILE|OUT_DIR|-]"
+
+	concatObjectArgument = "FILE|DIRECTORY[/PATTERN] [ FILE|DIRECTORY[/PATTERN] ...] " + objectArgument
 
 	renameObjectArgument = objectArgument + " NEW_OBJECT_NAME"
 
@@ -315,7 +321,7 @@ const (
 	showAuthUserListArgument  = "[USER_NAME]"
 	addSetAuthRoleArgument    = "ROLE [PERMISSION ...]"
 	deleteAuthRoleArgument    = "ROLE"
-	deleteAuthTokenArgument   = "TOKEN | TOKEN_FILE"
+	deleteAuthTokenArgument   = "TOKEN | TOKEN_FILE" //nolint:gosec // false positive G101
 
 	// Alias
 	aliasURLPairArgument = "ALIAS=URL (or UUID=URL)"
@@ -356,19 +362,11 @@ var (
 	rmrfFlag            = cli.BoolFlag{Name: scopeAll, Usage: "remove all objects (use it with extreme caution!)"}
 	allLogsFlag         = cli.BoolFlag{Name: scopeAll, Usage: "download all logs"}
 
-	allColumnsFlag = cli.BoolFlag{
-		Name:  scopeAll,
-		Usage: "when printing tables, show all columns including those that have only zero values",
-	}
 	allObjsOrBcksFlag = cli.BoolFlag{
 		Name: scopeAll,
-		Usage: "depending on the context:\n" +
-			indent4 + "\t- all objects in a given bucket, including misplaced and copies, or\n" +
-			indent4 + "\t- all buckets, including accessible (visible) remote buckets that are _not present_ in the cluster",
-	}
-	allBcksFlag = cli.BoolFlag{
-		Name:  scopeAll,
-		Usage: "all buckets, including accessible remote buckets that are not present in the cluster",
+		Usage: "depending on the context, list:\n" +
+			indent4 + "\t- all buckets, including accessible (visible) remote buckets that are _not present_ in the cluster\n" +
+			indent4 + "\t- all objects in a given accessible (visible) bucket, including remote objects and misplaced copies",
 	}
 	copyAllObjsFlag = cli.BoolFlag{
 		Name:  scopeAll,
@@ -391,23 +389,24 @@ var (
 	// prefix (to match)
 	listObjPrefixFlag = cli.StringFlag{
 		Name: "prefix",
-		Usage: "list objects that start with the specified prefix, e.g.:\n" +
+		Usage: "list objects that have names starting with the specified prefix, e.g.:\n" +
 			indent4 + "\t'--prefix a/b/c' - list virtual directory a/b/c and/or objects from the virtual directory\n" +
-			indent4 + "\ta/b that have their names (relative to this directory) starting with the letter c",
+			indent4 + "\ta/b that have their names (relative to this directory) starting with the letter 'c'",
 	}
 	getObjPrefixFlag = cli.StringFlag{
 		Name: listObjPrefixFlag.Name,
 		Usage: "get objects that start with the specified prefix, e.g.:\n" +
 			indent4 + "\t'--prefix a/b/c' - get objects from the virtual directory a/b/c and objects from the virtual directory\n" +
-			indent4 + "\ta/b that have their names (relative to this directory) starting with c;\n" +
-			indent4 + "\t'--prefix \"\"' - get entire bucket",
+			indent4 + "\ta/b that have their names (relative to this directory) starting with 'c';\n" +
+			indent4 + "\t'--prefix \"\"' - get entire bucket (all objects)",
 	}
-	copyObjPrefixFlag = cli.StringFlag{
+	verbObjPrefixFlag = cli.StringFlag{
 		Name: "prefix",
-		Usage: "copy objects that start with the specified prefix, e.g.:\n" +
-			indent4 + "\t'--prefix a/b/c' - copy virtual directory a/b/c and/or objects from the virtual directory\n" +
-			indent4 + "\ta/b that have their names (relative to this directory) starting with the letter c",
+		Usage: "select objects that have names starting with the specified prefix, e.g.:\n" +
+			indent4 + "\t'--prefix a/b/c'\t- matches names 'a/b/c/d', 'a/b/cdef', and similar;\n" +
+			indent4 + "\t'--prefix a/b/c/'\t- only matches objects from the virtual directory a/b/c/",
 	}
+
 	bsummPrefixFlag = cli.StringFlag{
 		Name: "prefix",
 		Usage: "for each bucket, select only those objects (names) that start with the specified prefix, e.g.:\n" +
@@ -442,8 +441,11 @@ var (
 			indent4 + "\tais ls ais://nnn --regex \"^A\"\t- match object names starting with letter A",
 	}
 	regexColsFlag = cli.StringFlag{
-		Name:  regexFlag.Name,
-		Usage: "regular expression to select table columns (case-insensitive), e.g.: --regex \"put|err\"",
+		Name: regexFlag.Name,
+		Usage: "regular expression select table columns (case-insensitive), e.g.:\n" +
+			indent4 + "\t --regex \"put|err\" - show PUT (count), PUT (total size), and all supported error counters;\n" +
+			indent4 + "\t --regex \"[a-z]\" - show all supported metrics, including those that have zero values across all nodes;\n" +
+			indent4 + "\t --regex \"(GET-COLD$|VERSION-CHANGE$)\" - show the number of cold GETs and object version changes (updates)",
 	}
 	regexJobsFlag = cli.StringFlag{
 		Name:  regexFlag.Name,
@@ -458,28 +460,30 @@ var (
 	dryRunFlag   = cli.BoolFlag{Name: "dry-run", Usage: "preview the results without really running the action"}
 
 	verboseFlag    = cli.BoolFlag{Name: "verbose,v", Usage: "verbose output"}
-	nonverboseFlag = cli.BoolFlag{Name: "non-verbose,nv", Usage: "non-verbose output"}
+	nonverboseFlag = cli.BoolFlag{Name: "non-verbose,nv", Usage: "non-verbose (quiet) output, minimized reporting"}
 	verboseJobFlag = cli.BoolFlag{
 		Name:  verboseFlag.Name,
 		Usage: "show extended statistics",
+	}
+	silentFlag = cli.BoolFlag{
+		Name:  "silent",
+		Usage: "server-side flag, an indication for aistore _not_ to log assorted errors (e.g., HEAD(object) failures)",
 	}
 
 	averageSizeFlag = cli.BoolFlag{Name: "average-size", Usage: "show average GET, PUT, etc. request size"}
 
 	ignoreErrorFlag = cli.BoolFlag{
 		Name:  "ignore-error",
-		Usage: "ignore \"soft\" failures, such as \"bucket already exists\", etc.",
+		Usage: "ignore \"soft\" failures such as \"bucket already exists\", etc.",
 	}
 
 	bucketPropsFlag = cli.StringFlag{
-		Name:  "props",
-		Usage: "bucket properties, e.g. --props=\"mirror.enabled=true mirror.copies=4 checksum.type=md5\"",
-	}
-
-	addRemoteBucketWithNoLookupFlag = cli.BoolFlag{
-		Name: "skip-lookup",
-		Usage: "add Cloud bucket to aistore without checking the bucket's accessibility and getting its Cloud properties\n" +
-			indent4 + "\t(usage must be limited to setting up bucket's aistore properties with alternative profile and/or endpoint)",
+		Name: "props",
+		Usage: "create bucket with the specified (non-default) properties, e.g.:\n" +
+			indent1 + "\t* ais create ais://mmm --props=\"versioning.validate_warm_get=false versioning.synchronize=true\"\n" +
+			indent1 + "\t* ais create ais://nnn --props='mirror.enabled=true mirror.copies=4 checksum.type=md5'\n" +
+			indent1 + "\t(tip: use '--props' to override properties that a new bucket inherits from cluster config at creation time;\n" +
+			indent1 + "\t see also: 'ais bucket props show' and 'ais bucket props set')",
 	}
 
 	forceFlag = cli.BoolFlag{Name: "force,f", Usage: "force an action"}
@@ -493,7 +497,7 @@ var (
 			indent4 + "\traw - do not convert to (or from) human-readable format",
 	}
 
-	// Bucket
+	// list-objects
 	startAfterFlag = cli.StringFlag{
 		Name:  "start-after",
 		Usage: "list bucket's content alphabetically starting with the first name _after_ the specified",
@@ -519,7 +523,16 @@ var (
 		Name:  "paged",
 		Usage: "list objects page by page, one page at a time (see also '--page-size' and '--limit')",
 	}
-	showUnmatchedFlag = cli.BoolFlag{Name: "show-unmatched", Usage: "list also objects that were _not_ matched by regex and/or template (range)"}
+	showUnmatchedFlag = cli.BoolFlag{
+		Name:  "show-unmatched",
+		Usage: "list also objects that were _not_ matched by regex and/or template (range)",
+	}
+	verChangedFlag = cli.BoolFlag{
+		Name: "check-versions",
+		Usage: "check whether listed remote objects and their in-cluster copies are identical, ie., have the same versions\n" +
+			indent4 + "\t- applies to remote backends that maintain at least some form of versioning information (e.g., version, checksum, ETag)\n" +
+			indent4 + "\t- see related: 'ais get --latest', 'ais cp --sync', 'ais prefetch --latest'",
+	}
 
 	keepMDFlag       = cli.BoolFlag{Name: "keep-md", Usage: "keep bucket metadata"}
 	dataSlicesFlag   = cli.IntFlag{Name: "data-slices,data,d", Usage: "number of data slices", Required: true}
@@ -573,7 +586,23 @@ var (
 		Name:  "object-list,from",
 		Usage: "path to file containing JSON array of object names to download",
 	}
-	syncFlag = cli.BoolFlag{Name: "sync", Usage: "sync bucket with Cloud"}
+
+	// sync
+	latestVerFlag = cli.BoolFlag{
+		Name: "latest",
+		Usage: "GET, prefetch, or copy the latest object version from the associated remote bucket;\n" +
+			indent1 + "\tprovides operation-level control over object versioning (and version synchronization)\n" +
+			indent1 + "\twithout requiring to change bucket configuration\n" +
+			indent1 + "\t- the latter can be done using 'ais bucket props set BUCKET versioning'\n" +
+			indent1 + "\t- see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'",
+	}
+	syncFlag = cli.BoolFlag{
+		Name: "sync",
+		Usage: "synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source;\n" +
+			indent1 + "\tthe option is a stronger variant of the '--latest' (option) - in addition it entails\n" +
+			indent1 + "\tremoving of the objects that no longer exist remotely\n" +
+			indent1 + "\t(see also: 'ais show bucket versioning' and the corresponding documentation)",
+	}
 
 	// dsort
 	dsortFsizeFlag  = cli.StringFlag{Name: "fsize", Value: "1024", Usage: "size of the files in a shard"}
@@ -606,6 +635,11 @@ var (
 		Name:  "wait",
 		Usage: "wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)",
 	}
+	dontWaitFlag = cli.BoolFlag{
+		Name: "dont-wait",
+		Usage: "when _summarizing_ buckets do not wait for the respective job to finish -\n" +
+			indent4 + "\tuse the job's UUID to query the results interactively",
+	}
 
 	// multi-object / multi-file
 	listFlag = cli.StringFlag{
@@ -629,7 +663,7 @@ var (
 			indent4 + "\t--template \"/abc/prefix-{0010..9999..2}-suffix\"",
 	}
 
-	listrangeFlags = []cli.Flag{
+	listRangeProgressWaitFlags = []cli.Flag{
 		listFlag,
 		templateFlag,
 		waitFlag,
@@ -654,9 +688,10 @@ var (
 	// speaking, not true for AIStore where LRU eviction is per-bucket configurable with default
 	// settings inherited from the cluster config, etc. etc.
 	// See also: apc.Flt* enum.
-	checkObjCachedFlag = cli.BoolFlag{
-		Name:  "check-cached",
-		Usage: "check if a given object from a remote bucket is present (\"cached\") in AIS",
+	headObjPresentFlag = cli.BoolFlag{
+		Name: "check-cached",
+		Usage: "instead of GET execute HEAD(object) to check if the object is present in aistore\n" +
+			indent1 + "\t(applies only to buckets with remote backend)",
 	}
 	listObjCachedFlag = cli.BoolFlag{
 		Name:  "cached",
@@ -664,17 +699,40 @@ var (
 	}
 	getObjCachedFlag = cli.BoolFlag{
 		Name:  "cached",
-		Usage: "get only those objects from a remote bucket that are present (\"cached\") in AIS",
+		Usage: "get only those objects from a remote bucket that are present (\"cached\") in aistore",
 	}
 	// when '--all' is used for/by another flag
 	objNotCachedPropsFlag = cli.BoolFlag{
 		Name:  "not-cached",
 		Usage: "show properties of _all_ objects from a remote bucket including those (objects) that are not present (not \"cached\")",
 	}
-	// to anonymously list public-access Cloud buckets
-	listAnonymousFlag = cli.BoolFlag{
-		Name:  "anonymous",
-		Usage: "list public-access Cloud buckets that may disallow certain operations (e.g., 'HEAD(bucket)')",
+
+	dontHeadSrcDstBucketsFlag = cli.BoolFlag{
+		Name:  "skip-lookup",
+		Usage: "skip checking source and destination buckets' existence (trading off extra lookup for performance)\n",
+	}
+	dontHeadRemoteFlag = cli.BoolFlag{
+		Name: "skip-lookup",
+		Usage: "do not execute HEAD(bucket) request to lookup remote bucket and its properties; possible usage scenarios include:\n" +
+			indent4 + "\t 1) adding remote bucket to aistore without first checking the bucket's accessibility\n" +
+			indent4 + "\t    (e.g., to configure the bucket's aistore properties with alternative security profile and/or endpoint)\n" +
+			indent4 + "\t 2) listing public-access Cloud buckets where certain operations (e.g., 'HEAD(bucket)') may be disallowed",
+	}
+	dontAddRemoteFlag = cli.BoolFlag{
+		Name: "dont-add",
+		Usage: "list remote bucket without adding it to cluster's metadata\n" +
+			indent1 + "\t  - let's say, s3://abc is accessible but not present in the cluster (e.g., 'ais ls' returns error);\n" +
+			indent1 + "\t  - then, if we ask aistore to list remote buckets: `ais ls s3://abc --all'\n" +
+			indent1 + "\t    the bucket will be added (in effect, it'll be created);\n" +
+			indent1 + "\t  - to prevent this from happening, either use this '--dont-add' flag or run 'ais evict' command later",
+	}
+	addRemoteFlag = cli.BoolFlag{
+		Name: "add",
+		Usage: "add remote bucket to cluster's metadata\n" +
+			indent1 + "\t  - let's say, s3://abc is accessible but not present in the cluster (e.g., 'ais ls' returns error);\n" +
+			indent1 + "\t  - most of the time, there's no need to worry about it as aistore handles presence/non-presence\n" +
+			indent1 + "\t    transparently behind the scenes;\n" +
+			indent1 + "\t  - but if you'd want to explicltly add the bucket, you could also use '--add' option",
 	}
 
 	enableFlag  = cli.BoolFlag{Name: "enable", Usage: "enable"}
@@ -706,6 +764,11 @@ var (
 		Name: "compute-checksum",
 		Usage: "[end-to-end protection] compute client-side checksum configured for the destination bucket\n" +
 			putObjCksumText,
+	}
+
+	appendConcatFlag = cli.BoolFlag{
+		Name:  "append",
+		Usage: "concatenate files: append a file or multiple files as a new _or_ to an existing object",
 	}
 
 	skipVerCksumFlag = cli.BoolFlag{
@@ -749,8 +812,9 @@ var (
 	}
 	// 'ais archive put': conditional APPEND
 	archAppendOrPutFlag = cli.BoolFlag{
-		Name:  "append-or-put",
-		Usage: "if destination object (\"archive\", \"shard\") exists append to it, otherwise archive a new one",
+		Name: "append-or-put",
+		Usage: "append to an existing destination object (\"archive\", \"shard\") iff exists; otherwise PUT a new archive (shard);\n" +
+			indent4 + "\tnote that PUT (with subsequent overwrite if the destination exists) is the default behavior when the flag is omitted",
 	}
 	// 'ais archive put': unconditional APPEND: destination must exist
 	archAppendOnlyFlag = cli.BoolFlag{
@@ -760,7 +824,7 @@ var (
 
 	continueOnErrorFlag = cli.BoolFlag{
 		Name:  "cont-on-err",
-		Usage: "keep running archiving xaction in presence of errors in a any given multi-object transaction",
+		Usage: "keep running archiving xaction (job) in presence of errors in a any given multi-object transaction",
 	}
 	// end archive
 

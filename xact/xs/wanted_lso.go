@@ -1,7 +1,7 @@
 // Package xs contains most of the supported eXtended actions (xactions) with some
 // exceptions that include certain storage services (mirror, EC) and extensions (downloader, lru).
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -9,10 +9,10 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 )
 
 // `apc.LsoMsg` flags
@@ -37,9 +37,13 @@ func wanted(msg *apc.LsoMsg) (flags cos.BitFlags) {
 	return
 }
 
-func setWanted(e *cmn.LsoEntry, lom *cluster.LOM, tmformat string, wanted cos.BitFlags) {
+func (wi *walkInfo) setWanted(e *cmn.LsoEntry, lom *core.LOM) {
+	var (
+		custom  = e.Custom
+		version = e.Version
+	)
 	for name, fl := range allmap {
-		if !wanted.IsSet(fl) {
+		if !wi.wanted.IsSet(fl) {
 			continue
 		}
 		switch name {
@@ -48,13 +52,16 @@ func setWanted(e *cmn.LsoEntry, lom *cluster.LOM, tmformat string, wanted cos.Bi
 		case apc.GetPropsCached: // via obj.SetPresent()
 
 		case apc.GetPropsSize:
+			if e.Size > 0 && lom.SizeBytes() != e.Size {
+				e.SetVerChanged()
+			}
 			e.Size = lom.SizeBytes()
 		case apc.GetPropsVersion:
 			e.Version = lom.Version()
 		case apc.GetPropsChecksum:
 			e.Checksum = lom.Checksum().Value()
 		case apc.GetPropsAtime:
-			e.Atime = cos.FormatNanoTime(lom.AtimeUnix(), tmformat)
+			e.Atime = cos.FormatNanoTime(lom.AtimeUnix(), wi.msg.TimeFormat)
 		case apc.GetPropsLocation:
 			e.Location = lom.Location()
 		case apc.GetPropsCopies:
@@ -68,6 +75,18 @@ func setWanted(e *cmn.LsoEntry, lom *cluster.LOM, tmformat string, wanted cos.Bi
 			}
 		default:
 			debug.Assert(false, name)
+		}
+	}
+	if wi.msg.IsFlagSet(apc.LsVerChanged) && !e.IsVerChanged() {
+		// slow path: extensive version-changed check
+		md := cmn.S2CustomMD(custom, version)
+		if len(md) > 0 {
+			var oa cmn.ObjAttrs
+			oa.CustomMD = md
+			oa.Size = e.Size
+			if !lom.Equal(&oa) {
+				e.SetVerChanged()
+			}
 		}
 	}
 }

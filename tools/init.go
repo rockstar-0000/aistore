@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -17,9 +18,9 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/authn"
 	"github.com/NVIDIA/aistore/api/env"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/tlog"
 )
@@ -31,7 +32,6 @@ const (
 
 const (
 	registerTimeout = time.Minute * 2
-	bucketTimeout   = time.Minute
 )
 
 type (
@@ -52,6 +52,11 @@ const (
 	ClusterTypeK8s    ClusterType = "k8s"
 )
 
+type g struct {
+	Client *http.Client
+	Log    func(format string, a ...any)
+}
+
 var (
 	proxyURLReadOnly string       // user-defined primary proxy URL - it is read-only variable and tests mustn't change it
 	pmapReadOnly     meta.NodeMap // initial proxy map - it is read-only variable
@@ -71,7 +76,9 @@ var (
 		MaxIdleConns:     2000,
 		IdleConnsPerHost: 200,
 	}
-	HTTPClient *http.Client
+	tlsArgs = cmn.TLSArgs{
+		SkipVerify: true,
+	}
 
 	RemoteCluster struct {
 		UUID  string
@@ -80,21 +87,43 @@ var (
 	}
 	LoggedUserToken string
 
-	gctx *Ctx
+	gctx g
 )
 
-func init() {
-	envURL := os.Getenv(env.AIS.Endpoint)
-	// Since tests do not have access to cluster configuration, the tests
-	// detect client type by the primary proxy URL passed by a user.
-	// Certificate check is always disabled.
-	transportArgs.UseHTTPS = cos.IsHTTPS(envURL)
-	transportArgs.SkipVerify = cos.IsParseBool(os.Getenv(env.AIS.SkipVerifyCrt))
-	HTTPClient = cmn.NewClient(transportArgs)
+// NOTE:
+// With no access to cluster configuration the tests
+// currently simply detect protocol type by the env.AIS.Endpoint (proxy's) URL.
+// Certificate check and other TLS is always disabled.
 
-	gctx = &Ctx{
-		Client: HTTPClient,
-		Log:    tlog.Logf,
+func init() {
+	gctx.Log = tlog.Logf
+
+	if cos.IsHTTPS(os.Getenv(env.AIS.Endpoint)) {
+		// fill-in from env
+		cmn.EnvToTLS(&tlsArgs)
+		gctx.Client = cmn.NewClientTLS(transportArgs, tlsArgs)
+	} else {
+		gctx.Client = cmn.NewClient(transportArgs)
+	}
+}
+
+func NewClientWithProxy(proxyURL string) *http.Client {
+	var (
+		transport      = cmn.NewTransport(transportArgs)
+		parsedURL, err = url.Parse(proxyURL)
+	)
+	cos.AssertNoErr(err)
+	transport.Proxy = http.ProxyURL(parsedURL)
+
+	if parsedURL.Scheme == "https" {
+		cos.AssertMsg(cos.IsHTTPS(proxyURL), proxyURL)
+		tlsConfig, err := cmn.NewTLS(tlsArgs)
+		cos.AssertNoErr(err)
+		transport.TLSClientConfig = tlsConfig
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   transportArgs.Timeout,
 	}
 }
 

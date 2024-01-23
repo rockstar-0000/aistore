@@ -28,14 +28,17 @@ import (
 const longListTime = 10 * time.Second // list-objects progress
 
 var (
-	// AisLoader, being a stress loading tool, should have different from
-	// AIS cluster timeouts. And if HTTPS is used, certificate check is
-	// always disable in AisLoader client.
-	transportArgs = cmn.TransportArgs{
+	// see related command-line: `transportArgs.Timeout` and UseHTTPS
+	cargs = cmn.TransportArgs{
 		UseHTTPProxyEnv: true,
-		SkipVerify:      true,
 	}
-	httpClient *http.Client
+	// NOTE: client X509 certificate and other `cmn.TLSArgs` variables can be provided via (os.Getenv) environment.
+	// See also:
+	// - docs/aisloader.md, section "Environment variables"
+	// - AIS_ENDPOINT and aisEndpoint
+	sargs = cmn.TLSArgs{
+		SkipVerify: true,
+	}
 )
 
 type (
@@ -188,7 +191,7 @@ func s3put(bck cmn.Bck, objName string, reader cos.ReadOpenCloser) (err error) {
 func put(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum, reader cos.ReadOpenCloser) (err error) {
 	var (
 		baseParams = api.BaseParams{
-			Client: httpClient,
+			Client: runParams.bp.Client,
 			URL:    proxyURL,
 			Method: http.MethodPut,
 			Token:  loggedUserToken,
@@ -203,7 +206,7 @@ func put(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum, reader 
 			SkipVC:     true,
 		}
 	)
-	_, err = api.PutObject(args)
+	_, err = api.PutObject(&args)
 	return
 }
 
@@ -218,7 +221,7 @@ func putWithTrace(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum
 		reqArgs.BodyR = reader
 	}
 	putter := tracePutter{
-		tctx:   newTraceCtx(),
+		tctx:   newTraceCtx(proxyURL),
 		cksum:  cksum,
 		reader: reader,
 	}
@@ -245,10 +248,18 @@ func putWithTrace(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum
 	return l, nil
 }
 
-func newTraceCtx() *traceCtx {
-	tctx := &traceCtx{}
+func newTraceCtx(proxyURL string) *traceCtx {
+	var (
+		tctx      = &traceCtx{}
+		transport = cmn.NewTransport(cargs)
+		err       error
+	)
+	if cos.IsHTTPS(proxyURL) {
+		transport.TLSClientConfig, err = cmn.NewTLS(sargs)
+		cos.AssertNoErr(err)
+	}
 	tctx.tr = &traceableTransport{
-		transport: cmn.NewTransport(transportArgs),
+		transport: transport,
 		tsBegin:   time.Now(),
 	}
 	tctx.trace = &httptrace.ClientTrace{
@@ -271,7 +282,7 @@ func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, len
 	)
 	query = bck.AddToQuery(query)
 	if etlName != "" {
-		query.Add(apc.QparamUUID, etlName)
+		query.Add(apc.QparamETLName, etlName)
 	}
 	if length > 0 {
 		hdr = cmn.MakeRangeHdr(offset, length)
@@ -319,7 +330,7 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, off
 	if err != nil {
 		return 0, err
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := runParams.bp.Client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -343,8 +354,7 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, off
 }
 
 // Same as above, but with HTTP trace.
-func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool,
-	offset, length int64) (int64, httpLatencies, error) {
+func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, offset, length int64) (int64, httpLatencies, error) {
 	var hdrCksumValue, hdrCksumType string
 
 	req, err := prepareGetRequest(proxyURL, bck, objName, offset, length)
@@ -352,7 +362,7 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool
 		return 0, httpLatencies{}, err
 	}
 
-	tctx := newTraceCtx()
+	tctx := newTraceCtx(proxyURL)
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
 
 	resp, err := tctx.tracedClient.Do(req)
@@ -394,10 +404,10 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool
 
 // getConfig sends a {what:config} request to the url and discard the message
 // For testing purpose only
-func getConfig(server string) (httpLatencies, error) {
-	tctx := newTraceCtx()
+func getConfig(proxyURL string) (httpLatencies, error) {
+	tctx := newTraceCtx(proxyURL)
 
-	url := server + apc.URLPathDae.S
+	url := proxyURL + apc.URLPathDae.S
 	req, _ := http.NewRequest(http.MethodGet, url, http.NoBody)
 	req.URL.RawQuery = api.GetWhatRawQuery(apc.WhatNodeConfig, "")
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
@@ -417,9 +427,11 @@ func getConfig(server string) (httpLatencies, error) {
 	return l, err
 }
 
-func listObjCallback(ctx *api.ProgressContext) {
-	fmt.Printf("\rListing %s objects", cos.FormatBigNum(ctx.Info().Count))
-	// Final message moves output to new line, to keep output tidy
+func listObjCallback(ctx *api.LsoCounter) {
+	if ctx.Count() < 0 {
+		return
+	}
+	fmt.Printf("\rListing %s objects", cos.FormatBigNum(ctx.Count()))
 	if ctx.IsFinished() {
 		fmt.Println()
 	}
@@ -431,8 +443,8 @@ func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string) ([]s
 	if bck.IsAIS() || bck.IsRemoteAIS() {
 		msg.PageSize = apc.DefaultPageSizeAIS
 	}
-	ctx := api.NewProgressContext(listObjCallback, longListTime)
-	objList, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{Progress: ctx})
+	args := api.ListArgs{Callback: listObjCallback, CallAfter: longListTime}
+	objList, err := api.ListObjects(baseParams, bck, msg, args)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,6 @@
 // Package apc: API messages and constants
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -14,20 +14,23 @@ import (
 // copy & (offline) transform bucket to bucket
 type (
 	CopyBckMsg struct {
-		Prepend string `json:"prepend"` // destination naming, as in: dest-obj-name = Prepend + source-obj-name
-		Prefix  string `json:"prefix"`  // prefix to select matching _source_ objects or virtual directories
-		DryRun  bool   `json:"dry_run"` // visit all source objects, don't make any modifications
-		Force   bool   `json:"force"`   // force running in presence of "limited coexistence" type conflicts
+		Prepend   string `json:"prepend"`     // destination naming, as in: dest-obj-name = Prepend + source-obj-name
+		Prefix    string `json:"prefix"`      // prefix to select matching _source_ objects or virtual directories
+		DryRun    bool   `json:"dry_run"`     // visit all source objects, don't make any modifications
+		Force     bool   `json:"force"`       // force running in presence of "limited coexistence" type conflicts
+		LatestVer bool   `json:"latest-ver"`  // see also: QparamLatestVer, 'versioning.validate_warm_get', PrefetchMsg
+		Sync      bool   `json:"synchronize"` // see also: 'versioning.synchronize'
 	}
 	Transform struct {
 		Name    string       `json:"id,omitempty"`
 		Timeout cos.Duration `json:"request_timeout,omitempty"`
 	}
 	TCBMsg struct {
-		// NOTE: resulting object names will have this extension, if specified.
-		// NOTE: if source bucket has two (or more) objects with the same base name but different extension,
-		// specifying this field might cause unintended override.
-		// TODO: this field might not be required when range/list transformation is supported.
+		// NOTE: objname extension ----------------------------------------------------------------------
+		// - resulting object names will have this extension, if specified.
+		// - if source bucket has two (or more) objects with the same base name but different extension,
+		//   specifying this field might cause unintended override.
+		// - this field might not be any longer required - TODO review
 		Ext cos.StrKVs `json:"ext"`
 
 		Transform

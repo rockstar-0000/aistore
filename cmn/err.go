@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,7 +33,7 @@ const (
 	fmtErrBckName   = "bucket name %q is invalid: " + cos.OnlyPlus
 	fmtErrNamespace = "bucket namespace (uuid: %q, name: %q) " + cos.OnlyNice
 
-	FmtErrIntegrity      = "[%s%d, for troubleshooting see %s/blob/master/docs/troubleshooting.md]"
+	FmtErrIntegrity      = "[%s%d, for troubleshooting see %s/blob/main/docs/troubleshooting.md]"
 	FmtErrUnmarshal      = "%s: failed to unmarshal %s (%s), err: %w"
 	FmtErrMorphUnmarshal = "%s: failed to unmarshal %s (%T), err: %w"
 	FmtErrUnknown        = "%s: unknown %s %q"
@@ -70,14 +69,19 @@ type (
 	ErrRemoteBckNotFound   struct{ bck Bck }
 	ErrRemoteBucketOffline struct{ bck Bck }
 	ErrBckNotFound         struct{ bck Bck }
-	ErrBucketIsBusy        struct{ bck Bck }
+
+	ErrBusy struct {
+		what   string
+		name   fmt.Stringer
+		detail string
+	}
 
 	ErrFailedTo struct {
-		actor  any    // most of the time it's this (target|proxy) node but may also be some other "actor"
-		what   any    // not necessarily LOM
-		err    error  // original error that can be Unwrap-ed
-		action string // not necessarily msg.Action
-		status int    // http status, if available
+		actor  fmt.Stringer // most of the time it's this (target|proxy) node but may also be some other "actor"
+		what   any          // not necessarily LOM
+		err    error        // original error that can be Unwrap-ed
+		action string       // not necessarily msg.Action
+		status int          // http status, if available
 	}
 	ErrUnsupp struct {
 		action, what string
@@ -211,7 +215,7 @@ var (
 
 // ErrFailedTo
 
-func NewErrFailedTo(actor any, action string, what any, err error, errCode ...int) *ErrFailedTo {
+func NewErrFailedTo(actor fmt.Stringer, action string, what any, err error, errCode ...int) *ErrFailedTo {
 	if e, ok := err.(*ErrFailedTo); ok {
 		return e
 	}
@@ -219,9 +223,6 @@ func NewErrFailedTo(actor any, action string, what any, err error, errCode ...in
 	_clean(err)
 
 	e := &ErrFailedTo{actor: actor, action: action, what: what, err: err, status: 0}
-	if actor == nil {
-		e.actor = thisNodeName
-	}
 	if len(errCode) > 0 {
 		e.status = errCode[0]
 	}
@@ -229,7 +230,12 @@ func NewErrFailedTo(actor any, action string, what any, err error, errCode ...in
 }
 
 func (e *ErrFailedTo) Error() string {
-	err := fmt.Errorf(fmtErrFailedTo, e.actor, e.action, e.what, e.err)
+	var err error
+	if e.actor == nil {
+		err = fmt.Errorf(fmtErrFailedTo, thisNodeName, e.action, e.what, e.err)
+	} else {
+		err = fmt.Errorf(fmtErrFailedTo, e.actor, e.action, e.what, e.err)
+	}
 	return err.Error()
 }
 
@@ -345,20 +351,25 @@ func (*ErrInvalidBackendProvider) Is(target error) bool {
 	return ok
 }
 
-// ErrBucketIsBusy
+// ErrBusy
 
-func NewErrBckIsBusy(bck *Bck) *ErrBucketIsBusy {
-	return &ErrBucketIsBusy{bck: *bck}
+func NewErrBusy(what string, name fmt.Stringer, detail string) *ErrBusy {
+	return &ErrBusy{what, name, detail}
 }
 
-func (e *ErrBucketIsBusy) Error() string {
-	return fmt.Sprintf("bucket %q is currently busy, please retry later", e.bck)
+func (e *ErrBusy) Error() string {
+	var s string
+	if e.detail != "" {
+		s = " (" + e.detail + ")"
+	}
+	return fmt.Sprintf("%s %q is currently busy%s, please try again in a few seconds or minutes", e.what, e.name, s)
 }
 
 // errAccessDenied & ErrBucketAccessDenied
 
 func (e *errAccessDenied) String() string {
-	return fmt.Sprintf("%s: %s access denied (%#x)", e.entity, e.operation, e.accessAttrs)
+	return fmt.Sprintf("%s: %s access denied (allowed: [%s])",
+		e.entity, e.operation, e.accessAttrs.Describe(false /*include all*/))
 }
 
 func (e *ErrBucketAccessDenied) Error() string {
@@ -735,37 +746,16 @@ func IsErrBucketNought(err error) bool {
 	return IsErrBckNotFound(err) || IsErrRemoteBckNotFound(err) || isErrRemoteBucketOffline(err)
 }
 
+// lom.Load
 func IsErrObjNought(err error) bool {
-	return IsObjNotExist(err) || IsStatusNotFound(err) || isErrObjDefunct(err) || IsErrLmetaNotFound(err)
+	return cos.IsNotExist(err, 0) || IsStatusNotFound(err) || isErrObjDefunct(err) || IsErrLmetaNotFound(err)
 }
 
 // used internally to report http.StatusNotFound _iff_ status is not set (is zero)
-func isErrNotFoundExtended(err error) bool {
-	return cos.IsErrNotFound(err) ||
-		IsErrBckNotFound(err) || IsErrRemoteBckNotFound(err) ||
-		IsObjNotExist(err) ||
-		IsErrMountpathNotFound(err) ||
-		IsErrXactNotFound(err)
-}
-
-// usage: lom.Load() (compare w/ IsNotExist)
-func IsObjNotExist(err error) bool {
-	if os.IsNotExist(err) {
-		return true
-	}
-	return errors.Is(err, fs.ErrNotExist) // when wrapped
-}
-
-// usage: everywhere where applicable (directories, xactions, nodes, ...)
-// excluding _local_ LOM (where the above applies)
-func IsNotExist(err error) bool {
-	if os.IsNotExist(err) {
-		return true
-	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return true
-	}
-	return cos.IsErrNotFound(err)
+func isErrNotFoundExtended(err error, status int) bool {
+	return IsErrBckNotFound(err) || IsErrRemoteBckNotFound(err) ||
+		IsErrMountpathNotFound(err) || IsErrXactNotFound(err) ||
+		cos.IsNotExist(err, status)
 }
 
 func IsFileAlreadyClosed(err error) bool {
@@ -871,7 +861,7 @@ func _clean(err error) {
 func (e *ErrHTTP) StringEx() (s string) {
 	s = e.Error()
 	if e.Method != "" || e.URLPath != "" {
-		if !strings.HasSuffix(s, ".") {
+		if !cos.IsLastB(s, '.') {
 			s += ":"
 		}
 		if e.Method != "" {
@@ -1007,7 +997,7 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, opts ...int /*[
 		status = opts[0]
 	} else if errf, ok := err.(*ErrFailedTo); ok {
 		status = errf.status
-	} else if isErrNotFoundExtended(err) {
+	} else if isErrNotFoundExtended(err, status) {
 		status = http.StatusNotFound
 	}
 

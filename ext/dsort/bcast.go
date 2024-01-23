@@ -10,9 +10,9 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 )
 
 //
@@ -33,7 +33,7 @@ outer:
 			continue
 		}
 		for _, ignoreNode := range ignore {
-			if ignoreNode.Equals(node) {
+			if ignoreNode.Eq(node) {
 				continue outer
 			}
 		}

@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -9,15 +9,14 @@ import (
 	"io"
 	"os"
 	"sync"
-	ratomic "sync/atomic"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xact"
 )
@@ -30,10 +29,6 @@ const (
 type (
 	xactECBase struct {
 		xact.DemandBase
-		t cluster.Target
-
-		smap   meta.Sowner // to get current cluster map
-		si     *meta.Snode // target daemonInfo
 		config *cmn.Config // config
 		stats  stats       // EC statistics
 		bck    cmn.Bck     // which bucket xctn belongs to
@@ -59,38 +54,23 @@ type (
 		mtx    sync.Mutex
 		slices map[string]*slice
 	}
-
-	BckXacts struct {
-		get ratomic.Pointer[XactGet]
-		put ratomic.Pointer[XactPut]
-		req ratomic.Pointer[XactRespond]
-	}
 )
+
+func (r *xactECBase) init(config *cmn.Config, bck *cmn.Bck, mgr *Manager) {
+	r.stats = stats{bck: *bck}
+	r.config = config
+	r.bck = *bck
+	r.dOwner = &dataOwner{slices: make(map[string]*slice, 10)}
+	r.mgr = mgr
+}
 
 /////////////////
 // xactReqBase //
 /////////////////
 
-func newXactReqECBase() xactReqBase {
-	return xactReqBase{
-		mpathReqCh: make(chan mpathReq, 1),
-		controlCh:  make(chan RequestsControlMsg, 8),
-	}
-}
-
-func newXactECBase(t cluster.Target, smap meta.Sowner, si *meta.Snode, config *cmn.Config, bck *cmn.Bck, mgr *Manager) xactECBase {
-	return xactECBase{
-		t:      t,
-		smap:   smap,
-		si:     si,
-		stats:  stats{bck: *bck},
-		config: config,
-		bck:    *bck,
-		dOwner: &dataOwner{
-			slices: make(map[string]*slice, 10),
-		},
-		mgr: mgr,
-	}
+func (r *xactReqBase) init() {
+	r.mpathReqCh = make(chan mpathReq, 1)
+	r.controlCh = make(chan RequestsControlMsg, 8)
 }
 
 // ClearRequests disables receiving new EC requests, they will be terminated with error
@@ -147,8 +127,8 @@ func newSliceResponse(md *Metadata, attrs *cmn.ObjAttrs, fqn string) (reader cos
 
 // replica/full object request
 func newReplicaResponse(attrs *cmn.ObjAttrs, bck *meta.Bck, objName string) (reader cos.ReadOpenCloser, err error) {
-	lom := cluster.AllocLOM(objName)
-	defer cluster.FreeLOM(lom)
+	lom := core.AllocLOM(objName)
+	defer core.FreeLOM(lom)
 	if err = lom.InitBck(bck.Bucket()); err != nil {
 		return nil, err
 	}
@@ -194,19 +174,21 @@ func (r *xactECBase) dataResponse(act intraReqType, hdr *transport.ObjHdr, fqn s
 
 	rHdr := transport.ObjHdr{ObjName: objName, ObjAttrs: objAttrs, Opcode: act}
 	rHdr.Bck.Copy(bck.Bucket())
-	rHdr.Opaque = ireq.NewPack(r.t.ByteMM())
+	rHdr.Opaque = ireq.NewPack(g.smm)
+
+	o := transport.AllocSend()
+	o.Hdr, o.Callback = rHdr, r.sendCb
 
 	r.ObjsAdd(1, objAttrs.Size)
 	r.IncPending()
-	return r.sendByDaemonID([]string{hdr.SID}, rHdr, reader, r.sendCb, false)
+	return r.sendByDaemonID([]string{hdr.SID}, o, reader, false)
 }
 
-func (r *xactECBase) sendCb(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
-	r.t.ByteMM().Free(hdr.Opaque)
+func (r *xactECBase) sendCb(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+	g.smm.Free(hdr.Opaque)
 	if err != nil {
-		err = fmt.Errorf("failed to send %s: %w", hdr.Cname(), err)
-		nlog.Errorln(err)
-		r.AddErr(err)
+		err = cmn.NewErrFailedTo(core.T, "ec-send", hdr.Cname(), err)
+		r.AddErr(err, 0)
 	}
 	r.DecPending()
 }
@@ -222,23 +204,20 @@ func (r *xactECBase) sendCb(hdr transport.ObjHdr, _ io.ReadCloser, _ any, err er
 //   - true - send lightweight request to all targets (usually reader is nil
 //     in this case)
 //   - false - send a slice/replica/metadata to targets
-func (r *xactECBase) sendByDaemonID(daemonIDs []string, hdr transport.ObjHdr, reader cos.ReadOpenCloser,
-	cb transport.ObjSentCB, isRequest bool) error {
-	nodes := meta.AllocNodes(len(daemonIDs))
-	smap := r.smap.Get()
+func (r *xactECBase) sendByDaemonID(daemonIDs []string, o *transport.Obj, reader cos.ReadOpenCloser, isRequest bool) error {
+	var (
+		err   error
+		nodes = meta.AllocNodes(len(daemonIDs))
+		smap  = core.T.Sowner().Get()
+	)
 	for _, id := range daemonIDs {
 		si, ok := smap.Tmap[id]
 		if !ok {
-			nlog.Errorf("Target with ID %s not found", id)
+			nlog.Errorf("t[%s] not found", id)
 			continue
 		}
 		nodes = append(nodes, si)
 	}
-	var (
-		err error
-		o   = transport.AllocSend()
-	)
-	o.Hdr, o.Callback = hdr, cb
 	if isRequest {
 		err = r.mgr.req().Send(o, reader, nodes...)
 	} else {
@@ -257,42 +236,41 @@ func (r *xactECBase) sendByDaemonID(daemonIDs []string, hdr transport.ObjHdr, re
 //     name, it puts the data to its writer and notifies when download is done
 //   - request - request to send
 //   - writer - an opened writer that will receive the replica/slice/meta
-func (r *xactECBase) readRemote(lom *cluster.LOM, daemonID, uname string, request []byte, writer io.Writer) (int64, error) {
+func (r *xactECBase) readRemote(lom *core.LOM, daemonID, uname string, request []byte, writer io.Writer) (int64, error) {
 	hdr := transport.ObjHdr{ObjName: lom.ObjName, Opaque: request, Opcode: reqGet}
 	hdr.Bck.Copy(lom.Bucket())
-	sw := &slice{
-		writer: writer,
-		twg:    cos.NewTimeoutGroup(),
-		lom:    lom,
-	}
 
+	o := transport.AllocSend()
+	o.Hdr = hdr
+
+	sw := &slice{writer: writer, twg: cos.NewTimeoutGroup(), lom: lom}
 	sw.twg.Add(1)
 	r.regWriter(uname, sw)
 
-	if r.config.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("Requesting object %s from %s", lom, daemonID)
 	}
-	if err := r.sendByDaemonID([]string{daemonID}, hdr, nil, nil, true); err != nil {
+	if err := r.sendByDaemonID([]string{daemonID}, o, nil, true); err != nil {
 		r.unregWriter(uname)
 		r.AddErr(err)
 		return 0, err
 	}
 	if sw.twg.WaitTimeout(r.config.Timeout.SendFile.D()) {
 		r.unregWriter(uname)
-		err := fmt.Errorf("timed out waiting for %s is read", uname)
+		err := fmt.Errorf("read-remote(%s): timeout %v", uname, r.config.Timeout.SendFile.D())
 		r.AddErr(err)
 		return 0, err
 	}
 	r.unregWriter(uname)
 
-	if r.config.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("Received object %s from %s", lom, daemonID)
 	}
 	if sw.version != "" {
 		lom.SetVersion(sw.version)
 	}
 	lom.SetCksum(sw.cksum)
-	lom.Uncache(true)
+	lom.Uncache()
 	return sw.n, nil
 }
 
@@ -336,15 +314,14 @@ func (r *xactECBase) unregWriter(uname string) {
 //     The counter is used for sending slices of one big SGL to a few nodes. In
 //     this case every slice must be sent to only one target, and transport bundle
 //     cannot help to track automatically when SGL should be freed.
-func (r *xactECBase) writeRemote(daemonIDs []string, lom *cluster.LOM, src *dataSource, cb transport.ObjSentCB) error {
+func (r *xactECBase) writeRemote(daemonIDs []string, lom *core.LOM, src *dataSource, cb transport.ObjSentCB) error {
 	if src.metadata != nil && src.metadata.ObjVersion == "" {
 		src.metadata.ObjVersion = lom.Version()
 	}
 	req := newIntraReq(src.reqType, src.metadata, lom.Bck())
 	req.isSlice = src.isSlice
 
-	mm := r.t.ByteMM()
-	putData := req.NewPack(mm)
+	putData := req.NewPack(g.smm)
 	objAttrs := cmn.ObjAttrs{
 		Size:  src.size,
 		Ver:   lom.Version(),
@@ -367,15 +344,19 @@ func (r *xactECBase) writeRemote(daemonIDs []string, lom *cluster.LOM, src *data
 	}
 	hdr.Bck.Copy(lom.Bucket())
 	oldCallback := cb
-	cb = func(hdr transport.ObjHdr, reader io.ReadCloser, arg any, err error) {
-		mm.Free(hdr.Opaque)
+	cb = func(hdr *transport.ObjHdr, reader io.ReadCloser, arg any, err error) {
+		g.smm.Free(hdr.Opaque)
 		if oldCallback != nil {
 			oldCallback(hdr, reader, arg, err)
 		}
 		r.DecPending()
 	}
+
+	o := transport.AllocSend()
+	o.Hdr, o.Callback = hdr, cb
+
 	r.IncPending()
-	return r.sendByDaemonID(daemonIDs, hdr, src.reader, cb, false)
+	return r.sendByDaemonID(daemonIDs, o, src.reader, false)
 }
 
 // Save data from a target response to SGL or file. When exists is false it
@@ -391,7 +372,7 @@ func _writerReceive(writer *slice, exists bool, objAttrs cmn.ObjAttrs, reader io
 		return ErrorNotFound
 	}
 
-	buf, slab := mm.Alloc()
+	buf, slab := g.pmm.Alloc()
 	writer.n, err = io.CopyBuffer(writer.writer, reader, buf)
 	writer.cksum = objAttrs.Cksum
 	if writer.version == "" && objAttrs.Ver != "" {
@@ -405,35 +386,10 @@ func _writerReceive(writer *slice, exists bool, objAttrs cmn.ObjAttrs, reader io
 
 func (r *xactECBase) ECStats() *Stats { return r.stats.stats() }
 
-func (r *xactECBase) baseSnap() (snap *cluster.Snap) {
-	snap = &cluster.Snap{}
+func (r *xactECBase) baseSnap() (snap *core.Snap) {
+	snap = &core.Snap{}
 	r.ToSnap(snap)
 
 	snap.IdleX = r.IsIdle()
 	return
-}
-
-//////////////
-// BckXacts //
-//////////////
-
-func (xacts *BckXacts) Get() *XactGet            { return xacts.get.Load() }
-func (xacts *BckXacts) Put() *XactPut            { return xacts.put.Load() }
-func (xacts *BckXacts) Req() *XactRespond        { return xacts.req.Load() }
-func (xacts *BckXacts) SetGet(xctn *XactGet)     { xacts.get.Store(xctn) }
-func (xacts *BckXacts) SetPut(xctn *XactPut)     { xacts.put.Store(xctn) }
-func (xacts *BckXacts) SetReq(xctn *XactRespond) { xacts.req.Store(xctn) }
-
-func (xacts *BckXacts) AbortGet() { // TODO: caller must provide the error (reason) - here and elsewhere
-	xctn := xacts.get.Load()
-	if xctn != nil {
-		xctn.Abort(nil)
-	}
-}
-
-func (xacts *BckXacts) AbortPut() {
-	xctn := xacts.put.Load()
-	if xctn != nil {
-		xctn.Abort(nil)
-	}
 }

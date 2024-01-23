@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -12,12 +12,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/nl"
@@ -44,7 +44,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 			t.writeErr(w, r, err, http.StatusInsufficientStorage)
 			return
 		}
-		if _, err := t.parseURL(w, r, 0, false, apc.URLPathDownload.L); err != nil {
+		if _, err := t.parseURL(w, r, apc.URLPathDownload.L, 0, false); err != nil {
 			return
 		}
 		var (
@@ -81,23 +81,24 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		xdl, err := t.renewdl(xid)
+		xdl, err := renewdl(xid, bck)
 		if err != nil {
 			t.writeErr(w, r, err, http.StatusInternalServerError)
 			return
 		}
-		dljob, err := dload.ParseStartRequest(t, bck, jobID, dlb, xdl)
+		dljob, err := dload.ParseStartRequest(bck, jobID, dlb, xdl)
 		if err != nil {
+			xdl.Abort(err)
 			t.writeErr(w, r, err)
 			return
 		}
-		if cmn.FastV(4, cos.SmoduleAIS) {
-			nlog.Infoln("Downloading: " + dljob.ID())
+		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			nlog.Infoln("Downloading:", dljob.ID())
 		}
 
 		dljob.AddNotif(&dload.NotifDownload{
 			Base: nl.Base{
-				When:     cluster.UponProgress,
+				When:     core.UponProgress,
 				Interval: progressInterval,
 				Dsts:     []string{equalIC},
 				F:        t.notifyTerm,
@@ -107,7 +108,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		response, statusCode, respErr = xdl.Download(dljob)
 
 	case http.MethodGet:
-		if _, err := t.parseURL(w, r, 0, false, apc.URLPathDownload.L); err != nil {
+		if _, err := t.parseURL(w, r, apc.URLPathDownload.L, 0, false); err != nil {
 			return
 		}
 		msg := &dload.AdminBody{}
@@ -123,7 +124,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		if msg.ID != "" {
 			xid := r.URL.Query().Get(apc.QparamUUID)
 			debug.Assert(cos.IsValidUUID(xid))
-			xdl, err := t.renewdl(xid)
+			xdl, err := renewdl(xid, nil)
 			if err != nil {
 				t.writeErr(w, r, err, http.StatusInternalServerError)
 				return
@@ -143,7 +144,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case http.MethodDelete:
-		items, err := t.parseURL(w, r, 1, false, apc.URLPathDownload.L)
+		items, err := t.parseURL(w, r, apc.URLPathDownload.L, 1, false)
 		if err != nil {
 			return
 		}
@@ -165,7 +166,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 		xid := r.URL.Query().Get(apc.QparamUUID)
 		debug.Assertf(cos.IsValidUUID(xid), "%q", xid)
-		xdl, err := t.renewdl(xid)
+		xdl, err := renewdl(xid, nil)
 		if err != nil {
 			t.writeErr(w, r, err, http.StatusInternalServerError)
 			return
@@ -192,8 +193,8 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *target) renewdl(xid string) (*dload.Xact, error) {
-	rns := xreg.RenewDownloader(t, t.statsT, xid)
+func renewdl(xid string, bck *meta.Bck) (*dload.Xact, error) {
+	rns := xreg.RenewDownloader(xid, bck)
 	if rns.Err != nil {
 		return nil, rns.Err
 	}

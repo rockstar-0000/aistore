@@ -1,48 +1,27 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/fs"
 )
 
-// low-level formatting routines and misc.
-
-func fmtObjStatus(obj *cmn.LsoEntry) string {
-	switch obj.Status() {
-	case apc.LocOK:
-		return "ok"
-	case apc.LocMisplacedNode:
-		return "misplaced(cluster)"
-	case apc.LocMisplacedMountpath:
-		return "misplaced(mountpath)"
-	case apc.LocIsCopy:
-		return "replica"
-	case apc.LocIsCopyMissingObj:
-		return "replica(object-is-missing)"
-	default:
-		debug.Assertf(false, "%#v", obj)
-		return "invalid"
-	}
-}
-
-func fmtObjIsCached(obj *cmn.LsoEntry) string {
-	return FmtBool(obj.CheckExists())
-}
+// this file: low-level formatting routines and misc.
 
 // FmtBool returns "yes" if true, else "no"
 func FmtBool(t bool) string {
@@ -64,7 +43,7 @@ func FmtCopies(copies int) string {
 	if copies == 0 {
 		return unknownVal
 	}
-	return fmt.Sprint(copies)
+	return strconv.Itoa(copies)
 }
 
 // FmtEC formats EC data (DataSlices, ParitySlices, IsECCopy) into a
@@ -137,19 +116,32 @@ func fmtProxiesSumm(smap *meta.Smap) string {
 	une := smap.CountNonElectable()
 	if une == 0 {
 		if cnt == 1 {
-			return fmt.Sprintf("%d", cnt)
+			return strconv.Itoa(cnt)
 		}
 		return fmt.Sprintf("%d (all electable)", cnt)
 	}
 	return fmt.Sprintf("%d (%d unelectable)", cnt, smap.CountNonElectable())
 }
 
-func fmtTargetsSumm(smap *meta.Smap) string {
-	cnt, act := len(smap.Tmap), smap.CountActiveTs()
-	if cnt != act {
-		return fmt.Sprintf("%d (%d inactive)", cnt, cnt-act)
+func fmtTargetsSumm(smap *meta.Smap, numDisks int) string {
+	var (
+		cnt, act = len(smap.Tmap), smap.CountActiveTs()
+		s        string
+	)
+	if numDisks > 0 {
+		switch {
+		case act > 1 && numDisks > 1:
+			s = fmt.Sprintf(" (total disks: %d)", numDisks)
+		case numDisks > 1:
+			s = fmt.Sprintf(" (num disks: %d)", numDisks)
+		default:
+			s = " (one disk)"
+		}
 	}
-	return fmt.Sprintf("%d", cnt)
+	if cnt != act {
+		return fmt.Sprintf("%d (%d inactive)%s", cnt, cnt-act, s)
+	}
+	return fmt.Sprintf("%d%s", cnt, s)
 }
 
 func fmtCapPctMAM(tcdf *fs.TargetCDF, list bool) string {
@@ -211,7 +203,7 @@ func fmtACL(acl apc.AccessAttrs) string {
 	if acl == 0 {
 		return unknownVal
 	}
-	return acl.Describe()
+	return acl.Describe(true /*incl. all*/)
 }
 
 func fmtNameArch(val string, flags uint16) string {
@@ -235,10 +227,10 @@ func dsortJobInfoStatus(j *dsort.JobInfo) string {
 }
 
 //
-// cluster.Snap helpers
+// core.Snap helpers
 //
 
-func fmtRebStatus(snap *cluster.Snap) string {
+func fmtRebStatus(snap *core.Snap) string {
 	if snap == nil {
 		return unknownVal
 	}
@@ -263,7 +255,7 @@ func fmtRebStatus(snap *cluster.Snap) string {
 	return unknownVal
 }
 
-func FmtXactStatus(snap *cluster.Snap) (s string) {
+func FmtXactStatus(snap *core.Snap) (s string) {
 	switch {
 	case snap.AbortedX:
 		if snap.AbortErr == cmn.ErrXactUserAbort.Error() {
@@ -286,7 +278,7 @@ func FmtXactStatus(snap *cluster.Snap) (s string) {
 	return
 }
 
-func extECGetStats(base *cluster.Snap) *ec.ExtECGetStats {
+func extECGetStats(base *core.Snap) *ec.ExtECGetStats {
 	ecGet := &ec.ExtECGetStats{}
 	if err := cos.MorphMarshal(base.Ext, ecGet); err != nil {
 		return &ec.ExtECGetStats{}
@@ -294,7 +286,7 @@ func extECGetStats(base *cluster.Snap) *ec.ExtECGetStats {
 	return ecGet
 }
 
-func extECPutStats(base *cluster.Snap) *ec.ExtECPutStats {
+func extECPutStats(base *core.Snap) *ec.ExtECPutStats {
 	ecPut := &ec.ExtECPutStats{}
 	if err := cos.MorphMarshal(base.Ext, ecPut); err != nil {
 		return &ec.ExtECPutStats{}

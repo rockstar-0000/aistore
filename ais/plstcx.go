@@ -5,43 +5,100 @@
 package ais
 
 import (
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
-type lstcx struct {
-	p *proxy
-	// arg
-	bckFrom *meta.Bck
-	bckTo   *meta.Bck
-	amsg    *apc.ActMsg // orig
-	tcbmsg  *apc.TCBMsg
-	// work
-	tsi    *meta.Snode
-	lsmsg  apc.LsoMsg
-	altmsg apc.ActMsg
-	tcomsg cmn.TCObjsMsg
+type (
+	lstca struct {
+		a  map[string]*lstcx
+		mu sync.Mutex
+	}
+	lstcx struct {
+		p *proxy
+		// arg
+		bckFrom *meta.Bck
+		bckTo   *meta.Bck
+		amsg    *apc.ActMsg // orig
+		config  *cmn.Config
+		smap    *smapX
+		// work
+		tsi     *meta.Snode
+		xid     string // x-tco
+		cnt     int
+		lsmsg   apc.LsoMsg
+		altmsg  apc.ActMsg
+		tcomsg  cmn.TCObjsMsg
+		stopped atomic.Bool
+	}
+)
+
+func (a *lstca) add(c *lstcx) {
+	a.mu.Lock()
+	if a.a == nil {
+		a.a = make(map[string]*lstcx, 4)
+	}
+	a.a[c.xid] = c
+	a.mu.Unlock()
+}
+
+func (a *lstca) del(c *lstcx) {
+	a.mu.Lock()
+	delete(a.a, c.xid)
+	a.mu.Unlock()
+}
+
+func (a *lstca) abort(xargs *xact.ArgsMsg) {
+	switch {
+	case xargs.ID != "":
+		if !strings.HasPrefix(xargs.ID, xs.PrefixTcoID) {
+			return
+		}
+		a.mu.Lock()
+		if c, ok := a.a[xargs.ID]; ok {
+			c.stopped.Store(true)
+		}
+		a.mu.Unlock()
+		nlog.Infoln(xargs.ID, "aborted")
+	case xargs.Kind == apc.ActCopyObjects || xargs.Kind == apc.ActETLObjects:
+		var ids []string
+		a.mu.Lock()
+		for uuid, c := range a.a {
+			c.stopped.Store(true)
+			ids = append(ids, uuid)
+		}
+		clear(a.a)
+		a.mu.Unlock()
+		if len(ids) > 0 {
+			nlog.Infoln(ids, "aborted")
+		}
+	}
 }
 
 func (c *lstcx) do() (string, error) {
-	var (
-		p    = c.p
-		smap = c.p.owner.smap.get()
-	)
 	// 1. lsmsg
 	c.lsmsg = apc.LsoMsg{
 		UUID:     cos.GenUUID(),
-		Prefix:   c.tcbmsg.Prefix,
+		Prefix:   c.tcomsg.TCBMsg.Prefix,
 		Props:    apc.GetPropsName,
 		PageSize: 0, // i.e., backend.MaxPageSize()
 	}
 	c.lsmsg.SetFlag(apc.LsNameOnly)
-	tsi, err := cluster.HrwTargetTask(c.lsmsg.UUID, &smap.Smap)
+	c.smap = c.p.owner.smap.get()
+	tsi, err := c.smap.HrwTargetTask(c.lsmsg.UUID)
 	if err != nil {
 		return "", err
 	}
@@ -50,75 +107,108 @@ func (c *lstcx) do() (string, error) {
 
 	// 2. ls 1st page
 	var lst *cmn.LsoResult
-	lst, err = p.lsObjsR(c.bckFrom, &c.lsmsg, smap, tsi /*designated target*/, true)
+	lst, err = c.p.lsObjsR(c.bckFrom, &c.lsmsg, c.smap, tsi /*designated target*/, c.config, true)
 	if err != nil {
 		return "", err
 	}
 	if len(lst.Entries) == 0 {
-		nlog.Infof("%s: %s => %s: lso counts zero - nothing to do", c.amsg.Action, c.bckFrom, c.bckTo)
+		// TODO: return http status to indicate exactly that (#6393)
+		nlog.Infoln(c.amsg.Action, c.bckFrom.Cname(""), " to ", c.bckTo.Cname("")+": lso counts zero - nothing to do")
 		return c.lsmsg.UUID, nil
 	}
 
 	// 3. tcomsg
 	c.tcomsg.ToBck = c.bckTo.Clone()
-	c.tcomsg.TCBMsg = *c.tcbmsg
-	names := make([]string, 0, len(lst.Entries))
+	lr, cnt := &c.tcomsg.ListRange, len(lst.Entries)
+	lr.ObjNames = make([]string, 0, cnt)
 	for _, e := range lst.Entries {
-		names = append(names, e.Name)
+		lr.ObjNames = append(lr.ObjNames, e.Name)
 	}
-	c.tcomsg.ListRange.ObjNames = names
 
-	// 4. multi-obj action: transform/copy
+	// 4. multi-obj action: transform/copy 1st page
 	c.altmsg.Value = &c.tcomsg
 	c.altmsg.Action = apc.ActCopyObjects
 	if c.amsg.Action == apc.ActETLBck {
 		c.altmsg.Action = apc.ActETLObjects
 	}
-	cnt := min(len(names), 10)
-	nlog.Infof("(%s => %s): %s => %s %v...", c.amsg.Action, c.altmsg.Action, c.bckFrom, c.bckTo, names[:cnt])
 
-	c.tcomsg.TxnUUID, err = p.tcobjs(c.bckFrom, c.bckTo, &c.altmsg, c.tcbmsg.DryRun)
-	if lst.ContinuationToken != "" {
-		c.lsmsg.ContinuationToken = lst.ContinuationToken
-		go c.pages(smap)
+	if c.xid, err = c.p.tcobjs(c.bckFrom, c.bckTo, c.config, &c.altmsg, &c.tcomsg); err != nil {
+		return "", err
 	}
-	return c.tcomsg.TxnUUID, err
+
+	nlog.Infoln("'ls --all' to execute [" + c.amsg.Action + " -> " + c.altmsg.Action + "]")
+	s := fmt.Sprintf("%s[%s] %s => %s", c.altmsg.Action, c.xid, c.bckFrom, c.bckTo)
+
+	// 5. more pages, if any
+	if lst.ContinuationToken != "" {
+		// Run
+		nlog.Infoln("run", s, "...")
+		c.lsmsg.ContinuationToken = lst.ContinuationToken
+		go c.pages(s, cnt)
+	} else {
+		nlog.Infoln(s, "count", cnt)
+	}
+	return c.xid, nil
 }
 
-// pages 2..last
-func (c *lstcx) pages(smap *smapX) {
-	p := c.p
-	for {
-		// next page
-		lst, err := p.lsObjsR(c.bckFrom, &c.lsmsg, smap, c.tsi, true)
-		if err != nil {
-			nlog.Errorln(err)
-			return
-		}
-		if len(lst.Entries) == 0 {
-			return
-		}
+func (c *lstcx) pages(s string, cnt int) {
+	c.cnt = cnt
+	c.p.lstca.add(c)
 
-		// next tcomsg
-		names := make([]string, 0, len(lst.Entries))
-		for _, e := range lst.Entries {
-			names = append(names, e.Name)
+	// pages 2, 3, ...
+	var err error
+	for !c.stopped.Load() && c.lsmsg.ContinuationToken != "" {
+		if cnt, err = c._page(); err != nil {
+			break
 		}
-		c.tcomsg.ListRange.ObjNames = names
-
-		// next tco action
-		c.altmsg.Value = &c.tcomsg
-		xid, err := p.tcobjs(c.bckFrom, c.bckTo, &c.altmsg, c.tcbmsg.DryRun)
-		if err != nil {
-			nlog.Errorln(err)
-			return
-		}
-		debug.Assertf(c.tcomsg.TxnUUID == xid, "%q vs %q", c.tcomsg.TxnUUID, xid)
-
-		// last page?
-		if lst.ContinuationToken == "" {
-			return
-		}
-		c.lsmsg.ContinuationToken = lst.ContinuationToken
+		c.cnt += cnt
 	}
+	c.p.lstca.del(c)
+	nlog.Infoln(s, "count", c.cnt, "stopped", c.stopped.Load(), "c-token", c.lsmsg.ContinuationToken, "err", err)
+}
+
+// next page
+func (c *lstcx) _page() (int, error) {
+	lst, err := c.p.lsObjsR(c.bckFrom, &c.lsmsg, c.smap, c.tsi, c.config, true)
+	if err != nil {
+		return 0, err
+	}
+	c.lsmsg.ContinuationToken = lst.ContinuationToken
+	if len(lst.Entries) == 0 {
+		debug.Assert(lst.ContinuationToken == "")
+		return 0, nil
+	}
+
+	lr := &c.tcomsg.ListRange
+	clear(lr.ObjNames)
+	lr.ObjNames = lr.ObjNames[:0]
+	for _, e := range lst.Entries {
+		lr.ObjNames = append(lr.ObjNames, e.Name)
+	}
+	c.altmsg.Value = &c.tcomsg
+	err = c.bcast()
+	return len(lr.ObjNames), err
+}
+
+// calls t.httpxpost (TODO: slice of names is the only "delta" - optimize)
+func (c *lstcx) bcast() (err error) {
+	body := cos.MustMarshal(apc.ActMsg{Name: c.xid, Value: &c.tcomsg})
+	args := allocBcArgs()
+	{
+		args.req = cmn.HreqArgs{Method: http.MethodPost, Path: apc.URLPathXactions.S, Body: body}
+		args.to = core.Targets
+		args.timeout = cmn.Rom.MaxKeepalive()
+	}
+	if c.stopped.Load() {
+		return
+	}
+	results := c.p.bcastGroup(args)
+	freeBcArgs(args)
+	for _, res := range results {
+		if err = res.err; err != nil {
+			break
+		}
+	}
+	freeBcastRes(results)
+	return err
 }

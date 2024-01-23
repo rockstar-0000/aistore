@@ -9,13 +9,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/nl"
@@ -90,7 +90,6 @@ func (t *target) runLRU(id string, wg *sync.WaitGroup, force bool, bcks ...cmn.B
 		t.bcastAsyncIC(msg)
 	}
 	ini := space.IniLRU{
-		T:                   t,
 		Xaction:             xlru.(*space.XactLRU),
 		Config:              cmn.GCO.Get(),
 		StatsT:              t.statsT,
@@ -101,7 +100,7 @@ func (t *target) runLRU(id string, wg *sync.WaitGroup, force bool, bcks ...cmn.B
 		Force:               force,
 	}
 	xlru.AddNotif(&xact.NotifXact{
-		Base: nl.Base{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
 		Xact: xlru,
 	})
 	space.RunLRU(&ini)
@@ -128,7 +127,6 @@ func (t *target) runStoreCleanup(id string, wg *sync.WaitGroup, bcks ...cmn.Bck)
 		t.bcastAsyncIC(msg)
 	}
 	ini := space.IniCln{
-		T:       t,
 		Xaction: xcln.(*space.XactCln),
 		Config:  cmn.GCO.Get(),
 		StatsT:  t.statsT,
@@ -136,7 +134,7 @@ func (t *target) runStoreCleanup(id string, wg *sync.WaitGroup, bcks ...cmn.Bck)
 		WG:      wg,
 	}
 	xcln.AddNotif(&xact.NotifXact{
-		Base: nl.Base{When: cluster.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
 		Xact: xcln,
 	})
 	return space.RunCleanup(&ini)

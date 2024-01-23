@@ -13,11 +13,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/ext/dsort/ct"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
@@ -55,7 +55,7 @@ type (
 	}
 
 	RecordExtractor interface {
-		RecordWithBuffer(args extractRecordArgs) (int64, error)
+		RecordWithBuffer(args *extractRecordArgs) (int64, error)
 	}
 
 	RecordManager struct {
@@ -75,12 +75,15 @@ type (
 	}
 )
 
-func NewRecordManager(bck cmn.Bck, extractCreator RW,
-	keyExtractor KeyExtractor, onDuplicatedRecords func(string) error) *RecordManager {
+///////////////////
+// RecordManager //
+///////////////////
+
+func NewRecordManager(bck cmn.Bck, extractCreator RW, keyExtractor KeyExtractor, onDupRecs func(string) error) *RecordManager {
 	return &RecordManager{
 		Records:             NewRecords(1000),
 		bck:                 bck,
-		onDuplicatedRecords: onDuplicatedRecords,
+		onDuplicatedRecords: onDupRecs,
 		extractCreator:      extractCreator,
 		keyExtractor:        keyExtractor,
 		contents:            &sync.Map{},
@@ -88,7 +91,7 @@ func NewRecordManager(bck cmn.Bck, extractCreator RW,
 	}
 }
 
-func (recm *RecordManager) RecordWithBuffer(args extractRecordArgs) (size int64, err error) {
+func (recm *RecordManager) RecordWithBuffer(args *extractRecordArgs) (size int64, err error) {
 	var (
 		storeType        string
 		contentPath      string
@@ -113,12 +116,13 @@ func (recm *RecordManager) RecordWithBuffer(args extractRecordArgs) (size int64,
 	debug.Assert(!args.extractMethod.Has(ExtractToWriter) || args.w != nil)
 
 	r, ske, needRead := recm.keyExtractor.PrepareExtractor(args.recordName, args.r, ext)
-	if args.extractMethod.Has(ExtractToMem) {
+	switch {
+	case args.extractMethod.Has(ExtractToMem):
 		mdSize = int64(len(args.metadata))
 		storeType = SGLStoreType
 		contentPath, fullContentPath = recm.encodeRecordName(storeType, args.shardName, args.recordName)
 
-		sgl := T.PageMM().NewSGL(r.Size() + int64(len(args.metadata)))
+		sgl := core.T.PageMM().NewSGL(r.Size() + int64(len(args.metadata)))
 		// No need for `io.CopyBuffer` since SGL implements `io.ReaderFrom`.
 		if _, err = io.Copy(sgl, bytes.NewReader(args.metadata)); err != nil {
 			sgl.Free()
@@ -134,7 +138,7 @@ func (recm *RecordManager) RecordWithBuffer(args extractRecordArgs) (size int64,
 			return size, errors.WithStack(err)
 		}
 		recm.contents.Store(fullContentPath, sgl)
-	} else if args.extractMethod.Has(ExtractToDisk) && recm.extractCreator.SupportsOffset() {
+	case args.extractMethod.Has(ExtractToDisk) && recm.extractCreator.SupportsOffset():
 		mdSize, size = recm.extractCreator.MetadataSize(), r.Size()
 		storeType = OffsetStoreType
 		contentPath, _ = recm.encodeRecordName(storeType, args.shardName, args.recordName)
@@ -150,7 +154,7 @@ func (recm *RecordManager) RecordWithBuffer(args extractRecordArgs) (size int64,
 				return 0, errors.WithStack(err)
 			}
 		}
-	} else if args.extractMethod.Has(ExtractToDisk) {
+	case args.extractMethod.Has(ExtractToDisk):
 		mdSize = int64(len(args.metadata))
 		storeType = DiskStoreType
 		contentPath, fullContentPath = recm.encodeRecordName(storeType, args.shardName, args.recordName)
@@ -165,7 +169,7 @@ func (recm *RecordManager) RecordWithBuffer(args extractRecordArgs) (size int64,
 		}
 		cos.Close(f)
 		recm.extractionPaths.Store(fullContentPath, struct{}{})
-	} else {
+	default:
 		debug.Assertf(false, "%d %d", args.extractMethod, args.extractMethod&ExtractToDisk)
 	}
 
@@ -180,7 +184,7 @@ func (recm *RecordManager) RecordWithBuffer(args extractRecordArgs) (size int64,
 	recm.Records.Insert(&Record{
 		Key:      key,
 		Name:     recordUniqueName,
-		DaemonID: T.SID(),
+		DaemonID: core.T.SID(),
 		Objects: []*RecordObj{{
 			ContentPath:    contentPath,
 			ObjectFileType: args.fileType,
@@ -238,9 +242,9 @@ func (recm *RecordManager) encodeRecordName(storeType, shardName, recordName str
 		//  * fullContentPath = fqn to recordUniqueName with extension (eg. <bucket_fqn>/shard_1-record_name.cls)
 		recordExt := cosExt(recordName)
 		contentPath := genRecordUname(shardName, recordName) + recordExt
-		c, err := cluster.NewCTFromBO(&recm.bck, contentPath, nil)
+		c, err := core.NewCTFromBO(&recm.bck, contentPath, nil)
 		debug.AssertNoErr(err)
-		return contentPath, c.Make(ct.DSortFileType)
+		return contentPath, c.Make(ct.DsortFileType)
 	default:
 		debug.Assert(false, storeType)
 		return "", ""
@@ -252,7 +256,7 @@ func (recm *RecordManager) FullContentPath(obj *RecordObj) string {
 	case OffsetStoreType:
 		// To convert contentPath to fullContentPath we need to make shard name
 		// full FQN.
-		ct, err := cluster.NewCTFromBO(&recm.bck, obj.ContentPath, nil)
+		ct, err := core.NewCTFromBO(&recm.bck, obj.ContentPath, nil)
 		debug.AssertNoErr(err)
 		return ct.Make(obj.ObjectFileType)
 	case SGLStoreType:
@@ -263,9 +267,9 @@ func (recm *RecordManager) FullContentPath(obj *RecordObj) string {
 		// To convert contentPath to fullContentPath we need to make record
 		// unique name full FQN.
 		contentPath := obj.ContentPath
-		c, err := cluster.NewCTFromBO(&recm.bck, contentPath, nil)
+		c, err := core.NewCTFromBO(&recm.bck, contentPath, nil)
 		debug.AssertNoErr(err)
-		return c.Make(ct.DSortFileType)
+		return c.Make(ct.DsortFileType)
 	default:
 		debug.Assert(false, obj.StoreType)
 		return ""
@@ -356,7 +360,7 @@ func (recm *RecordManager) Cleanup() {
 	recm.contents = nil
 
 	// NOTE: may call cos.FreeMemToOS
-	T.PageMM().FreeSpec(memsys.FreeSpec{
+	core.T.PageMM().FreeSpec(memsys.FreeSpec{
 		Totally: true,
 		ToOS:    true,
 		MinSize: 1, // force toGC to free all (even small) memory to system

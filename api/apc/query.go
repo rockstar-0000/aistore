@@ -1,6 +1,6 @@
 // Package apc: API messages and constants
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -49,18 +49,16 @@ const (
 	// When evicting, keep remote bucket in BMD (i.e., evict data only)
 	QparamKeepRemote = "keep_bck_md"
 
-	// When summarizing via a (blocking) api.GetBucketInfo call, provide remote stats as well
-	// NOTE: to be used with caution! depending on remote bucket size and network speed
-	//       the waiting time may be significant
-	QparamCountRemoteObjs = "count_remote_objs"
+	// (api.GetBucketInfo)
+	QparamBsummRemote = "bsumm_remote"
 
-	// NOTE: "presence" in a given cluster shall not be be confused with "existence" (possibly, remote).
+	// "presence" in a given cluster shall not be be confused with "existence" (possibly, remote).
 	// See also:
 	// - Flt* enum below
 	// - ListObjsMsg flags, docs/providers.md (for terminology)
 	QparamFltPresence = "presence"
 
-	// Object related query params.
+	// APPEND(object) operation - QparamAppendType enum below
 	QparamAppendType   = "append_type"
 	QparamAppendHandle = "append_handle"
 
@@ -88,6 +86,15 @@ const (
 	// - shutdown the primary and the entire cluster
 	// - attach invalid mountpath
 	QparamForce = "frc"
+
+	// same as `Versioning.ValidateWarmGet` (cluster config and bucket props)
+	// - usage: GET and (copy|transform) x (bucket|multi-object) operations
+	// - implies remote backend
+	QparamLatestVer = "latest-ver"
+
+	QparamSync = "synchronize" // TODO: in progress
+
+	QparamSilent = "sln" // when true., skip nlog.Error* (motivation: can be quite numerous and/or ignorable)
 )
 
 // QparamFltPresence enum.
@@ -105,7 +112,7 @@ const (
 	FltPresent               // bucket: is present | object: present and properly located
 	FltPresentNoProps        // same as above but no need to return props/info
 	FltPresentCluster        // objects: present anywhere/anyhow _in_ the cluster as: replica, ec-slices, misplaced
-	FltExistsOutside         // not present - exists _outside_ cluster
+	FltExistsOutside         // not present - exists _outside_ cluster (NOTE: currently, only list-buckets)
 )
 
 func IsFltPresent(v int) bool {
@@ -120,13 +127,6 @@ func IsFltNoProps(v int) bool {
 const (
 	AppendOp = "append"
 	FlushOp  = "flush"
-)
-
-// QparamTaskAction enum.
-const (
-	TaskStart  = Start
-	TaskStatus = "status"
-	TaskResult = "result"
 )
 
 // health
@@ -144,10 +144,8 @@ const (
 	QparamNonElectable     = "nel" // true: proxy is non-electable for the primary role
 	QparamUnixTime         = "utm" // Unix time since 01/01/70 UTC (nanoseconds)
 	QparamIsGFNRequest     = "gfn" // true if the request is a Get-From-Neighbor
-	QparamSilent           = "sln" // true: skip nlog.Error* (motivation: can be quite, multiple, and/or ignorable)
 	QparamRebStatus        = "rbs" // true: get detailed rebalancing status
 	QparamRebData          = "rbd" // true: get EC rebalance data (pulling data if push way fails)
-	QparamTaskAction       = "tac" // "start", "status", "result"
 	QparamClusterInfo      = "cii" // true: /Health to return cluster info and status
 	QparamOWT              = "owt" // object write transaction enum { OwtPut, ..., OwtGet* }
 

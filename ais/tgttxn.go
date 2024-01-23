@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -11,11 +11,10 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -23,9 +22,10 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/mirror"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/xact"
@@ -34,9 +34,11 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
+const ActCleanup = "cleanup" // in addition to (apc.ActBegin, ...)
+
 // context structure to gather all (or most) of the relevant state in one place
-// (compare with txnClientCtx)
-type txnServerCtx struct {
+// (compare with txnCln)
+type txnSrv struct {
 	t          *target
 	msg        *aisMsg
 	bck        *meta.Bck // aka bckFrom
@@ -72,7 +74,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiItems, err := t.parseURL(w, r, 0, true, apc.URLPathTxn.L)
+	apiItems, err := t.parseURL(w, r, apc.URLPathTxn.L, 0, true)
 	if err != nil {
 		return
 	}
@@ -85,23 +87,25 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		t.writeErrURL(w, r)
 		return
 	}
-	c, err := t.prepTxnServer(r, msg, bucket, phase)
-	if err != nil {
+
+	c := &txnSrv{t: t, msg: msg, phase: phase}
+	if err := c.init(r, bucket); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
+
 	switch msg.Action {
 	case apc.ActCreateBck, apc.ActAddRemoteBck:
 		err = t.createBucket(c)
 	case apc.ActMakeNCopies:
 		xid, err = t.makeNCopies(c)
 	case apc.ActSetBprops, apc.ActResetBprops:
-		xid, err = t.setBucketProps(c)
+		xid, err = t.setBprops(c)
 	case apc.ActMoveBck:
 		xid, err = t.renameBucket(c)
 	case apc.ActCopyBck, apc.ActETLBck:
 		var (
-			dp     cluster.DP
+			dp     core.DP
 			tcbmsg = &apc.TCBMsg{}
 		)
 		if err := cos.MorphMarshal(c.msg.Value, tcbmsg); err != nil {
@@ -110,7 +114,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if msg.Action == apc.ActETLBck {
 			var err error
-			if dp, err = t.etlDP(tcbmsg); err != nil {
+			if dp, err = etlDP(tcbmsg); err != nil {
 				t.writeErr(w, r, err)
 				return
 			}
@@ -118,7 +122,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		xid, err = t.tcb(c, tcbmsg, dp)
 	case apc.ActCopyObjects, apc.ActETLObjects:
 		var (
-			dp     cluster.DP
+			dp     core.DP
 			tcomsg = &cmn.TCObjsMsg{}
 		)
 		if err := cos.MorphMarshal(c.msg.Value, tcomsg); err != nil {
@@ -126,8 +130,13 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if msg.Action == apc.ActETLObjects {
+			cs := fs.Cap()
+			if err := cs.Err(); err != nil {
+				t.writeErr(w, r, err, http.StatusInsufficientStorage)
+				return
+			}
 			var err error
-			if dp, err = t.etlDP(&tcomsg.TCBMsg); err != nil {
+			if dp, err = etlDP(&tcomsg.TCBMsg); err != nil {
 				t.writeErr(w, r, err)
 				return
 			}
@@ -153,6 +162,10 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	// cleanup on error
+	t.transactions.find(c.uuid, ActCleanup)
+
 	if cmn.IsErrCapExceeded(err) {
 		cs := t.OOS(nil)
 		t.writeErrStatusf(w, r, http.StatusInsufficientStorage, "%s: %v", cs.String(), err)
@@ -165,7 +178,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 // createBucket
 //
 
-func (t *target) createBucket(c *txnServerCtx) error {
+func (t *target) createBucket(c *txnSrv) error {
 	switch c.phase {
 	case apc.ActBegin:
 		txn := newTxnCreateBucket(c)
@@ -192,7 +205,7 @@ func (t *target) createBucket(c *txnServerCtx) error {
 	return nil
 }
 
-func (t *target) _commitCreateDestroy(c *txnServerCtx) (err error) {
+func (t *target) _commitCreateDestroy(c *txnSrv) (err error) {
 	txn, err := t.transactions.find(c.uuid, "")
 	if err != nil {
 		return err
@@ -208,29 +221,34 @@ func (t *target) _commitCreateDestroy(c *txnServerCtx) (err error) {
 // makeNCopies
 //
 
-func (t *target) makeNCopies(c *txnServerCtx) (string, error) {
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return "", err
-	}
+func (t *target) makeNCopies(c *txnSrv) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		curCopies, newCopies, err := t.validateMakeNCopies(c.bck, c.msg)
 		if err != nil {
 			return "", err
 		}
-		nlp := newBckNLP(c.bck)
-		if !nlp.TryLock(c.timeout.netw / 2) {
-			return "", cmn.NewErrBckIsBusy(c.bck.Bucket())
-		}
-		txn := newTxnMakeNCopies(c, curCopies, newCopies)
-		if err := t.transactions.begin(txn); err != nil {
-			nlp.Unlock()
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
 			return "", err
 		}
-		txn.nlps = []cluster.NLP{nlp}
+		nlp := newBckNLP(c.bck)
+		if !nlp.TryLock(c.timeout.netw / 2) {
+			return "", cmn.NewErrBusy("bucket", c.bck, "")
+		}
+		txn := newTxnMakeNCopies(c, curCopies, newCopies)
+		if err := t.transactions.begin(txn, nlp); err != nil {
+			return "", err
+		}
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		copies, err := _parseNCopies(c.msg.Value)
 		debug.AssertNoErr(err)
 		txn, err := t.transactions.find(c.uuid, "")
@@ -246,7 +264,7 @@ func (t *target) makeNCopies(c *txnServerCtx) (string, error) {
 		}
 
 		// do the work in xaction
-		rns := xreg.RenewBckMakeNCopies(t, c.bck, c.uuid, "mnc-actmnc", int(copies))
+		rns := xreg.RenewBckMakeNCopies(c.bck, c.uuid, "mnc-actmnc", int(copies))
 		if rns.Err != nil {
 			return "", fmt.Errorf("%s %s: %v", t, txn, rns.Err)
 		}
@@ -285,17 +303,17 @@ func (t *target) validateMakeNCopies(bck *meta.Bck, msg *aisMsg) (curCopies, new
 }
 
 //
-// setBucketProps
+// setBprops
 //
 
-func (t *target) setBucketProps(c *txnServerCtx) (string, error) {
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return "", err
-	}
+func (t *target) setBprops(c *txnSrv) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		var (
-			nprops *cmn.BucketProps
+			nprops *cmn.Bprops
 			err    error
 		)
 		if nprops, err = t.validateNprops(c.bck, c.msg); err != nil {
@@ -303,17 +321,18 @@ func (t *target) setBucketProps(c *txnServerCtx) (string, error) {
 		}
 		nlp := newBckNLP(c.bck)
 		if !nlp.TryLock(c.timeout.netw / 2) {
-			return "", cmn.NewErrBckIsBusy(c.bck.Bucket())
+			return "", cmn.NewErrBusy("bucket", c.bck, "")
 		}
 		txn := newTxnSetBucketProps(c, nprops)
-		if err := t.transactions.begin(txn); err != nil {
-			nlp.Unlock()
+		if err := t.transactions.begin(txn, nlp); err != nil {
 			return "", err
 		}
-		txn.nlps = []cluster.NLP{nlp}
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		var xid string
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
@@ -327,7 +346,7 @@ func (t *target) setBucketProps(c *txnServerCtx) (string, error) {
 		}
 		if _reMirror(bprops, nprops) {
 			n := int(nprops.Mirror.Copies)
-			rns := xreg.RenewBckMakeNCopies(t, c.bck, c.uuid, "mnc-setprops", n)
+			rns := xreg.RenewBckMakeNCopies(c.bck, c.uuid, "mnc-setprops", n)
 			if rns.Err != nil {
 				return "", fmt.Errorf("%s %s: %v", t, txn, rns.Err)
 			}
@@ -341,7 +360,7 @@ func (t *target) setBucketProps(c *txnServerCtx) (string, error) {
 		if _, reec := _reEC(bprops, nprops, c.bck, nil /*smap*/); reec {
 			flt := xreg.Flt{Kind: apc.ActECEncode, Bck: c.bck}
 			xreg.DoAbort(flt, errors.New("re-ec"))
-			rns := xreg.RenewECEncode(t, c.bck, c.uuid, apc.ActCommit)
+			rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit)
 			if rns.Err != nil {
 				return "", rns.Err
 			}
@@ -362,12 +381,12 @@ func (t *target) setBucketProps(c *txnServerCtx) (string, error) {
 	return "", nil
 }
 
-func (t *target) validateNprops(bck *meta.Bck, msg *aisMsg) (nprops *cmn.BucketProps, err error) {
+func (t *target) validateNprops(bck *meta.Bck, msg *aisMsg) (nprops *cmn.Bprops, err error) {
 	var (
 		body = cos.MustMarshal(msg.Value)
 		cs   = fs.Cap()
 	)
-	nprops = &cmn.BucketProps{}
+	nprops = &cmn.Bprops{}
 	if err = jsoniter.Unmarshal(body, nprops); err != nil {
 		err = fmt.Errorf(cmn.FmtErrUnmarshal, t, "new bucket props", cos.BHead(body), err)
 		return
@@ -393,12 +412,12 @@ func (t *target) validateNprops(bck *meta.Bck, msg *aisMsg) (nprops *cmn.BucketP
 // renameBucket
 //
 
-func (t *target) renameBucket(c *txnServerCtx) (string, error) {
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return "", err
-	}
+func (t *target) renameBucket(c *txnSrv) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		bckFrom, bckTo := c.bck, c.bckTo
 		if err := t.validateBckRenTxn(bckFrom, bckTo, c.msg); err != nil {
 			return "", err
@@ -406,22 +425,22 @@ func (t *target) renameBucket(c *txnServerCtx) (string, error) {
 		nlpFrom := newBckNLP(bckFrom)
 		nlpTo := newBckNLP(bckTo)
 		if !nlpFrom.TryLock(c.timeout.netw / 4) {
-			return "", cmn.NewErrBckIsBusy(bckFrom.Bucket())
+			return "", cmn.NewErrBusy("bucket", bckFrom, "")
 		}
 		if !nlpTo.TryLock(c.timeout.netw / 4) {
 			nlpFrom.Unlock()
-			return "", cmn.NewErrBckIsBusy(bckTo.Bucket())
+			return "", cmn.NewErrBusy("bucket", bckTo, "")
 		}
 		txn := newTxnRenameBucket(c, bckFrom, bckTo)
-		if err := t.transactions.begin(txn); err != nil {
-			nlpTo.Unlock()
-			nlpFrom.Unlock()
+		if err := t.transactions.begin(txn, nlpFrom, nlpTo); err != nil {
 			return "", err
 		}
-		txn.nlps = []cluster.NLP{nlpFrom, nlpTo}
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
 			return "", err
@@ -431,7 +450,7 @@ func (t *target) renameBucket(c *txnServerCtx) (string, error) {
 		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
-		rns := xreg.RenewBckRename(t, txnRenB.bckFrom, txnRenB.bckTo, c.uuid, c.msg.RMDVersion, apc.ActCommit)
+		rns := xreg.RenewBckRename(txnRenB.bckFrom, txnRenB.bckTo, c.uuid, c.msg.RMDVersion, apc.ActCommit)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %s %v", t, txn, rns.Err)
 			return "", rns.Err // must not happen at commit time
@@ -486,23 +505,23 @@ func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *aisMsg) error 
 	return nil
 }
 
-func (t *target) etlDP(msg *apc.TCBMsg) (cluster.DP, error) {
-	if err := k8s.Detect(); err != nil {
-		return nil, err
+func etlDP(msg *apc.TCBMsg) (core.DP, error) {
+	if !k8s.IsK8s() {
+		return nil, k8s.ErrK8sRequired
 	}
 	if err := msg.Validate(true); err != nil {
 		return nil, err
 	}
-	return etl.NewOfflineDP(msg, t.si, cmn.GCO.Get())
+	return etl.NewOfflineDP(msg, cmn.GCO.Get())
 }
 
 // common for both bucket copy and bucket transform - does the heavy lifting
-func (t *target) tcb(c *txnServerCtx, msg *apc.TCBMsg, dp cluster.DP) (string, error) {
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return "", err
-	}
+func (t *target) tcb(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		bckTo, bckFrom := c.bckTo, c.bck
 		if err := bckTo.Validate(); err != nil {
 			return "", err
@@ -524,19 +543,15 @@ func (t *target) tcb(c *txnServerCtx, msg *apc.TCBMsg, dp cluster.DP) (string, e
 		if _, present := bmd.Get(bckFrom); !present {
 			return "", cmn.NewErrBckNotFound(bckFrom.Bucket())
 		}
-		nlpTo, nlpFrom, err := t._tcbBegin(c, msg, dp)
-		if err != nil {
-			if nlpFrom != nil {
-				nlpFrom.Unlock()
-			}
-			if nlpTo != nil {
-				nlpTo.Unlock()
-			}
+		if err := t._tcbBegin(c, msg, dp); err != nil {
 			return "", err
 		}
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
 			return "", err
@@ -559,7 +574,7 @@ func (t *target) tcb(c *txnServerCtx, msg *apc.TCBMsg, dp cluster.DP) (string, e
 			return "", err
 		}
 		custom.Phase = apc.ActCommit
-		rns := xreg.RenewTCB(t, c.uuid, c.msg.Action /*kind*/, txnTcb.xtcb.Args())
+		rns := xreg.RenewTCB(c.uuid, c.msg.Action /*kind*/, txnTcb.xtcb.Args())
 		if rns.Err != nil {
 			txnTcb.xtcb.TxnAbort(rns.Err)
 			nlog.Errorf("%s: %s %v", t, txn, rns.Err)
@@ -577,53 +592,54 @@ func (t *target) tcb(c *txnServerCtx, msg *apc.TCBMsg, dp cluster.DP) (string, e
 	return "", nil
 }
 
-func (t *target) _tcbBegin(c *txnServerCtx, msg *apc.TCBMsg, dp cluster.DP) (nlpTo, nlpFrom cluster.NLP, err error) {
-	bckTo, bckFrom := c.bckTo, c.bck
-	nlpFrom = newBckNLP(bckFrom)
-
+func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
+	var (
+		bckTo, bckFrom = c.bckTo, c.bck
+		nlpFrom        = newBckNLP(bckFrom)
+		nlpTo          core.NLP
+	)
 	if !nlpFrom.TryRLock(c.timeout.netw / 4) {
-		nlpFrom = nil
-		err = cmn.NewErrBckIsBusy(bckFrom.Bucket())
-		return
+		return cmn.NewErrBusy("bucket", bckFrom, "")
 	}
-	if !msg.DryRun {
+	if !msg.DryRun && !bckFrom.Equal(bckTo, true, true) {
 		nlpTo = newBckNLP(bckTo)
 		if !nlpTo.TryLock(c.timeout.netw / 4) {
-			nlpTo = nil
-			err = cmn.NewErrBckIsBusy(bckTo.Bucket())
-			return
+			nlpFrom.Unlock()
+			return cmn.NewErrBusy("bucket", bckTo, "")
 		}
 	}
 	custom := &xreg.TCBArgs{Phase: apc.ActBegin, BckFrom: bckFrom, BckTo: bckTo, DP: dp, Msg: msg}
-	rns := xreg.RenewTCB(t, c.uuid, c.msg.Action /*kind*/, custom)
+	rns := xreg.RenewTCB(c.uuid, c.msg.Action /*kind*/, custom)
 	if err = rns.Err; err != nil {
 		nlog.Errorf("%s: %q %+v %v", t, c.uuid, msg, rns.Err)
 		return
 	}
-	xctn := rns.Entry.Get()
-	xtcb := xctn.(*mirror.XactTCB)
-	txn := newTxnTCB(c, xtcb)
-	if err = t.transactions.begin(txn); err != nil {
-		return
-	}
-	txn.nlps = []cluster.NLP{nlpFrom}
+
+	var (
+		xctn = rns.Entry.Get()
+		xtcb = xctn.(*xs.XactTCB)
+		txn  = newTxnTCB(c, xtcb)
+		nlps = []core.NLP{nlpFrom}
+	)
 	if nlpTo != nil {
-		txn.nlps = append(txn.nlps, nlpTo)
+		nlps = append(nlps, nlpTo)
 	}
-	return
+	return t.transactions.begin(txn, nlps...)
 }
 
-func (t *target) tcobjs(c *txnServerCtx, msg *cmn.TCObjsMsg, dp cluster.DP) (string, error) {
-	var xid string
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return xid, err
-	}
+// Two IDs:
+// - TxnUUID: transaction (txn) ID
+// - xid: xaction ID (will have "tco-" prefix)
+func (t *target) tcobjs(c *txnSrv, msg *cmn.TCObjsMsg, dp core.DP) (xid string, _ error) {
 	switch c.phase {
 	case apc.ActBegin:
 		var (
 			bckTo   = c.bckTo
 			bckFrom = c.bck // from
 		)
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return xid, err
+		}
 		// validate
 		if err := bckTo.Validate(); err != nil {
 			return xid, err
@@ -644,7 +660,7 @@ func (t *target) tcobjs(c *txnServerCtx, msg *cmn.TCObjsMsg, dp cluster.DP) (str
 		}
 		// begin
 		custom := &xreg.TCObjsArgs{BckFrom: bckFrom, BckTo: bckTo, DP: dp}
-		rns := xreg.RenewTCObjs(t, c.msg.Action /*kind*/, custom)
+		rns := xreg.RenewTCObjs(c.msg.Action /*kind*/, custom)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %q %+v %v", t, c.uuid, c.msg, rns.Err)
 			return xid, rns.Err
@@ -670,6 +686,9 @@ func (t *target) tcobjs(c *txnServerCtx, msg *cmn.TCObjsMsg, dp cluster.DP) (str
 			}
 		}
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return xid, err
+		}
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
 			return xid, err
@@ -699,30 +718,34 @@ func (t *target) tcobjs(c *txnServerCtx, msg *cmn.TCObjsMsg, dp cluster.DP) (str
 // ecEncode
 //
 
-func (t *target) ecEncode(c *txnServerCtx) (string, error) {
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return "", err
-	}
+func (t *target) ecEncode(c *txnSrv) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		if err := t.validateECEncode(c.bck, c.msg); err != nil {
+			return "", err
+		}
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
 			return "", err
 		}
 		nlp := newBckNLP(c.bck)
 
 		if !nlp.TryLock(c.timeout.netw / 4) {
-			return "", cmn.NewErrBckIsBusy(c.bck.Bucket())
+			return "", cmn.NewErrBusy("bucket", c.bck, "")
 		}
-
 		txn := newTxnECEncode(c, c.bck)
-		if err := t.transactions.begin(txn); err != nil {
-			nlp.Unlock()
+		if err := t.transactions.begin(txn, nlp); err != nil {
 			return "", err
 		}
-		txn.nlps = []cluster.NLP{nlp}
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
 			return "", err
@@ -731,7 +754,7 @@ func (t *target) ecEncode(c *txnServerCtx) (string, error) {
 		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
-		rns := xreg.RenewECEncode(t, c.bck, c.uuid, apc.ActCommit)
+		rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %s %v", t, txn, rns.Err)
 			return "", rns.Err
@@ -759,17 +782,17 @@ func (t *target) validateECEncode(bck *meta.Bck, msg *aisMsg) error {
 // createArchMultiObj
 //
 
-func (t *target) createArchMultiObj(c *txnServerCtx) (string /*xaction uuid*/, error) {
+func (t *target) createArchMultiObj(c *txnSrv) (string /*xaction uuid*/, error) {
 	var xid string
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return xid, err
-	}
 	switch c.phase {
 	case apc.ActBegin:
 		var (
 			bckTo   = c.bckTo
 			bckFrom = c.bck
 		)
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return xid, err
+		}
 		if err := bckTo.Validate(); err != nil {
 			return xid, err
 		}
@@ -793,7 +816,7 @@ func (t *target) createArchMultiObj(c *txnServerCtx) (string /*xaction uuid*/, e
 			return xid, err
 		}
 
-		rns := xreg.RenewPutArchive(t, bckFrom, bckTo)
+		rns := xreg.RenewPutArchive(bckFrom, bckTo)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %q %+v %v", t, c.uuid, archMsg, rns.Err)
 			return xid, rns.Err
@@ -805,9 +828,9 @@ func (t *target) createArchMultiObj(c *txnServerCtx) (string /*xaction uuid*/, e
 		// finalize the message and begin local transaction
 		archMsg.TxnUUID = c.uuid
 		archMsg.FromBckName = bckFrom.Name
-		archlom := cluster.AllocLOM(archMsg.ArchName)
+		archlom := core.AllocLOM(archMsg.ArchName)
 		if err := xarch.Begin(archMsg, archlom); err != nil {
-			cluster.FreeLOM(archlom) // otherwise is freed by x-archive
+			core.FreeLOM(archlom) // otherwise is freed by x-archive
 			return xid, err
 		}
 		txn := newTxnArchMultiObj(c, bckFrom, xarch, archMsg)
@@ -825,6 +848,9 @@ func (t *target) createArchMultiObj(c *txnServerCtx) (string /*xaction uuid*/, e
 			}
 		}
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return xid, err
+		}
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
 			return xid, err
@@ -841,7 +867,7 @@ func (t *target) createArchMultiObj(c *txnServerCtx) (string /*xaction uuid*/, e
 // begin (maintenance -- decommission -- shutdown) via p.beginRmTarget
 //
 
-func (t *target) beginRm(c *txnServerCtx) error {
+func (t *target) beginRm(c *txnSrv) error {
 	var opts apc.ActValRmNode
 	if c.phase != apc.ActBegin {
 		return fmt.Errorf("%s: expecting begin phase, got %q", t, c.phase)
@@ -853,23 +879,21 @@ func (t *target) beginRm(c *txnServerCtx) error {
 }
 
 //
-// destroy local bucket / evict cloud buket
+// destroy local bucket / evict cloud bucket
 //
 
-func (t *target) destroyBucket(c *txnServerCtx) error {
+func (t *target) destroyBucket(c *txnSrv) error {
 	switch c.phase {
 	case apc.ActBegin:
 		nlp := newBckNLP(c.bck)
 		if !nlp.TryLock(c.timeout.netw / 2) {
-			return cmn.NewErrBckIsBusy(c.bck.Bucket())
+			return cmn.NewErrBusy("bucket", c.bck, "")
 		}
 		txn := newTxnBckBase(c.bck)
 		txn.fillFromCtx(c)
-		if err := t.transactions.begin(txn); err != nil {
-			nlp.Unlock()
+		if err := t.transactions.begin(txn, nlp); err != nil {
 			return err
 		}
-		txn.nlps = []cluster.NLP{nlp}
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
@@ -880,16 +904,23 @@ func (t *target) destroyBucket(c *txnServerCtx) error {
 	return nil
 }
 
-func (t *target) promote(c *txnServerCtx, hdr http.Header) (string, error) {
-	if err := c.bck.Init(t.owner.bmd); err != nil {
-		return "", err
-	}
+func (t *target) promote(c *txnSrv, hdr http.Header) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
-		prmMsg := &cluster.PromoteArgs{}
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
+		cs := fs.Cap()
+		if err := cs.Err(); err != nil {
+			return "", err
+		}
+		prmMsg := &apc.PromoteArgs{}
 		if err := cos.MorphMarshal(c.msg.Value, prmMsg); err != nil {
 			err = fmt.Errorf(cmn.FmtErrMorphUnmarshal, t, c.msg.Action, c.msg.Value, err)
 			return "", err
+		}
+		if strings.Contains(prmMsg.ObjName, "../") || strings.Contains(prmMsg.ObjName, "~/") {
+			return "", fmt.Errorf("invalid object name or prefix %q", prmMsg.ObjName)
 		}
 		srcFQN := c.msg.Name
 		finfo, err := os.Stat(srcFQN)
@@ -897,7 +928,7 @@ func (t *target) promote(c *txnServerCtx, hdr http.Header) (string, error) {
 			return "", err
 		}
 		if !finfo.IsDir() {
-			txn := newTxnPromote(c, prmMsg, []string{srcFQN}, "", 1)
+			txn := newTxnPromote(c, prmMsg, []string{srcFQN}, "" /*dirFQN*/, 1)
 			if err := t.transactions.begin(txn); err != nil {
 				return "", err
 			}
@@ -922,6 +953,9 @@ func (t *target) promote(c *txnServerCtx, hdr http.Header) (string, error) {
 	case apc.ActAbort:
 		t.transactions.find(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
+		if err := c.bck.Init(t.owner.bmd); err != nil {
+			return "", err
+		}
 		txn, err := t.transactions.find(c.uuid, "")
 		if err != nil {
 			return "", err
@@ -945,7 +979,7 @@ func (t *target) promote(c *txnServerCtx, hdr http.Header) (string, error) {
 			return "", err
 		}
 
-		rns := xreg.RenewPromote(t, c.uuid, c.bck, txnPrm.msg)
+		rns := xreg.RenewPromote(c.uuid, c.bck, txnPrm.msg)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %s %v", t, txnPrm, rns.Err)
 			return "", rns.Err
@@ -964,10 +998,10 @@ func (t *target) promote(c *txnServerCtx, hdr http.Header) (string, error) {
 }
 
 // scan and, optionally, auto-detect file-share
-func prmScan(dirFQN string, prmMsg *cluster.PromoteArgs) (fqns []string, totalN int, cksumVal string, err error) {
+func prmScan(dirFQN string, prmMsg *apc.PromoteArgs) (fqns []string, totalN int, cksumVal string, err error) {
 	var (
 		cksum      *cos.CksumHash
-		autoDetect = !prmMsg.SrcIsNotFshare || !cmn.Features.IsSet(feat.DontAutoDetectFshare)
+		autoDetect = !prmMsg.SrcIsNotFshare || !cmn.Rom.Features().IsSet(feat.DontAutoDetectFshare)
 	)
 	cb := func(fqn string, de fs.DirEntry) (err error) {
 		if de.IsDir() {
@@ -1004,16 +1038,17 @@ func prmScan(dirFQN string, prmMsg *cluster.PromoteArgs) (fqns []string, totalN 
 }
 
 // synchronously wo/ xaction
-func (t *target) prmNumFiles(c *txnServerCtx, txnPrm *txnPromote, confirmedFshare bool) error {
+func (t *target) prmNumFiles(c *txnSrv, txnPrm *txnPromote, confirmedFshare bool) error {
 	smap := t.owner.smap.Get()
+	config := cmn.GCO.Get()
 	for _, fqn := range txnPrm.fqns {
-		objName, err := cmn.PromotedObjDstName(fqn, txnPrm.dirFQN, txnPrm.msg.ObjName)
+		objName, err := xs.PrmObjName(fqn, txnPrm.dirFQN, txnPrm.msg.ObjName)
 		if err != nil {
 			return err
 		}
 		// file share == true: promote only the part of the txnPrm.fqns that "lands" locally
 		if confirmedFshare {
-			si, err := cluster.HrwTarget(c.bck.MakeUname(objName), smap)
+			si, err := smap.HrwName2T(c.bck.MakeUname(objName))
 			if err != nil {
 				return err
 			}
@@ -1021,63 +1056,58 @@ func (t *target) prmNumFiles(c *txnServerCtx, txnPrm *txnPromote, confirmedFshar
 				continue
 			}
 		}
-		params := cluster.PromoteParams{
-			Bck: c.bck,
-			PromoteArgs: cluster.PromoteArgs{
+		params := core.PromoteParams{
+			Bck:    c.bck,
+			Config: config,
+			PromoteArgs: apc.PromoteArgs{
 				SrcFQN:       fqn,
 				ObjName:      objName,
 				OverwriteDst: txnPrm.msg.OverwriteDst,
 				DeleteSrc:    txnPrm.msg.DeleteSrc,
 			},
 		}
-		if _, err := t.Promote(params); err != nil {
+		if _, err := t.Promote(&params); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-//
-// misc
-//
+////////////
+// txnSrv //
+////////////
 
-func (t *target) prepTxnServer(r *http.Request, msg *aisMsg, bucket, phase string) (*txnServerCtx, error) {
-	var (
-		err   error
-		query = r.URL.Query()
-		c     = &txnServerCtx{}
-	)
-	c.msg = msg
+func (c *txnSrv) init(r *http.Request, bucket string) (err error) {
 	c.callerName = r.Header.Get(apc.HdrCallerName)
 	c.callerID = r.Header.Get(apc.HdrCallerID)
-	c.phase = phase
 
+	query := r.URL.Query()
 	if bucket != "" {
 		if c.bck, err = newBckFromQ(bucket, query, nil); err != nil {
-			return c, err
+			return err
 		}
 	}
 	c.bckTo, err = newBckFromQuname(query, false /*required*/)
 	if err != nil {
-		return c, err
+		return err
 	}
 
 	// latency = (network) +- (clock drift)
-	if phase == apc.ActBegin {
+	if c.phase == apc.ActBegin {
 		if ptime := query.Get(apc.QparamUnixTime); ptime != "" {
 			now := time.Now().UnixNano()
 			dur := ptLatency(now, ptime, r.Header.Get(apc.HdrCallerIsPrimary))
-			lim := int64(cmn.Timeout.CplaneOperation()) >> 1
+			lim := int64(cmn.Rom.CplaneOperation()) >> 1
 			if dur > lim || dur < -lim {
 				nlog.Errorf("Warning: clock drift %s <-> %s(self) = %v, txn %s[%s]",
-					c.callerName, t, time.Duration(dur), msg.Action, c.msg.UUID)
+					c.callerName, c.t, time.Duration(dur), c.msg.Action, c.msg.UUID)
 			}
 		}
 	}
 
 	c.uuid = c.msg.UUID
 	if c.uuid == "" {
-		return c, nil
+		return nil
 	}
 	if tout := query.Get(apc.QparamNetwTimeout); tout != "" {
 		c.timeout.netw, err = cos.S2Duration(tout)
@@ -1088,22 +1118,16 @@ func (t *target) prepTxnServer(r *http.Request, msg *aisMsg, bucket, phase strin
 		debug.AssertNoErr(err)
 	}
 	c.query = query // operation-specific values, if any
-
-	c.t = t
-	return c, err
+	return err
 }
 
-//
-// notifications
-//
-
-func (c *txnServerCtx) addNotif(xctn cluster.Xact) {
+func (c *txnSrv) addNotif(xctn core.Xact) {
 	dsts, ok := c.query[apc.QparamNotifyMe]
 	if !ok {
 		return
 	}
 	xctn.AddNotif(&xact.NotifXact{
-		Base: nl.Base{When: cluster.UponTerm, Dsts: dsts, F: c.t.notifyTerm},
+		Base: nl.Base{When: core.UponTerm, Dsts: dsts, F: c.t.notifyTerm},
 		Xact: xctn,
 	})
 }

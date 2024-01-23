@@ -12,6 +12,7 @@ redirect_from:
 - [Getting Started](#getting-started)
 - [CLI Reference](#cli-reference)
 - [CLI Config](#cli-config)
+- [Environment variables](#environment-variables)
 - [First steps](#first-steps)
 - [Global options](#global-options)
 - [Backend Provider](#backend-provider)
@@ -38,7 +39,7 @@ $ MODE=debug make cli
 
 Alternatively, install directly from GitHub:
 
-* [Install CLI from release binaries](https://github.com/NVIDIA/aistore/blob/master/deploy/scripts/install_from_binaries.sh)
+* [Install CLI from release binaries](https://github.com/NVIDIA/aistore/blob/main/deploy/scripts/install_from_binaries.sh)
 
 For example, the following command extracts CLI binary to the specified destination and, secondly, installs `bash` autocompletions:
 
@@ -50,7 +51,7 @@ For more usage options, run: `./deploy/scripts/install_from_binaries.sh --help`
 
 You can also install `bash` and/or `zsh` autocompletions separately at any (later) time:
 
-* [Install CLI autocompletions](https://github.com/NVIDIA/aistore/blob/master/cmd/cli/install_autocompletions.sh)
+* [Install CLI autocompletions](https://github.com/NVIDIA/aistore/blob/main/cmd/cli/install_autocompletions.sh)
 
 To uninstall autocompletions, follow the `install_autocompletions.sh` generated prompts, or simply run `bash autocomplete/uninstall.sh`.
 
@@ -64,7 +65,7 @@ Once installed, you should be able to start by running ais `<TAB-TAB>`, selectin
 
 See also:
 
-* [cmd/cli/README.md](https://github.com/NVIDIA/aistore/blob/master/cmd/cli/README.md)
+* [cmd/cli/README.md](https://github.com/NVIDIA/aistore/blob/main/cmd/cli/README.md)
 
 > The rest of the README assumes that user's `PATH` environment variable contains `$GOPATH/bin` directory.
 > Run `export PATH=$PATH:$GOPATH/bin` if this is not the case.
@@ -121,17 +122,22 @@ Notice:
 * CLI configuration directory: `$HOME/.config/ais/cli`
 * CLI configuration filename: `cli.json`
 
-> For the most updated system filenames and configuration directories, please see [`fname/fname.go`](https://github.com/NVIDIA/aistore/blob/master/cmn/fname/fname.go) source.
+> For the most updated system filenames and configuration directories, please see [`fname/fname.go`](https://github.com/NVIDIA/aistore/blob/main/cmn/fname/fname.go) source.
 
 
 When used the very first time, *or* if the `$HOME/.config/ais/cli/cli.json` does not exist, the latter will be created with default parameters:
 
 ```json
+$ ais config cli --json
+
 {
     "cluster": {
         "url": "http://127.0.0.1:8080",
         "default_ais_host": "http://127.0.0.1:8080",
         "default_docker_host": "http://172.50.0.2:8080",
+        "client_crt": "",
+        "client_crt_key": "",
+        "client_ca_tls": "",
         "skip_verify_crt": false
     },
     "timeout": {
@@ -142,15 +148,18 @@ When used the very first time, *or* if the `$HOME/.config/ais/cli/cli.json` does
         "url": "http://127.0.0.1:52001"
     },
     "aliases": {
+        "wait": "job wait",
         "cp": "bucket cp",
         "create": "bucket create",
-        "wait": "job wait",
-        "stop": "job stop",
+        "download": "job start download",
+        "evict": "bucket evict",
         "get": "object get",
-        "ls": "bucket ls",
         "put": "object put",
+        "dsort": "job start dsort",
+        "ls": "bucket ls",
         "rmb": "bucket rm",
-        "start": "job start"
+        "start": "job start",
+        "stop": "job stop"
     },
     "default_provider": "ais",
     "no_color": false,
@@ -158,7 +167,32 @@ When used the very first time, *or* if the `$HOME/.config/ais/cli/cli.json` does
 }
 ```
 
-If you update config via `ais config cli set` command (or even simply change the config file) the next time CLI will use updated values.
+CLI config can be updated using `ais config cli set` command or even simply by changing the config file.
+
+The next time you run it CLI will use the updated values.
+
+To get back to system defaults, run `ais config cli reset`.
+
+## Environment variables
+
+First and foremost, there's `AIS_ENDPOINT`. If defined, it'll take precedence over "cluster.url" (section [CLI Config](#cli-config) above).
+
+Example:
+
+```console
+$ export AIS_ENDPOINT=https://10.07.56.68:51080
+```
+
+In addition, environment can be used to **override** client-side TLS (aka, HTTPS) configuration - the knobs "client_crt", etc. also listed in the table below:
+
+| var name | description | the corresponding [CLI Config](#cli-config) |
+| -- | -- | -- |
+| `AIS_CRT`             | X509 certificate | "cluster.client_crt" |
+| `AIS_CRT_KEY`         | X509 certificate's private key | "cluster.client_crt_key"|
+| `AIS_CLIENT_CA`       | Certificate authority that authorized (signed) the certificate | "cluster.client_ca_tls" |
+| `AIS_SKIP_VERIFY_CRT` | true: skip X509 cert verification (usually enabled to circumvent limitations of self-signed certs) | "cluster.skip_verify_crt" |
+
+* See also: [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
 
 ## First steps
 
@@ -219,7 +253,7 @@ See also:
 
 ## Verbose errors
 
-CLI uses [AIS API](https://github.com/NVIDIA/aistore/tree/master/api) to execute operations on a cluster.
+CLI uses [AIS API](https://github.com/NVIDIA/aistore/tree/main/api) to execute operations on a cluster.
 
 Of course, a remote API call - any API call, for that matter - may return errors. For developers, it may be sometimes useful to see a complete and unredacted error information.
 

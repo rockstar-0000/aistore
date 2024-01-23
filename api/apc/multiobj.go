@@ -1,17 +1,20 @@
 // Package apc: API messages and constants
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
 type (
-	// List of object names _or_ a template specifying { Prefix, Regex, and/or Range }
+	// List of object names _or_ a template specifying { optional Prefix, zero or more Ranges }
 	ListRange struct {
 		Template string   `json:"template"`
 		ObjNames []string `json:"objnames"`
 	}
-
-	// TODO: ContinueOnError vs. cmn.SupportedReactions - unify
+	PrefetchMsg struct {
+		ListRange
+		ContinueOnError bool `json:"coer"`
+		LatestVer       bool `json:"latest-ver"` // see also: QparamLatestVer, 'versioning.validate_warm_get'
+	}
 
 	// ArchiveMsg contains the parameters (all except the destination bucket)
 	// for archiving mutiple objects as one of the supported archive.FileExtensions types
@@ -35,7 +38,7 @@ type (
 		ListRange
 		TxnUUID string `json:"-"`
 		TCBMsg
-		ContinueOnError bool `json:"coer"` // ditto; TODO above
+		ContinueOnError bool `json:"coer"`
 	}
 )
 

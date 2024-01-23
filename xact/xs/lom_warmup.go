@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -9,10 +9,10 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/xact"
@@ -31,7 +31,7 @@ type (
 
 // interface guard
 var (
-	_ cluster.Xact   = (*xactLLC)(nil)
+	_ core.Xact      = (*xactLLC)(nil)
 	_ xreg.Renewable = (*llcFactory)(nil)
 )
 
@@ -46,14 +46,14 @@ func (*llcFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 }
 
 func (p *llcFactory) Start() error {
-	xctn := newXactLLC(p.T, p.UUID(), p.Bck)
+	xctn := newXactLLC(p.UUID(), p.Bck)
 	p.xctn = xctn
 	go xctn.Run(nil)
 	return nil
 }
 
-func (*llcFactory) Kind() string        { return apc.ActLoadLomCache }
-func (p *llcFactory) Get() cluster.Xact { return p.xctn }
+func (*llcFactory) Kind() string     { return apc.ActLoadLomCache }
+func (p *llcFactory) Get() core.Xact { return p.xctn }
 
 func (*llcFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) { return xreg.WprUse, nil }
 
@@ -61,12 +61,11 @@ func (*llcFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) { return 
 // xactLLC //
 /////////////
 
-func newXactLLC(t cluster.Target, uuid string, bck *meta.Bck) (r *xactLLC) {
+func newXactLLC(uuid string, bck *meta.Bck) (r *xactLLC) {
 	r = &xactLLC{}
 	mpopts := &mpather.JgroupOpts{
-		T:        t,
 		CTs:      []string{fs.ObjectType},
-		VisitObj: func(*cluster.LOM, []byte) error { return nil },
+		VisitObj: func(*core.LOM, []byte) error { return nil },
 		DoLoad:   mpather.Load,
 	}
 	mpopts.Bck.Copy(bck.Bucket())
@@ -78,12 +77,14 @@ func (r *xactLLC) Run(*sync.WaitGroup) {
 	r.BckJog.Run()
 	nlog.Infoln(r.Name())
 	err := r.BckJog.Wait()
-	r.AddErr(err)
+	if err != nil {
+		r.AddErr(err)
+	}
 	r.Finish()
 }
 
-func (r *xactLLC) Snap() (snap *cluster.Snap) {
-	snap = &cluster.Snap{}
+func (r *xactLLC) Snap() (snap *core.Snap) {
+	snap = &core.Snap{}
 	r.ToSnap(snap)
 
 	snap.IdleX = r.IsIdle()

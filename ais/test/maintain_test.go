@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -13,10 +13,10 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/fname"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -25,7 +25,7 @@ import (
 )
 
 func TestMaintenanceOnOff(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3})
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3})
 	proxyURL := tools.RandomProxyURL(t)
 	smap := tools.GetClusterMap(t, proxyURL)
 
@@ -54,7 +54,7 @@ func TestMaintenanceOnOff(t *testing.T) {
 }
 
 func TestMaintenanceListObjects(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, MinTargets: 3})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, MinTargets: 3})
 
 	var (
 		bck = cmn.Bck{Name: "maint-list", Provider: apc.AIS}
@@ -99,7 +99,7 @@ func TestMaintenanceListObjects(t *testing.T) {
 		_, err = tools.WaitForClusterState(proxyURL, "target is back",
 			m.smap.Version, m.smap.CountActivePs(), m.smap.CountTargets())
 		args := xact.ArgsMsg{ID: rebID, Timeout: tools.RebalanceTimeout}
-		_, err = api.WaitForXactionIC(baseParams, args)
+		_, err = api.WaitForXactionIC(baseParams, &args)
 		tassert.CheckFatal(t, err)
 	}()
 
@@ -128,7 +128,7 @@ func TestMaintenanceListObjects(t *testing.T) {
 
 func TestMaintenanceMD(t *testing.T) {
 	// NOTE: this test requires local deployment as it checks local filesystem for VMDs.
-	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		proxyURL   = tools.RandomProxyURL(t)
@@ -143,7 +143,7 @@ func TestMaintenanceMD(t *testing.T) {
 
 	t.Cleanup(func() {
 		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-		api.WaitForXactionIC(baseParams, args)
+		api.WaitForXactionIC(baseParams, &args)
 	})
 
 	tlog.Logf("Decommission %s\n", dcmTarget.StringEx())
@@ -189,7 +189,7 @@ func TestMaintenanceMD(t *testing.T) {
 }
 
 func TestMaintenanceDecommissionRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3, RequiredDeployment: tools.ClusterTypeLocal, Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3, RequiredDeployment: tools.ClusterTypeLocal, Long: true})
 	var (
 		proxyURL   = tools.RandomProxyURL(t)
 		smap       = tools.GetClusterMap(t, proxyURL)
@@ -209,7 +209,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 	for i := 0; i < objCount; i++ {
 		objName := fmt.Sprintf("%sobj%04d", objPath, i)
 		r, _ := readers.NewRand(int64(fileSize), cos.ChecksumXXHash)
-		_, err := api.PutObject(api.PutArgs{
+		_, err := api.PutObject(&api.PutArgs{
 			BaseParams: baseParams,
 			Bck:        bck,
 			ObjName:    objName,
@@ -270,7 +270,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 	if dcm != nil {
 		tlog.Logf("Canceling maintenance for %s\n", dcm.ID())
 		args := xact.ArgsMsg{Kind: apc.ActRebalance}
-		err = api.AbortXaction(baseParams, args)
+		err = api.AbortXaction(baseParams, &args)
 		tassert.CheckError(t, err)
 		val := &apc.ActValRmNode{DaemonID: dcm.ID()}
 		rebID, err = api.StopMaintenance(baseParams, val)
@@ -278,7 +278,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		tools.WaitForRebalanceByID(t, baseParams, rebID)
 	} else {
 		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-		_, err = api.WaitForXactionIC(baseParams, args)
+		_, err = api.WaitForXactionIC(baseParams, &args)
 		tassert.CheckError(t, err)
 	}
 
@@ -302,7 +302,7 @@ func countVMDTargets(tsMpaths map[*meta.Snode][]string) (total int) {
 }
 
 func TestMaintenanceRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3, Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3, Long: true})
 	var (
 		bck = cmn.Bck{Name: "maint-reb", Provider: apc.AIS}
 		m   = &ioContext{
@@ -372,7 +372,7 @@ func TestMaintenanceRebalance(t *testing.T) {
 }
 
 func TestMaintenanceGetWhileRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{MinTargets: 3, Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3, Long: true})
 	var (
 		bck = cmn.Bck{Name: "maint-get-reb", Provider: apc.AIS}
 		m   = &ioContext{
@@ -496,7 +496,7 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 		time.Sleep(time.Second)
 		xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		for i := 0; i < 3; i++ {
-			status, err := api.WaitForXactionIC(baseParams, xargs)
+			status, err := api.WaitForXactionIC(baseParams, &xargs)
 			if err == nil {
 				tlog.Logf("%v\n", status)
 				break
@@ -540,7 +540,7 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 }
 
 func TestShutdownListObjects(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		bck = cmn.Bck{Name: "shutdown-list", Provider: apc.AIS}
 		m   = &ioContext{
@@ -605,7 +605,7 @@ func TestShutdownListObjects(t *testing.T) {
 		time.Sleep(time.Second)
 		xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		for i := 0; i < 3; i++ {
-			status, err := api.WaitForXactionIC(baseParams, xargs)
+			status, err := api.WaitForXactionIC(baseParams, &xargs)
 			if err == nil {
 				tlog.Logf("%v\n", status)
 				break

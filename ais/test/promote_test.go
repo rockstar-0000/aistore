@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
  * Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -17,9 +17,8 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tlog"
@@ -148,16 +147,12 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	test.generate(t, from, to, tempdir, subdir)
 
 	// prepare request
-	args := api.PromoteArgs{
-		BaseParams: baseParams,
-		Bck:        m.bck,
-		PromoteArgs: cluster.PromoteArgs{
-			SrcFQN:         tempdir,
-			Recursive:      test.recurs,
-			OverwriteDst:   test.overwriteDst,
-			DeleteSrc:      test.deleteSrc,
-			SrcIsNotFshare: test.notFshare,
-		},
+	args := apc.PromoteArgs{
+		SrcFQN:         tempdir,
+		Recursive:      test.recurs,
+		OverwriteDst:   test.overwriteDst,
+		DeleteSrc:      test.deleteSrc,
+		SrcIsNotFshare: test.notFshare,
 	}
 	var target *meta.Snode
 	if test.singleTarget {
@@ -167,7 +162,7 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	}
 
 	// (I) do
-	xid, err := api.Promote(&args)
+	xid, err := api.Promote(baseParams, m.bck, &args)
 	tassert.CheckFatal(t, err)
 
 	// wait for the operation to finish and collect stats
@@ -245,7 +240,7 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	}
 
 	// do
-	xid, err = api.Promote(&args)
+	xid, err = api.Promote(baseParams, m.bck, &args)
 	tassert.CheckFatal(t, err)
 
 	locObjs, outObjs, inObjs = test.wait(t, xid, tempdir, target, &m)
@@ -287,7 +282,7 @@ func (test *prmTests) wait(t *testing.T, xid, tempdir string, target *meta.Snode
 	// wait "cases" 1. through 3.
 	if xid != "" && !test.singleTarget { // 1. cluster-wide xaction
 		tlog.Logf("Waiting for global %s(%s=>%s)\n", xname, tempdir, m.bck)
-		notifStatus, err := api.WaitForXactionIC(baseParams, xargs)
+		notifStatus, err := api.WaitForXactionIC(baseParams, &xargs)
 		tassert.CheckFatal(t, err)
 		if notifStatus != nil && (notifStatus.AbortedX || notifStatus.ErrMsg != "") {
 			tlog.Logf("Warning: notif-status: %+v\n", notifStatus)
@@ -295,14 +290,14 @@ func (test *prmTests) wait(t *testing.T, xid, tempdir string, target *meta.Snode
 	} else if xid != "" && test.singleTarget { // 2. single-target xaction
 		xargs.DaemonID = target.ID()
 		tlog.Logf("Waiting for %s(%s=>%s) at %s\n", xname, tempdir, m.bck, target.StringEx())
-		err := api.WaitForXactionNode(baseParams, xargs, xactSnapNotRunning)
+		err := api.WaitForXactionNode(baseParams, &xargs, xactSnapNotRunning)
 		tassert.CheckFatal(t, err)
 	} else { // 3. synchronous execution
 		tlog.Logf("Promoting without xaction (%s=>%s)\n", tempdir, m.bck)
 	}
 
 	// collect stats
-	xs, err := api.QueryXactionSnaps(baseParams, xargs)
+	xs, err := api.QueryXactionSnaps(baseParams, &xargs)
 	tassert.CheckFatal(t, err)
 	if xid != "" {
 		locObjs, outObjs, inObjs = xs.ObjCounts(xid)

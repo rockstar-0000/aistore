@@ -19,10 +19,10 @@ import (
 
 type (
 	gco struct {
-		c        ratomic.Pointer[Config]         // (cluster + local + override config)
-		oc       ratomic.Pointer[ConfigToUpdate] // for a node to override inherited (global) configuration
-		confPath ratomic.Pointer[string]         // initial (plain-text) global config path
-		mtx      sync.Mutex                      // [BeginUpdate -- CommitUpdate]
+		c        ratomic.Pointer[Config]      // (cluster + local + override config)
+		oc       ratomic.Pointer[ConfigToSet] // for a node to override inherited (global) configuration
+		confPath ratomic.Pointer[string]      // initial (plain-text) global config path
+		mtx      sync.Mutex                   // [BeginUpdate -- CommitUpdate]
 	}
 )
 
@@ -31,6 +31,8 @@ var GCO *gco
 func init() {
 	GCO = &gco{}
 	GCO.c.Store(&Config{})
+
+	Rom.init()
 }
 
 /////////
@@ -40,10 +42,10 @@ func init() {
 func (gco *gco) Get() *Config       { return gco.c.Load() }
 func (gco *gco) Put(config *Config) { gco.c.Store(config) }
 
-func (gco *gco) GetOverride() *ConfigToUpdate       { return gco.oc.Load() }
-func (gco *gco) PutOverride(config *ConfigToUpdate) { gco.oc.Store(config) }
+func (gco *gco) GetOverride() *ConfigToSet       { return gco.oc.Load() }
+func (gco *gco) PutOverride(config *ConfigToSet) { gco.oc.Store(config) }
 
-func (gco *gco) MergeOverride(toUpdate *ConfigToUpdate) (overrideConfig *ConfigToUpdate) {
+func (gco *gco) MergeOverride(toUpdate *ConfigToSet) (overrideConfig *ConfigToSet) {
 	overrideConfig = gco.GetOverride()
 	if overrideConfig == nil {
 		overrideConfig = toUpdate
@@ -53,7 +55,7 @@ func (gco *gco) MergeOverride(toUpdate *ConfigToUpdate) (overrideConfig *ConfigT
 	return
 }
 
-func (gco *gco) SetLocalFSPaths(toUpdate *ConfigToUpdate) (overrideConfig *ConfigToUpdate) {
+func (gco *gco) SetLocalFSPaths(toUpdate *ConfigToSet) (overrideConfig *ConfigToSet) {
 	overrideConfig = gco.GetOverride()
 	if overrideConfig == nil {
 		overrideConfig = toUpdate

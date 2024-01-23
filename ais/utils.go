@@ -1,10 +1,11 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -14,11 +15,11 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 )
 
 const (
@@ -33,45 +34,51 @@ const (
 )
 
 // Network access of handlers (Public, IntraControl, & IntraData)
-type netAccess int
+type (
+	netAccess int
 
-func (na netAccess) isSet(flag netAccess) bool {
-	return na&flag == flag
-}
+	// HTTP Range (aka Read Range)
+	htrange struct {
+		Start, Length int64
+	}
+	errRangeNoOverlap struct {
+		ranges []string // RFC 7233
+		size   int64    // [0, size)
+	}
+
+	// Local unicast IP info
+	localIPv4Info struct {
+		ipv4 string
+		mtu  int
+	}
+)
+
+func (na netAccess) isSet(flag netAccess) bool { return na&flag == flag }
 
 //
 // IPV4
 //
 
-// Local unicast IP info
-type localIPv4Info struct {
-	ipv4 string
-	mtu  int
-}
-
-// getLocalIPv4List returns a list of local unicast IPv4 with MTU
-func getLocalIPv4List() (addrlist []*localIPv4Info, err error) {
+// returns a list of local unicast (IPv4, MTU)
+func getLocalIPv4s(config *cmn.Config) (addrlist []*localIPv4Info, err error) {
 	addrlist = make([]*localIPv4Info, 0, 4)
+
 	addrs, e := net.InterfaceAddrs()
 	if e != nil {
-		err = fmt.Errorf("failed to get host unicast IPs, err: %w", e)
+		err = fmt.Errorf("failed to get host unicast IPs: %w", e)
 		return
 	}
 	iflist, e := net.Interfaces()
 	if e != nil {
-		err = fmt.Errorf("failed to get interface list: %w", e)
+		err = fmt.Errorf("failed to get network interfaces: %w", e)
 		return
 	}
 
-	var (
-		testingEnv  = cmn.GCO.Get().TestingEnv()
-		k8sDetected = k8s.Detect() == nil
-	)
 	for _, addr := range addrs {
 		curr := &localIPv4Info{}
 		if ipnet, ok := addr.(*net.IPNet); ok {
-			// Ignore loopback addresses in production env.
-			if ipnet.IP.IsLoopback() && (!testingEnv || k8sDetected) {
+			// production or K8s: skip loopbacks
+			if ipnet.IP.IsLoopback() && (!config.TestingEnv() || k8s.IsK8s()) {
 				continue
 			}
 			if ipnet.IP.To4() == nil {
@@ -98,50 +105,58 @@ func getLocalIPv4List() (addrlist []*localIPv4Info, err error) {
 			}
 		}
 	}
-
 	if len(addrlist) == 0 {
-		return addrlist, fmt.Errorf("the host does not have any IPv4 addresses")
+		return addrlist, errors.New("the host does not have any IPv4 addresses")
 	}
-
 	return addrlist, nil
 }
 
-// selectConfiguredHostname returns the first Hostname from a preconfigured Hostname list that
-// matches any local unicast IPv4
-func selectConfiguredHostname(addrlist []*localIPv4Info, configuredList []string) (hostname string, err error) {
-	nlog.Infof("Selecting one of the configured IPv4 addresses: %s...", configuredList)
+// given configured list of hostnames, return the first one matching local unicast IPv4
+func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
+	sb := &strings.Builder{}
+	sb.WriteByte('[')
+	for i, lip := range locIPs {
+		sb.WriteString(lip.ipv4)
+		sb.WriteString("(MTU=")
+		sb.WriteString(strconv.Itoa(lip.mtu))
+		sb.WriteByte(')')
+		if i < len(locIPs)-1 {
+			sb.WriteByte(' ')
+		}
+	}
+	sb.WriteByte(']')
+	nlog.Infoln("local IPv4:", sb.String())
+	nlog.Infoln("configured:", hostnames)
 
-	var localList, ipv4 string
-	for i, host := range configuredList {
-		if net.ParseIP(host) != nil {
-			ipv4 = strings.TrimSpace(host)
+	for i, host := range hostnames {
+		host = strings.TrimSpace(host)
+		var ipv4 string
+		if net.ParseIP(host) != nil { // parses as IP
+			ipv4 = host
 		} else {
-			nlog.Warningf("failed to parse IP for hostname %q", host)
-			ip, err := resolveHostIPv4(host)
+			ip, err := _resolve(host)
 			if err != nil {
-				nlog.Errorf("failed to get IPv4 for host=%q; err %v", host, err)
+				nlog.Errorln("failed to resolve hostname(?)", host, "err:", err, "[idx:", i, len(hostnames))
 				continue
 			}
 			ipv4 = ip.String()
+			nlog.Infoln("resolved hostname", host, "to IP addr", ipv4)
 		}
-		for _, localaddr := range addrlist {
-			if i == 0 {
-				localList += " " + localaddr.ipv4
-			}
-			if localaddr.ipv4 == ipv4 {
-				nlog.Warningf("Selected IPv4 %s from the configuration file", ipv4)
+		for _, addr := range locIPs {
+			if addr.ipv4 == ipv4 {
+				nlog.Infoln("selected: hostname", host, "IP", ipv4)
 				return host, nil
 			}
 		}
 	}
 
-	nlog.Errorf("Configured Hostname does not match any local one.\nLocal IPv4 list:%s; Configured ip: %s",
-		localList, configuredList)
-	return "", fmt.Errorf("configured Hostname does not match any local one")
+	err := fmt.Errorf("failed to select hostname from: (%s, %v)", sb.String(), hostnames)
+	nlog.Errorln(err)
+	return "", err
 }
 
-// detectLocalIPv4 takes a list of local IPv4s and returns the best fit for a daemon to listen on it
-func detectLocalIPv4(config *cmn.Config, addrList []*localIPv4Info) (ip net.IP, err error) {
+// _localIP takes a list of local IPv4s and returns the best fit for a daemon to listen on it
+func _localIP(addrList []*localIPv4Info) (ip net.IP, err error) {
 	if len(addrList) == 0 {
 		return nil, fmt.Errorf("no addresses to choose from")
 	}
@@ -155,7 +170,7 @@ func detectLocalIPv4(config *cmn.Config, addrList []*localIPv4Info) (ip net.IP, 
 		}
 		return ip, nil
 	}
-	if config.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		nlog.Infof("%d IPv4s:", len(addrList))
 		for _, addr := range addrList {
 			nlog.Infof("    %#v\n", *addr)
@@ -167,31 +182,48 @@ func detectLocalIPv4(config *cmn.Config, addrList []*localIPv4Info) (ip net.IP, 
 	return ip, nil
 }
 
-// getNetInfo returns an Hostname for proxy/target to listen on it.
-// 1. If there is an Hostname in config - it tries to use it
-// 2. If config does not contain Hostname - it chooses one of local IPv4s
-func getNetInfo(config *cmn.Config, addrList []*localIPv4Info, proto, configuredIPv4s, port string) (netInfo meta.NetInfo, err error) {
-	var ip net.IP
-	if configuredIPv4s == "" {
-		ip, err = detectLocalIPv4(config, addrList)
-		if err != nil {
-			return netInfo, err
+func multihome(configuredIPv4s string) (pub string, extra []string) {
+	if i := strings.IndexByte(configuredIPv4s, cmn.HostnameListSepa[0]); i <= 0 {
+		cos.ExitAssertLog(i < 0, "invalid format:", configuredIPv4s)
+		return configuredIPv4s, nil
+	}
+
+	// trim + validation
+	lst := strings.Split(configuredIPv4s, cmn.HostnameListSepa)
+	pub, extra = strings.TrimSpace(lst[0]), lst[1:]
+	for i := range extra {
+		extra[i] = strings.TrimSpace(extra[i])
+		cos.ExitAssertLog(len(extra[i]) > 0, "invalid format (empty value):", configuredIPv4s)
+		cos.ExitAssertLog(extra[i] != pub, "duplicated addr or hostname:", configuredIPv4s)
+		for j := 0; j < i; j++ {
+			cos.ExitAssertLog(extra[i] != extra[j], "duplicated addr or hostname:", configuredIPv4s)
 		}
-		netInfo = *meta.NewNetInfo(proto, ip.String(), port)
+	}
+	nlog.Infof("multihome: %s and %v", pub, extra)
+	return pub, extra
+}
+
+// choose one of the local IPv4s if local config doesn't contain (explicitly) specified
+func initNetInfo(ni *meta.NetInfo, addrList []*localIPv4Info, proto, configuredIPv4s, port string) (err error) {
+	var (
+		ip   net.IP
+		host string
+	)
+	if configuredIPv4s == "" {
+		if ip, err = _localIP(addrList); err == nil {
+			ni.Init(proto, ip.String(), port)
+		}
 		return
 	}
 
-	configuredList := strings.Split(configuredIPv4s, ",")
-	selHostname, err := selectConfiguredHostname(addrList, configuredList)
-	if err != nil {
-		return netInfo, err
+	lst := strings.Split(configuredIPv4s, cmn.HostnameListSepa)
+	if host, err = _selectHost(addrList, lst); err == nil {
+		ni.Init(proto, host, port)
 	}
-
-	netInfo = *meta.NewNetInfo(proto, selHostname, port)
 	return
 }
 
-func resolveHostIPv4(hostName string) (net.IP, error) {
+func _resolve(hostName string) (net.IP, error) {
 	ips, err := net.LookupIP(hostName)
 	if err != nil {
 		return nil, err
@@ -204,24 +236,18 @@ func resolveHostIPv4(hostName string) (net.IP, error) {
 	return nil, fmt.Errorf("failed to find non-empty IPv4 in list %v (hostName=%q)", ips, hostName)
 }
 
-func validateHostname(hostname string) (err error) {
+func parseOrResolve(hostname string) (err error) {
 	if net.ParseIP(hostname) != nil {
+		// is a parse-able IP addr
 		return
 	}
-	_, err = resolveHostIPv4(hostname)
+	_, err = _resolve(hostname)
 	return
 }
 
-// HTTP Range (aka Read Range)
-type (
-	htrange struct {
-		Start, Length int64
-	}
-	errRangeNoOverlap struct {
-		ranges []string // RFC 7233
-		size   int64    // [0, size)
-	}
-)
+/////////////
+// htrange //
+/////////////
 
 func (r htrange) contentRange(size int64) string {
 	return fmt.Sprintf("%s%d-%d/%d", cos.HdrContentRangeValPrefix, r.Start, r.Start+r.Length-1, size)
@@ -314,12 +340,14 @@ func parseMultiRange(s string, size int64) (ranges []htrange, err error) {
 //
 
 func deploymentType() string {
-	if k8s.Detect() == nil {
+	switch {
+	case k8s.IsK8s():
 		return apc.DeploymentK8s
-	} else if cmn.GCO.Get().TestingEnv() {
+	case cmn.GCO.Get().TestingEnv():
 		return apc.DeploymentDev
+	default:
+		return runtime.GOOS
 	}
-	return runtime.GOOS
 }
 
 // for AIS metadata filenames (constants), see `cmn/fname` package
@@ -338,4 +366,18 @@ func cleanupConfigDir(name string, keepInitialConfig bool) {
 		}
 		return nil
 	})
+}
+
+//
+// common APPEND(file(s)) pre-parser
+//
+
+const appendHandleSepa = "|"
+
+func preParse(packedHdl string) (items []string, err error) {
+	items = strings.SplitN(packedHdl, appendHandleSepa, 4)
+	if len(items) != 4 {
+		err = fmt.Errorf("invalid APPEND handle: %q", packedHdl)
+	}
+	return
 }

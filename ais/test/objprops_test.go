@@ -1,8 +1,8 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
 	"fmt"
@@ -12,9 +12,9 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
@@ -52,7 +52,7 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 			Cksum:      r.Cksum(),
 			Reader:     r,
 		}
-		_, err = api.PutObject(putArgs)
+		_, err = api.PutObject(&putArgs)
 		if err != nil {
 			t.Errorf("Failed to PUT new data to object %s: %v", bck.Cname(fname), err)
 		}
@@ -73,7 +73,7 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 		}
 		newVersions[m.Name] = m.Version
 
-		if !m.CheckExists() && bck.IsRemote() {
+		if !m.IsPresent() && bck.IsRemote() {
 			t.Errorf("%s: not marked as cached one", bck.Cname(m.Name))
 		}
 		if !versionEnabled {
@@ -129,12 +129,12 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 	}
 
 	baseParams := tools.BaseAPIParams(proxyURL)
-	xid, err := api.EvictList(baseParams, bck, toEvictList)
+	xid, err := api.EvictMultiObj(baseParams, bck, toEvictList, "" /*template*/)
 	if err != nil {
 		t.Errorf("Failed to evict objects: %v\n", err)
 	}
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	tlog.Logf("Reading object list...\n")
@@ -151,7 +151,7 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 		if !ok {
 			continue
 		}
-		tlog.Logf("%s [%d] - cached: [%v], atime [%v]\n", bck.Cname(m.Name), m.Flags, m.CheckExists(), m.Atime)
+		tlog.Logf("%s [%d] - cached: [%v], atime [%v]\n", bck.Cname(m.Name), m.Flags, m.IsPresent(), m.Atime)
 
 		// e.g. misplaced replica
 		if !m.IsStatusOK() {
@@ -162,7 +162,7 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 			if m.Atime != "" {
 				t.Errorf("Evicted %s still has atime %q", bck.Cname(m.Name), m.Atime)
 			}
-			if m.CheckExists() {
+			if m.IsPresent() {
 				t.Errorf("Evicted %s is still marked as _cached_", bck.Cname(m.Name))
 			}
 		}
@@ -196,7 +196,7 @@ func propsRecacheObjects(t *testing.T, proxyURL string, bck cmn.Bck, objs map[st
 		if version, ok = objs[m.Name]; !ok {
 			continue
 		}
-		if !m.CheckExists() {
+		if !m.IsPresent() {
 			t.Errorf("%s: not marked as cached one", bck.Cname(m.Name))
 		}
 		if m.Atime == "" {
@@ -272,7 +272,7 @@ func propsRebalance(t *testing.T, proxyURL string, bck cmn.Bck, objects map[stri
 			continue
 		}
 		objFound++
-		if !m.CheckExists() && bck.IsRemote() {
+		if !m.IsPresent() && bck.IsRemote() {
 			t.Errorf("%s: not marked as cached one", bck.Cname(m.Name))
 		}
 		if m.Atime == "" {
@@ -304,7 +304,7 @@ func propsCleanupObjects(t *testing.T, proxyURL string, bck cmn.Bck, newVersions
 }
 
 func TestObjPropsVersion(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	for _, versioning := range []bool{false, true} {
 		t.Run(fmt.Sprintf("enabled=%t", versioning), func(t *testing.T) {
@@ -383,7 +383,7 @@ func propsVersion(t *testing.T, bck cmn.Bck, versionEnabled bool, cksumType stri
 	for _, m := range reslist.Entries {
 		tlog.Logf("%s initial version:\t%q\n", bck.Cname(m.Name), m.Version)
 
-		if !m.CheckExists() && bck.IsRemote() {
+		if !m.IsPresent() && bck.IsRemote() {
 			t.Errorf("%s: not marked as _cached_", bck.Cname(m.Name))
 		}
 		if m.Atime == "" {
@@ -479,11 +479,11 @@ func TestObjProps(t *testing.T) {
 			switch test.bucketType {
 			case typeCloud:
 				m.bck = cliBck
-				tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
+				tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
 			case typeLocal:
 				tools.CreateBucket(t, proxyURL, m.bck, nil, true /*cleanup*/)
 			case typeRemoteAIS:
-				tools.CheckSkip(t, tools.SkipTestArgs{RequiresRemoteCluster: true})
+				tools.CheckSkip(t, &tools.SkipTestArgs{RequiresRemoteCluster: true})
 				m.bck.Ns.UUID = tools.RemoteCluster.UUID
 				tools.CreateBucket(t, proxyURL, m.bck, nil, true /*cleanup*/)
 			default:
@@ -493,9 +493,9 @@ func TestObjProps(t *testing.T) {
 			defaultBckProp, err := api.HeadBucket(baseParams, m.bck, true /* don't add */)
 			tassert.CheckFatal(t, err)
 
-			_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BucketPropsToUpdate{
-				Versioning: &cmn.VersionConfToUpdate{
-					Enabled: api.Bool(test.verEnabled),
+			_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
+				Versioning: &cmn.VersionConfToSet{
+					Enabled: apc.Bool(test.verEnabled),
 				},
 			})
 			if test.bucketType == typeCloud && test.verEnabled != defaultBckProp.Versioning.Enabled {
@@ -511,9 +511,9 @@ func TestObjProps(t *testing.T) {
 			}
 			if test.bucketType == typeCloud || test.bucketType == typeRemoteAIS {
 				m.remotePuts(test.evict)
-				defer api.SetBucketProps(baseParams, m.bck, &cmn.BucketPropsToUpdate{
-					Versioning: &cmn.VersionConfToUpdate{
-						Enabled: api.Bool(defaultBckProp.Versioning.Enabled),
+				defer api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
+					Versioning: &cmn.VersionConfToSet{
+						Enabled: apc.Bool(defaultBckProp.Versioning.Enabled),
 					},
 				})
 			} else {
@@ -535,7 +535,7 @@ func TestObjProps(t *testing.T) {
 					flt = apc.FltExistsOutside
 				}
 
-				props, err := api.HeadObject(baseParams, m.bck, objName, flt)
+				props, err := api.HeadObject(baseParams, m.bck, objName, flt, false /*silent*/)
 				if test.checkPresent {
 					if test.bucketType != typeLocal && test.evict {
 						tassert.Fatalf(t, err != nil,

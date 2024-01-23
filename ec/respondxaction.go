@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -12,12 +12,12 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xact"
@@ -51,8 +51,8 @@ func (*rspFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 	return p
 }
 
-func (*rspFactory) Kind() string        { return apc.ActECRespond }
-func (p *rspFactory) Get() cluster.Xact { return p.xctn }
+func (*rspFactory) Kind() string     { return apc.ActECRespond }
+func (p *rspFactory) Get() core.Xact { return p.xctn }
 
 func (p *rspFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	debug.Assertf(false, "%s vs %s", p.Str(p.Kind()), xprev) // xreg.usePrev() must've returned true
@@ -71,12 +71,10 @@ func (p *rspFactory) Start() error {
 // XactRespond //
 /////////////////
 
-func NewRespondXact(t cluster.Target, bck *cmn.Bck, mgr *Manager) *XactRespond {
-	var (
-		config   = cmn.GCO.Get()
-		smap, si = t.Sowner(), t.Snode()
-	)
-	return &XactRespond{xactECBase: newXactECBase(t, smap, si, config, bck, mgr)}
+func newRespondXact(bck *cmn.Bck, mgr *Manager) *XactRespond {
+	xctn := &XactRespond{}
+	xctn.xactECBase.init(cmn.GCO.Get(), bck, mgr)
+	return xctn
 }
 
 func (r *XactRespond) Run(*sync.WaitGroup) {
@@ -104,12 +102,12 @@ func (r *XactRespond) Run(*sync.WaitGroup) {
 
 // Utility function to cleanup both object/slice and its meta on the local node
 // Used when processing object deletion request
-func (r *XactRespond) removeObjAndMeta(bck *meta.Bck, objName string) error {
-	if r.config.FastV(4, cos.SmoduleEC) {
+func (*XactRespond) removeObjAndMeta(bck *meta.Bck, objName string) error {
+	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("Delete request for %s", bck.Cname(objName))
 	}
 
-	ct, err := cluster.NewCTFromBO(bck.Bucket(), objName, r.t.Bowner(), fs.ECSliceType)
+	ct, err := core.NewCTFromBO(bck.Bucket(), objName, core.T.Bowner(), fs.ECSliceType)
 	if err != nil {
 		return err
 	}
@@ -123,7 +121,7 @@ func (r *XactRespond) removeObjAndMeta(bck *meta.Bck, objName string) error {
 	// metafile that makes remained slices/replicas outdated and can be cleaned
 	// up later by LRU or other runner
 	for _, tp := range []string{fs.ECMetaType, fs.ObjectType, fs.ECSliceType} {
-		fqnMeta, _, err := cluster.HrwFQN(bck.Bucket(), tp, objName)
+		fqnMeta, _, err := core.HrwFQN(bck.Bucket(), tp, objName)
 		if err != nil {
 			return err
 		}
@@ -141,11 +139,11 @@ func (r *XactRespond) trySendCT(iReq intraReq, hdr *transport.ObjHdr, bck *meta.
 		md           *Metadata
 		objName      = hdr.ObjName
 	)
-	if r.config.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("Received request for slice %d of %s", iReq.meta.SliceID, objName)
 	}
 	if iReq.isSlice {
-		ct, err := cluster.NewCTFromBO(bck.Bucket(), objName, r.t.Bowner(), fs.ECSliceType)
+		ct, err := core.NewCTFromBO(bck.Bucket(), objName, core.T.Bowner(), fs.ECSliceType)
 		if err != nil {
 			return err
 		}
@@ -167,15 +165,13 @@ func (r *XactRespond) DispatchReq(iReq intraReq, hdr *transport.ObjHdr, bck *met
 	case reqDel:
 		// object cleanup request: delete replicas, slices and metafiles
 		if err := r.removeObjAndMeta(bck, hdr.ObjName); err != nil {
-			err = fmt.Errorf("%s: failed to delete %s: %w", r.t, bck.Cname(hdr.ObjName), err)
-			nlog.Errorln(err)
-			r.AddErr(err)
+			err = cmn.NewErrFailedTo(core.T, "delete", bck.Cname(hdr.ObjName), err)
+			r.AddErr(err, 0)
 		}
 	case reqGet:
 		err := r.trySendCT(iReq, hdr, bck)
 		if err != nil {
-			r.AddErr(err)
-			nlog.Errorln(err)
+			r.AddErr(err, 0)
 		}
 	default:
 		debug.Assert(false, "opcode", hdr.Opcode)
@@ -198,21 +194,21 @@ func (r *XactRespond) DispatchResp(iReq intraReq, hdr *transport.ObjHdr, object 
 			meta = iReq.meta
 		)
 		if meta == nil {
-			nlog.Errorf("%s: no metadata for %s", r.t, hdr.Cname())
+			nlog.Errorf("%s: no metadata for %s", core.T, hdr.Cname())
 			return
 		}
 
-		if r.config.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.FastV(4, cos.SmoduleEC) {
 			nlog.Infof("Got slice=%t from %s (#%d of %s) v%s, cksum: %s", iReq.isSlice, hdr.SID,
 				iReq.meta.SliceID, hdr.Cname(), meta.ObjVersion, meta.CksumValue)
 		}
 		md := meta.NewPack()
 		if iReq.isSlice {
 			args := &WriteArgs{Reader: object, MD: md, BID: iReq.bid, Generation: meta.Generation, Xact: r}
-			err = WriteSliceAndMeta(r.t, hdr, args)
+			err = WriteSliceAndMeta(hdr, args)
 		} else {
-			var lom *cluster.LOM
-			lom, err = cluster.AllocLomFromHdr(hdr)
+			var lom *core.LOM
+			lom, err = core.AllocLomFromHdr(hdr)
 			if err == nil {
 				args := &WriteArgs{
 					Reader:     object,
@@ -222,13 +218,12 @@ func (r *XactRespond) DispatchResp(iReq intraReq, hdr *transport.ObjHdr, object 
 					Generation: meta.Generation,
 					Xact:       r,
 				}
-				err = WriteReplicaAndMeta(r.t, lom, args)
+				err = WriteReplicaAndMeta(lom, args)
 			}
-			cluster.FreeLOM(lom)
+			core.FreeLOM(lom)
 		}
 		if err != nil {
-			r.AddErr(err)
-			nlog.Errorln(err)
+			r.AddErr(err, 0)
 			return
 		}
 		r.ObjsAdd(1, hdr.ObjAttrs.Size)
@@ -246,4 +241,4 @@ func (r *XactRespond) stop() {
 }
 
 // (compare w/ XactGet/Put)
-func (r *XactRespond) Snap() *cluster.Snap { return r.baseSnap() }
+func (r *XactRespond) Snap() *core.Snap { return r.baseSnap() }

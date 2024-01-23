@@ -7,7 +7,6 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -35,7 +34,7 @@ func newServer(mgr *mgr) *hserv {
 }
 
 func parseURL(w http.ResponseWriter, r *http.Request, itemsAfter int, items []string) ([]string, error) {
-	items, err := cmn.ParseURL(r.URL.Path, itemsAfter, true, items)
+	items, err := cmn.ParseURL(r.URL.Path, items, itemsAfter, true)
 	if err != nil {
 		cmn.WriteErr(w, r, err)
 		return nil, err
@@ -49,7 +48,14 @@ func (h *hserv) Run() (err error) {
 	nlog.Infof("Listening on *:%s", portstring)
 
 	h.registerPublicHandlers()
-	h.s = &http.Server{Addr: portstring, Handler: h.mux}
+	h.s = &http.Server{
+		Addr:              portstring,
+		Handler:           h.mux,
+		ReadHeaderTimeout: apc.ReadHeaderTimeout,
+	}
+	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
+		h.s.ReadHeaderTimeout = timeout
+	}
 	if Conf.Net.HTTP.UseHTTPS {
 		if err = h.s.ListenAndServeTLS(Conf.Net.HTTP.Certificate, Conf.Net.HTTP.Key); err == nil {
 			return nil
@@ -69,7 +75,7 @@ rerr:
 
 func (h *hserv) registerHandler(path string, handler func(http.ResponseWriter, *http.Request)) {
 	h.mux.HandleFunc(path, handler)
-	if !strings.HasSuffix(path, "/") {
+	if !cos.IsLastB(path, '/') {
 		h.mux.HandleFunc(path+"/", handler)
 	}
 }
@@ -157,9 +163,11 @@ func (h *hserv) httpUserDel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *hserv) httpUserPost(w http.ResponseWriter, r *http.Request) {
-	if apiItems, err := parseURL(w, r, 0, apc.URLPathUsers.L); err != nil {
+	apiItems, err := parseURL(w, r, 0, apc.URLPathUsers.L)
+	if err != nil {
 		return
-	} else if len(apiItems) == 0 {
+	}
+	if len(apiItems) == 0 {
 		h.userAdd(w, r)
 	} else {
 		h.userLogin(w, r)

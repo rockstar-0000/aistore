@@ -34,9 +34,8 @@ type (
 		AvgMs int64 `json:"avg_ms,string"`
 	}
 
-	// PhaseInfo contains general stats and state for given phase. It is base struct
-	// which is extended by actual phases structs.
-	PhaseInfo struct {
+	// included by 3 actual phases below
+	phaseBase struct {
 		Start time.Time `json:"started_time"`
 		End   time.Time `json:"end_time"`
 		// Elapsed time (in seconds) from start to given point of time or end when
@@ -56,10 +55,10 @@ type (
 
 // phases
 type (
-	// LocalExtraction contains metrics for first phase of DSort.
+	// LocalExtraction contains metrics for first phase of Dsort.
 	LocalExtraction struct {
-		PhaseInfo
-		// TotalCnt is the number of shards DSort has to process in total.
+		phaseBase
+		// TotalCnt is the number of shards Dsort has to process in total.
 		TotalCnt int64 `json:"total_count,string"`
 		// ExtractedCnt is the cumulative number of extracted shards. In the
 		// end, this should be roughly equal to TotalCnt/#Targets.
@@ -76,18 +75,18 @@ type (
 		ExtractedToDiskSize int64 `json:"extracted_to_disk_size,string"`
 	}
 
-	// MetaSorting contains metrics for second phase of DSort.
+	// MetaSorting contains metrics for second phase of Dsort.
 	MetaSorting struct {
-		PhaseInfo
+		phaseBase
 		// SentStats - time statistics about records sent to another target
 		SentStats *TimeStats `json:"sent_stats,omitempty"`
 		// RecvStats - time statistics about records receivied from another target
 		RecvStats *TimeStats `json:"recv_stats,omitempty"`
 	}
 
-	// ShardCreation contains metrics for third and last phase of DSort.
+	// ShardCreation contains metrics for third and last phase of Dsort.
 	ShardCreation struct {
-		PhaseInfo
+		phaseBase
 		// ToCreate - number of shards that to be created in this phase.
 		ToCreate int64 `json:"to_create,string"`
 		// CreatedCnt the number of shards that have been so far created.
@@ -107,7 +106,7 @@ type (
 
 // main stats-and-status types
 type (
-	// Metrics is general struct which contains all stats about DSort run.
+	// Metrics is general struct which contains all stats about Dsort run.
 	Metrics struct {
 		Extraction *LocalExtraction `json:"local_extraction,omitempty"`
 		Sorting    *MetaSorting     `json:"meta_sorting,omitempty"`
@@ -127,7 +126,7 @@ type (
 		Archived atomic.Bool `json:"archived,omitempty"`
 	}
 
-	// JobInfo is a struct that contains stats that represent the DSort run in a list
+	// JobInfo is a struct that contains stats that represent the Dsort run in a list
 	JobInfo struct {
 		ID                string        `json:"id"` // job ID == xact ID (aka managerUUID)
 		SrcBck            cmn.Bck       `json:"src-bck"`
@@ -146,11 +145,11 @@ type (
 )
 
 ///////////////
-// PhaseInfo //
+// phaseBase //
 ///////////////
 
 // begin marks phase as in progress.
-func (pi *PhaseInfo) begin() {
+func (pi *phaseBase) begin() {
 	pi.mu.Lock()
 	pi.Running = true
 	pi.Start = time.Now()
@@ -158,7 +157,7 @@ func (pi *PhaseInfo) begin() {
 }
 
 // finish marks phase as finished.
-func (pi *PhaseInfo) finish() {
+func (pi *phaseBase) finish() {
 	pi.mu.Lock()
 	pi.Running = false
 	pi.Finished = true
@@ -171,24 +170,19 @@ func (pi *PhaseInfo) finish() {
 // Metrics //
 /////////////
 
-// newMetrics creates new Metrics instance.
 func newMetrics(description string) *Metrics {
-	extraction := &LocalExtraction{}
-	sorting := &MetaSorting{}
-	creation := &ShardCreation{}
-
-	sorting.SentStats = newTimeStats()
-	sorting.RecvStats = newTimeStats()
-
 	return &Metrics{
 		Description: description,
-		Extraction:  extraction,
-		Sorting:     sorting,
-		Creation:    creation,
+		Extraction:  &LocalExtraction{},
+		Sorting: &MetaSorting{
+			SentStats: newTimeStats(),
+			RecvStats: newTimeStats(),
+		},
+		Creation: &ShardCreation{},
 	}
 }
 
-// setAbortedTo updates aborted state of DSort.
+// setAbortedTo updates aborted state of Dsort.
 func (m *Metrics) setAbortedTo(b bool) {
 	m.Aborted.Store(b)
 }

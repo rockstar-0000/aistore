@@ -14,11 +14,11 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/urfave/cli"
@@ -75,7 +75,7 @@ func fillNodeStatusMap(c *cli.Context, daeType string) (smap *meta.Smap, tstatus
 	wg.Wait()
 
 	mmc := strings.Split(cmn.VersionAIStore, versionSepa)
-	debug.Assert(len(mmc) > 2)
+	debug.Assert(len(mmc) > 1)
 	ok := checkVersionWarn(c, apc.Target, mmc, tstatusMap)
 	if ok && pstatusMap != nil {
 		_ = checkVersionWarn(c, apc.Proxy, mmc, pstatusMap)
@@ -104,9 +104,16 @@ func checkVersionWarn(c *cli.Context, role string, mmc []string, stmap teb.StstM
 		return false
 	}
 	for _, ds := range stmap {
+		if ds.Version == "" {
+			warn := fmt.Sprintf("empty version from %s (in maintenance mode?)", ds.Node.Snode.StringEx())
+			actionWarn(c, warn)
+			continue
+		}
 		mmx := strings.Split(ds.Version, versionSepa)
-		if len(mmx) < 3 {
-			debug.Assert(len(mmx) > 2)
+		if _, err := strconv.Atoi(mmx[0]); err != nil {
+			warn := fmt.Sprintf("%s: unexpected version format: %s, %v", ds.Node.Snode.StringEx(), ds.Version, mmx)
+			fmt.Fprintln(c.App.ErrWriter, fred("Error: ")+warn)
+			debug.Assert(false)
 			continue
 		}
 		// major

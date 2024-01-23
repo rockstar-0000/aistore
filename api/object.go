@@ -1,6 +1,6 @@
-// Package api provides AIStore API over HTTP(S)
+// Package api provides Go based AIStore API/SDK over HTTP(S)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
@@ -41,6 +40,7 @@ type (
 		// 1. `apc.QparamETLName`: named ETL to transform the object (i.e., perform "inline transformation")
 		// 2. `apc.QparamOrigURL`: GET from a vanilla http(s) location (`ht://` bucket with the corresponding `OrigURLBck`)
 		// 3. `apc.QparamSilent`: do not log errors
+		// 4. `apc.QparamLatestVer`: get latest version from the associated Cloud bucket; see also: `ValidateWarmGet`
 		Query url.Values
 
 		// The field is exclusively used to facilitate Range Read.
@@ -87,11 +87,6 @@ type (
 		// - we massively write a new content into a bucket, and/or
 		// - we simply don't care.
 		SkipVC bool
-	}
-	PromoteArgs struct {
-		BaseParams BaseParams
-		Bck        cmn.Bck
-		cluster.PromoteArgs
 	}
 
 	// (see also: api.PutApndArchArgs)
@@ -164,7 +159,7 @@ func (oah *ObjAttrs) RespHeader() http.Header {
 // `io.Copy` is used internally to copy response bytes from the request to the writer.
 //
 // Returns `ObjAttrs` that can be further used to get the size and other object metadata.
-func GetObject(bp BaseParams, bck cmn.Bck, object string, args *GetArgs) (oah ObjAttrs, err error) {
+func GetObject(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) (oah ObjAttrs, err error) {
 	var (
 		wresp     *wrappedResp
 		w, q, hdr = args.ret()
@@ -173,7 +168,7 @@ func GetObject(bp BaseParams, bck cmn.Bck, object string, args *GetArgs) (oah Ob
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name, objName)
 		reqParams.Query = bck.NewQuery()
 		reqParams.Header = hdr
 	}
@@ -231,14 +226,14 @@ func GetObjectWithValidation(bp BaseParams, bck cmn.Bck, objName string, args *G
 
 // GetObjectReader returns reader of the requested object. It does not read body
 // bytes, nor validates a checksum. Caller is responsible for closing the reader.
-func GetObjectReader(bp BaseParams, bck cmn.Bck, object string, args *GetArgs) (r io.ReadCloser, err error) {
+func GetObjectReader(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) (r io.ReadCloser, err error) {
 	_, q, hdr := args.ret()
 	q = bck.AddToQuery(q)
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name, objName)
 		reqParams.Query = q
 		reqParams.Header = hdr
 	}
@@ -301,13 +296,14 @@ func (args *AppendArgs) _append(reqArgs *cmn.HreqArgs) (*http.Request, error) {
 }
 
 // HeadObject returns object properties; can be conventionally used to establish in-cluster presence.
-// `fltPresence` - as per QparamFltPresence enum (for values and comments, see api/apc/query.go)
-func HeadObject(bp BaseParams, bck cmn.Bck, object string, fltPresence int) (*cmn.ObjectProps, error) {
+// - fltPresence:  as per QparamFltPresence enum (for values and comments, see api/apc/query.go)
+// - silent==true: not to log (not-found) error
+func HeadObject(bp BaseParams, bck cmn.Bck, objName string, fltPresence int, silent bool) (*cmn.ObjectProps, error) {
 	bp.Method = http.MethodHead
 
 	q := bck.NewQuery()
 	q.Set(apc.QparamFltPresence, strconv.Itoa(fltPresence))
-	if fltPresence == apc.FltPresentNoProps {
+	if silent {
 		q.Set(apc.QparamSilent, "true")
 	}
 
@@ -315,10 +311,10 @@ func HeadObject(bp BaseParams, bck cmn.Bck, object string, fltPresence int) (*cm
 	defer FreeRp(reqParams)
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name, objName)
 		reqParams.Query = q
 	}
-	hdr, err := reqParams.doReqHdr()
+	hdr, _, err := reqParams.doReqHdr()
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +327,7 @@ func HeadObject(bp BaseParams, bck cmn.Bck, object string, fltPresence int) (*cm
 	op.Cksum = op.ObjAttrs.FromHeader(hdr)
 	// second, all the rest
 	err = cmn.IterFields(op, func(tag string, field cmn.IterField) (error, bool) {
-		headerName := cmn.PropToHeader(tag)
+		headerName := apc.PropToHeader(tag)
 		// skip the missing ones
 		if _, ok := hdr[textproto.CanonicalMIMEHeaderKey(headerName)]; !ok {
 			return nil, false
@@ -349,7 +345,7 @@ func HeadObject(bp BaseParams, bck cmn.Bck, object string, fltPresence int) (*cm
 // By default, adds new or updates existing custom keys.
 // Use `setNewCustomMDFlag` to _replace_ all existing keys with the specified (new) ones.
 // See also: HeadObject() and apc.HdrObjCustomMD
-func SetObjectCustomProps(bp BaseParams, bck cmn.Bck, object string, custom cos.StrKVs, setNew bool) error {
+func SetObjectCustomProps(bp BaseParams, bck cmn.Bck, objName string, custom cos.StrKVs, setNew bool) error {
 	var (
 		actMsg = apc.ActMsg{Value: custom}
 		q      url.Values
@@ -365,7 +361,7 @@ func SetObjectCustomProps(bp BaseParams, bck cmn.Bck, object string, custom cos.
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name, objName)
 		reqParams.Body = cos.MustMarshal(actMsg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 		reqParams.Query = q
@@ -375,13 +371,12 @@ func SetObjectCustomProps(bp BaseParams, bck cmn.Bck, object string, custom cos.
 	return err
 }
 
-// DeleteObject deletes an object specified by bucket/object.
-func DeleteObject(bp BaseParams, bck cmn.Bck, object string) error {
+func DeleteObject(bp BaseParams, bck cmn.Bck, objName string) error {
 	bp.Method = http.MethodDelete
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name, objName)
 		reqParams.Query = bck.NewQuery()
 	}
 	err := reqParams.DoRequest()
@@ -389,14 +384,13 @@ func DeleteObject(bp BaseParams, bck cmn.Bck, object string) error {
 	return err
 }
 
-// EvictObject evicts an object specified by bucket/object.
-func EvictObject(bp BaseParams, bck cmn.Bck, object string) error {
+func EvictObject(bp BaseParams, bck cmn.Bck, objName string) error {
 	bp.Method = http.MethodDelete
-	actMsg := apc.ActMsg{Action: apc.ActEvictObjects, Name: cos.JoinWords(bck.Name, object)}
+	actMsg := apc.ActMsg{Action: apc.ActEvictObjects, Name: cos.JoinWords(bck.Name, objName)}
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathObjects.Join(bck.Name, object)
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name, objName)
 		reqParams.Body = cos.MustMarshal(actMsg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 		reqParams.Query = bck.NewQuery()
@@ -406,12 +400,20 @@ func EvictObject(bp BaseParams, bck cmn.Bck, object string) error {
 	return err
 }
 
-// PutObject creates an object from the body of the reader (`args.Reader`) and puts
-// it in the specified bucket.
+// prefetch object - a convenience method added for "symmetry" with the evict (above)
+// - compare with api.PrefetchList and api.PrefetchRange
+func PrefetchObject(bp BaseParams, bck cmn.Bck, objName string) (string, error) {
+	var msg apc.PrefetchMsg
+	msg.ObjNames = []string{objName}
+	return Prefetch(bp, bck, msg)
+}
+
+// PutObject PUTs the specified reader (`args.Reader`) as a new object
+// (or a new version of the object) it in the specified bucket.
 //
 // Assumes that `args.Reader` is already opened and ready for usage.
 // Returns `ObjAttrs` that can be further used to get the size and other object metadata.
-func PutObject(args PutArgs) (oah ObjAttrs, err error) {
+func PutObject(args *PutArgs) (oah ObjAttrs, err error) {
 	var (
 		resp  *http.Response
 		query = args.Bck.NewQuery()
@@ -444,7 +446,7 @@ func PutObject(args PutArgs) (oah ObjAttrs, err error) {
 // See also:
 // - api.ArchiveMultiObj(msg.AppendIfExists = true)
 // - api.AppendObject
-func PutApndArch(args PutApndArchArgs) (err error) {
+func PutApndArch(args *PutApndArchArgs) (err error) {
 	q := make(url.Values, 4)
 	q = args.Bck.AddToQuery(q)
 	q.Set(apc.QparamArchpath, args.ArchPath)
@@ -474,7 +476,7 @@ func PutApndArch(args PutApndArchArgs) (err error) {
 // Once all the "appending" is done, the caller must call `api.FlushObject`
 // to finalize the object.
 // NOTE: object becomes visible and accessible only _after_ the call to `api.FlushObject`.
-func AppendObject(args AppendArgs) (string /*handle*/, error) {
+func AppendObject(args *AppendArgs) (string /*handle*/, error) {
 	q := make(url.Values, 4)
 	q.Set(apc.QparamAppendType, apc.AppendOp)
 	q.Set(apc.QparamAppendHandle, args.Handle)
@@ -499,10 +501,11 @@ func AppendObject(args AppendArgs) (string /*handle*/, error) {
 // FlushObject must be called after all the appends (via `api.AppendObject`).
 // To "flush", it uses the handle returned by `api.AppendObject`.
 // This call will create a fully operational and accessible object.
-func FlushObject(args FlushArgs) error {
+func FlushObject(args *FlushArgs) error {
 	var (
 		header http.Header
 		q      = make(url.Values, 4)
+		method = args.BaseParams.Method
 	)
 	q.Set(apc.QparamAppendType, apc.FlushOp)
 	q.Set(apc.QparamAppendHandle, args.Handle)
@@ -523,6 +526,7 @@ func FlushObject(args FlushArgs) error {
 	}
 	err := reqParams.DoRequest()
 	FreeRp(reqParams)
+	args.BaseParams.Method = method
 	return err
 }
 
@@ -544,21 +548,20 @@ func RenameObject(bp BaseParams, bck cmn.Bck, oldName, newName string) error {
 }
 
 // promote files and directories to ais objects
-func Promote(args *PromoteArgs) (xid string, err error) {
-	actMsg := apc.ActMsg{Action: apc.ActPromote, Name: args.SrcFQN}
-	actMsg.Value = &args.PromoteArgs
-	args.BaseParams.Method = http.MethodPost
+func Promote(bp BaseParams, bck cmn.Bck, args *apc.PromoteArgs) (xid string, err error) {
+	actMsg := apc.ActMsg{Action: apc.ActPromote, Name: args.SrcFQN, Value: args}
+	bp.Method = http.MethodPost
 	reqParams := AllocRp()
 	{
-		reqParams.BaseParams = args.BaseParams
-		reqParams.Path = apc.URLPathObjects.Join(args.Bck.Name)
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathObjects.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(actMsg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = args.Bck.NewQuery()
+		reqParams.Query = bck.NewQuery()
 	}
 	_, err = reqParams.doReqStr(&xid)
 	FreeRp(reqParams)
-	return
+	return xid, err
 }
 
 // DoWithRetry executes `http-client.Do` and retries *retriable connection errors*,

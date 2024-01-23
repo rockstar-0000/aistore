@@ -22,12 +22,18 @@ For datasets, say, below 50TB a single host may suffice and should, therefore, b
 
 AIStore runs on commodity Linux machines with no special requirements whatsoever. It is expected that within a given cluster, all AIS [targets](/docs/overview.md#key-concepts-and-diagrams) are identical, hardware-wise.
 
-* [Linux](#Linux) (with `GCC`, `sysstat` and `attr` packages, and kernel 4.15+) or [macOS](#macOS)
-* [Go 1.20 or later](https://golang.org/dl/)
+* [Linux](#Linux) distribution with `GCC`, `sysstat`, `attr` and `util-linux` packages(**)
+* Linux kernel 5.15+
+* [Go 1.21 or later](https://golang.org/dl/)
 * Extended attributes (`xattrs` - see next section)
 * Optionally, Amazon (AWS), Google Cloud Platform (GCP), and/or Azure Cloud Storage accounts.
 
-> See also: `CROSS_COMPILE` comment below.
+> (**) [Mac](#macOS) is also supported albeit in a limited (development only) way.
+
+See also:
+
+* Section [assorted command lines](#assorted-command-lines), and
+* `CROSS_COMPILE` comment below.
 
 ### Linux
 
@@ -51,8 +57,23 @@ $ getfattr -n user.bar foo
 
 ### macOS
 
-macOS/Darwin is also supported, albeit for development only.
-Certain capabilities related to querying the state and status of local hardware resources (memory, CPU, disks) may be missing, which is why we **strongly** recommend Linux for production deployments.
+For developers, there's also macOS aka Darwin option. Certain capabilities related to querrying the state and status of local hardware resources (memory, CPU, disks) may be missing. In fact, it is easy to review specifics with a quick check on the sources:
+
+```console
+$ find . -name "*darwin*"
+
+./fs/fs_darwin.go
+./cmn/cos/err_darwin.go
+./sys/proc_darwin.go
+./sys/cpu_darwin.go
+./sys/mem_darwin.go
+./ios/diskstats_darwin.go
+./ios/dutils_darwin.go
+./ios/fsutils_darwin.go
+...
+```
+
+Benchmarking and stress-testing is also being done on Linux only - another reason to consider Linux (and only Linux) for production deployments.
 
 The rest of this document is structured as follows:
 
@@ -76,6 +97,8 @@ The rest of this document is structured as follows:
 - [HTTPS from scratch](#https-from-scratch)
 - [Build, Make and Development Tools](#build-make-and-development-tools)
 - [Containerized Deployments: Host Resource Sharing](#containerized-deployments-host-resource-sharing)
+- [TLS: testing with self-signed certificates](#tls-testing-with-self-signed-certificates)
+- [Assorted command lines](#assorted-command-lines)
 
 ## Local Playground
 
@@ -91,9 +114,9 @@ To run AIStore from source, you'd typically need **Go**: compiler, linker, tools
 
 To install Go(lang) on Linux:
 
-* Download the latest `go1.20.<x>.linux-amd64.tar.gz` from [Go downloads](https://golang.org/dl/)
+* Download the latest `go1.21.<x>.linux-amd64.tar.gz` from [Go downloads](https://golang.org/dl/)
 * Follow [installation instructions](https://go.dev/doc/install)
-* **Or** simply run: `tar -C /usr/local -xzf go1.20.<x>.linux-amd64.tar.gz` and add `/usr/local/go/bin` to $PATH
+* **Or** simply run: `tar -C /usr/local -xzf go1.21.<x>.linux-amd64.tar.gz` and add `/usr/local/go/bin` to $PATH
 
 Next, if not done yet, export the [`GOPATH`](https://go.dev/doc/gopath_code#GOPATH) environment variable.
 
@@ -223,6 +246,10 @@ Other variables, such as `AIS_IS_PRIMARY` and `AIS_USE_HTTPS` can prove to be us
 For developers, CLI `ais config cluster log.modules ec xs` (for instance) would allow to selectively raise and/or reduce logging verbosity on a per module bases - modules EC (erasure coding) and xactions (batch jobs) in this particular case.
 
 > To list all log modules, type `ais config cluster` or `ais config node` and press `<TAB-TAB>`.
+
+Finally, there's also HTTPS configuration (including **X509** certificates and options), and the corresponding [environment](#tls-testing-with-self-signed-certificates).
+
+For details, please see section [TLS: testing with self-signed certificates](#tls-testing-with-self-signed-certificates) below.
 
 ## Multiple deployment options
 
@@ -418,3 +445,57 @@ Further, given the container's cgroup/memory limitation, each AIS node adjusts t
 > Memory limits may affect [dSort](/docs/dsort.md) performance forcing it to "spill" the content associated with in-progress resharding into local drives. The same is true for erasure-coding which also requires memory to rebuild objects from slices, etc.
 
 > For technical details on AIS memory management, please see [this readme](/memsys/README.md).
+
+## TLS: testing with self-signed certificates
+
+Local playground run: 6 gateways, 6 targets:
+
+```console
+$ source ais/test/tls-env/server.conf
+$ source ais/test/tls-env/client.conf
+$ AIS_USE_HTTPS=true make kill cli deploy <<< $'6\n6\n4\ny\ny\nn\nn\n'
+```
+
+Notice that when the cluster is first time deployed `server.conf` environment (above) overrides aistore cluster configuration.
+
+> Environment is ignored upon cluster restarts and upgrades.
+
+Here's a quick summary of the corresponding configuration variables (that are also referenced inside `ais/test/tls-env/server.conf`).
+
+| var name | description | the corresponding cluster configuration |
+| -- | -- | -- |
+| `AIS_USE_HTTPS`       | when false, we use plain HTTP with all the TLS config (below) simply **ignored** | "net.http.use_https" |
+| -- | -- | -- |
+| `AIS_SERVER_CRT`         | aistore cluster X509 certificate | "net.http.server_crt" |
+| `AIS_SERVER_KEY`         | certificate's private key | "net.http.server_key"|
+| `AIS_DOMAIN_TLS`         | domain, hostname, or Subject Alternative Name (SAN) registered with the certificate | "net.http.domain_tls"|
+| `AIS_CLIENT_CA_TLS`       | Certificate authority that authorized (signed) the certificate | "net.http.client_ca_tls" |
+| `AIS_CLIENT_AUTH_TLS`       | Client authentication during TLS handshake: a range from 0 (no authentication) to 4 (request and validate client's certificate) | "net.http.client_auth_tls" |
+| `AIS_SKIP_VERIFY_CRT` | when true: skip X509 cert verification (usually enabled to circumvent limitations of self-signed certs) | "net.http.skip_verify" |
+
+
+On the other hand, `ais/test/tls-env/client.conf` contains environment variables to override CLI config. The correspondence between environment and config names is easy to see as well.
+
+Prerequisites:
+
+* `/tmp/tls` (or any other location of your choosing) must contain valid X509 certs for both the CLI (and aisloader, other clients), and aistore itself.
+* testing-wise,`openssl`-generated and self-signed X509 certs will be perfectly fine.
+
+See also:
+
+* [Client-side TLS environment](/docs/cli.md#environment-variables)
+
+
+## Assorted command lines
+
+AIStore targets may execute (and parse the output of) the following 3 commands:
+
+```console
+$ du -bc
+$ lsblk -Jt
+$ df -PT    # e.g., `df -PT /tmp/foo`
+```
+
+**Tip**:
+
+> In fact, prior to deploying AIS cluster on a given Linux distribution the very first time, it'd make sense to maybe run the 3 commands and check output for "invalid option" or lack of thereof.

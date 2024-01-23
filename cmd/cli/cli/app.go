@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -23,16 +23,9 @@ const (
 	ua       = "ais/cli"
 	metadata = "md"
 	cliDescr = `If <TAB-TAB> completion doesn't work:
-   * download ` + cmn.GitHubHome + `/tree/master/cmd/cli/autocomplete
+   * download ` + cmn.GitHubHome + `/tree/main/cmd/cli/autocomplete
    * and run 'install.sh'.
-   To install CLI directly from GitHub: ` + cmn.GitHubHome + `/blob/master/deploy/scripts/install_from_binaries.sh`
-)
-
-const (
-	warnRemAisOffline = `remote ais cluster %s is crrrently unreachable.
-Run 'ais config cluster backend.conf --json' - to show the respective configuration;
-    'ais config cluster backend.conf <new JSON formatted value>' - to reconfigure or remove.
-For details and usage examples, see: docs/cli/config.md`
+   To install CLI directly from GitHub: ` + cmn.GitHubHome + `/blob/main/deploy/scripts/install_from_binaries.sh`
 )
 
 const (
@@ -51,7 +44,7 @@ type (
 	}
 	longRun struct {
 		count            int
-		footer           int
+		lfooter          int
 		refreshRate      time.Duration
 		offset           int64
 		mapBegin, mapEnd teb.StstMap
@@ -83,7 +76,7 @@ var helpCommand = cli.Command{
 	},
 }
 
-func configuredVerbosity() bool { return cfg.Verbose } // more warnings, errors with backtraces and details
+func cliConfVerbose() bool { return cfg.Verbose } // more warnings, errors with backtraces and details
 
 func helpCmdHandler(c *cli.Context) error {
 	args := c.Args()
@@ -126,7 +119,7 @@ func (a *acli) runOnce(args []string) error {
 	}
 	if isStartingUp(err) {
 		for i := 0; i < 4; i++ {
-			time.Sleep(2 * time.Second)
+			briefPause(2)
 			fmt.Fprint(a.app.Writer, ". ")
 			if err = a.app.Run(args); err == nil {
 				fmt.Fprintln(a.app.Writer)
@@ -141,7 +134,7 @@ func (a *acli) runForever(args []string) error {
 	rate := a.longRun.refreshRate
 	for {
 		time.Sleep(rate)
-		printLongRunFooter(a.outWriter, a.longRun.footer)
+		printLongRunFooter(a.outWriter, a.longRun.lfooter)
 		if err := a.runOnce(args); err != nil {
 			return err
 		}
@@ -318,7 +311,7 @@ func (p *longRun) init(c *cli.Context, runOnce bool) {
 			warn := fmt.Sprintf("option '%s=%d' is invalid (must be >= 1). Proceeding with '%s=%d' (default).",
 				n, p.count, n, countDefault)
 			actionWarn(c, warn)
-			time.Sleep(2 * time.Second)
+			briefPause(2)
 			p.count = countDefault
 		}
 	}
@@ -334,9 +327,9 @@ func setLongRunParams(c *cli.Context, footer ...int) bool {
 	if params.isSet() {
 		return false
 	}
-	params.footer = 8
+	params.lfooter = 8
 	if len(footer) > 0 {
-		params.footer = footer[0]
+		params.lfooter = footer[0]
 	}
 	params.init(c, false)
 	return true

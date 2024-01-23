@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -12,14 +12,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/xact/xreg"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -41,14 +44,40 @@ type (
 	startupSema struct {
 		started atomic.Bool
 	}
+
+	global struct {
+		tstats stats.Tracker
+		db     kvdb.Driver
+		store  *infoStore
+
+		// Downloader selects one of the two clients (below) by the destination URL.
+		// Certification check is disabled for now and does not depend on cluster settings.
+		clientH   *http.Client
+		clientTLS *http.Client
+	}
 )
+
+var g global
+
+func Init(tstats stats.Tracker, db kvdb.Driver, clientConf *cmn.ClientConf) {
+	g.clientH, g.clientTLS = cmn.NewDefaultClients(clientConf.TimeoutLong.D())
+
+	if db == nil { // unit tests only
+		return
+	}
+	{
+		g.tstats = tstats
+		g.db = db
+		g.store = newInfoStore(db)
+	}
+	xreg.RegNonBckXact(&factory{})
+}
 
 ////////////////
 // dispatcher //
 ////////////////
 
 func newDispatcher(xdl *Xact) *dispatcher {
-	initInfoStore(db) // initialize only once
 	return &dispatcher{
 		xdl:         xdl,
 		startupSema: startupSema{},
@@ -73,14 +102,15 @@ func (d *dispatcher) run() (err error) {
 	// allow other goroutines to run
 	d.startupSema.markStarted()
 
+	nlog.Infoln(d.xdl.Name(), "started, cnt:", len(availablePaths))
 mloop:
 	for {
 		select {
 		case <-d.xdl.IdleTimer():
-			nlog.Infof("%s timed out. Exiting...", d.xdl.Name())
+			nlog.Infoln(d.xdl.Name(), "idle timeout")
 			break mloop
 		case errCause := <-d.xdl.ChanAbort():
-			nlog.Infof("%s aborted (cause %v). Exiting...", d.xdl.Name(), errCause)
+			nlog.Infoln(d.xdl.Name(), "aborted:", errCause)
 			break mloop
 		case <-ctx.Done():
 			break mloop
@@ -94,10 +124,10 @@ mloop:
 
 			select {
 			case <-d.xdl.IdleTimer():
-				nlog.Infof("%s has timed out. Exiting...", d.xdl.Name())
+				nlog.Infoln(d.xdl.Name(), "idle timeout")
 				break mloop
 			case errCause := <-d.xdl.ChanAbort():
-				nlog.Infof("%s has been aborted (cause %v). Exiting...", d.xdl.Name(), errCause)
+				nlog.Infoln(d.xdl.Name(), "aborted:", errCause)
 				break mloop
 			case <-ctx.Done():
 				break mloop
@@ -144,7 +174,7 @@ func (d *dispatcher) cleanupJob(jobID string) {
 }
 
 func (d *dispatcher) finish(job jobif) {
-	verbose := d.config.FastV(4, cos.SmoduleDload)
+	verbose := cmn.Rom.FastV(4, cos.SmoduleDload)
 	if verbose {
 		nlog.Infof("Waiting for job %q", job.ID())
 	}
@@ -170,94 +200,18 @@ func (d *dispatcher) dispatchDownload(job jobif) (ok bool) {
 		return !aborted
 	}
 
-	diffResolver := NewDiffResolver(nil)
+	diffResolver := NewDiffResolver(&defaultDiffResolverCtx{})
+	go diffResolver.Start()
 
-	diffResolver.Start()
-
-	// In case of `!job.Sync()` we don't want to traverse the whole bucket.
-	// We just want to download requested objects so we know exactly which
-	// objects must be checked (compared) and which not. Therefore, only traverse
-	// bucket when we need to sync the objects.
+	// In case of `!job.Sync()` we don't want to traverse entire bucket.
+	// We just want to download requested objects and to find out which
+	// objects must be checked (latest version-wise). Therefore, "walk"
+	// bucket only when we need to sync the objects.
 	if job.Sync() {
-		go func() {
-			defer diffResolver.CloseSrc()
-			opts := &fs.WalkBckOpts{
-				WalkOpts: fs.WalkOpts{CTs: []string{fs.ObjectType}, Sorted: true},
-			}
-			opts.WalkOpts.Bck.Copy(job.Bck())
-			opts.Callback = func(fqn string, de fs.DirEntry) error {
-				if diffResolver.Stopped() {
-					return cmn.NewErrAborted(job.String(), "diff-resolver stopped", nil)
-				}
-				lom := &cluster.LOM{}
-				if err := lom.InitFQN(fqn, job.Bck()); err != nil {
-					return err
-				}
-				if !job.checkObj(lom.ObjName) {
-					return nil
-				}
-				diffResolver.PushSrc(lom)
-				return nil
-			}
-			err := fs.WalkBck(opts)
-			if err != nil && !cmn.IsErrAborted(err) {
-				diffResolver.Abort(err)
-			}
-		}()
+		go diffResolver.walk(job)
 	}
 
-	go func() {
-		defer func() {
-			diffResolver.CloseDst()
-			if !job.Sync() {
-				diffResolver.CloseSrc()
-			}
-		}()
-
-		for {
-			objs, ok, err := job.genNext()
-			if err != nil {
-				diffResolver.Abort(err)
-				return
-			}
-			if !ok || diffResolver.Stopped() {
-				return
-			}
-
-			for _, obj := range objs {
-				if d.checkAborted() {
-					err := cmn.NewErrAborted(job.String(), "", nil)
-					diffResolver.Abort(err)
-					return
-				} else if d.checkAbortedJob(job) {
-					diffResolver.Stop()
-					return
-				}
-
-				if !job.Sync() {
-					// When it is not a sync job, push LOM for a given object
-					// because we need to check if it exists.
-					lom := &cluster.LOM{ObjName: obj.objName}
-					if err := lom.InitBck(job.Bck()); err != nil {
-						diffResolver.Abort(err)
-						return
-					}
-					diffResolver.PushSrc(lom)
-				}
-
-				if obj.link != "" {
-					diffResolver.PushDst(&WebResource{
-						ObjName: obj.objName,
-						Link:    obj.link,
-					})
-				} else {
-					diffResolver.PushDst(&BackendResource{
-						ObjName: obj.objName,
-					})
-				}
-			}
-		}
-	}()
+	go diffResolver.push(job, d)
 
 	for {
 		result, err := diffResolver.Next()
@@ -283,10 +237,10 @@ func (d *dispatcher) dispatchDownload(job jobif) (ok bool) {
 				}
 			}
 
-			dlStore.incScheduled(job.ID())
+			g.store.incScheduled(job.ID())
 
 			if result.Action == DiffResolverSkip {
-				dlStore.incSkipped(job.ID())
+				g.store.incSkipped(job.ID())
 				continue
 			}
 
@@ -299,29 +253,29 @@ func (d *dispatcher) dispatchDownload(job jobif) (ok bool) {
 			if result.Action == DiffResolverDelete {
 				requiresSync := job.Sync()
 				debug.Assert(requiresSync)
-				if _, err := d.xdl.t.EvictObject(result.Src); err != nil {
+				if _, err := core.T.EvictObject(result.Src); err != nil {
 					task.markFailed(err.Error())
 				} else {
-					dlStore.incFinished(job.ID())
+					g.store.incFinished(job.ID())
 				}
 				continue
 			}
 
 			ok, err := d.doSingle(task)
 			if err != nil {
-				nlog.Errorf("%s failed to download %s: %v", job, obj.objName, err)
-				dlStore.setAborted(job.ID()) // TODO -- FIXME: pass (report, handle) error, here and elsewhere
+				nlog.Errorln(job.String(), "failed to download", obj.objName+":", err)
+				g.store.setAborted(job.ID()) // TODO -- FIXME: pass (report, handle) error, here and elsewhere
 				return ok
 			}
 			if !ok {
-				dlStore.setAborted(job.ID())
+				g.store.setAborted(job.ID())
 				return false
 			}
 		case DiffResolverSend:
 			requiresSync := job.Sync()
 			debug.Assert(requiresSync)
 		case DiffResolverEOF:
-			dlStore.setAllDispatched(job.ID(), true)
+			g.store.setAllDispatched(job.ID(), true)
 			return true
 		}
 	}
@@ -361,11 +315,11 @@ func (d *dispatcher) checkAborted() bool {
 // returns false if dispatcher encountered hard error, true otherwise
 func (d *dispatcher) doSingle(task *singleTask) (ok bool, err error) {
 	bck := meta.CloneBck(task.job.Bck())
-	if err := bck.Init(d.xdl.t.Bowner()); err != nil {
+	if err := bck.Init(core.T.Bowner()); err != nil {
 		return true, err
 	}
 
-	mi, _, err := cluster.HrwMpath(bck.MakeUname(task.obj.objName))
+	mi, _, err := fs.Hrw(bck.MakeUname(task.obj.objName))
 	if err != nil {
 		return false, err
 	}
@@ -399,7 +353,7 @@ func (d *dispatcher) doSingle(task *singleTask) (ok bool, err error) {
 }
 
 func (d *dispatcher) adminReq(req *request) (resp any, statusCode int, err error) {
-	if d.config.FastV(4, cos.SmoduleDload) {
+	if cmn.Rom.FastV(4, cos.SmoduleDload) {
 		nlog.Infof("Admin request (id: %q, action: %q, onlyActive: %t)", req.id, req.action, req.onlyActive)
 	}
 	// Need to make sure that the dispatcher has fully initialized and started,
@@ -420,36 +374,29 @@ func (d *dispatcher) adminReq(req *request) (resp any, statusCode int, err error
 	return r.value, r.statusCode, r.err
 }
 
-func (d *dispatcher) handleRemove(req *request) {
-	dljob, err := d.xdl.checkJob(req)
+func (*dispatcher) handleRemove(req *request) {
+	dljob, err := g.store.checkExists(req)
 	if err != nil {
 		return
 	}
-
-	// There's a slight chance this doesn't happen if target rejoins after target checks for download not running
 	job := dljob.clone()
 	if job.JobRunning() {
-		req.errRsp(fmt.Errorf("download job %q is still running", dljob.id), http.StatusBadRequest)
+		req.errRsp(fmt.Errorf("job %q is still running", dljob.id), http.StatusBadRequest)
 		return
 	}
-
-	dlStore.delJob(req.id)
+	g.store.delJob(req.id)
 	req.okRsp(nil)
 }
 
 func (d *dispatcher) handleAbort(req *request) {
-	_, err := d.xdl.checkJob(req)
-	if err != nil {
+	if _, err := g.store.checkExists(req); err != nil {
 		return
 	}
-
 	d.jobAbortedCh(req.id).Close()
-
 	for _, j := range d.joggers {
 		j.abortJob(req.id)
 	}
-
-	dlStore.setAborted(req.id)
+	g.store.setAborted(req.id)
 	req.okRsp(nil)
 }
 
@@ -458,20 +405,20 @@ func (d *dispatcher) handleStatus(req *request) {
 		finishedTasks []TaskDlInfo
 		dlErrors      []TaskErrInfo
 	)
-	dljob, err := d.xdl.checkJob(req)
+	dljob, err := g.store.checkExists(req)
 	if err != nil {
 		return
 	}
 
 	currentTasks := d.activeTasks(req.id)
 	if !req.onlyActive {
-		finishedTasks, err = dlStore.getTasks(req.id)
+		finishedTasks, err = g.store.getTasks(req.id)
 		if err != nil {
 			req.errRsp(err, http.StatusInternalServerError)
 			return
 		}
 
-		dlErrors, err = dlStore.getErrors(req.id)
+		dlErrors, err = g.store.getErrors(req.id)
 		if err != nil {
 			req.errRsp(err, http.StatusInternalServerError)
 			return

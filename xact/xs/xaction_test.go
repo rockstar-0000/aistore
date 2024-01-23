@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
-	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/xact"
@@ -34,7 +34,7 @@ func init() {
 	cmn.GCO.CommitUpdate(config)
 
 	xreg.Init()
-	xs.Xreg()
+	xs.Xreg(false)
 }
 
 // Smoke tests for xactions
@@ -71,14 +71,15 @@ func TestXactionRenewLRU(t *testing.T) {
 
 func TestXactionRenewPrefetch(t *testing.T) {
 	var (
-		evArgs = &apc.ListRange{}
-		bmd    = mock.NewBaseBownerMock()
-		bck    = meta.NewBck(
+		msg = &apc.PrefetchMsg{}
+		bmd = mock.NewBaseBownerMock()
+		bck = meta.NewBck(
 			"test", apc.GCP, cmn.NsGlobal,
-			&cmn.BucketProps{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}},
+			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}},
 		)
 		tMock = mock.NewTarget(bmd)
 	)
+	core.T = tMock
 	xreg.TestReset()
 	bmd.Add(bck)
 
@@ -92,14 +93,14 @@ func TestXactionRenewPrefetch(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		go func() {
 			defer wg.Done()
-			ch <- xreg.RenewPrefetch(cos.GenUUID(), tMock, bck, evArgs)
+			ch <- xreg.RenewPrefetch(cos.GenUUID(), bck, msg)
 		}()
 	}
 
 	wg.Wait()
 	close(ch)
 
-	res := make(map[cluster.Xact]struct{}, 10)
+	res := make(map[core.Xact]struct{}, 10)
 	for rns := range ch {
 		if xctn := rns.Entry.Get(); xctn != nil {
 			res[xctn] = struct{}{}
@@ -116,6 +117,7 @@ func TestXactionAbortAll(t *testing.T) {
 		bckTo   = meta.NewBck("test", apc.AIS, cmn.NsGlobal)
 		tMock   = mock.NewTarget(bmd)
 	)
+	core.T = tMock
 	xreg.TestReset()
 	bmd.Add(bckFrom)
 	bmd.Add(bckTo)
@@ -126,7 +128,7 @@ func TestXactionAbortAll(t *testing.T) {
 
 	rnsLRU := xreg.RenewLRU(cos.GenUUID())
 	tassert.Errorf(t, !rnsLRU.IsRunning(), "new LRU must be created")
-	rnsRen := xreg.RenewBckRename(tMock, bckFrom, bckTo, cos.GenUUID(), 123, "phase")
+	rnsRen := xreg.RenewBckRename(bckFrom, bckTo, cos.GenUUID(), 123, "phase")
 	xactBck := rnsRen.Entry.Get()
 	tassert.Errorf(t, rnsRen.Err == nil && xactBck != nil, "Xaction must be created")
 
@@ -143,6 +145,7 @@ func TestXactionAbortAllGlobal(t *testing.T) {
 		bckTo   = meta.NewBck("test", apc.AIS, cmn.NsGlobal)
 		tMock   = mock.NewTarget(bmd)
 	)
+	core.T = tMock
 	xreg.TestReset()
 
 	defer xreg.AbortAll(errors.New("test-abort-global"))
@@ -156,7 +159,7 @@ func TestXactionAbortAllGlobal(t *testing.T) {
 
 	rnsLRU := xreg.RenewLRU(cos.GenUUID())
 	tassert.Errorf(t, !rnsLRU.IsRunning(), "new LRU must be created")
-	rnsRen := xreg.RenewBckRename(tMock, bckFrom, bckTo, cos.GenUUID(), 123, "phase")
+	rnsRen := xreg.RenewBckRename(bckFrom, bckTo, cos.GenUUID(), 123, "phase")
 	xactBck := rnsRen.Entry.Get()
 	tassert.Errorf(t, rnsRen.Err == nil && xactBck != nil, "Xaction must be created")
 
@@ -173,6 +176,7 @@ func TestXactionAbortBuckets(t *testing.T) {
 		bckTo   = meta.NewBck("test", apc.AIS, cmn.NsGlobal)
 		tMock   = mock.NewTarget(bmd)
 	)
+	core.T = tMock
 	xreg.TestReset()
 
 	defer xreg.AbortAll(errors.New("abort-buckets"))
@@ -186,7 +190,7 @@ func TestXactionAbortBuckets(t *testing.T) {
 
 	rnsLRU := xreg.RenewLRU(cos.GenUUID())
 	tassert.Errorf(t, !rnsLRU.IsRunning(), "new LRU must be created")
-	rns := xreg.RenewBckRename(tMock, bckFrom, bckTo, cos.GenUUID(), 123, "phase")
+	rns := xreg.RenewBckRename(bckFrom, bckTo, cos.GenUUID(), 123, "phase")
 	xactBck := rns.Entry.Get()
 	tassert.Errorf(t, rns.Err == nil && xactBck != nil, "Xaction must be created")
 
@@ -211,6 +215,7 @@ func TestXactionQueryFinished(t *testing.T) {
 		bck3  = meta.NewBck("test3", apc.GCP, cmn.NsGlobal)
 		tMock = mock.NewTarget(bmd)
 	)
+	core.T = tMock
 	xreg.TestReset()
 
 	defer xreg.AbortAll(nil)
@@ -223,16 +228,17 @@ func TestXactionQueryFinished(t *testing.T) {
 	xreg.RegBckXact(&xs.TestBmvFactory{})
 	cos.InitShortID(0)
 
-	rns1 := xreg.RenewBckRename(tMock, bck1, bck1, cos.GenUUID(), 123, "phase")
+	rns1 := xreg.RenewBckRename(bck1, bck1, cos.GenUUID(), 123, "phase")
 	tassert.Errorf(t, rns1.Err == nil && rns1.Entry.Get() != nil, "Xaction must be created")
-	rns2 := xreg.RenewBckRename(tMock, bck2, bck2, cos.GenUUID(), 123, "phase")
+	rns2 := xreg.RenewBckRename(bck2, bck2, cos.GenUUID(), 123, "phase")
 	tassert.Errorf(t, rns2.Err == nil && rns2.Entry.Get() != nil, "Xaction must be created %v", rns2.Err)
 	rns1.Entry.Get().Finish()
 
-	rns1 = xreg.RenewBckRename(tMock, bck1, bck1, cos.GenUUID(), 123, "phase")
+	rns1 = xreg.RenewBckRename(bck1, bck1, cos.GenUUID(), 123, "phase")
 	tassert.Errorf(t, rns1.Err == nil && rns1.Entry.Get() != nil, "Xaction must be created")
-	rns3 := xreg.RenewPrefetch(cos.GenUUID(), tMock, bck3, &apc.ListRange{})
-	tassert.Errorf(t, rns3.Entry.Get() != nil, "Xaction must be created %v", rns3.Err)
+
+	rns3 := xreg.RenewPrefetch(cos.GenUUID(), bck3, &apc.PrefetchMsg{})
+	tassert.Fatalf(t, cmn.IsErrRemoteBckNotFound(rns3.Err), "x-prefetch: expected 'cloud bucket does not exist' error")
 
 	xactBck1 := rns1.Entry.Get()
 

@@ -1,10 +1,11 @@
 // Package reb provides global cluster-wide rebalance upon adding/removing storage nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package reb
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,8 +16,6 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -24,6 +23,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/cmn/prob"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
@@ -68,7 +69,6 @@ const fmtpend = "%s: newer rebalance[g%d] pending - not running"
 
 type (
 	Reb struct {
-		t         cluster.Target
 		smap      ratomic.Pointer[meta.Smap] // next smap (new that'll become current after rebalance)
 		xreb      ratomic.Pointer[xs.Rebalance]
 		dm        *bundle.DataMover
@@ -93,7 +93,7 @@ type (
 	}
 	lomAcks struct {
 		mu *sync.Mutex
-		q  map[string]*cluster.LOM // on the wire, waiting for ACK
+		q  map[string]*core.LOM // on the wire, waiting for ACK
 	}
 	joggerBase struct {
 		m    *Reb
@@ -115,17 +115,18 @@ type (
 	}
 )
 
-func New(t cluster.Target, config *cmn.Config) *Reb {
-	ecClient := cmn.NewClient(cmn.TransportArgs{
-		Timeout:    config.Client.Timeout.D(),
-		UseHTTPS:   config.Net.HTTP.UseHTTPS,
-		SkipVerify: config.Net.HTTP.SkipVerify,
-	})
-	reb := &Reb{
-		t:         t,
-		filterGFN: prob.NewDefaultFilter(),
-		stages:    newNodeStages(),
-		ecClient:  ecClient,
+func New(config *cmn.Config) *Reb {
+	var (
+		reb = &Reb{
+			filterGFN: prob.NewDefaultFilter(),
+			stages:    newNodeStages(),
+		}
+		cargs = cmn.TransportArgs{Timeout: config.Client.Timeout.D()}
+	)
+	if config.Net.HTTP.UseHTTPS {
+		reb.ecClient = cmn.NewIntraClientTLS(cargs, config)
+	} else {
+		reb.ecClient = cmn.NewClient(cargs)
 	}
 	dmExtra := bundle.Extra{
 		RecvAck:     reb.recvAck,
@@ -133,10 +134,11 @@ func New(t cluster.Target, config *cmn.Config) *Reb {
 		Compression: config.Rebalance.Compression,
 		Multiplier:  config.Rebalance.SbundleMult,
 	}
-	dm, err := bundle.NewDataMover(t, trname, reb.recvObj, cmn.OwtMigrate, dmExtra)
+	dm, err := bundle.NewDataMover(trname, reb.recvObj, cmn.OwtRebalance, dmExtra)
 	if err != nil {
 		cos.ExitLog(err)
 	}
+	debug.Assert(dm != nil)
 	reb.dm = dm
 
 	// serialize one global rebalance at a time
@@ -185,7 +187,7 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 	logHdr := reb.logHdr(id, smap, true /*initializing*/)
 	nlog.Infoln(logHdr + ": initializing")
 
-	bmd := reb.t.Bowner().Get()
+	bmd := core.T.Bowner().Get()
 	rargs := &rebArgs{id: id, smap: smap, config: cmn.GCO.Get(), ecUsed: bmd.IsECUsed()}
 	if !reb.serialize(rargs, logHdr) {
 		return
@@ -193,7 +195,7 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 
 	reb.regRecv()
 
-	haveStreams := smap.HasActiveTs(reb.t.SID())
+	haveStreams := smap.HasActiveTs(core.T.SID())
 	if bmd.IsEmpty() {
 		haveStreams = false
 	}
@@ -214,6 +216,9 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 		return
 	}
 
+	// abort all running `dtor.AbortRebRes` xactions (download, dsort, etl)
+	xreg.AbortByNewReb(errors.New("reason: starting " + reb.xctn().Name()))
+
 	// At this point, only one rebalance is running
 
 	onGFN()
@@ -228,7 +233,7 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 	reb.changeStage(rebStageFin)
 
 	for errCnt != 0 && !reb.xctn().IsAborted() {
-		errCnt = reb.bcast(rargs, reb.waitFinExtended)
+		errCnt = bcast(rargs, reb.waitFinExtended)
 	}
 
 	reb.fini(rargs, logHdr, err)
@@ -266,11 +271,11 @@ func (reb *Reb) run(rargs *rebArgs) error {
 
 func (reb *Reb) serialize(rargs *rebArgs, logHdr string) bool {
 	// 1. check whether other targets are up and running
-	if errCnt := reb.bcast(rargs, reb.pingTarget); errCnt > 0 {
+	if errCnt := bcast(rargs, reb.pingTarget); errCnt > 0 {
 		return false
 	}
 	if rargs.smap.Version == 0 {
-		rargs.smap = reb.t.Sowner().Get()
+		rargs.smap = core.T.Sowner().Get()
 	}
 	// 2. serialize global rebalance and start new xaction -
 	//    but only if the one that handles the current version is _not_ already in progress
@@ -278,7 +283,7 @@ func (reb *Reb) serialize(rargs *rebArgs, logHdr string) bool {
 		return false
 	}
 	if rargs.smap.Version == 0 {
-		rargs.smap = reb.t.Sowner().Get()
+		rargs.smap = core.T.Sowner().Get()
 	}
 	rargs.apaths = fs.GetAvail()
 	return true
@@ -405,10 +410,10 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 	reb.rebID.Store(rargs.id)
 
 	// check Smap _prior_ to opening streams
-	smap := reb.t.Sowner().Get()
+	smap := core.T.Sowner().Get()
 	if smap.Version != rargs.smap.Version {
 		debug.Assert(smap.Version > rargs.smap.Version)
-		nlog.Errorf("Warning %s: %s post-init version change %s => %s", reb.t, xreb, rargs.smap, smap)
+		nlog.Errorf("Warning %s: %s post-init version change %s => %s", core.T, xreb, rargs.smap, smap)
 		// TODO: handle an unlikely corner case keeping in mind that not every change warants a different rebalance
 	}
 
@@ -424,7 +429,7 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 	}
 	acks := reb.lomAcks()
 	for i := 0; i < len(acks); i++ { // init lom acks
-		acks[i] = &lomAcks{mu: &sync.Mutex{}, q: make(map[string]*cluster.LOM, 64)}
+		acks[i] = &lomAcks{mu: &sync.Mutex{}, q: make(map[string]*core.LOM, 64)}
 	}
 
 	// 4. create persistent mark
@@ -461,7 +466,7 @@ func (reb *Reb) beginStreams(config *cmn.Config) {
 		Multiplier: config.Rebalance.SbundleMult,
 		Extra:      &transport.Extra{SenderID: xreb.ID(), Config: config},
 	}
-	reb.pushes = bundle.New(reb.t.Sowner(), reb.t.Snode(), transport.NewIntraDataClient(), pushArgs)
+	reb.pushes = bundle.New(transport.NewIntraDataClient(), pushArgs)
 
 	reb.laterx.Store(false)
 	reb.inQueue.Store(0)
@@ -481,32 +486,45 @@ func (reb *Reb) endStreams(err error) {
 
 // when at least one bucket has EC enabled
 func (reb *Reb) runEC(rargs *rebArgs) error {
-	_ = reb.bcast(rargs, reb.rxReady) // NOTE: ignore timeout
+	errCnt := bcast(rargs, reb.rxReady) // ignore timeout
 	xreb := reb.xctn()
 	if err := xreb.AbortErr(); err != nil {
-		return cmn.NewErrAborted(xreb.Name(), "reb-run-ec-bcast", err)
+		logHdr := reb.logHdr(rargs.id, rargs.smap)
+		nlog.Infoln(logHdr, "abort ec rx-ready", err, "num-fail", errCnt)
+		return err
+	}
+	if errCnt > 0 {
+		logHdr := reb.logHdr(rargs.id, rargs.smap)
+		nlog.Errorln(logHdr, "ec rx-ready num-fail", errCnt) // unlikely
 	}
 
 	reb.runECjoggers()
 
 	if err := xreb.AbortErr(); err != nil {
-		return cmn.NewErrAborted(xreb.Name(), "reb-run-ec-joggers", err)
+		logHdr := reb.logHdr(rargs.id, rargs.smap)
+		nlog.Infoln(logHdr, "abort ec-joggers", err)
+		return err
 	}
-	nlog.Infof("[%s] RebalanceEC done", reb.t.SID())
+	nlog.Infof("[%s] RebalanceEC done", core.T.SID())
 	return nil
 }
 
-// when no bucket has EC enabled
+// when not a single bucket has EC enabled
 func (reb *Reb) runNoEC(rargs *rebArgs) error {
-	ver := rargs.smap.Version
-	_ = reb.bcast(rargs, reb.rxReady) // NOTE: ignore timeout
-
+	errCnt := bcast(rargs, reb.rxReady) // ignore timeout
 	xreb := reb.xctn()
 	if err := xreb.AbortErr(); err != nil {
-		return cmn.NewErrAborted(xreb.Name(), "reb-run-bcast", err)
+		logHdr := reb.logHdr(rargs.id, rargs.smap)
+		nlog.Infoln(logHdr, "abort rx-ready", err, "num-fail", errCnt)
+		return err
+	}
+	if errCnt > 0 {
+		logHdr := reb.logHdr(rargs.id, rargs.smap)
+		nlog.Errorln(logHdr, "rx-ready num-fail", errCnt) // unlikely
 	}
 
 	wg := &sync.WaitGroup{}
+	ver := rargs.smap.Version
 	for _, mi := range rargs.apaths {
 		rl := &rebJogger{
 			joggerBase: joggerBase{m: reb, xreb: reb.xctn(), wg: wg},
@@ -518,9 +536,11 @@ func (reb *Reb) runNoEC(rargs *rebArgs) error {
 	wg.Wait()
 
 	if err := xreb.AbortErr(); err != nil {
-		return cmn.NewErrAborted(xreb.Name(), "reb-run-joggers", err)
+		logHdr := reb.logHdr(rargs.id, rargs.smap)
+		nlog.Infoln(logHdr, "abort joggers", err)
+		return err
 	}
-	if rargs.config.FastV(4, cos.SmoduleReb) {
+	if cmn.Rom.FastV(4, cos.SmoduleReb) {
 		nlog.Infof("finished rebalance walk (g%d)", rargs.id)
 	}
 	return nil
@@ -533,6 +553,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 		sleep  = rargs.config.Timeout.CplaneOperation.D()
 		maxwt  = rargs.config.Rebalance.DestRetryTime.D()
 		xreb   = reb.xctn()
+		smap   = rargs.smap
 	)
 	maxwt += time.Duration(int64(time.Minute) * int64(rargs.smap.CountTargets()/10))
 	maxwt = min(maxwt, rargs.config.Rebalance.DestRetryTime.D()*2)
@@ -551,7 +572,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 					cnt += l
 					if !logged {
 						for _, lom := range lomack.q {
-							tsi, err := cluster.HrwTarget(lom.Uname(), rargs.smap)
+							tsi, err := smap.HrwHash2T(lom.Digest())
 							if err == nil {
 								nlog.Infof("waiting for %s ACK from %s", lom, tsi.StringEx())
 								logged = true
@@ -593,7 +614,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 
 		// 8. synchronize
 		nlog.Infof("%s: poll targets for: stage=(%s or %s***)", logHdr, stages[rebStageFin], stages[rebStageWaitAck])
-		errCnt = reb.bcast(rargs, reb.waitFinExtended)
+		errCnt = bcast(rargs, reb.waitFinExtended)
 		if xreb.IsAborted() {
 			return
 		}
@@ -624,21 +645,20 @@ func (reb *Reb) retransmit(rargs *rebArgs, xreb *xs.Rebalance) (cnt int) {
 		lomAck.mu.Lock()
 		for uname, lom := range lomAck.q {
 			if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
-				if cmn.IsObjNotExist(err) {
-					if rargs.config.FastV(4, cos.SmoduleReb) {
-						nlog.Infof("%s: %s not found", loghdr, lom)
+				if cos.IsNotExist(err, 0) {
+					if cmn.Rom.FastV(5, cos.SmoduleReb) {
+						nlog.Infoln(loghdr, lom.Cname(), "not found")
 					}
 				} else {
-					err = fmt.Errorf("%s: failed loading %s: %w", loghdr, lom, err)
-					nlog.Errorln(err)
+					err = cmn.NewErrFailedTo(core.T, "load", lom.Cname(), err)
 					rj.xreb.AddErr(err)
 				}
 				delete(lomAck.q, uname)
 				continue
 			}
-			tsi, _ := cluster.HrwTarget(lom.Uname(), rargs.smap)
-			if reb.t.HeadObjT2T(lom, tsi) {
-				if rargs.config.FastV(4, cos.SmoduleReb) {
+			tsi, _ := rargs.smap.HrwHash2T(lom.Digest())
+			if core.T.HeadObjT2T(lom, tsi) {
+				if cmn.Rom.FastV(4, cos.SmoduleReb) {
 					nlog.Infof("%s: HEAD ok %s at %s", loghdr, lom, tsi.StringEx())
 				}
 				delete(lomAck.q, uname)
@@ -650,7 +670,7 @@ func (reb *Reb) retransmit(rargs *rebArgs, xreb *xs.Rebalance) (cnt int) {
 				err = rj.doSend(lom, tsi, roc)
 			}
 			if err == nil {
-				if rargs.config.FastV(4, cos.SmoduleReb) {
+				if cmn.Rom.FastV(4, cos.SmoduleReb) {
 					nlog.Infof("%s: retransmit %s => %s", loghdr, lom, tsi.StringEx())
 				}
 				cnt++
@@ -678,19 +698,19 @@ func (reb *Reb) retransmit(rargs *rebArgs, xreb *xs.Rebalance) (cnt int) {
 
 func (reb *Reb) _aborted(rargs *rebArgs) (yes bool) {
 	yes = reb.xctn().IsAborted()
-	yes = yes || (rargs.smap.Version != reb.t.Sowner().Get().Version)
+	yes = yes || (rargs.smap.Version != core.T.Sowner().Get().Version)
 	return
 }
 
 func (reb *Reb) fini(rargs *rebArgs, logHdr string, err error) {
-	var stats cluster.Stats
-	if rargs.config.FastV(4, cos.SmoduleReb) {
+	var stats core.Stats
+	if cmn.Rom.FastV(4, cos.SmoduleReb) {
 		nlog.Infof("finishing rebalance (reb_args: %s)", reb.logHdr(rargs.id, rargs.smap))
 	}
 	// prior to closing the streams
-	if q := reb.quiesce(rargs, rargs.config.Transport.QuiesceTime.D(), reb.nodesQuiescent); q != cluster.QuiAborted {
+	if q := reb.quiesce(rargs, rargs.config.Transport.QuiesceTime.D(), reb.nodesQuiescent); q != core.QuiAborted {
 		if errM := fs.RemoveMarker(fname.RebalanceMarker); errM == nil {
-			nlog.Infof("%s: %s removed marker ok", reb.t, reb.xctn())
+			nlog.Infof("%s: %s removed marker ok", core.T, reb.xctn())
 		}
 		_ = fs.RemoveMarker(fname.NodeRestartedPrev)
 	}
@@ -728,7 +748,7 @@ func (rj *rebJogger) jog(mi *fs.Mountpath) {
 		rj.opts.Callback = rj.visitObj
 		rj.opts.Sorted = false
 	}
-	bmd := rj.m.t.Bowner().Get()
+	bmd := core.T.Bowner().Get()
 	bmd.Range(nil, nil, rj.walkBck)
 }
 
@@ -739,51 +759,52 @@ func (rj *rebJogger) walkBck(bck *meta.Bck) bool {
 		return rj.xreb.IsAborted()
 	}
 	if rj.xreb.IsAborted() {
-		nlog.Infof("aborting traversal")
+		nlog.Infoln(rj.xreb.Name(), "aborting traversal")
 	} else {
-		nlog.Errorf("%s: %s failed to traverse: %v", rj.m.t, rj.xreb.Name(), err)
+		nlog.Errorln(core.T.String(), rj.xreb.Name(), "failed to traverse", err)
 	}
 	return true
 }
 
 // send completion
-func (rj *rebJogger) objSentCallback(hdr transport.ObjHdr, _ io.ReadCloser, arg any, err error) {
+func (rj *rebJogger) objSentCallback(hdr *transport.ObjHdr, _ io.ReadCloser, arg any, err error) {
 	rj.m.inQueue.Dec()
 	if err == nil {
 		rj.xreb.OutObjsAdd(1, hdr.ObjAttrs.Size) // NOTE: double-counts retransmissions
 		return
 	}
 	// log err
-	if cmn.FastV(4, cos.SmoduleReb) || !cos.IsRetriableConnErr(err) {
+	if cmn.Rom.FastV(4, cos.SmoduleReb) || !cos.IsRetriableConnErr(err) {
 		if bundle.IsErrDestinationMissing(err) {
 			nlog.Errorf("%s: %v, %s", rj.xreb.Name(), err, rj.smap)
 		} else {
-			lom, ok := arg.(*cluster.LOM)
+			lom, ok := arg.(*core.LOM)
 			debug.Assert(ok)
-			nlog.Errorf("%s: %s failed to send %s: %v", rj.m.t, rj.xreb.Name(), lom, err)
+			nlog.Errorf("%s: %s failed to send %s: %v", core.T, rj.xreb.Name(), lom, err)
 		}
 	}
 }
 
-func (rj *rebJogger) visitObj(fqn string, de fs.DirEntry) (err error) {
+func (rj *rebJogger) visitObj(fqn string, de fs.DirEntry) error {
 	if err := rj.xreb.AbortErr(); err != nil {
-		return cmn.NewErrAborted(rj.xreb.Name(), "rj-walk", err)
+		nlog.Infoln(rj.xreb.Name(), "rj-walk-visit aborted", err)
+		return err
 	}
 	if de.IsDir() {
 		return nil
 	}
-	lom := cluster.AllocLOM(fqn)
-	err = rj._lwalk(lom, fqn)
+	lom := core.AllocLOM(fqn)
+	err := rj._lwalk(lom, fqn)
 	if err != nil {
-		cluster.FreeLOM(lom)
+		core.FreeLOM(lom)
 		if err == cmn.ErrSkip {
 			err = nil
 		}
 	}
-	return
+	return err
 }
 
-func (rj *rebJogger) _lwalk(lom *cluster.LOM, fqn string) error {
+func (rj *rebJogger) _lwalk(lom *core.LOM, fqn string) error {
 	if err := lom.InitFQN(fqn, nil); err != nil {
 		if cmn.IsErrBucketLevel(err) {
 			return err
@@ -794,11 +815,11 @@ func (rj *rebJogger) _lwalk(lom *cluster.LOM, fqn string) error {
 	if lom.Bck().Props.EC.Enabled {
 		return filepath.SkipDir
 	}
-	tsi, err := cluster.HrwTarget(lom.Uname(), rj.smap)
+	tsi, err := rj.smap.HrwHash2T(lom.Digest())
 	if err != nil {
 		return err
 	}
-	if tsi.ID() == rj.m.t.SID() {
+	if tsi.ID() == core.T.SID() {
 		return cmn.ErrSkip
 	}
 
@@ -810,8 +831,8 @@ func (rj *rebJogger) _lwalk(lom *cluster.LOM, fqn string) error {
 		return cmn.ErrSkip
 	}
 	// prepare to send: rlock, load, new roc
-	roc, err := _getReader(lom)
-	if err != nil {
+	var roc cos.ReadOpenCloser
+	if roc, err = _getReader(lom); err != nil {
 		return err
 	}
 
@@ -826,7 +847,7 @@ func (rj *rebJogger) _lwalk(lom *cluster.LOM, fqn string) error {
 }
 
 // takes rlock and keeps it _iff_ successful
-func _getReader(lom *cluster.LOM) (roc cos.ReadOpenCloser, err error) {
+func _getReader(lom *core.LOM) (roc cos.ReadOpenCloser, err error) {
 	lom.Lock(false)
 	if err = lom.Load(false /*cache it*/, true /*locked*/); err != nil {
 		lom.Unlock(false)
@@ -843,19 +864,20 @@ func _getReader(lom *cluster.LOM) (roc cos.ReadOpenCloser, err error) {
 			return
 		}
 	}
+	debug.Assert(lom.Checksum() != nil, lom.String())
 	return lom.NewDeferROC()
 }
 
-func (rj *rebJogger) doSend(lom *cluster.LOM, tsi *meta.Snode, roc cos.ReadOpenCloser) error {
+func (rj *rebJogger) doSend(lom *core.LOM, tsi *meta.Snode, roc cos.ReadOpenCloser) error {
 	var (
-		ack    = regularAck{rebID: rj.m.RebID(), daemonID: rj.m.t.SID()}
+		ack    = regularAck{rebID: rj.m.RebID(), daemonID: core.T.SID()}
 		o      = transport.AllocSend()
 		opaque = ack.NewPack()
 	)
 	o.Hdr.Bck.Copy(lom.Bucket())
 	o.Hdr.ObjName = lom.ObjName
 	o.Hdr.Opaque = opaque
-	o.Hdr.ObjAttrs.CopyFrom(lom.ObjAttrs())
+	o.Hdr.ObjAttrs.CopyFrom(lom.ObjAttrs(), false /*skip cksum*/)
 	o.Callback, o.CmplArg = rj.objSentCallback, lom
 	rj.m.inQueue.Inc()
 	return rj.m.dm.Send(o, roc, tsi)

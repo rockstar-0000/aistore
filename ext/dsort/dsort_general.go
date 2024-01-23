@@ -12,14 +12,14 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
@@ -41,7 +41,7 @@ import (
 // the creation phase super fast.
 
 const (
-	DSorterGeneralType = "dsort_general"
+	GeneralType = "dsort_general"
 )
 
 type (
@@ -81,7 +81,7 @@ type (
 // interface guard
 var _ dsorter = (*dsorterGeneral)(nil)
 
-func newDSorterGeneral(m *Manager) (*dsorterGeneral, error) {
+func newDsorterGeneral(m *Manager) (*dsorterGeneral, error) {
 	var mem sys.MemStat
 	if err := mem.Get(); err != nil {
 		return nil, err
@@ -115,7 +115,7 @@ func (ds *dsorterGeneral) pullStreamWriter(objName string) *streamWriter {
 	return writer
 }
 
-func (*dsorterGeneral) name() string { return DSorterGeneralType }
+func (*dsorterGeneral) name() string { return GeneralType }
 
 func (ds *dsorterGeneral) init() error {
 	ds.creationPhase.adjuster = newConcAdjuster(
@@ -141,7 +141,7 @@ func (ds *dsorterGeneral) start() error {
 		Multiplier: ds.m.Pars.SbundleMult,
 		Net:        reqNetwork,
 		Trname:     trname,
-		Ntype:      cluster.Targets,
+		Ntype:      core.Targets,
 		Extra: &transport.Extra{
 			Config: config,
 		},
@@ -155,9 +155,9 @@ func (ds *dsorterGeneral) start() error {
 		Multiplier: ds.m.Pars.SbundleMult,
 		Net:        respNetwork,
 		Trname:     trname,
-		Ntype:      cluster.Targets,
+		Ntype:      core.Targets,
 		Extra: &transport.Extra{
-			Compression: config.DSort.Compression,
+			Compression: config.Dsort.Compression,
 			Config:      config,
 		},
 	}
@@ -165,8 +165,8 @@ func (ds *dsorterGeneral) start() error {
 		return errors.WithStack(err)
 	}
 
-	ds.streams.request = bundle.New(g.t.Sowner(), g.t.Snode(), client, reqSbArgs)
-	ds.streams.response = bundle.New(g.t.Sowner(), g.t.Snode(), client, respSbArgs)
+	ds.streams.request = bundle.New(client, reqSbArgs)
+	ds.streams.response = bundle.New(client, respSbArgs)
 
 	// start watching memory
 	return ds.mw.watch()
@@ -240,7 +240,7 @@ outer:
 		select {
 		case <-ds.m.listenAborted():
 			_ = group.Wait()
-			return newDSortAbortedError(ds.m.ManagerUUID)
+			return ds.m.newErrAborted()
 		case <-ctx.Done():
 			break outer // context was canceled, therefore we have an error
 		default:
@@ -266,9 +266,9 @@ func (ds *dsorterGeneral) postShardCreation(mi *fs.Mountpath) {
 // loads content from disk or memory, local or remote
 func (ds *dsorterGeneral) Load(w io.Writer, rec *shard.Record, obj *shard.RecordObj) (int64, error) {
 	if ds.m.aborted() {
-		return 0, newDSortAbortedError(ds.m.ManagerUUID)
+		return 0, ds.m.newErrAborted()
 	}
-	if rec.DaemonID != g.t.SID() {
+	if rec.DaemonID != core.T.SID() {
 		return ds.loadRemote(w, rec, obj)
 	}
 	return ds.loadLocal(w, obj)
@@ -384,8 +384,8 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *shard.Record, obj *shard.
 		// stats
 		delta := mono.Since(beforeRecv)
 		g.tstats.AddMany(
-			cos.NamedVal64{Name: stats.DSortCreationRespCount, Value: 1},
-			cos.NamedVal64{Name: stats.DSortCreationRespLatency, Value: int64(delta)},
+			cos.NamedVal64{Name: stats.DsortCreationRespCount, Value: 1},
+			cos.NamedVal64{Name: stats.DsortCreationRespLatency, Value: int64(delta)},
 		)
 	}
 
@@ -400,7 +400,7 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *shard.Record, obj *shard.
 		case stopped:
 			err = cmn.NewErrAborted("wait for remote content", "", nil)
 		case timed:
-			err = errors.Errorf("wait for remote content timed out (%q was waiting for %q)", g.t.SID(), tid)
+			err = errors.Errorf("wait for remote content timed out (%q was waiting for %q)", core.T.SID(), tid)
 		default:
 			debug.Assert(false, "pulled but not stopped or timed?")
 		}
@@ -414,14 +414,14 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *shard.Record, obj *shard.
 	return writer.n, writer.err
 }
 
-func (ds *dsorterGeneral) sentCallback(_ transport.ObjHdr, _ io.ReadCloser, arg any, err error) {
+func (ds *dsorterGeneral) sentCallback(_ *transport.ObjHdr, _ io.ReadCloser, arg any, err error) {
 	if err == nil {
-		g.tstats.Add(stats.DSortCreationReqCount, 1)
+		g.tstats.Add(stats.DsortCreationReqCount, 1)
 		return
 	}
 	req := arg.(*remoteRequest)
 	nlog.Errorf("%s: [dsort] %s failed to send remore-req %s: %v",
-		g.t, ds.m.ManagerUUID, req.Record.MakeUniqueName(req.RecordObj), err)
+		core.T, ds.m.ManagerUUID, req.Record.MakeUniqueName(req.RecordObj), err)
 }
 
 func (ds *dsorterGeneral) errHandler(err error, node *meta.Snode, o *transport.Obj) {
@@ -434,11 +434,12 @@ func (ds *dsorterGeneral) errHandler(err error, node *meta.Snode, o *transport.O
 }
 
 // implements receiver i/f
-func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err error) error {
+func (ds *dsorterGeneral) recvReq(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	ds.m.inFlightInc()
-	defer ds.m.inFlightDec()
-
-	transport.FreeRecv(objReader)
+	defer func() {
+		ds.m.inFlightDec()
+		transport.FreeRecv(objReader)
+	}()
 	req := remoteRequest{}
 	if err := jsoniter.Unmarshal(hdr.Opaque, &req); err != nil {
 		err := fmt.Errorf(cmn.FmtErrUnmarshal, apc.ActDsort, "recv request", cos.BHead(hdr.Opaque), err)
@@ -453,12 +454,12 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 	}
 
 	if err != nil {
-		ds.errHandler(err, fromNode, &transport.Obj{Hdr: hdr})
+		ds.errHandler(err, fromNode, &transport.Obj{Hdr: *hdr})
 		return err
 	}
 
 	if ds.m.aborted() {
-		return newDSortAbortedError(ds.m.ManagerUUID)
+		return ds.m.newErrAborted()
 	}
 
 	o := transport.AllocSend()
@@ -512,14 +513,14 @@ func (ds *dsorterGeneral) recvReq(hdr transport.ObjHdr, objReader io.Reader, err
 	return nil
 }
 
-func (ds *dsorterGeneral) responseCallback(hdr transport.ObjHdr, rc io.ReadCloser, _ any, err error) {
+func (ds *dsorterGeneral) responseCallback(hdr *transport.ObjHdr, rc io.ReadCloser, _ any, err error) {
 	if sgl, ok := rc.(*memsys.SGL); ok {
 		sgl.Free()
 	}
 	ds.m.decrementRef(1)
 	if err != nil {
 		nlog.Errorf("%s: [dsort] %s failed to send rsp %s (size %d): %v - aborting...",
-			g.t, ds.m.ManagerUUID, hdr.ObjName, hdr.ObjAttrs.Size, err)
+			core.T, ds.m.ManagerUUID, hdr.ObjName, hdr.ObjAttrs.Size, err)
 		ds.m.abort(err)
 	}
 }
@@ -528,7 +529,7 @@ func (ds *dsorterGeneral) postExtraction() {
 	ds.mw.stopWatchingReserved()
 }
 
-func (ds *dsorterGeneral) recvResp(hdr transport.ObjHdr, object io.Reader, err error) error {
+func (ds *dsorterGeneral) recvResp(hdr *transport.ObjHdr, object io.Reader, err error) error {
 	ds.m.inFlightInc()
 	defer func() {
 		transport.DrainAndFreeReader(object)
@@ -541,7 +542,7 @@ func (ds *dsorterGeneral) recvResp(hdr transport.ObjHdr, object io.Reader, err e
 	}
 
 	if ds.m.aborted() {
-		return newDSortAbortedError(ds.m.ManagerUUID)
+		return ds.m.newErrAborted()
 	}
 
 	writer := ds.pullStreamWriter(hdr.ObjName)
@@ -585,9 +586,9 @@ type dsgCreateShard struct {
 }
 
 func (cs *dsgCreateShard) do() (err error) {
-	lom := cluster.AllocLOM(cs.shard.Name)
+	lom := core.AllocLOM(cs.shard.Name)
 	err = cs.ds.m.createShard(cs.shard, lom)
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 	cs.ds.creationPhase.adjuster.releaseGoroutineSema()
 	return
 }

@@ -1,11 +1,10 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
-package tests
+package tests_test
 
 import (
-	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -42,7 +41,7 @@ var _ = Describe("IterFields", func() {
 				Expect(got).To(Equal(expected))
 			},
 			Entry("list BucketProps fields",
-				cmn.BucketProps{
+				cmn.Bprops{
 					Provider: apc.AIS,
 					BackendBck: cmn.Bck{
 						Name:     "name",
@@ -80,6 +79,7 @@ var _ = Describe("IterFields", func() {
 
 					"versioning.enabled":           false,
 					"versioning.validate_warm_get": false,
+					"versioning.synchronize":       false,
 
 					"checksum.type":              cos.ChecksumXXHash,
 					"checksum.validate_warm_get": false,
@@ -102,19 +102,19 @@ var _ = Describe("IterFields", func() {
 					"write_policy.md":   apc.WritePolicy(""),
 				},
 			),
-			Entry("list BucketPropsToUpdate fields",
-				&cmn.BucketPropsToUpdate{
-					EC: &cmn.ECConfToUpdate{
-						Enabled:      api.Bool(true),
-						ParitySlices: api.Int(1024),
+			Entry("list BpropsToSet fields",
+				&cmn.BpropsToSet{
+					EC: &cmn.ECConfToSet{
+						Enabled:      apc.Bool(true),
+						ParitySlices: apc.Int(1024),
 					},
-					LRU: &cmn.LRUConfToUpdate{},
-					Cksum: &cmn.CksumConfToUpdate{
-						Type: api.String(cos.ChecksumXXHash),
+					LRU: &cmn.LRUConfToSet{},
+					Cksum: &cmn.CksumConfToSet{
+						Type: apc.String(cos.ChecksumXXHash),
 					},
-					Access: api.AccessAttrs(1024),
-					WritePolicy: &cmn.WritePolicyConfToUpdate{
-						MD: api.WritePolicy(apc.WriteDelayed),
+					Access: apc.AccAttrs(1024),
+					WritePolicy: &cmn.WritePolicyConfToSet{
+						MD: apc.WPolicy(apc.WriteDelayed),
 					},
 				},
 				map[string]any{
@@ -125,8 +125,8 @@ var _ = Describe("IterFields", func() {
 					"mirror.copies":       (*int64)(nil),
 					"mirror.burst_buffer": (*int)(nil),
 
-					"ec.enabled":           api.Bool(true),
-					"ec.parity_slices":     api.Int(1024),
+					"ec.enabled":           apc.Bool(true),
+					"ec.parity_slices":     apc.Int(1024),
 					"ec.data_slices":       (*int)(nil),
 					"ec.objsize_limit":     (*int64)(nil),
 					"ec.compression":       (*string)(nil),
@@ -135,8 +135,9 @@ var _ = Describe("IterFields", func() {
 
 					"versioning.enabled":           (*bool)(nil),
 					"versioning.validate_warm_get": (*bool)(nil),
+					"versioning.synchronize":       (*bool)(nil),
 
-					"checksum.type":              api.String(cos.ChecksumXXHash),
+					"checksum.type":              apc.String(cos.ChecksumXXHash),
 					"checksum.validate_warm_get": (*bool)(nil),
 					"checksum.validate_cold_get": (*bool)(nil),
 					"checksum.validate_obj_move": (*bool)(nil),
@@ -146,10 +147,10 @@ var _ = Describe("IterFields", func() {
 					"lru.dont_evict_time":   (*cos.Duration)(nil),
 					"lru.capacity_upd_time": (*cos.Duration)(nil),
 
-					"access": api.AccessAttrs(1024),
+					"access": apc.AccAttrs(1024),
 
 					"write_policy.data": (*apc.WritePolicy)(nil),
-					"write_policy.md":   api.WritePolicy(apc.WriteDelayed),
+					"write_policy.md":   apc.WPolicy(apc.WriteDelayed),
 
 					"extra.hdfs.ref_directory": (*string)(nil),
 					"extra.aws.cloud_region":   (*string)(nil),
@@ -211,7 +212,7 @@ var _ = Describe("IterFields", func() {
 				Expect(v).To(Equal(expected))
 			},
 			Entry("update some BucketProps",
-				&cmn.BucketProps{
+				&cmn.Bprops{
 					Versioning: cmn.VersionConf{
 						ValidateWarmGet: true,
 					},
@@ -233,7 +234,7 @@ var _ = Describe("IterFields", func() {
 					"access":          "12", // type == uint64
 					"write_policy.md": apc.WriteNever,
 				},
-				&cmn.BucketProps{
+				&cmn.Bprops{
 					Mirror: cmn.MirrorConf{
 						Enabled: true,
 						Copies:  120,
@@ -255,10 +256,10 @@ var _ = Describe("IterFields", func() {
 					WritePolicy: cmn.WritePolicyConf{MD: apc.WriteNever},
 				},
 			),
-			Entry("update some BucketPropsToUpdate",
-				&cmn.BucketPropsToUpdate{
-					Cksum: &cmn.CksumConfToUpdate{
-						ValidateWarmGet: api.Bool(true),
+			Entry("update some BpropsToSet",
+				&cmn.BpropsToSet{
+					Cksum: &cmn.CksumConfToSet{
+						ValidateWarmGet: apc.Bool(true),
 					},
 				},
 				map[string]any{
@@ -278,28 +279,28 @@ var _ = Describe("IterFields", func() {
 					"access":          "12", // type == uint64
 					"write_policy.md": apc.WriteNever,
 				},
-				&cmn.BucketPropsToUpdate{
-					Versioning: &cmn.VersionConfToUpdate{
-						Enabled: api.Bool(false),
+				&cmn.BpropsToSet{
+					Versioning: &cmn.VersionConfToSet{
+						Enabled: apc.Bool(false),
 					},
-					Mirror: &cmn.MirrorConfToUpdate{
-						Enabled: api.Bool(true),
-						Copies:  api.Int64(120),
-						Burst:   api.Int(9560),
+					Mirror: &cmn.MirrorConfToSet{
+						Enabled: apc.Bool(true),
+						Copies:  apc.Int64(120),
+						Burst:   apc.Int(9560),
 					},
-					EC: &cmn.ECConfToUpdate{
-						Enabled:      api.Bool(true),
-						ParitySlices: api.Int(1024),
-						ObjSizeLimit: api.Int64(0),
-						Compression:  api.String(""),
+					EC: &cmn.ECConfToSet{
+						Enabled:      apc.Bool(true),
+						ParitySlices: apc.Int(1024),
+						ObjSizeLimit: apc.Int64(0),
+						Compression:  apc.String(""),
 					},
-					Cksum: &cmn.CksumConfToUpdate{
-						Type:            api.String(cos.ChecksumXXHash),
-						ValidateWarmGet: api.Bool(true),
+					Cksum: &cmn.CksumConfToSet{
+						Type:            apc.String(cos.ChecksumXXHash),
+						ValidateWarmGet: apc.Bool(true),
 					},
-					Access: api.AccessAttrs(12),
-					WritePolicy: &cmn.WritePolicyConfToUpdate{
-						MD: api.WritePolicy(apc.WriteNever),
+					Access: apc.AccAttrs(12),
+					WritePolicy: &cmn.WritePolicyConfToSet{
+						MD: apc.WPolicy(apc.WriteNever),
 					},
 				},
 			),
@@ -312,10 +313,10 @@ var _ = Describe("IterFields", func() {
 					Expect(err).To(HaveOccurred())
 				}
 			},
-			Entry("non-pointer struct", cmn.BucketProps{}, map[string]any{
+			Entry("non-pointer struct", cmn.Bprops{}, map[string]any{
 				"mirror.enabled": true,
 			}),
-			Entry("readonly field", &cmn.BucketProps{}, map[string]any{
+			Entry("readonly field", &cmn.Bprops{}, map[string]any{
 				"provider": apc.AIS,
 			}),
 			Entry("field not found", &Foo{}, map[string]any{
@@ -324,65 +325,65 @@ var _ = Describe("IterFields", func() {
 		)
 
 		DescribeTable("should error on update",
-			func(orig *cmn.ConfigToUpdate, merge *cmn.ConfigToUpdate, expected *cmn.ConfigToUpdate) {
+			func(orig *cmn.ConfigToSet, merge *cmn.ConfigToSet, expected *cmn.ConfigToSet) {
 				orig.Merge(merge)
 				Expect(orig).To(Equal(expected))
 			},
-			Entry("override configuration", &cmn.ConfigToUpdate{
-				Mirror: &cmn.MirrorConfToUpdate{
-					Enabled: api.Bool(true),
-					Copies:  api.Int64(2),
+			Entry("override configuration", &cmn.ConfigToSet{
+				Mirror: &cmn.MirrorConfToSet{
+					Enabled: apc.Bool(true),
+					Copies:  apc.Int64(2),
 				},
-			}, &cmn.ConfigToUpdate{
-				Mirror: &cmn.MirrorConfToUpdate{
-					Enabled: api.Bool(false),
+			}, &cmn.ConfigToSet{
+				Mirror: &cmn.MirrorConfToSet{
+					Enabled: apc.Bool(false),
 				},
-			}, &cmn.ConfigToUpdate{
-				Mirror: &cmn.MirrorConfToUpdate{
-					Enabled: api.Bool(false),
-					Copies:  api.Int64(2),
-				},
-			}),
-
-			Entry("add new fields", &cmn.ConfigToUpdate{
-				Mirror: &cmn.MirrorConfToUpdate{
-					Enabled: api.Bool(true),
-					Copies:  api.Int64(2),
-				},
-			}, &cmn.ConfigToUpdate{
-				Mirror: &cmn.MirrorConfToUpdate{
-					Enabled: api.Bool(false),
-				},
-				EC: &cmn.ECConfToUpdate{
-					Enabled: api.Bool(true),
-				},
-			}, &cmn.ConfigToUpdate{
-				Mirror: &cmn.MirrorConfToUpdate{
-					Enabled: api.Bool(false),
-					Copies:  api.Int64(2),
-				},
-				EC: &cmn.ECConfToUpdate{
-					Enabled: api.Bool(true),
+			}, &cmn.ConfigToSet{
+				Mirror: &cmn.MirrorConfToSet{
+					Enabled: apc.Bool(false),
+					Copies:  apc.Int64(2),
 				},
 			}),
 
-			Entry("nested fields", &cmn.ConfigToUpdate{
-				Net: &cmn.NetConfToUpdate{
-					HTTP: &cmn.HTTPConfToUpdate{
-						Certificate: api.String("secret"),
+			Entry("add new fields", &cmn.ConfigToSet{
+				Mirror: &cmn.MirrorConfToSet{
+					Enabled: apc.Bool(true),
+					Copies:  apc.Int64(2),
+				},
+			}, &cmn.ConfigToSet{
+				Mirror: &cmn.MirrorConfToSet{
+					Enabled: apc.Bool(false),
+				},
+				EC: &cmn.ECConfToSet{
+					Enabled: apc.Bool(true),
+				},
+			}, &cmn.ConfigToSet{
+				Mirror: &cmn.MirrorConfToSet{
+					Enabled: apc.Bool(false),
+					Copies:  apc.Int64(2),
+				},
+				EC: &cmn.ECConfToSet{
+					Enabled: apc.Bool(true),
+				},
+			}),
+
+			Entry("nested fields", &cmn.ConfigToSet{
+				Net: &cmn.NetConfToSet{
+					HTTP: &cmn.HTTPConfToSet{
+						Certificate: apc.String("secret"),
 					},
 				},
-			}, &cmn.ConfigToUpdate{
-				Net: &cmn.NetConfToUpdate{
-					HTTP: &cmn.HTTPConfToUpdate{
-						UseHTTPS: api.Bool(true),
+			}, &cmn.ConfigToSet{
+				Net: &cmn.NetConfToSet{
+					HTTP: &cmn.HTTPConfToSet{
+						UseHTTPS: apc.Bool(true),
 					},
 				},
-			}, &cmn.ConfigToUpdate{
-				Net: &cmn.NetConfToUpdate{
-					HTTP: &cmn.HTTPConfToUpdate{
-						Certificate: api.String("secret"),
-						UseHTTPS:    api.Bool(true),
+			}, &cmn.ConfigToSet{
+				Net: &cmn.NetConfToSet{
+					HTTP: &cmn.HTTPConfToSet{
+						Certificate: apc.String("secret"),
+						UseHTTPS:    apc.Bool(true),
 					},
 				},
 			}),

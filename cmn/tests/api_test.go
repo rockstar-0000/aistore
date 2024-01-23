@@ -2,10 +2,9 @@
 /*
  * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
  */
-package tests
+package tests_test
 
 import (
-	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	. "github.com/onsi/ginkgo"
@@ -16,57 +15,57 @@ import (
 var _ = Describe("API", func() {
 	Describe("Apply", func() {
 		DescribeTable("should successfully apply all the props",
-			func(src cmn.BucketProps, props cmn.BucketPropsToUpdate, expect cmn.BucketProps) {
+			func(src cmn.Bprops, props cmn.BpropsToSet, expect cmn.Bprops) {
 				src.Apply(&props)
 				Expect(src).To(Equal(expect))
 			},
 			Entry("non-nested field",
-				cmn.BucketProps{},
-				cmn.BucketPropsToUpdate{
-					Access: api.AccessAttrs(1024),
+				cmn.Bprops{},
+				cmn.BpropsToSet{
+					Access: apc.AccAttrs(1024),
 				},
-				cmn.BucketProps{
+				cmn.Bprops{
 					Access: 1024,
 				},
 			),
 			Entry("non-nested field and non-empty initial struct",
-				cmn.BucketProps{
+				cmn.Bprops{
 					Provider: apc.AWS,
 				},
-				cmn.BucketPropsToUpdate{
-					Access: api.AccessAttrs(1024),
+				cmn.BpropsToSet{
+					Access: apc.AccAttrs(1024),
 				},
-				cmn.BucketProps{
+				cmn.Bprops{
 					Provider: apc.AWS,
 					Access:   1024,
 				},
 			),
 			Entry("nested field",
-				cmn.BucketProps{},
-				cmn.BucketPropsToUpdate{
-					Cksum: &cmn.CksumConfToUpdate{
-						Type: api.String("value"),
+				cmn.Bprops{},
+				cmn.BpropsToSet{
+					Cksum: &cmn.CksumConfToSet{
+						Type: apc.String("value"),
 					},
 				},
-				cmn.BucketProps{
+				cmn.Bprops{
 					Cksum: cmn.CksumConf{
 						Type: "value",
 					},
 				},
 			),
 			Entry("multiple nested fields",
-				cmn.BucketProps{},
-				cmn.BucketPropsToUpdate{
-					Cksum: &cmn.CksumConfToUpdate{
-						Type:            api.String("value"),
-						ValidateColdGet: api.Bool(true),
+				cmn.Bprops{},
+				cmn.BpropsToSet{
+					Cksum: &cmn.CksumConfToSet{
+						Type:            apc.String("value"),
+						ValidateColdGet: apc.Bool(true),
 					},
-					EC: &cmn.ECConfToUpdate{
-						Enabled:      api.Bool(true),
-						ObjSizeLimit: api.Int64(1024),
+					EC: &cmn.ECConfToSet{
+						Enabled:      apc.Bool(true),
+						ObjSizeLimit: apc.Int64(1024),
 					},
 				},
-				cmn.BucketProps{
+				cmn.Bprops{
 					Cksum: cmn.CksumConf{
 						Type:            "value",
 						ValidateColdGet: true,
@@ -81,7 +80,7 @@ var _ = Describe("API", func() {
 				},
 			),
 			Entry("multiple nested fields and non-empty initial struct",
-				cmn.BucketProps{
+				cmn.Bprops{
 					Provider: apc.AWS,
 					Cksum: cmn.CksumConf{
 						ValidateColdGet: true,
@@ -95,17 +94,17 @@ var _ = Describe("API", func() {
 						Enabled: true,
 					},
 				},
-				cmn.BucketPropsToUpdate{
-					Cksum: &cmn.CksumConfToUpdate{
-						Type: api.String("value"),
+				cmn.BpropsToSet{
+					Cksum: &cmn.CksumConfToSet{
+						Type: apc.String("value"),
 					},
-					Mirror: &cmn.MirrorConfToUpdate{
-						Enabled: api.Bool(true),
-						Copies:  api.Int64(3),
+					Mirror: &cmn.MirrorConfToSet{
+						Enabled: apc.Bool(true),
+						Copies:  apc.Int64(3),
 					},
-					Access: api.AccessAttrs(10),
+					Access: apc.AccAttrs(10),
 				},
-				cmn.BucketProps{
+				cmn.Bprops{
 					Provider: apc.AWS,
 					Cksum: cmn.CksumConf{
 						Type:            "value",
@@ -123,37 +122,37 @@ var _ = Describe("API", func() {
 				},
 			),
 			Entry("all fields",
-				cmn.BucketProps{},
-				cmn.BucketPropsToUpdate{
-					Versioning: &cmn.VersionConfToUpdate{
-						Enabled:         api.Bool(true),
-						ValidateWarmGet: api.Bool(true),
+				cmn.Bprops{},
+				cmn.BpropsToSet{
+					Versioning: &cmn.VersionConfToSet{
+						Enabled:         apc.Bool(true),
+						ValidateWarmGet: apc.Bool(true),
 					},
-					Cksum: &cmn.CksumConfToUpdate{
-						Type:            api.String("value"),
-						ValidateColdGet: api.Bool(true),
-						ValidateWarmGet: api.Bool(false),
-						ValidateObjMove: api.Bool(true),
-						EnableReadRange: api.Bool(false),
+					Cksum: &cmn.CksumConfToSet{
+						Type:            apc.String("value"),
+						ValidateColdGet: apc.Bool(true),
+						ValidateWarmGet: apc.Bool(false),
+						ValidateObjMove: apc.Bool(true),
+						EnableReadRange: apc.Bool(false),
 					},
-					Mirror: &cmn.MirrorConfToUpdate{
-						Copies:  api.Int64(10),
-						Burst:   api.Int(32),
-						Enabled: api.Bool(false),
+					Mirror: &cmn.MirrorConfToSet{
+						Copies:  apc.Int64(10),
+						Burst:   apc.Int(32),
+						Enabled: apc.Bool(false),
 					},
-					EC: &cmn.ECConfToUpdate{
-						Enabled:      api.Bool(true),
-						ObjSizeLimit: api.Int64(1024),
-						DataSlices:   api.Int(1024),
-						ParitySlices: api.Int(1024),
-						Compression:  api.String("false"),
+					EC: &cmn.ECConfToSet{
+						Enabled:      apc.Bool(true),
+						ObjSizeLimit: apc.Int64(1024),
+						DataSlices:   apc.Int(1024),
+						ParitySlices: apc.Int(1024),
+						Compression:  apc.String("false"),
 					},
-					Access: api.AccessAttrs(1024),
-					WritePolicy: &cmn.WritePolicyConfToUpdate{
-						MD: api.WritePolicy(apc.WriteDelayed),
+					Access: apc.AccAttrs(1024),
+					WritePolicy: &cmn.WritePolicyConfToSet{
+						MD: apc.WPolicy(apc.WriteDelayed),
 					},
 				},
-				cmn.BucketProps{
+				cmn.Bprops{
 					Versioning: cmn.VersionConf{
 						Enabled:         true,
 						ValidateWarmGet: true,

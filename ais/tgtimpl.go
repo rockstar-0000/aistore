@@ -1,11 +1,12 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,26 +14,28 @@ import (
 
 	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 // interface guard
-var _ cluster.Target = (*target)(nil)
+var _ core.Target = (*target)(nil)
 
 func (t *target) FSHC(err error, path string) { t.fsErr(err, path) }
 func (t *target) PageMM() *memsys.MMSA        { return t.gmm }
 func (t *target) ByteMM() *memsys.MMSA        { return t.smm }
 
-func (*target) GetAllRunning(inout *cluster.AllRunningInOut, periodic bool) {
+func (*target) GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	xreg.GetAllRunning(inout, periodic)
 }
 
@@ -40,7 +43,7 @@ func (t *target) Health(si *meta.Snode, timeout time.Duration, query url.Values)
 	return t.reqHealth(si, timeout, query, t.owner.smap.get())
 }
 
-func (t *target) Backend(bck *meta.Bck) cluster.BackendProvider {
+func (t *target) Backend(bck *meta.Bck) core.BackendProvider {
 	if bck.IsRemoteAIS() {
 		return t.backend[apc.AIS]
 	}
@@ -64,7 +67,7 @@ func (t *target) Backend(bck *meta.Bck) cluster.BackendProvider {
 	return c
 }
 
-func (t *target) PutObject(lom *cluster.LOM, params *cluster.PutObjectParams) error {
+func (t *target) PutObject(lom *core.LOM, params *core.PutParams) error {
 	debug.Assert(params.WorkTag != "" && !params.Atime.IsZero())
 	workFQN := fs.CSM.Gen(lom, fs.WorkfileType, params.WorkTag)
 	poi := allocPOI()
@@ -76,18 +79,21 @@ func (t *target) PutObject(lom *cluster.LOM, params *cluster.PutObjectParams) er
 		poi.workFQN = workFQN
 		poi.atime = params.Atime.UnixNano()
 		poi.xctn = params.Xact
+		poi.size = params.Size
 		poi.owt = params.OWT
-		poi.skipEC = params.SkipEncode
+		poi.skipEC = params.SkipEC
+		poi.coldGET = params.ColdGET
 	}
 	if poi.owt != cmn.OwtPut {
 		poi.cksumToUse = params.Cksum
 	}
 	_, err := poi.putObject()
 	freePOI(poi)
+	debug.Assert(err != nil || params.Size <= 0 || params.Size == lom.SizeBytes(true), lom.String(), params.Size, lom.SizeBytes(true))
 	return err
 }
 
-func (t *target) FinalizeObj(lom *cluster.LOM, workFQN string, xctn cluster.Xact) (errCode int, err error) {
+func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact) (errCode int, err error) {
 	poi := allocPOI()
 	{
 		poi.t = t
@@ -102,12 +108,12 @@ func (t *target) FinalizeObj(lom *cluster.LOM, workFQN string, xctn cluster.Xact
 	return
 }
 
-func (t *target) EvictObject(lom *cluster.LOM) (errCode int, err error) {
+func (t *target) EvictObject(lom *core.LOM) (errCode int, err error) {
 	errCode, err = t.DeleteObject(lom, true /*evict*/)
 	return
 }
 
-func (t *target) HeadObjT2T(lom *cluster.LOM, si *meta.Snode) bool {
+func (t *target) HeadObjT2T(lom *core.LOM, si *meta.Snode) bool {
 	return t.headt2t(lom, si, t.owner.smap.get())
 }
 
@@ -127,30 +133,25 @@ func (t *target) HeadObjT2T(lom *cluster.LOM, si *meta.Snode) bool {
 //     the AIS cluster (by performing a cold GET if need be).
 //   - if the dst is cloud, we perform a regular PUT logic thus also making sure that the new
 //     replica gets created in the cloud bucket of _this_ AIS cluster.
-func (t *target) CopyObject(lom *cluster.LOM, params *cluster.CopyObjectParams, dryRun bool) (size int64, err error) {
-	objNameTo := lom.ObjName
-	coi := allocCOI()
-	{
-		coi.CopyObjectParams = *params
-		coi.t = t
-		coi.owt = cmn.OwtMigrate
-		coi.finalize = false
-		coi.dryRun = dryRun
+func (t *target) CopyObject(lom *core.LOM, dm core.DM, params *core.CopyParams) (size int64, err error) {
+	coi := (*copyOI)(params)
+	// defaults
+	coi.OWT = cmn.OwtCopy
+	coi.Finalize = false
+	if coi.ObjnameTo == "" {
+		coi.ObjnameTo = lom.ObjName
 	}
-	if params.ObjNameTo != "" {
-		objNameTo = params.ObjNameTo
-	}
-	if params.DP != nil { // NOTE: w/ transformation
-		size, err = coi.copyReader(lom, objNameTo)
-	} else {
-		size, err = coi.copyObject(lom, objNameTo)
-	}
-	coi.objsAdd(size, err)
-	freeCOI(coi)
-	return
+	realDM, ok := dm.(*bundle.DataMover) // TODO -- FIXME: eliminate typecast
+	debug.Assert(ok)
+
+	size, err = coi.do(t, realDM, lom)
+
+	coi.stats(size, err)
+	return size, err
 }
 
-func (t *target) GetCold(ctx context.Context, lom *cluster.LOM, owt cmn.OWT) (errCode int, err error) {
+// use `backend.GetObj` (compare w/ other instances calling `backend.GetObjReader`)
+func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (errCode int, err error) {
 	// 1. lock
 	switch owt {
 	case cmn.OwtGetPrefetchLock:
@@ -158,7 +159,7 @@ func (t *target) GetCold(ctx context.Context, lom *cluster.LOM, owt cmn.OWT) (er
 	case cmn.OwtGetTryLock, cmn.OwtGetLock:
 		if owt == cmn.OwtGetTryLock {
 			if !lom.TryLock(true) {
-				if cmn.FastV(4, cos.SmoduleAIS) {
+				if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 					nlog.Warningf("%s: %s(%s) is busy", t, lom, owt)
 				}
 				return 0, cmn.ErrSkip // e.g. prefetch can skip it and keep on going
@@ -166,62 +167,49 @@ func (t *target) GetCold(ctx context.Context, lom *cluster.LOM, owt cmn.OWT) (er
 		} else {
 			lom.Lock(true)
 		}
-	case cmn.OwtGet:
-		for lom.UpgradeLock() {
-			// The action was performed by some other goroutine and we don't need
-			// to do it again. But we need to check on the object.
-			if err := lom.Load(true /*cache it*/, true /*locked*/); err != nil {
-				nlog.Errorf("%s: %s load err: %v - retrying...", t, lom, err)
-				continue
-			}
-			return 0, nil
-		}
 	default:
-		debug.Assert(false)
-		return
+		// for cmn.OwtGet, see goi.getCold
+		debug.Assert(false, owt.String())
+		return http.StatusInternalServerError, errors.New("invalid " + owt.String())
 	}
 
-	// 2. get from remote
+	// 2. GET remote object and store it
+	now := mono.NanoTime()
 	if errCode, err = t.Backend(lom.Bck()).GetObj(ctx, lom, owt); err != nil {
 		if owt != cmn.OwtGetPrefetchLock {
 			lom.Unlock(true)
 		}
-		nlog.Errorf("%s: failed to GET remote %s (%s): %v(%d)", t, lom.Cname(), owt, err, errCode)
-		return
+		nlog.Infoln(t.String()+":", "failed to GET remote", lom.Cname()+":", err, errCode)
+		return errCode, err
 	}
 
-	// 3. unlock or downgrade
+	// 3. unlock
 	switch owt {
 	case cmn.OwtGetPrefetchLock:
 		// do nothing
 	case cmn.OwtGetTryLock, cmn.OwtGetLock:
 		lom.Unlock(true)
-	case cmn.OwtGet:
-		if err = lom.Load(true /*cache it*/, true /*locked*/); err == nil {
-			t.statsT.AddMany(
-				cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-				cos.NamedVal64{Name: stats.GetColdSize, Value: lom.SizeBytes()},
-			)
-			lom.DowngradeLock()
-		} else {
-			errCode = http.StatusInternalServerError
-			lom.Unlock(true)
-			nlog.Errorf("%s: unexpected failure to load %s (%s): %v", t, lom.Cname(), owt, err)
-		}
 	}
-	return
+
+	// 4. stats
+	t.statsT.AddMany(
+		cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
+		cos.NamedVal64{Name: stats.GetColdSize, Value: lom.SizeBytes()},
+		cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(now)},
+	)
+	return 0, nil
 }
 
-func (t *target) Promote(params cluster.PromoteParams) (errCode int, err error) {
-	lom := cluster.AllocLOM(params.ObjName)
+func (t *target) Promote(params *core.PromoteParams) (errCode int, err error) {
+	lom := core.AllocLOM(params.ObjName)
 	if err = lom.InitBck(params.Bck.Bucket()); err == nil {
-		errCode, err = t._promote(&params, lom)
+		errCode, err = t._promote(params, lom)
 	}
-	cluster.FreeLOM(lom)
+	core.FreeLOM(lom)
 	return
 }
 
-func (t *target) _promote(params *cluster.PromoteParams, lom *cluster.LOM) (errCode int, err error) {
+func (t *target) _promote(params *core.PromoteParams, lom *core.LOM) (errCode int, err error) {
 	smap := t.owner.smap.get()
 	tsi, local, erh := lom.HrwTarget(&smap.Smap)
 	if erh != nil {
@@ -250,7 +238,7 @@ func (t *target) _promote(params *cluster.PromoteParams, lom *cluster.LOM) (errC
 	return
 }
 
-func (t *target) _promLocal(params *cluster.PromoteParams, lom *cluster.LOM) (fileSize int64, errCode int, err error) {
+func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize int64, errCode int, err error) {
 	var (
 		cksum     *cos.CksumHash
 		workFQN   string
@@ -264,7 +252,7 @@ func (t *target) _promLocal(params *cluster.PromoteParams, lom *cluster.LOM) (fi
 	if params.DeleteSrc {
 		// To use `params.SrcFQN` as `workFQN`, make sure both are
 		// located on the same filesystem. About "filesystem sharing" see also:
-		// * https://github.com/NVIDIA/aistore/blob/master/docs/overview.md#terminology
+		// * https://github.com/NVIDIA/aistore/blob/main/docs/overview.md#terminology
 		mi, _, err := fs.FQN2Mpath(params.SrcFQN)
 		extraCopy = err != nil || !mi.FS.Equal(lom.Mountpath().FS)
 	}
@@ -295,11 +283,11 @@ func (t *target) _promLocal(params *cluster.PromoteParams, lom *cluster.LOM) (fi
 		} else {
 			clone := lom.CloneMD(params.SrcFQN)
 			if cksum, err = clone.ComputeCksum(lom.CksumType()); err != nil {
-				cluster.FreeLOM(clone)
+				core.FreeLOM(clone)
 				return
 			}
 			lom.SetCksum(cksum.Clone())
-			cluster.FreeLOM(clone)
+			core.FreeLOM(clone)
 		}
 	}
 	if params.Cksum != nil && cksum != nil {
@@ -315,6 +303,7 @@ func (t *target) _promLocal(params *cluster.PromoteParams, lom *cluster.LOM) (fi
 	{
 		poi.atime = time.Now().UnixNano()
 		poi.t = t
+		poi.config = params.Config
 		poi.lom = lom
 		poi.workFQN = workFQN
 		poi.owt = cmn.OwtPromote
@@ -328,7 +317,7 @@ func (t *target) _promLocal(params *cluster.PromoteParams, lom *cluster.LOM) (fi
 
 // TODO: use DM streams
 // TODO: Xact.InObjsAdd on the receive side
-func (t *target) _promRemote(params *cluster.PromoteParams, lom *cluster.LOM, tsi *meta.Snode, smap *smapX) (int64, error) {
+func (t *target) _promRemote(params *core.PromoteParams, lom *core.LOM, tsi *meta.Snode, smap *smapX) (int64, error) {
 	lom.FQN = params.SrcFQN
 
 	// when not overwriting check w/ remote target first (and separately)
@@ -336,15 +325,17 @@ func (t *target) _promRemote(params *cluster.PromoteParams, lom *cluster.LOM, ts
 		return -1, nil
 	}
 
-	coi := allocCOI()
+	coiParams := core.AllocCOI()
 	{
-		coi.t = t
-		coi.BckTo = lom.Bck()
-		coi.owt = cmn.OwtPromote
-		coi.Xact = params.Xact
+		coiParams.BckTo = lom.Bck()
+		coiParams.OWT = cmn.OwtPromote
+		coiParams.Xact = params.Xact
+		coiParams.Config = params.Config
 	}
-	size, err := coi.sendRemote(lom, lom.ObjName, tsi)
-	freeCOI(coi)
+	coi := (*copyOI)(coiParams)
+	size, err := coi.send(t, nil /*DM*/, lom, lom.ObjName, tsi)
+	core.FreeCOI(coiParams)
+
 	return size, err
 }
 

@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
@@ -117,7 +117,7 @@ type (
 
 func ObjName(items []string) string { return path.Join(items[1:]...) }
 
-func FillMsgFromS3Query(query url.Values, msg *apc.LsoMsg) {
+func FillLsoMsg(query url.Values, msg *apc.LsoMsg) {
 	mxStr := query.Get(QparamMaxKeys)
 	if pageSize, err := strconv.Atoi(mxStr); err == nil && pageSize > 0 {
 		msg.PageSize = uint(pageSize)
@@ -127,6 +127,7 @@ func FillMsgFromS3Query(query url.Values, msg *apc.LsoMsg) {
 	}
 	var token string
 	if token = query.Get(QparamContinuationToken); token != "" {
+		// base64 encoded, as in: base64.StdEncoding.DecodeString(token)
 		msg.ContinuationToken = token
 	}
 	// `start-after` is used only when starting to list pages, subsequent next-page calls
@@ -178,16 +179,16 @@ func entryToS3(entry *cmn.LsoEntry, lsmsg *apc.LsoMsg) *ObjInfo {
 	return objInfo
 }
 
-func (r *ListObjectResult) FillFromAisBckList(bckList *cmn.LsoResult, lsmsg *apc.LsoMsg) {
-	r.KeyCount = len(bckList.Entries)
-	r.IsTruncated = bckList.ContinuationToken != ""
-	r.NextContinuationToken = bckList.ContinuationToken
-	for _, e := range bckList.Entries {
+func (r *ListObjectResult) FromLsoResult(lst *cmn.LsoResult, lsmsg *apc.LsoMsg) {
+	r.KeyCount = len(lst.Entries)
+	r.IsTruncated = lst.ContinuationToken != ""
+	r.NextContinuationToken = lst.ContinuationToken
+	for _, e := range lst.Entries {
 		r.Add(e, lsmsg)
 	}
 }
 
-func lomMD5(lom *cluster.LOM) string {
+func lomMD5(lom *core.LOM) string {
 	if v, exists := lom.GetCustomKey(cmn.SourceObjMD); exists && v == apc.AWS {
 		if v, exists := lom.GetCustomKey(cmn.MD5ObjMD); exists {
 			return v
@@ -199,7 +200,7 @@ func lomMD5(lom *cluster.LOM) string {
 	return ""
 }
 
-func SetETag(header http.Header, lom *cluster.LOM) {
+func SetETag(header http.Header, lom *core.LOM) {
 	if md5val := lomMD5(lom); md5val != "" {
 		header.Set(cos.S3CksumHeader, md5val)
 	}

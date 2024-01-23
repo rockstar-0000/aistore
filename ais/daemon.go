@@ -17,8 +17,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/space"
@@ -166,7 +166,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 	//   (once done, `ais config node ... inherited log` will show "3 (modules: ec,xs)")
 	if daemon.cli.confCustom != "" {
 		var (
-			toUpdate = &cmn.ConfigToUpdate{}
+			toUpdate = &cmn.ConfigToSet{}
 			kvs      = strings.Split(daemon.cli.confCustom, ",")
 		)
 		if err := toUpdate.FillFromKVS(kvs); err != nil {
@@ -199,13 +199,15 @@ func initDaemon(version, buildTime string) cos.Runner {
 	hk.Init(&daemon.stopping)
 	daemon.rg.add(hk.DefaultHK)
 
-	// reg xaction factories
+	// K8s
+	k8s.Init()
+
 	xreg.Init()
-	xs.Xreg()
 
 	// fork (proxy | target)
 	co := newConfigOwner(config)
 	if daemon.cli.role == apc.Proxy {
+		xs.Xreg(true /* x-ele only */)
 		p := newProxy(co)
 		p.init(config)
 		title := "Node " + p.si.Name() + ", " + loghdr + "\n"
@@ -217,9 +219,9 @@ func initDaemon(version, buildTime string) cos.Runner {
 		return p
 	}
 
-	// reg more xaction factories
-	space.Xreg(config)
-	dload.Xreg()
+	// reg xaction factories
+	xs.Xreg(false /* x-ele only */)
+	space.Xreg()
 
 	t := newTarget(co)
 	t.init(config)

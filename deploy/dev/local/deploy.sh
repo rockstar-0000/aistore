@@ -8,12 +8,12 @@
 # AIStore cluster set DEPLOY_AS_NEXT_TIER=1.
 #
 # NOTE: system environment variables are listed in the `env` package.
-# See https://github.com/NVIDIA/aistore/blob/master/api/env/README.md
+# See https://github.com/NVIDIA/aistore/blob/main/api/env/README.md
 #
 # NOTE: by default, configuration files are stored under $HOME/.config/ais/<app-name>
 # E.g., $HOME/.config/ais/authn - AuthN config, $HOME/.config/ais/cli - CLI config
 # and so on. This rule holds for all AIS "applications" except `aisnode` itself.
-# See https://github.com/NVIDIA/aistore/tree/master/cmn/fname for the most updated locations.
+# See https://github.com/NVIDIA/aistore/tree/main/cmn/fname for the most updated locations.
 #
 ############################################
 
@@ -255,6 +255,9 @@ if command -v pgrep &> /dev/null; then
    run_count=$(pgrep -a aisnode | grep -c "${NEXT_TIER}")
    if [[ "${run_count}" -eq $((TARGET_CNT + PROXY_CNT)) ]]; then
       echo "${listening_on}"
+      if [[ -z $DEPLOY_AS_NEXT_TIER ]]; then
+         echo "Primary endpoint: ${AIS_PRIMARY_URL}"
+      fi
    fi
 else
    echo "Warning: pgrep not found"

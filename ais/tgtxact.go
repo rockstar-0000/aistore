@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -10,23 +10,24 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
 // TODO: uplift via higher-level query and similar (#668)
 
 // verb /v1/xactions
 func (t *target) xactHandler(w http.ResponseWriter, r *http.Request) {
-	if _, err := t.parseURL(w, r, 0, true, apc.URLPathXactions.L); err != nil {
+	if _, err := t.parseURL(w, r, apc.URLPathXactions.L, 0, true); err != nil {
 		return
 	}
 	switch r.Method {
@@ -34,10 +35,16 @@ func (t *target) xactHandler(w http.ResponseWriter, r *http.Request) {
 		t.httpxget(w, r)
 	case http.MethodPut:
 		t.httpxput(w, r)
+	case http.MethodPost:
+		t.httpxpost(w, r)
 	default:
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPut)
 	}
 }
+
+//
+// GET
+//
 
 func (t *target) httpxget(w http.ResponseWriter, r *http.Request) {
 	var (
@@ -59,7 +66,7 @@ func (t *target) httpxget(w http.ResponseWriter, r *http.Request) {
 	// TODO: add user option to return idle xactions (separately)
 	//
 	if what == apc.WhatAllRunningXacts {
-		var inout = cluster.AllRunningInOut{Kind: xactMsg.Kind}
+		var inout = core.AllRunningInOut{Kind: xactMsg.Kind}
 		xreg.GetAllRunning(&inout, false /*periodic*/)
 		t.writeJSON(w, r, inout.Running, what)
 		return
@@ -104,13 +111,22 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if config := cmn.GCO.Get(); config.FastV(4, cos.SmoduleAIS) {
-		nlog.Infof("%s %s", msg.Action, xargs.String())
+	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+		nlog.Infoln(msg.Action, xargs.String())
 	}
 	switch msg.Action {
 	case apc.ActXactStart:
 		debug.Assert(xact.IsValidKind(xargs.Kind), xargs.String())
-		if err := t.xstart(r, &xargs, bck); err != nil {
+		if xargs.Kind == apc.ActPrefetchObjects {
+			// TODO: consider adding `Value any` to generic `xact.ArgsMsg`
+			errCode, err := t.runPrefetch(xargs.ID, bck, &apc.PrefetchMsg{})
+			if err != nil {
+				t.writeErr(w, r, err, errCode)
+			}
+			return
+		}
+		// the rest startable
+		if err := t.xstart(&xargs, bck); err != nil {
 			t.writeErr(w, r, err)
 			return
 		}
@@ -158,7 +174,11 @@ func (t *target) xquery(w http.ResponseWriter, r *http.Request, what string, xac
 	}
 }
 
-func (t *target) xstart(r *http.Request, args *xact.ArgsMsg, bck *meta.Bck) error {
+//
+// PUT
+//
+
+func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck) error {
 	const erfmb = "global xaction %q does not require bucket (%s) - ignoring it and proceeding to start"
 	const erfmn = "xaction %q requires a bucket to start"
 
@@ -174,11 +194,9 @@ func (t *target) xstart(r *http.Request, args *xact.ArgsMsg, bck *meta.Bck) erro
 		if bck != nil {
 			nlog.Errorf(erfmb, args.Kind, bck)
 		}
-		q := r.URL.Query()
-		force := cos.IsParseBool(q.Get(apc.QparamForce)) // NOTE: the only 'force' use case so far
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
-		go t.runLRU(args.ID, wg, force, args.Buckets...)
+		go t.runLRU(args.ID, wg, args.Force, args.Buckets...)
 		wg.Wait()
 	case apc.ActStoreCleanup:
 		wg := &sync.WaitGroup{}
@@ -191,7 +209,7 @@ func (t *target) xstart(r *http.Request, args *xact.ArgsMsg, bck *meta.Bck) erro
 		}
 		notif := &xact.NotifXact{
 			Base: nl.Base{
-				When: cluster.UponTerm,
+				When: core.UponTerm,
 				Dsts: []string{equalIC},
 				F:    t.notifyTerm,
 			},
@@ -200,29 +218,8 @@ func (t *target) xstart(r *http.Request, args *xact.ArgsMsg, bck *meta.Bck) erro
 		wg.Add(1)
 		go t.runResilver(res.Args{UUID: args.ID, Notif: notif}, wg)
 		wg.Wait()
-	// 2. with bucket
-	case apc.ActPrefetchObjects:
-		var (
-			smsg = &apc.ListRange{}
-		)
-		rns := xreg.RenewPrefetch(args.ID, t, bck, smsg)
-		if rns.Err != nil {
-			nlog.Errorf("%s: %s %v", t, bck, rns.Err)
-			debug.AssertNoErr(rns.Err)
-			return rns.Err
-		}
-		xctn := rns.Entry.Get()
-		xctn.AddNotif(&xact.NotifXact{
-			Base: nl.Base{
-				When: cluster.UponTerm,
-				Dsts: []string{equalIC},
-				F:    t.notifyTerm,
-			},
-			Xact: xctn,
-		})
-		go xctn.Run(nil)
 	case apc.ActLoadLomCache:
-		rns := xreg.RenewBckLoadLomCache(t, args.ID, bck)
+		rns := xreg.RenewBckLoadLomCache(args.ID, bck)
 		return rns.Err
 	// 3. cannot start
 	case apc.ActPutCopies:
@@ -236,4 +233,35 @@ func (t *target) xstart(r *http.Request, args *xact.ArgsMsg, bck *meta.Bck) erro
 		return cmn.NewErrUnsupp("start xaction", args.Kind)
 	}
 	return nil
+}
+
+//
+// POST
+//
+
+// client: plstcx.go
+func (t *target) httpxpost(w http.ResponseWriter, r *http.Request) {
+	var (
+		err    error
+		xctn   core.Xact
+		amsg   *apc.ActMsg
+		tcomsg cmn.TCObjsMsg
+	)
+	if amsg, err = t.readActionMsg(w, r); err != nil {
+		return
+	}
+
+	xactID := amsg.Name
+	if xctn, err = xreg.GetXact(xactID); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	xtco, ok := xctn.(*xs.XactTCObjs)
+	debug.Assert(ok)
+
+	if err = cos.MorphMarshal(amsg.Value, &tcomsg); err != nil {
+		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, "special", amsg.Value, err)
+		return
+	}
+	xtco.Do(&tcomsg)
 }

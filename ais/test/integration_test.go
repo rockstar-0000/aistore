@@ -1,11 +1,11 @@
-// Package integration contains AIS integration tests.
+// Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
-package integration
+package integration_test
 
 import (
-	"fmt"
+	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -16,9 +16,9 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/readers"
@@ -33,7 +33,7 @@ import (
 // 3. PUT large amount of objects into the ais bucket
 // 4. GET the objects while simultaneously registering the target T
 func TestGetAndReRegisterInParallel(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		m = ioContext{
 			t:               t,
@@ -84,7 +84,7 @@ func TestGetAndReRegisterInParallel(t *testing.T) {
 // 3. Crash the primary proxy and PUT in parallel
 // 4. Failback to the original primary proxy, register target, and GET in parallel
 func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, MinTargets: 2, MinProxies: 3})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, MinTargets: 2, MinProxies: 3})
 	m := ioContext{
 		t:                   t,
 		otherTasksToTrigger: 1,
@@ -137,7 +137,7 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 	wg.Wait()
 
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, OnlyRunning: true, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, xargs)
+	_, _ = api.WaitForXactionIC(baseParams, &xargs)
 
 	// Step 5.
 	m.ensureNoGetErrors()
@@ -150,7 +150,7 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 // 3. PUT large amounts of objects into ais bucket
 // 4. Get the objects while simultaneously registering the target
 func TestGetAndRestoreInParallel(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		m = ioContext{
@@ -226,7 +226,7 @@ func TestUnregisterPreviouslyUnregisteredTarget(t *testing.T) {
 }
 
 func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:   t,
@@ -297,7 +297,7 @@ func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
 }
 
 func TestAckRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:             t,
@@ -328,7 +328,7 @@ func TestAckRebalance(t *testing.T) {
 }
 
 func TestStressRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := &ioContext{
 		t: t,
@@ -411,7 +411,7 @@ func testStressRebalance(t *testing.T, bck cmn.Bck) {
 }
 
 func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	m := ioContext{
 		t:   t,
 		num: 10000,
@@ -487,7 +487,7 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 }
 
 func TestPutDuringRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:   t,
@@ -527,7 +527,7 @@ func TestPutDuringRebalance(t *testing.T) {
 }
 
 func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		m = ioContext{
@@ -625,7 +625,7 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 }
 
 func TestGetDuringResilver(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		m = ioContext{
@@ -683,7 +683,7 @@ func TestGetDuringResilver(t *testing.T) {
 
 	tlog.Logf("Wait for rebalance (when target %s that has previously lost all mountpaths joins back)\n", target.StringEx())
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	tools.WaitForResilvering(t, baseParams, nil)
 
@@ -692,7 +692,7 @@ func TestGetDuringResilver(t *testing.T) {
 }
 
 func TestGetDuringRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:   t,
@@ -731,7 +731,7 @@ func TestGetDuringRebalance(t *testing.T) {
 }
 
 func TestRegisterTargetsAndCreateBucketsInParallel(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	const (
 		unregisterTargetCount = 2
@@ -792,7 +792,7 @@ func TestMountpathDetachAll(t *testing.T) {
 	if true {
 		t.Skipf("skipping %s", t.Name()) // TODO -- FIXME: add back, here and elsewhere
 	}
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, MinTargets: 2})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, MinTargets: 2})
 
 	var (
 		m = ioContext{
@@ -821,7 +821,7 @@ func TestMountpathDetachAll(t *testing.T) {
 	time.Sleep(time.Second)
 	tlog.Logf("Wait for rebalance (triggered by %s leaving the cluster after having lost all mountpaths)\n", tname)
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	// Check if mountpaths were actually removed
 	mountpaths, err := api.GetMountpaths(baseParams, target)
@@ -843,7 +843,7 @@ func TestMountpathDetachAll(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	tlog.Logf("Wait for rebalance (when target %s that has previously lost all mountpaths joins back)\n", target.StringEx())
 	args = xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	tools.WaitForResilvering(t, baseParams, target)
 
@@ -856,7 +856,7 @@ func TestMountpathDetachAll(t *testing.T) {
 }
 
 func TestResilverAfterAddingMountpath(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		m = ioContext{
 			t:               t,
@@ -918,7 +918,7 @@ func TestResilverAfterAddingMountpath(t *testing.T) {
 }
 
 func TestAttachDetachMountpathAllTargets(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		m = ioContext{
 			t:               t,
@@ -964,7 +964,7 @@ func TestAttachDetachMountpathAllTargets(t *testing.T) {
 			tassert.CheckFatal(t, err)
 			allMps[target.ID()] = mpList
 
-			mountpath := filepath.Join(testMpath, fmt.Sprintf("%d", idx))
+			mountpath := filepath.Join(testMpath, strconv.Itoa(idx))
 			cos.CreateDir(mountpath)
 			err = api.AttachMountpath(baseParams, target, mountpath, true /*force*/)
 			tassert.CheckFatal(t, err)
@@ -987,7 +987,7 @@ func TestAttachDetachMountpathAllTargets(t *testing.T) {
 		}
 	} else {
 		for idx, target := range targets {
-			mountpath := filepath.Join(testMpath, fmt.Sprintf("%d", idx))
+			mountpath := filepath.Join(testMpath, strconv.Itoa(idx))
 			os.RemoveAll(mountpath)
 			if err := api.DetachMountpath(baseParams, target, mountpath, false /*dont-resil*/); err != nil {
 				t.Error(err.Error())
@@ -1046,7 +1046,7 @@ func TestMountpathDisableAll(t *testing.T) {
 			tlog.Logf("Wait for rebalance (when target %s that has previously lost all mountpaths joins back)\n",
 				tname)
 			args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-			_, _ = api.WaitForXactionIC(baseParams, args)
+			_, _ = api.WaitForXactionIC(baseParams, &args)
 
 			tools.WaitForResilvering(t, baseParams, nil)
 		}
@@ -1060,7 +1060,7 @@ func TestMountpathDisableAll(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	tlog.Logf("Wait for rebalance (triggered by %s leaving the cluster after having lost all mountpaths)\n", tname)
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	// Check if mountpaths were actually disabled
 	time.Sleep(time.Second)
@@ -1088,12 +1088,12 @@ func TestMountpathDisableAll(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	tlog.Logf("Wait for rebalance (when target %s that has previously lost all mountpaths joins back)\n", target.StringEx())
 	args = xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	tools.WaitForResilvering(t, baseParams, target)
 
 	tlog.Logf("waiting for bucket %s to show up on all targets\n", m.bck)
-	err = tools.WaitForBucket(m.proxyURL, cmn.QueryBcks(m.bck), true /*exists*/)
+	err = checkTargetBMDsFor(m.proxyURL, m.bck)
 	tassert.CheckFatal(t, err)
 
 	// Put and read random files
@@ -1102,6 +1102,36 @@ func TestMountpathDisableAll(t *testing.T) {
 
 	m.ensureNoGetErrors()
 	m.ensureNumMountpaths(target, origMountpaths)
+}
+
+// get BMD from each target; check the BMD for the specified bucket
+func checkTargetBMDsFor(proxyURL string, bck cmn.Bck) error {
+	bp := tools.BaseAPIParams(proxyURL)
+	smap, err := api.GetClusterMap(bp)
+	if err != nil {
+		return err
+	}
+	to := time.Now().Add(10 * time.Second)
+	b := meta.CloneBck(&bck)
+	for tid := range smap.Tmap {
+		// poll
+		for {
+			// alternatively, something like: api.GetBMD(tools.BaseAPIParams(tsi.URL(...)))
+			val, err := api.GetNodeMeta(bp, tid, apc.WhatBMD)
+			if err != nil {
+				return err
+			}
+			bmd := val.(*meta.BMD)
+			if _, bucketExists := bmd.Get(b); bucketExists {
+				break
+			}
+			if time.Now().After(to) {
+				return errors.New("checkBMDsFor: timeout")
+			}
+			time.Sleep(time.Second)
+		}
+	}
+	return nil
 }
 
 func TestForwardCP(t *testing.T) {
@@ -1158,7 +1188,7 @@ func TestForwardCP(t *testing.T) {
 }
 
 func TestAtimeRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:               t,
@@ -1245,7 +1275,7 @@ func TestAtimeLocalGet(t *testing.T) {
 
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
-	_, err := api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objectName, Reader: objectContent})
+	_, err := api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objectName, Reader: objectContent})
 	tassert.CheckFatal(t, err)
 
 	putAtime, putAtimeFormatted := tools.GetObjectAtime(t, baseParams, bck, objectName, time.RFC3339Nano)
@@ -1270,7 +1300,7 @@ func TestAtimeColdGet(t *testing.T) {
 		objectContent = readers.NewBytes([]byte("dummy content"))
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
 	api.DeleteObject(baseParams, bck, objectName)
 	defer api.DeleteObject(baseParams, bck, objectName)
 
@@ -1291,7 +1321,7 @@ func TestAtimeColdGet(t *testing.T) {
 }
 
 func TestAtimePrefetch(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		bck        = cliBck
@@ -1305,7 +1335,7 @@ func TestAtimePrefetch(t *testing.T) {
 		objs       = make([]string, 0, numObjs)
 	)
 
-	tools.CheckSkip(t, tools.SkipTestArgs{RemoteBck: true, Bck: bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
 	api.DeleteObject(baseParams, bck, objectName)
 	defer func() {
 		for _, obj := range objs {
@@ -1319,7 +1349,7 @@ func TestAtimePrefetch(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			object := objPath + strconv.FormatUint(uint64(idx), 10)
-			_, err := api.PutObject(api.PutArgs{
+			_, err := api.PutObject(&api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        bck,
 				ObjName:    object,
@@ -1339,19 +1369,23 @@ func TestAtimePrefetch(t *testing.T) {
 	for obj := range nameCh {
 		objs = append(objs, obj)
 	}
-	xid, err := api.EvictList(baseParams, bck, objs)
+	xid, err := api.EvictMultiObj(baseParams, bck, objs, "" /*template*/)
 	tassert.CheckFatal(t, err)
 	args := xact.ArgsMsg{ID: xid, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	timeAfterPut := time.Now()
 
-	xid, err = api.PrefetchList(baseParams, bck, objs)
-	tassert.CheckFatal(t, err)
-	args = xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
-	tassert.CheckFatal(t, err)
+	{
+		var msg apc.PrefetchMsg
+		msg.ObjNames = objs
+		xid, err = api.Prefetch(baseParams, bck, msg)
+		tassert.CheckFatal(t, err)
+		args = xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
+		_, err = api.WaitForXactionIC(baseParams, &args)
+		tassert.CheckFatal(t, err)
+	}
 
 	timeFormat := time.RFC3339Nano
 	msg := &apc.LsoMsg{Props: apc.GetPropsAtime, TimeFormat: timeFormat, Prefix: objPath}
@@ -1385,7 +1419,7 @@ func TestAtimeLocalPut(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 	timeBeforePut := time.Now()
-	_, err := api.PutObject(api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objectName, Reader: objectContent})
+	_, err := api.PutObject(&api.PutArgs{BaseParams: baseParams, Bck: bck, ObjName: objectName, Reader: objectContent})
 	tassert.CheckFatal(t, err)
 
 	putAtime, putAtimeFormatted := tools.GetObjectAtime(t, baseParams, bck, objectName, time.RFC3339Nano)
@@ -1402,7 +1436,7 @@ func TestAtimeLocalPut(t *testing.T) {
 // 4. Put objects
 // 5. Get objects - everything should succeed
 func TestGetAndPutAfterReregisterWithMissedBucketUpdate(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:               t,
@@ -1434,7 +1468,7 @@ func TestGetAndPutAfterReregisterWithMissedBucketUpdate(t *testing.T) {
 // 4. Reregister target - rebalance kicks in
 // 5. Get objects - everything should succeed
 func TestGetAfterReregisterWithMissedBucketUpdate(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	m := ioContext{
 		t:               t,
@@ -1480,7 +1514,7 @@ func TestGetAfterReregisterWithMissedBucketUpdate(t *testing.T) {
 }
 
 func TestRenewRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
 		m = ioContext{
@@ -1509,7 +1543,7 @@ func TestRenewRebalance(t *testing.T) {
 	// Step 4: Re-register target (triggers rebalance)
 	m.stopMaintenance(target)
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceStartTimeout}
-	err := api.WaitForXactionNode(baseParams, xargs, xactSnapRunning)
+	err := api.WaitForXactionNode(baseParams, &xargs, xactSnapRunning)
 	tassert.CheckError(t, err)
 	tlog.Logf("rebalance started\n")
 
@@ -1529,14 +1563,14 @@ func TestRenewRebalance(t *testing.T) {
 
 		<-m.controlCh // wait for half the GETs to complete
 
-		rebID, err = api.StartXaction(baseParams, xact.ArgsMsg{Kind: apc.ActRebalance})
+		rebID, err = api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActRebalance})
 		tassert.CheckFatal(t, err)
 		tlog.Logf("manually initiated rebalance\n")
 	}()
 
 	wg.Wait()
 	args := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckError(t, err)
 
 	m.ensureNoGetErrors()
@@ -1544,7 +1578,7 @@ func TestRenewRebalance(t *testing.T) {
 }
 
 func TestGetFromMirroredWithLostOneMountpath(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
 		copies = 2
 		m      = ioContext{
@@ -1571,10 +1605,10 @@ func TestGetFromMirroredWithLostOneMountpath(t *testing.T) {
 	tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 	// Step 2: Make the bucket redundant
-	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BucketPropsToUpdate{
-		Mirror: &cmn.MirrorConfToUpdate{
-			Enabled: api.Bool(true),
-			Copies:  api.Int64(int64(copies)),
+	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
+		Mirror: &cmn.MirrorConfToSet{
+			Enabled: apc.Bool(true),
+			Copies:  apc.Int64(int64(copies)),
 		},
 	})
 	if err != nil {
@@ -1611,7 +1645,7 @@ func TestGetFromMirroredWithLostOneMountpath(t *testing.T) {
 }
 
 func TestGetFromMirroredWithLostMountpathAllExceptOne(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	m := ioContext{
 		t:               t,
 		num:             10000,
@@ -1633,10 +1667,10 @@ func TestGetFromMirroredWithLostMountpathAllExceptOne(t *testing.T) {
 	tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
 	// Make the bucket n-copy mirrored
-	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BucketPropsToUpdate{
-		Mirror: &cmn.MirrorConfToUpdate{
-			Enabled: api.Bool(true),
-			Copies:  api.Int64(int64(mpathCount)),
+	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
+		Mirror: &cmn.MirrorConfToSet{
+			Enabled: apc.Bool(true),
+			Copies:  apc.Int64(int64(mpathCount)),
 		},
 	})
 	if err != nil {
@@ -1664,7 +1698,7 @@ func TestGetFromMirroredWithLostMountpathAllExceptOne(t *testing.T) {
 
 	// Wait for async mirroring to finish
 	flt := xact.ArgsMsg{Kind: apc.ActPutCopies, Bck: m.bck}
-	api.WaitForXactionIdle(baseParams, flt)
+	api.WaitForXactionIdle(baseParams, &flt)
 	time.Sleep(time.Second) // pending writes
 
 	// GET
@@ -1695,7 +1729,7 @@ func TestGetNonRedundantWithDetachedMountpath(t *testing.T) {
 }
 
 func testNonRedundantMpathDD(t *testing.T, action string) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	m := ioContext{
 		t:               t,
 		num:             1000,
@@ -1753,7 +1787,7 @@ func testNonRedundantMpathDD(t *testing.T, action string) {
 // 2. Start changing the primary proxy
 // 3. IC must survive and rebalance must finish
 func TestICRebalance(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		m = ioContext{
@@ -1778,11 +1812,11 @@ func TestICRebalance(t *testing.T) {
 	baseParams := tools.BaseAPIParams(m.proxyURL)
 
 	tlog.Logf("Manually initiated rebalance\n")
-	rebID, err = api.StartXaction(baseParams, xact.ArgsMsg{Kind: apc.ActRebalance})
+	rebID, err = api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActRebalance})
 	tassert.CheckFatal(t, err)
 
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceStartTimeout}
-	api.WaitForXactionNode(baseParams, xargs, xactSnapRunning)
+	api.WaitForXactionNode(baseParams, &xargs, xactSnapRunning)
 
 	tlog.Logf("Killing %s\n", icNode.StringEx())
 	// cmd and args are the original command line of how the proxy is started
@@ -1806,7 +1840,7 @@ func TestICRebalance(t *testing.T) {
 
 	tlog.Logf("Wait for rebalance: %s\n", rebID)
 	args := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
-	_, _ = api.WaitForXactionIC(baseParams, args)
+	_, _ = api.WaitForXactionIC(baseParams, &args)
 
 	m.waitAndCheckCluState()
 }
@@ -1815,7 +1849,7 @@ func TestICRebalance(t *testing.T) {
 // 2. Start changing the primary proxy
 // 3. IC must survive, rebalance must finish, and the target must be gone
 func TestICDecommission(t *testing.T) {
-	tools.CheckSkip(t, tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, RequiredDeployment: tools.ClusterTypeLocal})
 
 	var (
 		err error
@@ -1891,17 +1925,17 @@ func TestSingleResilver(t *testing.T) {
 
 	// Start resilvering just on the target
 	args := xact.ArgsMsg{Kind: apc.ActResilver, DaemonID: target.ID()}
-	id, err := api.StartXaction(baseParams, args)
+	id, err := api.StartXaction(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// Wait for specific resilvering x[id]
 	args = xact.ArgsMsg{ID: id, Kind: apc.ActResilver, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, args)
+	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
 	// Make sure other nodes were not resilvered
 	args = xact.ArgsMsg{ID: id}
-	snaps, err := api.QueryXactionSnaps(baseParams, args)
+	snaps, err := api.QueryXactionSnaps(baseParams, &args)
 	tassert.CheckFatal(t, err)
 	tassert.Errorf(t, len(snaps) == 1, "expected only 1 resilver")
 }

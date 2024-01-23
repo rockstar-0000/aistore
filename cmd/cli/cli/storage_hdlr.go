@@ -1,33 +1,46 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
 	"fmt"
+	"net/http"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster/meta"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
 )
 
 type bsummCtx struct {
+	c       *cli.Context
+	units   string
+	xid     string
 	qbck    cmn.QueryBcks
-	timeout time.Duration
 	msg     apc.BsummCtrlMsg
-	// results
-	res cmn.AllBsummResults
+	args    api.BsummArgs
+	started int64
+	l       int
+	n       int
+	res     cmn.AllBsummResults
+	// waiting
+	longWaitTime   time.Duration
+	longWaitPrompt string
+	dontWait       bool
 }
 
 var (
@@ -106,10 +119,9 @@ var (
 		longRunFlags,
 		bsummPrefixFlag,
 		listObjCachedFlag,
-		allBcksFlag,
 		unitsFlag,
 		verboseFlag,
-		waitJobXactFinishedFlag,
+		dontWaitFlag,
 		noHeaderFlag,
 	)
 	storageFlags = map[string][]cli.Flag{
@@ -206,7 +218,7 @@ func cleanupStorageHandler(c *cli.Context) (err error) {
 		}
 	}
 	xargs := xact.ArgsMsg{Kind: apc.ActStoreCleanup, Bck: bck}
-	if id, err = api.StartXaction(apiBP, xargs); err != nil {
+	if id, err = api.StartXaction(apiBP, &xargs); err != nil {
 		return
 	}
 
@@ -223,7 +235,7 @@ func cleanupStorageHandler(c *cli.Context) (err error) {
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		xargs.Timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
-	if err := waitXact(apiBP, xargs); err != nil {
+	if err := waitXact(apiBP, &xargs); err != nil {
 		return err
 	}
 	fmt.Fprint(c.App.Writer, fmtXactSucceeded)
@@ -327,27 +339,58 @@ func showDiskStats(c *cli.Context, tid string) error {
 
 func summaryStorageHandler(c *cli.Context) error {
 	uri := c.Args().Get(0)
-	queryBcks, err := parseQueryBckURI(c, uri)
-	if err != nil {
-		return err
+	qbck, errV := parseQueryBckURI(c, uri)
+	if errV != nil {
+		return errV
 	}
+
 	units, errU := parseUnitsFlag(c, unitsFlag)
 	if errU != nil {
-		return err
+		return errU
 	}
-	ctx := &bsummCtx{
-		qbck:    queryBcks,
-		timeout: longClientTimeout,
-	}
-	if flagIsSet(c, waitJobXactFinishedFlag) {
-		ctx.timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
-	}
-	ctx.msg.Prefix = parseStrFlag(c, bsummPrefixFlag)
-	ctx.msg.ObjCached = flagIsSet(c, listObjCachedFlag)
-	ctx.msg.BckPresent = !flagIsSet(c, allBcksFlag)
+
+	// TODO: remote buckets not in BMD - see ais ls --summary and `listBckTableWithSummary`
+	dontWait := flagIsSet(c, dontWaitFlag)
+	ctx := newBsummContext(c, units, qbck, true /*bckPresent*/, dontWait)
 
 	setLongRunParams(c)
-	summaries, err := ctx.slow()
+
+	var news = true
+	if xid := c.Args().Get(1); xid != "" && cos.IsValidUUID(xid) {
+		ctx.msg.UUID = xid
+		news = false
+	}
+	xid, summaries, err := ctx.slow() // execute
+
+	f := func() string {
+		verb := "has started"
+		if !news {
+			verb = "is running"
+		}
+		return fmt.Sprintf("Job %s[%s] %s. To monitor, run 'ais storage summary %s %s %s' or 'ais show job %s';\n"+
+			"see %s for more options",
+			cmdSummary, xid, verb, uri, xid, flprn(dontWaitFlag), xid, qflprn(cli.HelpFlag))
+	}
+	if err == nil && dontWait && len(summaries) == 0 {
+		actionDone(c, f())
+		return nil
+	}
+
+	var status int
+	if err != nil {
+		if herr, ok := err.(*cmn.ErrHTTP); ok {
+			status = herr.Status
+		}
+		if dontWait && status == http.StatusAccepted {
+			actionDone(c, f())
+			return nil
+		}
+		if dontWait && status == http.StatusPartialContent {
+			msg := fmt.Sprintf("%s[%s] is still running - showing partial results:", cmdSummary, ctx.msg.UUID)
+			actionNote(c, msg)
+			err = nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -361,17 +404,110 @@ func summaryStorageHandler(c *cli.Context) error {
 	return teb.Print(summaries, teb.BucketsSummariesTmpl, opts)
 }
 
+func newBsummContext(c *cli.Context, units string, qbck cmn.QueryBcks, bckPresent, dontWait bool) *bsummCtx {
+	ctx := &bsummCtx{
+		c:        c,
+		units:    units,
+		qbck:     qbck,
+		started:  mono.NanoTime(),
+		dontWait: dontWait,
+	}
+	ctx.msg.Prefix = parseStrFlag(c, bsummPrefixFlag)
+	ctx.msg.ObjCached = flagIsSet(c, listObjCachedFlag)
+	ctx.msg.BckPresent = bckPresent
+
+	ctx.args.DontWait = dontWait
+
+	if flagIsSet(c, refreshFlag) {
+		ctx.args.CallAfter = parseDurationFlag(c, refreshFlag)
+		ctx.args.Callback = ctx.progress
+		ctx.longWaitTime = 0 // have refresh callback
+	} else if !dontWait {
+		ctx.longWaitTime = listObjectsWaitTime
+		if ctx.msg.UUID != "" {
+			ctx.longWaitPrompt = "Please wait, the operation may take some time.\n" +
+				"To monitor, run 'ais storage summary " + ctx.msg.UUID // TODO -- FIXME
+		}
+	}
+	return ctx
+}
+
 // "slow" version of the bucket-summary (compare with `listBuckets` => `listBckTableWithSummary`)
-func (ctx *bsummCtx) slow() (res cmn.AllBsummResults, err error) {
-	ctx.msg.Fast = false
-	err = cmn.WaitForFunc(ctx.get, ctx.timeout)
-	res = ctx.res
+func (ctx *bsummCtx) slow() (xid string, res cmn.AllBsummResults, err error) {
+	if ctx.longWaitTime > 0 {
+		err = waitForFunc(ctx.get, ctx.longWaitTime, ctx.longWaitPrompt)
+	} else {
+		err = ctx.get()
+	}
+	xid, res = ctx.xid, ctx.res
 	return
 }
 
 func (ctx *bsummCtx) get() (err error) {
-	ctx.res, err = api.GetBucketSummary(apiBP, ctx.qbck, &ctx.msg)
+	ctx.xid, ctx.res, err = api.GetBucketSummary(apiBP, ctx.qbck, &ctx.msg, ctx.args)
 	return
+}
+
+// re-print line per bucket
+func (ctx *bsummCtx) progress(summaries *cmn.AllBsummResults, done bool) {
+	if done {
+		if ctx.n > 0 {
+			fmt.Fprintln(ctx.c.App.Writer)
+		}
+		return
+	}
+	if summaries == nil {
+		return
+	}
+	results := *summaries
+	if len(results) == 0 {
+		return
+	}
+	ctx.n++
+
+	// format out
+	elapsed := mono.SinceNano(ctx.started)
+	for i, res := range results {
+		s := res.Bck.Cname("") + ": "
+		if res.ObjCount.Present == 0 && res.ObjCount.Remote == 0 {
+			s += "is empty"
+			goto emit
+		}
+		if res.Bck.IsAIS() {
+			debug.Assert(res.ObjCount.Remote == 0 && res.ObjCount.Present != 0)
+			s += fmt.Sprintf("(%s, size=%s)", cos.FormatBigNum(int(res.ObjCount.Present)),
+				teb.FmtSize(int64(res.TotalSize.PresentObjs), ctx.units, 2))
+			goto emit
+		}
+
+		// cloud bucket
+		if res.ObjCount.Present == 0 {
+			s += "[cluster: none"
+		} else {
+			s += fmt.Sprintf("[cluster: (%s, size=%s)",
+				cos.FormatBigNum(int(res.ObjCount.Present)), teb.FmtSize(int64(res.TotalSize.PresentObjs), ctx.units, 2))
+		}
+		if res.ObjCount.Remote == 0 {
+			s += "]"
+		} else {
+			s += fmt.Sprintf(", remote: (%s, size=%s)]",
+				cos.FormatBigNum(int(res.ObjCount.Remote)), teb.FmtSize(int64(res.TotalSize.RemoteObjs), ctx.units, 2))
+		}
+		s += ", " + teb.FmtDuration(elapsed, ctx.units)
+
+	emit:
+		if ctx.l < len(s) {
+			ctx.l = len(s) + 4
+		}
+		s += strings.Repeat(" ", ctx.l-len(s))
+		fmt.Fprintf(ctx.c.App.Writer, "\r%s", s)
+
+		if len(results) > 1 {
+			if i < len(results)-1 {
+				briefPause(3)
+			}
+		}
+	}
 }
 
 //

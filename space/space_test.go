@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cluster"
-	"github.com/NVIDIA/aistore/cluster/meta"
-	"github.com/NVIDIA/aistore/cluster/mock"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/space"
@@ -59,7 +59,6 @@ func TestEvictCleanup(t *testing.T) {
 var _ = Describe("space evict/cleanup tests", func() {
 	Describe("Run", func() {
 		var (
-			t          *mock.TargetMock
 			filesPath  string
 			fpAnother  string
 			bckAnother cmn.Bck
@@ -68,7 +67,7 @@ var _ = Describe("space evict/cleanup tests", func() {
 		BeforeEach(func() {
 			initConfig()
 			createAndAddMountpath(basePath)
-			t = newTargetLRUMock()
+			core.T = newTargetLRUMock()
 			availablePaths := fs.GetAvail()
 			bck := cmn.Bck{Name: bucketName, Provider: apc.AIS, Ns: cmn.NsGlobal}
 			bckAnother = cmn.Bck{Name: bucketNameAnother, Provider: apc.AIS, Ns: cmn.NsGlobal}
@@ -85,7 +84,7 @@ var _ = Describe("space evict/cleanup tests", func() {
 		Describe("evict files", func() {
 			var ini *space.IniLRU
 			BeforeEach(func() {
-				ini = newIniLRU(t)
+				ini = newIniLRU()
 			})
 			It("should not fail when there are no files", func() {
 				space.RunLRU(ini)
@@ -204,7 +203,7 @@ var _ = Describe("space evict/cleanup tests", func() {
 		Describe("not evict files", func() {
 			var ini *space.IniLRU
 			BeforeEach(func() {
-				ini = newIniLRU(t)
+				ini = newIniLRU()
 			})
 			It("should do nothing when disk usage is below hwm", func() {
 				const numberOfFiles = 4
@@ -258,7 +257,7 @@ var _ = Describe("space evict/cleanup tests", func() {
 		Describe("cleanup 'deleted'", func() {
 			var ini *space.IniCln
 			BeforeEach(func() {
-				ini = newInitStoreCln(t)
+				ini = newInitStoreCln()
 			})
 			It("should remove all deleted items", func() {
 				var (
@@ -320,7 +319,7 @@ func newTargetLRUMock() *mock.TargetMock {
 		bmdMock = mock.NewBaseBownerMock(
 			meta.NewBck(
 				bucketName, apc.AIS, cmn.NsGlobal,
-				&cmn.BucketProps{
+				&cmn.Bprops{
 					Cksum:  cmn.CksumConf{Type: cos.ChecksumNone},
 					LRU:    cmn.LRUConf{Enabled: true},
 					Access: apc.AccessAll,
@@ -329,7 +328,7 @@ func newTargetLRUMock() *mock.TargetMock {
 			),
 			meta.NewBck(
 				bucketNameAnother, apc.AIS, cmn.NsGlobal,
-				&cmn.BucketProps{
+				&cmn.Bprops{
 					Cksum:  cmn.CksumConf{Type: cos.ChecksumNone},
 					LRU:    cmn.LRUConf{Enabled: false},
 					Access: apc.AccessAll,
@@ -342,27 +341,25 @@ func newTargetLRUMock() *mock.TargetMock {
 	return tMock
 }
 
-func newIniLRU(t cluster.Target) *space.IniLRU {
+func newIniLRU() *space.IniLRU {
 	xlru := &space.XactLRU{}
 	xlru.InitBase(cos.GenUUID(), apc.ActLRU, nil)
 	return &space.IniLRU{
 		Xaction:             xlru,
 		Config:              cmn.GCO.Get(),
 		StatsT:              mock.NewStatsTracker(),
-		T:                   t,
 		GetFSUsedPercentage: mockGetFSUsedPercentage,
 		GetFSStats:          getMockGetFSStats(numberOfCreatedFiles),
 	}
 }
 
-func newInitStoreCln(t cluster.Target) *space.IniCln {
+func newInitStoreCln() *space.IniCln {
 	xcln := &space.XactCln{}
 	xcln.InitBase(cos.GenUUID(), apc.ActStoreCleanup, nil)
 	return &space.IniCln{
 		Xaction: xcln,
 		Config:  cmn.GCO.Get(),
 		StatsT:  mock.NewStatsTracker(),
-		T:       t,
 	}
 }
 
@@ -393,7 +390,7 @@ func saveRandomFile(filename string, size int64) {
 	buff := make([]byte, size)
 	_, err := cos.SaveReader(filename, rand.Reader, buff, cos.ChecksumNone, size)
 	Expect(err).NotTo(HaveOccurred())
-	lom := &cluster.LOM{}
+	lom := &core.LOM{}
 	err = lom.InitFQN(filename, nil)
 	Expect(err).NotTo(HaveOccurred())
 	lom.SetSize(size)
