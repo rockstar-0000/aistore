@@ -53,18 +53,19 @@ type ecSliceMD struct {
 }
 
 type ecOptions struct {
-	seed        int64
-	objSize     int64
-	concurrency int
-	objCount    int
-	dataCnt     int
-	parityCnt   int
-	minTargets  int
-	pattern     string
-	sema        *cos.DynSemaphore
-	silent      bool
-	rnd         *rand.Rand
-	smap        *meta.Smap
+	seed         int64
+	objSize      int64
+	objSizeLimit int64
+	concurrency  int
+	objCount     int
+	dataCnt      int
+	parityCnt    int
+	minTargets   int
+	pattern      string
+	sema         *cos.DynSemaphore
+	silent       bool
+	rnd          *rand.Rand
+	smap         *meta.Smap
 }
 
 // Initializes the EC options, validates the number of targets.
@@ -91,28 +92,33 @@ func (o ecOptions) init(t *testing.T, proxyURL string) *ecOptions {
 }
 
 func (o *ecOptions) sliceTotal() int {
+	if o.objSizeLimit == cmn.ObjSizeToAlwaysReplicate {
+		return 0
+	}
 	return o.dataCnt + o.parityCnt
 }
 
 type ecTest struct {
-	name   string
-	data   int
-	parity int
+	name         string
+	objSizeLimit int64
+	data         int
+	parity       int
 }
 
 var ecTests = []ecTest{
-	{"EC 1:1", 1, 1},
-	{"EC 1:2", 1, 2},
-	{"EC 2:2", 2, 2},
+	{"EC 1:1", cmn.ObjSizeToAlwaysReplicate, 1, 1},
+	{"EC 1:1", ecObjLimit, 1, 1},
+	{"EC 1:2", ecObjLimit, 1, 2},
+	{"EC 2:2", ecObjLimit, 2, 2},
 }
 
 func defaultECBckProps(o *ecOptions) *cmn.BpropsToSet {
 	return &cmn.BpropsToSet{
 		EC: &cmn.ECConfToSet{
-			Enabled:      apc.Bool(true),
-			ObjSizeLimit: apc.Int64(ecObjLimit),
-			DataSlices:   apc.Int(o.dataCnt),
-			ParitySlices: apc.Int(o.parityCnt),
+			Enabled:      apc.Ptr(true),
+			ObjSizeLimit: apc.Ptr[int64](ecObjLimit),
+			DataSlices:   apc.Ptr(o.dataCnt),
+			ParitySlices: apc.Ptr(o.parityCnt),
 		},
 	}
 }
@@ -246,7 +252,7 @@ func waitForECFinishes(t *testing.T, totalCnt int, objSize, sliceSize int64, doE
 func randObjectSize(n, every int, o *ecOptions) (
 	totalCnt int, objSize, sliceSize int64, doEC bool) {
 	if o.objSize != 0 {
-		doEC = o.objSize >= ecObjLimit
+		doEC = o.objSizeLimit != cmn.ObjSizeToAlwaysReplicate && o.objSize >= o.objSizeLimit
 		objSize = o.objSize
 		if doEC {
 			totalCnt = 2 + (o.sliceTotal())*2
@@ -265,7 +271,7 @@ func randObjectSize(n, every int, o *ecOptions) (
 	totalCnt = 2 + (o.sliceTotal())*2
 	objSize = int64(ecMinBigSize + o.rnd.Intn(ecBigDelta))
 	sliceSize = ec.SliceSize(objSize, o.dataCnt)
-	if (n+1)%every == 0 {
+	if (n+1)%every == 0 || o.objSizeLimit == cmn.ObjSizeToAlwaysReplicate {
 		// Small object case
 		// full object copy+meta: 1+1
 		// number of metafiles: parity
@@ -274,7 +280,11 @@ func randObjectSize(n, every int, o *ecOptions) (
 		objSize = int64(ecMinSmallSize + o.rnd.Intn(ecSmallDelta))
 		sliceSize = objSize
 	}
-	doEC = objSize >= ecObjLimit
+	doEC = objSize >= o.objSizeLimit
+	if o.objSizeLimit == cmn.ObjSizeToAlwaysReplicate {
+		doEC = false
+		totalCnt = 2 + o.parityCnt*2
+	}
 	return
 }
 
@@ -462,8 +472,8 @@ func newLocalBckWithProps(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, 
 	proxyURL := tools.RandomProxyURL()
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
-	tlog.Logf("Changing EC %d:%d [ seed = %d ], concurrent: %d\n",
-		o.dataCnt, o.parityCnt, o.seed, o.concurrency)
+	tlog.Logf("Changing EC %d:%d, objLimit [%d] [ seed = %d ], concurrent: %d\n",
+		o.dataCnt, o.parityCnt, o.objSizeLimit, o.seed, o.concurrency)
 	_, err := api.SetBucketProps(baseParams, bck, bckProps)
 	tassert.CheckFatal(t, err)
 }
@@ -560,10 +570,10 @@ func TestECChange(t *testing.T) {
 
 	bucketProps := &cmn.BpropsToSet{
 		EC: &cmn.ECConfToSet{
-			Enabled:      apc.Bool(true),
-			ObjSizeLimit: apc.Int64(ecObjLimit),
-			DataSlices:   apc.Int(1),
-			ParitySlices: apc.Int(1),
+			Enabled:      apc.Ptr(true),
+			ObjSizeLimit: apc.Ptr[int64](ecObjLimit),
+			DataSlices:   apc.Ptr(1),
+			ParitySlices: apc.Ptr(1),
 		},
 	}
 	baseParams := tools.BaseAPIParams(proxyURL)
@@ -573,14 +583,14 @@ func TestECChange(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	tlog.Logln("Trying to set too many slices")
-	bucketProps.EC.DataSlices = apc.Int(25)
-	bucketProps.EC.ParitySlices = apc.Int(25)
+	bucketProps.EC.DataSlices = apc.Ptr(25)
+	bucketProps.EC.ParitySlices = apc.Ptr(25)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err != nil, "Enabling EC must fail in case of the number of targets fewer than the number of slices")
 
 	tlog.Logln("Enabling EC")
-	bucketProps.EC.DataSlices = apc.Int(1)
-	bucketProps.EC.ParitySlices = apc.Int(1)
+	bucketProps.EC.DataSlices = apc.Ptr(1)
+	bucketProps.EC.ParitySlices = apc.Ptr(1)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.CheckFatal(t, err)
 
@@ -589,18 +599,18 @@ func TestECChange(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	tlog.Logln("Trying to disable EC")
-	bucketProps.EC.Enabled = apc.Bool(false)
+	bucketProps.EC.Enabled = apc.Ptr(false)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err == nil, "Disabling EC failed: %v", err)
 
 	tlog.Logln("Trying to re-enable EC")
-	bucketProps.EC.Enabled = apc.Bool(true)
+	bucketProps.EC.Enabled = apc.Ptr(true)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err == nil, "Enabling EC failed: %v", err)
 
 	tlog.Logln("Trying to modify EC options when EC is enabled")
-	bucketProps.EC.Enabled = apc.Bool(true)
-	bucketProps.EC.ObjSizeLimit = apc.Int64(300000)
+	bucketProps.EC.Enabled = apc.Ptr(true)
+	bucketProps.EC.ObjSizeLimit = apc.Ptr[int64](300000)
 	_, err = api.SetBucketProps(baseParams, bck, bucketProps)
 	tassert.Errorf(t, err != nil, "Modifiying EC properties must fail")
 
@@ -787,10 +797,11 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  4,
-		objCount:    25,
-		concurrency: 8,
-		pattern:     "obj-rest-remote-%04d",
+		minTargets:   4,
+		objCount:     25,
+		concurrency:  8,
+		pattern:      "obj-rest-remote-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
@@ -817,9 +828,10 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 				}
 				o.parityCnt = test.parity
 				o.dataCnt = test.data
+				o.objSizeLimit = test.objSizeLimit
 				setBucketECProps(t, baseParams, bck, defaultECBckProps(o))
 				defer api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
-					EC: &cmn.ECConfToSet{Enabled: apc.Bool(false)},
+					EC: &cmn.ECConfToSet{Enabled: apc.Ptr(false)},
 				})
 
 				defer func() {
@@ -899,6 +911,7 @@ func TestECRestoreObjAndSlice(t *testing.T) {
 				}
 				o.parityCnt = test.parity
 				o.dataCnt = test.data
+				o.objSizeLimit = test.objSizeLimit
 				newLocalBckWithProps(t, baseParams, bck, defaultECBckProps(o), o)
 
 				wg := sync.WaitGroup{}
@@ -973,10 +986,11 @@ func TestECChecksum(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets: 4,
-		dataCnt:    1,
-		parityCnt:  1,
-		pattern:    "obj-cksum-%04d",
+		minTargets:   4,
+		dataCnt:      1,
+		parityCnt:    1,
+		pattern:      "obj-cksum-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	baseParams := tools.BaseAPIParams(proxyURL)
 	initMountpaths(t, proxyURL)
@@ -1038,12 +1052,13 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  4,
-		dataCnt:     1,
-		parityCnt:   1,
-		objCount:    25,
-		concurrency: 8,
-		pattern:     "obj-rest-%04d",
+		minTargets:   4,
+		dataCnt:      1,
+		parityCnt:    1,
+		objCount:     25,
+		concurrency:  8,
+		pattern:      "obj-rest-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	initMountpaths(t, proxyURL)
@@ -1074,7 +1089,7 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 
 	// Disable EC, put normal files, check if were created properly
 	_, err := api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
-		EC: &cmn.ECConfToSet{Enabled: apc.Bool(false)},
+		EC: &cmn.ECConfToSet{Enabled: apc.Ptr(false)},
 	})
 	tassert.CheckError(t, err)
 
@@ -1097,7 +1112,7 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 
 	// Enable EC again, check if EC was started properly and creates files with EC correctly
 	_, err = api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
-		EC: &cmn.ECConfToSet{Enabled: apc.Bool(true)},
+		EC: &cmn.ECConfToSet{Enabled: apc.Ptr(true)},
 	})
 	tassert.CheckError(t, err)
 
@@ -1135,12 +1150,13 @@ func TestECDisableEnableDuringLoad(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  4,
-		dataCnt:     1,
-		parityCnt:   1,
-		objCount:    5,
-		concurrency: 8,
-		pattern:     "obj-disable-enable-load-%04d",
+		minTargets:   4,
+		dataCnt:      1,
+		parityCnt:    1,
+		objCount:     5,
+		concurrency:  8,
+		pattern:      "obj-disable-enable-load-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	initMountpaths(t, proxyURL)
@@ -1196,14 +1212,14 @@ func TestECDisableEnableDuringLoad(t *testing.T) {
 
 	tlog.Logf("Disabling EC for the bucket %s\n", bck)
 	_, err := api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
-		EC: &cmn.ECConfToSet{Enabled: apc.Bool(false)},
+		EC: &cmn.ECConfToSet{Enabled: apc.Ptr(false)},
 	})
 	tassert.CheckError(t, err)
 
 	time.Sleep(15 * time.Millisecond)
 	tlog.Logf("Enabling EC for the bucket %s\n", bck)
 	_, err = api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{
-		EC: &cmn.ECConfToSet{Enabled: apc.Bool(true)},
+		EC: &cmn.ECConfToSet{Enabled: apc.Ptr(true)},
 	})
 	tassert.CheckError(t, err)
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck}
@@ -1258,6 +1274,7 @@ func TestECStress(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			newLocalBckWithProps(t, baseParams, bck, defaultECBckProps(o), o)
 			doECPutsAndCheck(t, baseParams, bck, o)
 
@@ -1287,20 +1304,22 @@ func TestECStressManyBuckets(t *testing.T) {
 	)
 
 	o1 := ecOptions{
-		minTargets:  4,
-		parityCnt:   1,
-		dataCnt:     1,
-		objCount:    200,
-		concurrency: 12,
-		pattern:     "obj-stress-manybck-%04d",
+		minTargets:   4,
+		parityCnt:    1,
+		dataCnt:      1,
+		objCount:     200,
+		concurrency:  12,
+		pattern:      "obj-stress-manybck-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	o2 := ecOptions{
-		minTargets:  4,
-		parityCnt:   1,
-		dataCnt:     1,
-		objCount:    200,
-		concurrency: 12,
-		pattern:     "obj-stress-manybck-%04d",
+		minTargets:   4,
+		parityCnt:    1,
+		dataCnt:      1,
+		objCount:     200,
+		concurrency:  12,
+		pattern:      "obj-stress-manybck-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	initMountpaths(t, proxyURL)
@@ -1369,6 +1388,7 @@ func TestECExtraStress(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			ecStressCore(t, o, proxyURL, bck)
 		})
 	}
@@ -1481,19 +1501,20 @@ func TestECXattrs(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  4,
-		dataCnt:     1,
-		parityCnt:   1,
-		objCount:    30,
-		concurrency: 8,
-		pattern:     "obj-xattr-%04d",
+		minTargets:   4,
+		dataCnt:      1,
+		parityCnt:    1,
+		objCount:     30,
+		concurrency:  8,
+		pattern:      "obj-xattr-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
 	baseParams := tools.BaseAPIParams(proxyURL)
 	bckProps := defaultECBckProps(o)
 	bckProps.Versioning = &cmn.VersionConfToSet{
-		Enabled: apc.Bool(true),
+		Enabled: apc.Ptr(true),
 	}
 
 	newLocalBckWithProps(t, baseParams, bck, bckProps, o)
@@ -1599,12 +1620,13 @@ func TestECDestroyBucket(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  4,
-		dataCnt:     1,
-		parityCnt:   1,
-		objCount:    100,
-		concurrency: 10,
-		pattern:     "obj-destroy-bck-%04d",
+		minTargets:   4,
+		dataCnt:      1,
+		parityCnt:    1,
+		objCount:     100,
+		concurrency:  10,
+		pattern:      "obj-destroy-bck-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	initMountpaths(t, proxyURL)
@@ -1690,11 +1712,12 @@ func TestECEmergencyTargetForSlices(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  5,
-		dataCnt:     -1,
-		objCount:    100,
-		concurrency: 12,
-		pattern:     "obj-emt-%04d",
+		minTargets:   5,
+		dataCnt:      -1,
+		objCount:     100,
+		concurrency:  12,
+		pattern:      "obj-emt-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
@@ -1786,11 +1809,12 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  5,
-		dataCnt:     -1,
-		objCount:    50,
-		concurrency: 8,
-		pattern:     "obj-rest-%04d",
+		minTargets:   5,
+		dataCnt:      -1,
+		objCount:     50,
+		concurrency:  8,
+		pattern:      "obj-rest-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	if o.smap.CountActiveTs() > 10 {
@@ -1934,12 +1958,13 @@ func TestECEmergencyMountpath(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  5,
-		dataCnt:     1,
-		parityCnt:   1,
-		objCount:    400,
-		concurrency: 24,
-		pattern:     "obj-em-mpath-%04d",
+		minTargets:   5,
+		dataCnt:      1,
+		parityCnt:    1,
+		objCount:     400,
+		concurrency:  24,
+		pattern:      "obj-em-mpath-%04d",
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 
 	removeTarget, _ := o.smap.GetRandTarget()
@@ -2045,10 +2070,11 @@ func TestECRebalance(t *testing.T) {
 		proxyURL = tools.RandomProxyURL()
 	)
 	o := ecOptions{
-		objCount:    30,
-		concurrency: 8,
-		pattern:     "obj-reb-chk-%04d",
-		silent:      true,
+		objCount:     30,
+		concurrency:  8,
+		pattern:      "obj-reb-chk-%04d",
+		silent:       true,
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
@@ -2059,6 +2085,7 @@ func TestECRebalance(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			ecOnlyRebalance(t, o, proxyURL, bck)
 		})
 	}
@@ -2075,10 +2102,11 @@ func TestECMountpaths(t *testing.T) {
 		proxyURL = tools.RandomProxyURL()
 	)
 	o := ecOptions{
-		objCount:    30,
-		concurrency: 8,
-		pattern:     "obj-reb-mp-%04d",
-		silent:      true,
+		objCount:     30,
+		concurrency:  8,
+		pattern:      "obj-reb-mp-%04d",
+		silent:       true,
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
@@ -2089,6 +2117,7 @@ func TestECMountpaths(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			ecMountpaths(t, o, proxyURL, bck)
 		})
 	}
@@ -2205,10 +2234,10 @@ func TestECBucketEncode(t *testing.T) {
 	tlog.Logf("Enabling EC\n")
 	bckPropsToUpate := &cmn.BpropsToSet{
 		EC: &cmn.ECConfToSet{
-			Enabled:      apc.Bool(true),
-			ObjSizeLimit: apc.Int64(1),
-			DataSlices:   apc.Int(1),
-			ParitySlices: apc.Int(parityCnt),
+			Enabled:      apc.Ptr(true),
+			ObjSizeLimit: apc.Ptr[int64](1),
+			DataSlices:   apc.Ptr(1),
+			ParitySlices: apc.Ptr(parityCnt),
 		},
 	}
 	_, err = api.SetBucketProps(baseParams, m.bck, bckPropsToUpate)
@@ -2248,11 +2277,12 @@ func TestECAndRegularRebalance(t *testing.T) {
 		proxyURL = tools.RandomProxyURL()
 	)
 	o := ecOptions{
-		minTargets:  5,
-		objCount:    90,
-		concurrency: 8,
-		pattern:     "obj-reb-chk-%04d",
-		silent:      true,
+		minTargets:   5,
+		objCount:     90,
+		concurrency:  8,
+		pattern:      "obj-reb-chk-%04d",
+		silent:       true,
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
@@ -2263,6 +2293,7 @@ func TestECAndRegularRebalance(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			ecAndRegularRebalance(t, o, proxyURL, bckReg, bckEC)
 		})
 	}
@@ -2377,10 +2408,11 @@ func TestECResilver(t *testing.T) {
 		proxyURL = tools.RandomProxyURL()
 	)
 	o := ecOptions{
-		objCount:    100,
-		concurrency: 8,
-		pattern:     "obj-reb-loc-%04d",
-		silent:      true,
+		objCount:     100,
+		concurrency:  8,
+		pattern:      "obj-reb-loc-%04d",
+		silent:       true,
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
@@ -2391,6 +2423,7 @@ func TestECResilver(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			ecResilver(t, o, proxyURL, bck)
 		})
 	}
@@ -2474,11 +2507,12 @@ func TestECAndRegularUnregisterWhileRebalancing(t *testing.T) {
 		proxyURL   = tools.RandomProxyURL()
 		baseParams = tools.BaseAPIParams(proxyURL)
 		o          = ecOptions{
-			minTargets:  5,
-			objCount:    300,
-			concurrency: 8,
-			pattern:     "obj-reb-chk-%04d",
-			silent:      true,
+			minTargets:   5,
+			objCount:     300,
+			concurrency:  8,
+			pattern:      "obj-reb-chk-%04d",
+			silent:       true,
+			objSizeLimit: ecObjLimit,
 		}.init(t, proxyURL)
 	)
 
@@ -2490,6 +2524,7 @@ func TestECAndRegularUnregisterWhileRebalancing(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			newLocalBckWithProps(t, baseParams, bckEC, defaultECBckProps(o), o)
 			defer tools.WaitForRebalAndResil(t, baseParams)
 			ecAndRegularUnregisterWhileRebalancing(t, o, bckEC)
@@ -2713,11 +2748,12 @@ func TestECGenerations(t *testing.T) {
 	)
 
 	o := ecOptions{
-		minTargets:  4,
-		objCount:    10,
-		concurrency: 4,
-		pattern:     "obj-gen-%04d",
-		silent:      testing.Short(),
+		minTargets:   4,
+		objCount:     10,
+		concurrency:  4,
+		pattern:      "obj-gen-%04d",
+		silent:       testing.Short(),
+		objSizeLimit: ecObjLimit,
 	}.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 	lastWrite := make([]int64, o.objCount)
@@ -2729,6 +2765,7 @@ func TestECGenerations(t *testing.T) {
 			}
 			o.parityCnt = test.parity
 			o.dataCnt = test.data
+			o.objSizeLimit = test.objSizeLimit
 			newLocalBckWithProps(t, baseParams, bck, defaultECBckProps(o), o)
 
 			wg := sync.WaitGroup{}

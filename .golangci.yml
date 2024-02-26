@@ -117,6 +117,8 @@ linters-settings:
       - name: unused-parameter
       - name: unused-receiver
       - name: waitgroup-by-value
+  gci:
+    skip-generated: true
   govet:
     enable-all: true
     disable:

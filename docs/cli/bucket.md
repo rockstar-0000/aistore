@@ -37,6 +37,7 @@ rmb             bucket rm
 - [Move or Rename a bucket](#move-or-rename-a-bucket)
 - [Copy bucket](#copy-bucket)
 - [Copy multiple objects](#copy-multiple-objects)
+- [Example copying buckets and multi-objects with simultaneous synchronization](#example-copying-buckets-and-multi-objects-with-simultaneous-synchronization)
 - [Show bucket summary](#show-bucket-summary)
 - [Start N-way Mirroring](#start-n-way-mirroring)
 - [Start Erasure Coding](#start-erasure-coding)
@@ -682,11 +683,12 @@ OPTIONS:
    --wait            wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
    --timeout value   maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
                      valid time units: ns, us (or µs), ms, s (default), m, h
-   --latest          GET, prefetch, or copy the latest object version from the associated remote bucket;
-                     provides operation-level control over object versioning (and version synchronization)
-                     without requiring to change bucket configuration
-                     - the latter can be done using 'ais bucket props set BUCKET versioning'
-                     - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
+   --latest          check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
+                     from the associated remote bucket:
+                      - provides operation-level control over object versioning (and version synchronization)
+                        without requiring to change bucket configuration
+                      - the latter can be done using 'ais bucket props set BUCKET versioning'
+                      - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
    --sync            synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source;
                      the option is a stronger variant of the '--latest' (option) - in addition it entails
                      removing of the objects that no longer exist remotely
@@ -808,6 +810,46 @@ In particular, the option will make sure that aistore has the **latest** version
 ### See also
 
 * [Out of band updates](/docs/out_of_band.md)
+
+## Example copying buckets and multi-objects with simultaneous synchronization
+
+There's a [script](https://github.com/NVIDIA/aistore/blob/main/ais/test/scripts/cp-sync-remais-out-of-band.sh) that we use for testing. When run, it produces the following output:
+
+```console
+$ ./ais/test/scripts/cp-sync-remais-out-of-band.sh --bucket gs://abc
+
+ 1. generate and write 500 random shards => gs://abc
+ 2. copy gs://abc => ais://dst-9408
+ 3. remove 10 shards from the source
+ 4. copy gs://abc => ais://dst-9408 w/ synchronization ('--sync' option)
+ 5. remove another 10 shards
+ 6. copy multiple objects using bash-expansion defined range and '--sync'
+ #
+ # out of band DELETE using remote AIS (remais)
+ #
+ 7. use remote AIS cluster ("remais") to out-of-band remove 10 shards from the source
+ 8. copy gs://abc => ais://dst-9408 w/ --sync
+ 9. when copying, we always synchronize content of the in-cluster source as well
+10. use remais to out-of-band remove 10 more shards from gs://abc source
+11. copy a range of shards from gs://abc to ais://dst-9408, and compare
+12. and again: when copying, we always synchronize content of the in-cluster source as well
+ #
+ # out of band ADD using remote AIS (remais)
+ #
+13. use remais to out-of-band add (i.e., PUT) 17 new shards
+14. copy a range of shards from gs://abc to ais://dst-9408, and check whether the destination has new shards
+15. compare the contents but NOTE: as of v3.22, this part requires multi-object copy (using '--list' or '--template')
+```
+
+The [script](https://github.com/NVIDIA/aistore/blob/main/ais/test/scripts/cp-sync-remais-out-of-band.sh) executes a sequence of steps (above).
+
+Notice a certain limitation (that also shows up as the last step #15):
+
+* As of the version 3.22, aistore `cp` commands will always synchronize _deleted_ and _updated_ remote content.
+
+* However, to see an out-of-band added content, you currently need to run [multi-object copy](#copy-multiple-objects), with multiple source objects specified using `--list` or `--template`.
+
+* See `ais cp --help` for details.
 
 ## Show bucket summary
 
@@ -963,27 +1005,27 @@ Useful `PROP_PREFIX` are: `access, checksum, ec, lru, mirror, provider, versioni
 Show only `lru` section of bucket props for `bucket_name` bucket.
 
 ```console
-$ ais bucket props show ais://bucket_name --compact
+$ ais bucket props show s3://bucket-name --compact
 PROPERTY	 VALUE
-access		 GET,PUT,DELETE,HEAD,ColdGET
-checksum	 Type: xxhash | Validate: ColdGET
-created		 2020-04-08T16:20:12-08:00
+access		 GET,HEAD-OBJECT,PUT,APPEND,DELETE-OBJECT,MOVE-OBJECT,PROMOTE,UPDATE-OBJECT,HEAD-BUCKET,LIST-OBJECTS,PATCH,SET-BUCKET-ACL,LIST-BUCKETS,SHOW-CLUSTER,CREATE-BUCKET,DESTROY-BUCKET,MOVE-BUCKET,ADMIN
+checksum	 Type: xxhash | Validate: Nothing
+created		 2024-01-31T15:42:59-08:00
 ec		 Disabled
-lru		 Watermarks: 75%/90% | Do not evict time: 120m | OOS: 95%
+lru		 lru.dont_evict_time=2h0m, lru.capacity_upd_time=10m
 mirror		 Disabled
-provider	 ais
-versioning	 Enabled | Validate on WarmGET: no
-$ ais bucket props show ais://bucket_name lru --compact
+present		 yes
+provider	 aws
+versioning	 Disabled
+
+$ ais bucket props show s3://bucket_name lru --compact
 PROPERTY	 VALUE
-lru		 Watermarks: 75%/90% | Do not evict time: 120m | OOS: 95%
-$ ais bucket props show bucket_name lru
+lru		 lru.dont_evict_time=2h0m, lru.capacity_upd_time=10m
+
+$ ais bucket props show s3://ais-abhishek lru
 PROPERTY		 VALUE
 lru.capacity_upd_time	 10m
-lru.dont_evict_time	 120m
+lru.dont_evict_time	 2h0m
 lru.enabled		 true
-lru.highwm		 90
-lru.lowwm		 75
-lru.out_of_space	 95
 ```
 
 ## Set bucket properties
@@ -1176,9 +1218,6 @@ $ ais bucket props set ais://bucket_name '{
       "enable_read_range": false
     },
     "lru": {
-      "lowwm": 20,
-      "highwm": 80,
-      "out_of_space": 90,
       "dont_evict_time": "20m",
       "capacity_upd_time": "1m",
       "enabled": true
@@ -1196,18 +1235,27 @@ $ ais bucket props set ais://bucket_name '{
     },
     "access": "255"
 }'
-Bucket props successfully updated
+"access" set to: "GET,HEAD-OBJECT,PUT,APPEND,DELETE-OBJECT,MOVE-OBJECT,PROMOTE,UPDATE-OBJECT" (was: "GET,HEAD-OBJECT,PUT,APPEND,DELETE-OBJECT,MOVE-OBJECT,PROMOTE,UPDATE-OBJECT,HEAD-BUCKET,LIST-OBJECTS,PATCH,SET-BUCKET-ACL,LIST-BUCKETS,SHOW-CLUSTER,CREATE-BUCKET,DESTROY-BUCKET,MOVE-BUCKET,ADMIN")
+"ec.enabled" set to: "true" (was: "false")
+"ec.objsize_limit" set to: "256000" (was: "262144")
+"lru.capacity_upd_time" set to: "1m" (was: "10m")
+"lru.dont_evict_time" set to: "20m" (was: "1s")
+"lru.enabled" set to: "true" (was: "false")
+"mirror.enabled" set to: "false" (was: "true")
+
+Bucket props successfully updated.
 ```
 
 ```console
 $ ais show bucket ais://bucket_name --compact
 PROPERTY	 VALUE
-access		 GET,PUT,DELETE,HEAD,ColdGET
+access		 GET,HEAD-OBJECT,PUT,APPEND,DELETE-OBJECT,MOVE-OBJECT,PROMOTE,UPDATE-OBJECT
 checksum	 Type: xxhash | Validate: ColdGET
-created		2020-04-08T16:20:12-08:00
+created		 2024-02-02T12:57:17-08:00
 ec		 2:2 (250KiB)
-lru		 Watermarks: 20%/80% | Do not evict time: 120m | OOS: 90%
+lru		 lru.dont_evict_time=20m, lru.capacity_upd_time=1m
 mirror		 Disabled
+present		 yes
 provider	 ais
 versioning	 Enabled | Validate on WarmGET: no
 ```
@@ -1215,9 +1263,7 @@ versioning	 Enabled | Validate on WarmGET: no
 If not all properties are mentioned in the JSON, the missing ones are set to zero values (empty / `false` / `nil`):
 
 ```bash
-$ ais bucket props reset ais://bucket_name
-Bucket props successfully reset
-$ ais bucket props set ais://bucket_name '{
+$ ais bucket props set ais://bucket-name '{
   "mirror": {
     "enabled": true,
     "copies": 2
@@ -1227,19 +1273,22 @@ $ ais bucket props set ais://bucket_name '{
     "validate_warm_get": true
   }
 }'
-Bucket props successfully updated
-"versioning.validate_warm_get" set to: "true" (was: "false")
 "mirror.enabled" set to: "true" (was: "false")
-$ ais show bucket bucket_name --compact
+"versioning.validate_warm_get" set to: "true" (was: "false")
+
+Bucket props successfully updated.
+
+$ ais show bucket ais://bucket-name --compact
 PROPERTY	 VALUE
-access		 GET,PUT,DELETE,HEAD,ColdGET
-checksum	 Type: xxhash | Validate: ColdGET
-created		2020-04-08T16:20:12-08:00
-ec		 Disabled
-lru		 Watermarks: 75%/90% | Do not evict time: 120m | OOS: 95%
+access		 GET,HEAD-OBJECT,PUT,APPEND,DELETE-OBJECT,MOVE-OBJECT,PROMOTE,UPDATE-OBJECT,HEAD-BUCKET,LIST-OBJECTS,PATCH,SET-BUCKET-ACL,LIST-BUCKETS,SHOW-CLUSTER,CREATE-BUCKET,DESTROY-BUCKET,MOVE-BUCKET,ADMIN
+checksum	 Type: xxhash | Validate: Nothing
+created		 2024-02-02T12:52:30-08:00
+ec		     Disabled
+lru   		 lru.dont_evict_time=2h0m, lru.capacity_upd_time=10m
 mirror		 2 copies
+present		 yes
 provider	 ais
-versioning	 Enabled | Validate on WarmGET: yes
+versioning Enabled | Validate on WarmGET: yes
 ```
 
 ## Show and set AWS-specific properties

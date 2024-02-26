@@ -1,6 +1,6 @@
 // Package apc: API constant and control messages
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -33,6 +33,8 @@ const (
 
 	ActDsort    = "dsort"
 	ActDownload = "download"
+
+	ActBlobDl = "blob-download"
 
 	ActMakeNCopies = "make-n-copies"
 	ActPutCopies   = "put-copies"

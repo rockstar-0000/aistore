@@ -1563,7 +1563,7 @@ func TestRenewRebalance(t *testing.T) {
 
 		<-m.controlCh // wait for half the GETs to complete
 
-		rebID, err = api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActRebalance})
+		rebID, err = api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActRebalance}, "")
 		tassert.CheckFatal(t, err)
 		tlog.Logf("manually initiated rebalance\n")
 	}()
@@ -1607,8 +1607,8 @@ func TestGetFromMirroredWithLostOneMountpath(t *testing.T) {
 	// Step 2: Make the bucket redundant
 	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
 		Mirror: &cmn.MirrorConfToSet{
-			Enabled: apc.Bool(true),
-			Copies:  apc.Int64(int64(copies)),
+			Enabled: apc.Ptr(true),
+			Copies:  apc.Ptr(int64(copies)),
 		},
 	})
 	if err != nil {
@@ -1669,8 +1669,8 @@ func TestGetFromMirroredWithLostMountpathAllExceptOne(t *testing.T) {
 	// Make the bucket n-copy mirrored
 	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
 		Mirror: &cmn.MirrorConfToSet{
-			Enabled: apc.Bool(true),
-			Copies:  apc.Int64(int64(mpathCount)),
+			Enabled: apc.Ptr(true),
+			Copies:  apc.Ptr(int64(mpathCount)),
 		},
 	})
 	if err != nil {
@@ -1812,7 +1812,7 @@ func TestICRebalance(t *testing.T) {
 	baseParams := tools.BaseAPIParams(m.proxyURL)
 
 	tlog.Logf("Manually initiated rebalance\n")
-	rebID, err = api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActRebalance})
+	rebID, err = api.StartXaction(baseParams, &xact.ArgsMsg{Kind: apc.ActRebalance}, "")
 	tassert.CheckFatal(t, err)
 
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceStartTimeout}
@@ -1925,7 +1925,7 @@ func TestSingleResilver(t *testing.T) {
 
 	// Start resilvering just on the target
 	args := xact.ArgsMsg{Kind: apc.ActResilver, DaemonID: target.ID()}
-	id, err := api.StartXaction(baseParams, &args)
+	id, err := api.StartXaction(baseParams, &args, "")
 	tassert.CheckFatal(t, err)
 
 	// Wait for specific resilvering x[id]

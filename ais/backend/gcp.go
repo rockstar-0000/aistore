@@ -112,10 +112,9 @@ func (gcpp *gcpProvider) createClient(ctx context.Context) (*storage.Client, err
 	return client, nil
 }
 
-func (*gcpProvider) Provider() string { return apc.GCP }
+// as core.BackendProvider --------------------------------------------------------------
 
-// https://cloud.google.com/storage/docs/json_api/v1/objects/list#parameters
-func (*gcpProvider) MaxPageSize() uint { return apc.DefaultPageSizeCloud }
+func (*gcpProvider) Provider() string { return apc.GCP }
 
 //
 // CREATE BUCKET
@@ -154,13 +153,13 @@ func (*gcpProvider) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos
 // LIST OBJECTS
 //
 
-func (gcpp *gcpProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (errCode int, err error) {
+func (*gcpProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (errCode int, err error) {
 	var (
 		query    *storage.Query
 		h        = cmn.BackendHelpers.Google
 		cloudBck = bck.RemoteBck()
 	)
-	msg.PageSize = calcPageSize(msg.PageSize, gcpp.MaxPageSize())
+	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
 	if msg.Prefix != "" {
 		query = &storage.Query{Prefix: msg.Prefix}
 	}
@@ -266,6 +265,7 @@ func (*gcpProvider) HeadObj(ctx context.Context, lom *core.LOM) (oa *cmn.ObjAttr
 		return
 	}
 	oa = &cmn.ObjAttrs{}
+	oa.CustomMD = make(cos.StrKVs, 6)
 	oa.SetCustomKey(cmn.SourceObjMD, apc.GCP)
 	oa.Size = attrs.Size
 	if v, ok := h.EncodeVersion(attrs.Generation); ok {
@@ -303,7 +303,7 @@ func (*gcpProvider) HeadObj(ctx context.Context, lom *core.LOM) (oa *cmn.ObjAttr
 //
 
 func (gcpp *gcpProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT) (int, error) {
-	res := gcpp.GetObjReader(ctx, lom)
+	res := gcpp.GetObjReader(ctx, lom, 0, 0)
 	if res.Err != nil {
 		return res.ErrCode, res.Err
 	}
@@ -316,7 +316,7 @@ func (gcpp *gcpProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT)
 	return 0, err
 }
 
-func (*gcpProvider) GetObjReader(ctx context.Context, lom *core.LOM) (res core.GetReaderResult) {
+func (*gcpProvider) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
 	var (
 		attrs    *storage.ObjectAttrs
 		rc       *storage.Reader
@@ -326,24 +326,34 @@ func (*gcpProvider) GetObjReader(ctx context.Context, lom *core.LOM) (res core.G
 	attrs, res.Err = o.Attrs(ctx)
 	if res.Err != nil {
 		res.ErrCode, res.Err = gcpErrorToAISError(res.Err, cloudBck)
-		return
+		return res
 	}
-	rc, res.Err = o.NewReader(ctx)
-	if res.Err != nil {
-		return
+	if length > 0 {
+		rc, res.Err = o.NewRangeReader(ctx, offset, length)
+		if res.Err != nil {
+			if res.ErrCode == http.StatusRequestedRangeNotSatisfiable {
+				res.Err = cmn.NewErrRangeNotSatisfiable(res.Err, nil, 0)
+			}
+			return res
+		}
+	} else {
+		rc, res.Err = o.NewReader(ctx)
+		if res.Err != nil {
+			return res
+		}
+		// custom metadata
+		lom.SetCustomKey(cmn.SourceObjMD, apc.GCP)
+		if cksumType, ok := attrs.Metadata[gcpChecksumType]; ok {
+			if cksumValue, ok := attrs.Metadata[gcpChecksumVal]; ok {
+				lom.SetCksum(cos.NewCksum(cksumType, cksumValue))
+			}
+		}
+		res.ExpCksum = setCustomGs(lom, attrs)
 	}
 
-	// custom metadata
-	lom.SetCustomKey(cmn.SourceObjMD, apc.GCP)
-	if cksumType, ok := attrs.Metadata[gcpChecksumType]; ok {
-		if cksumValue, ok := attrs.Metadata[gcpChecksumVal]; ok {
-			lom.SetCksum(cos.NewCksum(cksumType, cksumValue))
-		}
-	}
-	res.ExpCksum = setCustomGs(lom, attrs)
 	res.Size = rc.Attrs.Size
 	res.R = rc
-	return
+	return res
 }
 
 func setCustomGs(lom *core.LOM, attrs *storage.ObjectAttrs) (expCksum *cos.Cksum) {
@@ -373,7 +383,7 @@ func setCustomGs(lom *core.LOM, attrs *storage.ObjectAttrs) (expCksum *cos.Cksum
 // PUT OBJECT
 //
 
-func (gcpp *gcpProvider) PutObj(r io.ReadCloser, lom *core.LOM) (errCode int, err error) {
+func (gcpp *gcpProvider) PutObj(r io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (errCode int, err error) {
 	var (
 		attrs    *storage.ObjectAttrs
 		written  int64
@@ -445,23 +455,38 @@ func readCredFile() (projectID string) {
 	return
 }
 
+const gcpErrPrefix = "gcp-error"
+
 func gcpErrorToAISError(gcpError error, bck *cmn.Bck) (int, error) {
-	switch {
-	case gcpError == storage.ErrBucketNotExist:
-		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
-	case gcpError == storage.ErrObjectNotExist:
-		return http.StatusNotFound, _gcpErr(gcpError)
-	default:
-		if apiErr, ok := gcpError.(*googleapi.Error); ok {
-			return apiErr.Code, _gcpErr(gcpError)
-		}
-		return http.StatusInternalServerError, _gcpErr(gcpError)
+	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+		nlog.InfoDepth(1, "begin "+gcpErrPrefix+" =========================")
+		nlog.InfoDepth(1, gcpError)
+		nlog.InfoDepth(1, "end "+gcpErrPrefix+" ===========================")
 	}
+	if gcpError == storage.ErrBucketNotExist {
+		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
+	}
+	err := _gcpErr(gcpError)
+	if gcpError == storage.ErrObjectNotExist {
+		return http.StatusNotFound, err
+	}
+	apiErr, ok := gcpError.(*googleapi.Error)
+	if !ok {
+		return http.StatusInternalServerError, err
+	}
+	if apiErr.Code == http.StatusForbidden && strings.Contains(apiErr.Error(), "may not exist") {
+		// HACK: "not found or misspelled" vs  "service not paid for" (the latter less likely)
+		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+			nlog.Infoln(err)
+		}
+		return http.StatusNotFound, err
+	}
+	return apiErr.Code, err
 }
 
 // (compare w/ _awsErr)
 func _gcpErr(gcpError error) error {
-	return errors.New("gcp-error[" + gcpError.Error() + "]")
+	return errors.New(gcpErrPrefix + "[" + gcpError.Error() + "]")
 }
 
 func handleObjectError(ctx context.Context, gcpClient *storage.Client, objErr error, bck *cmn.Bck) (int, error) {

@@ -46,8 +46,9 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadR
 }
 
 // Destroy ais buckets
-func destroyBuckets(c *cli.Context, buckets []cmn.Bck) error {
-	for _, bck := range buckets {
+func destroyBuckets(c *cli.Context, buckets []cmn.Bck) (cmn.Bck, error) {
+	for i := range buckets {
+		bck := buckets[i]
 		empty, errEmp := isBucketEmpty(bck, true /*cached*/)
 		if errEmp == nil && !empty {
 			if !flagIsSet(c, yesFlag) {
@@ -65,14 +66,14 @@ func destroyBuckets(c *cli.Context, buckets []cmn.Bck) error {
 		if cmn.IsStatusNotFound(err) {
 			err := &errDoesNotExist{what: "bucket", name: bck.Cname("")}
 			if !flagIsSet(c, ignoreErrorFlag) {
-				return err
+				return bck, err
 			}
-			fmt.Fprintln(c.App.ErrWriter, err.Error())
+			fmt.Fprintln(c.App.ErrWriter, err)
 			continue
 		}
-		return err
+		return bck, err
 	}
-	return nil
+	return cmn.Bck{}, nil
 }
 
 // Rename ais bucket
@@ -85,9 +86,13 @@ func mvBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 		return V(err)
 	}
 	_, xname := xact.GetKindName(apc.ActMoveBck)
-	text := fmt.Sprintf("%s[%s] %s => %s", xname, xid, bckFrom, bckTo)
+	text := fmt.Sprintf("%s %s => %s", xact.Cname(xname, xid), bckFrom, bckTo)
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
-		actionDone(c, text+". "+toMonitorMsg(c, xid, ""))
+		if flagIsSet(c, nonverboseFlag) {
+			fmt.Fprintln(c.App.Writer, xid)
+		} else {
+			actionDone(c, text+". "+toMonitorMsg(c, xid, ""))
+		}
 		return nil
 	}
 
@@ -98,8 +103,8 @@ func mvBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 	}
 	fmt.Fprintln(c.App.Writer, text+" ...")
 	xargs := xact.ArgsMsg{ID: xid, Kind: apc.ActMoveBck, Timeout: timeout}
-	if err := waitXact(apiBP, &xargs); err != nil {
-		fmt.Fprintf(c.App.Writer, fmtXactFailed, "rename", bckFrom, bckTo)
+	if err := waitXact(&xargs); err != nil {
+		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, "rename", bckFrom, bckTo)
 		return err
 	}
 	fmt.Fprint(c.App.Writer, fmtXactSucceeded)
@@ -117,8 +122,11 @@ func evictBucket(c *cli.Context, bck cmn.Bck) error {
 		return err
 	}
 	if !bck.IsQuery() {
-		if _, present := bmd.Get((*meta.Bck)(&bck)); !present {
-			return fmt.Errorf("%s does not exist - nothing to do", bck)
+		// check presence unless remais (in re: bck/@alias/name vs bck/@uuid/name)
+		if !bck.IsRemoteAIS() {
+			if _, present := bmd.Get((*meta.Bck)(&bck)); !present {
+				return fmt.Errorf("%s does not exist - nothing to do", bck)
+			}
 		}
 		return _evictBck(c, bck)
 	}
@@ -147,10 +155,15 @@ func _evictBck(c *cli.Context, bck cmn.Bck) (err error) {
 	if err = ensureRemoteProvider(bck); err != nil {
 		return err
 	}
-	if err = api.EvictRemoteBucket(apiBP, bck, flagIsSet(c, keepMDFlag)); err != nil {
+	keep := flagIsSet(c, keepMDFlag)
+	if err = api.EvictRemoteBucket(apiBP, bck, keep); err != nil {
 		return V(err)
 	}
-	actionDone(c, "Evicted bucket "+bck.Cname("")+" from aistore")
+	if !keep {
+		actionDone(c, "Evicted bucket "+bck.Cname("")+" from aistore")
+	} else {
+		actionDone(c, "Evicted "+bck.Cname("")+" contents from aistore: the bucket is now empty")
+	}
 	return nil
 }
 
@@ -166,11 +179,21 @@ func listOrSummBuckets(c *cli.Context, qbck cmn.QueryBcks, lsb lsbCtx) error {
 	// an exception - extending ais queries to include remote ais
 
 	if lsb.all && qbck.Ns.IsGlobal() && (qbck.Provider == apc.AIS || qbck.Provider == "") {
-		if _, err := api.GetRemoteAIS(apiBP); err == nil {
+		if remais, err := api.GetRemoteAIS(apiBP); err == nil && len(remais.A) > 0 {
 			qrais := qbck
 			qrais.Ns = cmn.NsAnyRemote
 			if brais, err := api.ListBuckets(apiBP, qrais, lsb.fltPresence); err == nil && len(brais) > 0 {
-				bcks = append(bcks, brais...)
+			outer:
+				for i := range brais {
+					bn := brais[i]
+					for j := range bcks {
+						bo := bcks[j]
+						if bn.Equal(&bo) {
+							continue outer
+						}
+					}
+					bcks = append(bcks, bn)
+				}
 			}
 		}
 	}
@@ -411,6 +434,10 @@ func configureNCopies(c *cli.Context, bck cmn.Bck, copies int) (err error) {
 	if xid, err = api.MakeNCopies(apiBP, bck, copies); err != nil {
 		return
 	}
+	if flagIsSet(c, nonverboseFlag) {
+		fmt.Fprintln(c.App.Writer, xid)
+		return nil
+	}
 	var baseMsg string
 	if copies > 1 {
 		baseMsg = fmt.Sprintf("Configured %s as %d-way mirror. ", bck.Cname(""), copies)
@@ -418,7 +445,7 @@ func configureNCopies(c *cli.Context, bck cmn.Bck, copies int) (err error) {
 		baseMsg = fmt.Sprintf("Configured %s for single-replica (no redundancy). ", bck.Cname(""))
 	}
 	actionDone(c, baseMsg+toMonitorMsg(c, xid, ""))
-	return
+	return nil
 }
 
 // erasure code the entire bucket
@@ -427,7 +454,11 @@ func ecEncode(c *cli.Context, bck cmn.Bck, data, parity int) (err error) {
 	if xid, err = api.ECEncodeBucket(apiBP, bck, data, parity); err != nil {
 		return
 	}
-	msg := fmt.Sprintf("Erasure-coding bucket %s. ", bck.Cname(""))
-	actionDone(c, msg+toMonitorMsg(c, xid, ""))
-	return
+	if flagIsSet(c, nonverboseFlag) {
+		fmt.Fprintln(c.App.Writer, xid)
+	} else {
+		msg := fmt.Sprintf("Erasure-coding bucket %s. ", bck.Cname(""))
+		actionDone(c, msg+toMonitorMsg(c, xid, ""))
+	}
+	return nil
 }

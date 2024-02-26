@@ -43,11 +43,12 @@ type (
 		// 4. `apc.QparamLatestVer`: get latest version from the associated Cloud bucket; see also: `ValidateWarmGet`
 		Query url.Values
 
-		// The field is exclusively used to facilitate Range Read.
-		// E.g. usage:
+		// The field is used to facilitate a) range read, and b) blob download
+		// E.g. range:
 		// * Header.Set(cos.HdrRange, fmt.Sprintf("bytes=%d-%d", fromOffset, toOffset))
-		// For range formatting, see the spec:
-		// * https://www.rfc-editor.org/rfc/rfc7233#section-2.1
+		//   For range formatting, see https://www.rfc-editor.org/rfc/rfc7233#section-2.1
+		// E.g. blob download:
+		// * Header.Set(apc.HdrBlobDownload, "true")
 		Header http.Header
 	}
 
@@ -153,8 +154,8 @@ func (oah *ObjAttrs) RespHeader() http.Header {
 	return oah.wrespHeader
 }
 
-// Writes the response body if GetArgs.Writer is specified;
-// otherwise, uses `io.Discard` to read all and discard
+// If GetArgs.Writer is specified GetObject will use it to write the response body;
+// otherwise, it'll `io.Discard` the latter.
 //
 // `io.Copy` is used internally to copy response bytes from the request to the writer.
 //
@@ -226,7 +227,7 @@ func GetObjectWithValidation(bp BaseParams, bck cmn.Bck, objName string, args *G
 
 // GetObjectReader returns reader of the requested object. It does not read body
 // bytes, nor validates a checksum. Caller is responsible for closing the reader.
-func GetObjectReader(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) (r io.ReadCloser, err error) {
+func GetObjectReader(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) (r io.ReadCloser, size int64, err error) {
 	_, q, hdr := args.ret()
 	q = bck.AddToQuery(q)
 	bp.Method = http.MethodGet
@@ -237,7 +238,7 @@ func GetObjectReader(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) 
 		reqParams.Query = q
 		reqParams.Header = hdr
 	}
-	r, err = reqParams.doReader()
+	r, size, err = reqParams.doReader()
 	FreeRp(reqParams)
 	return
 }

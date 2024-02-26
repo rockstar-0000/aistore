@@ -58,6 +58,7 @@ var (
 	startCommonFlags = []cli.Flag{
 		waitFlag,
 		waitJobXactFinishedFlag,
+		nonverboseFlag,
 	}
 	startSpecialFlags = map[string][]cli.Flag{
 		cmdDownload: {
@@ -82,10 +83,23 @@ var (
 			dryRunFlag,
 			verbObjPrefixFlag, // to disambiguate bucket/prefix vs bucket/objName
 			latestVerFlag,
+			blobThresholdFlag,
 		),
+		cmdBlobDownload: {
+			refreshFlag,
+			progressFlag,
+			listFlag,
+			chunkSizeFlag,
+			numWorkersFlag,
+			waitFlag,
+			waitJobXactFinishedFlag,
+			latestVerFlag,
+			nonverboseFlag,
+		},
 		cmdLRU: {
 			lruBucketsFlag,
 			forceFlag,
+			nonverboseFlag,
 		},
 	}
 
@@ -107,12 +121,24 @@ var (
 		Action:       startPrefetchHandler,
 		BashComplete: bucketCompletions(bcmplop{multiple: true}),
 	}
+	blobDownloadCmd = cli.Command{
+		Name: cmdBlobDownload,
+		Usage: "run a job to download large object(s) from remote storage to aistore cluster, e.g.:\n" +
+			indent1 + "\t- 'blob-download s3://ab/largefile --chunk-size=2mb --progress'\t- download one blob at a given chunk size\n" +
+			indent1 + "\t- 'blob-download s3://ab --list \"f1, f2\" --num-workers=4 --progress'\t- use 4 concurrent readers to download each of the 2 blobs\n" +
+			indent1 + "When _not_ using '--progress' option, run 'ais show job' to monitor.",
+		ArgsUsage:    objectArgument,
+		Flags:        startSpecialFlags[cmdBlobDownload],
+		Action:       blobDownloadHandler,
+		BashComplete: remoteBucketCompletions(bcmplop{multiple: true}),
+	}
 
 	jobStartSub = cli.Command{
 		Name:  commandStart,
 		Usage: "run batch job",
 		Subcommands: []cli.Command{
 			prefetchStartCmd,
+			blobDownloadCmd,
 			{
 				Name:      cmdDownload,
 				Usage:     "download files and objects from remote sources",
@@ -249,6 +275,7 @@ outer:
 				// - lru
 				// - make-n-copies
 				// - prefetch-listrange
+				// - blob-download
 				// - rebalance
 				// - resilver
 				continue outer
@@ -257,7 +284,7 @@ outer:
 		// add generic start handler on the fly
 		cmd := cli.Command{
 			Name:   xname,
-			Usage:  fmt.Sprintf("start %s", xname),
+			Usage:  "start " + xname,
 			Flags:  startCommonFlags,
 			Action: startXactionHandler,
 		}
@@ -294,17 +321,26 @@ func startXactionHandler(c *cli.Context) (err error) {
 }
 
 func startXactionKind(c *cli.Context, xname string) (err error) {
-	var bck cmn.Bck
+	var (
+		bck   cmn.Bck
+		extra string
+	)
 	if c.NArg() == 0 && xact.IsSameScope(xname, xact.ScopeB) {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
 	if c.NArg() > 0 && xact.IsSameScope(xname, xact.ScopeB, xact.ScopeGB) {
-		bck, err = parseBckURI(c, c.Args().Get(0), false)
+		uri := c.Args().Get(0)
+		if xname == apc.ActBlobDl {
+			bck, extra /*objName*/, err = parseBckObjURI(c, uri, false)
+		} else {
+			bck, err = parseBckURI(c, uri, false)
+		}
 		if err != nil {
 			return err
 		}
 	}
-	return startXaction(c, xname, bck, "" /*sid*/)
+	xargs := xact.ArgsMsg{Kind: xname, Bck: bck}
+	return startXaction(c, &xargs, extra)
 }
 
 func startResilverHandler(c *cli.Context) error {
@@ -316,20 +352,20 @@ func startResilverHandler(c *cli.Context) error {
 		}
 		tid = tsi.ID()
 	}
-	return startXaction(c, apc.ActResilver, cmn.Bck{}, tid)
+	xargs := xact.ArgsMsg{Kind: apc.ActResilver, DaemonID: tid}
+	return startXaction(c, &xargs, "")
 }
 
-func startXaction(c *cli.Context, xname string, bck cmn.Bck, sid string) error {
-	if !bck.IsQuery() {
-		if _, err := headBucket(bck, false /* don't add */); err != nil {
+func startXaction(c *cli.Context, xargs *xact.ArgsMsg, extra string) error {
+	if !xargs.Bck.IsQuery() {
+		if _, err := headBucket(xargs.Bck, false /* don't add */); err != nil {
 			return err
 		}
-	} else if xact.IsSameScope(xname, xact.ScopeB) {
-		return fmt.Errorf("%q requires bucket to run", xname)
+	} else if xact.IsSameScope(xargs.Kind, xact.ScopeB) {
+		return fmt.Errorf("%q requires bucket to run", xargs.Kind)
 	}
 
-	xargs := xact.ArgsMsg{Kind: xname, Bck: bck, DaemonID: sid}
-	xid, err := api.StartXaction(apiBP, &xargs)
+	xid, err := api.StartXaction(apiBP, xargs, extra)
 	if err != nil {
 		return V(err)
 	}
@@ -341,16 +377,17 @@ func startXaction(c *cli.Context, xname string, bck cmn.Bck, sid string) error {
 	}
 
 	debug.Assert(xact.IsValidUUID(xid), xid)
-	msg := "Started global rebalance. To monitor the progress, run 'ais show rebalance'"
-	if xname != apc.ActRebalance {
-		msg = fmt.Sprintf("Started %s[%s]. %s", xname, xid, toMonitorMsg(c, xid, ""))
+
+	if xargs.Kind == apc.ActRebalance {
+		actionDone(c, "Started global rebalance. To monitor the progress, run 'ais show rebalance'")
+	} else {
+		actionX(c, xargs, "")
 	}
-	actionDone(c, msg)
 
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
 		return nil
 	}
-	return waitJob(c, xname, xid, bck)
+	return waitJob(c, xargs.Kind, xid, xargs.Bck)
 }
 
 func startDownloadHandler(c *cli.Context) error {
@@ -599,7 +636,7 @@ func waitDownload(c *cli.Context, id string) (err error) {
 	var (
 		elapsed, timeout time.Duration
 		refreshRate      = _refreshRate(c)
-		qn               = fmt.Sprintf("%s[%s]", cmdDownload, id)
+		qn               = xact.Cname(cmdDownload, id)
 		aborted          bool
 	)
 	if flagIsSet(c, waitJobXactFinishedFlag) {
@@ -655,11 +692,11 @@ func startLRUHandler(c *cli.Context) (err error) {
 		id    string
 		xargs = xact.ArgsMsg{Kind: apc.ActLRU, Buckets: buckets, Force: flagIsSet(c, forceFlag)}
 	)
-	if id, err = api.StartXaction(apiBP, &xargs); err != nil {
+	if id, err = api.StartXaction(apiBP, &xargs, ""); err != nil {
 		return
 	}
 
-	fmt.Fprintf(c.App.Writer, "Started %s %s. %s\n", apc.ActLRU, id, toMonitorMsg(c, id, ""))
+	actionX(c, &xact.ArgsMsg{Kind: apc.ActLRU, ID: id}, "")
 	return
 }
 
@@ -759,7 +796,7 @@ func stopJobHandler(c *cli.Context) error {
 	// query
 	msg := formatXactMsg(xactID, xname, bck)
 	xargs := xact.ArgsMsg{ID: xactID, Kind: xactKind}
-	snap, err := getXactSnap(&xargs)
+	_, snap, err := getXactSnap(&xargs)
 	if err != nil {
 		return fmt.Errorf("cannot stop %s: %v", msg, err)
 	}
@@ -831,11 +868,11 @@ func stopXactionKindOrAll(c *cli.Context, xactKind, xname string, bck cmn.Bck) e
 func formatXactMsg(xactID, xactKind string, bck cmn.Bck) string {
 	var sb string
 	if !bck.IsQuery() {
-		sb = fmt.Sprintf(", %s", bck.Cname(""))
+		sb = ", " + bck.Cname("")
 	}
 	switch {
 	case xactKind != "" && xactID != "":
-		return fmt.Sprintf("%s[%s]%s", xactKind, xactID, sb)
+		return fmt.Sprintf("%s%s", xact.Cname(xactKind, xactID), sb)
 	case xactKind != "" && sb != "":
 		return fmt.Sprintf("%s%s", xactKind, sb)
 	case xactKind != "":
@@ -854,7 +891,7 @@ func stopDownloadRegex(c *cli.Context, regex string) error {
 	var cnt int
 	for _, dl := range dlList {
 		if err = api.AbortDownload(apiBP, dl.ID); err == nil {
-			actionDone(c, fmt.Sprintf("Stopped download job %s", dl.ID))
+			actionDone(c, "Stopped download job "+dl.ID)
 			cnt++
 		} else {
 			actionWarn(c, fmt.Sprintf("failed to stop download job %q: %v", dl.ID, err))
@@ -886,7 +923,7 @@ func stopDsortRegex(c *cli.Context, regex string) error {
 	var cnt int
 	for _, dsort := range dsortLst {
 		if err = api.AbortDsort(apiBP, dsort.ID); err == nil {
-			actionDone(c, fmt.Sprintf("Stopped dsort job %s", dsort.ID))
+			actionDone(c, "Stopped dsort job "+dsort.ID)
 			cnt++
 		} else {
 			actionWarn(c, fmt.Sprintf("failed to stop dsort job %q: %v", dsort.ID, err))
@@ -974,11 +1011,22 @@ func waitJob(c *cli.Context, name, xid string, bck cmn.Bck) error {
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		xargs.Timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
+
+	// find out the kind if not provided
+	if xargs.Kind == "" {
+		_, snap, err := getXactSnap(&xargs)
+		if err != nil {
+			return err
+		}
+		xargs.Kind = snap.Kind
+		_, xname = xact.GetKindName(xargs.Kind)
+	}
+
 	msg := formatXactMsg(xactID, xname, bck)
-	fmt.Fprintf(c.App.Writer, "Waiting for "+msg+" ...")
-	err := waitXact(apiBP, &xargs)
+	fmt.Fprintln(c.App.Writer, "Waiting for "+msg+" ...")
+	err := waitXact(&xargs)
 	if err == nil {
-		actionDone(c, " done.")
+		actionDone(c, "Done.")
 	}
 	return nil
 }
@@ -998,7 +1046,7 @@ func waitDownloadHandler(c *cli.Context, id string) error {
 	var (
 		total   time.Duration
 		timeout time.Duration
-		qn      = fmt.Sprintf("%s[%s]", cmdDownload, id)
+		qn      = xact.Cname(cmdDownload, id)
 	)
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
@@ -1042,7 +1090,7 @@ func waitDsortHandler(c *cli.Context, id string) error {
 	var (
 		total   time.Duration
 		timeout time.Duration
-		qn      = fmt.Sprintf("%s[%s]", cmdDsort, id)
+		qn      = xact.Cname(cmdDsort, id)
 	)
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)

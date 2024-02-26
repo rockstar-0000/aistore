@@ -1,6 +1,6 @@
 // Package config provides types and functions to configure AIS CLI.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package config
 
@@ -79,11 +79,12 @@ var (
 		"rmb":    "bucket rm",
 		"evict":  "bucket evict",
 		// job
-		"start":    "job start",
-		"stop":     "job stop",
-		"wait":     "job wait",
-		"dsort":    "job start dsort",
-		"download": "job start download",
+		"start":         "job start",
+		"stop":          "job stop",
+		"wait":          "job wait",
+		apc.ActDsort:    "job start " + apc.ActDsort,
+		apc.ActDownload: "job start " + apc.ActDownload,
+		apc.ActBlobDl:   "job start " + apc.ActBlobDl,
 	}
 )
 
@@ -122,7 +123,9 @@ func init() {
 /////////////////
 
 // compare w/ showAliasHandler(*cli.Context)
-func (a AliasConfig) String() (s string) {
+func (a AliasConfig) String() string { return a.Str("\t ") }
+
+func (a AliasConfig) Str(indent string) (s string) {
 	b := cos.StrKVs(a)
 	keys := b.Keys()
 	sort.Slice(keys, func(i, j int) bool { return b[keys[i]] < b[keys[j]] })
@@ -135,7 +138,7 @@ func (a AliasConfig) String() (s string) {
 		if next {
 			s += "; "
 			if len(s)-n > 60 {
-				s += "\n" + "\t "
+				s += "\n" + indent
 				n = len(s)
 			}
 		}

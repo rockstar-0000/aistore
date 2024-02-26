@@ -22,8 +22,7 @@ See also:
 The rest of this document is structured as follows:
 
 - [At a glance](#at-a-glance)
-- [ETL](#etl)
-- [Recently Added](#recently-added)
+- [Terminology](#terminology)
 - [Design Philosophy](#design-philosophy)
 - [Key Concepts and Diagrams](#key-concepts-and-diagrams)
 - [Traffic Patterns](#traffic-patterns)
@@ -38,7 +37,22 @@ The rest of this document is structured as follows:
 - [Other Services](#other-services)
 - [dSort](#dsort)
 - [CLI](#cli)
+- [ETL](#etl)
 - [_No limitations_ principle](#no-limitations-principle)
+
+## At a glance
+
+Following is a high-level **block diagram** with an emphasis on supported frontend and backend APIs, and the capability to scale-out horizontally. The picture also tries to make the point that AIS aggregates an arbitrary numbers of storage servers ("targets") with local or locally accessible drives, whereby each drive is formatted with a local filesystem of choice (e.g., xfs or zfs).
+
+![At-a-Glance](images/cluster-block-2024.png)
+
+In any aistore cluster, there are **two kinds of nodes**: proxies (a.k.a. gateways) and storage nodes (targets):
+
+![Proxies and Targets](images/proxy-target-block-2024.png)
+
+Proxies provide access points ("endpoints") for the frontend API. At any point in time there is a single **primary** proxy that also controls versioning and distribution of the current cluster map. When and if the primary fails, another proxy is majority-elected to perform the (primary) role.
+
+All user data is equally distributed (or [balanced](/docs/rebalance.md)) across all storage nodes ("targets"). Which, combined with zero (I/O routing and metadata processing) overhead, provides for linear scale with no limitation on the total number of aggregated storage drives.
 
 ## Terminology
 
@@ -53,30 +67,6 @@ The rest of this document is structured as follows:
    - in a typical deployment, the total number of mountpaths would compute as a direct product of (number of storage targets) x (number of disks in each target).
 
 * [Xaction](/xact/README.md) - asynchronous batch operations that may take many seconds (minutes, hours, etc.) to execute - are called *eXtended actions* or simply *xactions*. CLI and [CLI documentation](/docs/cli) refers to such operations as **jobs** - the more familiar term that can be used interchangeably. Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, archiving multiple objects, copying buckets, and many more. All [eXtended actions](/xact/README.md) support generic [API](/api/xaction.go) and [CLI](/docs/cli/job.md#show-job-statistics) to show both common counters (byte and object numbers) as well as operation-specific extended statistics.
-
-## At a glance
-
-Following is a high-level block diagram with an emphasis on supported frontend and backend APIs, and the capability to scale-out horizontally. The picture also tries to make the point that AIS aggregates arbitrary numbers of storage servers with local drive(s), whereby each drive is formatted with a local filesystem of choice (e.g., xfs or zfs).
-
-![At-a-Glance](images/ais-block.png)
-
-All user data is at any point in time equally [balanced](/docs/rebalance.md) across all storage nodes (aka "targets"). Which, combined with zero (I/O routing and metadata processing) overhead, provides for linear scale with no limitation on the total number of aggregated storage drives.
-
-## ETL
-
-AIStore is a hyper-converged architecture tailored specifically to run [extract-transform-load](/ext/etl/README.md) workloads - run them close to data and on (and by) all storage nodes in parallel:
-
-![etl-v3.3](images/etl-v3.3.png)
-
-For background and further references, see:
-
-* [Extract, Transform, Load with AIStore](etl.md)
-* [AIS-ETL introduction and a Jupyter notebook walk-through](https://www.youtube.com/watch?v=4PHkqTSE0ls)
-
-## Recently Added
-
-- [v3.16](https://github.com/NVIDIA/aistore/releases/tag/v1.3.16)
-- [v3.12](https://github.com/NVIDIA/aistore/releases/tag/v1.3.15)
 
 ## Design Philosophy
 
@@ -155,6 +145,7 @@ It is worth emphasizing that the same rules of data protection and consistency a
 * copy bucket; transform bucket;
 * multi-object copy; multi-object transform; multi-object archive;
 * prefetch remote bucket;
+* download very large remote objects (blobs);
 * rename bucket;
 * promote NFS share
 
@@ -186,6 +177,9 @@ To this end, AIS provides 6 (six) easy ways ranging from the conventional on-dem
 4. [HTTP(S) Datasets](#existing-datasets-https-datasets)
 5. [Promote local or shared files](#promote-local-or-shared-files)
 6. [Backend Bucket](bucket.md#backend-bucket)
+7. [Download very large objects (BLOBs)](/docs/cli/blob-downloader.md)
+8. [Copy remote bucket](/docs/cli/bucket.md#copy-bucket)
+9. [Copy multiple remote objects](/docs/cli/bucket.md#copy-multiple-objects)
 
 In particular:
 
@@ -202,6 +196,10 @@ In all other cases, AIS will service the GET request without going to Cloud.
 ### Existing Datasets: Batch Prefetch
 
 Alternatively or in parallel, you can also *prefetch* a flexibly-defined *list* or *range* of objects from any given remote bucket, as described in [this readme](batch.md).
+
+For CLI usage, see:
+
+* [CLI: prefetch](/docs/cli/object.md#prefetch-objects)
 
 ### Existing Datasets: integrated Downloader
 
@@ -386,6 +384,18 @@ One salient feature of AIS CLI is its Bash style [auto-completions](/docs/cli.md
 ![CLI-tab](images/cli-overview.gif)
 
 AIS CLI is currently quickly developing. For more information, please see the project's own [README](/docs/cli.md).
+
+## ETL
+
+AIStore is a hyper-converged architecture tailored specifically to run [extract-transform-load](/ext/etl/README.md) workloads - run them close to data and on (and by) all storage nodes in parallel:
+
+![etl-v3.3](images/etl-v3.3.png)
+
+For background and further references, see:
+
+* [Extract, Transform, Load with AIStore](etl.md)
+* [AIS-ETL introduction and a Jupyter notebook walk-through](https://www.youtube.com/watch?v=4PHkqTSE0ls)
+
 
 ## _No limitations_ principle
 

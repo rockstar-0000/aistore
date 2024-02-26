@@ -20,7 +20,7 @@ import (
 )
 
 // Start xaction
-func StartXaction(bp BaseParams, args *xact.ArgsMsg) (xid string, err error) {
+func StartXaction(bp BaseParams, args *xact.ArgsMsg, extra string) (xid string, err error) {
 	if !xact.Table[args.Kind].Startable {
 		return "", fmt.Errorf("xaction %q is not startable", args.Kind)
 	}
@@ -28,7 +28,7 @@ func StartXaction(bp BaseParams, args *xact.ArgsMsg) (xid string, err error) {
 	if args.Force {
 		q.Set(apc.QparamForce, "true")
 	}
-	msg := apc.ActMsg{Action: apc.ActXactStart, Value: args}
+	msg := apc.ActMsg{Action: apc.ActXactStart, Value: args, Name: extra}
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
 	{
@@ -88,7 +88,7 @@ func GetAllRunningXactions(bp BaseParams, kindOrName string) (out []string, err 
 func QueryXactionSnaps(bp BaseParams, args *xact.ArgsMsg) (xs xact.MultiSnap, err error) {
 	msg := xact.QueryMsg{ID: args.ID, Kind: args.Kind, Bck: args.Bck}
 	if args.OnlyRunning {
-		msg.OnlyRunning = apc.Bool(true)
+		msg.OnlyRunning = apc.Ptr(true)
 	}
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
@@ -138,7 +138,7 @@ func getxst(out any, q url.Values, bp BaseParams, args *xact.ArgsMsg) (err error
 	bp.Method = http.MethodGet
 	msg := xact.QueryMsg{ID: args.ID, Kind: args.Kind, Bck: args.Bck}
 	if args.OnlyRunning {
-		msg.OnlyRunning = apc.Bool(true)
+		msg.OnlyRunning = apc.Ptr(true)
 	}
 	reqParams := AllocRp()
 	{

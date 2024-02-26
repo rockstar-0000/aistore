@@ -152,7 +152,7 @@ func (t *target) stopETL(w http.ResponseWriter, r *http.Request, etlName string)
 	}
 }
 
-func (t *target) doETL(w http.ResponseWriter, r *http.Request, etlName string, bck *meta.Bck, objName string) {
+func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, bck *meta.Bck, objName string) {
 	var (
 		comm etl.Communicator
 		err  error
@@ -265,8 +265,12 @@ func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lom := core.AllocLOM(objName)
-	t.getObject(w, r, dpq, bck, lom)
+	lom, err = t.getObject(w, r, dpq, bck, lom)
 	core.FreeLOM(lom)
+
+	if err != nil {
+		t._erris(w, r, dpq.silent, err, 0)
+	}
 	dpqFree(dpq)
 }
 
@@ -286,7 +290,7 @@ func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lom := core.AllocLOM(objName)
-	errCode, err := t.objhead(w.Header(), r.URL.Query(), bck, lom)
+	errCode, err := t.objHead(w.Header(), r.URL.Query(), bck, lom)
 	core.FreeLOM(lom)
 	if err != nil {
 		// always silent (compare w/ httpobjhead)

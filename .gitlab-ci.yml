@@ -104,7 +104,7 @@ variables:
   stage: test-long
   tags:
     - ais
-  timeout: 3h
+  timeout: 200m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "web"'
@@ -116,7 +116,7 @@ variables:
   stage: test-long
   tags:
     - ais
-  timeout: 3h
+  timeout: 200m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
@@ -266,6 +266,32 @@ test:short:s3rproxy:
     - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
     - make test-short
 
+test:short:aws:
+  <<: *test_short_skip_scheduled_def
+  variables:
+    BUCKET: "aws://ais-cicd"
+  script:
+    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws
+    - make test-short
+
+test:short:gcp:
+  <<: *test_short_skip_scheduled_def
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcs.json"
+    BUCKET: "gs://ais-ci"
+  script:
+    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
+    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
+    - make test-short
+
+test:short:azure:
+  <<: *test_short_skip_scheduled_def
+  variables:
+    BUCKET: "az://ais-ci"
+  script:
+    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
+    - make test-short
+
 test:long:
   <<: *test_long_skip_scheduled_def
   variables:
@@ -295,17 +321,26 @@ test:long:gcp:
     - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
     - make test-long
 
-test:long:hdfs:
-  image: aistorage/hdfs-ci
-  <<: *test_long_skip_scheduled_def
+test:long:azure:
+  <<: *test_long_def
   variables:
     NUM_PROXY: 6
-    BUCKET: "hdfs://ais-ci"
+    BUCKET: "az://ais-ci"
   script:
-    - bash deploy/ci/setup_hdfs.sh
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --hdfs
-    - ais bucket create "${BUCKET}" --props="extra.hdfs.ref_directory=/"
+    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
     - make test-long
+
+# test:long:hdfs:
+#   image: aistorage/hdfs-ci
+#   <<: *test_long_skip_scheduled_def
+#   variables:
+#     NUM_PROXY: 6
+#     BUCKET: "hdfs://ais-ci"
+#   script:
+#     - bash deploy/ci/setup_hdfs.sh
+#     - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --hdfs
+#     - ais bucket create "${BUCKET}" --props="extra.hdfs.ref_directory=/"
+#     - make test-long
 
 test:long:aisloader:
   stage: test-long
@@ -395,7 +430,7 @@ test:short:assorted:k8s:
 test:long:k8s:
   stage: test-long
   <<: *test_k8s_long_def
-  timeout: 3h
+  timeout: 200m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
@@ -413,7 +448,7 @@ test:long:k8s:
 test:long:k8s:single-target:
   stage: test-long
   <<: *test_k8s_long_def
-  timeout: 3h
+  timeout: 200m
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'

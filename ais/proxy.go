@@ -43,8 +43,7 @@ import (
 )
 
 const (
-	fmtNotRemote = "%q is AIS (ais://) bucket - expecting remote bucket"
-	lsotag       = "list-objects"
+	lsotag = "list-objects"
 )
 
 type (
@@ -819,8 +818,8 @@ func (p *proxy) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *ap
 	// 3. action
 	switch msg.Action {
 	case apc.ActEvictRemoteBck:
-		if !bck.IsRemote() {
-			p.writeErrf(w, r, fmtNotRemote, bck.Name)
+		if err := cmn.ValidateRemoteBck(apc.ActEvictRemoteBck, bck.Bucket()); err != nil {
+			p.writeErr(w, r, err)
 			return
 		}
 		keepMD := cos.IsParseBool(apireq.query.Get(apc.QparamKeepRemote))
@@ -860,12 +859,14 @@ func (p *proxy) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *ap
 			}
 		}
 	case apc.ActDeleteObjects, apc.ActEvictObjects:
-		var xid string
-		if msg.Action == apc.ActEvictObjects && bck.IsAIS() {
-			p.writeErrf(w, r, fmtNotRemote, bck.Name)
-			return
+		if msg.Action == apc.ActEvictObjects {
+			if err := cmn.ValidateRemoteBck(apc.ActEvictRemoteBck, bck.Bucket()); err != nil {
+				p.writeErr(w, r, err)
+				return
+			}
 		}
-		if xid, err = p.listrange(r.Method, bck.Name, msg, apireq.query); err != nil {
+		xid, err := p.listrange(r.Method, bck.Name, msg, apireq.query)
+		if err != nil {
 			p.writeErr(w, r, err)
 			return
 		}
@@ -1319,8 +1320,8 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		return
 	case apc.ActPrefetchObjects:
 		// TODO: GET vs SYNC?
-		if bck.IsAIS() {
-			p.writeErrf(w, r, fmtNotRemote, bucket)
+		if err := cmn.ValidateRemoteBck(apc.ActPrefetchObjects, bck.Bucket()); err != nil {
+			p.writeErr(w, r, err)
 			return
 		}
 		if xid, err = p.listrange(r.Method, bucket, msg, query); err != nil {
@@ -1545,12 +1546,8 @@ func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	} else {
 		ok = p.writeJS(w, r, lst, lsotag)
 	}
-	if !ok {
-		// TODO -- FIXME: abort x-lso (e.g., `ls very-large-cloud-bucket` followed by Ctrl-C)
-		if false {
-			p._lstop(amsg, lst)
-		}
-		return
+	if !ok && cmn.Rom.FastV(4, cos.SmoduleAIS) {
+		nlog.Errorln("failed to transmit list-objects page (TCP RST?)")
 	}
 
 	// GC
@@ -1623,27 +1620,6 @@ func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, smap 
 	return lst, err
 }
 
-func (p *proxy) _lstop(amsg *apc.ActMsg, lst *cmn.LsoResult) {
-	body := cos.MustMarshal(apc.ActMsg{Action: apc.ActXactStop, Value: xact.ArgsMsg{ID: lst.UUID, Kind: amsg.Action}})
-	args := allocBcArgs()
-	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: apc.URLPathXactions.S, Body: body}
-	args.to = core.Targets
-	results := p.bcastGroup(args)
-	freeBcArgs(args)
-	ok := true
-	for _, res := range results {
-		if res.err != nil {
-			ok = false
-			nlog.Warningf("failed to stop %s[%s]: %v", amsg.Action, lst.UUID, res.toErr())
-			break
-		}
-	}
-	freeBcastRes(results)
-	if ok {
-		nlog.Infof("stopped %s[%s]", amsg.Action, lst.UUID)
-	}
-}
-
 // list-objects flow control helper
 func (p *proxy) _lsofc(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (tsi *meta.Snode, listRemote, wantOnlyRemote bool, err error) {
 	listRemote = bck.IsRemote() && !lsmsg.IsFlagSet(apc.LsObjCached)
@@ -1703,12 +1679,14 @@ func (p *proxy) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *apiR
 		return
 	}
 
-	// TODO: revisit versus remote bucket not being present, see p.tryBckInit
 	bck := apireq.bck
-	if err := bck.Init(p.owner.bmd); err != nil {
-		p.writeErr(w, r, err)
+	bckArgs := bctx{p: p, w: w, r: r, msg: msg, perms: apc.AcePUT, bck: bck}
+	bckArgs.createAIS = false
+	bckArgs.dontHeadRemote = true
+	if _, err := bckArgs.initAndTry(); err != nil {
 		return
 	}
+
 	switch msg.Action {
 	case apc.ActRenameObject:
 		if err := p.checkAccess(w, r, bck, apc.AceObjMOVE); err != nil {
@@ -1722,8 +1700,15 @@ func (p *proxy) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *apiR
 			p.writeErrActf(w, r, msg.Action, "not supported for erasure-coded buckets (%s)", bck)
 			return
 		}
-		p.objMv(w, r, bck, apireq.items[1], msg)
-		return
+		objName, objNameTo := apireq.items[1], msg.Name
+		if objName == objNameTo {
+			p.writeErrMsg(w, r, "cannot rename "+bck.Cname(objName)+" to self, nothing to do")
+			return
+		}
+		if !p.isValidObjname(w, r, objNameTo) {
+			return
+		}
+		p.redirectObjAction(w, r, bck, apireq.items[1], msg)
 	case apc.ActPromote:
 		if err := p.checkAccess(w, r, bck, apc.AcePromote); err != nil {
 			return
@@ -1757,6 +1742,16 @@ func (p *proxy) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *apiR
 			return
 		}
 		w.Write([]byte(xid))
+	case apc.ActBlobDl:
+		if err := p.checkAccess(w, r, bck, apc.AccessRW); err != nil {
+			return
+		}
+		if err := cmn.ValidateRemoteBck(apc.ActBlobDl, bck.Bucket()); err != nil {
+			p.writeErr(w, r, err)
+			return
+		}
+		objName := msg.Name
+		p.redirectObjAction(w, r, bck, objName, msg)
 	default:
 		p.writeErrAct(w, r, msg.Action)
 	}
@@ -2108,7 +2103,7 @@ func (p *proxy) lsObjsA(bck *meta.Bck, lsmsg *apc.LsoMsg) (allEntries *cmn.LsoRe
 		flags     uint32
 	)
 	if lsmsg.PageSize == 0 {
-		lsmsg.PageSize = apc.DefaultPageSizeAIS
+		lsmsg.PageSize = apc.MaxPageSizeAIS
 	}
 	pageSize := lsmsg.PageSize
 
@@ -2260,18 +2255,8 @@ func (p *proxy) lsObjsR(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX, tsi *meta
 	return cmn.MergeLso(resLists, 0), nil
 }
 
-func (p *proxy) objMv(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string, msg *apc.ActMsg) {
-	var (
-		started   = time.Now()
-		objNameTo = msg.Name
-	)
-	if objName == objNameTo {
-		p.writeErrMsg(w, r, "the new and the current name are the same")
-		return
-	}
-	if !p.isValidObjname(w, r, objNameTo) {
-		return
-	}
+func (p *proxy) redirectObjAction(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string, msg *apc.ActMsg) {
+	started := time.Now()
 	smap := p.owner.smap.get()
 	si, err := smap.HrwName2T(bck.MakeUname(objName))
 	if err != nil {

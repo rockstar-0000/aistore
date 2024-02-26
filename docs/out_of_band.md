@@ -1,3 +1,12 @@
+---
+layout: post
+title: Out-of-band updates
+permalink: /docs/out_of_band
+redirect_from:
+ - /out_of_band.md/
+ - /docs/out_of_band.md/
+---
+
 ## Out-of-band updates
 
 One (but not the only one) way to deal with out-of-band updates is to configure bucket as follows:
@@ -55,6 +64,7 @@ OPTIONS:
 ### See also
 
 * [`ais cp` command](/docs/cli/bucket.md) and, in particular, its `--sync` option.
+- [Example copying buckets and multi-objects with simultaneous synchronization](/docs/cli/bucket.md#example-copying-buckets-and-multi-objects-with-simultaneous-synchronization)
 
 ## Out-of-band writes, deletes, and more
 
@@ -194,3 +204,8 @@ version          KJOQsGcR3qBX5WvXbwiB.2LAQW12opbQ
 ```
 
 Notice that we now have the latest `KJOQsGc...` version (that `s3api` also calls `VersionIdMarker`).
+
+## References
+
+* [`ais cp` command](/docs/cli/bucket.md) and, in particular, its `--sync` option.
+- [Example copying buckets and multi-objects with simultaneous synchronization](/docs/cli/bucket.md#example-copying-buckets-and-multi-objects-with-simultaneous-synchronization)

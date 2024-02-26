@@ -61,6 +61,14 @@ func (b *Bck) Cname(name string) string     { return (*cmn.Bck)(b).Cname(name) }
 func (b *Bck) IsEmpty() bool                { return (*cmn.Bck)(b).IsEmpty() }
 func (b *Bck) HasVersioningMD() bool        { return (*cmn.Bck)(b).HasVersioningMD() }
 
+func (b *Bck) IsRemoteS3() bool {
+	if b.Provider == apc.AWS {
+		return true
+	}
+	backend := b.Backend()
+	return backend != nil && backend.Provider == apc.AWS
+}
+
 func (b *Bck) NewQuery() url.Values               { return (*cmn.Bck)(b).NewQuery() }
 func (b *Bck) AddToQuery(q url.Values) url.Values { return (*cmn.Bck)(b).AddToQuery(q) }
 
@@ -242,4 +250,27 @@ func (b *Bck) checkAccess(bit apc.AccessAttrs) (err error) {
 	op := apc.AccessOp(bit)
 	err = cmn.NewBucketAccessDenied(b.String(), op, b.Props.Access)
 	return
+}
+
+func (b *Bck) MaxPageSize() uint {
+	switch b.Provider {
+	case apc.AIS:
+		return apc.MaxPageSizeAIS
+	case apc.AWS:
+		// ref:
+		// - https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-serverside
+		// - https://docs.openstack.org/swift/latest/api/pagination.html
+		if b == nil || b.Props == nil || b.Props.Extra.AWS.MaxPageSize == 0 {
+			return apc.MaxPageSizeAWS
+		}
+		return b.Props.Extra.AWS.MaxPageSize
+	case apc.GCP:
+		// ref: https://cloud.google.com/storage/docs/json_api/v1/objects/list#parameters
+		return apc.MaxPageSizeGCP
+	case apc.Azure:
+		// ref: https://docs.microsoft.com/en-us/connectors/azureblob/#general-limits
+		return apc.MaxPageSizeAzure
+	default:
+		return 1000
+	}
 }

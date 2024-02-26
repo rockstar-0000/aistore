@@ -1,10 +1,11 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -14,30 +15,89 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"time"
 
+	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 )
 
-const fmtErrBO = "bucket and object names are required to complete multipart upload (have %v)"
+func decodeXML[T any](body []byte) (result T, _ error) {
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return result, err
+	}
+	return result, nil
+}
 
-// Copy another object or its range as a part of the multipart upload.
-// Body is empty, everything in the query params and the header.
-// https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html
-// TODO: not implemented yet
-func (*target) putMptCopy(w http.ResponseWriter, r *http.Request, items []string) {
-	if len(items) < 2 {
-		err := fmt.Errorf(fmtErrBO, items)
+func multiWriter(writers ...io.Writer) io.Writer {
+	a := make([]io.Writer, 0, 3)
+	for _, w := range writers {
+		if w != nil {
+			a = append(a, w)
+		}
+	}
+	return io.MultiWriter(a...)
+}
+
+// Initialize multipart upload.
+// - Generate UUID for the upload
+// - Return the UUID to a caller
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html
+func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string, bck *meta.Bck, q url.Values) {
+	var (
+		objName  = s3.ObjName(items)
+		lom      = &core.LOM{ObjName: objName}
+		uploadID string
+		errCode  int
+	)
+	err := lom.InitBck(bck.Bucket())
+	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-	s3.WriteErr(w, r, errors.New("not implemented yet"), http.StatusNotImplemented)
+	if bck.IsRemoteS3() {
+		pts := s3.NewPassThroughSignedReq(g.client.control, r, lom, nil, q)
+		resp, err := pts.Do()
+		if err != nil {
+			s3.WriteErr(w, r, err, resp.StatusCode)
+			return
+		}
+		if resp != nil {
+			result, err := decodeXML[s3.InitiateMptUploadResult](resp.Body)
+			if err != nil {
+				s3.WriteErr(w, r, err, http.StatusBadRequest)
+				return
+			}
+
+			s3.InitUpload(result.UploadID, result.Bucket, result.Key)
+			w.Header().Set(cos.HdrContentType, cos.ContentXML)
+			w.Write(resp.Body)
+			return
+		}
+		uploadID, errCode, err = backend.StartMpt(lom)
+		if err != nil {
+			s3.WriteErr(w, r, err, errCode)
+			return
+		}
+	} else {
+		uploadID = cos.GenUUID()
+	}
+
+	s3.InitUpload(uploadID, bck.Name, objName)
+	result := &s3.InitiateMptUploadResult{Bucket: bck.Name, Key: objName, UploadID: uploadID}
+
+	sgl := t.gmm.NewSGL(0)
+	result.MustMarshal(sgl)
+	w.Header().Set(cos.HdrContentType, cos.ContentXML)
+	sgl.WriteTo(w)
+	sgl.Free()
 }
 
 // PUT a part of the multipart upload.
@@ -48,11 +108,7 @@ func (*target) putMptCopy(w http.ResponseWriter, r *http.Request, items []string
 //
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html
 func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []string, q url.Values, bck *meta.Bck) {
-	if len(items) < 2 {
-		err := fmt.Errorf(fmtErrBO, items)
-		s3.WriteErr(w, r, err, 0)
-		return
-	}
+	// 1. parse/validate
 	uploadID := q.Get(s3.QparamMptUploadID)
 	if uploadID == "" {
 		s3.WriteErr(w, r, errors.New("empty uploadId"), 0)
@@ -74,96 +130,99 @@ func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []stri
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-	if r.Header.Get(cos.S3HdrObjSrc) != "" {
-		s3.WriteErr(w, r, errors.New("uploading a copy is not supported yet"), http.StatusNotImplemented)
-		return
-	}
 
+	// 2. init lom, create part file
 	objName := s3.ObjName(items)
 	lom := &core.LOM{ObjName: objName}
-	err = lom.InitBck(bck.Bucket())
-	if err != nil {
+	if err := lom.InitBck(bck.Bucket()); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-
-	prefix := fmt.Sprintf("%s.%d", uploadID, partNum) // workfile name format: <upload-id>.<part-number>.<obj-name>
+	// workfile name format: <upload-id>.<part-number>.<obj-name>
+	prefix := uploadID + "." + strconv.FormatInt(int64(partNum), 10)
 	wfqn := fs.CSM.Gen(lom, fs.WorkfileType, prefix)
-	fh, err := os.Create(wfqn)
-	if err != nil {
-		s3.WriteErr(w, r, err, 0)
+	partFh, errC := lom.CreateFileRW(wfqn)
+	if errC != nil {
+		s3.WriteMptErr(w, r, errC, 0, lom, uploadID)
 		return
 	}
 
+	// 3. write
 	var (
-		buf, slab = t.gmm.Alloc()
-		cksumMD5  = cos.NewCksumHash(cos.ChecksumMD5)
-		cksumSHA  *cos.CksumHash
-		partSHA   string
-		mwriter   io.Writer
+		etag         string
+		errCode      int
+		partSHA      = r.Header.Get(cos.S3HdrContentSHA256)
+		checkPartSHA = partSHA != "" && partSHA != cos.S3UnsignedPayload
+		buf, slab    = t.gmm.Alloc()
+		cksumSHA     = &cos.CksumHash{}
+		cksumMD5     = &cos.CksumHash{}
+		remote       = bck.IsRemoteS3()
 	)
-	if partSHA = r.Header.Get(cos.S3HdrContentSHA256); partSHA != "" {
+	if checkPartSHA {
 		cksumSHA = cos.NewCksumHash(cos.ChecksumSHA256)
-		mwriter = io.MultiWriter(cksumMD5.H, cksumSHA.H, fh)
-	} else {
-		mwriter = io.MultiWriter(cksumMD5.H, fh)
 	}
-	size, err := io.CopyBuffer(mwriter, r.Body, buf)
-	cos.Close(fh)
+	if !remote {
+		cksumMD5 = cos.NewCksumHash(cos.ChecksumMD5)
+	}
+	mw := multiWriter(cksumMD5.H, cksumSHA.H, partFh)
+	size, err := io.CopyBuffer(mw, r.Body, buf)
 	slab.Free(buf)
+
+	// 4. rewind and call s3 API
+	if err == nil && remote {
+		if _, err = partFh.Seek(0, io.SeekStart); err == nil {
+			var (
+				resp *s3.PassThroughSignedResp
+				pts  = s3.NewPassThroughSignedReq(g.client.data, r, lom, partFh, q)
+			)
+			resp, err = pts.Do()
+			if resp != nil {
+				errCode = resp.StatusCode
+				etag = cmn.UnquoteCEV(resp.Header.Get(cos.HdrETag))
+			} else {
+				etag, errCode, err = backend.PutMptPart(lom, partFh, uploadID, partNum, size)
+			}
+		}
+	}
+
+	cos.Close(partFh)
 	if err != nil {
-		if nerr := cos.RemoveFile(wfqn); nerr != nil {
+		if nerr := cos.RemoveFile(wfqn); nerr != nil && !os.IsNotExist(nerr) {
 			nlog.Errorf(fmtNested, t, err, "remove", wfqn, nerr)
 		}
-		s3.WriteErr(w, r, err, 0)
+		s3.WriteMptErr(w, r, err, errCode, lom, uploadID)
 		return
 	}
-	cksumMD5.Finalize()
-	if partSHA != "" {
+
+	// 5. finalize part
+	// expecting the part's remote etag to be md5 checksum, not computing otherwise
+	md5 := etag
+	if cksumMD5.H != nil {
+		debug.Assert(etag == "")
+		cksumMD5.Finalize()
+		md5 = cksumMD5.Value()
+	}
+	if checkPartSHA {
 		cksumSHA.Finalize()
 		recvSHA := cos.NewCksum(cos.ChecksumSHA256, partSHA)
 		if !cksumSHA.Equal(recvSHA) {
 			detail := fmt.Sprintf("upload %q, %s, part %d", uploadID, lom, partNum)
 			err = cos.NewErrDataCksum(&cksumSHA.Cksum, recvSHA, detail)
-			s3.WriteErr(w, r, err, http.StatusInternalServerError)
+			s3.WriteMptErr(w, r, err, http.StatusInternalServerError, lom, uploadID)
 			return
 		}
 	}
-
 	npart := &s3.MptPart{
-		MD5:  cksumMD5.Value(),
+		MD5:  md5,
 		FQN:  wfqn,
 		Size: size,
 		Num:  partNum,
 	}
 	if err := s3.AddPart(uploadID, npart); err != nil {
-		s3.WriteErr(w, r, err, 0)
+		s3.WriteMptErr(w, r, err, 0, lom, uploadID)
 		return
 	}
-	w.Header().Set(cos.S3CksumHeader, cksumMD5.Value()) // s3cmd checks this one
-}
-
-// Initialize multipart upload.
-// - Generate UUID for the upload
-// - Return the UUID to a caller
-// https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html
-func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string, bck *meta.Bck) {
-	objName := s3.ObjName(items)
-	lom := core.LOM{ObjName: objName}
-	if err := lom.InitBck(bck.Bucket()); err != nil {
-		s3.WriteErr(w, r, err, 0)
-		return
-	}
-
-	uploadID := cos.GenUUID()
-	s3.InitUpload(uploadID, bck.Name, objName)
-	result := &s3.InitiateMptUploadResult{Bucket: bck.Name, Key: objName, UploadID: uploadID}
-
-	sgl := t.gmm.NewSGL(0)
-	result.MustMarshal(sgl)
-	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	sgl.WriteTo(w)
-	sgl.Free()
+	w.Header().Set(cos.S3CksumHeader, md5) // s3cmd checks this one
 }
 
 // Complete multipart upload.
@@ -173,19 +232,204 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 // 3. Return ETag to a caller
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
 func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []string, q url.Values, bck *meta.Bck) {
+	// parse/validate
 	uploadID := q.Get(s3.QparamMptUploadID)
 	if uploadID == "" {
 		s3.WriteErr(w, r, errors.New("empty uploadId"), 0)
 		return
 	}
-	decoder := xml.NewDecoder(r.Body)
-	partList := &s3.CompleteMptUpload{}
-	if err := decoder.Decode(partList); err != nil {
-		s3.WriteErr(w, r, err, 0)
+
+	output, err := io.ReadAll(r.Body)
+	if err != nil {
+		s3.WriteErr(w, r, err, http.StatusBadRequest)
+		return
+	}
+	partList, err := decodeXML[*s3.CompleteMptUpload](output)
+	if err != nil {
+		s3.WriteErr(w, r, err, http.StatusBadRequest)
 		return
 	}
 	if len(partList.Parts) == 0 {
-		s3.WriteErr(w, r, errors.New("empty list of upload parts"), 0)
+		s3.WriteErr(w, r, fmt.Errorf("upload %q: empty list of upload parts", uploadID), 0)
+		return
+	}
+	objName := s3.ObjName(items)
+	lom := &core.LOM{ObjName: objName}
+	if err := lom.InitBck(bck.Bucket()); err != nil {
+		s3.WriteErr(w, r, err, 0)
+		return
+	}
+	size, errN := s3.ObjSize(uploadID)
+	if errN != nil {
+		s3.WriteMptErr(w, r, errN, 0, lom, uploadID)
+		return
+	}
+
+	// call s3
+	var (
+		etag    string
+		started = time.Now()
+		remote  = bck.IsRemoteS3()
+	)
+	if remote {
+		pts := s3.NewPassThroughSignedReq(g.client.control, r, lom, io.NopCloser(bytes.NewReader(output)), q)
+		resp, err := pts.Do()
+		if err != nil {
+			s3.WriteErr(w, r, err, resp.StatusCode)
+			return
+		} else if resp != nil {
+			result, err := decodeXML[s3.CompleteMptUploadResult](resp.Body)
+			if err != nil {
+				s3.WriteErr(w, r, err, http.StatusBadRequest)
+				return
+			}
+
+			etag = result.ETag
+		} else {
+			v, errCode, err := backend.CompleteMpt(lom, uploadID, partList)
+			if err != nil {
+				s3.WriteMptErr(w, r, err, errCode, lom, uploadID)
+				return
+			}
+			etag = v
+		}
+	}
+
+	// append parts and finalize locally
+	var (
+		mw          io.Writer
+		concatMD5   string // => ETag
+		actualCksum = &cos.CksumHash{}
+	)
+	// .1 sort and check parts
+	sort.Slice(partList.Parts, func(i, j int) bool {
+		return partList.Parts[i].PartNumber < partList.Parts[j].PartNumber
+	})
+	nparts, err := s3.CheckParts(uploadID, partList.Parts)
+	if err != nil {
+		s3.WriteMptErr(w, r, err, 0, lom, uploadID)
+		return
+	}
+	// 2. <upload-id>.complete.<obj-name>
+	prefix := uploadID + ".complete"
+	wfqn := fs.CSM.Gen(lom, fs.WorkfileType, prefix)
+	wfh, errC := lom.CreateFile(wfqn)
+	if errC != nil {
+		s3.WriteMptErr(w, r, errC, 0, lom, uploadID)
+		return
+	}
+	if remote && lom.CksumConf().Type != cos.ChecksumNone {
+		actualCksum = cos.NewCksumHash(lom.CksumConf().Type)
+	} else {
+		actualCksum = cos.NewCksumHash(cos.ChecksumMD5)
+	}
+	mw = multiWriter(actualCksum.H, wfh)
+
+	// .3 write
+	buf, slab := t.gmm.Alloc()
+	concatMD5, written, errA := _appendMpt(nparts, buf, mw)
+	slab.Free(buf)
+
+	if cmn.Rom.Features().IsSet(feat.FsyncPUT) {
+		errS := wfh.Sync()
+		debug.AssertNoErr(errS)
+	}
+	cos.Close(wfh)
+
+	if errA == nil && written != size {
+		errA = fmt.Errorf("upload %q %q: expected full size=%d, got %d", uploadID, lom.Cname(), size, written)
+	}
+	if errA != nil {
+		if nerr := cos.RemoveFile(wfqn); nerr != nil && !os.IsNotExist(nerr) {
+			nlog.Errorf(fmtNested, t, err, "remove", wfqn, nerr)
+		}
+		s3.WriteMptErr(w, r, errA, 0, lom, uploadID)
+		return
+	}
+
+	// .4 (s3 client => ais://) compute resulting MD5 and, optionally, ETag
+	if actualCksum.H != nil {
+		actualCksum.Finalize()
+		lom.SetCksum(actualCksum.Cksum.Clone())
+	}
+	if etag == "" {
+		debug.Assert(!remote)
+		debug.Assert(concatMD5 != "")
+		resMD5 := cos.NewCksumHash(cos.ChecksumMD5)
+		_, err = resMD5.H.Write([]byte(concatMD5))
+		debug.AssertNoErr(err)
+		resMD5.Finalize()
+		etag = resMD5.Value() + cmn.AwsMultipartDelim + strconv.Itoa(len(partList.Parts))
+	}
+
+	// .5 finalize
+	lom.SetSize(size)
+	lom.SetCustomKey(cmn.ETag, etag)
+
+	poi := allocPOI()
+	{
+		poi.t = t
+		poi.atime = started.UnixNano()
+		poi.lom = lom
+		poi.workFQN = wfqn
+		poi.owt = cmn.OwtNone
+	}
+	errCode, errF := poi.finalize()
+	freePOI(poi)
+
+	// .6 cleanup parts - unconditionally
+	exists := s3.CleanupUpload(uploadID, lom.FQN, false /*aborted*/)
+	debug.Assert(exists)
+
+	if errF != nil {
+		// NOTE: not failing if remote op. succeeded
+		if !remote {
+			s3.WriteMptErr(w, r, errF, errCode, lom, uploadID)
+			return
+		}
+		nlog.Errorf("upload %q: failed to complete %s locally: %v(%d)", uploadID, lom.Cname(), err, errCode)
+	}
+
+	// .7 respond
+	result := &s3.CompleteMptUploadResult{Bucket: bck.Name, Key: objName, ETag: etag}
+	sgl := t.gmm.NewSGL(0)
+	result.MustMarshal(sgl)
+	w.Header().Set(cos.HdrContentType, cos.ContentXML)
+	w.Header().Set(cos.S3CksumHeader, etag)
+	sgl.WriteTo(w)
+	sgl.Free()
+}
+
+func _appendMpt(nparts []*s3.MptPart, buf []byte, mw io.Writer) (concatMD5 string, written int64, err error) {
+	for _, partInfo := range nparts {
+		var (
+			partFh   *os.File
+			partSize int64
+		)
+		concatMD5 += partInfo.MD5
+		if partFh, err = os.Open(partInfo.FQN); err != nil {
+			return "", 0, err
+		}
+		partSize, err = io.CopyBuffer(mw, partFh, buf)
+		cos.Close(partFh)
+		if err != nil {
+			return "", 0, err
+		}
+		written += partSize
+	}
+	return concatMD5, written, nil
+}
+
+// Abort an active multipart upload.
+// Body is empty, only URL query contains uploadID
+// 1. uploadID must exists
+// 2. Remove all temporary files
+// 3. Remove all info from in-memory structs
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html
+func (t *target) abortMpt(w http.ResponseWriter, r *http.Request, items []string, q url.Values) {
+	bck, err, errCode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	if err != nil {
+		s3.WriteErr(w, r, err, errCode)
 		return
 	}
 	objName := s3.ObjName(items)
@@ -195,88 +439,33 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 		return
 	}
 
-	// steps 1-...
-	var (
-		obj         io.WriteCloser
-		objWorkfile string
-		mwriter     io.Writer
-		concatMD5   string // => ETag
-		actualMD5   = cos.NewCksumHash(cos.ChecksumMD5)
-	)
-	// 1. sort
-	sort.Slice(partList.Parts, func(i, j int) bool {
-		return partList.Parts[i].PartNumber < partList.Parts[j].PartNumber
-	})
-	// 2. check
-	nparts, err := s3.CheckParts(uploadID, partList.Parts)
-	if err != nil {
-		s3.WriteErr(w, r, err, 0)
-		return
-	}
-	// 3. append all parts and, separately, their respective MD5s
-	buf, slab := t.gmm.Alloc()
-	defer slab.Free(buf)
+	uploadID := q.Get(s3.QparamMptUploadID)
 
-	prefix := fmt.Sprintf("%s.%s", uploadID, "complete") // <upload-id>.complete.<obj-name>
-	objWorkfile = fs.CSM.Gen(lom, fs.WorkfileType, prefix)
-	obj, err = os.Create(objWorkfile)
-	if err != nil {
-		s3.WriteErr(w, r, err, 0)
-		return
-	}
-	mwriter = io.MultiWriter(actualMD5.H, obj)
-
-	for _, partInfo := range nparts {
-		concatMD5 += partInfo.MD5
-		nextPart, err := os.Open(partInfo.FQN)
+	if bck.IsRemoteS3() {
+		pts := s3.NewPassThroughSignedReq(g.client.control, r, lom, r.Body, q)
+		resp, err := pts.Do()
 		if err != nil {
-			cos.Close(obj)
-			s3.WriteErr(w, r, err, 0)
+			s3.WriteErr(w, r, err, resp.StatusCode)
 			return
 		}
-		if _, err := io.CopyBuffer(mwriter, nextPart, buf); err != nil {
-			cos.Close(obj)
-			cos.Close(nextPart)
-			s3.WriteErr(w, r, err, 0)
-			return
+		if resp == nil {
+			errCode, err := backend.AbortMpt(lom, uploadID)
+			if err != nil {
+				s3.WriteErr(w, r, err, errCode)
+				return
+			}
 		}
-		cos.Close(nextPart)
 	}
-	cos.Close(obj)
 
-	// 4. resulting ETag and MD5
-	resMD5 := cos.NewCksumHash(cos.ChecksumMD5)
-	_, err = resMD5.H.Write([]byte(concatMD5))
-	debug.AssertNoErr(err)
-	resMD5.Finalize()
-	actualMD5.Finalize()
-
-	// (e.g. sample 9-part response: <ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>)
-	objETag := fmt.Sprintf("%s%s%d", resMD5.Value(), cmn.AwsMultipartDelim, len(partList.Parts))
-
-	// 5. finalize
-	size, err := s3.ObjSize(uploadID)
-	if err != nil {
-		s3.WriteErr(w, r, err, 0)
+	exists := s3.CleanupUpload(uploadID, "", true /*aborted*/)
+	if !exists {
+		err := fmt.Errorf("upload %q does not exist", uploadID)
+		s3.WriteErr(w, r, err, http.StatusNotFound)
 		return
 	}
-	lom.SetSize(size)
-	lom.SetCustomKey(cmn.ETag, objETag)
-	lom.SetCksum(actualMD5.Cksum.Clone())
-	t.FinalizeObj(lom, objWorkfile, nil) // locks inside
 
-	// 6. mpt state => xattr
-	exists := s3.FinishUpload(uploadID, lom.FQN, false /*aborted*/)
-	debug.Assert(exists)
-
-	// 7. respond
-	result := &s3.CompleteMptUploadResult{Bucket: bck.Name, Key: objName, ETag: objETag}
-	sgl := t.gmm.NewSGL(0)
-	result.MustMarshal(sgl)
-	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	w.Header().Set(cos.S3CksumHeader, objETag)
-	sgl.WriteTo(w)
-	sgl.Free()
+	// Respond with status 204(!see the docs) and empty body.
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // List already stored parts of the active multipart upload by bucket name and uploadID.
@@ -293,7 +482,7 @@ func (t *target) listMptParts(w http.ResponseWriter, r *http.Request, bck *meta.
 		return
 	}
 
-	parts, err, errCode := s3.ListParts(uploadID, lom)
+	parts, errCode, err := s3.ListParts(uploadID, lom)
 	if err != nil {
 		s3.WriteErr(w, r, err, errCode)
 		return
@@ -327,30 +516,6 @@ func (t *target) listMptUploads(w http.ResponseWriter, bck *meta.Bck, q url.Valu
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
 	sgl.WriteTo(w)
 	sgl.Free()
-}
-
-// Abort an active multipart upload.
-// Body is empty, only URL query contains uploadID
-// 1. uploadID must exists
-// 2. Remove all temporary files
-// 3. Remove all info from in-memory structs
-// https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html
-func (*target) abortMptUpload(w http.ResponseWriter, r *http.Request, items []string, q url.Values) {
-	if len(items) < 2 {
-		err := fmt.Errorf(fmtErrBO, items)
-		s3.WriteErr(w, r, err, 0)
-		return
-	}
-	uploadID := q.Get(s3.QparamMptUploadID)
-	exists := s3.FinishUpload(uploadID, "", true /*aborted*/)
-	if !exists {
-		err := fmt.Errorf("upload %q does not exist", uploadID)
-		s3.WriteErr(w, r, err, http.StatusNotFound)
-		return
-	}
-
-	// Respond with status 204(!see the docs) and empty body.
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // Acts on an already multipart-uploaded object, returns `partNumber` (URL query)

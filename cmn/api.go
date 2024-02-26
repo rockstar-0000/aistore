@@ -6,6 +6,7 @@
 package cmn
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 // Bprops - manageable, user-configurable, and inheritable (from cluster config).
@@ -66,7 +68,7 @@ type (
 	}
 
 	ExtraPropsAWS struct {
-		CloudRegion string `json:"cloud_region,omitempty" list:"readonly"`
+		CloudRegion string `json:"cloud_region,omitempty"`
 
 		// from https://github.com/aws/aws-sdk-go/blob/main/aws/config.go:
 		// - "An optional endpoint URL (hostname only or fully qualified URI)
@@ -78,11 +80,18 @@ type (
 		// set the value of the environment variable will be loaded (AWS_PROFILE,
 		// or AWS_DEFAULT_PROFILE if the Shared Config is enabled)."
 		Profile string `json:"profile,omitempty"`
+
+		// Amazon S3: 1000
+		// - https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-serverside
+		// vs OpenStack Swift: 10,000
+		// - https://docs.openstack.org/swift/latest/api/pagination.html
+		MaxPageSize uint `json:"max_pagesize,omitempty"`
 	}
 	ExtraPropsAWSToSet struct {
 		CloudRegion *string `json:"cloud_region"`
 		Endpoint    *string `json:"endpoint"`
 		Profile     *string `json:"profile"`
+		MaxPageSize *uint   `json:"max_pagesize"`
 	}
 
 	ExtraPropsHTTP struct {
@@ -220,7 +229,7 @@ func (bp *Bprops) Validate(targetCnt int) error {
 		}
 	}
 	if bp.Mirror.Enabled && bp.EC.Enabled {
-		return fmt.Errorf("cannot enable mirroring and ec at the same time for the same bucket")
+		nlog.Warningln("n-way mirroring and EC are both enabled at the same time on the same bucket")
 	}
 	return softErr
 }
@@ -259,11 +268,11 @@ func (c *ExtraProps) ValidateAsProps(arg ...any) error {
 	switch provider {
 	case apc.HDFS:
 		if c.HDFS.RefDirectory == "" {
-			return fmt.Errorf("reference directory must be set for a bucket with HDFS provider")
+			return errors.New("reference directory must be set for a bucket with HDFS provider")
 		}
 	case apc.HTTP:
 		if c.HTTP.OrigURLBck == "" {
-			return fmt.Errorf("original bucket URL must be set for a bucket with HTTP provider")
+			return errors.New("original bucket URL must be set for a bucket with HTTP provider")
 		}
 	}
 	return nil

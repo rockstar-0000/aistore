@@ -186,13 +186,37 @@ type (
 	}
 
 	ECConf struct {
-		ObjSizeLimit int64  `json:"objsize_limit"`     // objects below this size are replicated instead of EC'ed
-		Compression  string `json:"compression"`       // enum { CompressAlways, ... } in api/apc/compression.go
-		SbundleMult  int    `json:"bundle_multiplier"` // stream-bundle multiplier: num streams to destination
-		DataSlices   int    `json:"data_slices"`       // number of data slices
-		ParitySlices int    `json:"parity_slices"`     // number of parity slices/replicas
-		Enabled      bool   `json:"enabled"`           // EC is enabled
-		DiskOnly     bool   `json:"disk_only"`         // if true, EC does not use SGL - data goes directly to drives
+		Compression string `json:"compression"` // enum { CompressAlways, ... } in api/apc/compression.go
+
+		// ObjSizeLimit is object size threshold _separating_ intra-cluster mirroring from
+		// erasure coding.
+		//
+		// The value 0 (zero) indicates that objects of any size
+		// are to be sliced, to produce (D) data slices and (P) erasure coded parity slices.
+		// On the other hand, the value -1 specifies that absolutely all objects of any size
+		// must be replicated as is. In effect, the (-1) option provides data protection via
+		// intra-cluster (P+1)-way replication (a.k.a. mirroring).
+		//
+		// In all cases, a given (D, P) configuration provides node-level redundancy,
+		// whereby P nodes can be lost without incurring loss of data.
+		ObjSizeLimit int64 `json:"objsize_limit"`
+
+		// Number of data (D) slices; the value 1 will have an effect of producing
+		// (P) additional full-size replicas.
+		DataSlices int `json:"data_slices"`
+
+		// Depending on the object size and `ObjSizeLimit`, the value of `ParitySlices` (or P) indicates:
+		// - a number of additional parity slices (generated or _computed_ from the (D) data slices),
+		// or:
+		// - a number of full object replicas (copies).
+		// In all cases, the same rule applies: all slices and/or all full copies are stored on different
+		// storage nodes (a.k.a. targets).
+		ParitySlices int `json:"parity_slices"`
+
+		SbundleMult int `json:"bundle_multiplier"` // stream-bundle multiplier: num streams to destination
+
+		Enabled  bool `json:"enabled"`   // EC is enabled
+		DiskOnly bool `json:"disk_only"` // if true, EC does not use SGL - data goes directly to drives
 	}
 	ECConfToSet struct {
 		ObjSizeLimit *int64  `json:"objsize_limit,omitempty"`
@@ -630,6 +654,7 @@ var (
 	_ Validator = (*RebalanceConf)(nil)
 	_ Validator = (*ResilverConf)(nil)
 	_ Validator = (*NetConf)(nil)
+	_ Validator = (*HTTPConf)(nil)
 	_ Validator = (*DownloaderConf)(nil)
 	_ Validator = (*DsortConf)(nil)
 	_ Validator = (*TransportConf)(nil)
@@ -844,7 +869,7 @@ func (c *BackendConf) Validate() (err error) {
 				return fmt.Errorf("invalid cloud specification: %v", err)
 			}
 			if len(hdfsConf.Addresses) == 0 {
-				return fmt.Errorf("no addresses provided to HDFS NameNode")
+				return errors.New("no addresses provided to HDFS NameNode")
 			}
 
 			// Check connectivity and filter out non-reachable addresses.
@@ -865,7 +890,7 @@ func (c *BackendConf) Validate() (err error) {
 
 			// Re-check if there is any address reachable.
 			if len(hdfsConf.Addresses) == 0 {
-				return fmt.Errorf("no address provided to HDFS NameNode is reachable")
+				return errors.New("no address provided to HDFS NameNode is reachable")
 			}
 
 			c.Conf[provider] = hdfsConf
@@ -946,7 +971,7 @@ func (c *BackendConf) EqualRemAIS(o *BackendConf, sname string) bool {
 
 func (c BackendConfAIS) String() (s string) {
 	for a, urls := range c {
-		if len(s) > 0 {
+		if s != "" {
 			s += "; "
 		}
 		s += fmt.Sprintf("[%s => %v]", a, urls)
@@ -964,10 +989,10 @@ func (c *DiskConf) Validate() (err error) {
 		return fmt.Errorf("invalid (disk_util_lwm, disk_util_hwm, disk_util_maxwm) config %+v", c)
 	}
 	if c.IostatTimeLong <= 0 {
-		return fmt.Errorf("disk.iostat_time_long is zero")
+		return errors.New("disk.iostat_time_long is zero")
 	}
 	if c.IostatTimeShort <= 0 {
-		return fmt.Errorf("disk.iostat_time_short is zero")
+		return errors.New("disk.iostat_time_short is zero")
 	}
 	if c.IostatTimeLong < c.IostatTimeShort {
 		return fmt.Errorf("disk.iostat_time_long %v shorter than disk.iostat_time_short %v",
@@ -1108,21 +1133,24 @@ func (c *MirrorConf) String() string {
 ////////////
 
 const (
-	MinSliceCount = 1  // minimum number of data or parity slices
-	MaxSliceCount = 32 // maximum --/--
+	ObjSizeToAlwaysReplicate = -1 // (see `ObjSizeLimit` comment above)
+
+	minSliceCount = 1  // minimum number of data or parity slices
+	maxSliceCount = 32 // maximum --/--
 )
 
 func (c *ECConf) Validate() error {
-	if c.ObjSizeLimit < 0 {
-		return fmt.Errorf("invalid ec.obj_size_limit: %d (expected >=0)", c.ObjSizeLimit)
+	if c.ObjSizeLimit < -1 {
+		return fmt.Errorf("invalid ec.obj_size_limit: %d (expecting greater or equal -1)", c.ObjSizeLimit)
 	}
-	if c.DataSlices < MinSliceCount || c.DataSlices > MaxSliceCount {
-		return fmt.Errorf("invalid ec.data_slices: %d (expected value in range [%d, %d])",
-			c.DataSlices, MinSliceCount, MaxSliceCount)
+	if c.DataSlices < minSliceCount || c.DataSlices > maxSliceCount {
+		err := fmt.Errorf("invalid ec.data_slices: %d (expected value in range [%d, %d])",
+			c.DataSlices, minSliceCount, maxSliceCount)
+		return err
 	}
-	if c.ParitySlices < MinSliceCount || c.ParitySlices > MaxSliceCount {
+	if c.ParitySlices < minSliceCount || c.ParitySlices > maxSliceCount {
 		return fmt.Errorf("invalid ec.parity_slices: %d (expected value in range [%d, %d])",
-			c.ParitySlices, MinSliceCount, MaxSliceCount)
+			c.ParitySlices, minSliceCount, maxSliceCount)
 	}
 	if c.SbundleMult < 0 || c.SbundleMult > 16 {
 		return fmt.Errorf("invalid ec.bundle_multiplier: %v (expected range [0, 16])", c.SbundleMult)
@@ -1142,13 +1170,14 @@ func (c *ECConf) ValidateAsProps(arg ...any) (err error) {
 	}
 	targetCnt, ok := arg[0].(int)
 	debug.Assert(ok)
-	required := c.RequiredEncodeTargets()
+	required := c.numRequiredTargets()
 	if required <= targetCnt {
 		return
 	}
-	err = fmt.Errorf("%v: EC configuration (d=%d, p=%d slices) requires at least %d targets (have %d)",
+
+	err = fmt.Errorf("%v: EC configuration (D = %d, P = %d) requires at least %d targets (have %d)",
 		ErrNotEnoughTargets, c.DataSlices, c.ParitySlices, required, targetCnt)
-	if c.ParitySlices > targetCnt {
+	if c.ObjSizeLimit == ObjSizeToAlwaysReplicate || c.ParitySlices > targetCnt {
 		return
 	}
 	return NewErrSoft(err.Error())
@@ -1159,11 +1188,17 @@ func (c *ECConf) String() string {
 		return "Disabled"
 	}
 	objSizeLimit := c.ObjSizeLimit
-	return fmt.Sprintf("%d:%d (%s)", c.DataSlices, c.ParitySlices, cos.ToSizeIEC(objSizeLimit, 0))
+	if objSizeLimit == ObjSizeToAlwaysReplicate {
+		return fmt.Sprintf("no EC - always producing %d total replicas", c.ParitySlices+1)
+	}
+	return fmt.Sprintf("%d:%d (objsize limit %s)", c.DataSlices, c.ParitySlices, cos.ToSizeIEC(objSizeLimit, 0))
 }
 
-func (c *ECConf) RequiredEncodeTargets() int {
-	// data slices + parity slices + 1 target for original object
+func (c *ECConf) numRequiredTargets() int {
+	if c.ObjSizeLimit == ObjSizeToAlwaysReplicate {
+		return c.ParitySlices + 1
+	}
+	// (data slices + parity slices + 1 target for the _main_ replica)
 	return c.DataSlices + c.ParitySlices + 1
 }
 
@@ -1223,6 +1258,13 @@ func (c *NetConf) Validate() (err error) {
 	if c.HTTP.ClientAuthTLS < int(tls.NoClientCert) || c.HTTP.ClientAuthTLS > int(tls.RequireAndVerifyClientCert) {
 		return fmt.Errorf("invalid client_auth_tls %d (expecting range [0 - %d])", c.HTTP.ClientAuthTLS,
 			tls.RequireAndVerifyClientCert)
+	}
+	return nil
+}
+
+func (c *HTTPConf) Validate() error {
+	if c.ServerNameTLS != "" {
+		return fmt.Errorf("invalid domain_tls %q: expecting empty (domain names/SANs should be set in X.509 cert)", c.ServerNameTLS)
 	}
 	return nil
 }
@@ -1632,7 +1674,7 @@ func (ctu *ConfigToSet) FillFromQuery(query url.Values) error {
 	}
 
 	if !anyExists {
-		return fmt.Errorf("no properties to update")
+		return errors.New("no properties to update")
 	}
 	return nil
 }

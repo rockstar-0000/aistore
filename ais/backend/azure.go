@@ -6,17 +6,32 @@
  */
 package backend
 
+// TODO:
+// - check a variety of az clients instantiated below, and alternatives
+//
+// - support alternative authentication methods (currently, NewSharedKeyCredential only)
+//   ref: ./storage/azblob@v1.3.0/container/examples_test.go
+//
+// - [200224] stop using etag as obj. version - see IsImmutableStorageWithVersioningEnabled, blob.VersionID, and:
+//   ref: https://learn.microsoft.com/en-us/azure/storage/blobs/versioning-overview#how-blob-versioning-works
+
 import (
 	"context"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
+	"regexp"
 	"strings"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -28,226 +43,229 @@ import (
 
 type (
 	azureProvider struct {
-		u string
-		c *azblob.SharedKeyCredential
-		t core.TargetPut
-		s azblob.ServiceURL
+		u     string
+		creds *azblob.SharedKeyCredential
+		t     core.TargetPut
 	}
 )
 
 const (
-	azureDefaultProto = "https://"
-	// Azure simulator(Azurite) consts
-	azureDevAccName = "devstoreaccount1"
-	azureDevAccKey  = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-	// Azurite is always HTTP
-	azureDevHost = "http://127.0.0.1:10000/" + azureDevAccName
+	azDefaultProto = "https://"
+	azHost         = ".blob.core.windows.net"
 
-	azureBackend = "azure-backend"
+	azAccNameEnvVar = "AZURE_STORAGE_ACCOUNT"
+	azAccKeyEnvVar  = "AZURE_STORAGE_KEY" // a.k.a. AZURE_STORAGE_PRIMARY_ACCOUNT_KEY or AZURE_STORAGE_SECONDARY_ACCOUNT_KEY
 
-	// real Azure server constants
-	azureHost = ".blob.core.windows.net"
-	// AZ CLI compatible env vars
-	azureAccNameEnvVar = "AZURE_STORAGE_ACCOUNT"
-	azureAccKeyEnvVar  = "AZURE_STORAGE_KEY"
-	// AZ AIS internal env vars
-	azureURLEnvVar   = "AIS_AZURE_URL"
-	azureProtoEnvVar = "AIS_AZURE_PROTO"
-	// Object lease time for PUT/DEL operations, in seconds.
-	// Must be within 15..60 range or -1(infinity).
-	leaseTime = 60
+	// ais
+	azURLEnvVar   = "AIS_AZURE_URL"
+	azProtoEnvVar = "AIS_AZURE_PROTO"
+)
+
+// used to parse azure errors
+const (
+	azErrDesc = "Description"
+	azErrCode = "Code: "
+
+	azErrPrefix = "azure-error["
 )
 
 var (
-	// context placeholder
-	azctx context.Context
-
-	// TODO: client provided key by name and/or by value to encrypt/decrypt data.
-	defaultKeyOptions azblob.ClientProvidedKeyOptions
-
-	// interface guard
-	_ core.BackendProvider = (*azureProvider)(nil)
+	azCleanErrRegex = regexp.MustCompile(`[^a-zA-Z0-9 ]+`)
 )
 
-func azureProto() string {
-	proto := os.Getenv(azureProtoEnvVar)
+// interface guard
+var _ core.BackendProvider = (*azureProvider)(nil)
+
+func azProto() string {
+	proto := os.Getenv(azProtoEnvVar)
 	if proto == "" {
-		return azureDefaultProto
+		proto = azDefaultProto
 	}
 	return proto
 }
 
-func azureUserName() string {
-	name := os.Getenv(azureAccNameEnvVar)
-	if name == "" {
-		return azureDevAccName
-	}
-	return name
-}
+func azAccName() string { return os.Getenv(azAccNameEnvVar) }
+func azAccKey() string  { return os.Getenv(azAccKeyEnvVar) }
 
-func azureUserKey() string {
-	key := os.Getenv(azureAccKeyEnvVar)
-	if key == "" && azureUserName() == azureDevAccName {
-		return azureDevAccKey
-	}
-	return key
-}
-
-func azureErrStatus(status int) error { return fmt.Errorf("http-status=%d", status) }
-
-// Detects development mode by checking the user name. It is a standalone
-// function because there can be a better way to detect developer mode
-func isAzureDevMode(user string) bool {
-	return user == azureDevAccName
-}
-
-// URL is empty:
-// Dev -> http://127.0.0.1:1000/devstoreaccount1
-// Prod -> http://<account_name>.blob.core.windows.net
-//
-// URL is not empty:
-// URL starts with protocol -> URL
-// URL does not contain protocol -> http://<account_name>URL/
-func azureURL() string {
-	url := os.Getenv(azureURLEnvVar)
-	if url != "" {
-		if !strings.HasPrefix(url, "http") {
-			if !strings.HasPrefix(url, ".") {
-				url = "." + url
-			}
-			url = azureProto() + azureUserName() + url
+func asEndpoint() string {
+	blurl := os.Getenv(azURLEnvVar)
+	switch {
+	case blurl == "":
+		// the default
+		return azProto() + azAccName() + azHost
+	case strings.HasPrefix(blurl, "http"):
+		return blurl
+	default:
+		if !strings.HasPrefix(blurl, ".") {
+			blurl = "." + blurl
 		}
-		return url
+		return azProto() + azAccName() + blurl
 	}
-	user := azureUserName()
-	if isAzureDevMode(user) {
-		return azureDevHost
-	}
-	return azureProto() + user + azureHost
 }
 
-// Only one authentication way is supported: with Shared Credentials that
-// requires Account name and key.
 func NewAzure(t core.TargetPut) (core.BackendProvider, error) {
-	path := azureURL()
-	u, err := url.Parse(path)
+	blurl := asEndpoint()
+
+	// NOTE: NewSharedKeyCredential requires account name and its primary or secondary key
+	creds, err := azblob.NewSharedKeyCredential(azAccName(), azAccKey())
 	if err != nil {
-		return nil, cmn.NewErrFailedTo(nil, azureBackend+": parse", "URL", err)
-	}
-	name := azureUserName()
-	key := azureUserKey()
-	creds, err := azblob.NewSharedKeyCredential(name, key)
-	if err != nil {
-		return nil, cmn.NewErrFailedTo(nil, azureBackend+": init", "credentials", err)
+		return nil, cmn.NewErrFailedTo(nil, azErrPrefix+": init]", "credentials", err)
 	}
 
-	azctx = context.Background()
-	p := azblob.NewPipeline(creds, azblob.PipelineOptions{})
 	return &azureProvider{
-		t: t,
-		u: path,
-		c: creds,
-		s: azblob.NewServiceURL(*u, p),
+		t:     t,
+		creds: creds,
+		u:     blurl,
 	}, nil
 }
 
-func azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (int, error) {
-	bckNotFound, status, err := _toErr(azureError, bck, objName)
-	if bckNotFound {
-		return status, err
+// (compare w/ cmn/backend)
+func azEncodeEtag(etag azcore.ETag) string { return cmn.UnquoteCEV(string(etag)) }
+
+func azEncodeChecksum(v []byte) string {
+	if len(v) == 0 {
+		return ""
 	}
-	return status, errors.New("azure-error[" + err.Error() + "]")
+	return hex.EncodeToString(v)
 }
 
-func _toErr(azureError error, bck *cmn.Bck, objName string) (bool, int, error) {
-	stgErr, ok := azureError.(azblob.StorageError)
-	if !ok {
-		return false, http.StatusInternalServerError, azureError
+//
+// format and parse errors
+//
+
+func azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (int, error) {
+	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+		nlog.InfoDepth(1, "begin azure error =========================")
+		nlog.InfoDepth(1, azureError)
+		nlog.InfoDepth(1, "end azure error ===========================")
 	}
-	switch stgErr.ServiceCode() {
-	case azblob.ServiceCodeContainerNotFound:
-		return true, http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
-	case azblob.ServiceCodeBlobNotFound:
-		err := fmt.Errorf("%s not found", bck.Cname(objName))
-		return false, http.StatusNotFound, cmn.NewErrHTTP(nil, err, http.StatusNotFound)
-	case azblob.ServiceCodeInvalidResourceName:
-		err := fmt.Errorf("%s not found", bck.Cname(objName))
-		return false, http.StatusNotFound, cmn.NewErrHTTP(nil, err, http.StatusNotFound)
-	default:
-		resp := stgErr.Response()
-		if resp != nil {
-			resp.Body.Close()
-			return false, resp.StatusCode, azureError
+
+	var stgErr *azcore.ResponseError
+	if !errors.As(azureError, &stgErr) {
+		return http.StatusInternalServerError, azureError
+	}
+	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+		nlog.InfoDepth(1, "ErrorCode:", stgErr.ErrorCode, "StatusCode:", stgErr.StatusCode)
+	}
+
+	// NOTE: error-codes documentation seems to be incomplete and/or outdated
+	// ref: https://learn.microsoft.com/en-us/rest/api/storageservices/common-rest-api-error-codes
+
+	switch bloberror.Code(stgErr.ErrorCode) {
+	case bloberror.ContainerNotFound:
+		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
+	case bloberror.BlobNotFound:
+		return http.StatusNotFound, errors.New(azErrPrefix + "NotFound: " + bck.Cname(objName) + "]")
+	case bloberror.InvalidResourceName:
+		if objName != "" {
+			return http.StatusNotFound, errors.New(azErrPrefix + "NotFound: " + bck.Cname(objName) + "]")
 		}
-		return false, http.StatusInternalServerError, azureError
 	}
+
+	// NOTE above
+	if objName == "" && bloberror.Code(stgErr.ErrorCode) == bloberror.OutOfRangeInput {
+		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
+	}
+
+	// azure error is usually a sizeable multi-line text with items including:
+	// request ID, authorization, variery of x-ms-* headers, server and user agent, and more
+
+	var (
+		status      = stgErr.StatusCode
+		code        string
+		description string
+		lines       = strings.Split(azureError.Error(), "\n")
+	)
+	if resp := stgErr.RawResponse; resp != nil {
+		resp.Body.Close()
+		debug.Assertf(resp.StatusCode == stgErr.StatusCode, "%d vs %d", resp.StatusCode, stgErr.StatusCode) // checking
+		status = resp.StatusCode
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, azErrDesc) {
+			description = azCleanErrRegex.ReplaceAllString(line[len(azErrDesc):], "")
+		} else if i := strings.Index(line, azErrCode); i > 0 {
+			code = azCleanErrRegex.ReplaceAllString(line[i+len(azErrCode):], "")
+		}
+	}
+	if code != "" && description != "" {
+		return status, errors.New(azErrPrefix + code + ": " + description + "]")
+	}
+	debug.Assert(false, azureError) // expecting to parse
+	return status, azureError
 }
+
+// as core.BackendProvider --------------------------------------------------------------
 
 func (*azureProvider) Provider() string { return apc.Azure }
 
-// https://docs.microsoft.com/en-us/connectors/azureblob/#general-limits
-func (*azureProvider) MaxPageSize() uint { return 5000 }
-
-///////////////////
-// CREATE BUCKET //
-///////////////////
+//
+// CREATE BUCKET
+//
 
 func (*azureProvider) CreateBucket(_ *meta.Bck) (int, error) {
 	return http.StatusNotImplemented, cmn.NewErrNotImpl("create", "azure:// bucket")
 }
 
-/////////////////
-// HEAD BUCKET //
-/////////////////
+//
+// HEAD BUCKET
+//
 
-func (ap *azureProvider) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.StrKVs,
-	errCode int, err error) {
+func (ap *azureProvider) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, int, error) {
 	var (
 		cloudBck = bck.RemoteBck()
-		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
+		cntURL   = ap.u + "/" + cloudBck.Name
 	)
-	resp, err := cntURL.GetProperties(ctx, azblob.LeaseAccessConditions{})
+	client, err := container.NewClientWithSharedKeyCredential(cntURL, ap.creds, nil)
 	if err != nil {
 		status, err := azureErrorToAISError(err, cloudBck, "")
-		return bckProps, status, err
+		return nil, status, err
 	}
-	if resp.StatusCode() >= http.StatusBadRequest {
-		err := cmn.NewErrFailedTo(nil, azureBackend+": read bucket", cloudBck.Name, azureErrStatus(resp.StatusCode()))
-		return bckProps, resp.StatusCode(), err
+	resp, err := client.GetProperties(ctx, nil)
+	if err != nil {
+		status, err := azureErrorToAISError(err, cloudBck, "")
+		return nil, status, err
 	}
-	bckProps = make(cos.StrKVs, 2)
+
+	bckProps := make(cos.StrKVs, 2)
 	bckProps[apc.HdrBackendProvider] = apc.Azure
-	bckProps[apc.HdrBucketVerEnabled] = "true"
+
+	// TODO #200224
+	if true || resp.IsImmutableStorageWithVersioningEnabled != nil && *resp.IsImmutableStorageWithVersioningEnabled {
+		bckProps[apc.HdrBucketVerEnabled] = "true"
+	} else {
+		bckProps[apc.HdrBucketVerEnabled] = "false"
+	}
 	return bckProps, http.StatusOK, nil
 }
 
-//////////////////
-// LIST OBJECTS //
-//////////////////
+//
+// LIST OBJECTS
+//
 
-func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (errCode int, err error) {
-	msg.PageSize = calcPageSize(msg.PageSize, ap.MaxPageSize())
+func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (int, error) {
+	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
 	var (
-		h        = cmn.BackendHelpers.Azure
 		cloudBck = bck.RemoteBck()
-		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
-		marker   = azblob.Marker{}
-		opts     = azblob.ListBlobsSegmentOptions{Prefix: msg.Prefix, MaxResults: int32(msg.PageSize)}
+		cntURL   = ap.u + "/" + cloudBck.Name
+		num      = int32(msg.PageSize)
+		opts     = container.ListBlobsFlatOptions{Prefix: apc.Ptr(msg.Prefix), MaxResults: &num}
 	)
+	client, err := container.NewClientWithSharedKeyCredential(cntURL, ap.creds, nil)
+	if err != nil {
+		return azureErrorToAISError(err, cloudBck, "")
+	}
 	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 		nlog.Infof("list_objects %s", cloudBck.Name)
 	}
 	if msg.ContinuationToken != "" {
-		marker.Val = apc.String(msg.ContinuationToken)
+		opts.Marker = apc.Ptr(msg.ContinuationToken)
 	}
 
-	resp, err := cntURL.ListBlobsFlatSegment(azctx, marker, opts)
+	pager := client.NewListBlobsFlatPager(&opts)
+	resp, err := pager.NextPage(context.Background())
 	if err != nil {
 		return azureErrorToAISError(err, cloudBck, "")
-	}
-	if resp.StatusCode() >= http.StatusBadRequest {
-		err := cmn.NewErrFailedTo(nil, azureBackend+": list objects of", cloudBck.Name, azureErrStatus(resp.StatusCode()))
-		return resp.StatusCode(), err
 	}
 
 	l := len(resp.Segment.BlobItems)
@@ -256,110 +274,132 @@ func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.Ls
 	}
 	for idx := range resp.Segment.BlobItems {
 		var (
-			blob  = &resp.Segment.BlobItems[idx]
-			entry = lst.Entries[idx]
+			custom = cos.StrKVs{}
+			blob   = resp.Segment.BlobItems[idx]
+			entry  = lst.Entries[idx]
 		)
-		entry.Name = blob.Name
-
-		debug.Assert(blob.Properties.ContentLength != nil) // NOTE: always expecting the size
-
-		if blob.Properties.ContentLength != nil {
-			entry.Size = *blob.Properties.ContentLength
-		}
+		entry.Name = *blob.Name
+		entry.Size = *blob.Properties.ContentLength
 		if msg.IsFlagSet(apc.LsNameOnly) || msg.IsFlagSet(apc.LsNameSize) {
 			continue
 		}
-		// NOTE: here and elsewhere (below), use Etag as the version
-		if v, ok := h.EncodeVersion(string(blob.Properties.Etag)); ok {
-			entry.Version = v
-		}
-		if v, ok := h.EncodeCksum(blob.Properties.ContentMD5); ok {
-			entry.Checksum = v
+
+		entry.Checksum = azEncodeChecksum(blob.Properties.ContentMD5)
+
+		etag := azEncodeEtag(*blob.Properties.ETag)
+		entry.Version = etag // (TODO a the top)
+
+		// custom
+		if msg.WantProp(apc.GetPropsCustom) {
+			custom[cmn.ETag] = etag
+			if !blob.Properties.LastModified.IsZero() {
+				custom[cmn.LastModified] = fmtTime(*blob.Properties.LastModified)
+			}
+			if blob.Properties.ContentType != nil {
+				custom[cos.HdrContentType] = *blob.Properties.ContentType
+			}
+			if blob.VersionID != nil {
+				custom[cmn.VersionObjMD] = *blob.VersionID
+			}
+			entry.Custom = cmn.CustomMD2S(custom)
 		}
 	}
 	lst.Entries = lst.Entries[:l]
 
-	if resp.NextMarker.Val != nil {
-		lst.ContinuationToken = *resp.NextMarker.Val
+	if resp.NextMarker != nil {
+		lst.ContinuationToken = *resp.NextMarker
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 		nlog.Infof("[list_objects] count %d(marker: %s)", len(lst.Entries), lst.ContinuationToken)
 	}
-	return
+	return 0, nil
 }
 
-//////////////////
-// LIST BUCKETS //
-//////////////////
+//
+// LIST BUCKETS
+//
 
-func (ap *azureProvider) ListBuckets(_ cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
-	var (
-		o          azblob.ListContainersSegmentOptions
-		marker     azblob.Marker
-		containers *azblob.ListContainersSegmentResponse
-	)
-	for marker.NotDone() {
-		containers, err = ap.s.ListContainersSegment(azctx, marker, o)
+func (ap *azureProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, _ int, _ error) {
+	serviceClient, err := service.NewClientWithSharedKeyCredential(ap.u, ap.creds, nil)
+	if err != nil {
+		status, err := azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
+		return nil, status, err
+	}
+	pager := serviceClient.NewListContainersPager(&service.ListContainersOptions{})
+	for pager.More() {
+		resp, err := pager.NextPage(context.TODO())
 		if err != nil {
-			errCode, err = azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
-			return
+			status, err := azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
+			return bcks, status, err
 		}
-
-		for idx := range containers.ContainerItems {
+		for _, ci := range resp.ContainerItems {
 			bcks = append(bcks, cmn.Bck{
-				Name:     containers.ContainerItems[idx].Name,
+				Name:     *ci.Name,
 				Provider: apc.Azure,
 			})
 		}
-		marker = containers.NextMarker
 	}
-	return
+	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		nlog.Infof("[list_buckets] count %d", len(bcks))
+	}
+	return bcks, 0, nil
 }
 
-/////////////////
-// HEAD OBJECT //
-/////////////////
+//
+// HEAD OBJECT
+//
 
-func (ap *azureProvider) HeadObj(ctx context.Context, lom *core.LOM) (oa *cmn.ObjAttrs, errCode int, err error) {
+func (ap *azureProvider) HeadObj(ctx context.Context, lom *core.LOM) (*cmn.ObjAttrs, int, error) {
 	var (
-		resp     *azblob.BlobGetPropertiesResponse
-		h        = cmn.BackendHelpers.Azure
-		cloudBck = lom.Bck().RemoteBck()
-		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
-		blobURL  = cntURL.NewBlobURL(lom.ObjName)
+		cloudBck = lom.Bucket().RemoteBck()
+		blURL    = ap.u + "/" + cloudBck.Name + "/" + lom.ObjName
 	)
-	if resp, err = blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, defaultKeyOptions); err != nil {
-		errCode, err = azureErrorToAISError(err, cloudBck, lom.ObjName)
-		return
+	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, ap.creds, nil)
+	if err != nil {
+		status, err := azureErrorToAISError(err, cloudBck, lom.ObjName)
+		return nil, status, err
 	}
-	if resp.StatusCode() >= http.StatusBadRequest {
-		err = cmn.NewErrFailedTo(nil, azureBackend+": get object props of", cloudBck.Name+"/"+lom.ObjName,
-			azureErrStatus(resp.StatusCode()))
-		errCode = resp.StatusCode()
-		return
+	resp, err := client.GetProperties(ctx, nil)
+	if err != nil {
+		status, err := azureErrorToAISError(err, cloudBck, lom.ObjName)
+		return nil, status, err
 	}
-	oa = &cmn.ObjAttrs{}
+
+	debug.Assert(resp.IsCurrentVersion == nil || *resp.IsCurrentVersion, "expecting current/latest/the-only ver")
+
+	oa := &cmn.ObjAttrs{}
+	oa.CustomMD = make(cos.StrKVs, 6)
 	oa.SetCustomKey(cmn.SourceObjMD, apc.Azure)
-	oa.Size = resp.ContentLength()
-	if v, ok := h.EncodeVersion(string(resp.ETag())); ok {
-		oa.Ver = v // NOTE: using ETag as _the_ version
-		oa.SetCustomKey(cmn.ETag, v)
+	oa.Size = *resp.ContentLength
+
+	etag := azEncodeEtag(*resp.ETag)
+	oa.SetCustomKey(cmn.ETag, etag)
+
+	oa.Ver = etag // TODO #200224
+
+	if md5 := azEncodeChecksum(resp.ContentMD5); md5 != "" {
+		oa.SetCustomKey(cmn.MD5ObjMD, md5)
 	}
-	if v, ok := h.EncodeCksum(resp.ContentMD5()); ok {
-		oa.SetCustomKey(cmn.MD5ObjMD, v)
+	if v := resp.LastModified; v != nil {
+		oa.SetCustomKey(cmn.LastModified, fmtTime(*v))
+	}
+	if v := resp.ContentType; v != nil {
+		// unlike other custom attrs, "Content-Type" is not getting stored w/ LOM
+		// - only shown via list-objects and HEAD when not present
+		oa.SetCustomKey(cos.HdrContentType, *v)
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infof("[head_object] %s", lom)
 	}
-	return
+	return oa, 0, nil
 }
 
-////////////////
-// GET OBJECT //
-////////////////
+//
+// GET OBJECT
+//
 
 func (ap *azureProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT) (int, error) {
-	res := ap.GetObjReader(ctx, lom)
+	res := ap.GetObjReader(ctx, lom, 0, 0)
 	if res.Err != nil {
 		return res.ErrCode, res.Err
 	}
@@ -372,114 +412,88 @@ func (ap *azureProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT)
 	return 0, err
 }
 
-////////////////////
-// GET OBJ READER //
-////////////////////
-
-func (ap *azureProvider) GetObjReader(ctx context.Context, lom *core.LOM) (res core.GetReaderResult) {
+func (ap *azureProvider) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
 	var (
-		h        = cmn.BackendHelpers.Azure
-		cloudBck = lom.Bck().RemoteBck()
-		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
-		blobURL  = cntURL.NewBlobURL(lom.ObjName)
+		cloudBck = lom.Bucket().RemoteBck()
+		blURL    = ap.u + "/" + cloudBck.Name + "/" + lom.ObjName
 	)
+	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, ap.creds, nil)
+	if err != nil {
+		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
+		return
+	}
+
 	// Get checksum
-	respProps, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, defaultKeyOptions)
+	respProps, err := client.GetProperties(ctx, nil)
 	if err != nil {
 		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
 		return
 	}
-	if respProps.StatusCode() >= http.StatusBadRequest {
-		res.Err = cmn.NewErrFailedTo(nil, azureBackend+": get object props of", cloudBck.Name+"/"+lom.ObjName,
-			azureErrStatus(respProps.StatusCode()))
-		res.ErrCode = respProps.StatusCode()
-		return
-	}
-	// 0, 0 = read range: the whole object
-	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, defaultKeyOptions)
+
+	// (0, 0) range indicates "whole object"
+	var opts blob.DownloadStreamOptions
+	opts.Range.Count = length
+	opts.Range.Offset = offset
+	resp, err := client.DownloadStream(ctx, &opts)
 	if err != nil {
 		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
-		return
-	}
-	if resp.StatusCode() >= http.StatusBadRequest {
-		res.Err = cmn.NewErrFailedTo(nil, azureBackend+": get object", cloudBck.Name+"/"+lom.ObjName,
-			azureErrStatus(respProps.StatusCode()))
-		res.ErrCode = resp.StatusCode()
-		return
+		if res.ErrCode == http.StatusRequestedRangeNotSatisfiable {
+			res.Err = cmn.NewErrRangeNotSatisfiable(res.Err, nil, 0)
+		}
+		return res
 	}
 
-	// custom metadata
-	lom.SetCustomKey(cmn.SourceObjMD, apc.Azure)
-	if v, ok := h.EncodeVersion(string(respProps.ETag())); ok {
-		lom.SetVersion(v)
-		lom.SetCustomKey(cmn.ETag, v)
-	}
-	if v, ok := h.EncodeCksum(respProps.ContentMD5()); ok {
-		lom.SetCustomKey(cmn.MD5ObjMD, v)
-		res.ExpCksum = cos.NewCksum(cos.ChecksumMD5, v)
+	debug.Assert(resp.IsCurrentVersion == nil || *resp.IsCurrentVersion, "expecting current/latest/the-only ver")
+	res.Size = *resp.ContentLength
+
+	if length == 0 {
+		// custom metadata
+		lom.SetCustomKey(cmn.SourceObjMD, apc.Azure)
+		etag := azEncodeEtag(*respProps.ETag)
+		lom.SetCustomKey(cmn.ETag, etag)
+
+		lom.SetVersion(etag) // TODO #200224
+
+		if md5 := azEncodeChecksum(respProps.ContentMD5); md5 != "" {
+			lom.SetCustomKey(cmn.MD5ObjMD, md5)
+			res.ExpCksum = cos.NewCksum(cos.ChecksumMD5, md5)
+		}
 	}
 
-	res.Size = resp.ContentLength()
-
-	retryOpts := azblob.RetryReaderOptions{MaxRetryRequests: 3}
-	res.R = resp.Body(retryOpts)
-	return
+	res.R = resp.Body
+	return res
 }
 
-////////////////
-// PUT OBJECT //
-////////////////
+//
+// PUT OBJECT
+//
 
-func (ap *azureProvider) PutObj(r io.ReadCloser, lom *core.LOM) (int, error) {
+func (ap *azureProvider) PutObj(r io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (int, error) {
 	defer cos.Close(r)
 
-	var (
-		leaseID  string
-		h        = cmn.BackendHelpers.Azure
-		cloudBck = lom.Bck().RemoteBck()
-		cntURL   = ap.s.NewContainerURL(cloudBck.Name)
-		blobURL  = cntURL.NewBlockBlobURL(lom.ObjName)
-		cond     = azblob.ModifiedAccessConditions{}
-	)
-	// Try to lease: if object does not exist, leasing fails with NotFound
-	acqResp, err := blobURL.AcquireLease(azctx, "", leaseTime, cond)
-	if err == nil {
-		leaseID = acqResp.LeaseID()
-		defer blobURL.ReleaseLease(azctx, acqResp.LeaseID(), cond)
-	}
+	client, err := azblob.NewClientWithSharedKeyCredential(ap.u, ap.creds, nil)
 	if err != nil {
-		code, errLease := azureErrorToAISError(err, cloudBck, lom.ObjName)
-		if code != http.StatusNotFound {
-			return code, errLease
-		}
+		return azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
 	}
-	// Use BlockBlob instead of PageBlob because the latter requires
-	// object size to be divisible by 512.
-	// Without buffer options(with 0's) UploadStreamToBlockBlob hangs up
-	opts := azblob.UploadStreamToBlockBlobOptions{
-		BufferSize: 64 * 1024,
-		MaxBuffers: 3,
+	cloudBck := lom.Bck().RemoteBck()
+
+	opts := azblob.UploadStreamOptions{}
+	if size := lom.SizeBytes(true); size > cos.MiB {
+		opts.Concurrency = int(min((size+cos.MiB-1)/cos.MiB, 8))
 	}
-	if leaseID != "" {
-		opts.AccessConditions = azblob.BlobAccessConditions{
-			LeaseAccessConditions: azblob.LeaseAccessConditions{LeaseID: leaseID},
-		}
-	}
-	putResp, err := azblob.UploadStreamToBlockBlob(azctx, r, blobURL, opts)
+
+	resp, err := client.UploadStream(context.Background(), cloudBck.Name, lom.ObjName, r, &opts)
 	if err != nil {
-		status, err := azureErrorToAISError(err, cloudBck, lom.ObjName)
-		return status, err
+		return azureErrorToAISError(err, cloudBck, lom.ObjName)
 	}
-	resp := putResp.Response()
-	resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
-		err := cmn.NewErrFailedTo(nil, azureBackend+": PUT", cloudBck.Name+"/"+lom.ObjName,
-			azureErrStatus(resp.StatusCode))
-		return resp.StatusCode, err
-	}
-	if v, ok := h.EncodeVersion(string(putResp.ETag())); ok {
-		lom.SetCustomKey(cmn.ETag, v) // NOTE: using ETag as version
-		lom.SetVersion(v)
+
+	etag := azEncodeEtag(*resp.ETag)
+	lom.SetCustomKey(cmn.ETag, etag)
+
+	lom.SetVersion(etag) // TODO #200224
+
+	if v := resp.LastModified; v != nil {
+		lom.SetCustomKey(cmn.LastModified, fmtTime(*v))
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infof("[put_object] %s", lom)
@@ -487,42 +501,20 @@ func (ap *azureProvider) PutObj(r io.ReadCloser, lom *core.LOM) (int, error) {
 	return http.StatusOK, nil
 }
 
-///////////////////
-// DELETE OBJECT //
-///////////////////
+//
+// DELETE OBJECT
+//
 
-// Delete looks complex because according to docs, it needs acquiring
-// an object beforehand and releasing the lease after
 func (ap *azureProvider) DeleteObj(lom *core.LOM) (int, error) {
-	var (
-		cloudBck = lom.Bck().RemoteBck()
-		cntURL   = ap.s.NewContainerURL(lom.Bck().Name)
-		blobURL  = cntURL.NewBlobURL(lom.ObjName)
-		cond     = azblob.ModifiedAccessConditions{}
-	)
+	client, err := azblob.NewClientWithSharedKeyCredential(ap.u, ap.creds, nil)
+	if err != nil {
+		return azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
+	}
+	cloudBck := lom.Bck().RemoteBck()
 
-	acqResp, err := blobURL.AcquireLease(azctx, "", leaseTime, cond)
+	_, err = client.DeleteBlob(context.Background(), cloudBck.Name, lom.ObjName, nil)
 	if err != nil {
 		return azureErrorToAISError(err, cloudBck, lom.ObjName)
-	}
-	if acqResp.StatusCode() >= http.StatusBadRequest {
-		err := cmn.NewErrFailedTo(nil, azureBackend+": acquire object", cloudBck.Name+"/"+lom.ObjName,
-			azureErrStatus(acqResp.StatusCode()))
-		return acqResp.StatusCode(), err
-	}
-
-	delCond := azblob.BlobAccessConditions{
-		LeaseAccessConditions: azblob.LeaseAccessConditions{LeaseID: acqResp.LeaseID()},
-	}
-	defer blobURL.ReleaseLease(azctx, acqResp.LeaseID(), cond)
-	delResp, err := blobURL.Delete(azctx, azblob.DeleteSnapshotsOptionInclude, delCond)
-	if err != nil {
-		return azureErrorToAISError(err, cloudBck, lom.ObjName)
-	}
-	if delResp.StatusCode() >= http.StatusBadRequest {
-		err := cmn.NewErrFailedTo(nil, azureBackend+": delete object", cloudBck.Name+"/"+lom.ObjName,
-			azureErrStatus(delResp.StatusCode()))
-		return delResp.StatusCode(), err
 	}
 	return http.StatusOK, nil
 }

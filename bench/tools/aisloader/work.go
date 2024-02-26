@@ -1,11 +1,12 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -242,12 +243,12 @@ func doGet(wo *workOrder) {
 			wo.size, wo.err = s3getDiscard(wo.bck, wo.objName)
 		} else {
 			wo.size, wo.err = getDiscard(url, wo.bck,
-				wo.objName, runParams.verifyHash, runParams.readOff, runParams.readLen)
+				wo.objName, runParams.readOff, runParams.readLen, runParams.verifyHash, runParams.latest)
 		}
 	} else {
 		debug.Assert(!isDirectS3())
 		wo.size, wo.latencies, wo.err = getTraceDiscard(url, wo.bck,
-			wo.objName, runParams.verifyHash, runParams.readOff, runParams.readLen)
+			wo.objName, runParams.readOff, runParams.readLen, runParams.verifyHash, runParams.latest)
 	}
 }
 
@@ -343,7 +344,7 @@ func _genObjName() (string, error) {
 
 func newGetWorkOrder() (*workOrder, error) {
 	if bucketObjsNames.Len() == 0 {
-		return nil, fmt.Errorf("no objects in bucket")
+		return nil, errors.New("no objects in bucket")
 	}
 
 	getPending++

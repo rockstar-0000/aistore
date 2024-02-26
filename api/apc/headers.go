@@ -1,4 +1,4 @@
-// Package apc: API messages and constants
+// Package apc: API control messages and constants
 /*
  * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
  */
@@ -16,11 +16,15 @@ const HdrError = "Hdr-Error"
 const (
 	HeaderPrefix = "ais-"
 
-	// Bucket props headers.
+	// GET via x-blob-download
+	HdrBlobDownload = HeaderPrefix + ActBlobDl
+	HdrBlobChunk    = HeaderPrefix + "blob-chunk"   // e.g., 1mb, 2MIB, 3m, or 1234567 (bytes)
+	HdrBlobWorkers  = HeaderPrefix + "blob-workers" // (dfltNumWorkers in xs/blob_download.go)
+
+	// Bucket props headers
 	HdrBucketProps      = HeaderPrefix + "bucket-props"       // => cmn.Bprops
 	HdrBucketSumm       = HeaderPrefix + "bucket-summ"        // => cmn.BsummResult (see also: QparamFltPresence)
 	HdrBucketVerEnabled = HeaderPrefix + "versioning-enabled" // Enable/disable object versioning in a bucket.
-	HdrBucketCreated    = HeaderPrefix + "created"            // Bucket creation time.
 	HdrBackendProvider  = HeaderPrefix + "provider"           // ProviderAmazon et al. - see cmn/bck.go.
 
 	// including BucketProps.Extra.AWS

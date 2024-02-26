@@ -1,16 +1,18 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
@@ -19,10 +21,10 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 const longListTime = 10 * time.Second // list-objects progress
@@ -177,8 +179,8 @@ func (putter *tracePutter) do(reqArgs *cmn.HreqArgs) (*http.Request, error) {
 
 // a bare-minimum (e.g. not passing checksum or any other metadata)
 func s3put(bck cmn.Bck, objName string, reader cos.ReadOpenCloser) (err error) {
-	uploader := s3manager.NewUploaderWithClient(s3svc)
-	_, err = uploader.Upload(&s3manager.UploadInput{
+	uploader := s3manager.NewUploader(s3svc)
+	_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String(bck.Name),
 		Key:    aws.String(objName),
 		Body:   reader,
@@ -275,7 +277,7 @@ func newTraceCtx(proxyURL string) *traceCtx {
 	return tctx
 }
 
-func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, length int64) (*http.Request, error) {
+func newGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, length int64, latest bool) (*http.Request, error) {
 	var (
 		hdr   http.Header
 		query = url.Values{}
@@ -284,8 +286,12 @@ func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, len
 	if etlName != "" {
 		query.Add(apc.QparamETLName, etlName)
 	}
+	if latest {
+		query.Add(apc.QparamLatestVer, "true")
+	}
 	if length > 0 {
-		hdr = cmn.MakeRangeHdr(offset, length)
+		rng := cmn.MakeRangeHdr(offset, length)
+		hdr = http.Header{cos.HdrRange: []string{rng}}
 	}
 	reqArgs := cmn.HreqArgs{
 		Method: http.MethodGet,
@@ -298,7 +304,7 @@ func prepareGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, len
 }
 
 func s3getDiscard(bck cmn.Bck, objName string) (int64, error) {
-	obj, err := s3svc.GetObject(&s3.GetObjectInput{
+	obj, err := s3svc.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(bck.Name),
 		Key:    aws.String(objName),
 	})
@@ -325,8 +331,8 @@ func s3getDiscard(bck cmn.Bck, objName string) (int64, error) {
 }
 
 // getDiscard sends a GET request and discards returned data.
-func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, offset, length int64) (int64, error) {
-	req, err := prepareGetRequest(proxyURL, bck, objName, offset, length)
+func getDiscard(proxyURL string, bck cmn.Bck, objName string, offset, length int64, validate, latest bool) (int64, error) {
+	req, err := newGetRequest(proxyURL, bck, objName, offset, length, latest)
 	if err != nil {
 		return 0, err
 	}
@@ -340,7 +346,7 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, off
 		hdrCksumValue = resp.Header.Get(apc.HdrObjCksumVal)
 		hdrCksumType = resp.Header.Get(apc.HdrObjCksumType)
 	}
-	src := fmt.Sprintf("GET (object %s from bucket %s)", objName, bck)
+	src := "GET " + bck.Cname(objName)
 	n, cksumValue, err := readDiscard(resp, src, hdrCksumType)
 
 	resp.Body.Close()
@@ -354,10 +360,12 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, off
 }
 
 // Same as above, but with HTTP trace.
-func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool, offset, length int64) (int64, httpLatencies, error) {
-	var hdrCksumValue, hdrCksumType string
-
-	req, err := prepareGetRequest(proxyURL, bck, objName, offset, length)
+func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, offset, length int64, validate, latest bool) (int64, httpLatencies, error) {
+	var (
+		hdrCksumValue string
+		hdrCksumType  string
+	)
+	req, err := newGetRequest(proxyURL, bck, objName, offset, length, latest)
 	if err != nil {
 		return 0, httpLatencies{}, err
 	}
@@ -377,7 +385,7 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, validate bool
 		hdrCksumType = resp.Header.Get(apc.HdrObjCksumType)
 	}
 
-	src := fmt.Sprintf("GET (object %s from bucket %s)", objName, bck)
+	src := "GET " + bck.Cname(objName)
 	n, cksumValue, err := readDiscard(resp, src, hdrCksumType)
 	if err != nil {
 		return 0, httpLatencies{}, err
@@ -438,10 +446,11 @@ func listObjCallback(ctx *api.LsoCounter) {
 }
 
 // listObjectNames returns a slice of object names of all objects that match the prefix in a bucket.
-func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string) ([]string, error) {
-	msg := &apc.LsoMsg{Prefix: prefix, PageSize: apc.DefaultPageSizeCloud}
-	if bck.IsAIS() || bck.IsRemoteAIS() {
-		msg.PageSize = apc.DefaultPageSizeAIS
+func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string, cached bool) ([]string, error) {
+	msg := &apc.LsoMsg{Prefix: prefix}
+	// if bck is remote then check for cached flag
+	if cached {
+		msg.Flags |= apc.LsObjCached
 	}
 	args := api.ListArgs{Callback: listObjCallback, CallAfter: longListTime}
 	objList, err := api.ListObjects(baseParams, bck, msg, args)
@@ -456,27 +465,35 @@ func listObjectNames(baseParams api.BaseParams, bck cmn.Bck, prefix string) ([]s
 	return objs, nil
 }
 
-func initS3Svc() {
-	config := aws.Config{HTTPClient: cmn.NewClient(cmn.TransportArgs{})}
-	config.WithEndpoint(s3Endpoint)
-	opts := session.Options{
-		SharedConfigState: session.SharedConfigEnable,
-		Config:            config,
-		Profile:           s3Profile,
+func initS3Svc() error {
+	if s3Profile == "" && os.Getenv(awsEnvConfigProfile) != "" {
+		s3Profile = os.Getenv(awsEnvConfigProfile)
 	}
-	sess := session.Must(session.NewSessionWithOptions(opts))
-	// config.Region = aws.String("us-east-1") // NOTE: may be needed
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithSharedConfigProfile(s3Profile),
+	)
+	if err != nil {
+		return err
+	}
+	if s3Endpoint != "" {
+		cfg.BaseEndpoint = aws.String(s3Endpoint)
+	}
+	if cfg.Region == "" {
+		cfg.Region = cmn.AwsDefaultRegion // Buckets in region `us-east-1` have a LocationConstraint of null.
+	}
 
-	s3svc = s3.New(sess)
+	s3svc = s3.NewFromConfig(cfg)
+	return nil
 }
 
 func s3ListObjects() ([]string, error) {
 	// first page
 	params := &s3.ListObjectsV2Input{Bucket: aws.String(runParams.bck.Name)}
-	params.MaxKeys = aws.Int64(apc.DefaultPageSizeCloud)
+	params.MaxKeys = aws.Int32(apc.MaxPageSizeAWS)
 
 	prev := mono.NanoTime()
-	resp, err := s3svc.ListObjectsV2(params)
+	resp, err := s3svc.ListObjectsV2(context.Background(), params)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +506,7 @@ func s3ListObjects() ([]string, error) {
 		token = *resp.NextContinuationToken
 	}
 	if token != "" {
-		l = 16 * apc.DefaultPageSizeCloud
+		l = 16 * apc.MaxPageSizeAWS
 	}
 	names := make([]string, 0, l)
 	for _, object := range resp.Contents {
@@ -503,7 +520,7 @@ func s3ListObjects() ([]string, error) {
 	var eol bool
 	for token != "" {
 		params.ContinuationToken = &token
-		resp, err = s3svc.ListObjectsV2(params)
+		resp, err = s3svc.ListObjectsV2(context.Background(), params)
 		if err != nil {
 			return nil, err
 		}

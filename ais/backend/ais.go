@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sync"
 	"time"
@@ -90,6 +91,9 @@ func extractErrCode(e error, uuid string) (int, error) {
 	herr := cmn.Err2HTTPErr(e)
 	if herr == nil {
 		return http.StatusInternalServerError, e
+	}
+	if herr.Status == http.StatusRequestedRangeNotSatisfiable {
+		return http.StatusRequestedRangeNotSatisfiable, cmn.NewErrRangeNotSatisfiable(herr, nil, 0)
 	}
 	if uuid != "" {
 		msg := herr.Message
@@ -376,8 +380,7 @@ func (m *AISBackendProvider) resolve(uuid string) (*remAis, string, error) {
 // BackendProvider //
 /////////////////////
 
-func (*AISBackendProvider) Provider() string  { return apc.AIS }
-func (*AISBackendProvider) MaxPageSize() uint { return apc.DefaultPageSizeAIS }
+func (*AISBackendProvider) Provider() string { return apc.AIS }
 
 func (*AISBackendProvider) CreateBucket(_ *meta.Bck) (errCode int, err error) {
 	debug.Assert(false) // Bucket creation happens only with reverse proxy to AIS cluster.
@@ -425,7 +428,7 @@ func (m *AISBackendProvider) ListObjects(remoteBck *meta.Bck, msg *apc.LsoMsg, l
 		return
 	}
 	remoteMsg := msg.Clone()
-	remoteMsg.PageSize = calcPageSize(remoteMsg.PageSize, m.MaxPageSize())
+	remoteMsg.PageSize = calcPageSize(remoteMsg.PageSize, remoteBck.MaxPageSize())
 
 	// TODO:
 	// Currently, not encoding xaction (aka request) `UUID` from the remote cluster
@@ -536,13 +539,14 @@ func (m *AISBackendProvider) GetObj(_ ctx, lom *core.LOM, owt cmn.OWT) (errCode 
 	var (
 		remAis    *remAis
 		r         io.ReadCloser
+		size      int64
 		remoteBck = lom.Bck().Clone()
 	)
 	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
 		return
 	}
 	unsetUUID(&remoteBck)
-	if r, err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, nil /*api.GetArgs*/); err != nil {
+	if r, size, err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, nil /*api.GetArgs*/); err != nil {
 		return extractErrCode(err, remAis.uuid)
 	}
 	params := core.AllocPutParams()
@@ -550,6 +554,7 @@ func (m *AISBackendProvider) GetObj(_ ctx, lom *core.LOM, owt cmn.OWT) (errCode 
 		params.WorkTag = fs.WorkfileColdget
 		params.Reader = r
 		params.OWT = owt
+		params.Size = size
 		params.Atime = time.Now()
 	}
 	err = m.t.PutObject(lom, params)
@@ -557,33 +562,43 @@ func (m *AISBackendProvider) GetObj(_ ctx, lom *core.LOM, owt cmn.OWT) (errCode 
 	return extractErrCode(err, remAis.uuid)
 }
 
-func (m *AISBackendProvider) GetObjReader(_ ctx, lom *core.LOM) (res core.GetReaderResult) {
+func (m *AISBackendProvider) GetObjReader(_ ctx, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
 	var (
 		remAis    *remAis
 		op        *cmn.ObjectProps
+		args      *api.GetArgs
 		remoteBck = lom.Bck().Clone()
 	)
 	if remAis, res.Err = m.getRemAis(remoteBck.Ns.UUID); res.Err != nil {
 		return
 	}
 	unsetUUID(&remoteBck)
-	if op, res.Err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, apc.FltPresent, true /*silent*/); res.Err != nil {
-		res.ErrCode, res.Err = extractErrCode(res.Err, remAis.uuid)
-		return
-	}
-	oa := lom.ObjAttrs()
-	*oa = op.ObjAttrs
-	res.Size = oa.Size
-	oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
-	res.ExpCksum = oa.Cksum
-	lom.SetCksum(nil)
+
 	// reader
-	res.R, res.Err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, nil /*api.GetArgs*/)
+	if length > 0 {
+		rng := cmn.MakeRangeHdr(offset, length)
+		args = &api.GetArgs{
+			Header: http.Header{cos.HdrRange: []string{rng}},
+			Query:  url.Values{apc.QparamSilent: []string{"true"}},
+		}
+	} else {
+		if op, res.Err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, apc.FltPresent, true /*silent*/); res.Err != nil {
+			res.ErrCode, res.Err = extractErrCode(res.Err, remAis.uuid)
+			return
+		}
+		oa := lom.ObjAttrs()
+		*oa = op.ObjAttrs
+		res.Size = oa.Size
+		oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
+		res.ExpCksum = oa.Cksum
+		lom.SetCksum(nil)
+	}
+	res.R, res.Size, res.Err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, args)
 	res.ErrCode, res.Err = extractErrCode(res.Err, remAis.uuid)
 	return
 }
 
-func (m *AISBackendProvider) PutObj(r io.ReadCloser, lom *core.LOM) (errCode int, err error) {
+func (m *AISBackendProvider) PutObj(r io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (errCode int, err error) {
 	var (
 		oah       api.ObjAttrs
 		remAis    *remAis

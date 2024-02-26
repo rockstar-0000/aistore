@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmd/cli/config"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/fatih/color"
 	"github.com/urfave/cli"
 )
@@ -22,10 +23,45 @@ const (
 	cliName  = "ais"
 	ua       = "ais/cli"
 	metadata = "md"
+)
+
+const (
 	cliDescr = `If <TAB-TAB> completion doesn't work:
    * download ` + cmn.GitHubHome + `/tree/main/cmd/cli/autocomplete
-   * and run 'install.sh'.
+   * run 'cmd/cli/autocomplete/install.sh'
    To install CLI directly from GitHub: ` + cmn.GitHubHome + `/blob/main/deploy/scripts/install_from_binaries.sh`
+
+	// custom cli.AppHelpTemplate
+	// "You can render custom help text by setting this variable." (from github.com/urfave/cli)
+	appHelpTemplate = `NAME:
+   {{.Name}}{{if .Usage}} - {{.Usage}}{{end}}
+
+USAGE:
+   {{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}} {{if .VisibleFlags}}[global options]{{end}}{{if .Commands}} command [command options]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}}{{if .Version}}{{if not .HideVersion}}
+
+VERSION:
+   {{.Version}}{{end}}{{end}}{{if .Description}}
+
+TAB completions (Bash and Zsh):
+   {{.Description}}{{end}}{{if len .Authors}}
+
+AUTHOR{{with $length := len .Authors}}{{if ne 1 $length}}S{{end}}{{end}}:
+   {{range $index, $author := .Authors}}{{if $index}}
+   {{end}}{{$author}}{{end}}{{end}}{{if .VisibleCommands}}
+
+COMMANDS:{{range .VisibleCategories}}{{if .Name}}
+
+   {{.Name}}:{{range .VisibleCommands}}
+     {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{else}}{{range .VisibleCommands}}
+   {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{end}}{{end}}{{end}}{{if .VisibleFlags}}
+
+GLOBAL OPTIONS:
+   {{range $index, $option := .VisibleFlags}}{{if $index}}
+   {{end}}{{$option}}{{end}}{{end}}{{if .Copyright}}
+
+COPYRIGHT:
+   {{.Copyright}}{{end}}
+`
 )
 
 const (
@@ -92,7 +128,16 @@ func helpCmdHandler(c *cli.Context) error {
 func Run(version, buildtime string, args []string) error {
 	a := acli{app: cli.NewApp(), outWriter: os.Stdout, errWriter: os.Stderr, longRun: &longRun{}}
 	buildTime = buildtime
-	a.init(version)
+
+	// empty command line or 'ais help'
+	debug.Assert(args[0] == cliName, "expecting arg0:", cliName)
+	emptyCmdline := len(args) == 1 ||
+		strings.Contains(args[1], "help") ||
+		strings.Contains(args[1], "usage") ||
+		args[1] == "-h" ||
+		strings.Contains(args[1], fl1n(cli.HelpFlag.GetName()))
+
+	a.init(version, emptyCmdline)
 
 	teb.Init(os.Stdout, cfg.NoColor)
 
@@ -101,6 +146,10 @@ func Run(version, buildtime string, args []string) error {
 		return err
 	}
 	if !a.longRun.isSet() {
+		if emptyCmdline {
+			fmt.Println("\nALIASES:")
+			fmt.Println(indent1 + cfg.Aliases.Str(indent1))
+		}
 		return nil
 	}
 	if a.longRun.outFile != nil {
@@ -164,7 +213,7 @@ func (a *acli) runN(args []string) error {
 	return nil
 }
 
-func (a *acli) init(version string) {
+func (a *acli) init(version string, emptyCmdline bool) {
 	app := a.app
 
 	if cfg.NoColor {
@@ -192,10 +241,12 @@ func (a *acli) init(version string) {
 	app.ErrWriter = a.errWriter
 	app.Description = cliDescr
 
-	a.setupCommands()
+	cli.AppHelpTemplate = appHelpTemplate
+
+	a.setupCommands(emptyCmdline)
 }
 
-func (a *acli) setupCommands() {
+func (a *acli) setupCommands(emptyCmdline bool) {
 	app := a.app
 
 	// Note: order of commands below is the order shown in "ais help"
@@ -222,6 +273,12 @@ func (a *acli) setupCommands() {
 	if k8sDetected {
 		app.Commands = append(app.Commands, k8sCmd)
 	}
+
+	// not adding aliases - showing them as part of `ais [--help]`
+	if emptyCmdline {
+		return
+	}
+
 	app.Commands = append(app.Commands, a.initAliases()...)
 	setupCommandHelp(app.Commands)
 	a.enableSearch()

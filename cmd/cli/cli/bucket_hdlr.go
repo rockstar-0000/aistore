@@ -94,10 +94,12 @@ var (
 			waitJobXactFinishedFlag,
 			latestVerFlag,
 			syncFlag,
+			nonverboseFlag,
 		},
 		commandRename: {
 			waitFlag,
 			waitJobXactFinishedFlag,
+			nonverboseFlag,
 		},
 		commandEvict: append(
 			listRangeProgressWaitFlags,
@@ -109,6 +111,7 @@ var (
 		),
 		cmdSetBprops: {
 			forceFlag,
+			dontHeadRemoteFlag,
 		},
 		cmdResetBprops: {},
 
@@ -400,7 +403,14 @@ func removeBucketHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	return destroyBuckets(c, buckets)
+	bck, err := destroyBuckets(c, buckets)
+	if err == nil {
+		return nil
+	}
+	if herr, ok := err.(*cmn.ErrHTTP); ok && herr.TypeCode == "ErrUnsupp" {
+		return fmt.Errorf("%v\n(Tip: did you want to evict '%s' from aistore?)", err, bck.Cname(""))
+	}
+	return err
 }
 
 func resetPropsHandler(c *cli.Context) error {
@@ -460,24 +470,37 @@ func setPropsHandler(c *cli.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if currProps, err = headBucket(bck, false /* don't add */); err != nil {
-		return err
+	dontHeadRemote := flagIsSet(c, dontHeadRemoteFlag)
+	if !dontHeadRemote {
+		if currProps, err = headBucket(bck, false /* don't add */); err != nil {
+			return err
+		}
 	}
 	newProps, err := parseBpropsFromContext(c)
-	if err != nil {
-		if strings.Contains(err.Error(), "missing property") {
-			if errV := showBucketProps(c); errV == nil {
-				msg := err.Error() + examplesBckSetProps
-				fmt.Fprintln(c.App.ErrWriter)
-				actionWarn(c, msg)
-				return nil
-			}
-		}
-		return fmt.Errorf("%v%s", err, examplesBckSetProps)
-	}
-	newProps.Force = flagIsSet(c, forceFlag)
 
-	return updateBckProps(c, bck, currProps, newProps)
+	if err == nil {
+		newProps.Force = flagIsSet(c, forceFlag)
+		return updateBckProps(c, bck, currProps, newProps)
+	}
+	var (
+		section = c.Args().Get(1)
+		isValid bool
+	)
+	if section != "" {
+		cmn.IterFields(&cmn.BpropsToSet{}, func(tag string, _ cmn.IterField) (e error, f bool) {
+			if strings.Contains(tag, section) {
+				isValid = true
+			}
+			return
+		})
+	}
+	if section == "" || isValid {
+		if errV := showBucketProps(c); errV == nil {
+			fmt.Fprint(c.App.ErrWriter, examplesBckSetProps)
+			return nil
+		}
+	}
+	return fmt.Errorf("%v%s", err, examplesBckSetProps)
 }
 
 // TODO: more validation; e.g. `validate_warm_get = true` is only supported for buckets with Cloud and remais backends

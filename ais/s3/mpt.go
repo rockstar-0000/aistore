@@ -24,7 +24,7 @@ type (
 		MD5  string // MD5 of the part (*)
 		FQN  string // FQN of the corresponding workfile
 		Size int64  // part size in bytes (*)
-		Num  int64  // part number (*)
+		Num  int32  // part number (*)
 	}
 	mpt struct {
 		bckName string
@@ -78,7 +78,7 @@ func CheckParts(id string, parts []*PartInfo) ([]*MptPart, error) {
 		return nil, fmt.Errorf("upload %q not found", id)
 	}
 	// first, check that all parts are present
-	var prev = int64(-1)
+	var prev = int32(-1)
 	for _, part := range parts {
 		debug.Assert(part.PartNumber > prev) // must ascend
 		if mpt.getPart(part.PartNumber) == nil {
@@ -94,12 +94,12 @@ func CheckParts(id string, parts []*PartInfo) ([]*MptPart, error) {
 	return nparts, nil
 }
 
-func ParsePartNum(s string) (partNum int64, err error) {
-	partNum, err = strconv.ParseInt(s, 10, 16)
+func ParsePartNum(s string) (int32, error) {
+	partNum, err := strconv.ParseInt(s, 10, 32)
 	if err != nil {
 		err = fmt.Errorf("invalid part number %q (must be in 1-%d range): %v", s, MaxPartsPerUpload, err)
 	}
-	return
+	return int32(partNum), err
 }
 
 // Return a sum of upload part sizes.
@@ -120,7 +120,7 @@ func ObjSize(id string) (size int64, err error) {
 
 // remove all temp files and delete from the map
 // if completed (i.e., not aborted): store xattr
-func FinishUpload(id, fqn string, aborted bool) (exists bool) {
+func CleanupUpload(id, fqn string, aborted bool) (exists bool) {
 	mu.Lock()
 	mpt, ok := ups[id]
 	if !ok {
@@ -175,7 +175,7 @@ func ListUploads(bckName, idMarker string, maxUploads int) (result *ListMptUploa
 	return
 }
 
-func ListParts(id string, lom *core.LOM) (parts []*PartInfo, err error, errCode int) {
+func ListParts(id string, lom *core.LOM) (parts []*PartInfo, errCode int, err error) {
 	mu.RLock()
 	mpt, ok := ups[id]
 	if !ok {
@@ -183,7 +183,7 @@ func ListParts(id string, lom *core.LOM) (parts []*PartInfo, err error, errCode 
 		mpt, err = loadMptXattr(lom.FQN)
 		if err != nil || mpt == nil {
 			mu.RUnlock()
-			return
+			return nil, errCode, err
 		}
 		mpt.bckName, mpt.objName = lom.Bck().Name, lom.ObjName
 		mpt.ctime = lom.Atime()
@@ -193,5 +193,5 @@ func ListParts(id string, lom *core.LOM) (parts []*PartInfo, err error, errCode 
 		parts = append(parts, &PartInfo{ETag: part.MD5, PartNumber: part.Num, Size: part.Size})
 	}
 	mu.RUnlock()
-	return
+	return parts, errCode, err
 }

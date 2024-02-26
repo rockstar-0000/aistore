@@ -754,8 +754,11 @@ func (h *htrun) bcastGroup(args *bcastArgs) sliceResults {
 		if present {
 			args.nodeCount--
 		}
+	case core.SelectedNodes:
+		args.nodeCount = len(args.nodes)
+		debug.Assert(args.nodeCount > 0)
 	default:
-		debug.Assert(false)
+		debug.Assert(false, args.to)
 	}
 	return h.bcastNodes(args)
 }
@@ -765,7 +768,7 @@ func (h *htrun) bcastGroup(args *bcastArgs) sliceResults {
 func (h *htrun) bcastNodes(bargs *bcastArgs) sliceResults {
 	var (
 		results bcastResults
-		wg      = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), bargs.nodeCount)
+		wg      = cos.NewLimitedWaitGroup(cmn.MaxParallelism(), bargs.nodeCount)
 		f       = func(si *meta.Snode) { h._call(si, bargs, &results); wg.Done() }
 	)
 	debug.Assert(len(bargs.selected) == 0)
@@ -791,7 +794,7 @@ func (h *htrun) bcastNodes(bargs *bcastArgs) sliceResults {
 func (h *htrun) bcastSelected(bargs *bcastArgs) sliceResults {
 	var (
 		results bcastResults
-		wg      = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), bargs.nodeCount)
+		wg      = cos.NewLimitedWaitGroup(cmn.MaxParallelism(), bargs.nodeCount)
 		f       = func(si *meta.Snode) { h._call(si, bargs, &results); wg.Done() }
 	)
 	debug.Assert(len(bargs.selected) > 0)
@@ -964,7 +967,7 @@ func (h *htrun) logerr(tag string, v any, err error) {
 func _parseNCopies(value any) (copies int64, err error) {
 	switch v := value.(type) {
 	case string:
-		copies, err = strconv.ParseInt(v, 10, 64)
+		copies, err = strconv.ParseInt(v, 10, 16)
 	case float64:
 		copies = int64(v)
 	default:
@@ -1267,8 +1270,8 @@ func (h *htrun) writeErrActf(w http.ResponseWriter, r *http.Request, action stri
 
 // also, validatePrefix
 func (h *htrun) isValidObjname(w http.ResponseWriter, r *http.Request, name string) bool {
-	if cos.IsLastB(name, filepath.Separator) || strings.Contains(name, "../") {
-		h.writeErrf(w, r, "invalid object name %q", name)
+	if err := cmn.ValidateObjName(name); err != nil {
+		h.writeErr(w, r, err)
 		return false
 	}
 	return true
@@ -1329,9 +1332,9 @@ func (h *htrun) _bch(c *getMaxCii, smap *smapX, nodeTy string) {
 		nodemap = smap.Tmap
 	}
 	if c.checkAll {
-		wg = cos.NewLimitedWaitGroup(cmn.MaxBcastParallel(), len(nodemap))
+		wg = cos.NewLimitedWaitGroup(cmn.MaxParallelism(), len(nodemap))
 	} else {
-		count = min(cmn.MaxBcastParallel(), maxVerConfirmations<<1)
+		count = min(cmn.MaxParallelism(), maxVerConfirmations<<1)
 		wg = cos.NewLimitedWaitGroup(count, len(nodemap) /*have*/)
 	}
 	for sid, si := range nodemap {

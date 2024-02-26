@@ -56,13 +56,13 @@ type (
 		ID   string // xaction UUID
 		Kind string // xaction kind _or_ name (see `xact.Table`)
 
-		// optional parameters to further narrow down or filter-out xactions in question
+		// optional parameters
 		DaemonID    string        // node that runs this xaction
 		Bck         cmn.Bck       // bucket
 		Buckets     []cmn.Bck     // list of buckets (e.g., copy-bucket, lru-evict, etc.)
-		Timeout     time.Duration // max time to wait and other "non-filters"
+		Timeout     time.Duration // max time to wait
 		Force       bool          // force
-		OnlyRunning bool          // look only for running xactions
+		OnlyRunning bool          // only for running xactions
 	}
 
 	// simplified JSON-tagged version of the above
@@ -86,9 +86,7 @@ type (
 		Scope       int             // ScopeG (global), etc. - the enum above
 		Startable   bool            // true if user can start this xaction (e.g., via `api.StartXaction`)
 		Metasync    bool            // true if this xaction changes (and metasyncs) cluster metadata
-		Owned       bool            // (for definition, see ais/ic.go)
 		RefreshCap  bool            // refresh capacity stats upon completion
-		Mountpath   bool            // is a mountpath-traversing ("jogger") xaction
 
 		// see xreg for "limited coexistence"
 		Rebalance      bool // moves data between nodes
@@ -118,32 +116,30 @@ type (
 var Table = map[string]Descriptor{
 	// bucket-less xactions that will typically have a 'cluster' scope (with resilver being a notable exception)
 	apc.ActElection:  {DisplayName: "elect-primary", Scope: ScopeG, Startable: false},
-	apc.ActRebalance: {Scope: ScopeG, Startable: true, Metasync: true, Owned: false, Mountpath: true, Rebalance: true},
+	apc.ActRebalance: {Scope: ScopeG, Startable: true, Metasync: true, Rebalance: true},
 
-	apc.ActETLInline: {Scope: ScopeG, Startable: false, Mountpath: false, AbortRebRes: true},
+	apc.ActETLInline: {Scope: ScopeG, Startable: false, AbortRebRes: true},
 
 	// (one bucket) | (all buckets)
-	apc.ActLRU:          {DisplayName: "lru-eviction", Scope: ScopeGB, Startable: true, Mountpath: true},
-	apc.ActStoreCleanup: {DisplayName: "cleanup", Scope: ScopeGB, Startable: true, Mountpath: true},
+	apc.ActLRU:          {DisplayName: "lru-eviction", Scope: ScopeGB, Startable: true},
+	apc.ActStoreCleanup: {DisplayName: "cleanup", Scope: ScopeGB, Startable: true},
 	apc.ActSummaryBck: {
 		DisplayName: "summary",
 		Scope:       ScopeGB,
 		Access:      apc.AceObjLIST | apc.AceBckHEAD,
 		Startable:   false,
 		Metasync:    false,
-		Owned:       true,
-		Mountpath:   true,
 	},
 
 	// single target (node)
-	apc.ActResilver: {Scope: ScopeT, Startable: true, Mountpath: true, Resilver: true},
+	apc.ActResilver: {Scope: ScopeT, Startable: true, Resilver: true},
 
 	// on-demand EC and n-way replication
 	// (non-startable, triggered by PUT => erasure-coded or mirrored bucket)
 	apc.ActECGet:     {Scope: ScopeB, Startable: false, Idles: true, ExtendedStats: true},
-	apc.ActECPut:     {Scope: ScopeB, Startable: false, Mountpath: true, RefreshCap: true, Idles: true, ExtendedStats: true},
+	apc.ActECPut:     {Scope: ScopeB, Startable: false, RefreshCap: true, Idles: true, ExtendedStats: true},
 	apc.ActECRespond: {Scope: ScopeB, Startable: false, Idles: true},
-	apc.ActPutCopies: {Scope: ScopeB, Startable: false, Mountpath: true, RefreshCap: true, Idles: true},
+	apc.ActPutCopies: {Scope: ScopeB, Startable: false, RefreshCap: true, Idles: true},
 
 	//
 	// on-demand multi-object (consider setting ConflictRebRes = true)
@@ -167,7 +163,9 @@ var Table = map[string]Descriptor{
 		AbortRebRes: true,
 	},
 
-	apc.ActDownload: {Access: apc.AccessRW, Scope: ScopeG, Startable: false, Mountpath: true, Idles: true, AbortRebRes: true},
+	apc.ActBlobDl: {Access: apc.AccessRW, Scope: ScopeB, Startable: true, AbortRebRes: true, RefreshCap: true},
+
+	apc.ActDownload: {Access: apc.AccessRW, Scope: ScopeG, Startable: false, Idles: true, AbortRebRes: true},
 
 	// in its own class
 	apc.ActDsort: {
@@ -176,7 +174,6 @@ var Table = map[string]Descriptor{
 		Access:         apc.AccessRW,
 		Startable:      false,
 		RefreshCap:     true,
-		Mountpath:      true,
 		ConflictRebRes: true,
 		ExtendedStats:  true,
 		AbortRebRes:    true,
@@ -196,7 +193,6 @@ var Table = map[string]Descriptor{
 		Access:      apc.AceObjDELETE,
 		Startable:   false,
 		RefreshCap:  true,
-		Mountpath:   true,
 	},
 	apc.ActDeleteObjects: {
 		DisplayName: "delete-objects",
@@ -204,7 +200,6 @@ var Table = map[string]Descriptor{
 		Access:      apc.AceObjDELETE,
 		Startable:   false,
 		RefreshCap:  true,
-		Mountpath:   true,
 	},
 	apc.ActPrefetchObjects: {
 		DisplayName: "prefetch-objects",
@@ -221,9 +216,7 @@ var Table = map[string]Descriptor{
 		Access:         apc.AccessRW,
 		Startable:      true,
 		Metasync:       true,
-		Owned:          false,
 		RefreshCap:     true,
-		Mountpath:      true,
 		ConflictRebRes: true,
 	},
 	apc.ActMakeNCopies: {
@@ -232,9 +225,7 @@ var Table = map[string]Descriptor{
 		Access:      apc.AccessRW,
 		Startable:   true,
 		Metasync:    true,
-		Owned:       false,
 		RefreshCap:  true,
-		Mountpath:   true,
 	},
 	apc.ActMoveBck: {
 		DisplayName:    "rename-bucket",
@@ -242,8 +233,6 @@ var Table = map[string]Descriptor{
 		Access:         apc.AceMoveBucket,
 		Startable:      false, // executing this one cannot be done via `api.StartXaction`
 		Metasync:       true,
-		Owned:          false,
-		Mountpath:      true,
 		Rebalance:      true,
 		ConflictRebRes: true,
 	},
@@ -253,9 +242,7 @@ var Table = map[string]Descriptor{
 		Access:         apc.AccessRW, // apc.AceCreateBucket ditto
 		Startable:      false,        // ditto
 		Metasync:       true,
-		Owned:          false,
 		RefreshCap:     true,
-		Mountpath:      true,
 		ConflictRebRes: true,
 	},
 	apc.ActETLBck: {
@@ -264,20 +251,16 @@ var Table = map[string]Descriptor{
 		Access:      apc.AccessRW, // ditto
 		Startable:   false,        // ditto
 		Metasync:    true,
-		Owned:       false,
 		RefreshCap:  true,
-		Mountpath:   true,
 		AbortRebRes: true,
 	},
 
-	apc.ActList: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false, Metasync: false, Owned: true, Idles: true},
+	apc.ActList: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false, Metasync: false, Idles: true},
 
 	// cache management, internal usage
-	apc.ActLoadLomCache:   {DisplayName: "warm-up-metadata", Scope: ScopeB, Startable: true, Mountpath: true},
+	apc.ActLoadLomCache:   {DisplayName: "warm-up-metadata", Scope: ScopeB, Startable: true},
 	apc.ActInvalListCache: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false},
 }
-
-func IsMountpath(kind string) bool { return Table[kind].Mountpath }
 
 func IsValidKind(kind string) bool {
 	_, ok := Table[kind]
@@ -307,6 +290,8 @@ func GetKindName(kindOrName string) (kind, name string) {
 	}
 	return
 }
+
+func Cname(kind, uuid string) string { return kind + LeftID + uuid + RightID }
 
 func ParseCname(cname string) (xactKind, xactID string, _ error) {
 	const efmt = "invalid name %q"
@@ -374,7 +359,7 @@ func getDtor(kindOrName string) (string, *Descriptor) {
 
 func (args *ArgsMsg) String() (s string) {
 	if args.ID == "" {
-		s = fmt.Sprintf("x-%s", args.Kind)
+		s = "x-" + args.Kind
 	} else {
 		s = fmt.Sprintf("x-%s[%s]", args.Kind, args.ID)
 	}
@@ -396,7 +381,7 @@ func (args *ArgsMsg) String() (s string) {
 
 func (msg *QueryMsg) String() (s string) {
 	if msg.ID == "" {
-		s = fmt.Sprintf("x-%s", msg.Kind)
+		s = "x-" + msg.Kind
 	} else {
 		s = fmt.Sprintf("x-%s[%s]", msg.Kind, msg.ID)
 	}

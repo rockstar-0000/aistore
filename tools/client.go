@@ -5,6 +5,7 @@
 package tools
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -248,8 +249,8 @@ func SetBackendBck(t *testing.T, bp api.BaseParams, srcBck, dstBck cmn.Bck) {
 
 	_, err = api.SetBucketProps(bp, srcBck, &cmn.BpropsToSet{
 		BackendBck: &cmn.BackendBckToSet{
-			Name:     apc.String(dstBck.Name),
-			Provider: apc.String(p.Provider),
+			Name:     apc.Ptr(dstBck.Name),
+			Provider: apc.Ptr(p.Provider),
 		},
 	})
 	tassert.CheckFatal(t, err)
@@ -451,12 +452,12 @@ func WaitForDsortToFinish(proxyURL, managerUUID string) (allAborted bool, err er
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return false, fmt.Errorf("deadline exceeded")
+	return false, errors.New("deadline exceeded")
 }
 
 func BaseAPIParams(urls ...string) api.BaseParams {
 	var u string
-	if len(urls) > 0 && len(urls[0]) > 0 {
+	if len(urls) > 0 && urls[0] != "" {
 		u = urls[0]
 	} else {
 		u = RandomProxyURL()

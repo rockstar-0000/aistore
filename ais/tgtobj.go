@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
@@ -46,6 +47,7 @@ import (
 
 type (
 	putOI struct {
+		req        *http.Request
 		r          io.ReadCloser // content reader
 		xctn       core.Xact     // xaction that puts
 		t          *target       // this
@@ -66,6 +68,7 @@ type (
 	}
 
 	getOI struct {
+		req        *http.Request
 		w          http.ResponseWriter
 		ctx        context.Context // context used when getting object from remote backend (access creds)
 		t          *target         // this
@@ -81,6 +84,7 @@ type (
 		retry      bool            // once
 		cold       bool            // true if executed backend.Get
 		latestVer  bool            // QparamLatestVer || 'versioning.*_warm_get'
+		isS3       bool            // calling via /s3 API
 	}
 
 	// textbook append: (packed) handle and control structure (see also `putA2I` arch below)
@@ -133,6 +137,7 @@ type (
 // poi.restful entry point
 func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (int, error) {
 	{
+		poi.req = r
 		poi.r = r.Body
 		poi.resphdr = resphdr
 		poi.workFQN = fs.CSM.Gen(poi.lom, fs.WorkfileType, fs.WorkfilePut)
@@ -185,7 +190,7 @@ func (poi *putOI) putObject() (errCode int, err error) {
 		goto rerr
 	}
 
-	// stats
+	// resp. header & stats
 	if !poi.t2t {
 		// NOTE: counting only user PUTs; ignoring EC and copies, on the one hand, and
 		// same-checksum-skip-writing, on the other
@@ -246,7 +251,7 @@ func (poi *putOI) finalize() (errCode int, err error) {
 				err1 = err
 			}
 			poi.t.fsErr(err1, poi.workFQN)
-			if err2 := cos.RemoveFile(poi.workFQN); err2 != nil {
+			if err2 := cos.RemoveFile(poi.workFQN); err2 != nil && !os.IsNotExist(err2) {
 				nlog.Errorf(fmtNested, poi.t, err1, "remove", poi.workFQN, err2)
 			}
 		}
@@ -360,7 +365,11 @@ func (poi *putOI) putRemote() (errCode int, err error) {
 		// some/all of those are set by the backend.PutObj()
 		lom.ObjAttrs().DelCustomKeys(cmn.SourceObjMD, cmn.CRC32CObjMD, cmn.ETag, cmn.MD5ObjMD, cmn.VersionObjMD)
 	}
-	errCode, err = backend.PutObj(lmfh, lom)
+
+	errCode, err = backend.PutObj(lmfh, lom, &core.ExtraArgsPut{
+		DataClient: g.client.data,
+		Req:        poi.req,
+	})
 	if err == nil && !lom.Bck().IsRemoteAIS() {
 		lom.SetCustomKey(cmn.SourceObjMD, backend.Provider())
 	}
@@ -470,7 +479,7 @@ func (poi *putOI) _cleanup(buf []byte, slab *memsys.Slab, lmfh *os.File, err err
 	if nerr := lmfh.Close(); nerr != nil {
 		nlog.Errorf(fmtNested, poi.t, err, "close", poi.workFQN, nerr)
 	}
-	if nerr := cos.RemoveFile(poi.workFQN); nerr != nil {
+	if nerr := cos.RemoveFile(poi.workFQN); nerr != nil && !os.IsNotExist(nerr) {
 		nlog.Errorf(fmtNested, poi.t, err, "remove", poi.workFQN, nerr)
 	}
 }
@@ -554,12 +563,28 @@ do:
 			goto fin
 		}
 	} else if goi.latestVer { // apc.QparamLatestVer or 'versioning.validate_warm_get'
-		eq, errCodeSync, errSync := goi.lom.CheckRemoteMD(true /* rlocked */, false /*synchronize*/)
-		if errSync != nil {
-			return errCodeSync, errSync
+		res := goi.lom.CheckRemoteMD(true /* rlocked */, false /*synchronize*/)
+		if res.Err != nil {
+			return res.ErrCode, res.Err
 		}
-		if !eq {
+		if !res.Eq {
 			cold, goi.verchanged = true, true
+		}
+		// TODO: utilize res.ObjAttrs
+	} else if cmn.Rom.Features().IsSet(feat.PassThroughSignedS3Req) {
+		cold = false
+		q := goi.req.URL.Query()
+		pts := s3.NewPassThroughSignedReq(g.client.control, goi.req, goi.lom, nil, q)
+		resp, err := pts.Do()
+		if err != nil {
+			return resp.StatusCode, err
+		}
+		if resp != nil {
+			oa := resp.ObjAttrs()
+			if !goi.lom.Equal(oa) {
+				err := fmt.Errorf("%s: checksum doesn't match, object should be retrieved from S3", goi.lom.Cname())
+				return http.StatusGone, err
+			}
 		}
 	}
 
@@ -601,7 +626,7 @@ do:
 		goi.lom.SetCustomMD(nil)
 
 		// get remote reader (compare w/ t.GetCold)
-		res = goi.t.Backend(goi.lom.Bck()).GetObjReader(goi.ctx, goi.lom)
+		res = goi.t.Backend(goi.lom.Bck()).GetObjReader(goi.ctx, goi.lom, 0, 0)
 		if res.Err != nil {
 			goi.lom.Unlock(true)
 			goi.unlocked = true
@@ -993,7 +1018,9 @@ func (goi *getOI) fini(fqn string, lmfh *os.File, hdr http.Header, hrng *htrange
 		reader io.Reader = lmfh
 	)
 	cmn.ToHeader(goi.lom.ObjAttrs(), hdr) // (defaults)
-
+	if goi.isS3 {
+		s3.SetEtag(hdr, goi.lom)
+	}
 	switch {
 	case goi.archive.filename != "": // archive
 		var (
@@ -1055,9 +1082,11 @@ func (goi *getOI) fini(fqn string, lmfh *os.File, hdr http.Header, hrng *htrange
 
 	hdr.Set(cos.HdrContentLength, strconv.FormatInt(size, 10))
 	hdr.Set(cos.HdrContentType, cos.ContentBinary)
+
 	buf, slab := goi.t.gmm.AllocSize(min(size, 64*cos.KiB))
 	err = goi.transmit(reader, buf, fqn)
 	slab.Free(buf)
+
 	return
 }
 
@@ -1111,7 +1140,7 @@ func (goi *getOI) parseRange(resphdr http.Header, size int64) (hrng *htrange, er
 	var ranges []htrange
 	ranges, err = parseMultiRange(goi.ranges.Range, size)
 	if err != nil {
-		if _, ok := err.(*errRangeNoOverlap); ok {
+		if cmn.IsErrRangeNotSatisfiable(err) {
 			// https://datatracker.ietf.org/doc/html/rfc7233#section-4.2
 			resphdr.Set(cos.HdrContentRange, fmt.Sprintf("%s*/%d", cos.HdrContentRangeValPrefix, size))
 		}

@@ -1,11 +1,12 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file provides aliases to frequently used commands that are inside other top level commands.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -192,7 +193,7 @@ func (a *acli) setAliasHandler(c *cli.Context) (err error) {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
 	if !validateAlias(alias) {
-		return fmt.Errorf(invalidAlias)
+		return errors.New(invalidAlias)
 	}
 
 	if c.NArg() < 2 {

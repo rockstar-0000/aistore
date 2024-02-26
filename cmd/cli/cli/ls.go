@@ -257,7 +257,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	}
 
 	// when prefix crosses shard boundary
-	if external, internal := splitPrefixShardBoundary(prefix); len(internal) > 0 {
+	if external, internal := splitPrefixShardBoundary(prefix); internal != "" {
 		origPrefix := prefix
 		prefix = external
 		lstFilter._add(func(obj *cmn.LsoEntry) bool { return strings.HasPrefix(obj.Name, origPrefix) })
@@ -442,25 +442,39 @@ func lsoErr(msg *apc.LsoMsg, err error) error {
 }
 
 func _setPage(c *cli.Context, bck cmn.Bck) (pageSize, limit int, err error) {
-	defaultPageSize := apc.DefaultPageSizeCloud
-	if bck.IsAIS() || bck.IsRemoteAIS() {
-		defaultPageSize = apc.DefaultPageSizeAIS
+	b := meta.CloneBck(&bck)
+	if flagIsSet(c, pageSizeFlag) {
+		pageSize = parseIntFlag(c, pageSizeFlag)
+		if pageSize < 0 {
+			err = fmt.Errorf("invalid %s: page size (%d) cannot be negative", qflprn(pageSizeFlag), pageSize)
+			return
+		}
+		if uint(pageSize) > b.MaxPageSize() {
+			if b.Props == nil {
+				if b.Props, err = headBucket(bck, true /* don't add */); err != nil {
+					return
+				}
+			}
+			// still?
+			if uint(pageSize) > b.MaxPageSize() {
+				err = fmt.Errorf("invalid %s: page size (%d) cannot exceed the maximum (%d)",
+					qflprn(pageSizeFlag), pageSize, b.MaxPageSize())
+				return
+			}
+		}
 	}
-	pageSize = parseIntFlag(c, pageSizeFlag)
-	if pageSize < 0 {
-		err = fmt.Errorf("page size (%d) cannot be negative", pageSize)
-		return
-	}
+
 	limit = parseIntFlag(c, objLimitFlag)
 	if limit < 0 {
-		err = fmt.Errorf("max object count (%d) cannot be negative", limit)
+		err = fmt.Errorf("invalid %s: max number of listed objects (%d) cannot be negative", qflprn(objLimitFlag), limit)
 		return
 	}
 	if limit == 0 {
 		return
 	}
+
 	// when limit "wins"
-	if limit < pageSize || (limit < defaultPageSize && pageSize == 0) {
+	if limit < pageSize || (uint(limit) < b.MaxPageSize() && pageSize == 0) {
 		pageSize = limit
 	}
 	return

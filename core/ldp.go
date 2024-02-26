@@ -29,6 +29,13 @@ type (
 		cos.ReadOpenCloser
 		lif LIF
 	}
+
+	CRMD struct {
+		Err      error
+		ObjAttrs *cmn.ObjAttrs
+		ErrCode  int
+		Eq       bool
+	}
 )
 
 // interface guard
@@ -57,15 +64,15 @@ func (*LDP) Reader(lom *LOM, latestVer, sync bool) (cos.ReadOpenCloser, cos.OAH,
 	if loadErr == nil {
 		if latestVer || sync {
 			debug.Assert(lom.Bck().IsRemote(), lom.Bck().String()) // caller's responsibility
-			eq, errCode, err := lom.CheckRemoteMD(true /* rlocked*/, sync)
-			if err != nil {
+			res := lom.CheckRemoteMD(true /* rlocked*/, sync)
+			if res.Err != nil {
 				lom.Unlock(false)
-				if !cos.IsNotExist(err, errCode) {
-					err = cmn.NewErrFailedTo(T, "head-latest", lom, err)
+				if !cos.IsNotExist(res.Err, res.ErrCode) {
+					res.Err = cmn.NewErrFailedTo(T, "head-latest", lom, res.Err)
 				}
-				return nil, nil, err
+				return nil, nil, res.Err
 			}
-			if !eq {
+			if !res.Eq {
 				// version changed
 				lom.Unlock(false)
 				goto remote
@@ -93,7 +100,7 @@ remote:
 		Cksum: cos.NoneCksum, // will likely reassign (below)
 		Atime: lom.AtimeUnix(),
 	}
-	res := T.Backend(lom.Bck()).GetObjReader(context.Background(), lom)
+	res := T.Backend(lom.Bck()).GetObjReader(context.Background(), lom, 0, 0)
 
 	if lom.Checksum() != nil {
 		oah.Cksum = lom.Checksum()
@@ -108,18 +115,20 @@ remote:
 // - [PRECONDITION]: `versioning.validate_warm_get` || QparamLatestVer
 // - [Sync] when Sync option is used (via bucket config and/or `sync` argument) caller MUST take wlock or rlock
 // - [MAY] delete remotely-deleted (non-existing) object and increment associated stats counter
-func (lom *LOM) CheckRemoteMD(locked, sync bool) (bool /*equal*/, int, error) {
+//
+// Returns NotFound also after having removed local replica (the Sync option)
+func (lom *LOM) CheckRemoteMD(locked, sync bool) (res CRMD) {
 	bck := lom.Bck()
 	if !bck.HasVersioningMD() {
 		// nothing to do with: in-cluster ais:// bucket, or a remote one
 		// that doesn't provide any versioning metadata
-		return true, 0, nil
+		return CRMD{Eq: true}
 	}
 
 	oa, errCode, err := T.Backend(bck).HeadObj(context.Background(), lom)
 	if err == nil {
 		debug.Assert(errCode == 0, errCode)
-		return lom.Equal(oa), errCode, nil
+		return CRMD{ObjAttrs: oa, Eq: lom.Equal(oa), ErrCode: errCode}
 	}
 
 	if errCode == http.StatusNotFound {
@@ -127,7 +136,7 @@ func (lom *LOM) CheckRemoteMD(locked, sync bool) (bool /*equal*/, int, error) {
 	}
 	if !locked {
 		// return info (neq and, possibly, not-found), and be done
-		return false, errCode, err
+		return CRMD{ErrCode: errCode, Err: err}
 	}
 
 	// rm remotely-deleted
@@ -138,9 +147,37 @@ func (lom *LOM) CheckRemoteMD(locked, sync bool) (bool /*equal*/, int, error) {
 		} else {
 			g.tstats.Inc(RemoteDeletedDelCount)
 		}
-		return false, errCode, err
+		debug.Assert(err != nil)
+		return CRMD{ErrCode: errCode, Err: err}
 	}
 
 	lom.Uncache()
-	return false, errCode, err
+	return CRMD{ErrCode: errCode, Err: err}
+}
+
+// NOTE: must be locked; NOTE: Sync == false (ie., not deleting)
+func (lom *LOM) LoadLatest(latest bool) (oa *cmn.ObjAttrs, deleted bool, err error) {
+	debug.AssertFunc(func() bool {
+		rc, exclusive := lom.IsLocked()
+		return exclusive || rc > 0
+	})
+	err = lom.Load(true /*cache it*/, true /*locked*/)
+	if err != nil {
+		if !cmn.IsErrObjNought(err) || !latest {
+			return nil, false, err
+		}
+	}
+	if latest {
+		res := lom.CheckRemoteMD(true /*locked*/, false /*synchronize*/)
+		if res.Eq {
+			debug.AssertNoErr(res.Err)
+			return nil, false, nil
+		}
+		if res.Err != nil {
+			deleted = cos.IsNotExist(res.Err, res.ErrCode)
+			return nil, deleted, res.Err
+		}
+		oa = res.ObjAttrs
+	}
+	return oa, false, nil
 }

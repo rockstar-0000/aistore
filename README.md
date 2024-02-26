@@ -5,7 +5,7 @@
 
 AIStore (AIS for short) is a built from scratch, lightweight storage stack tailored for AI apps. It's an elastic cluster that can grow and shrink at runtime and can be ad-hoc deployed, with or without Kubernetes, anywhere from a single Linux machine to a bare-metal cluster of any size.
 
-AIS consistently shows balanced I/O distribution and **linear scalability** across arbitrary numbers of clustered nodes. The ability to scale linearly with each added disk was, and remains, one of the main incentives. Much of the initial design was also driven by the ideas to [offload](https://aiatscale.org/blog) custom dataset transformations (often referred to as [ETL](https://aiatscale.org/blog/2021/10/21/ais-etl-1)). And finally, since AIS is a software system that aggregates Linux machines to provide storage for user data, there's the requirement number one: reliability and data protection.
+AIS [consistently shows balanced I/O distribution and linear scalability](https://aiatscale.org/blog/2024/02/16/multihome-bench) across arbitrary numbers of clustered nodes. The ability to scale linearly with each added disk was, and remains, one of the main incentives. Much of the initial design was also driven by the ideas to [offload](https://aiatscale.org/blog/2023/06/09/aisio-transforms-with-webdataset-pt-3) custom dataset transformations (often referred to as [ETL](https://aiatscale.org/blog/2021/10/21/ais-etl-1)). And finally, since AIS is a software system that aggregates Linux machines to provide storage for user data, there's the requirement number one: reliability and data protection.
 
 ## Features
 
@@ -21,10 +21,20 @@ AIS consistently shows balanced I/O distribution and **linear scalability** acro
 * **Write-through**. In presence of any [remote backend](/docs/providers.md), AIS executes remote write (e.g., using vendor's SDK) as part of the [transaction](https://github.com/NVIDIA/aistore/blob/main/docs/overview.md#read-after-write-consistency) that places and _finalizes_ the first replica.
 * **Small file datasets.** To serialize small files and facilitate batch processing, AIS supports TAR, TAR.GZ (or TGZ), ZIP, and TAR.LZ4 formatted objects (often called _shards_). Resharding (for optimal sorting and sizing), listing contained files (samples), appending to existing shards, and generating new ones from existing objects and/or client-side files - is also fully supported.
 * **Kubernetes**. Provides for easy Kubernetes deployment via a separate GitHub [repo](https://github.com/NVIDIA/ais-k8s) and [AIS/K8s Operator](https://github.com/NVIDIA/ais-k8s/tree/master/operator).
-* **Command line management**. Integrated powerful [CLI](/docs/cli.md) for easy management and monitoring.
 * **Access control**. For security and fine-grained access control, AIS includes OAuth 2.0 compliant [Authentication Server (AuthN)](/docs/authn.md). A single AuthN instance executes CLI requests over HTTPS and can serve multiple clusters.
 * **Distributed shuffle** extension for massively parallel resharding of very large datasets.
 * **Batch jobs**. APIs and CLI to start, stop, and monitor documented [batch operations](/docs/batch.md), such as `prefetch`, `download`, copy or transform datasets, and many more.
+
+For easy usage, management, and monitoring, there's also:
+* **Integrated and powerful [CLI](/docs/cli.md)**. As of early 2024, top-level CLI commands include:
+```console
+$ ais
+
+bucket        etl         help           log              create        dsort        stop         blob-download
+object        job         advanced       performance      download      evict        cp           rmo
+cluster       auth        storage        remote-cluster   prefetch      get          rmb          wait
+config        show        archive        alias            put           ls           start        search
+```
 
 AIS runs natively on Kubernetes and features open format - thus, the freedom to copy or move your data from AIS at any time using the familiar Linux `tar(1)`, `scp(1)`, `rsync(1)` and similar.
 
@@ -60,6 +70,22 @@ Further, there's the capability referred to as [global namespace](https://github
 > For detailed discussion on supported deployments, please refer to [Getting Started](/docs/getting_started.md).
 
 > For performance tuning and preparing AIS nodes for bare-metal deployment, see [performance](/docs/performance.md).
+
+## Existing datasets
+
+AIStore supports multiple ways to populate itself with existing datasets, including (but not limited to):
+
+* **on demand**, often during the first epoch;
+* **copy** entire bucket or its selected virtual subdirectories;
+* **copy** multiple matching objects;
+* **archive** multiple objects
+* **prefetch** remote bucket or parts of thereof;
+* **download** raw http(s) addressible directories, including (but not limited to) Cloud storages;
+* **promote** NFS or SMB shares accessible by one or multiple (or all) AIS target nodes;
+
+> The on-demand "way" is maybe the most popular, whereby users just start running their workloads against a [remote bucket](docs/providers.md) with AIS cluster positioned as an intermediate fast tier.
+
+But there's more. In v3.22, we introduce [blob downloader](docs/blob_downloader.md), a special facility to download very large remote objects (BLOBs).
 
 ## Installing from release binaries
 
@@ -107,6 +133,7 @@ With a little effort, they all could be extracted and used outside.
 - Amazon S3
   - [`s3cmd` client](/docs/s3cmd.md)
   - [S3 compatibility](/docs/s3compat.md)
+  - [Presigned S3 requests](/docs/s3compat.md#presigned-s3-requests)
   - [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch)
 - [CLI](/docs/cli.md)
   - [`ais help`](/docs/cli/help.md)
@@ -149,7 +176,7 @@ With a little effort, they all could be extracted and used outside.
   - [S3 compatibility](/docs/s3compat.md)
 - Cluster Management
   - [Node lifecycle: maintenance mode, rebalance/rebuild, shutdown, decommission](/docs/lifecycle_node.md)
-  - [CLI: `ais cluster` and subcommands](/docs/cli/show.md)
+  - [Monitoring: `ais show` and subcommands](/docs/cli/show.md)
   - [Joining AIS cluster](/docs/join_cluster.md)
   - [Leaving AIS cluster](/docs/leave_cluster.md)
   - [Global Rebalance](/docs/rebalance.md)
@@ -171,7 +198,12 @@ With a little effort, they all could be extracted and used outside.
 - Batch jobs
   - [Batch operations](/docs/batch.md)
   - [eXtended Actions (xactions)](/xact/README.md)
-  - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md)
+  - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md), including:
+    - [prefetch remote datasets](/docs/cli/object.md#prefetch-objects)
+    - [copy bucket](/docs/cli/bucket.md#copy-bucket)
+    - [copy multiple objects](/docs/cli/bucket.md#copy-multiple-objects)
+    - [download remote BLOBs](/docs/cli/blob-downloader.md)
+    - [promote NFS or SMB share](https://aiatscale.org/blog/2022/03/17/promote), and more
 - Assorted Topics
   - [System files](/docs/sysfiles.md)
   - [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)
@@ -184,7 +216,7 @@ With a little effort, they all could be extracted and used outside.
   - [Downloader](/docs/downloader.md)
   - [On-disk layout](/docs/on_disk_layout.md)
   - [Buckets: definition, operations, properties](https://github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket)
-  - [Out of band updates](/docs/out_of_band.md)
+  - [Out-of-band updates](/docs/out_of_band.md)
 
 ## License
 

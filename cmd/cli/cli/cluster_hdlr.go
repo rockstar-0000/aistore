@@ -296,7 +296,7 @@ func joinNodeHandler(c *cli.Context) (err error) {
 	addr = c.Args().Get(0)
 	addrParts = strings.Split(addr, ":")
 	if len(addrParts) != 2 {
-		return fmt.Errorf("invalid address, expecting 'IPv4:PORT'")
+		return errors.New("invalid address, expecting 'IPv4:PORT'")
 	}
 
 	switch parseStrFlag(c, roleFlag) {
@@ -412,7 +412,7 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 		xid, err = api.StopMaintenance(apiBP, actValue)
 	case cmdNodeDecommission:
 		if !flagIsSet(c, yesFlag) {
-			warn := fmt.Sprintf("about to permanently decommission %s. The operation cannot be undone!", sname)
+			warn := "about to permanently decommission " + sname + ". The operation cannot be undone!"
 			if ok := confirm(c, "Proceed?", warn); !ok {
 				return nil
 			}
@@ -420,7 +420,7 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 		xid, err = api.DecommissionNode(apiBP, actValue)
 	case cmdShutdown:
 		if !flagIsSet(c, yesFlag) {
-			prompt := fmt.Sprintf("Shut down %s", sname)
+			prompt := "Shut down " + sname
 			if ok := confirm(c, prompt); !ok {
 				return nil
 			}
@@ -492,7 +492,7 @@ func startClusterRebalanceHandler(c *cli.Context) (err error) {
 
 func stopClusterRebalanceHandler(c *cli.Context) error {
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, OnlyRunning: true}
-	snap, err := getXactSnap(&xargs)
+	_, snap, err := getXactSnap(&xargs)
 	if err != nil {
 		return err
 	}

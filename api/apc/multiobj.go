@@ -1,4 +1,4 @@
-// Package apc: API messages and constants
+// Package apc: API control messages and constants
 /*
  * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
@@ -12,8 +12,9 @@ type (
 	}
 	PrefetchMsg struct {
 		ListRange
-		ContinueOnError bool `json:"coer"`
-		LatestVer       bool `json:"latest-ver"` // see also: QparamLatestVer, 'versioning.validate_warm_get'
+		BlobThreshold   int64 `json:"blob-threshold"`
+		ContinueOnError bool  `json:"coer"`
+		LatestVer       bool  `json:"latest-ver"` // see also: QparamLatestVer, 'versioning.validate_warm_get'
 	}
 
 	// ArchiveMsg contains the parameters (all except the destination bucket)

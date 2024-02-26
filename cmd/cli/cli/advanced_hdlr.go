@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file provides advanced commands that are useful for testing or development but not everyday use.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -11,6 +11,7 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
 )
 
@@ -71,7 +72,8 @@ func loadLomCacheHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	return startXaction(c, apc.ActLoadLomCache, bck, "")
+	xargs := xact.ArgsMsg{Kind: apc.ActLoadLomCache, Bck: bck}
+	return startXaction(c, &xargs, "")
 }
 
 func removeNodeFromSmap(c *cli.Context) error {
@@ -150,8 +152,7 @@ func rotateLogs(c *cli.Context) error {
 		if err := api.RotateLogs(apiBP, node.ID()); err != nil {
 			return V(err)
 		}
-		msg := fmt.Sprintf("%s: rotated logs", sname)
-		actionDone(c, msg)
+		actionDone(c, sname+": rotated logs")
 		return nil
 	}
 	// 2. or cluster

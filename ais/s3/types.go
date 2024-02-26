@@ -66,7 +66,7 @@ type (
 	// Multipart uploaded part
 	PartInfo struct {
 		ETag       string `xml:"ETag"`
-		PartNumber int64  `xml:"PartNumber"`
+		PartNumber int32  `xml:"PartNumber"`
 		Size       int64  `xml:"Size,omitempty"`
 	}
 
@@ -188,21 +188,16 @@ func (r *ListObjectResult) FromLsoResult(lst *cmn.LsoResult, lsmsg *apc.LsoMsg) 
 	}
 }
 
-func lomMD5(lom *core.LOM) string {
-	if v, exists := lom.GetCustomKey(cmn.SourceObjMD); exists && v == apc.AWS {
-		if v, exists := lom.GetCustomKey(cmn.MD5ObjMD); exists {
-			return v
-		}
+func SetEtag(hdr http.Header, lom *core.LOM) {
+	if hdr.Get(cos.S3CksumHeader) != "" {
+		return
+	}
+	if v, exists := lom.GetCustomKey(cmn.ETag); exists && !cmn.IsS3MultipartEtag(v) {
+		hdr.Set(cos.S3CksumHeader /*"ETag"*/, v)
+		return
 	}
 	if cksum := lom.Checksum(); cksum.Type() == cos.ChecksumMD5 {
-		return cksum.Value()
-	}
-	return ""
-}
-
-func SetETag(header http.Header, lom *core.LOM) {
-	if md5val := lomMD5(lom); md5val != "" {
-		header.Set(cos.S3CksumHeader, md5val)
+		hdr.Set(cos.S3CksumHeader, cksum.Value())
 	}
 }
 

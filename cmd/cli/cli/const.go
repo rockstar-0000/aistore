@@ -88,13 +88,14 @@ const (
 	commandEvict    = "evict"    // apc.ActEvictRemoteBck or apc.ActEvictObjects
 	commandPrefetch = "prefetch" // apc.ActPrefetchObjects
 
-	cmdDownload    = apc.ActDownload
-	cmdDsort       = apc.ActDsort
-	cmdRebalance   = apc.ActRebalance
-	cmdLRU         = apc.ActLRU
-	cmdStgCleanup  = "cleanup" // display name for apc.ActStoreCleanup
-	cmdStgValidate = "validate"
-	cmdSummary     = "summary" // ditto apc.ActSummaryBck
+	cmdBlobDownload = apc.ActBlobDl   // blob-download
+	cmdDownload     = apc.ActDownload // download
+	cmdDsort        = apc.ActDsort
+	cmdRebalance    = apc.ActRebalance
+	cmdLRU          = apc.ActLRU
+	cmdStgCleanup   = "cleanup" // display name for apc.ActStoreCleanup
+	cmdStgValidate  = "validate"
+	cmdSummary      = "summary" // ditto apc.ActSummaryBck
 
 	cmdCluster    = commandCluster
 	cmdNode       = "node"
@@ -184,11 +185,6 @@ const (
 //
 
 const flagPrefix = "--"
-
-const (
-	fileStdIO = "-"         // STDIN (for `ais put`), STDOUT (for `ais put`)
-	discardIO = "/dev/null" // (io.Discard)
-)
 
 const (
 	cluTotal = "--- Cluster:"
@@ -370,11 +366,11 @@ var (
 	}
 	copyAllObjsFlag = cli.BoolFlag{
 		Name:  scopeAll,
-		Usage: "copy all objects from a remote bucket including those that are not present (not \"cached\") in the cluster",
+		Usage: "copy all objects from a remote bucket including those that are not present (not \"cached\") in cluster",
 	}
 	etlAllObjsFlag = cli.BoolFlag{
 		Name:  scopeAll,
-		Usage: "transform all objects from a remote bucket including those that are not present (not \"cached\") in the cluster",
+		Usage: "transform all objects from a remote bucket including those that are not present (not \"cached\") in cluster",
 	}
 
 	// obj props
@@ -590,9 +586,10 @@ var (
 	// sync
 	latestVerFlag = cli.BoolFlag{
 		Name: "latest",
-		Usage: "GET, prefetch, or copy the latest object version from the associated remote bucket;\n" +
-			indent1 + "\tprovides operation-level control over object versioning (and version synchronization)\n" +
-			indent1 + "\twithout requiring to change bucket configuration\n" +
+		Usage: "check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version\n" +
+			indent1 + "\tfrom the associated remote bucket:\n" +
+			indent1 + "\t- provides operation-level control over object versioning (and version synchronization)\n" +
+			indent1 + "\t  without requiring to change bucket configuration\n" +
 			indent1 + "\t- the latter can be done using 'ais bucket props set BUCKET versioning'\n" +
 			indent1 + "\t- see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'",
 	}
@@ -690,16 +687,16 @@ var (
 	// See also: apc.Flt* enum.
 	headObjPresentFlag = cli.BoolFlag{
 		Name: "check-cached",
-		Usage: "instead of GET execute HEAD(object) to check if the object is present in aistore\n" +
+		Usage: "check whether a given named object is present in cluster\n" +
 			indent1 + "\t(applies only to buckets with remote backend)",
 	}
 	listObjCachedFlag = cli.BoolFlag{
 		Name:  "cached",
-		Usage: "list only those objects from a remote bucket that are present (\"cached\")",
+		Usage: "list only in-cluster objects - only those objects from a remote bucket that are present (\"cached\")",
 	}
 	getObjCachedFlag = cli.BoolFlag{
 		Name:  "cached",
-		Usage: "get only those objects from a remote bucket that are present (\"cached\") in aistore",
+		Usage: "get only in-cluster objects - only those objects from a remote bucket that are present (\"cached\")",
 	}
 	// when '--all' is used for/by another flag
 	objNotCachedPropsFlag = cli.BoolFlag{
@@ -720,7 +717,7 @@ var (
 	}
 	dontAddRemoteFlag = cli.BoolFlag{
 		Name: "dont-add",
-		Usage: "list remote bucket without adding it to cluster's metadata\n" +
+		Usage: "list remote bucket without adding it to cluster's metadata - e.g.:\n" +
 			indent1 + "\t  - let's say, s3://abc is accessible but not present in the cluster (e.g., 'ais ls' returns error);\n" +
 			indent1 + "\t  - then, if we ask aistore to list remote buckets: `ais ls s3://abc --all'\n" +
 			indent1 + "\t    the bucket will be added (in effect, it'll be created);\n" +
@@ -732,7 +729,7 @@ var (
 			indent1 + "\t  - let's say, s3://abc is accessible but not present in the cluster (e.g., 'ais ls' returns error);\n" +
 			indent1 + "\t  - most of the time, there's no need to worry about it as aistore handles presence/non-presence\n" +
 			indent1 + "\t    transparently behind the scenes;\n" +
-			indent1 + "\t  - but if you'd want to explicltly add the bucket, you could also use '--add' option",
+			indent1 + "\t  - but if you do want to (explicltly) add the bucket, you could also use '--add' option",
 	}
 
 	enableFlag  = cli.BoolFlag{Name: "enable", Usage: "enable"}
@@ -751,9 +748,26 @@ var (
 
 	yesFlag = cli.BoolFlag{Name: "yes,y", Usage: "assume 'yes' to all questions"}
 
+	// usage: STDIN, blob
 	chunkSizeFlag = cli.StringFlag{
 		Name:  "chunk-size",
-		Usage: "chunk size in IEC or SI units, or \"raw\" bytes (e.g.: 1MiB or 1048576; see '--units')",
+		Usage: "chunk size in IEC or SI units, or \"raw\" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')",
+	}
+
+	blobThresholdFlag = cli.StringFlag{
+		Name: "blob-threshold",
+		Usage: "utilize built-in blob-downloader for remote objects greater than the specified (threshold) size\n" +
+			indent1 + "\tin IEC or SI units, or \"raw\" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')",
+	}
+
+	blobDownloadFlag = cli.BoolFlag{
+		Name:  apc.ActBlobDl,
+		Usage: "utilize built-in blob-downloader (and the corresponding alternative datapath) to read very large remote objects",
+	}
+
+	numWorkersFlag = cli.IntFlag{
+		Name:  "num-workers",
+		Usage: "number of concurrent blob-downloading workers (readers); system default when omitted or zero",
 	}
 
 	cksumFlag = cli.BoolFlag{Name: "checksum", Usage: "validate checksum"}

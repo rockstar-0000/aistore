@@ -47,6 +47,7 @@ import (
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/volume"
 	"github.com/NVIDIA/aistore/xact/xreg"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
 const dbName = "ais.db"
@@ -544,7 +545,7 @@ func (t *target) errURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
-	if len(path) > 0 && path[0] == '/' {
+	if path != "" && path[0] == '/' {
 		path = path[1:]
 	}
 	split := strings.Split(path, "/")
@@ -642,10 +643,12 @@ func (t *target) ecHandler(w http.ResponseWriter, r *http.Request) {
 // If the bucket is in the Cloud one and ValidateWarmGet is enabled there is an extra
 // check whether the object exists locally. Version is checked as well if configured.
 func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
-	if err := t.parseReq(w, r, apireq); err != nil {
+	err := t.parseReq(w, r, apireq)
+	if err != nil {
 		return
 	}
-	if err := apireq.dpq.parse(r.URL.RawQuery); err != nil {
+	err = apireq.dpq.parse(r.URL.RawQuery)
+	if err != nil {
 		debug.AssertNoErr(err)
 		t.writeErr(w, r, err)
 		return
@@ -657,36 +660,42 @@ func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiR
 			return
 		}
 	}
+
 	lom := core.AllocLOM(apireq.items[1])
-	lom = t.getObject(w, r, apireq.dpq, apireq.bck, lom)
+	lom, err = t.getObject(w, r, apireq.dpq, apireq.bck, lom)
+	if err != nil {
+		t._erris(w, r, apireq.dpq.silent, err, 0)
+	}
 	core.FreeLOM(lom)
 }
 
-func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck *meta.Bck, lom *core.LOM) *core.LOM {
+func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck *meta.Bck, lom *core.LOM) (*core.LOM, error) {
 	if err := lom.InitBck(bck.Bucket()); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
 			err = lom.InitBck(bck.Bucket())
 		}
 		if err != nil {
-			t._erris(w, r, dpq.silent, err, 0)
-			return lom
+			return lom, err
 		}
 	}
 
-	debug.Assert(dpq.uuid == "", dpq.uuid+" vs "+dpq.etlName) // expecting etlName or none of the above
+	// two special flows
 	if dpq.etlName != "" {
-		t.doETL(w, r, dpq.etlName, bck, lom.ObjName)
-		return lom
+		t.getETL(w, r, dpq.etlName, bck, lom.ObjName)
+		return lom, nil
+	}
+	if cos.IsParseBool(r.Header.Get(apc.HdrBlobDownload)) {
+		var args apc.BlobMsg
+		if err := args.FromHeader(r.Header); err != nil {
+			return lom, err
+		}
+		// NOTE: make a blocking call w/ simultaneous Tx
+		_, _, err := t.blobdl(lom, nil /*oa*/, &args, w)
+		return lom, err
 	}
 
-	filename := dpq.archpath // apc.QparamArchpath
-	if strings.HasPrefix(filename, lom.ObjName) {
-		if rel, err := filepath.Rel(lom.ObjName, filename); err == nil {
-			filename = rel
-		}
-	}
-	// GET context
+	// GET: regular | archive | range
 	goi := allocGOI()
 	{
 		goi.atime = time.Now().UnixNano()
@@ -698,29 +707,49 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		}
 		goi.t = t
 		goi.lom = lom
+		goi.req = r
 		goi.w = w
 		goi.ctx = context.Background()
 		goi.ranges = byteRanges{Range: r.Header.Get(cos.HdrRange), Size: 0}
-		goi.archive = archiveQuery{
-			filename: filename,
-			mime:     dpq.archmime, // apc.QparamArchmime
-		}
-		goi.isGFN = cos.IsParseBool(dpq.isGFN)                 // query.Get(apc.QparamIsGFNRequest)
+		goi.isGFN = cos.IsParseBool(dpq.isGFN)                 // apc.QparamIsGFNRequest
 		goi.latestVer = goi.lom.ValidateWarmGet(dpq.latestVer) // apc.QparamLatestVer || versioning.*_warm_get
+		goi.isS3 = dpq.isS3 != ""
 	}
+	// apc.QparamArchpath & apc.QparamArchmime, respectively
+	if goi.archive.filename = dpq.archpath; goi.archive.filename != "" {
+		if strings.HasPrefix(goi.archive.filename, lom.ObjName) {
+			if rel, err := filepath.Rel(lom.ObjName, goi.archive.filename); err == nil {
+				goi.archive.filename = rel
+			}
+		}
+		goi.archive.mime = dpq.archmime
+	}
+	// apc.QparamOrigURL
 	if bck.IsHTTP() {
-		originalURL := dpq.origURL // query.Get(apc.QparamOrigURL)
+		originalURL := dpq.origURL
 		goi.ctx = context.WithValue(goi.ctx, cos.CtxOriginalURL, originalURL)
 	}
+
+	// do
 	if errCode, err := goi.getObject(); err != nil {
 		t.statsT.IncErr(stats.GetCount)
+
+		// handle right here, return nil
 		if err != errSendingResp {
-			t._erris(w, r, dpq.silent, err, errCode)
+			if dpq.isS3 != "" {
+				s3.WriteErr(w, r, err, errCode)
+			} else {
+				silent := dpq.silent
+				if errCode == http.StatusNotFound {
+					silent = "true"
+				}
+				t._erris(w, r, silent, err, errCode)
+			}
 		}
 	}
 	lom = goi.lom
 	freeGOI(goi)
-	return lom
+	return lom, nil
 }
 
 // err in silence
@@ -881,9 +910,8 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 	if err != nil {
 		return
 	}
-	if msg.Action != apc.ActRenameObject {
-		t.writeErrAct(w, r, msg.Action)
-		return
+	if msg.Action == apc.ActBlobDl {
+		apireq.after = 1
 	}
 	if t.parseReq(w, r, apireq) != nil {
 		return
@@ -892,22 +920,48 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 		t.writeErrf(w, r, "%s: %s-%s(obj) is expected to be redirected", t.si, r.Method, msg.Action)
 		return
 	}
-
-	lom := core.AllocLOM(apireq.items[1])
-	if !t.isValidObjname(w, r, lom.ObjName) {
+	var lom *core.LOM
+	switch msg.Action {
+	case apc.ActRenameObject:
+		lom = core.AllocLOM(apireq.items[1])
+		if err = lom.InitBck(apireq.bck.Bucket()); err != nil {
+			break
+		}
+		if err = t.objMv(lom, msg); err == nil {
+			t.statsT.Inc(stats.RenameCount)
+			core.FreeLOM(lom)
+			lom = nil
+		} else {
+			t.statsT.IncErr(stats.RenameCount)
+		}
+	case apc.ActBlobDl:
+		var (
+			xid     string
+			objName = msg.Name
+			args    apc.BlobMsg
+		)
+		lom = core.AllocLOM(objName)
+		if err = lom.InitBck(apireq.bck.Bucket()); err != nil {
+			break
+		}
+		if err = cos.MorphMarshal(msg.Value, &args); err != nil {
+			err = fmt.Errorf(cmn.FmtErrMorphUnmarshal, t, "set-custom", msg.Value, err)
+			break
+		}
+		if xid, _, err = t.blobdl(lom, nil /*oa*/, &args, nil /*writer*/); xid != "" {
+			debug.AssertNoErr(err)
+			w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(xid)))
+			w.Write([]byte(xid))
+			// lom is eventually freed by x-blob
+		}
+	default:
+		t.writeErrAct(w, r, msg.Action)
 		return
 	}
-	err = lom.InitBck(apireq.bck.Bucket())
-	if err == nil {
-		err = t.objMv(lom, msg)
-	}
-	if err == nil {
-		t.statsT.Inc(stats.RenameCount)
-	} else {
-		t.statsT.IncErr(stats.RenameCount)
+	if err != nil {
 		t.writeErr(w, r, err)
+		core.FreeLOM(lom)
 	}
-	core.FreeLOM(lom)
 }
 
 // HEAD /v1/objects/<bucket-name>/<object-name>
@@ -925,14 +979,14 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 		}
 	}
 	lom := core.AllocLOM(objName)
-	errCode, err := t.objhead(w.Header(), query, bck, lom)
+	errCode, err := t.objHead(w.Header(), query, bck, lom)
 	core.FreeLOM(lom)
 	if err != nil {
 		t._erris(w, r, query.Get(apc.QparamSilent), err, errCode)
 	}
 }
 
-func (t *target) objhead(hdr http.Header, query url.Values, bck *meta.Bck, lom *core.LOM) (errCode int, err error) {
+func (t *target) objHead(hdr http.Header, query url.Values, bck *meta.Bck, lom *core.LOM) (errCode int, err error) {
 	var (
 		fltPresence int
 		exists      = true
@@ -1120,7 +1174,9 @@ func (t *target) httpecget(w http.ResponseWriter, r *http.Request) {
 	case ec.URLMeta:
 		t.sendECMetafile(w, r, apireq.bck, apireq.items[2])
 	case ec.URLCT:
-		t.sendECCT(w, r, apireq.bck, apireq.items[2])
+		lom := core.AllocLOM(apireq.items[2])
+		t.sendECCT(w, r, apireq.bck, lom)
+		core.FreeLOM(lom)
 	default:
 		t.writeErrURL(w, r)
 	}
@@ -1149,9 +1205,7 @@ func (t *target) sendECMetafile(w http.ResponseWriter, r *http.Request, bck *met
 	w.Write(b)
 }
 
-func (t *target) sendECCT(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string) {
-	lom := core.AllocLOM(objName)
-	defer core.FreeLOM(lom)
+func (t *target) sendECCT(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lom *core.LOM) {
 	if err := lom.InitBck(bck.Bucket()); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
@@ -1162,7 +1216,7 @@ func (t *target) sendECCT(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 			return
 		}
 	}
-	sliceFQN := lom.Mountpath().MakePathFQN(bck.Bucket(), fs.ECSliceType, objName)
+	sliceFQN := lom.Mountpath().MakePathFQN(bck.Bucket(), fs.ECSliceType, lom.ObjName)
 	finfo, err := os.Stat(sliceFQN)
 	if err != nil {
 		t.writeErr(w, r, err, http.StatusNotFound, Silent)
@@ -1179,7 +1233,7 @@ func (t *target) sendECCT(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 	_, err = io.Copy(w, file) // No need for `io.CopyBuffer` as `sendfile` syscall will be used.
 	cos.Close(file)
 	if err != nil {
-		nlog.Errorf("Failed to send slice %s: %v", bck.Cname(objName), err)
+		nlog.Errorf("Failed to send slice %s: %v", lom.Cname(), err)
 	}
 }
 
@@ -1310,7 +1364,7 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 // rename obj
 func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) (err error) {
 	if lom.Bck().IsRemote() {
-		return fmt.Errorf("%s: cannot rename object %s from a remote bucket", t.si, lom)
+		return fmt.Errorf("%s: cannot rename object %s from remote bucket", t.si, lom)
 	}
 	if lom.Bck().Props.EC.Enabled {
 		return fmt.Errorf("%s: cannot rename erasure-coded object %s", t.si, lom)
@@ -1344,6 +1398,80 @@ func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) (err error) {
 	}
 	lom.Unlock(true)
 	return nil
+}
+
+// compare running the same via (generic) t.xstart
+func (t *target) blobdl(lom *core.LOM, oa *cmn.ObjAttrs, args *apc.BlobMsg, w http.ResponseWriter) (string, *xs.XactBlobDl, error) {
+	// cap
+	cs := fs.Cap()
+	if errCap := cs.Err(); errCap != nil {
+		cs = t.OOS(nil)
+		if err := cs.Err(); err != nil {
+			return "", nil, err
+		}
+	}
+
+	if oa != nil {
+		return _blobdl(lom, args, w, oa)
+	}
+
+	// - try-lock (above) to load, check availability
+	// - unlock right away
+	// - subsequently, use cmn.OwtGetPrefetchLock to finalize
+	// - there's a single x-blob-download per object (see WhenPrevIsRunning)
+	if !lom.TryLock(false) {
+		return "", nil, cmn.NewErrBusy("blob", lom, "")
+	}
+
+	oa, deleted, err := lom.LoadLatest(args.LatestVer)
+	lom.Unlock(false)
+
+	// w/ assorted returns
+	switch {
+	case deleted: // remotely
+		debug.Assert(args.LatestVer && err != nil)
+		return "", nil, err
+	case oa != nil:
+		debug.Assert(args.LatestVer && err == nil)
+		// not latest
+	case err == nil:
+		return "", nil, nil // nothing to do
+	case !cmn.IsErrObjNought(err):
+		return "", nil, err
+	}
+
+	// handle: (not-present || latest-not-eq)
+	return _blobdl(lom, args, w, oa)
+}
+
+// returns empty xid ("") if nothing to do
+func _blobdl(lom *core.LOM, args *apc.BlobMsg, w http.ResponseWriter, oa *cmn.ObjAttrs) (string, *xs.XactBlobDl, error) {
+	// create wfqn
+	wfqn := fs.CSM.Gen(lom, fs.WorkfileType, "blob-dl")
+	lmfh, err := lom.CreateFile(wfqn)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// new
+	xid := cos.GenUUID()
+	rns := xs.RenewBlobDl(xid, lom, oa, wfqn, lmfh, args, w)
+	if rns.Err != nil || rns.IsRunning() { // cmn.IsErrXactUsePrev(rns.Err): single blob-downloader per blob
+		if errRemove := cos.RemoveFile(wfqn); errRemove != nil {
+			nlog.Errorln("nested err", errRemove)
+		}
+		return "", nil, rns.Err
+	}
+
+	// a) via x-start, x-blob-download
+	xblob := rns.Entry.Get().(*xs.XactBlobDl)
+	if w == nil {
+		go xblob.Run(nil)
+		return xblob.ID(), xblob, nil
+	}
+	// b) via GET (blocking w/ simultaneous transmission)
+	xblob.Run(nil)
+	return "", nil, xblob.AbortErr()
 }
 
 func (t *target) fsErr(err error, filepath string) {

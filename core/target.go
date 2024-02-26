@@ -67,10 +67,13 @@ type (
 		DataClient() *http.Client
 
 		// core object (+ PutObject above)
-		FinalizeObj(lom *LOM, workFQN string, xctn Xact) (errCode int, err error)
+		FinalizeObj(lom *LOM, workFQN string, xctn Xact, owt cmn.OWT) (errCode int, err error)
 		EvictObject(lom *LOM) (errCode int, err error)
 		DeleteObject(lom *LOM, evict bool) (errCode int, err error)
+
 		GetCold(ctx context.Context, lom *LOM, owt cmn.OWT) (errCode int, err error)
+		GetColdBlob(lom *LOM, oa *cmn.ObjAttrs) (xctn Xact, err error)
+
 		CopyObject(lom *LOM, dm DM, coi *CopyParams) (int64, error)
 		Promote(params *PromoteParams) (errCode int, err error)
 		HeadObjT2T(lom *LOM, si *meta.Snode) bool

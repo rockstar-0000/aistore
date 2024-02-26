@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -39,8 +40,7 @@ const (
 	FmtErrUnknown        = "%s: unknown %s %q"
 	FmtErrBackwardCompat = "%v (backward compatibility is supported only one version back, e.g. 3.9 => 3.10)"
 
-	// (see ErrFailedTo)
-	fmtErrFailedTo = "%s: failed to %s %s, err: %w"
+	fmtErrFailedTo = "%s: failed to %s %s, err: %v" // (ErrFailedTo)
 
 	BadSmapPrefix = "[bad cluster map]"
 
@@ -77,11 +77,11 @@ type (
 	}
 
 	ErrFailedTo struct {
-		actor  fmt.Stringer // most of the time it's this (target|proxy) node but may also be some other "actor"
-		what   any          // not necessarily LOM
-		err    error        // original error that can be Unwrap-ed
-		action string       // not necessarily msg.Action
-		status int          // http status, if available
+		actor  string // most of the time it's this (target|proxy) node but may also be some other "actor"
+		what   any    // not necessarily LOM
+		err    error  // original error that can be Unwrap-ed
+		action string // not necessarily msg.Action
+		status int    // http status, if available
 	}
 	ErrUnsupp struct {
 		action, what string
@@ -184,12 +184,23 @@ type (
 		xaction string
 		tname   string
 	}
-
 	ErrStreamTerminated struct {
 		err    error
 		stream string
 		reason string
 		detail string
+	}
+	ErrInvalidObjName struct {
+		name string
+	}
+	ErrNotRemoteBck struct {
+		act string
+		bck *Bck
+	}
+	ErrRangeNotSatisfiable struct {
+		err    error    // original (backend reported) error
+		ranges []string // RFC 7233
+		size   int64    // [0, size)
 	}
 )
 
@@ -219,24 +230,24 @@ func NewErrFailedTo(actor fmt.Stringer, action string, what any, err error, errC
 	if e, ok := err.(*ErrFailedTo); ok {
 		return e
 	}
-
 	_clean(err)
 
-	e := &ErrFailedTo{actor: actor, action: action, what: what, err: err, status: 0}
+	e := &ErrFailedTo{action: action, what: what, err: err}
+	e.actor = thisNodeName
+	if actor != nil {
+		e.actor = actor.String()
+	}
 	if len(errCode) > 0 {
 		e.status = errCode[0]
+		if err == nil && e.status > 0 {
+			e.err = errors.New("error code: " + strconv.Itoa(e.status) + "(\"" + http.StatusText(e.status) + "\")")
+		}
 	}
 	return e
 }
 
 func (e *ErrFailedTo) Error() string {
-	var err error
-	if e.actor == nil {
-		err = fmt.Errorf(fmtErrFailedTo, thisNodeName, e.action, e.what, e.err)
-	} else {
-		err = fmt.Errorf(fmtErrFailedTo, e.actor, e.action, e.what, e.err)
-	}
-	return err.Error()
+	return fmt.Sprintf(fmtErrFailedTo, e.actor, e.action, e.what, e.err)
 }
 
 func (e *ErrFailedTo) Unwrap() (err error) { return e.err }
@@ -362,7 +373,7 @@ func (e *ErrBusy) Error() string {
 	if e.detail != "" {
 		s = " (" + e.detail + ")"
 	}
-	return fmt.Sprintf("%s %q is currently busy%s, please try again in a few seconds or minutes", e.what, e.name, s)
+	return fmt.Sprintf("%s %q is currently busy%s, please try again", e.what, e.name, s)
 }
 
 // errAccessDenied & ErrBucketAccessDenied
@@ -546,7 +557,7 @@ func NewErrAborted(what, ctx string, err error) *ErrAborted {
 }
 
 func (e *ErrAborted) Error() (s string) {
-	s = fmt.Sprintf("%s aborted", e.what)
+	s = e.what + " aborted"
 	if e.err != nil {
 		s = fmt.Sprintf("%s, err: %v", s, e.err)
 	}
@@ -672,9 +683,7 @@ func IsErrSoft(err error) bool {
 	return errors.As(err, &target)
 }
 
-///////////////////////
 // ErrLmetaCorrupted & ErrLmetaNotFound
-///////////////////////
 
 func NewErrLmetaCorrupted(err error) *ErrLmetaCorrupted { return &ErrLmetaCorrupted{err} }
 func (e *ErrLmetaCorrupted) Error() string              { return e.err.Error() }
@@ -694,9 +703,7 @@ func IsErrLmetaNotFound(err error) bool {
 	return ok
 }
 
-///////////////////////////
-// ErrLimitedCoexistence //
-///////////////////////////
+// ErrLimitedCoexistence
 
 func NewErrLimitedCoexistence(node, xaction, action, detail string) *ErrLimitedCoexistence {
 	return &ErrLimitedCoexistence{node, xaction, action, detail}
@@ -707,16 +714,14 @@ func (e *ErrLimitedCoexistence) Error() string {
 		e.node, e.xaction, e.action, e.detail)
 }
 
-////////////////////
-// ErrXactUsePrev //
-////////////////////
+// ErrXactUsePrev
 
 func NewErrXactUsePrev(xaction string) *ErrXactUsePrev {
 	return &ErrXactUsePrev{xaction}
 }
 
 func (e *ErrXactUsePrev) Error() string {
-	return fmt.Sprintf("%s is already running - not starting", e.xaction)
+	return e.xaction + "is already running - not starting"
 }
 
 func IsErrXactUsePrev(err error) bool {
@@ -724,9 +729,33 @@ func IsErrXactUsePrev(err error) bool {
 	return ok
 }
 
-///////////////////////
-// ErrXactTgtInMaint //
-///////////////////////
+// ErrInvalidObjName
+
+func ValidateObjName(name string) (err *ErrInvalidObjName) {
+	if cos.IsLastB(name, filepath.Separator) || strings.Contains(name, "../") {
+		err = &ErrInvalidObjName{name}
+	}
+	return err
+}
+
+func (e *ErrInvalidObjName) Error() string {
+	return fmt.Sprintf("invalid object name %q", e.name)
+}
+
+// ErrNotRemoteBck
+
+func ValidateRemoteBck(act string, bck *Bck) (err *ErrNotRemoteBck) {
+	if !bck.IsRemote() {
+		err = &ErrNotRemoteBck{act, bck}
+	}
+	return err
+}
+
+func (e *ErrNotRemoteBck) Error() string {
+	return fmt.Sprintf("%s: expecting remote bucket (have %s)", e.act, e.bck)
+}
+
+// ErrXactTgtInMaint
 
 func NewErrXactTgtInMaint(xaction, tname string) *ErrXactTgtInMaint {
 	return &ErrXactTgtInMaint{xaction, tname}
@@ -737,9 +766,29 @@ func (e *ErrXactTgtInMaint) Error() string {
 		e.tname, e.xaction)
 }
 
-////////////////////////////
-// error grouping helpers //
-////////////////////////////
+// ErrRangeNotSatisfiable
+// http.StatusRequestedRangeNotSatisfiable = 416 // RFC 9110, 15.5.17
+
+func NewErrRangeNotSatisfiable(err error, ranges []string, size int64) *ErrRangeNotSatisfiable {
+	return &ErrRangeNotSatisfiable{err, ranges, size}
+}
+
+func (e *ErrRangeNotSatisfiable) Error() string {
+	if e.err == nil {
+		s := "object size = " + strconv.FormatInt(e.size, 10)
+		return fmt.Sprintf("%s, range%s %v not satisfiable", s, cos.Plural(len(e.ranges)), e.ranges)
+	}
+	return e.err.Error()
+}
+
+func IsErrRangeNotSatisfiable(err error) bool {
+	_, ok := err.(*ErrRangeNotSatisfiable)
+	return ok
+}
+
+//
+// more is-error helpers
+//
 
 // nought: not a thing
 func IsErrBucketNought(err error) bool {
@@ -999,6 +1048,10 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, opts ...int /*[
 		status = errf.status
 	} else if isErrNotFoundExtended(err, status) {
 		status = http.StatusNotFound
+	} else if IsErrCapExceeded(err) {
+		status = http.StatusInsufficientStorage
+	} else if IsErrRangeNotSatisfiable(err) {
+		status = http.StatusRequestedRangeNotSatisfiable
 	}
 
 	herr.init(r, err, status)

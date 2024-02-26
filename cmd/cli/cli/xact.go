@@ -6,6 +6,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -60,10 +62,18 @@ func toShowMsg(c *cli.Context, xjid, prompt string, verbose bool) string {
 
 // Wait for the caller's started xaction to run until finished _or_ idle (NOTE),
 // warn if aborted
-func waitXact(apiBP api.BaseParams, args *xact.ArgsMsg) error {
+func waitXact(args *xact.ArgsMsg) error {
 	debug.Assert(args.ID == "" || xact.IsValidUUID(args.ID))
+
+	// NOTE: relying on the Kind to decide between waiting APIs
+	debug.Assert(args.Kind != "")
 	kind, xname := xact.GetKindName(args.Kind)
-	debug.Assert(kind != "") // relying on it to decide between APIs
+	debug.Assert(kind != "")
+
+	if kind == apc.ActBlobDl {
+		return waitXactBlob(args)
+	}
+
 	if xact.IdlesBeforeFinishing(kind) {
 		return api.WaitForXactionIdle(apiBP, args)
 	}
@@ -73,9 +83,29 @@ func waitXact(apiBP api.BaseParams, args *xact.ArgsMsg) error {
 		return V(err)
 	}
 	if status.Aborted() {
-		return fmt.Errorf("%s[%s] aborted", xname, status.UUID)
+		return fmt.Errorf("%s aborted", xact.Cname(xname, status.UUID))
 	}
 	return nil
+}
+
+// (x-blob doesn't do nofif listener - see ais/prxclu xstart)
+func waitXactBlob(xargs *xact.ArgsMsg) error {
+	var sleep = xact.MinPollTime
+	for {
+		time.Sleep(sleep)
+		_, snap, errN := getXactSnap(xargs)
+		if errN != nil {
+			return errN
+		}
+		if snap.IsAborted() {
+			return errors.New(snap.AbortErr)
+		}
+		debug.Assert(snap.ID == xargs.ID)
+		if snap.Finished() {
+			return nil
+		}
+		sleep = min(sleep+sleep/2, xact.MaxPollTime)
+	}
 }
 
 func getKindNameForID(xid string, otherKind ...string) (kind, xname string, rerr error) {
@@ -184,17 +214,17 @@ func flattenXactStats(snap *core.Snap, units string) nvpairList {
 	return props
 }
 
-func getXactSnap(xargs *xact.ArgsMsg) (*core.Snap, error) {
+func getXactSnap(xargs *xact.ArgsMsg) (string, *core.Snap, error) {
 	xs, err := api.QueryXactionSnaps(apiBP, xargs)
 	if err != nil {
-		return nil, V(err)
+		return "", nil, V(err)
 	}
-	for _, snaps := range xs {
+	for tid, snaps := range xs {
 		for _, snap := range snaps {
-			return snap, nil
+			return tid, snap, nil
 		}
 	}
-	return nil, nil
+	return "", nil, nil
 }
 
 func queryXactions(xargs *xact.ArgsMsg) (xs xact.MultiSnap, err error) {

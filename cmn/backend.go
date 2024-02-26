@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -14,8 +14,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
-const AwsMultipartDelim = "-"
-
 type backendFuncs struct {
 	EncodeVersion func(v any) (version string, isSet bool)
 	EncodeCksum   func(v any) (cksumValue string, isSet bool)
@@ -24,6 +22,10 @@ type backendFuncs struct {
 func awsIsVersionSet(version *string) bool {
 	return version != nil && *version != "" && *version != "null"
 }
+
+// unquote checksum, ETag, and version
+// e.g., https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
+func UnquoteCEV(val string) string { return strings.Trim(val, "\"") }
 
 var BackendHelpers = struct {
 	Amazon backendFuncs
@@ -53,40 +55,12 @@ var BackendHelpers = struct {
 		EncodeCksum: func(v any) (string, bool) {
 			switch x := v.(type) {
 			case *string:
-				if strings.Contains(*x, AwsMultipartDelim) {
+				if IsS3MultipartEtag(*x) {
 					return *x, true // return as-is multipart
 				}
-				cksum, _ := strconv.Unquote(*x)
-				return cksum, true
+				return UnquoteCEV(*x), true
 			case string:
 				return x, true
-			default:
-				debug.FailTypeCast(v)
-				return "", false
-			}
-		},
-	},
-	Azure: backendFuncs{
-		EncodeVersion: func(v any) (string, bool) {
-			switch x := v.(type) {
-			case string:
-				x = strings.Trim(x, "\"")
-				return x, x != ""
-			default:
-				debug.FailTypeCast(v)
-				return "", false
-			}
-		},
-		EncodeCksum: func(v any) (string, bool) {
-			switch x := v.(type) {
-			case string:
-				decoded, err := base64.StdEncoding.DecodeString(x)
-				if err != nil {
-					return "", false
-				}
-				return hex.EncodeToString(decoded), true
-			case []byte:
-				return hex.EncodeToString(x), true
 			default:
 				debug.FailTypeCast(v)
 				return "", false
@@ -143,7 +117,7 @@ var BackendHelpers = struct {
 			case string:
 				// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
 				x = strings.TrimPrefix(x, "W/")
-				x = strings.Trim(x, "\"")
+				x = UnquoteCEV(x)
 				return x, x != ""
 			default:
 				debug.FailTypeCast(v)

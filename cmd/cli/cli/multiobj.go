@@ -98,13 +98,17 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		}
 		_, cpr.xname = xact.GetKindName(xkind)
 		cpr.totals.objs = numObjs
-		cpr.loghdr = fmt.Sprintf("%s[%s] %s => %s", cpr.xname, cpr.xid, cpr.from, cpr.to)
+		cpr.loghdr = fmt.Sprintf("%s %s => %s", xact.Cname(cpr.xname, cpr.xid), cpr.from, cpr.to)
 		return cpr.multiobj(c, text)
 	}
 
 	// done
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
-		actionDone(c, tcbtcoCptn(text, bckFrom, bckTo)+". "+toMonitorMsg(c, xid, ""))
+		if flagIsSet(c, nonverboseFlag) {
+			fmt.Fprintln(c.App.Writer, xid)
+		} else {
+			actionDone(c, tcbtcoCptn(text, bckFrom, bckTo)+". "+toMonitorMsg(c, xid, ""))
+		}
 		return nil
 	}
 
@@ -117,8 +121,8 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
 	xargs := xact.ArgsMsg{ID: xid, Kind: xkind, Timeout: timeout}
-	if err = waitXact(apiBP, &xargs); err != nil {
-		fmt.Fprintf(c.App.Writer, fmtXactFailed, text, bckFrom, bckTo)
+	if err = waitXact(&xargs); err != nil {
+		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, text, bckFrom, bckTo)
 	} else {
 		fmt.Fprint(c.App.Writer, fmtXactSucceeded)
 	}
@@ -282,11 +286,11 @@ func _prefetchOne(c *cli.Context, shift int) error {
 	if err != nil {
 		return err
 	}
-	if bck.IsAIS() {
-		return fmt.Errorf("cannot prefetch from ais buckets (the operation applies to remote buckets only)")
-	}
-	if _, err = headBucket(bck, false /* don't add */); err != nil {
+	if bck.Props, err = headBucket(bck, true /* add */); err != nil {
 		return err
+	}
+	if !bck.IsRemote() {
+		return fmt.Errorf("expecting remote bucket (have %s)", bck.Cname(""))
 	}
 	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
 	if err != nil {
@@ -349,14 +353,14 @@ func (lr *lrCtx) do(c *cli.Context) (err error) {
 			s = fmt.Sprintf("%v...", fileList[:4])
 		}
 		_, xname = xact.GetKindName(kind)
-		text = fmt.Sprintf("%s[%s]: %s %s from %s", xname, xid, s, action, lr.bck.Cname(""))
+		text = fmt.Sprintf("%s: %s %s from %s", xact.Cname(xname, xid), s, action, lr.bck.Cname(""))
 	} else {
 		num = pt.Count()
 		_, xname = xact.GetKindName(kind)
 		if emptyTemplate {
-			text = fmt.Sprintf("%s[%s]: %s entire bucket %s", xname, xid, action, lr.bck.Cname(""))
+			text = fmt.Sprintf("%s: %s entire bucket %s", xact.Cname(xname, xid), action, lr.bck.Cname(""))
 		} else {
-			text = fmt.Sprintf("%s[%s]: %s %q from %s", xname, xid, action, lr.tmplObjs, lr.bck.Cname(""))
+			text = fmt.Sprintf("%s: %s %q from %s", xact.Cname(xname, xid), action, lr.tmplObjs, lr.bck.Cname(""))
 		}
 	}
 
@@ -389,7 +393,7 @@ func (lr *lrCtx) do(c *cli.Context) (err error) {
 	}
 	fmt.Fprintln(c.App.Writer, text+" ...")
 	xargs := xact.ArgsMsg{ID: xid, Kind: xname, Timeout: timeout}
-	if err := waitXact(apiBP, &xargs); err != nil {
+	if err := waitXact(&xargs); err != nil {
 		return err
 	}
 	fmt.Fprint(c.App.Writer, fmtXactSucceeded)
@@ -430,6 +434,12 @@ func (lr *lrCtx) _do(c *cli.Context, fileList []string) (xid, kind, action strin
 			msg.ObjNames = fileList
 			msg.Template = lr.tmplObjs
 			msg.LatestVer = flagIsSet(c, latestVerFlag)
+		}
+		if flagIsSet(c, blobThresholdFlag) {
+			msg.BlobThreshold, err = parseSizeFlag(c, blobThresholdFlag)
+			if err != nil {
+				return
+			}
 		}
 		xid, err = api.Prefetch(apiBP, lr.bck, msg)
 		kind = apc.ActPrefetchObjects

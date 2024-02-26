@@ -93,14 +93,17 @@ func (t *target) PutObject(lom *core.LOM, params *core.PutParams) error {
 	return err
 }
 
-func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact) (errCode int, err error) {
+func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt cmn.OWT) (errCode int, err error) {
+	if err = cos.Stat(workFQN); err != nil {
+		return
+	}
 	poi := allocPOI()
 	{
 		poi.t = t
 		poi.atime = time.Now().UnixNano()
 		poi.lom = lom
 		poi.workFQN = workFQN
-		poi.owt = cmn.OwtFinalize
+		poi.owt = owt
 		poi.xctn = xctn
 	}
 	errCode, err = poi.finalize()
@@ -198,6 +201,12 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (errCo
 		cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(now)},
 	)
 	return 0, nil
+}
+
+func (t *target) GetColdBlob(lom *core.LOM, oa *cmn.ObjAttrs) (xctn core.Xact, err error) {
+	var args apc.BlobMsg
+	_, xctn, err = t.blobdl(lom, oa, &args, nil /*writer*/)
+	return xctn, err
 }
 
 func (t *target) Promote(params *core.PromoteParams) (errCode int, err error) {

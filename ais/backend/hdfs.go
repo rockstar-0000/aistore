@@ -30,10 +30,22 @@ type (
 		t core.TargetPut
 		c *hdfs.Client
 	}
+	sectionReaderCloser struct {
+		fr  *hdfs.FileReader
+		sec *io.SectionReader
+	}
 )
 
 // interface guard
 var _ core.BackendProvider = (*hdfsProvider)(nil)
+
+func (sfr *sectionReaderCloser) Read(b []byte) (int, error) {
+	return sfr.sec.Read(b)
+}
+func (sfr *sectionReaderCloser) ReadAt(b []byte, off int64) (int, error) {
+	return sfr.sec.ReadAt(b, off)
+}
+func (sfr *sectionReaderCloser) Close() error { return sfr.fr.Close() }
 
 func NewHDFS(t core.TargetPut) (core.BackendProvider, error) {
 	var (
@@ -68,8 +80,7 @@ func hdfsErrorToAISError(err error) (int, error) {
 	return http.StatusBadRequest, err
 }
 
-func (*hdfsProvider) Provider() string  { return apc.HDFS }
-func (*hdfsProvider) MaxPageSize() uint { return 10000 }
+func (*hdfsProvider) Provider() string { return apc.HDFS }
 
 //
 // CREATE BUCKET
@@ -119,7 +130,7 @@ func (hp *hdfsProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.Lso
 		h   = cmn.BackendHelpers.HDFS
 		idx int
 	)
-	msg.PageSize = calcPageSize(msg.PageSize, hp.MaxPageSize())
+	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
 
 	err := hp.c.Walk(bck.Props.Extra.HDFS.RefDirectory, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
@@ -231,7 +242,7 @@ func (hp *hdfsProvider) HeadObj(_ ctx, lom *core.LOM) (oa *cmn.ObjAttrs, errCode
 //
 
 func (hp *hdfsProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT) (int, error) {
-	res := hp.GetObjReader(ctx, lom)
+	res := hp.GetObjReader(ctx, lom, 0, 0)
 	if res.Err != nil {
 		return res.ErrCode, res.Err
 	}
@@ -243,7 +254,7 @@ func (hp *hdfsProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT) 
 	return 0, err
 }
 
-func (hp *hdfsProvider) GetObjReader(_ context.Context, lom *core.LOM) (res core.GetReaderResult) {
+func (hp *hdfsProvider) GetObjReader(_ context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
 	filePath := filepath.Join(lom.Bck().Props.Extra.HDFS.RefDirectory, lom.ObjName)
 	fr, err := hp.c.Open(filePath)
 	if err != nil {
@@ -251,8 +262,13 @@ func (hp *hdfsProvider) GetObjReader(_ context.Context, lom *core.LOM) (res core
 		return
 	}
 	lom.SetCustomKey(cmn.SourceObjMD, apc.HDFS)
-	res.Size = fr.Stat().Size()
-	res.R = fr
+	if length > 0 {
+		sec := io.NewSectionReader(fr /* ReaderAt */, offset, length)
+		res.R = &sectionReaderCloser{fr, sec}
+	} else {
+		res.R = fr
+		res.Size = fr.Stat().Size()
+	}
 	return
 }
 
@@ -260,7 +276,7 @@ func (hp *hdfsProvider) GetObjReader(_ context.Context, lom *core.LOM) (res core
 // PUT OBJECT
 //
 
-func (hp *hdfsProvider) PutObj(r io.ReadCloser, lom *core.LOM) (errCode int, err error) {
+func (hp *hdfsProvider) PutObj(r io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (errCode int, err error) {
 	filePath := filepath.Join(lom.Bck().Props.Extra.HDFS.RefDirectory, lom.ObjName)
 	fw, err := hp.c.Create(filePath)
 	if err != nil {

@@ -28,8 +28,8 @@ var _ core.BackendProvider = (*mockBP)(nil)
 
 func NewDummyBackend(t core.TargetPut) (core.BackendProvider, error) { return &mockBP{t: t}, nil }
 
-func (*mockBP) Provider() string  { return mock }
-func (*mockBP) MaxPageSize() uint { return math.MaxUint32 }
+func (*mockBP) Provider() string           { return mock }
+func (*mockBP) MaxPageSize(*meta.Bck) uint { return math.MaxUint32 }
 
 func (*mockBP) CreateBucket(*meta.Bck) (int, error) {
 	return http.StatusBadRequest, cmn.NewErrUnsupp("create", mock+" bucket")
@@ -56,11 +56,11 @@ func (*mockBP) GetObj(_ ctx, lom *core.LOM, _ cmn.OWT) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*mockBP) GetObjReader(context.Context, *core.LOM) (res core.GetReaderResult) {
+func (*mockBP) GetObjReader(context.Context, *core.LOM, int64, int64) (res core.GetReaderResult) {
 	return
 }
 
-func (*mockBP) PutObj(_ io.ReadCloser, lom *core.LOM) (int, error) {
+func (*mockBP) PutObj(_ io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
