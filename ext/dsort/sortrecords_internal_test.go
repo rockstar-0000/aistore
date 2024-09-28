@@ -10,7 +10,7 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -80,8 +80,8 @@ var _ = Describe("SortRecords", func() {
 	})
 
 	It("should shuffle records reproducibly when same seed specified", func() {
-		expected := createRecords("def", "abc")
-		fm := createRecords("abc", "def")
+		expected := createRecords("klm", "abc", "def", "ghi")
+		fm := createRecords("abc", "def", "ghi", "klm")
 		err := sortRecords(fm, &Algorithm{Kind: Shuffle, Seed: "1010102", ContentKeyType: shard.ContentKeyString})
 		Expect(err).ToNot(HaveOccurred())
 		Expect(fm).To(Equal(expected))

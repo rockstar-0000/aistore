@@ -5,8 +5,6 @@
 package ais
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -95,82 +93,81 @@ func newConfigOwner(config *cmn.Config) (co *configOwner) {
 func (co *configOwner) get() (clone *globalConfig, err error) {
 	clone = &globalConfig{}
 	if _, err = jsp.LoadMeta(co.globalFpath, clone); err == nil {
-		return
+		return clone, nil
 	}
-	clone = nil
 	if os.IsNotExist(err) {
 		err = nil
 	} else {
 		nlog.Errorf("failed to load global config from %s: %v", co.globalFpath, err)
 	}
-	return
+	return nil, err
 }
 
 func (*configOwner) version() int64 { return cmn.GCO.Get().Version }
 
-func (co *configOwner) runPre(ctx *configModifier) (clone *globalConfig, err error) {
-	co.Lock()
-	defer co.Unlock()
+// is called under co.lock
+func (co *configOwner) _runPre(ctx *configModifier) (clone *globalConfig, err error) {
 	clone, err = co.get()
 	if err != nil {
 		return
 	}
-	// NOTE: nil config == missing config
 	if clone == nil {
+		// missing config - try to load initial plain-text
 		clone = &globalConfig{}
-		_, err = jsp.Load(cmn.GCO.GetInitialGconfPath(), clone, jsp.Plain())
+		_, err = jsp.Load(cmn.GCO.GetInitialGconfPath(), clone, jsp.Plain()) // must exist
 		if err != nil {
-			return
+			return clone, err
 		}
 	}
 
-	if updated, err := ctx.pre(ctx, clone); err != nil || !updated {
+	var updated bool
+	if updated, err = ctx.pre(ctx, clone); err != nil || !updated {
 		return nil, err
 	}
 
 	ctx.oldConfig = cmn.GCO.Get()
 	if err = cmn.GCO.Update(&clone.ClusterConfig); err != nil {
-		clone = nil
-		return
+		return nil, err
 	}
 
 	clone.Version++
 	clone.LastUpdated = time.Now().String()
 	clone._sgl = clone._encode(co.immSize)
 	co.immSize = max(co.immSize, clone._sgl.Len())
-	if err := co.persist(clone, nil); err != nil {
+	if err = co.persist(clone, nil); err != nil {
 		clone._sgl.Free()
 		clone._sgl = nil
 		return nil, cmn.NewErrFailedTo(nil, "persist", clone, err)
 	}
-	return
+	return clone, nil
 }
 
 // Update the global config on primary proxy.
 func (co *configOwner) modify(ctx *configModifier) (config *globalConfig, err error) {
-	if config, err = co.runPre(ctx); err != nil || config == nil {
-		return
+	co.Lock()
+	config, err = co._runPre(ctx)
+	co.Unlock()
+	if err != nil || config == nil {
+		return config, err
 	}
 	if ctx.final != nil {
 		ctx.final(ctx, config)
 	}
-	return
+	return config, nil
 }
 
 func (co *configOwner) persist(clone *globalConfig, payload msPayload) error {
 	if co.persistBytes(payload, co.globalFpath) {
 		return nil
 	}
-	var wto io.WriterTo
-	if clone._sgl != nil {
-		wto = clone._sgl
-	} else {
-		sgl := clone._encode(co.immSize)
+
+	sgl := clone._sgl
+	if sgl == nil {
+		sgl = clone._encode(co.immSize)
 		co.immSize = max(co.immSize, sgl.Len())
 		defer sgl.Free()
-		wto = sgl
 	}
-	return jsp.SaveMeta(co.globalFpath, clone, wto)
+	return jsp.SaveMeta(co.globalFpath, clone, sgl)
 }
 
 func (*configOwner) persistBytes(payload msPayload, globalFpath string) (done bool) {
@@ -183,40 +180,35 @@ func (*configOwner) persistBytes(payload msPayload, globalFpath string) (done bo
 	}
 	var (
 		config globalConfig
-		wto    = bytes.NewBuffer(confValue)
-		err    = jsp.SaveMeta(globalFpath, &config, wto)
+		wto    = cos.NewBuffer(confValue)
 	)
+	err := jsp.SaveMeta(globalFpath, &config, wto)
 	done = err == nil
 	return
 }
 
-func (co *configOwner) setDaemonConfig(toUpdate *cmn.ConfigToSet, transient bool) (err error) {
-	co.Lock()
+// NOTE: must be called under config-owner lock
+func setConfig(toUpdate *cmn.ConfigToSet, transient bool) (err error) {
 	clone := cmn.GCO.Clone()
 	err = setConfigInMem(toUpdate, clone, apc.Daemon)
 	if err != nil {
-		co.Unlock()
-		return
+		return err
 	}
-
 	override := cmn.GCO.GetOverride()
 	if override == nil {
 		override = toUpdate
 	} else {
 		override.Merge(toUpdate)
 	}
-
 	if !transient {
 		if err = cmn.SaveOverrideConfig(clone.ConfigDir, override); err != nil {
-			co.Unlock()
-			return
+			return err
 		}
 	}
 
 	cmn.GCO.Put(clone)
 	cmn.GCO.PutOverride(override)
-	co.Unlock()
-	return
+	return nil
 }
 
 func setConfigInMem(toUpdate *cmn.ConfigToSet, config *cmn.Config, asType string) (err error) {

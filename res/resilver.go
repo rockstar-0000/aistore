@@ -84,8 +84,8 @@ func (res *Res) RunResilver(args Args) {
 		nlog.Errorf("FATAL: %v, WRITE: %v", fatalErr, writeErr)
 		return
 	}
-	availablePaths, _ := fs.Get()
-	if len(availablePaths) < 1 {
+	avail, _ := fs.Get()
+	if len(avail) < 1 {
 		nlog.Errorln(cmn.ErrNoMountpaths)
 		return
 	}
@@ -114,10 +114,10 @@ func (res *Res) RunResilver(args Args) {
 	debug.Assert(args.PostDD == nil || (args.Action == apc.ActMountpathDetach || args.Action == apc.ActMountpathDisable))
 
 	if args.SingleRmiJogger {
-		jg = mpather.NewJoggerGroup(opts, config, args.Rmi.Path)
+		jg = mpather.NewJoggerGroup(opts, config, args.Rmi)
 		nlog.Infof("%s, action %q, jogger->(%q)", xres.Name(), args.Action, args.Rmi)
 	} else {
-		jg = mpather.NewJoggerGroup(opts, config, "")
+		jg = mpather.NewJoggerGroup(opts, config, nil)
 		if args.Rmi != nil {
 			nlog.Infof("%s, action %q, rmi %s, num %d", xres.Name(), args.Action, args.Rmi, jg.Num())
 		} else {
@@ -190,16 +190,17 @@ func (jg *joggerCtx) _mvSlice(ct *core.CT, buf []byte) {
 	if _, _, err = cos.CopyFile(ct.FQN(), destFQN, buf, cos.ChecksumNone); err != nil {
 		errV := fmt.Errorf("failed to copy %q -> %q: %v. Rolling back", ct.FQN(), destFQN, err)
 		jg.xres.AddErr(errV, 0)
-		if err = os.Remove(destMetaFQN); err != nil {
+		if err = cos.RemoveFile(destMetaFQN); err != nil {
 			errV := fmt.Errorf("failed to cleanup metafile %q: %v", destMetaFQN, err)
 			nlog.Infoln("Warning:", errV)
 			jg.xres.AddErr(errV)
 		}
 	}
-	errMeta := os.Remove(srcMetaFQN)
-	errSlice := os.Remove(ct.FQN())
-	if errMeta != nil || errSlice != nil {
-		nlog.Warningf("Failed to cleanup %q: %v, %v", ct.FQN(), errSlice, errMeta)
+	if errMeta := cos.RemoveFile(srcMetaFQN); errMeta != nil {
+		nlog.Warningln("failed to cleanup meta", srcMetaFQN, "[", errMeta, "]")
+	}
+	if errSlice := cos.RemoveFile(ct.FQN()); errSlice != nil {
+		nlog.Warningln("failed to cleanup slice", ct.FQN(), "[", errSlice, "]")
 	}
 }
 
@@ -253,18 +254,19 @@ func (jg *joggerCtx) visitObj(lom *core.LOM, buf []byte) (errHrw error) {
 
 	// 1. fix EC metafile
 	var metaOldPath, metaNewPath string
-	if !lom.IsHRW() && lom.Bprops().EC.Enabled {
-		// copy metafile
-		newMpath, _, errEc := core.ResolveFQN(lom.HrwFQN)
-		if errEc != nil {
-			nlog.Warningf("%s: %s %v", xname, lom, errEc)
+	if !lom.IsHRW() && lom.ECEnabled() {
+		var parsed fs.ParsedFQN
+		_, err := core.ResolveFQN(*lom.HrwFQN, &parsed)
+		if err != nil {
+			nlog.Warningf("%s: %s %v", xname, lom, err)
 			return nil
 		}
 		ct := core.NewCTFromLOM(lom, fs.ObjectType)
-		metaOldPath, metaNewPath, errEc = _moveECMeta(ct, lom.Mountpath(), newMpath.Mountpath, buf)
-		if errEc != nil {
-			nlog.Warningf("%s: failed to copy EC metafile %s %q -> %q: %v",
-				xname, lom, lom.Mountpath().Path, newMpath.Mountpath.Path, errEc)
+		// copy metafile
+		metaOldPath, metaNewPath, err = _moveECMeta(ct, lom.Mountpath(), parsed.Mountpath, buf)
+		if err != nil {
+			nlog.Warningf("%s: failed to copy EC metafile %s %q -> %q: %v", xname, lom, lom.Mountpath().Path,
+				parsed.Mountpath.Path, err)
 			return nil
 		}
 	}
@@ -272,7 +274,7 @@ func (jg *joggerCtx) visitObj(lom *core.LOM, buf []byte) (errHrw error) {
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
 		return nil
 	}
-	size = lom.SizeBytes()
+	size = lom.Lsize()
 	// 2. fix hrw location; fail and subsequently abort if unsuccessful
 	var (
 		retries   int

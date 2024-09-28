@@ -1,19 +1,20 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
 #
 
 from __future__ import annotations  # pylint: disable=unused-variable
 
 import json
 import logging
+import os
 from pathlib import Path
 import time
 from typing import Dict, List, NewType, Iterable
 import requests
 
 from aistore.sdk.ais_source import AISSource
-from aistore.sdk.etl_const import DEFAULT_ETL_TIMEOUT
-from aistore.sdk.object_iterator import ObjectIterator
+from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
+from aistore.sdk.obj.object_iterator import ObjectIterator
 from aistore.sdk.const import (
     ACT_COPY_BCK,
     ACT_CREATE_BCK,
@@ -44,7 +45,10 @@ from aistore.sdk.const import (
     STATUS_ACCEPTED,
     STATUS_OK,
     STATUS_PARTIAL_CONTENT,
+    DEFAULT_JOB_POLL_TIME,
 )
+from aistore.sdk.enums import FLTPresence
+from aistore.sdk.dataset.dataset_config import DatasetConfig
 
 from aistore.sdk.errors import (
     InvalidBckProvider,
@@ -54,7 +58,7 @@ from aistore.sdk.errors import (
 )
 from aistore.sdk.multiobj import ObjectGroup, ObjectRange
 from aistore.sdk.request_client import RequestClient
-from aistore.sdk.object import Object
+from aistore.sdk.obj.object import Object
 from aistore.sdk.types import (
     ActionMsg,
     BucketEntry,
@@ -69,11 +73,12 @@ from aistore.sdk.types import (
 )
 from aistore.sdk.list_object_flag import ListObjectFlag
 from aistore.sdk.utils import validate_directory, get_file_size
+from aistore.sdk.obj.object_props import ObjectProps
 
 Header = NewType("Header", requests.structures.CaseInsensitiveDict)
 
 
-# pylint: disable=unused-variable,too-many-public-methods
+# pylint: disable=unused-variable,too-many-public-methods,too-many-lines
 class Bucket(AISSource):
     """
     A class representing a bucket that contains user data.
@@ -105,6 +110,11 @@ class Bucket(AISSource):
         """The client bound to this bucket."""
         return self._client
 
+    @client.setter
+    def client(self, client) -> RequestClient:
+        """Update the client bound to this bucket."""
+        self._client = client
+
     @property
     def qparam(self) -> Dict:
         """Default query parameters to use with API calls from this bucket."""
@@ -127,16 +137,36 @@ class Bucket(AISSource):
 
     def list_urls(self, prefix: str = "", etl_name: str = None) -> Iterable[str]:
         """
-            Get an iterator of full URLs to every object in this bucket matching the prefix
+        Implementation of the abstract method from AISSource that provides an iterator
+        of full URLs to every object in this bucket matching the specified prefix
+
         Args:
             prefix (str, optional): Limit objects selected by a given string prefix
             etl_name (str, optional): ETL to include in URLs
 
         Returns:
-            Iterator of all object URLs matching the prefix
+            Iterator of full URLs of all objects matching the prefix
         """
         for entry in self.list_objects_iter(prefix=prefix, props="name"):
             yield self.object(entry.name).get_url(etl_name=etl_name)
+
+    def list_all_objects_iter(
+        self, prefix: str = "", props: str = "name,size"
+    ) -> Iterable[Object]:
+        """
+        Implementation of the abstract method from AISSource that provides an iterator
+        of all the objects in this bucket matching the specified prefix.
+
+        Args:
+            prefix (str, optional): Limit objects selected by a given string prefix
+            props (str, optional): Comma-separated list of object properties to return. Default value is "name,size".
+                Properties: "name", "size", "atime", "version", "checksum", "target_url", "copies".
+
+        Returns:
+            Iterator of all object URLs matching the prefix
+        """
+        for entry in self.list_objects_iter(prefix=prefix, props=props):
+            yield self.object(entry.name, entry.generate_object_props())
 
     def create(self, exist_ok=False):
         """
@@ -310,8 +340,8 @@ class Bucket(AISSource):
         # Update the uuid in the control message
         bsumm_ctrl_msg.uuid = job_id
 
-        # Sleep and request frequency in sec (starts at 200 ms)
-        sleep_time = 0.2
+        # Sleep and request frequency in sec (starts at 0.2s)
+        sleep_time = DEFAULT_JOB_POLL_TIME
 
         # Poll async task for http.StatusOK completion
         while True:
@@ -325,36 +355,45 @@ class Bucket(AISSource):
             # If task completed successfully, break the loop
             if resp.status_code == STATUS_OK:
                 break
+            # If status code received is neither STATUS_ACCEPTED nor STATUS_PARTIAL_CONTENT, raise an exception
+            if resp.status_code not in (STATUS_ACCEPTED, STATUS_PARTIAL_CONTENT):
+                raise UnexpectedHTTPStatusCode(
+                    [STATUS_OK, STATUS_ACCEPTED, STATUS_PARTIAL_CONTENT],
+                    resp.status_code,
+                )
+
             # If task is still running, wait for some time and try again
-            if resp.status_code == STATUS_ACCEPTED:
-                time.sleep(sleep_time)
+            time.sleep(sleep_time)
+            if resp.status_code != STATUS_PARTIAL_CONTENT:
                 sleep_time = min(
                     10, sleep_time * 1.5
                 )  # Increase sleep_time by 50%, but don't exceed 10 seconds
-            # Otherwise, if status code received is neither STATUS_OK or STATUS_ACCEPTED, raise an exception
-            else:
-                raise UnexpectedHTTPStatusCode(
-                    [STATUS_OK, STATUS_ACCEPTED], resp.status_code
-                )
 
         return json.loads(resp.content.decode("utf-8"))[0]
 
-    def info(self, flt_presence: int = 0, bsumm_remote: bool = True):
+    def info(
+        self,
+        flt_presence: int = FLTPresence.FLT_EXISTS,
+        bsumm_remote: bool = True,
+        prefix: str = "",
+    ):
         """
         Returns bucket summary and information/properties.
 
         Args:
-            flt_presence (int): Describes the presence of buckets and objects with respect to their existence
-                                or non-existence in the AIS cluster. Defaults to 0.
-
-                                Expected values are:
-                                0 - (object | bucket) exists inside and/or outside cluster
-                                1 - same as 0 but no need to return summary
-                                2 - bucket: is present | object: present and properly located
-                                3 - same as 2 but no need to return summary
-                                4 - objects: present anywhere/anyhow _in_ the cluster as: replica, ec-slices, misplaced
-                                5 - not present - exists _outside_ cluster
+            flt_presence (FLTPresence): Describes the presence of buckets and objects with respect to their existence
+                                or non-existence in the AIS cluster using the enum FLTPresence. Defaults to
+                                value FLT_EXISTS and values are:
+                                FLT_EXISTS - object or bucket exists inside and/or outside cluster
+                                FLT_EXISTS_NO_PROPS - same as FLT_EXISTS but no need to return summary
+                                FLT_PRESENT - bucket is present or object is present and properly
+                                located
+                                FLT_PRESENT_NO_PROPS - same as FLT_PRESENT but no need to return summary
+                                FLT_PRESENT_CLUSTER - objects present anywhere/how in
+                                the cluster as replica, ec-slices, misplaced
+                                FLT_EXISTS_OUTSIDE - not present; exists outside cluster
             bsumm_remote (bool): If True, returned bucket info will include remote objects as well
+            prefix (str): Only include objects with the given prefix in the bucket
 
         Raises:
             requests.ConnectionError: Connection error
@@ -365,22 +404,32 @@ class Bucket(AISSource):
             ValueError: `flt_presence` is not one of the expected values
             aistore.sdk.errors.AISError: All other types of errors with AIStore
         """
-        if flt_presence not in range(6):
-            raise ValueError("`flt_presence` must be one of 0, 1, 2, 3, 4, or 5.")
+        try:
+            flt_presence = int(FLTPresence(flt_presence))
+        except Exception as err:
+            raise ValueError(
+                "`flt_presence` must be in values of enum FLTPresence"
+            ) from err
 
         params = self.qparam.copy()
         params.update({QPARAM_FLT_PRESENCE: flt_presence})
         params[QPARAM_BSUMM_REMOTE] = bsumm_remote
 
+        path = f"{URL_PATH_BUCKETS}/{self.name}"
+        if prefix:
+            path += f"/{prefix}"
+
         response = self.client.request(
             HTTP_METHOD_HEAD,
-            path=f"{URL_PATH_BUCKETS}/{self.name}",
+            path=path,
             params=params,
         )
 
         bucket_props = response.headers.get(HEADER_BUCKET_PROPS, "{}")
         uuid = response.headers.get(HEADER_XACTION_ID, "").strip('"')
         params[QPARAM_UUID] = uuid
+
+        result = {}
 
         # Initial response status code should be 202
         if response.status_code != int(STATUS_ACCEPTED):
@@ -714,7 +763,7 @@ class Bucket(AISSource):
         Args:
             path (str): Local filepath, can be relative or absolute
             prefix_filter (str, optional): Only put files with names starting with this prefix
-            pattern (str, optional): Regex pattern to filter files
+            pattern (str, optional): Shell-style wildcard pattern to filter files
             basename (bool, optional): Whether to use the file names only as object names and omit the path information
             prepend (str, optional): Optional string to use as a prefix in the object name for all objects uploaded
                 No delimiter ("/", "-", etc.) is automatically applied between the prepend value and the object name
@@ -770,25 +819,23 @@ class Bucket(AISSource):
             return prepend + obj_name
         return obj_name
 
-    def object(self, obj_name: str) -> Object:
+    def object(self, obj_name: str, props: ObjectProps = None) -> Object:
         """
         Factory constructor for an object in this bucket.
         Does not make any HTTP request, only instantiates an object in a bucket owned by the client.
 
         Args:
             obj_name (str): Name of object
+            size (int, optional): Size of object in bytes
 
         Returns:
             The object created.
         """
-        return Object(
-            bucket=self,
-            name=obj_name,
-        )
+        return Object(bucket=self, name=obj_name, props=props)
 
     def objects(
         self,
-        obj_names: list = None,
+        obj_names: List = None,
         obj_range: ObjectRange = None,
         obj_template: str = None,
     ) -> ObjectGroup:
@@ -814,8 +861,8 @@ class Bucket(AISSource):
         self,
         method: str,
         action: str,
-        value: dict = None,
-        params: dict = None,
+        value: Dict = None,
+        params: Dict = None,
     ) -> requests.Response:
         """
         Use the bucket's client to make a request to the bucket endpoint on the AIS server
@@ -874,3 +921,30 @@ class Bucket(AISSource):
         return BucketModel(
             name=self.name, namespace=self.namespace, provider=self.provider
         )
+
+    def write_dataset(
+        self,
+        config: DatasetConfig,
+        skip_missing: bool = True,
+        **kwargs,
+    ):
+        """
+        Write a dataset to a bucket in AIS in webdataset format using wds.ShardWriter. Logs the missing attributes
+
+        Args:
+            config (DatasetConfig): Configuration dict specifying how to process
+                and store each part of the dataset item
+            skip_missing (bool, optional): Skip samples that are missing one or more attributes, defaults to True
+            **kwargs (optional): Optional keyword arguments to pass to the ShardWriter
+        """
+
+        # Add the upload shard logic to the original post processing function
+        original_post = kwargs.get("post", lambda path: None)
+
+        def combined_post_processing(shard_path):
+            original_post(shard_path)
+            self.object(shard_path).put_file(shard_path)
+            os.unlink(shard_path)
+
+        kwargs["post"] = combined_post_processing
+        config.write_shards(skip_missing=skip_missing, **kwargs)

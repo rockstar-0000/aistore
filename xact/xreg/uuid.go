@@ -21,15 +21,15 @@ var (
 // see related: cmn/cos/uuid.go
 
 // "best-effort ID" - to independently and locally generate globally unique xaction ID
-func GenBEID(div uint64, tag string) (beid string, xctn core.Xact, err error) {
+func GenBEID(div uint64, tag []byte) (beid string, xctn core.Xact, err error) {
 	// primary's "now"
 	now := uint64(time.Now().UnixNano() - MyTime.Load() + PrimeTime.Load())
 
 	// compute
 	val := now / div
 	org := val
-	val ^= xxhash.Checksum64S(cos.UnsafeB(tag), val)
-	beid = cos.GenBEID(val)
+	val ^= xxhash.Checksum64S(tag, val)
+	beid = cos.GenBEID(val, cos.LenShortID)
 
 	// check vs registry
 	xctn, err = GetXact(beid)
@@ -43,7 +43,7 @@ func GenBEID(div uint64, tag string) (beid string, xctn core.Xact, err error) {
 
 	// "idling" away, so try again but only once
 	val ^= org
-	beid = cos.GenBEID(val)
+	beid = cos.GenBEID(val, cos.LenShortID)
 	if xctn, err = GetXact(beid); err != nil || xctn != nil {
 		beid = ""
 	}

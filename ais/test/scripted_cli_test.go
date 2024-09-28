@@ -120,12 +120,14 @@ func TestPrefetchLatestRemaisUsingScript(t *testing.T) {
 }
 
 func TestCopySyncWithOutOfBandUsingRemaisScript(t *testing.T) {
+	bck := cliBck
 	tools.CheckSkip(t, &tools.SkipTestArgs{
+		Bck:                   bck,
 		Long:                  true,
 		RequiresRemoteCluster: true,
+		CloudBck:              true,
 	})
 
-	bck := cliBck
 	var (
 		bucketName = bck.Cname("")
 		cmd        = exec.Command("./scripts/cp-sync-remais-out-of-band.sh", "--bucket", bucketName)
@@ -199,6 +201,17 @@ func TestRemaisBlobDownloadScript(t *testing.T) {
 	cmd := exec.Command("./scripts/remais-blob-download.sh", "--bucket", name)
 
 	tlog.Logf("Running '%s' (this may take a while...)\n", cmd.String())
+	out, err := cmd.CombinedOutput()
+	if len(out) > 0 {
+		tlog.Logln(string(out))
+	}
+	tassert.CheckFatal(t, err)
+}
+
+// get-archregx-wdskey.sh
+func TestGetArchregxWdskeyScript(t *testing.T) {
+	cmd := exec.Command("./scripts/get-archregx-wdskey.sh")
+
 	out, err := cmd.CombinedOutput()
 	if len(out) > 0 {
 		tlog.Logln(string(out))

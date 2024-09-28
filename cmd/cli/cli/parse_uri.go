@@ -16,7 +16,7 @@ import (
 )
 
 func errBucketNameInvalid(c *cli.Context, arg string, err error) error {
-	if errV := errMisplacedFlag(c, arg); errV != nil {
+	if errV := errArgIsFlag(c, arg); errV != nil {
 		return errV
 	}
 	if strings.Contains(err.Error(), cos.OnlyPlus) && strings.Contains(err.Error(), "bucket name") {
@@ -128,7 +128,7 @@ func parseDest(c *cli.Context, uri string) (bck cmn.Bck, pathSuffix string, err 
 	bck, pathSuffix, err = parseBckObjURI(c, uri, true /*optional objName*/)
 	if err != nil {
 		return
-	} else if bck.IsHTTP() {
+	} else if bck.IsHT() {
 		err = errors.New("http bucket is not supported as destination")
 		return
 	}

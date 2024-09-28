@@ -37,11 +37,19 @@ Rest of this document covers starting, stopping, and otherwise managing job kind
 ### See also
 
 - [static descriptors (source code)](https://github.com/NVIDIA/aistore/blob/main/xact/api.go#L108)
-- [`xact` package README](/xact/README.md).
+- [`xact` package README](https://github.com/NVIDIA/aistore/blob/main/xact/README.md).
 - [`batch jobs`](/docs/batch.md)
 - [CLI: `dsort` (distributed shuffle)](/docs/cli/dsort.md)
 - [CLI: `download` from any remote source](/docs/cli/download.md)
 - [built-in `rebalance`](/docs/rebalance.md)
+
+* And more:
+  - [`ais etl`](/docs/cli/etl.md)
+  - [`ais prefetch`](/docs/cli/object.md)
+  - [`ais cp`](#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+  - [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
+  - [reading, writing, and listing archives](/docs/cli/object.md)
+  - [copying buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 # `ais job` command
 

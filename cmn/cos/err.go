@@ -42,6 +42,8 @@ var (
 	errQuantityNonNegative = errors.New("quantity should not be negative")
 )
 
+var ErrWorkChanFull = errors.New("work channel full")
+
 var errBufferUnderrun = errors.New("buffer underrun")
 
 // ErrNotFound
@@ -67,8 +69,9 @@ func IsErrNotFound(err error) bool {
 // gen-purpose not-finding-anything: objects, directories, xactions, nodes, ...
 //
 
-func IsNotExist(err error, errCode int) bool {
-	if errCode == http.StatusNotFound || IsErrNotFound(err) {
+// NOTE: compare with cmn.IsErrObjNought() that also includes lmeta-not-found et al.
+func IsNotExist(err error, ecode int) bool {
+	if ecode == http.StatusNotFound || IsErrNotFound(err) {
 		return true
 	}
 	return os.IsNotExist(err) // unwraps for fs.ErrNotExist
@@ -165,14 +168,17 @@ func IsErrOOS(err error) bool {
 	return errors.Is(err, syscall.ENOSPC)
 }
 
-func isErrDNSLookup(err error) bool {
-	_, ok := err.(*net.DNSError)
-	return ok
+func IsErrDNSLookup(err error) bool {
+	if _, ok := err.(*net.DNSError); ok {
+		return ok
+	}
+	wrapped := &net.DNSError{}
+	return errors.As(err, &wrapped)
 }
 
 func IsUnreachable(err error, status int) bool {
 	return IsErrConnectionRefused(err) ||
-		isErrDNSLookup(err) ||
+		IsErrDNSLookup(err) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		status == http.StatusRequestTimeout ||
 		status == http.StatusServiceUnavailable ||

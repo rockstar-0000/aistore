@@ -48,15 +48,14 @@ func (b *Bck) Bucket() *cmn.Bck { return (*cmn.Bck)(b) }
 
 func (b *Bck) IsAIS() bool                  { return (*cmn.Bck)(b).IsAIS() }
 func (b *Bck) HasProvider() bool            { return (*cmn.Bck)(b).HasProvider() }
-func (b *Bck) IsHTTP() bool                 { return (*cmn.Bck)(b).IsHTTP() }
-func (b *Bck) IsHDFS() bool                 { return (*cmn.Bck)(b).IsHDFS() }
+func (b *Bck) IsHT() bool                   { return (*cmn.Bck)(b).IsHT() }
 func (b *Bck) IsCloud() bool                { return (*cmn.Bck)(b).IsCloud() }
 func (b *Bck) IsRemote() bool               { return (*cmn.Bck)(b).IsRemote() }
 func (b *Bck) IsRemoteAIS() bool            { return (*cmn.Bck)(b).IsRemoteAIS() }
 func (b *Bck) IsQuery() bool                { return (*cmn.Bck)(b).IsQuery() }
 func (b *Bck) RemoteBck() *cmn.Bck          { return (*cmn.Bck)(b).RemoteBck() }
 func (b *Bck) Validate() error              { return (*cmn.Bck)(b).Validate() }
-func (b *Bck) MakeUname(name string) string { return (*cmn.Bck)(b).MakeUname(name) }
+func (b *Bck) MakeUname(name string) []byte { return (*cmn.Bck)(b).MakeUname(name) }
 func (b *Bck) Cname(name string) string     { return (*cmn.Bck)(b).Cname(name) }
 func (b *Bck) IsEmpty() bool                { return (*cmn.Bck)(b).IsEmpty() }
 func (b *Bck) HasVersioningMD() bool        { return (*cmn.Bck)(b).HasVersioningMD() }
@@ -79,40 +78,22 @@ func (b *Bck) AddUnameToQuery(q url.Values, uparam string) url.Values {
 	return bck.AddUnameToQuery(q, uparam)
 }
 
-const aisBIDmask = uint64(1 << 63)
-
-func (b *Bck) MaskBID(i int64) uint64 {
-	bck := (*cmn.Bck)(b)
-	if bck.IsAIS() {
-		return uint64(i) | aisBIDmask
-	}
-	return uint64(i)
-}
-
-func (b *Bck) unmaskBID() uint64 {
-	if b.Props == nil || b.Props.BID == 0 {
-		return 0
-	}
-	bck := (*cmn.Bck)(b)
-	if bck.IsAIS() {
-		return b.Props.BID ^ aisBIDmask
-	}
-	return b.Props.BID
-}
-
 func (b *Bck) String() string {
 	var (
 		s   string
-		bid = b.unmaskBID()
+		bid uint64
+		bck = (*cmn.Bck)(b)
 	)
-	bck := (*cmn.Bck)(b)
+	if bck.Props != nil {
+		bid = b.Props.BID
+	}
 	if bid == 0 {
 		return bck.String()
 	}
 	if backend := bck.Backend(); backend != nil {
 		s = ", backend=" + backend.String()
 	}
-	return fmt.Sprintf("%s(%#x%s)", bck, bid, s)
+	return fmt.Sprintf("%s(%#x%s)", bck, BID(bid).serial(), s)
 }
 
 func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
@@ -203,27 +184,27 @@ func (b *Bck) init(bmd *BMD) error {
 // to support s3 clients:
 // find an already existing bucket by name (and nothing else)
 // returns an error when name cannot be unambiguously resolved to a single bucket
-func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, err error, errCode int) {
+func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, err error, ecode int) {
 	bmd := bowner.Get()
 	all := bmd.getAllByName(bckName)
-	if all == nil {
+	switch {
+	case all == nil:
 		err = cmn.NewErrBckNotFound(&cmn.Bck{Name: bckName})
-		errCode = http.StatusNotFound
-	} else if len(all) == 1 {
+		ecode = http.StatusNotFound
+	case len(all) == 1:
 		bck = &all[0]
 		if bck.Props == nil {
 			err = cmn.NewErrBckNotFound(bck.Bucket())
-			errCode = http.StatusNotFound
+			ecode = http.StatusNotFound
 		} else if backend := bck.Backend(); backend != nil && backend.Props == nil {
 			debug.Assert(apc.IsRemoteProvider(backend.Provider))
 			err = backend.init(bmd)
 		}
-	} else {
-		err = fmt.Errorf("cannot unambiguously resolve bucket name %q to a single bucket (%v)",
-			bckName, all)
-		errCode = http.StatusUnprocessableEntity
+	default:
+		err = fmt.Errorf("cannot unambiguously resolve bucket name %q to a single bucket (%v)", bckName, all)
+		ecode = http.StatusUnprocessableEntity
 	}
-	return
+	return bck, err, ecode
 }
 
 func (b *Bck) CksumConf() (conf *cmn.CksumConf) { return &b.Props.Cksum }
@@ -252,7 +233,7 @@ func (b *Bck) checkAccess(bit apc.AccessAttrs) (err error) {
 	return
 }
 
-func (b *Bck) MaxPageSize() uint {
+func (b *Bck) MaxPageSize() int64 {
 	switch b.Provider {
 	case apc.AIS:
 		return apc.MaxPageSizeAIS

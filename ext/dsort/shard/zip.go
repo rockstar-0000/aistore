@@ -57,15 +57,15 @@ func (*zipRW) MetadataSize() int64  { return 0 } // zip does not have header siz
 
 // Extract reads the tarball f and extracts its metadata.
 func (zrw *zipRW) Extract(lom *core.LOM, r cos.ReadReaderAt, extractor RecordExtractor, toDisk bool) (int64, int, error) {
-	ar, err := archive.NewReader(zrw.ext, r, lom.SizeBytes())
+	ar, err := archive.NewReader(zrw.ext, r, lom.Lsize())
 	if err != nil {
 		return 0, 0, err
 	}
-	c := &rcbCtx{parent: zrw, extractor: extractor, shardName: lom.ObjName, toDisk: toDisk}
-	buf, slab := core.T.PageMM().AllocSize(lom.SizeBytes())
+	c := &rcbCtx{parent: zrw, extractor: extractor, shardName: lom.ObjName, toDisk: toDisk, fromTar: false}
+	buf, slab := core.T.PageMM().AllocSize(lom.Lsize())
 	c.buf = buf
 
-	_, err = ar.Range("", c.xzip)
+	err = ar.ReadUntil(c, cos.EmptyMatchAll, "")
 
 	slab.Free(buf)
 	return c.extractedSize, c.extractedCount, err

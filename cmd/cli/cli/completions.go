@@ -37,16 +37,22 @@ const (
 var (
 	supportedBool = []string{"true", "false"}
 	propCmpls     = map[string][]string{
-		confLogModules:                        append(cos.Smodules, NilValue),
-		cmn.PropBucketAccessAttrs:             apc.SupportedPermissions(),
-		apc.HdrObjCksumType:                   cos.SupportedChecksums(),
-		feat.FeaturesPropName:                 append(feat.All, NilValue),
-		"write_policy.data":                   apc.SupportedWritePolicy,
-		"write_policy.md":                     apc.SupportedWritePolicy,
-		"ec.compression":                      apc.SupportedCompression,
-		"compression.checksum":                apc.SupportedCompression,
-		"rebalance.compression":               apc.SupportedCompression,
-		"distributed_sort.compression":        apc.SupportedCompression,
+		// log modules
+		confLogModules: append(cos.Smodules[:], apc.NilValue),
+		// checksums
+		apc.HdrObjCksumType: cos.SupportedChecksums(),
+		// access
+		cmn.PropBucketAccessAttrs: apc.SupportedPermissions(),
+		// feature flags
+		"cluster.features": append(feat.Cluster[:], apc.NilValue),
+		"bucket.features":  append(feat.Bucket[:], apc.NilValue),
+		// rest
+		"write_policy.data":                   apc.SupportedWritePolicy[:],
+		"write_policy.md":                     apc.SupportedWritePolicy[:],
+		"ec.compression":                      apc.SupportedCompression[:],
+		"compression.checksum":                apc.SupportedCompression[:],
+		"rebalance.compression":               apc.SupportedCompression[:],
+		"distributed_sort.compression":        apc.SupportedCompression[:],
 		"distributed_sort.duplicated_records": cmn.SupportedReactions,
 		"distributed_sort.ekm_malformed_line": cmn.SupportedReactions,
 		"distributed_sort.ekm_missing_key":    cmn.SupportedReactions,
@@ -69,9 +75,29 @@ var (
 	}
 )
 
-func lastIsSmodule(c *cli.Context) bool { return _lastv(c, propCmpls[confLogModules]) }
-func lastIsAccess(c *cli.Context) bool  { return _lastv(c, propCmpls[cmn.PropBucketAccessAttrs]) }
-func lastIsFeature(c *cli.Context) bool { return _lastv(c, propCmpls[feat.FeaturesPropName]) }
+func lastIsSmodule(c *cli.Context) bool {
+	if argLast(c) == confLogModules {
+		return true
+	}
+	return _lastv(c, propCmpls[confLogModules])
+}
+
+func lastIsAccess(c *cli.Context) bool {
+	if argLast(c) == cmn.PropBucketAccessAttrs {
+		return true
+	}
+	return _lastv(c, propCmpls[cmn.PropBucketAccessAttrs])
+}
+
+func lastIsFeature(c *cli.Context, bucketScope bool) bool {
+	if argLast(c) == feat.PropName {
+		return true
+	}
+	if bucketScope {
+		return _lastv(c, propCmpls["bucket.features"])
+	}
+	return _lastv(c, propCmpls["cluster.features"])
+}
 
 // Returns true if the last arg is any of the enumerated constants
 func _lastv(c *cli.Context, values []string) bool {
@@ -79,6 +105,7 @@ func _lastv(c *cli.Context, values []string) bool {
 		return false
 	}
 	lastArg := argLast(c)
+
 	for _, v := range values {
 		if v == lastArg {
 			return true
@@ -93,7 +120,14 @@ func _lastv(c *cli.Context, values []string) bool {
 // - features
 func smoduleCompletions(c *cli.Context) { remaining(c, propCmpls[confLogModules]) }
 func accessCompletions(c *cli.Context)  { remaining(c, propCmpls[cmn.PropBucketAccessAttrs]) }
-func featureCompletions(c *cli.Context) { remaining(c, propCmpls[feat.FeaturesPropName]) }
+
+func featureCompletions(c *cli.Context, bucketScope bool) {
+	if bucketScope {
+		remaining(c, propCmpls["bucket.features"])
+	} else {
+		remaining(c, propCmpls["cluster.features"])
+	}
+}
 
 func remaining(c *cli.Context, values []string) {
 	typedList := c.Args()
@@ -108,15 +142,15 @@ outer:
 	}
 }
 
-func propValueCompletion(c *cli.Context) bool {
+func propValueCompletion(c *cli.Context, bucketScope bool) bool {
 	switch {
 	case c.NArg() == 0:
 		return false
 	case lastIsAccess(c):
 		accessCompletions(c)
 		return true
-	case lastIsFeature(c):
-		featureCompletions(c)
+	case lastIsFeature(c, bucketScope):
+		featureCompletions(c, bucketScope)
 		return true
 	case lastIsSmodule(c):
 		smoduleCompletions(c)
@@ -198,6 +232,7 @@ func setNodeConfigCompletions(c *cli.Context) {
 			v = &config.LocalConfig
 		} else if argLast(c) == cfgScopeInherited {
 			fmt.Println(cmdReset)
+			fmt.Println("backend") // NOTE special case: custom marshaling (ref 080235)
 		}
 		err := cmn.IterFields(v, func(tag string, _ cmn.IterField) (err error, b bool) {
 			props.Set(tag)
@@ -299,9 +334,15 @@ func setCluConfigCompletions(c *cli.Context) {
 	}, cmn.IterOpts{Allowed: apc.Cluster})
 	debug.AssertNoErr(err)
 
-	if propValueCompletion(c) {
+	if propValueCompletion(c, false /*bucket scope*/) {
 		return
 	}
+
+	// NOTE special case: custom marshaling (ref 080235)
+	if c.NArg() == 0 {
+		propList = append(propList, "backend")
+	}
+
 	for _, prop := range propList {
 		if !cos.AnyHasPrefixInSlice(prop, c.Args()) {
 			fmt.Println(prop)
@@ -310,7 +351,7 @@ func setCluConfigCompletions(c *cli.Context) {
 }
 
 func suggestUpdatableConfig(c *cli.Context) {
-	if propValueCompletion(c) {
+	if propValueCompletion(c, false /*bucket scope*/) {
 		return
 	}
 	scope := apc.Cluster
@@ -349,7 +390,7 @@ func (opts *bcmplop) buckets(c *cli.Context) {
 	)
 	additionalCompletions = opts.additionalCompletions
 	if c.NArg() > opts.firstBucketIdx && !opts.multiple {
-		if propValueCompletion(c) {
+		if propValueCompletion(c, true /*bucket scope*/) {
 			return
 		}
 		for _, f := range additionalCompletions {
@@ -480,10 +521,8 @@ func bpropsFilterExtra(c *cli.Context, tag string) bool {
 	switch c.Args().Get(0) {
 	case apc.S3Scheme, apc.AWS:
 		return strings.HasPrefix(tag, "extra.aws")
-	case apc.HTTP:
+	case apc.HT:
 		return strings.HasPrefix(tag, "extra.http")
-	case apc.HDFS:
-		return strings.HasPrefix(tag, "extra.hdfs")
 	}
 	return false
 }
@@ -699,12 +738,12 @@ func oneRoleCompletions(c *cli.Context) {
 		return
 	}
 	for _, role := range roleList {
-		if role.ID == c.Args().Get(0) {
+		if role.Name == c.Args().Get(0) {
 			return
 		}
 	}
 	for _, role := range roleList {
-		fmt.Println(role.ID)
+		fmt.Println(role.Name)
 	}
 }
 
@@ -715,10 +754,10 @@ func multiRoleCompletions(c *cli.Context) {
 	}
 	args := c.Args()
 	for _, role := range roleList {
-		if cos.StringInSlice(role.ID, args) {
+		if cos.StringInSlice(role.Name, args) {
 			continue
 		}
-		fmt.Println(role.ID)
+		fmt.Println(role.Name)
 	}
 }
 
@@ -766,7 +805,7 @@ func oneClusterCompletions(c *cli.Context) {
 		return
 	}
 	for _, clu := range cluList {
-		fmt.Println(cos.Either(clu.Alias, clu.ID))
+		fmt.Println(cos.Left(clu.Alias, clu.ID))
 	}
 }
 
@@ -821,7 +860,11 @@ func cliPropCompletions(c *cli.Context) {
 	debug.AssertNoErr(err)
 }
 
-func suggestTargetMpath(c *cli.Context, cmd string) {
+func suggestMpathEnable(c *cli.Context) { _suggestMpath(c, cmdMpathEnable) }
+func suggestMpathActive(c *cli.Context) { _suggestMpath(c, "select-active") } // local usage
+func suggestMpathDetach(c *cli.Context) { _suggestMpath(c, cmdMpathDetach) }
+
+func _suggestMpath(c *cli.Context, cmd string) {
 	switch c.NArg() {
 	case 0:
 		suggestTargets(c)
@@ -849,10 +892,21 @@ func suggestTargetMpath(c *cli.Context, cmd string) {
 			for _, mpath := range mpl.Disabled {
 				fmt.Println(mpath)
 			}
-		case cmdMpathDisable:
+		case "select-active":
 			for _, mpath := range mpl.Available {
 				fmt.Println(mpath)
 			}
+		}
+	}
+}
+
+func suggestCloudProvider(c *cli.Context) {
+	if c.NArg() > 0 {
+		return
+	}
+	for provider := range apc.Providers {
+		if apc.IsCloudProvider(provider) {
+			fmt.Println(provider)
 		}
 	}
 }

@@ -1,7 +1,7 @@
 // Package stats provides methods and functionality to register, track, log,
 // and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
@@ -11,9 +11,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
-	"github.com/NVIDIA/aistore/core/meta"
 )
 
 const numProxyStats = 24 // approx. initial
@@ -29,14 +29,12 @@ type Prunner struct {
 /////////////
 
 // interface guard
-var _ cos.Runner = (*Prunner)(nil)
+var (
+	_ cos.Runner = (*Prunner)(nil)
+	_ Tracker    = (*Prunner)(nil)
+)
 
 func (r *Prunner) Run() error { return r._run(r /*as statsLogger*/) }
-
-// have only common metrics - init only the Prometheus part if enabled
-func (r *Prunner) RegMetrics(node *meta.Snode) {
-	r.core.initProm(node)
-}
 
 // All stats that proxy currently has are CoreStats which are registered at startup
 func (r *Prunner) Init(p core.Node) *atomic.Bool {
@@ -50,11 +48,9 @@ func (r *Prunner) Init(p core.Node) *atomic.Bool {
 	r.ctracker = make(copyTracker, numProxyStats)
 
 	r.runner.name = "proxystats"
-	r.runner.daemon = p
+	r.runner.node = p
 
 	r.runner.stopCh = make(chan struct{}, 4)
-
-	r.core.initMetricClient(p.Snode(), &r.runner)
 
 	r.sorted = make([]string, 0, numProxyStats)
 	return &r.runner.startedUp
@@ -64,7 +60,7 @@ func (r *Prunner) Init(p core.Node) *atomic.Bool {
 // statsLogger interface impl
 //
 
-func (r *Prunner) log(now int64, uptime time.Duration, _ *cmn.Config) {
+func (r *Prunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 	s := r.core
 	s.updateUptime(uptime)
 	s.promLock()
@@ -74,17 +70,20 @@ func (r *Prunner) log(now int64, uptime time.Duration, _ *cmn.Config) {
 	if now >= r.next || !idle {
 		s.sgl.Reset() // sharing w/ CoreStats.copyT
 		r.ctracker.write(s.sgl, r.sorted, false /*target*/, idle)
-		if s.sgl.Len() > 3 { // skip '{}'
+		if l := s.sgl.Len(); l > 3 { // skip '{}'
 			line := string(s.sgl.Bytes())
+			debug.Assert(l < s.sgl.Slab().Size(), l, " vs slab ", s.sgl.Slab().Size())
 			if line != r.prev {
 				nlog.Infoln(line)
 				r.prev = line
 			}
 		}
 		if idle {
-			r.next = now + maxStatsLogInterval
+			r._next(config, now)
 		}
 	}
+
+	r._mem(r.node.PageMM(), 0, 0)
 }
 
 func (r *Prunner) statsTime(newval time.Duration) {

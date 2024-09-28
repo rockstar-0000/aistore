@@ -5,7 +5,6 @@
 package ais
 
 import (
-	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -23,10 +22,12 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 func decodeXML[T any](body []byte) (result T, _ error) {
@@ -55,7 +56,7 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 		objName  = s3.ObjName(items)
 		lom      = &core.LOM{ObjName: objName}
 		uploadID string
-		errCode  int
+		ecode    int
 	)
 	err := lom.InitBck(bck.Bucket())
 	if err != nil {
@@ -63,27 +64,9 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 		return
 	}
 	if bck.IsRemoteS3() {
-		pts := s3.NewPassThroughSignedReq(g.client.control, r, lom, nil, q)
-		resp, err := pts.Do()
+		uploadID, ecode, err = backend.StartMpt(lom, r, q)
 		if err != nil {
-			s3.WriteErr(w, r, err, resp.StatusCode)
-			return
-		}
-		if resp != nil {
-			result, err := decodeXML[s3.InitiateMptUploadResult](resp.Body)
-			if err != nil {
-				s3.WriteErr(w, r, err, http.StatusBadRequest)
-				return
-			}
-
-			s3.InitUpload(result.UploadID, result.Bucket, result.Key)
-			w.Header().Set(cos.HdrContentType, cos.ContentXML)
-			w.Write(resp.Body)
-			return
-		}
-		uploadID, errCode, err = backend.StartMpt(lom)
-		if err != nil {
-			s3.WriteErr(w, r, err, errCode)
+			s3.WriteErr(w, r, err, ecode)
 			return
 		}
 	} else {
@@ -96,7 +79,7 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 	sgl := t.gmm.NewSGL(0)
 	result.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	sgl.WriteTo(w)
+	sgl.WriteTo2(w)
 	sgl.Free()
 }
 
@@ -108,6 +91,10 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 //
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html
 func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []string, q url.Values, bck *meta.Bck) {
+	var (
+		remotePutLatency int64
+		startTime        = mono.NanoTime()
+	)
 	// 1. parse/validate
 	uploadID := q.Get(s3.QparamMptUploadID)
 	if uploadID == "" {
@@ -141,19 +128,18 @@ func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []stri
 	// workfile name format: <upload-id>.<part-number>.<obj-name>
 	prefix := uploadID + "." + strconv.FormatInt(int64(partNum), 10)
 	wfqn := fs.CSM.Gen(lom, fs.WorkfileType, prefix)
-	partFh, errC := lom.CreateFileRW(wfqn)
+	partFh, errC := lom.CreatePart(wfqn)
 	if errC != nil {
 		s3.WriteMptErr(w, r, errC, 0, lom, uploadID)
 		return
 	}
 
-	// 3. write
 	var (
 		etag         string
-		errCode      int
+		size         int64
+		ecode        int
 		partSHA      = r.Header.Get(cos.S3HdrContentSHA256)
 		checkPartSHA = partSHA != "" && partSHA != cos.S3UnsignedPayload
-		buf, slab    = t.gmm.Alloc()
 		cksumSHA     = &cos.CksumHash{}
 		cksumMD5     = &cos.CksumHash{}
 		remote       = bck.IsRemoteS3()
@@ -164,25 +150,23 @@ func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []stri
 	if !remote {
 		cksumMD5 = cos.NewCksumHash(cos.ChecksumMD5)
 	}
-	mw := multiWriter(cksumMD5.H, cksumSHA.H, partFh)
-	size, err := io.CopyBuffer(mw, r.Body, buf)
-	slab.Free(buf)
 
-	// 4. rewind and call s3 API
-	if err == nil && remote {
-		if _, err = partFh.Seek(0, io.SeekStart); err == nil {
-			var (
-				resp *s3.PassThroughSignedResp
-				pts  = s3.NewPassThroughSignedReq(g.client.data, r, lom, partFh, q)
-			)
-			resp, err = pts.Do()
-			if resp != nil {
-				errCode = resp.StatusCode
-				etag = cmn.UnquoteCEV(resp.Header.Get(cos.HdrETag))
-			} else {
-				etag, errCode, err = backend.PutMptPart(lom, partFh, uploadID, partNum, size)
-			}
-		}
+	// 3. write
+	mw := multiWriter(cksumMD5.H, cksumSHA.H, partFh)
+
+	if !remote {
+		// write locally
+		buf, slab := t.gmm.Alloc()
+		size, err = io.CopyBuffer(mw, r.Body, buf)
+		slab.Free(buf)
+	} else {
+		// write locally and utilize TeeReader to simultaneously send data to S3
+		tr := io.NopCloser(io.TeeReader(r.Body, mw))
+		size = r.ContentLength
+		debug.Assert(size > 0, "mpt upload: expecting positive content-length")
+		remoteStart := mono.NanoTime()
+		etag, ecode, err = backend.PutMptPart(lom, tr, r, q, uploadID, size, partNum)
+		remotePutLatency = mono.SinceNano(remoteStart)
 	}
 
 	cos.Close(partFh)
@@ -190,12 +174,11 @@ func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []stri
 		if nerr := cos.RemoveFile(wfqn); nerr != nil && !os.IsNotExist(nerr) {
 			nlog.Errorf(fmtNested, t, err, "remove", wfqn, nerr)
 		}
-		s3.WriteMptErr(w, r, err, errCode, lom, uploadID)
+		s3.WriteMptErr(w, r, err, ecode, lom, uploadID)
 		return
 	}
 
-	// 5. finalize part
-	// expecting the part's remote etag to be md5 checksum, not computing otherwise
+	// 4. finalize the part (expecting the part's remote etag to be md5 checksum)
 	md5 := etag
 	if cksumMD5.H != nil {
 		debug.Assert(etag == "")
@@ -223,6 +206,20 @@ func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []stri
 		return
 	}
 	w.Header().Set(cos.S3CksumHeader, md5) // s3cmd checks this one
+
+	delta := mono.SinceNano(startTime)
+	t.statsT.AddMany(
+		cos.NamedVal64{Name: stats.PutSize, Value: size},
+		cos.NamedVal64{Name: stats.PutLatencyTotal, Value: delta},
+	)
+	if remotePutLatency > 0 {
+		backendBck := t.Backend(bck)
+		t.statsT.AddMany(
+			cos.NamedVal64{Name: backendBck.MetricName(stats.PutSize), Value: size},
+			cos.NamedVal64{Name: backendBck.MetricName(stats.PutLatency), Value: remotePutLatency},
+			cos.NamedVal64{Name: backendBck.MetricName(stats.PutE2ELatencyTotal), Value: delta},
+		)
+	}
 }
 
 // Complete multipart upload.
@@ -239,7 +236,7 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 		return
 	}
 
-	output, err := io.ReadAll(r.Body)
+	output, err := cos.ReadAllN(r.Body, r.ContentLength)
 	if err != nil {
 		s3.WriteErr(w, r, err, http.StatusBadRequest)
 		return
@@ -272,27 +269,12 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 		remote  = bck.IsRemoteS3()
 	)
 	if remote {
-		pts := s3.NewPassThroughSignedReq(g.client.control, r, lom, io.NopCloser(bytes.NewReader(output)), q)
-		resp, err := pts.Do()
+		v, ecode, err := backend.CompleteMpt(lom, r, q, uploadID, partList)
 		if err != nil {
-			s3.WriteErr(w, r, err, resp.StatusCode)
+			s3.WriteMptErr(w, r, err, ecode, lom, uploadID)
 			return
-		} else if resp != nil {
-			result, err := decodeXML[s3.CompleteMptUploadResult](resp.Body)
-			if err != nil {
-				s3.WriteErr(w, r, err, http.StatusBadRequest)
-				return
-			}
-
-			etag = result.ETag
-		} else {
-			v, errCode, err := backend.CompleteMpt(lom, uploadID, partList)
-			if err != nil {
-				s3.WriteMptErr(w, r, err, errCode, lom, uploadID)
-				return
-			}
-			etag = v
 		}
+		etag = v
 	}
 
 	// append parts and finalize locally
@@ -313,7 +295,7 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	// 2. <upload-id>.complete.<obj-name>
 	prefix := uploadID + ".complete"
 	wfqn := fs.CSM.Gen(lom, fs.WorkfileType, prefix)
-	wfh, errC := lom.CreateFile(wfqn)
+	wfh, errC := lom.CreateWork(wfqn)
 	if errC != nil {
 		s3.WriteMptErr(w, r, errC, 0, lom, uploadID)
 		return
@@ -330,7 +312,7 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	concatMD5, written, errA := _appendMpt(nparts, buf, mw)
 	slab.Free(buf)
 
-	if cmn.Rom.Features().IsSet(feat.FsyncPUT) {
+	if lom.IsFeatureSet(feat.FsyncPUT) {
 		errS := wfh.Sync()
 		debug.AssertNoErr(errS)
 	}
@@ -374,7 +356,7 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 		poi.workFQN = wfqn
 		poi.owt = cmn.OwtNone
 	}
-	errCode, errF := poi.finalize()
+	ecode, errF := poi.finalize()
 	freePOI(poi)
 
 	// .6 cleanup parts - unconditionally
@@ -384,10 +366,10 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	if errF != nil {
 		// NOTE: not failing if remote op. succeeded
 		if !remote {
-			s3.WriteMptErr(w, r, errF, errCode, lom, uploadID)
+			s3.WriteMptErr(w, r, errF, ecode, lom, uploadID)
 			return
 		}
-		nlog.Errorf("upload %q: failed to complete %s locally: %v(%d)", uploadID, lom.Cname(), err, errCode)
+		nlog.Errorf("upload %q: failed to complete %s locally: %v(%d)", uploadID, lom.Cname(), err, ecode)
 	}
 
 	// .7 respond
@@ -396,8 +378,14 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	result.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
 	w.Header().Set(cos.S3CksumHeader, etag)
-	sgl.WriteTo(w)
+	sgl.WriteTo2(w)
 	sgl.Free()
+
+	// stats
+	t.statsT.Inc(stats.PutCount)
+	if remote {
+		t.statsT.Inc(t.Backend(bck).MetricName(stats.PutCount))
+	}
 }
 
 func _appendMpt(nparts []*s3.MptPart, buf []byte, mw io.Writer) (concatMD5 string, written int64, err error) {
@@ -427,9 +415,9 @@ func _appendMpt(nparts []*s3.MptPart, buf []byte, mw io.Writer) (concatMD5 strin
 // 3. Remove all info from in-memory structs
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html
 func (t *target) abortMpt(w http.ResponseWriter, r *http.Request, items []string, q url.Values) {
-	bck, err, errCode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	bck, err, ecode := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
-		s3.WriteErr(w, r, err, errCode)
+		s3.WriteErr(w, r, err, ecode)
 		return
 	}
 	objName := s3.ObjName(items)
@@ -442,18 +430,10 @@ func (t *target) abortMpt(w http.ResponseWriter, r *http.Request, items []string
 	uploadID := q.Get(s3.QparamMptUploadID)
 
 	if bck.IsRemoteS3() {
-		pts := s3.NewPassThroughSignedReq(g.client.control, r, lom, r.Body, q)
-		resp, err := pts.Do()
+		ecode, err := backend.AbortMpt(lom, r, q, uploadID)
 		if err != nil {
-			s3.WriteErr(w, r, err, resp.StatusCode)
+			s3.WriteErr(w, r, err, ecode)
 			return
-		}
-		if resp == nil {
-			errCode, err := backend.AbortMpt(lom, uploadID)
-			if err != nil {
-				s3.WriteErr(w, r, err, errCode)
-				return
-			}
 		}
 	}
 
@@ -482,16 +462,16 @@ func (t *target) listMptParts(w http.ResponseWriter, r *http.Request, bck *meta.
 		return
 	}
 
-	parts, errCode, err := s3.ListParts(uploadID, lom)
+	parts, ecode, err := s3.ListParts(uploadID, lom)
 	if err != nil {
-		s3.WriteErr(w, r, err, errCode)
+		s3.WriteErr(w, r, err, ecode)
 		return
 	}
 	result := &s3.ListPartsResult{Bucket: bck.Name, Key: objName, UploadID: uploadID, Parts: parts}
 	sgl := t.gmm.NewSGL(0)
 	result.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	sgl.WriteTo(w)
+	sgl.WriteTo2(w)
 	sgl.Free()
 }
 
@@ -514,7 +494,7 @@ func (t *target) listMptUploads(w http.ResponseWriter, bck *meta.Bck, q url.Valu
 	sgl := t.gmm.NewSGL(0)
 	result.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	sgl.WriteTo(w)
+	sgl.WriteTo2(w)
 	sgl.Free()
 }
 
@@ -523,9 +503,8 @@ func (t *target) listMptUploads(w http.ResponseWriter, bck *meta.Bck, q url.Valu
 // The object must have been multipart-uploaded beforehand.
 // See:
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
-func (t *target) getMptPart(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string, q url.Values) {
-	lom := core.AllocLOM(objName)
-	defer core.FreeLOM(lom)
+func (t *target) getMptPart(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lom *core.LOM, q url.Values) {
+	startTime := mono.NanoTime()
 	if err := lom.InitBck(bck.Bucket()); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
@@ -540,7 +519,7 @@ func (t *target) getMptPart(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	if err != nil {
 		s3.WriteErr(w, r, err, status)
 	}
-	fh, err := os.Open(lom.FQN)
+	fh, err := lom.Open()
 	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
@@ -552,4 +531,9 @@ func (t *target) getMptPart(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	}
 	cos.Close(fh)
 	slab.Free(buf)
+	t.statsT.AddMany(
+		cos.NamedVal64{Name: stats.GetCount, Value: 1},
+		cos.NamedVal64{Name: stats.GetSize, Value: size},
+		cos.NamedVal64{Name: stats.GetLatencyTotal, Value: mono.SinceNano(startTime)},
+	)
 }

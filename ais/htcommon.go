@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	rdebug "runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/3rdparty/golang/mux"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/certloader"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
@@ -50,6 +52,8 @@ const (
 	fmtUnknownQue       = "unexpected query [what=%s]"
 	fmtNested           = "%s: nested (%v): failed to %s %q: %v"
 	fmtOutside          = "%s is present (vs requested 'flt-outside'(%d))"
+	fmtFailedRejoin     = "%s failed to rejoin cluster: %v(%d)"
+	fmtSelfNotPresent   = "%s (self) not present in %s"
 )
 
 // intra-cluster control messages
@@ -57,48 +61,14 @@ type (
 	// cluster-wide control information - replicated, versioned, and synchronized
 	// usage: elect new primary, join cluster, ...
 	cluMeta struct {
-		Smap           *smapX        `json:"smap"`
-		BMD            *bucketMD     `json:"bmd"`
-		RMD            *rebMD        `json:"rmd"`
-		EtlMD          *etlMD        `json:"etlMD"`
-		Config         *globalConfig `json:"config"`
-		SI             *meta.Snode   `json:"si"`
-		PrimeTime      int64         `json:"prime_time"`
-		VoteInProgress bool          `json:"voting"`
-		// target only
-		RebInterrupted bool `json:"reb_interrupted"`
-		Restarted      bool `json:"restarted"`
-	}
-
-	// node <=> node cluster-info exchange
-	clusterInfo struct {
-		Smap struct {
-			Primary struct {
-				PubURL  string `json:"pub_url"`
-				CtrlURL string `json:"control_url"`
-				ID      string `json:"id"`
-			}
-			Version int64  `json:"version,string"`
-			UUID    string `json:"uuid"`
-		} `json:"smap"`
-		BMD struct {
-			UUID    string `json:"uuid"`
-			Version int64  `json:"version,string"`
-		} `json:"bmd"`
-		RMD struct {
-			Version int64 `json:"version,string"`
-		} `json:"rmd"`
-		Config struct {
-			Version int64 `json:"version,string"`
-		} `json:"config"`
-		EtlMD struct {
-			Version int64 `json:"version,string"`
-		} `json:"etlmd"`
-		Flags struct {
-			VoteInProgress bool `json:"vote_in_progress"`
-			ClusterStarted bool `json:"cluster_started"`
-			NodeStarted    bool `json:"node_started"`
-		} `json:"flags"`
+		Smap      *smapX             `json:"smap"`
+		BMD       *bucketMD          `json:"bmd"`
+		RMD       *rebMD             `json:"rmd"`
+		EtlMD     *etlMD             `json:"etlMD"`
+		Config    *globalConfig      `json:"config"`
+		SI        *meta.Snode        `json:"si"`
+		PrimeTime int64              `json:"prime_time"`
+		Flags     cos.NodeStateFlags `json:"flags"`
 	}
 
 	// extend control msg: ActionMsg with an extra information for node <=> node control plane communications
@@ -121,11 +91,6 @@ type (
 	byteRanges struct {
 		Range string // cos.HdrRange, see https://www.rfc-editor.org/rfc/rfc7233#section-2.1
 		Size  int64  // size, in bytes
-	}
-
-	archiveQuery struct {
-		filename string // pathname in archive
-		mime     string // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
 	}
 
 	// callResult contains HTTP response.
@@ -197,7 +162,7 @@ type (
 
 	getMaxCii struct {
 		h          *htrun
-		maxCii     *clusterInfo
+		maxNsti    *cos.NodeStateInfo
 		query      url.Values
 		maxConfVer int64
 		timeout    time.Duration
@@ -250,7 +215,7 @@ type (
 	}
 )
 
-var allHTTPverbs = []string{
+var htverbs = [...]string{
 	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
 	http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace,
 }
@@ -421,7 +386,7 @@ func freeBcastRes(results sliceResults) {
 //
 
 type (
-	cresCM struct{} // -> cluMeta
+	cresCM struct{} // -> cluMeta; selectively and alternatively, via `recvCluMetaBytes`
 	cresSM struct{} // -> smapX
 	cresND struct{} // -> meta.Snode
 	cresBA struct{} // -> cmn.BackendInfoAIS
@@ -431,7 +396,7 @@ type (
 	cresIC struct{} // -> icBundle
 	cresBM struct{} // -> bucketMD
 
-	cresLso   struct{} // -> cmn.LsoResult
+	cresLso   struct{} // -> cmn.LsoRes
 	cresBsumm struct{} // -> cmn.AllBsummResults
 )
 
@@ -449,8 +414,13 @@ var (
 	_ cresv = cresBsumm{}
 )
 
-func (res *callResult) read(body io.Reader)  { res.bytes, res.err = io.ReadAll(body) }
-func (res *callResult) jread(body io.Reader) { res.err = jsoniter.NewDecoder(body).Decode(res.v) }
+func (res *callResult) read(body io.Reader, size int64) {
+	res.bytes, res.err = cos.ReadAllN(body, size)
+}
+
+func (res *callResult) jread(body io.Reader) {
+	res.err = jsoniter.NewDecoder(body).Decode(res.v)
+}
 
 func (res *callResult) mread(body io.Reader) {
 	vv, ok := res.v.(msgp.Decodable)
@@ -463,7 +433,7 @@ func (res *callResult) mread(body io.Reader) {
 func (cresCM) newV() any                              { return &cluMeta{} }
 func (c cresCM) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
 
-func (cresLso) newV() any                              { return &cmn.LsoResult{} }
+func (cresLso) newV() any                              { return &cmn.LsoRes{} }
 func (c cresLso) read(res *callResult, body io.Reader) { res.v = c.newV(); res.mread(body) }
 
 func (cresSM) newV() any                              { return &smapX{} }
@@ -590,7 +560,8 @@ func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Co
 retry:
 	if config.Net.HTTP.UseHTTPS {
 		tag = "HTTPS"
-		err = server.s.ListenAndServeTLS(config.Net.HTTP.Certificate, config.Net.HTTP.CertKey)
+		// Listen and Serve TLS using certificates provided using the GetCertificate() instead of static files.
+		err = server.s.ListenAndServeTLS("", "")
 	} else {
 		err = server.s.ListenAndServe()
 	}
@@ -613,17 +584,23 @@ func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
 		caCert     []byte
 		clientAuth = tls.ClientAuthType(conf.ClientAuthTLS)
 	)
+	tlsConf = &tls.Config{
+		ClientAuth: clientAuth,
+	}
 	if clientAuth > tls.RequestClientCert {
 		if caCert, err = os.ReadFile(conf.ClientCA); err != nil {
-			return
+			return nil, fmt.Errorf("new-tls: failed to read PEM %q, err: %w", conf.ClientCA, err)
 		}
 		pool = x509.NewCertPool()
 		if ok := pool.AppendCertsFromPEM(caCert); !ok {
-			return nil, fmt.Errorf("tls: failed to append CA certs from PEM: %q", conf.ClientCA)
+			return nil, fmt.Errorf("new-tls: failed to append CA certs from PEM %q", conf.ClientCA)
 		}
+		tlsConf.ClientCAs = pool
 	}
-	tlsConf = &tls.Config{ClientAuth: clientAuth, ClientCAs: pool}
-	return
+	if conf.Certificate != "" && conf.CertKey != "" {
+		tlsConf.GetCertificate, err = certloader.GetCert()
+	}
+	return tlsConf, err
 }
 
 func (server *netServer) connStateListener(c net.Conn, cs http.ConnState) {
@@ -658,8 +635,8 @@ func (server *netServer) shutdown(config *cmn.Config) {
 var _ http.Handler = (*httpMuxers)(nil)
 
 func newMuxers() httpMuxers {
-	m := make(httpMuxers, len(allHTTPverbs))
-	for _, v := range allHTTPverbs {
+	m := make(httpMuxers, len(htverbs))
+	for _, v := range htverbs {
 		m[v] = mux.NewServeMux()
 	}
 	return m
@@ -679,41 +656,68 @@ func (m httpMuxers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // clusterInfo //
 /////////////////
 
-func (cii *clusterInfo) String() string { return fmt.Sprintf("%+v", *cii) }
+func (p *proxy) fillNsti(nsti *cos.NodeStateInfo) {
+	p.htrun.fill(nsti)
+	onl := true
+	flt := nlFilter{Kind: apc.ActRebalance, OnlyRunning: &onl}
+	if nl := p.notifs.find(flt); nl != nil {
+		nsti.Flags = nsti.Flags.Set(cos.Rebalancing)
+	}
+}
 
-func (cii *clusterInfo) fill(h *htrun) {
+func (t *target) fillNsti(nsti *cos.NodeStateInfo) {
+	t.htrun.fill(nsti)
+	marked := xreg.GetRebMarked()
+	if marked.Xact != nil {
+		nsti.Flags = nsti.Flags.Set(cos.Rebalancing)
+	}
+	if marked.Interrupted {
+		nsti.Flags = nsti.Flags.Set(cos.RebalanceInterrupted)
+	}
+	if marked.Restarted {
+		nsti.Flags = nsti.Flags.Set(cos.Restarted)
+	}
+	marked = xreg.GetResilverMarked()
+	if marked.Xact != nil {
+		nsti.Flags = nsti.Flags.Set(cos.Resilvering)
+	}
+	if marked.Interrupted {
+		nsti.Flags = nsti.Flags.Set(cos.ResilverInterrupted)
+	}
+}
+
+func (h *htrun) fill(nsti *cos.NodeStateInfo) {
 	var (
 		smap = h.owner.smap.get()
 		bmd  = h.owner.bmd.get()
 		rmd  = h.owner.rmd.get()
 		etl  = h.owner.etl.get()
 	)
-	cii.fillSmap(smap)
-	cii.BMD.Version = bmd.version()
-	cii.BMD.UUID = bmd.UUID
-	cii.RMD.Version = rmd.Version
-	cii.Config.Version = h.owner.config.version()
-	cii.EtlMD.Version = etl.version()
-	cii.Flags.ClusterStarted = h.ClusterStarted()
-	cii.Flags.NodeStarted = h.NodeStarted()
+	smap.fill(nsti)
+	nsti.BMD.Version = bmd.version()
+	nsti.BMD.UUID = bmd.UUID
+	nsti.RMD.Version = rmd.Version
+	nsti.Config.Version = h.owner.config.version()
+	nsti.EtlMD.Version = etl.version()
+	if h.ClusterStarted() {
+		nsti.Flags = nsti.Flags.Set(cos.ClusterStarted)
+	}
+	if h.NodeStarted() {
+		nsti.Flags = nsti.Flags.Set(cos.NodeStarted)
+	}
 }
 
-func (cii *clusterInfo) fillSmap(smap *smapX) {
-	cii.Smap.Version = smap.version()
-	cii.Smap.UUID = smap.UUID
+func (smap *smapX) fill(nsti *cos.NodeStateInfo) {
+	nsti.Smap.Version = smap.version()
+	nsti.Smap.UUID = smap.UUID
 	if smap.Primary != nil {
-		cii.Smap.Primary.CtrlURL = smap.Primary.URL(cmn.NetIntraControl)
-		cii.Smap.Primary.PubURL = smap.Primary.URL(cmn.NetPublic)
-		cii.Smap.Primary.ID = smap.Primary.ID()
-		cii.Flags.VoteInProgress = voteInProgress() != nil
+		nsti.Smap.Primary.CtrlURL = smap.Primary.URL(cmn.NetIntraControl)
+		nsti.Smap.Primary.PubURL = smap.Primary.URL(cmn.NetPublic)
+		nsti.Smap.Primary.ID = smap.Primary.ID()
+		if voteInProgress() != nil {
+			nsti.Flags = nsti.Flags.Set(cos.VoteInProgress)
+		}
 	}
-}
-
-func (cii *clusterInfo) smapEqual(other *clusterInfo) (ok bool) {
-	if cii == nil || other == nil {
-		return false
-	}
-	return cii.Smap.Version == other.Smap.Version && cii.Smap.Primary.ID == other.Smap.Primary.ID
 }
 
 ///////////////
@@ -721,28 +725,37 @@ func (cii *clusterInfo) smapEqual(other *clusterInfo) (ok bool) {
 ///////////////
 
 func (c *getMaxCii) do(si *meta.Snode, wg cos.WG, smap *smapX) {
-	var cii *clusterInfo
-	body, _, err := c.h.reqHealth(si, c.timeout, c.query, smap)
+	var nsti *cos.NodeStateInfo
+	body, _, err := c.h.reqHealth(si, c.timeout, c.query, smap, false /*retry pub-addr*/)
 	if err != nil {
 		goto ret
 	}
-	if cii = extractCii(body, smap, c.h.si, si); cii == nil {
+	if nsti = extractCii(body, smap, c.h.si, si); nsti == nil {
 		goto ret
 	}
+	if nsti.Smap.UUID != smap.UUID {
+		if nsti.Smap.UUID == "" {
+			goto ret
+		}
+		if smap.UUID != "" {
+			// FATAL: cluster integrity error (cie)
+			cos.ExitLogf("%s: split-brain uuid [%s %s] vs %+v", ciError(10), c.h, smap.StringEx(), nsti.Smap)
+		}
+	}
 	c.mu.Lock()
-	if c.maxCii.Smap.Version < cii.Smap.Version {
+	if c.maxNsti.Smap.Version < nsti.Smap.Version {
 		// reset confirmation count if there's any sign of disagreement
-		if c.maxCii.Smap.Primary.ID != cii.Smap.Primary.ID || cii.Flags.VoteInProgress {
+		if c.maxNsti.Smap.Primary.ID != nsti.Smap.Primary.ID || nsti.Flags.IsSet(cos.VoteInProgress) {
 			c.cnt = 1
 		} else {
 			c.cnt++
 		}
-		c.maxCii = cii
-	} else if c.maxCii.smapEqual(cii) {
+		c.maxNsti = nsti
+	} else if c.maxNsti.SmapEqual(nsti) {
 		c.cnt++
 	}
-	if c.maxConfVer < cii.Config.Version {
-		c.maxConfVer = cii.Config.Version
+	if c.maxConfVer < nsti.Config.Version {
+		c.maxConfVer = nsti.Config.Version
 	}
 	c.mu.Unlock()
 ret:
@@ -757,17 +770,17 @@ func (c *getMaxCii) haveEnough() (yes bool) {
 	return
 }
 
-func extractCii(body []byte, smap *smapX, self, si *meta.Snode) *clusterInfo {
-	var cii clusterInfo
-	if err := jsoniter.Unmarshal(body, &cii); err != nil {
+func extractCii(body []byte, smap *smapX, self, si *meta.Snode) *cos.NodeStateInfo {
+	var nsti cos.NodeStateInfo
+	if err := jsoniter.Unmarshal(body, &nsti); err != nil {
 		nlog.Errorf("%s: failed to unmarshal clusterInfo, err: %v", self, err)
 		return nil
 	}
-	if smap.UUID != cii.Smap.UUID {
-		nlog.Errorf("%s: Smap have different UUIDs: %s and %s from %s", self, smap.UUID, cii.Smap.UUID, si)
+	if smap.UUID != nsti.Smap.UUID {
+		nlog.Errorf("%s: Smap have different UUIDs: %s and %s from %s", self, smap.UUID, nsti.Smap.UUID, si)
 		return nil
 	}
-	return &cii
+	return &nsti
 }
 
 ////////////////
@@ -819,6 +832,13 @@ func apiReqFree(a *apiRequest) {
 // misc helpers
 //
 
+// http response: xaction ID most of the time but may be any string
+func writeXid(w http.ResponseWriter, xid string) {
+	debug.Assert(xid != "")
+	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(xid)))
+	w.Write(cos.UnsafeB(xid))
+}
+
 func newBckFromQ(bckName string, query url.Values, dpq *dpq) (*meta.Bck, error) {
 	bck := _bckFromQ(bckName, query, dpq)
 	normp, err := cmn.NormalizeProvider(bck.Provider)
@@ -844,8 +864,8 @@ func _bckFromQ(bckName string, query url.Values, dpq *dpq) *meta.Bck {
 		provider = query.Get(apc.QparamProvider)
 		namespace = cmn.ParseNsUname(query.Get(apc.QparamNamespace))
 	} else {
-		provider = dpq.provider
-		namespace = cmn.ParseNsUname(dpq.namespace)
+		provider = dpq.bck.provider
+		namespace = cmn.ParseNsUname(dpq.bck.namespace)
 	}
 	return &meta.Bck{Name: bckName, Provider: provider, Ns: namespace}
 }

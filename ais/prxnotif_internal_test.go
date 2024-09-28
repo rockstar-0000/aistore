@@ -6,7 +6,6 @@ package ais
 
 import (
 	"bytes"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"time"
@@ -20,16 +19,16 @@ import (
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 type nopHB struct{}
 
-func (*nopHB) HeardFrom(string, int64) {}
-func (*nopHB) TimedOut(string) bool    { return false }
-func (*nopHB) reg(string)              {}
-func (*nopHB) set(time.Duration) bool  { return false }
+func (*nopHB) HeardFrom(string, int64) int64 { return 0 }
+func (*nopHB) TimedOut(string) bool          { return false }
+func (*nopHB) reg(string)                    {}
+func (*nopHB) set(time.Duration) bool        { return false }
 
 var _ hbTracker = (*nopHB)(nil)
 
@@ -138,7 +137,7 @@ var _ = Describe("Notifications xaction test", func() {
 			writer := httptest.NewRecorder()
 			n.handler(writer, req)
 			resp := writer.Result()
-			respBody, _ := io.ReadAll(resp.Body)
+			respBody, _ := cos.ReadAllN(resp.Body, resp.ContentLength)
 			resp.Body.Close()
 			Expect(resp.StatusCode).To(BeEquivalentTo(expectedStatus))
 			return respBody

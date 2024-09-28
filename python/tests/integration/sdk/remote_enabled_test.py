@@ -2,22 +2,26 @@
 # Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
 #
 
+from typing import List
 import unittest
 import boto3
 
 from aistore.sdk.const import PROVIDER_AIS
-
 from aistore import Client
 from tests.integration import (
     REMOTE_SET,
     REMOTE_BUCKET,
     CLUSTER_ENDPOINT,
-    OBJECT_COUNT,
-    TEST_TIMEOUT_LONG,
 )
-from tests.utils import random_string, destroy_bucket, create_and_put_objects
+from tests.utils import (
+    random_string,
+    destroy_bucket,
+    create_and_put_objects,
+    create_and_put_object,
+)
 from tests import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 from tests.integration.boto3 import AWS_REGION
+from tests.const import TEST_TIMEOUT_LONG, OBJECT_COUNT, SUFFIX_NAME
 
 
 class RemoteEnabledTest(unittest.TestCase):
@@ -35,13 +39,14 @@ class RemoteEnabledTest(unittest.TestCase):
         self.bck_name = random_string()
         self.client = Client(CLUSTER_ENDPOINT)
         self.buckets = []
-        self.obj_prefix = f"{self._testMethodName}-{random_string(6)}-"
+        self.obj_prefix = f"{self._testMethodName}-{random_string(6)}"
 
         if REMOTE_SET:
             self.cloud_objects = []
             provider, bck_name = REMOTE_BUCKET.split("://")
             self.bucket = self.client.bucket(bck_name, provider=provider)
             self.provider = provider
+            self.bck_name = bck_name
         else:
             self.provider = PROVIDER_AIS
             self.bucket = self._create_bucket(self.bck_name)
@@ -68,11 +73,59 @@ class RemoteEnabledTest(unittest.TestCase):
             provider: Provider for new bucket
         """
         bck = self.client.bucket(bck_name, provider=provider)
-        self.buckets.append(bck_name)
         bck.create()
+        self._register_for_post_test_cleanup(names=[bck_name], is_bucket=True)
         return bck
 
-    def _create_objects(self, num_obj=OBJECT_COUNT, suffix=""):
+    def _register_for_post_test_cleanup(self, names: List[str], is_bucket: bool):
+        """
+        Register objects or buckets for post-test cleanup
+
+        Args:
+            names (List[str]): Names of buckets or objects
+            is_bucket (bool): True if we are storing a bucket; False for an object
+        """
+        if is_bucket:
+            self.buckets.extend(names)
+        elif REMOTE_SET:
+            self.cloud_objects.extend(names)
+
+    def _create_object(self):
+        """
+        Create an object and track it for later cleanup
+
+        Returns:
+            The object created
+        """
+        obj_name = f"{self.obj_prefix}-{random_string(6)}"
+        obj = self.bucket.object(obj_name=obj_name)
+        self._register_for_post_test_cleanup(names=[obj_name], is_bucket=False)
+        return obj
+
+    def _create_object_with_content(self, obj_size=None):
+        """
+        Create an object with the given content and track for later cleanup
+
+        Args:
+            obj_size: Size of the content in the created object
+
+        Returns:
+            Tuple of the object name and the content of the object created
+        """
+        obj_name = f"{self.obj_prefix}-{random_string(6)}"
+        content = create_and_put_object(
+            client=self.client,
+            bck_name=self.bck_name,
+            obj_name=obj_name,
+            provider=self.provider,
+            obj_size=obj_size,
+        )
+        self._register_for_post_test_cleanup(names=[obj_name], is_bucket=False)
+        return obj_name, content
+
+    def _create_objects(
+        self, num_obj=OBJECT_COUNT, suffix="", obj_names=None, obj_size=None
+    ):
         """
         Create a list of objects using a unique test prefix and track them for later cleanup
         Args:
@@ -85,9 +138,10 @@ class RemoteEnabledTest(unittest.TestCase):
             self.obj_prefix,
             suffix,
             num_obj,
+            obj_names,
+            obj_size,
         )
-        if REMOTE_SET:
-            self.cloud_objects.extend(obj_names)
+        self._register_for_post_test_cleanup(names=obj_names, is_bucket=False)
         return obj_names
 
     def _check_all_objects_cached(self, num_obj, expected_cached):
@@ -110,6 +164,7 @@ class RemoteEnabledTest(unittest.TestCase):
             objects: List of objects to check
             expected_cached: Whether we expect them to be cached
         """
+        self.assertTrue(len(objects) > 0)
         for obj in objects:
             self.assertTrue(obj.is_ok())
             if expected_cached:
@@ -130,7 +185,7 @@ class RemoteEnabledTest(unittest.TestCase):
             props="name,cached", prefix=self.obj_prefix
         ).entries
         self.assertEqual(expected_object_count, len(objects))
-        cached_names = {self.obj_prefix + str(x) + "-suffix" for x in cached_range}
+        cached_names = {self.obj_prefix + str(x) + SUFFIX_NAME for x in cached_range}
         cached_objs = []
         evicted_objs = []
         for obj in objects:
@@ -138,8 +193,10 @@ class RemoteEnabledTest(unittest.TestCase):
                 cached_objs.append(obj)
             else:
                 evicted_objs.append(obj)
-        self._validate_objects_cached(cached_objs, True)
-        self._validate_objects_cached(evicted_objs, False)
+        if len(cached_objs) > 0:
+            self._validate_objects_cached(cached_objs, True)
+        if len(evicted_objs) > 0:
+            self._validate_objects_cached(evicted_objs, False)
 
     def _get_boto3_client(self):
         return boto3.client(

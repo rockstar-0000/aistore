@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -103,8 +103,8 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 		//  at the lowest level (and with no handler and its rxObj cb).
 		//
 		if _, ok := err.(*errAlreadyClosedTrname); ok {
-			if verbose {
-				nlog.Errorln(err)
+			if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+				nlog.Errorln(trname, "err:", err)
 			}
 		} else {
 			cmn.WriteErr(w, r, err, 0)
@@ -118,9 +118,13 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 		reader = lz4Reader
 	}
 
-	stats, uid, loghdr := h.stats(r, trname)
-	it := &iterator{handler: h, body: reader, stats: stats}
-	it.hbuf, _ = mm.AllocSize(dfltMaxHdr)
+	var (
+		config             = cmn.GCO.Get()
+		stats, uid, loghdr = h.stats(r, trname)
+		it                 = &iterator{handler: h, body: reader, stats: stats}
+	)
+	debug.Assert(config.Transport.IdleTeardown > 0, "invalid config ", config.Transport)
+	it.hbuf, _ = mm.AllocSize(_sizeHdr(config, 0))
 
 	// receive loop
 	err = it.rxloop(uid, loghdr, mm)
@@ -169,8 +173,8 @@ func (h *hdlExtra) stats(r *http.Request, trname string) (rxStats, uint64, strin
 
 	xxh, _ := UID2SessID(uid)
 	loghdr := fmt.Sprintf("%s[%d:%d]", h.trname, xxh, sessID)
-	if verbose {
-		nlog.Infof("%s: start-of-stream from %s", loghdr, r.RemoteAddr)
+	if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+		nlog.Infoln(loghdr, "start-of-stream from", r.RemoteAddr)
 	}
 	return statsif.(rxStats), uid, loghdr
 }
@@ -181,8 +185,8 @@ func (h *hdlExtra) unreg() { hk.Unreg(h.hkName + hk.NameSuffix) }
 func (*hdl) addOld(uint64)            {}
 func (h *hdlExtra) addOld(uid uint64) { h.oldSessions.Store(uid, mono.NanoTime()) }
 
-func (h *hdlExtra) cleanup() time.Duration {
-	h.now = mono.NanoTime()
+func (h *hdlExtra) cleanup(now int64) time.Duration {
+	h.now = now
 	h.oldSessions.Range(h.cl)
 	return sessionIsOld
 }
@@ -236,14 +240,14 @@ func (it *iterator) rxloop(uid uint64, loghdr string, mm *memsys.MMSA) (err erro
 			break
 		}
 		if hlen > cap(it.hbuf) {
-			if hlen > maxSizeHeader {
-				err = fmt.Errorf("sbr1 %s: hlen %d exceeds maximum %d", loghdr, hlen, maxSizeHeader)
+			if hlen > cmn.MaxTransportHeader {
+				err = fmt.Errorf("sbr1 %s: transport header %d exceeds maximum %d", loghdr, hlen, cmn.MaxTransportHeader)
 				break
 			}
 			// grow
 			nlog.Warningf("%s: header length %d exceeds the current buffer %d", loghdr, hlen, cap(it.hbuf))
 			mm.Free(it.hbuf)
-			it.hbuf, _ = mm.AllocSize(min(int64(hlen)<<1, maxSizeHeader))
+			it.hbuf, _ = mm.AllocSize(min(int64(hlen)<<1, cmn.MaxTransportHeader))
 		}
 
 		it.stats.addOff(int64(hlen + sizeProtoHdr))
@@ -280,14 +284,14 @@ func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
 		}
 		// stats
 		if err == nil {
-			it.stats.incNum()        // 1. this stream stats
-			g.tstats.Inc(InObjCount) // 2. stats/target_stats.go
+			it.stats.incNum()                   // 1. this stream stats
+			g.tstats.Inc(cos.StreamsInObjCount) // 2. stats/target_stats.go
 
 			if size >= 0 {
-				g.tstats.Add(InObjSize, size)
+				g.tstats.Add(cos.StreamsInObjSize, size)
 			} else {
 				debug.Assert(size == SizeUnknown)
-				g.tstats.Add(InObjSize, obj.off-off)
+				g.tstats.Add(cos.StreamsInObjSize, obj.off-off)
 			}
 		}
 	} else if err != nil && err != io.EOF {
@@ -328,14 +332,17 @@ func (it *iterator) nextObj(loghdr string, hlen int) (obj *objReader, err error)
 		if err == nil {
 			// [retry] insist on receiving the full length
 			var m int
-			for i := 0; i < maxInReadRetries; i++ {
+			for range maxInReadRetries {
 				runtime.Gosched()
 				m, err = it.Read(it.hbuf[n:hlen])
 				if err != nil {
 					break
 				}
+				// Check for potential overflow before adding
+				debug.Assert(n <= math.MaxInt-m)
 				n += m
-				if n == hlen {
+				if n >= hlen {
+					debug.Assert(n == hlen)
 					break
 				}
 			}

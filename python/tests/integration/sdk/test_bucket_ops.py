@@ -9,21 +9,23 @@ import boto3
 import requests
 
 from aistore.sdk import ListObjectFlag
-from aistore.sdk.const import PROVIDER_AIS, UTF_ENCODING, LOREM, DUIS
+from aistore.sdk.const import UTF_ENCODING, LOREM, DUIS
+from aistore.sdk.dataset.dataset_config import DatasetConfig
+from aistore.sdk.dataset.data_attribute import DataAttribute
+from aistore.sdk.dataset.label_attribute import LabelAttribute
 from aistore.sdk.errors import InvalidBckProvider, AISError, ErrBckNotFound
+from aistore.sdk.enums import FLTPresence
 
 from tests.integration.sdk.remote_enabled_test import RemoteEnabledTest
-from tests.unit.sdk.test_utils import test_cases
 from tests import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 from tests.integration.boto3 import AWS_REGION
 
-from tests.utils import random_string, cleanup_local
-from tests.integration import REMOTE_BUCKET, OBJECT_COUNT
-
-# If remote bucket is not set, skip all cloud-related tests
-REMOTE_SET = REMOTE_BUCKET != "" and not REMOTE_BUCKET.startswith(PROVIDER_AIS + ":")
+from tests.utils import random_string, cleanup_local, test_cases
+from tests.const import OBJECT_COUNT, OBJ_CONTENT, PREFIX_NAME
+from tests.integration import REMOTE_SET
 
 INNER_DIR = "directory"
+DATASET_DIR = "dataset"
 TOP_LEVEL_FILES = {
     "top_level_file.txt": b"test data to verify",
     "other_top_level_file.txt": b"other file test data to verify",
@@ -64,6 +66,13 @@ class TestBucketOps(RemoteEnabledTest):
         bucket_names = {bck.name for bck in res}
         self.assertIn(new_bck_name, bucket_names)
 
+    @test_cases(
+        "*", ".", "", " ", "bucket/name", "bucket and name", "#name", "$name", "~name"
+    )
+    def test_create_bucket_invalid_name(self, testcase):
+        with self.assertRaises(AISError):
+            self._create_bucket(testcase)
+
     def test_bucket_invalid_name(self):
         with self.assertRaises(ErrBckNotFound):
             self.client.bucket("INVALID_BCK_NAME").list_objects()
@@ -101,13 +110,14 @@ class TestBucketOps(RemoteEnabledTest):
             from_bck.head()
         except requests.exceptions.HTTPError as err:
             self.assertEqual(err.response.status_code, 404)
+        self._register_for_post_test_cleanup(names=[to_bck_name], is_bucket=True)
 
     def test_copy(self):
         from_bck_name = self.bck_name + "from"
         to_bck_name = self.bck_name + "to"
         from_bck = self._create_bucket(from_bck_name)
         to_bck = self._create_bucket(to_bck_name)
-        prefix = "prefix-"
+        prefix = PREFIX_NAME
         new_prefix = "new-"
         content = b"test"
         expected_name = prefix + "-obj"
@@ -128,7 +138,7 @@ class TestBucketOps(RemoteEnabledTest):
     )
     def test_get_latest_flag(self):
         obj_name = random_string()
-        self.cloud_objects.append(obj_name)
+        self._register_for_post_test_cleanup(names=[obj_name], is_bucket=False)
 
         s3_client = boto3.client(
             "s3",
@@ -165,7 +175,7 @@ class TestBucketOps(RemoteEnabledTest):
 
         # cold GET must result in Error
         with self.assertRaises(AISError):
-            self.bucket.object(obj_name).get(latest=True)
+            self.bucket.object(obj_name).get(latest=True).read_all()
 
     @unittest.skipIf(
         not REMOTE_SET,
@@ -176,7 +186,7 @@ class TestBucketOps(RemoteEnabledTest):
         objects = self.bucket.list_objects(
             props="name,cached", prefix=self.obj_prefix
         ).entries
-        self._verify_objects_cache_status(objects, True)
+        self._validate_objects_cached(objects, True)
 
         self.bucket.evict(keep_md=True)
 
@@ -184,7 +194,7 @@ class TestBucketOps(RemoteEnabledTest):
             props="name,cached", prefix=self.obj_prefix
         ).entries
         self.assertEqual(OBJECT_COUNT, len(objects))
-        self._verify_objects_cache_status(objects, False)
+        self._validate_objects_cached(objects, False)
 
     def test_evict_local(self):
         # If the bucket is local, eviction should fail
@@ -196,12 +206,6 @@ class TestBucketOps(RemoteEnabledTest):
         local_bucket = self._create_bucket(self.bck_name + "-local")
         with self.assertRaises(InvalidBckProvider):
             local_bucket.evict()
-
-    def _verify_objects_cache_status(self, objects, expected_status):
-        self.assertTrue(len(objects) > 0)
-        for obj in objects:
-            self.assertTrue(obj.is_ok())
-            self.assertEqual(expected_status, obj.is_cached())
 
     def test_put_files_invalid(self):
         with self.assertRaises(ValueError):
@@ -217,7 +221,7 @@ class TestBucketOps(RemoteEnabledTest):
         if expect_err:
             for obj_name in expected_res_dict:
                 with self.assertRaises(AISError):
-                    self.bucket.object(self.obj_prefix + obj_name).get()
+                    self.bucket.object(self.obj_prefix + obj_name).get().read_all()
         else:
             for obj_name, expected_data in expected_res_dict.items():
                 res = self.bucket.object(self.obj_prefix + obj_name).get()
@@ -270,14 +274,14 @@ class TestBucketOps(RemoteEnabledTest):
         self.bucket.put_files(
             self.local_test_files,
             prepend=self.obj_prefix,
-            prefix_filter="prefix-",
+            prefix_filter=PREFIX_NAME,
             pattern="*.txt",
         )
         self.bucket.object(self.obj_prefix + included_filename).get()
         with self.assertRaises(AISError):
-            self.bucket.object(excluded_by_pattern).get()
+            self.bucket.object(excluded_by_pattern).get().read_all()
         with self.assertRaises(AISError):
-            self.bucket.object(excluded_by_prefix).get()
+            self.bucket.object(excluded_by_prefix).get().read_all()
 
     def test_put_files_dry_run(self):
         self._create_put_files_structure(TOP_LEVEL_FILES, LOWER_LEVEL_FILES)
@@ -350,13 +354,31 @@ class TestBucketOps(RemoteEnabledTest):
         self.assertEqual(bucket_summary["TotalSize"]["size_all_remote_objs"], "0")
         self.assertEqual(bucket_summary["used_pct"], 0)
 
-        summ_test_bck.object("test-object").put_content("test-content")
+        # Upload objects to the bucket with different prefixes
+        obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
+        for obj_name in obj_names:
+            summ_test_bck.object(obj_name).put_content(OBJ_CONTENT)
 
-        bucket_summary = summ_test_bck.summary()
+        # Verify the info with no prefix (should include all objects)
+        bck_summ = summ_test_bck.summary()
+        self.assertEqual(bck_summ["ObjCount"]["obj_count_present"], "4")
+        self.assertNotEqual(bck_summ["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_summ["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_summ["used_pct"], 0)
 
-        # Now, the bucket should have 1 object
-        self.assertEqual(bucket_summary["ObjCount"]["obj_count_present"], "1")
-        self.assertNotEqual(bucket_summary["TotalSize"]["size_all_present_objs"], "0")
+        # Verify the info with prefix1
+        bck_summ = summ_test_bck.summary(prefix="prefix1")
+        self.assertEqual(bck_summ["ObjCount"]["obj_count_present"], "2")
+        self.assertNotEqual(bck_summ["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_summ["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_summ["used_pct"], 0)
+
+        # Verify the info with prefix2
+        bck_summ = summ_test_bck.summary(prefix="prefix2")
+        self.assertEqual(bck_summ["ObjCount"]["obj_count_present"], "2")
+        self.assertNotEqual(bck_summ["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_summ["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_summ["used_pct"], 0)
 
         summ_test_bck.delete()
 
@@ -368,26 +390,43 @@ class TestBucketOps(RemoteEnabledTest):
         info_test_bck = self._create_bucket("info-test")
 
         # Initially, the bucket should be empty
-        _, bck_summ = info_test_bck.info(flt_presence=0)
+        _, bck_info = info_test_bck.info(flt_presence=FLTPresence.FLT_EXISTS)
 
         # For an empty bucket, the object count and total size should be zero
-        self.assertEqual(bck_summ["ObjCount"]["obj_count_present"], "0")
-        self.assertEqual(bck_summ["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_summ["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_summ["provider"], "ais")
-        self.assertEqual(bck_summ["name"], "info-test")
+        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "0")
+        self.assertEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_info["provider"], "ais")
+        self.assertEqual(bck_info["name"], "info-test")
 
-        # Upload an object to the bucket
-        info_test_bck.object("test-object").put_content("test-content")
+        # Upload objects to the bucket with different prefixes
+        obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
+        for obj_name in obj_names:
+            info_test_bck.object(obj_name).put_content(OBJ_CONTENT)
 
-        _, bck_summ = info_test_bck.info()
+        # Verify the info with no prefix (should include all objects)
+        _, bck_info = info_test_bck.info()
+        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "4")
+        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_info["provider"], "ais")
+        self.assertEqual(bck_info["name"], "info-test")
 
-        # Now the bucket should have one object and non-zero size
-        self.assertEqual(bck_summ["ObjCount"]["obj_count_present"], "1")
-        self.assertNotEqual(bck_summ["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_summ["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_summ["provider"], "ais")
-        self.assertEqual(bck_summ["name"], "info-test")
+        # Verify the info with prefix1
+        _, bck_info = info_test_bck.info(prefix="prefix1")
+        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "2")
+        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_info["provider"], "ais")
+        self.assertEqual(bck_info["name"], "info-test")
+
+        # Verify the info with prefix2
+        _, bck_info = info_test_bck.info(prefix="prefix2")
+        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "2")
+        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
+        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_info["provider"], "ais")
+        self.assertEqual(bck_info["name"], "info-test")
 
         info_test_bck.delete()
 
@@ -395,6 +434,59 @@ class TestBucketOps(RemoteEnabledTest):
         with self.assertRaises(ErrBckNotFound):
             info_test_bck.summary()
 
+    def test_write_dataset(self):
+        self.local_test_files.mkdir(exist_ok=True)
+        dataset_directory = self.local_test_files.joinpath(DATASET_DIR)
+        dataset_directory.mkdir(exist_ok=True)
+        img_files = {
+            "file1.jpg": b"file1",
+            "file2.jpg": b"file2",
+            "file3.jpg": b"file3",
+        }
+        _create_files(dataset_directory, img_files)
 
-if __name__ == "__main__":
-    unittest.main()
+        dataset_config = DatasetConfig(
+            primary_attribute=DataAttribute(
+                path=dataset_directory, name="image", file_type="jpg"
+            ),
+            secondary_attributes=[
+                LabelAttribute(
+                    name="label", label_identifier=lambda filename: f"{filename}_label"
+                )
+            ],
+        )
+        shards = []
+
+        def post_process(shard_path):
+            self._register_for_post_test_cleanup(names=[shard_path], is_bucket=False)
+            shards.append(shard_path)
+
+        self.bucket.write_dataset(
+            dataset_config, pattern="dataset", maxcount=10, post=post_process
+        )
+        self.assertEqual(len(shards), 1)
+        for shard in shards:
+            self.assertIsNotNone(self.bucket.object(shard).head())
+
+    def test_write_dataset_missing_attributes(self):
+        self.local_test_files.mkdir(exist_ok=True)
+        dataset_directory = self.local_test_files.joinpath(DATASET_DIR)
+        dataset_directory.mkdir(exist_ok=True)
+        img_files = {
+            "file1.jpg": b"file1",
+            "file2.jpg": b"file2",
+            "file3.jpg": b"file3",
+        }
+        _create_files(dataset_directory, img_files)
+
+        dataset_config = DatasetConfig(
+            primary_attribute=DataAttribute(
+                path=dataset_directory, name="image", file_type="jpg"
+            ),
+            secondary_attributes=[
+                LabelAttribute(name="cls", label_identifier=lambda filename: None)
+            ],
+        )
+        self.bucket.write_dataset(
+            dataset_config, skip_missing=False, pattern="dataset", maxcount=10
+        )

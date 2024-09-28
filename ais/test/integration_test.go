@@ -6,7 +6,7 @@ package integration_test
 
 import (
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +26,30 @@ import (
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/xact"
 )
+
+func TestDisableEnableBackend(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{Bck: cliBck, CloudBck: true})
+
+	_backend(t, "disable")
+	time.Sleep(time.Second >> 1)
+
+	_backend(t, "enable")
+	time.Sleep(time.Second >> 1)
+}
+
+func _backend(t *testing.T, action string) {
+	var (
+		err        error
+		baseParams = tools.BaseAPIParams()
+	)
+	tlog.Logf("%s %s\n", action, cliBck.Provider)
+	if action == "disable" {
+		err = api.DisableBackend(baseParams, cliBck.Provider)
+	} else {
+		err = api.EnableBackend(baseParams, cliBck.Provider)
+	}
+	tassert.CheckFatal(t, err)
+}
 
 // Intended for a deployment with multiple targets
 // 1. Create ais bucket
@@ -132,7 +156,7 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-m.controlCh // <-- half GETs
-		primarySetToOriginal(t)
+		primarySetToRand(t)
 	}()
 	wg.Wait()
 
@@ -356,7 +380,7 @@ func testStressRebalance(t *testing.T, bck cmn.Bck) {
 	m.initAndSaveState(true /*cleanup*/)
 
 	tgts := m.smap.Tmap.ActiveNodes()
-	i1 := rand.Intn(len(tgts))
+	i1 := rand.IntN(len(tgts))
 	i2 := (i1 + 1) % len(tgts)
 	target1, target2 := tgts[i1], tgts[i2]
 
@@ -385,7 +409,7 @@ func testStressRebalance(t *testing.T, bck cmn.Bck) {
 	tassert.CheckFatal(t, err)
 
 	// random sleep between the first and the second join
-	time.Sleep(time.Duration(rand.Intn(3)+1) * time.Second)
+	time.Sleep(time.Duration(rand.IntN(3)+1) * time.Second)
 
 	err = tools.RestoreNode(cmd2, false, "the 2nd target")
 	tassert.CheckFatal(t, err)
@@ -463,7 +487,7 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 	wg.Wait()
 
 	// Register target 1 to bring cluster to original state
-	sleep := time.Duration(rand.Intn(5))*time.Second + time.Millisecond
+	sleep := time.Duration(rand.IntN(5))*time.Second + time.Millisecond
 	time.Sleep(sleep)
 	tlog.Logf("Join %s back\n", target1.StringEx())
 	rebID, err := tools.JoinCluster(m.proxyURL, target1)
@@ -749,7 +773,7 @@ func TestRegisterTargetsAndCreateBucketsInParallel(t *testing.T) {
 	baseParams := tools.BaseAPIParams(m.proxyURL)
 
 	// Decommission targets
-	for i := 0; i < unregisterTargetCount; i++ {
+	for i := range unregisterTargetCount {
 		args := &apc.ActValRmNode{DaemonID: targets[i].ID(), SkipRebalance: true}
 		_, err := api.StartMaintenance(baseParams, args)
 		tassert.CheckError(t, err)
@@ -764,7 +788,7 @@ func TestRegisterTargetsAndCreateBucketsInParallel(t *testing.T) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(unregisterTargetCount)
-	for i := 0; i < unregisterTargetCount; i++ {
+	for i := range unregisterTargetCount {
 		go func(number int) {
 			defer wg.Done()
 			args := &apc.ActValRmNode{DaemonID: targets[number].ID()}
@@ -774,7 +798,7 @@ func TestRegisterTargetsAndCreateBucketsInParallel(t *testing.T) {
 	}
 
 	wg.Add(newBucketCount)
-	for i := 0; i < newBucketCount; i++ {
+	for i := range newBucketCount {
 		bck := m.bck
 		bck.Name += strconv.Itoa(i)
 
@@ -836,7 +860,7 @@ func TestMountpathDetachAll(t *testing.T) {
 
 	// Add target mountpath again
 	for _, mpath := range origMountpaths.Available {
-		err = api.AttachMountpath(baseParams, target, mpath, false /*force*/)
+		err = api.AttachMountpath(baseParams, target, mpath)
 		tassert.CheckFatal(t, err)
 	}
 
@@ -893,7 +917,7 @@ func TestResilverAfterAddingMountpath(t *testing.T) {
 
 	// Add new mountpath to target
 	tlog.Logf("attach new %q at target %s\n", testMpath, target.StringEx())
-	err = api.AttachMountpath(baseParams, target, testMpath, true /*force*/)
+	err = api.AttachMountpath(baseParams, target, testMpath)
 	tassert.CheckFatal(t, err)
 
 	tools.WaitForResilvering(t, baseParams, target)
@@ -954,7 +978,7 @@ func TestAttachDetachMountpathAllTargets(t *testing.T) {
 			tassert.CheckFatal(t, err)
 			allMps[target.ID()] = mpList
 
-			err = api.AttachMountpath(baseParams, target, testMpath, true /*force*/)
+			err = api.AttachMountpath(baseParams, target, testMpath)
 			tassert.CheckFatal(t, err)
 		}
 	} else {
@@ -966,7 +990,7 @@ func TestAttachDetachMountpathAllTargets(t *testing.T) {
 
 			mountpath := filepath.Join(testMpath, strconv.Itoa(idx))
 			cos.CreateDir(mountpath)
-			err = api.AttachMountpath(baseParams, target, mountpath, true /*force*/)
+			err = api.AttachMountpath(baseParams, target, mountpath)
 			tassert.CheckFatal(t, err)
 		}
 	}
@@ -1010,11 +1034,12 @@ func TestMountpathDisableAll(t *testing.T) {
 			num:             5000,
 			numGetsEachFile: 2,
 		}
-		baseParams = tools.BaseAPIParams()
 	)
 
 	m.initAndSaveState(true /*cleanup*/)
 	m.expectTargets(1)
+
+	baseParams := tools.BaseAPIParams(m.smap.Primary.PubNet.URL) // NOTE: only primary has self-removed
 
 	// Remove all mountpaths on the target
 	target, _ := m.smap.GetRandTarget()
@@ -1309,8 +1334,10 @@ func TestAtimeColdGet(t *testing.T) {
 	timeAfterPut := time.Now()
 
 	// Perform the COLD get
-	_, err := api.GetObject(baseParams, bck, objectName, nil)
+	oah, err := api.GetObject(baseParams, bck, objectName, nil)
 	tassert.CheckFatal(t, err)
+
+	tlog.Logf("%+v\n", oah) // DEBUG
 
 	getAtime, getAtimeFormatted := tools.GetObjectAtime(t, baseParams, bck, objectName, time.RFC3339Nano)
 	tassert.Fatalf(t, !getAtime.IsZero(), "GET atime is zero")
@@ -1344,7 +1371,7 @@ func TestAtimePrefetch(t *testing.T) {
 	}()
 
 	wg := &sync.WaitGroup{}
-	for i := 0; i < numObjs; i++ {
+	for i := range numObjs {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -1634,7 +1661,7 @@ func TestGetFromMirroredWithLostOneMountpath(t *testing.T) {
 
 	// Step 6: Add previously removed mountpath
 	tlog.Logf("Add mountpath %s on target %s\n", mpath, target.ID())
-	err = api.AttachMountpath(baseParams, target, mpath, false /*force*/)
+	err = api.AttachMountpath(baseParams, target, mpath)
 	tassert.CheckFatal(t, err)
 
 	tools.WaitForResilvering(t, baseParams, target)
@@ -1686,8 +1713,8 @@ func TestGetFromMirroredWithLostMountpathAllExceptOne(t *testing.T) {
 	for i, mpath := range mpList.Available[1:] {
 		err = api.DetachMountpath(baseParams, target, mpath, false /*dont-resil*/)
 		if err != nil {
-			for j := 0; j < i; j++ {
-				api.AttachMountpath(baseParams, target, mpList.Available[j+1], false /*force*/)
+			for j := range i {
+				api.AttachMountpath(baseParams, target, mpList.Available[j+1])
 			}
 			tassert.CheckFatal(t, err)
 		}
@@ -1707,7 +1734,7 @@ func TestGetFromMirroredWithLostMountpathAllExceptOne(t *testing.T) {
 	// Reattach previously removed mountpaths
 	tlog.Logf("Reattach mountpaths at %s\n", target.StringEx())
 	for _, mpath := range mpList.Available[1:] {
-		err = api.AttachMountpath(baseParams, target, mpath, false /*force*/)
+		err = api.AttachMountpath(baseParams, target, mpath)
 		tassert.CheckFatal(t, err)
 		time.Sleep(time.Second)
 	}
@@ -1773,7 +1800,7 @@ func testNonRedundantMpathDD(t *testing.T, action string) {
 		err = api.EnableMountpath(baseParams, target, mpList.Available[0])
 	} else {
 		tlog.Logf("Re-attach %q at target %s\n", mpList.Available[0], target.StringEx())
-		err = api.AttachMountpath(baseParams, target, mpList.Available[0], false /*force*/)
+		err = api.AttachMountpath(baseParams, target, mpList.Available[0])
 	}
 	tassert.CheckFatal(t, err)
 

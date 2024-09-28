@@ -19,11 +19,12 @@ import (
 type npgCtx struct {
 	bck  *meta.Bck
 	wi   walkInfo
-	page cmn.LsoResult
+	page cmn.LsoRes
+	ctx  *core.LsoInvCtx
 	idx  int
 }
 
-func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb) (npg *npgCtx) {
+func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb, ctx *core.LsoInvCtx) (npg *npgCtx) {
 	npg = &npgCtx{
 		bck: bck,
 		wi: walkInfo{
@@ -32,6 +33,7 @@ func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb) (npg *npgCtx) {
 			wanted:       wanted(msg),
 			smap:         core.T.Sowner().Get(),
 		},
+		ctx: ctx,
 	}
 	return
 }
@@ -44,7 +46,7 @@ func (npg *npgCtx) nextPageA() error {
 		WalkOpts: fs.WalkOpts{CTs: []string{fs.ObjectType}, Callback: npg.cb, Sorted: true},
 	}
 	opts.WalkOpts.Bck.Copy(npg.bck.Bucket())
-	opts.ValidateCallback = func(fqn string, de fs.DirEntry) error {
+	opts.ValidateCb = func(fqn string, de fs.DirEntry) error {
 		if de.IsDir() {
 			return npg.wi.processDir(fqn)
 		}
@@ -78,10 +80,19 @@ func (npg *npgCtx) cb(fqn string, de fs.DirEntry) error {
 }
 
 // Returns the next page from the remote bucket's "list-objects" result set.
-func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries, inclStatusLocalMD bool) (*cmn.LsoResult, error) {
+func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries, inclStatusLocalMD bool) (lst *cmn.LsoRes, err error) {
 	debug.Assert(!npg.wi.msg.IsFlagSet(apc.LsObjCached))
-	lst := &cmn.LsoResult{Entries: nentries}
-	_, err := core.T.Backend(npg.bck).ListObjects(npg.bck, npg.wi.msg, lst)
+	lst = &cmn.LsoRes{Entries: nentries}
+	if npg.ctx != nil {
+		if npg.ctx.Lom == nil {
+			_, err = core.T.Backend(npg.bck).GetBucketInv(npg.bck, npg.ctx)
+		}
+		if err == nil {
+			err = core.T.Backend(npg.bck).ListObjectsInv(npg.bck, npg.wi.msg, lst, npg.ctx)
+		}
+	} else {
+		_, err = core.T.Backend(npg.bck).ListObjects(npg.bck, npg.wi.msg, lst)
+	}
 	if err != nil {
 		freeLsoEntries(nentries)
 		return nil, err
@@ -95,9 +106,13 @@ func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries, inclStatusLocalMD bool) (*
 	return lst, err
 }
 
-func (npg *npgCtx) populate(lst *cmn.LsoResult) error {
+func (npg *npgCtx) populate(lst *cmn.LsoRes) error {
 	post := npg.wi.lomVisitedCb
 	for _, obj := range lst.Entries {
+		if obj.IsDir() {
+			// collecting virtual dir-s when apc.LsNoRecursion is on - skipping here
+			continue
+		}
 		si, err := npg.wi.smap.HrwName2T(npg.bck.MakeUname(obj.Name))
 		if err != nil {
 			return err

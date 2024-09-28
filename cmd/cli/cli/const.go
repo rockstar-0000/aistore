@@ -5,7 +5,6 @@
 package cli
 
 import (
-	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -18,19 +17,20 @@ import (
 
 // top-level commands (categories - nouns)
 const (
-	commandAuth     = "auth"
 	commandAdvanced = "advanced"
+	commandAlias    = "alias"
+	commandArch     = "archive"
+	commandAuth     = "auth"
 	commandBucket   = "bucket"
-	commandObject   = "object"
 	commandCluster  = "cluster"
 	commandConfig   = "config"
+	commandETL      = apc.ETL
 	commandJob      = "job"
 	commandLog      = "log"
+	commandObject   = "object"
 	commandPerf     = "performance"
 	commandStorage  = "storage"
-	commandETL      = apc.ETL   // TODO: add `ais show etl`
-	commandAlias    = "alias"   // TODO: ditto alias
-	commandArch     = "archive" // TODO: ditto archive
+	commandTLS      = "tls"
 
 	commandSearch = "search"
 )
@@ -118,11 +118,22 @@ const (
 	cmdCluConfig = "configure"
 	cmdReset     = "reset"
 
-	// Mountpath (disk) actions
+	// Mountpath commands
 	cmdMpathAttach  = cmdAttach
 	cmdMpathEnable  = "enable"
 	cmdMpathDetach  = cmdDetach
 	cmdMpathDisable = "disable"
+
+	// More mountpath commands (advanced usage)
+	cmdMpathRescanDisks = "rescan-disks"
+	cmdMpathFshc        = "fshc"
+
+	// backend enable/disable (advanced use only)
+	cmdBackendEnable  = "enable-backend"
+	cmdBackendDisable = "disable-backend"
+
+	cmdLoadTLS     = "load-certificate"
+	cmdValidateTLS = "validate-certificates"
 
 	// Node subcommands
 	cmdJoin                = "join"
@@ -136,7 +147,7 @@ const (
 	cmdShowStats      = "stats"
 	cmdMountpath      = "mountpath"
 	cmdCapacity       = "capacity"
-	cmdShowDisk       = apc.WhatDiskStats
+	cmdShowDisk       = "disk"
 	cmdShowCounters   = "counters"
 	cmdShowThroughput = "throughput"
 	cmdShowLatency    = "latency"
@@ -181,20 +192,17 @@ const (
 )
 
 //
-// more constants
+// more constants (misc)
 //
 
 const flagPrefix = "--"
 
 const (
-	cluTotal = "--- Cluster:"
-	tgtTotal = "------- Sum:"
+	dfltStdinChunkSize = 10 * cos.MiB
 )
 
-const NilValue = "none"
-
 const (
-	defaultChunkSize = 10 * cos.MiB
+	NIY = "not implemented yet" // TODO potentially
 )
 
 const (
@@ -210,10 +218,20 @@ const (
 	tabHelpDet = "press <TAB-TAB> to select, '--help' for details"
 )
 
+// indentation
+const (
+	indent1 = "   "
+	indent2 = "      "       // repeat(indent1, 2)
+	indent4 = "            " // repeat(indent1, 4)
+)
+
+const (
+	archFormats = ".tar, .tgz or .tar.gz, .zip, .tar.lz4" // namely, archive.FileExtensions
+	archExts    = "(" + archFormats + ")"
+)
+
 // `ArgsUsage`: argument placeholders in help messages
 const (
-	indent1 = "   " // indent4 et al.
-
 	// Job IDs (download, dsort)
 	jobIDArgument                 = "JOB_ID"
 	optionalJobIDArgument         = "[JOB_ID]"
@@ -223,7 +241,7 @@ const (
 	jobShowRebalanceArgument = "[REB_ID] [NODE_ID]"
 
 	// Perf
-	showPerfArgument = "show performance counters, throughput, latency, and more (" + tabtab + " specific view)"
+	showPerfArgument = "show performance counters, throughput, latency, disks, used/available capacities (" + tabtab + " specific view)"
 
 	// ETL
 	etlNameArgument     = "ETL_NAME"
@@ -285,12 +303,13 @@ const (
 	getLogArgument  = nodeIDArgument + " [OUT_FILE|OUT_DIR|-]"
 
 	// cluster
-	showClusterArgument = "[NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | " +
-		"[smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]"
+	showClusterArgument = "[NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | \n" +
+		"                     [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]"
 
 	// config
 	showConfigArgument = "cli | cluster [CONFIG SECTION OR PREFIX] |\n" +
-		"      NODE_ID [ inherited | local | all [CONFIG SECTION OR PREFIX ] ]"
+		"                NODE_ID [ inherited | local | all [CONFIG SECTION OR PREFIX]]"
+
 	showClusterConfigArgument = "[CONFIG_SECTION]"
 	nodeConfigArgument        = nodeIDArgument + " " + keyValuePairsArgument
 
@@ -300,6 +319,9 @@ const (
 
 	startDownloadArgument = "SOURCE DESTINATION"
 	showStatsArgument     = "[NODE_ID]"
+
+	// backend enable/disable
+	cloudProviderArg = "CLOUD_PROVIDER"
 
 	// List command
 	listAnyCommandArgument = "PROVIDER:[//BUCKET_NAME]"
@@ -342,12 +364,6 @@ const (
 //
 
 var (
-	indent2 = strings.Repeat(indent1, 2)
-	indent4 = strings.Repeat(indent1, 4)
-
-	archFormats = ".tar, .tgz or .tar.gz, .zip, .tar.lz4" // namely, archive.FileExtensions
-	archExts    = "(" + archFormats + ")"
-
 	//
 	// scope 'all'
 	//
@@ -415,7 +431,7 @@ var (
 	//
 	refreshFlag = DurationFlag{
 		Name: "refresh",
-		Usage: "interval for continuous monitoring;\n" +
+		Usage: "time interval for continuous monitoring; can be also used to update progress bar (at a given interval);\n" +
 			indent4 + "\tvalid time units: " + timeUnits,
 	}
 	countFlag = cli.IntFlag{
@@ -441,7 +457,8 @@ var (
 		Usage: "regular expression select table columns (case-insensitive), e.g.:\n" +
 			indent4 + "\t --regex \"put|err\" - show PUT (count), PUT (total size), and all supported error counters;\n" +
 			indent4 + "\t --regex \"[a-z]\" - show all supported metrics, including those that have zero values across all nodes;\n" +
-			indent4 + "\t --regex \"(GET-COLD$|VERSION-CHANGE$)\" - show the number of cold GETs and object version changes (updates)",
+			indent4 + "\t --regex \"(AWS-GET$|VERSION-CHANGE$)\" - show the number object version changes (updates) and cold GETs from AWS\n" +
+			indent4 + "\t --regex \"(GCP-GET$|VERSION-CHANGE$)\" - same as above for GCP ('gs://')",
 	}
 	regexJobsFlag = cli.StringFlag{
 		Name:  regexFlag.Name,
@@ -450,13 +467,13 @@ var (
 
 	jsonFlag     = cli.BoolFlag{Name: "json,j", Usage: "json input/output"}
 	noHeaderFlag = cli.BoolFlag{Name: "no-headers,H", Usage: "display tables without headers"}
-	noFooterFlag = cli.BoolFlag{Name: "no-footers", Usage: "display tables without footers"}
+	noFooterFlag = cli.BoolFlag{Name: "no-footers,F", Usage: "display tables without footers"}
 
 	progressFlag = cli.BoolFlag{Name: "progress", Usage: "show progress bar(s) and progress of execution in real time"}
 	dryRunFlag   = cli.BoolFlag{Name: "dry-run", Usage: "preview the results without really running the action"}
 
 	verboseFlag    = cli.BoolFlag{Name: "verbose,v", Usage: "verbose output"}
-	nonverboseFlag = cli.BoolFlag{Name: "non-verbose,nv", Usage: "non-verbose (quiet) output, minimized reporting"}
+	nonverboseFlag = cli.BoolFlag{Name: "non-verbose,nv", Usage: "non-verbose (quiet) output, minimized reporting, fewer warnings"}
 	verboseJobFlag = cli.BoolFlag{
 		Name:  verboseFlag.Name,
 		Usage: "show extended statistics",
@@ -493,19 +510,46 @@ var (
 			indent4 + "\traw - do not convert to (or from) human-readable format",
 	}
 
+	dateTimeFlag = cli.BoolFlag{
+		Name:  "date-time",
+		Usage: "override the default hh:mm:ss (hours, minutes, seconds) time format - include calendar date as well",
+	}
+
 	// list-objects
 	startAfterFlag = cli.StringFlag{
 		Name:  "start-after",
 		Usage: "list bucket's content alphabetically starting with the first name _after_ the specified",
 	}
-	objLimitFlag = cli.IntFlag{Name: "limit", Usage: "limit object name count (0 - unlimited)"}
-	pageSizeFlag = cli.IntFlag{
-		Name:  "page-size",
-		Usage: "maximum number of names per page (0 - the maximum is defined by the corresponding backend)",
-	}
-	copiesFlag   = cli.IntFlag{Name: "copies", Usage: "number of object replicas", Value: 1, Required: true}
-	maxPagesFlag = cli.IntFlag{Name: "max-pages", Usage: "display up to this number pages of bucket objects"}
 
+	//
+	// list-objects sizing and limiting
+	//
+	objLimitFlag = cli.IntFlag{
+		Name: "limit",
+		Usage: "maximum number of object names to display (0 - unlimited; see also '--max-pages')\n" +
+			indent4 + "\te.g.: 'ais ls gs://abc --limit 1234 --cached --props size,custom",
+	}
+	pageSizeFlag = cli.IntFlag{
+		Name: "page-size",
+		Usage: "maximum number of object names per page; when the flag is omitted or 0 (zero)\n" +
+			indent4 + "\tthe maximum is defined by the corresponding backend; see also '--max-pages' and '--paged'",
+	}
+	maxPagesFlag = cli.IntFlag{
+		Name: "max-pages",
+		Usage: "maximum number of pages to display (see also '--page-size' and '--limit')\n" +
+			indent4 + "\te.g.: 'ais ls az://abc --paged --page-size 123 --max-pages 7",
+	}
+	pagedFlag = cli.BoolFlag{
+		Name: "paged",
+		Usage: "list objects page by page - one page at a time (see also '--page-size' and '--limit')\n" +
+			indent4 + "\tnote: recommended for use with very large buckets",
+	}
+	countAndTimeFlag = cli.BoolFlag{
+		Name:  "count-only",
+		Usage: "print only the resulting number of listed objects and elapsed time",
+	}
+
+	// bucket summary
 	validateSummaryFlag = cli.BoolFlag{
 		Name:  "validate",
 		Usage: "perform checks (correctness of placement, number of copies, and more) and show the corresponding error counts",
@@ -515,10 +559,7 @@ var (
 		Usage: "show object numbers, bucket sizes, and used capacity;\n" +
 			indent4 + "\tnote: applies only to buckets and objects that are _present_ in the cluster",
 	}
-	pagedFlag = cli.BoolFlag{
-		Name:  "paged",
-		Usage: "list objects page by page, one page at a time (see also '--page-size' and '--limit')",
-	}
+
 	showUnmatchedFlag = cli.BoolFlag{
 		Name:  "show-unmatched",
 		Usage: "list also objects that were _not_ matched by regex and/or template (range)",
@@ -530,10 +571,31 @@ var (
 			indent4 + "\t- see related: 'ais get --latest', 'ais cp --sync', 'ais prefetch --latest'",
 	}
 
-	keepMDFlag       = cli.BoolFlag{Name: "keep-md", Usage: "keep bucket metadata"}
-	dataSlicesFlag   = cli.IntFlag{Name: "data-slices,data,d", Usage: "number of data slices", Required: true}
-	paritySlicesFlag = cli.IntFlag{Name: "parity-slices,parity,p", Usage: "number of parity slices", Required: true}
-	compactPropFlag  = cli.BoolFlag{Name: "compact,c", Usage: "display properties grouped in human-readable mode"}
+	useInventoryFlag = cli.BoolFlag{
+		Name: "inventory",
+		Usage: "list objects using _bucket inventory_ (docs/s3inventory.md); requires s3:// backend; will provide significant performance\n" +
+			indent4 + "\tboost when used with very large s3 buckets; e.g. usage:\n" +
+			indent4 + "\t  1) 'ais ls s3://abc --inventory'\n" +
+			indent4 + "\t  2) 'ais ls s3://abc --inventory --paged --prefix=subdir/'\n" +
+			indent4 + "\t(see also: docs/s3inventory.md)",
+	}
+	invNameFlag = cli.StringFlag{
+		Name:  "inv-name", // compare w/ HdrInvName
+		Usage: "bucket inventory name (optional; system default name is '.inventory')",
+	}
+	invIDFlag = cli.StringFlag{
+		Name:  "inv-id", // cpmpare w/ HdrInvID
+		Usage: "bucket inventory ID (optional; by default, we use bucket name as the bucket's inventory ID)",
+	}
+
+	keepMDFlag = cli.BoolFlag{Name: "keep-md", Usage: "keep bucket metadata"}
+
+	copiesFlag = cli.IntFlag{Name: "copies", Usage: "number of object replicas", Value: 1, Required: true}
+
+	dataSlicesFlag   = cli.IntFlag{Name: "data-slices,data,d", Value: 2, Usage: "number of data slices", Required: true}
+	paritySlicesFlag = cli.IntFlag{Name: "parity-slices,parity,p", Value: 2, Usage: "number of parity slices", Required: true}
+
+	compactPropFlag = cli.BoolFlag{Name: "compact,c", Usage: "display properties grouped in human-readable mode"}
 
 	nameOnlyFlag = cli.BoolFlag{
 		Name:  "name-only",
@@ -601,11 +663,21 @@ var (
 			indent1 + "\t(see also: 'ais show bucket versioning' and the corresponding documentation)",
 	}
 
+	// gen-shards
+	fsizeFlag  = cli.StringFlag{Name: "fsize", Value: "1024", Usage: "size of the files in a shard"}
+	fcountFlag = cli.IntFlag{Name: "fcount", Value: 5, Usage: "number of files in a shard"}
+
+	dfltFext  = ".test"
+	fextsFlag = cli.StringFlag{
+		Name: "fext",
+		Usage: "comma-separated list of file extensions (default \"" + dfltFext + "\"), e.g.:\n" +
+			indent4 + "\t--fext .mp3\n" +
+			indent4 + "\t--fext '.mp3,.json,.cls' (or, same: \".mp3,  .json,  .cls\")",
+	}
+
 	// dsort
-	dsortFsizeFlag  = cli.StringFlag{Name: "fsize", Value: "1024", Usage: "size of the files in a shard"}
-	dsortLogFlag    = cli.StringFlag{Name: "log", Usage: "filename to log metrics (statistics)"}
-	dsortFcountFlag = cli.IntFlag{Name: "fcount", Value: 5, Usage: "number of files in a shard"}
-	dsortSpecFlag   = cli.StringFlag{Name: "file,f", Value: "", Usage: "path to JSON or YAML job specification"}
+	dsortLogFlag  = cli.StringFlag{Name: "log", Usage: "filename to log metrics (statistics)"}
+	dsortSpecFlag = cli.StringFlag{Name: "file,f", Value: "", Usage: "path to JSON or YAML job specification"}
 
 	cleanupFlag = cli.BoolFlag{
 		Name:  "cleanup",
@@ -736,6 +808,9 @@ var (
 	disableFlag = cli.BoolFlag{Name: "disable", Usage: "disable"}
 	recursFlag  = cli.BoolFlag{Name: "recursive,r", Usage: "recursive operation"}
 
+	noRecursFlag = cli.BoolFlag{Name: "non-recursive,nr", Usage: "list objects without including nested virtual subdirectories"}
+	noDirsFlag   = cli.BoolFlag{Name: "no-dirs", Usage: "do not return virtual subdirectories (applies to remote buckets only)"}
+
 	overwriteFlag = cli.BoolFlag{Name: "overwrite-dst,o", Usage: "overwrite destination, if exists"}
 	deleteSrcFlag = cli.BoolFlag{Name: "delete-src", Usage: "delete successfully promoted source"}
 	targetIDFlag  = cli.StringFlag{Name: "target-id", Usage: "ais target designated to carry out the entire operation"}
@@ -765,19 +840,33 @@ var (
 		Usage: "utilize built-in blob-downloader (and the corresponding alternative datapath) to read very large remote objects",
 	}
 
-	numWorkersFlag = cli.IntFlag{
+	// num-workers
+	numBlobWorkersFlag = cli.IntFlag{
 		Name:  "num-workers",
 		Usage: "number of concurrent blob-downloading workers (readers); system default when omitted or zero",
 	}
+	numListRangeWorkersFlag = cli.IntFlag{
+		Name: "num-workers",
+		Usage: "number of concurrent workers (readers); defaults to a number of target mountpaths if omitted or zero;\n" +
+			indent4 + "\t(-1) is a special value indicating no workers at all (ie., single-threaded execution);\n" +
+			indent4 + "\tany positive value will be adjusted _not_ to exceed the number of target CPUs",
+	}
 
+	// validate
 	cksumFlag = cli.BoolFlag{Name: "checksum", Usage: "validate checksum"}
 
+	// ais put
 	putObjCksumText     = indent4 + "\tand provide it as part of the PUT request for subsequent validation on the server side"
 	putObjCksumFlags    = initPutObjCksumFlags()
 	putObjDfltCksumFlag = cli.BoolFlag{
 		Name: "compute-checksum",
 		Usage: "[end-to-end protection] compute client-side checksum configured for the destination bucket\n" +
 			putObjCksumText,
+	}
+	putRetriesFlag = cli.IntFlag{
+		Name:  "retries",
+		Value: 1,
+		Usage: "when failing to PUT retry the operation up to so many times (with increasing timeout if timed out)",
 	}
 
 	appendConcatFlag = cli.BoolFlag{
@@ -803,14 +892,40 @@ var (
 	// archive
 	listArchFlag = cli.BoolFlag{Name: "archive", Usage: "list archived content (see docs/archive.md for details)"}
 
-	archpathFlag = cli.StringFlag{
+	archpathFlag = cli.StringFlag{ // for apc.QparamArchpath; PUT/append => shard
 		Name:  "archpath",
-		Usage: "filename in archive (shard)",
+		Usage: "filename in an object (\"shard\") formatted as: " + archFormats,
 	}
-	archpathGetFlag = cli.StringFlag{
-		Name:  archpathFlag.Name,
-		Usage: "extract the specified file from an archive (shard)",
+	archpathGetFlag = cli.StringFlag{ // for apc.QparamArchpath; GET from shard
+		Name: archpathFlag.Name,
+		Usage: "extract the specified file from an object (\"shard\") formatted as: " + archFormats + ";\n" +
+			indent4 + "\tsee also: '--archregx'",
 	}
+	archmimeFlag = cli.StringFlag{ // for apc.QparamArchmime
+		Name: "archmime",
+		Usage: "expected format (mime type) of an object (\"shard\") formatted as: " + archFormats + ";\n" +
+			indent4 + "\tespecially usable for shards with non-standard extensions\n",
+	}
+	archregxFlag = cli.StringFlag{ // for apc.QparamArchregx
+		Name: "archregx",
+		Usage: "specifies prefix, suffix, substring, WebDataset key, _or_ a general-purpose regular expression\n" +
+			indent4 + "\tto select possibly multiple matching archived files from a given shard;\n" +
+			indent4 + "\tis used in combination with '--archmode' (\"matching mode\") option",
+	}
+	archmodeFlag = cli.StringFlag{ // for apc.QparamArchmode
+		Name: "archmode",
+		Usage: "enumerated \"matching mode\" that tells aistore how to handle '--archregx', one of:\n" +
+			indent4 + "\t  * regexp - general purpose regular expression;\n" +
+			indent4 + "\t  * prefix - matching filename starts with;\n" +
+			indent4 + "\t  * suffix - matching filename ends with;\n" +
+			indent4 + "\t  * substr - matching filename contains;\n" +
+			indent4 + "\t  * wdskey - WebDataset key\n" +
+			indent4 + "\texample:\n" +
+			indent4 + "\t\tgiven a shard containing (subdir/aaa.jpg, subdir/aaa.json, subdir/bbb.jpg, subdir/bbb.json, ...)\n" +
+			indent4 + "\t\tand wdskey=subdir/aaa, aistore will match and return (subdir/aaa.jpg, subdir/aaa.json)",
+	}
+
+	// client side
 	extractFlag = cli.BoolFlag{
 		Name:  "extract,x",
 		Usage: "extract all files from archive(s)",
@@ -923,6 +1038,17 @@ var (
 	noRebalanceFlag = cli.BoolFlag{
 		Name:  "no-rebalance",
 		Usage: "do _not_ run global rebalance after putting node in maintenance (caution: advanced usage only!)",
+	}
+	mountpathLabelFlag = cli.StringFlag{
+		Name: "label",
+		Usage: "an optional _mountpath label_ to facilitate extended functionality and context, including:\n" +
+			indent2 + "1. device sharing (or non-sharing) between multiple mountpaths;\n" +
+			indent2 + "2. associated storage class (one of the enumerated ones, as in: \"different storage media for different datasets\");\n" +
+			indent2 + "3. parallelism multiplier - a number of goroutines to concurrently read, write, and/or traverse the mountpath in question\n" +
+			indent2 + "   (e.g.: 'local-NVMe = 8', 'remote-NFS = 1', etc.);\n" +
+			indent2 + "4. mapping of the mountpath to underlying block device(s)\n" +
+			indent2 + "   (potentially useful in virtualized/containerized environments where '/sys/block/' wouldn't show a thing);\n" +
+			indent2 + "5. user-defined grouping of the target mountpaths",
 	}
 	noResilverFlag = cli.BoolFlag{
 		Name:  "no-resilver",

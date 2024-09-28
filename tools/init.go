@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -101,7 +101,7 @@ func init() {
 	if cos.IsHTTPS(os.Getenv(env.AIS.Endpoint)) {
 		// fill-in from env
 		cmn.EnvToTLS(&tlsArgs)
-		gctx.Client = cmn.NewClientTLS(transportArgs, tlsArgs)
+		gctx.Client = cmn.NewClientTLS(transportArgs, tlsArgs, false /*intra-cluster*/)
 	} else {
 		gctx.Client = cmn.NewClient(transportArgs)
 	}
@@ -117,7 +117,7 @@ func NewClientWithProxy(proxyURL string) *http.Client {
 
 	if parsedURL.Scheme == "https" {
 		cos.AssertMsg(cos.IsHTTPS(proxyURL), proxyURL)
-		tlsConfig, err := cmn.NewTLS(tlsArgs)
+		tlsConfig, err := cmn.NewTLS(tlsArgs, false /*intra-cluster*/)
 		cos.AssertNoErr(err)
 		transport.TLSClientConfig = tlsConfig
 	}
@@ -171,8 +171,7 @@ func InitLocalCluster() {
 		fmt.Printf("Hint: make sure that cluster is running and/or specify its endpoint via %s environment\n",
 			env.AIS.Endpoint)
 	} else {
-		fmt.Printf("Hint: check api/env/*.go environment and, in particular, %s, %s, and more\n",
-			env.AIS.Endpoint, env.AIS.PrimaryID)
+		fmt.Printf("Hint: check api/env/*.go environment and, in particular %q\n", env.AIS.Endpoint)
 		if len(envVars) > 0 {
 			fmt.Println("Docker Environment:")
 			for k, v := range envVars {
@@ -184,11 +183,9 @@ func InitLocalCluster() {
 }
 
 // InitCluster initializes the environment necessary for testing against an AIS cluster.
-// NOTE:
-//
-//	the function is also used for testing by NVIDIA/ais-k8s Operator
+// NOTE: the function is also used for testing by NVIDIA/ais-k8s Operator
 func InitCluster(proxyURL string, clusterType ClusterType) (err error) {
-	LoggedUserToken = authn.LoadToken("")
+	LoggedUserToken, _ = authn.LoadToken("") // ignore error as not all tests require token
 	proxyURLReadOnly = proxyURL
 	testClusterType = clusterType
 	if err = initProxyURL(); err != nil {

@@ -1,32 +1,70 @@
 #
-# Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
 #
 
 from __future__ import annotations  # pylint: disable=unused-variable
+from typing import Optional, Tuple, Union
+import os
+
+from urllib3 import Retry
 
 from aistore.sdk.bucket import Bucket
 from aistore.sdk.const import (
     PROVIDER_AIS,
+    AIS_AUTHN_TOKEN,
 )
 from aistore.sdk.cluster import Cluster
 from aistore.sdk.dsort import Dsort
 from aistore.sdk.request_client import RequestClient
+from aistore.sdk.session_manager import SessionManager
 from aistore.sdk.types import Namespace
 from aistore.sdk.job import Job
-from aistore.sdk.etl import Etl
+from aistore.sdk.etl.etl import Etl
+from aistore.sdk.utils import parse_url
+from aistore.sdk.obj.object import Object
+from aistore.sdk.errors import InvalidURLException
 
 
-# pylint: disable=unused-variable
+# pylint: disable=unused-variable, duplicate-code, too-many-arguments
 class Client:
     """
     AIStore client for managing buckets, objects, ETL jobs
 
     Args:
         endpoint (str): AIStore endpoint
+        skip_verify (bool, optional): If True, skip SSL certificate verification. Defaults to False.
+        ca_cert (str, optional): Path to a CA certificate file for SSL verification. If not provided, the
+            'AIS_CLIENT_CA' environment variable will be used. Defaults to None.
+        timeout (Union[float, Tuple[float, float], None], optional): Request timeout in seconds; a single float
+            for both connect/read timeouts (e.g., 5.0), a tuple for separate connect/read timeouts (e.g., (3.0, 10.0)),
+            or None to disable timeout.
+        retry (urllib3.Retry, optional): Retry configuration object from the urllib3 library.
+        token (str, optional): Authorization token. If not provided, the 'AIS_AUTHN_TOKEN' environment variable
+            will be used. Defaults to None.
     """
 
-    def __init__(self, endpoint: str, skip_verify: bool = False, ca_cert: str = None):
-        self._request_client = RequestClient(endpoint, skip_verify, ca_cert)
+    def __init__(
+        self,
+        endpoint: str,
+        skip_verify: bool = False,
+        ca_cert: Optional[str] = None,
+        timeout: Optional[Union[float, Tuple[float, float]]] = None,
+        retry: Optional[Retry] = None,
+        token: Optional[str] = None,
+    ):
+        session_manager = SessionManager(
+            retry=retry, ca_cert=ca_cert, skip_verify=skip_verify
+        )
+
+        # Check for token from arguments or environment variable
+        if not token:
+            token = os.environ.get(AIS_AUTHN_TOKEN, None)
+        self._request_client = RequestClient(
+            endpoint=endpoint,
+            session_manager=session_manager,
+            timeout=timeout,
+            token=token,
+        )
 
     def bucket(
         self, bck_name: str, provider: str = PROVIDER_AIS, namespace: Namespace = None
@@ -101,3 +139,21 @@ class Client:
             dSort object created
         """
         return Dsort(client=self._request_client, dsort_id=dsort_id)
+
+    def fetch_object_by_url(self, url: str) -> Object:
+        """
+        Retrieve an object based on its URL.
+
+        Args:
+            url (str): Full URL of the object (e.g., "ais://bucket1/file.txt")
+
+        Returns:
+            Object: The object retrieved from the specified URL
+        """
+        try:
+            provider, bck_name, obj_name = parse_url(url)
+            if not provider or not bck_name or not obj_name:
+                raise InvalidURLException(url)
+            return self.bucket(bck_name, provider=provider).object(obj_name)
+        except InvalidURLException as err:
+            raise err

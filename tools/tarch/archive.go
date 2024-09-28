@@ -1,15 +1,16 @@
 // Package archive provides common low-level utilities for testing archives
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package tarch
 
 import (
 	"archive/tar"
 	"bytes"
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"sync"
@@ -19,10 +20,15 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
-	"github.com/NVIDIA/aistore/tools/cryptorand"
+	"github.com/NVIDIA/aistore/tools/trand"
 )
 
 var pool1m, pool128k, pool32k sync.Pool
+
+var (
+	_ archive.ArchRCB = (*rcbCtx)(nil)
+	_ archive.ArchRCB = (*rcbDummy)(nil)
+)
 
 type (
 	FileContent struct {
@@ -33,6 +39,13 @@ type (
 	dummyFile struct {
 		name string
 		size int64
+	}
+	rcbCtx struct {
+		files []FileContent
+		ext   string
+	}
+	rcbDummy struct {
+		files []os.FileInfo
 	}
 )
 
@@ -50,8 +63,9 @@ func addBufferToArch(aw archive.Writer, path string, l int, buf []byte) error {
 	return aw.Write(path, oah, reader)
 }
 
+// TODO: refactor to reduce number of arguments
 func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, fileCnt, fileSize int,
-	dup bool, recExts, randNames []string) error {
+	dup, randDir bool, recExts, randNames []string) error {
 	wfh, err := cos.CreateFile(shardName)
 	if err != nil {
 		return err
@@ -65,12 +79,12 @@ func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, f
 
 	var (
 		prevFileName string
-		dupIndex     = rand.Intn(fileCnt-1) + 1
+		dupIndex     = rand.IntN(fileCnt-1) + 1
 	)
 	if len(recExts) == 0 {
 		recExts = []string{".txt"}
 	}
-	for i := 0; i < fileCnt; i++ {
+	for i := range fileCnt {
 		var randomName int
 		if randNames == nil {
 			randomName = rand.Int()
@@ -85,6 +99,12 @@ func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, f
 			} else {
 				fileName = randNames[i]
 			}
+			if randDir {
+				layers := rand.IntN(5)
+				for range layers {
+					fileName = trand.String(5) + "/" + fileName
+				}
+			}
 			if err := addBufferToArch(aw, fileName, fileSize, nil); err != nil {
 				return err
 			}
@@ -98,13 +118,13 @@ func CreateArchCustomFilesToW(w io.Writer, tarFormat tar.Format, ext string, fil
 	customFileType, customFileExt string, missingKeys bool) error {
 	aw := archive.NewWriter(ext, w, nil, &archive.Opts{TarFormat: tarFormat})
 	defer aw.Fini()
-	for i := 0; i < fileCnt; i++ {
+	for range fileCnt {
 		fileName := strconv.Itoa(rand.Int()) // generate random names
 		if err := addBufferToArch(aw, fileName+".txt", fileSize, nil); err != nil {
 			return err
 		}
 		// If missingKeys enabled we should only add keys randomly
-		if !missingKeys || (missingKeys && rand.Intn(2) == 0) {
+		if !missingKeys || (missingKeys && rand.IntN(2) == 0) {
 			var buf []byte
 			// random content
 			if err := shard.ValidateContentKeyTy(customFileType); err != nil {
@@ -149,48 +169,54 @@ func newArchReader(mime string, buffer *bytes.Buffer) (ar archive.Reader, err er
 	return
 }
 
+func (rcb *rcbCtx) Call(filename string, reader cos.ReadCloseSizer, _ any) (bool, error) {
+	var (
+		buf bytes.Buffer
+		ext = cos.Ext(filename)
+	)
+	defer reader.Close()
+	if rcb.ext == ext {
+		if _, err := io.Copy(&buf, reader); err != nil {
+			return true, err
+		}
+	}
+	rcb.files = append(rcb.files, FileContent{Name: filename, Ext: ext, Content: buf.Bytes()})
+	return false, nil
+}
+
 func GetFilesFromArchBuffer(mime string, buffer bytes.Buffer, extension string) ([]FileContent, error) {
 	var (
-		files   = make([]FileContent, 0, 10)
+		rcb = rcbCtx{
+			files: make([]FileContent, 0, 10),
+			ext:   extension,
+		}
 		ar, err = newArchReader(mime, &buffer)
 	)
 	if err != nil {
 		return nil, err
 	}
-	rcb := func(filename string, reader cos.ReadCloseSizer, _ any) (bool, error) {
-		var (
-			buf bytes.Buffer
-			ext = cos.Ext(filename)
-		)
-		defer reader.Close()
-		if extension == ext {
-			if _, err := io.Copy(&buf, reader); err != nil {
-				return true, err
-			}
-		}
-		files = append(files, FileContent{Name: filename, Ext: ext, Content: buf.Bytes()})
-		return false, nil
-	}
+	err = ar.ReadUntil(&rcb, cos.EmptyMatchAll, "")
+	return rcb.files, err
+}
 
-	_, err = ar.Range("", rcb)
-	return files, err
+func (rcb *rcbDummy) Call(filename string, reader cos.ReadCloseSizer, _ any) (bool, error) {
+	rcb.files = append(rcb.files, newDummyFile(filename, reader.Size()))
+	reader.Close()
+	return false, nil
 }
 
 func GetFileInfosFromArchBuffer(buffer bytes.Buffer, mime string) ([]os.FileInfo, error) {
 	var (
-		files   = make([]os.FileInfo, 0, 10)
+		rcb = rcbDummy{
+			files: make([]os.FileInfo, 0, 10),
+		}
 		ar, err = newArchReader(mime, &buffer)
 	)
 	if err != nil {
 		return nil, err
 	}
-	rcb := func(filename string, reader cos.ReadCloseSizer, _ any) (bool, error) {
-		files = append(files, newDummyFile(filename, reader.Size()))
-		reader.Close()
-		return false, nil
-	}
-	_, err = ar.Range("", rcb)
-	return files, err
+	err = ar.ReadUntil(&rcb, cos.EmptyMatchAll, "")
+	return rcb.files, err
 }
 
 ///////////////

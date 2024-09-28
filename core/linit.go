@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -9,12 +9,11 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 )
-
-const fmtErrLinit = "lom-init %s: %s mismatch (%q != %q)"
 
 // Local Object Metadata (LOM) - is cached. Respectively, lifecycle of any given LOM
 // instance includes the following steps:
@@ -31,37 +30,45 @@ const fmtErrLinit = "lom-init %s: %s mismatch (%q != %q)"
 // 6) remove a given LOM instance from cache: lom.Uncache()
 // 7) evict an entire bucket-load of LOM cache: cluster.EvictCache(bucket)
 // 8) periodic (lazy) eviction followed by access-time synchronization: see LomCacheRunner
-// =======================================================================================
+
+// NOTE: to facilitate fast path filtering-out
+func (lom *LOM) PreInit(fqn string) error {
+	var (
+		parsed      fs.ParsedFQN
+		hrwFQN, err = ResolveFQN(fqn, &parsed)
+	)
+	if err != nil {
+		return err
+	}
+	debug.Assert(parsed.ContentType == fs.ObjectType)
+	lom.HrwFQN = &hrwFQN
+	lom.FQN = fqn
+	lom.mi = parsed.Mountpath
+	lom.digest = parsed.Digest
+	lom.ObjName = parsed.ObjName
+	lom.bck = *(*meta.Bck)(&parsed.Bck)
+	return nil
+}
+
+func (lom *LOM) PostInit() (err error) {
+	if err = lom.bck.InitFast(T.Bowner()); err != nil {
+		return err
+	}
+	uname := lom.bck.MakeUname(lom.ObjName)
+	lom.md.uname = cos.UnsafeSptr(uname)
+	return nil
+}
 
 func (lom *LOM) InitFQN(fqn string, expbck *cmn.Bck) (err error) {
-	var parsedFQN fs.ParsedFQN
-	parsedFQN, lom.HrwFQN, err = ResolveFQN(fqn)
-	if err != nil {
-		return
+	if err = lom.PreInit(fqn); err != nil {
+		return err
 	}
-	debug.Assert(parsedFQN.ContentType == fs.ObjectType)
-	lom.FQN = fqn
-	lom.mi = parsedFQN.Mountpath
-	lom.digest = parsedFQN.Digest
-	lom.ObjName = parsedFQN.ObjName
-	lom.bck = *(*meta.Bck)(&parsedFQN.Bck)
-
-	if expbck != nil {
-		if expbck.Name != parsedFQN.Bck.Name {
-			return fmt.Errorf(fmtErrLinit, lom.FQN, "bucket", expbck.String(), parsedFQN.Bck)
-		}
-		if expbck.Provider != "" && expbck.Provider != lom.bck.Provider {
-			return fmt.Errorf(fmtErrLinit, lom.FQN, "provider", lom.bck.Provider, expbck.Provider)
-		}
-		if !expbck.Ns.IsGlobal() && expbck.Ns != parsedFQN.Bck.Ns {
-			return fmt.Errorf(fmtErrLinit, lom.FQN, "namespace", expbck.Ns, parsedFQN.Bck.Ns)
-		}
+	if expbck != nil && !lom.Bucket().Equal(expbck) {
+		err = fmt.Errorf("lom-init mismatch for %q: %s vs %s", fqn, lom.Bucket(), expbck)
+		debug.AssertNoErr(err)
+		return err
 	}
-	if err = lom.bck.InitFast(T.Bowner()); err != nil {
-		return
-	}
-	lom.md.uname = lom.bck.MakeUname(lom.ObjName)
-	return nil
+	return lom.PostInit()
 }
 
 func (lom *LOM) InitCT(ct *CT) {
@@ -73,7 +80,7 @@ func (lom *LOM) InitCT(ct *CT) {
 	lom.digest = ct.digest
 	lom.ObjName = ct.objName
 	lom.bck = *ct.bck
-	lom.md.uname = ct.Uname()
+	lom.md.uname = ct.UnamePtr()
 }
 
 func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
@@ -81,13 +88,14 @@ func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
 	if err = lom.bck.InitFast(T.Bowner()); err != nil {
 		return
 	}
-	lom.md.uname = lom.bck.MakeUname(lom.ObjName)
-	lom.mi, lom.digest, err = fs.Hrw(lom.md.uname)
+	uname := lom.bck.MakeUname(lom.ObjName)
+	lom.md.uname = cos.UnsafeSptr(uname)
+	lom.mi, lom.digest, err = fs.Hrw(uname)
 	if err != nil {
 		return
 	}
 	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
-	lom.HrwFQN = lom.FQN
+	lom.HrwFQN = &lom.FQN
 	return
 }
 
@@ -105,11 +113,11 @@ func (lom *LOM) String() string {
 }
 
 // allocates and copies metadata (in particular, atime and uname)
+// NOTE: cloned lom.bid() == 0 is possible - copying/transforming scenarios
 func (lom *LOM) CloneMD(fqn string) *LOM {
 	dst := AllocLOM("")
 	*dst = *lom
 	dst.md = lom.md
-	dst.md.bckID = 0
 	dst.md.copies = nil
 	dst.FQN = fqn
 	return dst

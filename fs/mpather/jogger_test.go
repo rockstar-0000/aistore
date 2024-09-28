@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"testing"
@@ -49,7 +49,7 @@ func TestJoggerGroup(t *testing.T) {
 			return nil
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -94,7 +94,7 @@ func TestJoggerGroupParallel(t *testing.T) {
 			_, err = b.WriteString(lom.FQN)
 			tassert.CheckFatal(t, err)
 
-			if rand.Intn(objectsCnt/mpathsCnt)%20 == 0 {
+			if rand.IntN(objectsCnt/mpathsCnt)%20 == 0 {
 				// Sometimes sleep a while, to check if in this time some other goroutine does not populate the buffer.
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -109,7 +109,7 @@ func TestJoggerGroupParallel(t *testing.T) {
 	for _, baseJgOpts.Parallel = range parallelOptions {
 		t.Run(fmt.Sprintf("TestJoggerGroupParallel/%d", baseJgOpts.Parallel), func(t *testing.T) {
 			counter = atomic.NewInt32(0)
-			jg := mpather.NewJoggerGroup(baseJgOpts, cmn.GCO.Get(), "")
+			jg := mpather.NewJoggerGroup(baseJgOpts, cmn.GCO.Get(), nil)
 			jg.Run()
 			<-jg.ListenFinished()
 
@@ -143,14 +143,14 @@ func TestJoggerGroupLoad(t *testing.T) {
 		Bck: out.Bck,
 		CTs: []string{fs.ObjectType},
 		VisitObj: func(lom *core.LOM, buf []byte) error {
-			tassert.Errorf(t, lom.SizeBytes() == desc.ObjectSize, "incorrect object size (lom probably not loaded)")
+			tassert.Errorf(t, lom.Lsize() == desc.ObjectSize, "incorrect object size (lom probably not loaded)")
 			tassert.Errorf(t, len(buf) == 0, "buffer expected to be empty")
 			counter.Inc()
 			return nil
 		},
 		DoLoad: mpather.Load,
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 
 	jg.Run()
 	<-jg.ListenFinished()
@@ -186,7 +186,7 @@ func TestJoggerGroupError(t *testing.T) {
 			return errors.New("oops")
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -239,7 +239,7 @@ func TestJoggerGroupOneErrorStopsAll(t *testing.T) {
 			return nil
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 
@@ -294,7 +294,7 @@ func TestJoggerGroupMultiContentTypes(t *testing.T) {
 			return nil
 		},
 	}
-	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), "")
+	jg := mpather.NewJoggerGroup(opts, cmn.GCO.Get(), nil)
 	jg.Run()
 	<-jg.ListenFinished()
 

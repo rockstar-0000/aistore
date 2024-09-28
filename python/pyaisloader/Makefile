@@ -7,11 +7,23 @@ short_put: ## Run a short PUT benchmark
 short_get: ## Run a short GET benchmark
 	pyaisloader GET --bucket ais://abc --duration 30s --workers 16 --totalsize 1GB --minsize 5KB --maxsize 10KB --cleanup
 
+short_get_etl: ## Run a short GET benchmark where all GETs undergo the ECHO ETL transformation
+	pyaisloader GET --bucket ais://abc --duration 30s --workers 16 --totalsize 1GB --minsize 5KB --maxsize 10KB --etl ECHO --cleanup
+
 short_mixed: ## Run a short MIXED benchmark
 	pyaisloader MIXED --bucket ais://abc --duration 30s --workers 16 --minsize 5KB --maxsize 10KB --putpct 50 --cleanup
 
+short_mixed_etl: ## Run a short MIXED benchmark where all GETs undergo the ECHO ETL transformation
+	pyaisloader MIXED --bucket ais://abc --duration 30s --workers 16 --minsize 5KB --maxsize 10KB --putpct 50 --etl ECHO --cleanup
+
 short_list: ## Run a short LIST benchmark
 	pyaisloader LIST --bucket ais://abc --cleanup true --objects 50000 --workers 16
+
+short_ais_dataset: ## Run a short AISDataset benchmark
+	pyaisloader AIS_DATASET --bucket ais://abc --duration 30s --workers 16 --totalsize 1GB --minsize 5KB --maxsize 10KB --cleanup
+
+short_ais_iter_dataset: ## Run a short AISIterDataset benchmark
+	pyaisloader AIS_ITER_DATASET --bucket ais://abc --iterations 1 --duration 30s --workers 16 --totalsize 1GB --minsize 5KB --maxsize 10KB --cleanup
 
 long_put: ## Run a long (and more intensive) PUT benchmark
 	pyaisloader PUT --bucket ais://abc --duration 30m --workers 32 --totalsize 10GB --minsize 50MB --maxsize 100MB --cleanup

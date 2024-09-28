@@ -16,7 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/tools/readers"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -40,7 +40,6 @@ var _ = Describe("Mirror", func() {
 	cmn.GCO.CommitUpdate(config)
 
 	fs.TestNew(nil)
-	fs.TestDisableValidation()
 	_, _ = fs.Add(mpath, "daeID")
 	_, _ = fs.Add(mpath2, "daeID")
 	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
@@ -96,7 +95,7 @@ var _ = Describe("Mirror", func() {
 			clone, err := lom.Copy2FQN(copyFQN, nil)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(expectedCopyFQN).To(BeARegularFile())
-			Expect(clone.SizeBytes(true)).To(BeEquivalentTo(testObjectSize))
+			Expect(clone.Lsize(true)).To(BeEquivalentTo(testObjectSize))
 
 			// Check copy set
 			Expect(clone.IsCopy()).To(BeTrue())

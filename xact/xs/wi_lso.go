@@ -1,7 +1,7 @@
 // Package xs contains most of the supported eXtended actions (xactions) with some
 // exceptions that include certain storage services (mirror, EC) and extensions (downloader, lru).
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -56,11 +56,6 @@ func newWalkInfo(msg *apc.LsoMsg, lomVisitedCb lomVisitedCb) (wi *walkInfo) {
 
 func (wi *walkInfo) lsmsg() *apc.LsoMsg { return wi.msg }
 
-// Checks if the directory should be processed by cache list call
-// Does checks:
-//   - Object name must start with prefix (if it is set)
-//   - Object name is not in early processed directories by the previous call:
-//     paging support
 func (wi *walkInfo) processDir(fqn string) error {
 	ct, err := core.NewCTFromFQN(fqn, nil)
 	if err != nil {
@@ -71,9 +66,9 @@ func (wi *walkInfo) processDir(fqn string) error {
 		return filepath.SkipDir
 	}
 
-	// When markerDir = "b/c/d/" we should skip directories: "a/", "b/a/",
-	// "b/b/" etc. but should not skip entire "b/" or "b/c/" since it is our
-	// parent which we want to traverse (see that: "b/" < "b/c/d/").
+	// e.g., when `markerDir` "b/c/d/" we skip directories "a/", "b/a/",
+	// "b/b/" etc. but do not skip entire "b/" and "b/c/" since it is our
+	// parent that we need to traverse ("b/" < "b/c/d/").
 	if wi.markerDir != "" && ct.ObjectName() < wi.markerDir && !strings.HasPrefix(wi.markerDir, ct.ObjectName()) {
 		return filepath.SkipDir
 	}
@@ -81,17 +76,16 @@ func (wi *walkInfo) processDir(fqn string) error {
 	return nil
 }
 
-// Returns true if LOM is to be included in the result set.
-func (wi *walkInfo) match(lom *core.LOM) bool {
-	if !cmn.ObjHasPrefix(lom.ObjName, wi.msg.Prefix) {
+func (wi *walkInfo) match(objName string) bool {
+	if !cmn.ObjHasPrefix(objName, wi.msg.Prefix) {
 		return false
 	}
-	return wi.msg.ContinuationToken == "" || !cmn.TokenGreaterEQ(wi.msg.ContinuationToken, lom.ObjName)
+	return wi.msg.ContinuationToken == "" || !cmn.TokenGreaterEQ(wi.msg.ContinuationToken, objName)
 }
 
 // new entry to be added to the listed page (note: slow path)
-func (wi *walkInfo) ls(lom *core.LOM, status uint16) (e *cmn.LsoEntry) {
-	e = &cmn.LsoEntry{Name: lom.ObjName, Flags: status | apc.EntryIsCached}
+func (wi *walkInfo) ls(lom *core.LOM, status uint16) (e *cmn.LsoEnt) {
+	e = &cmn.LsoEnt{Name: lom.ObjName, Flags: status | apc.EntryIsCached}
 	if wi.msg.IsFlagSet(apc.LsVerChanged) {
 		checkRemoteMD(lom, e)
 	}
@@ -104,12 +98,12 @@ func (wi *walkInfo) ls(lom *core.LOM, status uint16) (e *cmn.LsoEntry) {
 }
 
 // NOTE: slow path
-func checkRemoteMD(lom *core.LOM, e *cmn.LsoEntry) {
+func checkRemoteMD(lom *core.LOM, e *cmn.LsoEnt) {
 	if !lom.Bucket().HasVersioningMD() {
 		debug.Assert(false, lom.Cname())
 		return
 	}
-	res := lom.CheckRemoteMD(false /*locked*/, false /*sync*/)
+	res := lom.CheckRemoteMD(false /*locked*/, false /*sync*/, nil /*origReq*/)
 	switch {
 	case res.Eq:
 		debug.AssertNoErr(res.Err)
@@ -121,30 +115,34 @@ func checkRemoteMD(lom *core.LOM, e *cmn.LsoEntry) {
 }
 
 // Performs a number of syscalls to load object metadata.
-func (wi *walkInfo) callback(fqn string, de fs.DirEntry) (entry *cmn.LsoEntry, err error) {
+func (wi *walkInfo) callback(fqn string, de fs.DirEntry) (entry *cmn.LsoEnt, err error) {
 	if de.IsDir() {
 		return
 	}
+
 	lom := core.AllocLOM("")
-	entry, err = wi.cb(lom, fqn)
+	entry, err = wi._cb(lom, fqn)
 	core.FreeLOM(lom)
 	return
 }
 
-func (wi *walkInfo) cb(lom *core.LOM, fqn string) (*cmn.LsoEntry, error) {
-	status := uint16(apc.LocOK)
-	if err := lom.InitFQN(fqn, nil); err != nil {
+func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
+	if err := lom.PreInit(fqn); err != nil {
 		return nil, err
 	}
-
-	if !wi.match(lom) {
+	if !wi.match(lom.ObjName) {
 		return nil, nil
+	}
+	if err := lom.PostInit(); err != nil {
+		return nil, err
 	}
 
 	_, local, err := lom.HrwTarget(wi.smap)
 	if err != nil {
 		return nil, err
 	}
+
+	status := uint16(apc.LocOK)
 	if !local {
 		status = apc.LocMisplacedNode
 	} else if !lom.IsHRW() {
@@ -180,7 +178,7 @@ func (wi *walkInfo) cb(lom *core.LOM, fqn string) (*cmn.LsoEntry, error) {
 	if local {
 		// check hrw mountpath location
 		hlom := &core.LOM{}
-		if err := hlom.InitFQN(lom.HrwFQN, lom.Bucket()); err != nil {
+		if err := hlom.InitFQN(*lom.HrwFQN, lom.Bucket()); err != nil {
 			return nil, err
 		}
 		if err := hlom.Load(true /*cache it*/, false /*locked*/); err != nil {

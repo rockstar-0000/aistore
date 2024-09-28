@@ -23,8 +23,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
-const secretKeyPodEnv = "SECRETKEY" // via https://kubernetes.io/docs/concepts/configuration/secret
-
 var (
 	build     string
 	buildtime string
@@ -72,8 +70,9 @@ func main() {
 	if _, err := jsp.LoadMeta(configPath, Conf); err != nil {
 		cos.ExitLogf("Failed to load configuration from %q: %v", configPath, err)
 	}
-	if val := os.Getenv(secretKeyPodEnv); val != "" {
-		Conf.Server.Secret = val
+	Conf.Init()
+	if val := os.Getenv(env.AuthN.SecretKey); val != "" {
+		Conf.SetSecret(&val)
 	}
 	if err := updateLogOptions(); err != nil {
 		cos.ExitLogf("Failed to set up logger: %v", err)
@@ -107,10 +106,11 @@ func main() {
 }
 
 func updateLogOptions() error {
-	if err := cos.CreateDir(Conf.Log.Dir); err != nil {
-		return fmt.Errorf("failed to create log dir %q, err: %v", Conf.Log.Dir, err)
+	logDir := cos.GetEnvOrDefault(env.AuthN.LogDir, Conf.Log.Dir)
+	if err := cos.CreateDir(logDir); err != nil {
+		return fmt.Errorf("failed to create log dir %q, err: %v", logDir, err)
 	}
-	nlog.SetLogDirRole(Conf.Log.Dir, "auth")
+	nlog.SetPre(logDir, "auth")
 	return nil
 }
 

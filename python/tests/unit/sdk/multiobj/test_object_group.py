@@ -14,9 +14,10 @@ from aistore.sdk.const import (
     PROVIDER_AMAZON,
     HTTP_METHOD_PUT,
 )
-from aistore.sdk.etl_const import DEFAULT_ETL_TIMEOUT
+from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
 from aistore.sdk.multiobj import ObjectGroup, ObjectRange
 from aistore.sdk.types import Namespace, BucketModel, ArchiveMultiObj
+from tests.const import LARGE_FILE_SIZE, ETL_NAME, PREFIX_NAME
 
 
 # pylint: disable=unused-variable,too-many-instance-attributes
@@ -46,7 +47,7 @@ class TestObjectGroup(unittest.TestCase):
 
     def test_object_group_parameters(self):
         obj_names = ["list", "of", "names"]
-        obj_range = ObjectRange(prefix="prefix-")
+        obj_range = ObjectRange(prefix=PREFIX_NAME)
         obj_template = "prefix-{0..3}"
         with self.assertRaises(ValueError):
             ObjectGroup(
@@ -98,11 +99,30 @@ class TestObjectGroup(unittest.TestCase):
         prefetch_expected_val = self.expected_value.copy()
         prefetch_expected_val["coer"] = False
         prefetch_expected_val["latest-ver"] = False
+        prefetch_expected_val["num-workers"] = 3
         self.object_group_test_helper(
             self.object_group.prefetch,
             HTTP_METHOD_POST,
             ACT_PREFETCH_OBJECTS,
             prefetch_expected_val,
+            num_workers=3,
+        )
+
+    def test_prefetch_with_blob_threshold(self):
+        prefetch_expected_val = self.expected_value.copy()
+        prefetch_expected_val["coer"] = False
+        prefetch_expected_val["latest-ver"] = False
+        blob_threshold_value = LARGE_FILE_SIZE
+        prefetch_expected_val["blob-threshold"] = blob_threshold_value
+        prefetch_expected_val["num-workers"] = 3
+
+        self.object_group_test_helper(
+            self.object_group.prefetch,
+            HTTP_METHOD_POST,
+            ACT_PREFETCH_OBJECTS,
+            prefetch_expected_val,
+            blob_threshold=blob_threshold_value,
+            num_workers=3,
         )
 
     def test_copy(self):
@@ -130,6 +150,7 @@ class TestObjectGroup(unittest.TestCase):
         self.expected_value["coer"] = True
         self.expected_value["latest-ver"] = False
         self.expected_value["synchronize"] = False
+        self.expected_value["num-workers"] = 3
 
         self.object_group_test_helper(
             self.object_group.copy,
@@ -141,6 +162,7 @@ class TestObjectGroup(unittest.TestCase):
             force=True,
             dry_run=True,
             continue_on_error=True,
+            num_workers=3,
         )
 
     @patch("aistore.sdk.multiobj.object_group.logging")
@@ -153,12 +175,11 @@ class TestObjectGroup(unittest.TestCase):
         mock_logger.info.assert_called()
 
     def test_transform(self):
-        etl_name = "any active etl"
         self.expected_value["prefix"] = ""
         self.expected_value["prepend"] = ""
         self.expected_value["dry_run"] = False
         self.expected_value["force"] = False
-        self.expected_value["id"] = etl_name
+        self.expected_value["id"] = ETL_NAME
         self.expected_value["request_timeout"] = DEFAULT_ETL_TIMEOUT
         self.expected_value["tobck"] = self.dest_bucket.as_model()
         self.expected_value["coer"] = False
@@ -172,7 +193,7 @@ class TestObjectGroup(unittest.TestCase):
             ACT_TRANSFORM_OBJECTS,
             self.expected_value,
             to_bck=self.dest_bucket,
-            etl_name=etl_name,
+            etl_name=ETL_NAME,
         )
         # Test provided optional args
         timeout = "30s"
@@ -182,6 +203,7 @@ class TestObjectGroup(unittest.TestCase):
         self.expected_value["request_timeout"] = timeout
         self.expected_value["dry_run"] = True
         self.expected_value["force"] = True
+        self.expected_value["num-workers"] = 3
         self.object_group_test_helper(
             self.object_group.transform,
             HTTP_METHOD_POST,
@@ -189,11 +211,12 @@ class TestObjectGroup(unittest.TestCase):
             self.expected_value,
             to_bck=self.dest_bucket,
             prepend=prepend_val,
-            etl_name=etl_name,
+            etl_name=ETL_NAME,
             timeout=timeout,
             dry_run=True,
             force=True,
             continue_on_error=True,
+            num_workers=3,
         )
 
     @patch("aistore.sdk.multiobj.object_group.logging")
@@ -202,7 +225,7 @@ class TestObjectGroup(unittest.TestCase):
         mock_logging.getLogger.return_value = mock_logger
 
         self.object_group.transform(
-            to_bck=self.dest_bucket, etl_name="any etl", dry_run=True
+            to_bck=self.dest_bucket, etl_name=ETL_NAME, dry_run=True
         )
 
         mock_logger.info.assert_called()
@@ -258,11 +281,24 @@ class TestObjectGroup(unittest.TestCase):
         )
 
     def test_list_urls(self):
-        etl_name = "myetl"
         expected_obj_calls = []
         # Should create an object reference and get url for every object returned by listing
         for name in self.obj_names:
             expected_obj_calls.append(call(name))
-            expected_obj_calls.append(call().get_url(etl_name=etl_name))
-        list(self.object_group.list_urls(etl_name=etl_name))
+            expected_obj_calls.append(call().get_url(etl_name=ETL_NAME))
+        list(self.object_group.list_urls(etl_name=ETL_NAME))
         self.mock_bck.object.assert_has_calls(expected_obj_calls)
+
+    def test_list_all_objects_iter(self):
+        res = self.object_group.list_all_objects_iter(props=None)
+        self.assertEqual(len(list(res)), len(self.obj_names))
+
+    def test_prefixes(self):
+        objs = list(self.object_group.list_all_objects_iter(prefix="obj"))
+        self.assertEqual(len(objs), len(self.obj_names))
+
+        objs = list(self.object_group.list_all_objects_iter(prefix="ojb"))
+        self.assertEqual(len(objs), 0)
+
+        objs = list(self.object_group.list_all_objects_iter(prefix="obj-1"))
+        self.assertEqual(len(objs), 1)

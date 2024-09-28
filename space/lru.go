@@ -134,12 +134,12 @@ func (*lruFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, er
 
 func RunLRU(ini *IniLRU) {
 	var (
-		xlru           = ini.Xaction
-		config         = cmn.GCO.Get()
-		availablePaths = fs.GetAvail()
-		num            = len(availablePaths)
-		joggers        = make(map[string]*lruJ, num)
-		parent         = &lruP{joggers: joggers, ini: *ini}
+		xlru    = ini.Xaction
+		config  = cmn.GCO.Get()
+		avail   = fs.GetAvail()
+		num     = len(avail)
+		joggers = make(map[string]*lruJ, num)
+		parent  = &lruP{joggers: joggers, ini: *ini}
 	)
 	defer func() {
 		if ini.WG != nil {
@@ -151,7 +151,7 @@ func RunLRU(ini *IniLRU) {
 		xlru.Finish()
 		return
 	}
-	for mpath, mi := range availablePaths {
+	for mpath, mi := range avail {
 		h := make(minHeap, 0, 64)
 		joggers[mpath] = &lruJ{
 			heap:   &h,
@@ -334,7 +334,7 @@ func (j *lruJ) _visit(lom *core.LOM) (pushed bool) {
 		return
 	}
 	heap.Push(j.heap, lom)
-	j.curSize += lom.SizeBytes()
+	j.curSize += lom.Lsize()
 	if lom.AtimeUnix() > j.newest {
 		j.newest = lom.AtimeUnix()
 	}
@@ -342,18 +342,18 @@ func (j *lruJ) _visit(lom *core.LOM) (pushed bool) {
 }
 
 func (j *lruJ) walk(fqn string, de fs.DirEntry) error {
+	var parsed fs.ParsedFQN
 	if de.IsDir() {
 		return nil
 	}
 	if err := j.yieldTerm(); err != nil {
 		return err
 	}
-	parsedFQN, _, err := core.ResolveFQN(fqn)
-	if err != nil {
+	if _, err := core.ResolveFQN(fqn, &parsed); err != nil {
 		return nil
 	}
-	if parsedFQN.ContentType == fs.ObjectType {
-		j.visitLOM(&parsedFQN)
+	if parsed.ContentType == fs.ObjectType {
+		j.visitLOM(&parsed)
 	}
 
 	return nil
@@ -374,7 +374,7 @@ func (j *lruJ) evict() (size int64, err error) {
 			core.FreeLOM(lom)
 			continue
 		}
-		objSize := lom.SizeBytes(true /*not loaded*/)
+		objSize := lom.Lsize(true /*not loaded*/)
 		core.FreeLOM(lom)
 		bevicted += objSize
 		size += objSize
@@ -432,14 +432,14 @@ func (j *lruJ) _throttle(usedPct int64) (err error) {
 // remove local copies that "belong" to different LRU joggers (space accounting may be temporarily not precise)
 func (j *lruJ) evictObj(lom *core.LOM) bool {
 	lom.Lock(true)
-	err := lom.Remove()
+	err := lom.RemoveObj()
 	lom.Unlock(true)
 	if err != nil {
 		nlog.Errorf("%s: failed to evict %s: %v", j, lom, err)
 		return false
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleSpace) {
-		nlog.Infof("%s: evicted %s, size=%d", j, lom, lom.SizeBytes(true /*not loaded*/))
+		nlog.Infof("%s: evicted %s, size=%d", j, lom, lom.Lsize(true /*not loaded*/))
 	}
 	return true
 }

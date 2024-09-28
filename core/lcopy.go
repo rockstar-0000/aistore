@@ -22,7 +22,7 @@ func (lom *LOM) whingeCopy() (yes bool) {
 	if !lom.IsCopy() {
 		return
 	}
-	msg := fmt.Sprintf("unexpected: %s([fqn=%s] [hrw=%s] %+v)", lom, lom.FQN, lom.HrwFQN, lom.md.copies)
+	msg := fmt.Sprintf("unexpected: %s([fqn=%s] [hrw=%s] %+v)", lom, lom.FQN, *lom.HrwFQN, lom.md.copies)
 	debug.Assert(false, msg)
 	nlog.Errorln(msg)
 	return true
@@ -32,12 +32,10 @@ func (lom *LOM) HasCopies() bool { return len(lom.md.copies) > 1 }
 func (lom *LOM) NumCopies() int  { return max(len(lom.md.copies), 1) } // metadata-wise
 
 // GetCopies returns all copies
-// NOTE: a) copies include lom.FQN aka "main repl.", and b) caller must take a lock
+// - copies include lom.FQN aka "main repl."
+// - caller must take a lock
 func (lom *LOM) GetCopies() fs.MPI {
-	debug.AssertFunc(func() bool {
-		rc, exclusive := lom.IsLocked()
-		return exclusive || rc > 0
-	})
+	debug.Assert(lom.isLockedRW(), lom.Cname())
 	return lom.md.copies
 }
 
@@ -120,8 +118,8 @@ func (lom *LOM) DelExtraCopies(fqn ...string) (removed bool, err error) {
 	if lom.whingeCopy() {
 		return
 	}
-	availablePaths := fs.GetAvail()
-	for _, mi := range availablePaths {
+	avail := fs.GetAvail()
+	for _, mi := range avail {
 		copyFQN := mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
 		if _, ok := lom.md.copies[copyFQN]; ok {
 			continue
@@ -145,11 +143,9 @@ func (lom *LOM) syncMetaWithCopies() (err error) {
 	if !lom.HasCopies() {
 		return nil
 	}
-	// NOTE: caller is responsible for write-locking
-	debug.AssertFunc(func() bool {
-		_, exclusive := lom.IsLocked()
-		return exclusive
-	})
+	// caller is responsible for write-locking
+	debug.Assert(lom.isLockedExcl(), lom.Cname())
+
 	if !lom.WritePolicy().IsImmediate() {
 		lom.md.makeDirty()
 		return nil
@@ -160,7 +156,12 @@ func (lom *LOM) syncMetaWithCopies() (err error) {
 		}
 		lom.delCopyMd(copyFQN)
 		if err1 := cos.Stat(copyFQN); err1 != nil && !os.IsNotExist(err1) {
-			T.FSHC(err, copyFQN) // TODO: notify scrubber
+			mi, _, err2 := fs.FQN2Mpath(copyFQN)
+			if err2 != nil {
+				nlog.Errorln("nested err:", err2, "fqn:", copyFQN)
+			} else {
+				T.FSHC(err, mi, copyFQN)
+			}
 		}
 	}
 	return
@@ -176,11 +177,11 @@ func (lom *LOM) RestoreToLocation() (exists bool) {
 		return true // nothing to do
 	}
 	var (
-		saved          = lom.md.pushrt()
-		availablePaths = fs.GetAvail()
-		buf, slab      = g.pmm.Alloc()
+		saved     = lom.md.pushrt()
+		avail     = fs.GetAvail()
+		buf, slab = g.pmm.Alloc()
 	)
-	for path, mi := range availablePaths {
+	for path, mi := range avail {
 		if path == lom.mi.Path {
 			continue
 		}
@@ -231,8 +232,10 @@ func (lom *LOM) Copy(mi *fs.Mountpath, buf []byte) (err error) {
 		cplom := AllocLOM(lom.ObjName)
 		defer FreeLOM(cplom)
 		if errExists = cplom.InitFQN(copyFQN, lom.Bucket()); errExists == nil {
-			if errExists = cplom.Load(false /*cache it*/, true /*locked*/); errExists == nil && cplom.Equal(lom) {
-				goto add
+			if errExists = cplom.Load(false /*cache it*/, true /*locked*/); errExists == nil {
+				if cplom.CheckEq(lom) == nil {
+					goto add // skip copying
+				}
 			}
 		}
 	}
@@ -327,7 +330,7 @@ func (lom *LOM) copy2fqn(dst *LOM, buf []byte) (err error) {
 		lom.md.copies[lom.FQN], dst.md.copies[lom.FQN] = lom.mi, lom.mi
 		if err = lom.syncMetaWithCopies(); err != nil {
 			if _, ok := lom.md.copies[dst.FQN]; !ok {
-				if errRemove := os.Remove(dst.FQN); errRemove != nil && !os.IsNotExist(errRemove) {
+				if errRemove := cos.RemoveFile(dst.FQN); errRemove != nil {
 					nlog.Errorln("nested err:", errRemove)
 				}
 			}
@@ -339,7 +342,7 @@ func (lom *LOM) copy2fqn(dst *LOM, buf []byte) (err error) {
 		}
 		err = lom.Persist()
 	} else if err = dst.Persist(); err != nil {
-		if errRemove := os.Remove(dst.FQN); errRemove != nil && !os.IsNotExist(errRemove) {
+		if errRemove := cos.RemoveFile(dst.FQN); errRemove != nil {
 			nlog.Errorln("nested err:", errRemove)
 		}
 	}
@@ -377,11 +380,11 @@ func (lom *LOM) leastUtilCopy() (fqn string) {
 // (compare with leastUtilCopy())
 func (lom *LOM) LeastUtilNoCopy() (mi *fs.Mountpath) {
 	var (
-		availablePaths = fs.GetAvail()
-		mpathUtils     = fs.GetAllMpathUtils()
-		minUtil        = int64(101) // to motivate the first assignment
+		avail      = fs.GetAvail()
+		mpathUtils = fs.GetAllMpathUtils()
+		minUtil    = int64(101) // to motivate the first assignment
 	)
-	for mpath, mpathInfo := range availablePaths {
+	for mpath, mpathInfo := range avail {
 		if lom.haveMpath(mpath) || mpathInfo.IsAnySet(fs.FlagWaitingDD) {
 			continue
 		}
@@ -411,8 +414,8 @@ func (lom *LOM) haveMpath(mpath string) bool {
 // - does not check `fstat` in either case (TODO: configurable or scrub);
 func (lom *LOM) ToMpath() (mi *fs.Mountpath, isHrw bool) {
 	var (
-		availablePaths = fs.GetAvail()
-		hrwMi, _, err  = fs.Hrw(lom.md.uname)
+		avail         = fs.GetAvail()
+		hrwMi, _, err = fs.Hrw(cos.UnsafeB(*lom.md.uname))
 	)
 	if err != nil {
 		nlog.Errorln(err)
@@ -430,7 +433,7 @@ func (lom *LOM) ToMpath() (mi *fs.Mountpath, isHrw bool) {
 	// take into account mountpath flags but stop short of `fstat`-ing
 	expCopies, gotCopies := int(mirror.Copies), 0
 	for fqn, mpi := range lom.md.copies {
-		mpathInfo, ok := availablePaths[mpi.Path]
+		mpathInfo, ok := avail[mpi.Path]
 		if !ok || mpathInfo.IsAnySet(fs.FlagWaitingDD) {
 			lom.delCopyMd(fqn)
 		} else {

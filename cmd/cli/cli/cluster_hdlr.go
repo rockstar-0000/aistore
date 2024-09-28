@@ -24,6 +24,17 @@ const (
 	roleTargetShort = "t"
 )
 
+// (compare with getLogUsage)
+const getCluLogsUsage = "download log archives from all clustered nodes (one TAR.GZ per node), e.g.:\n" +
+	indent4 + "\t - 'download-logs /tmp/www' - save log archives to /tmp/www directory\n" +
+	indent4 + "\t - 'download-logs --severity w' - errors and warnings to /tmp directory\n" +
+	indent4 + "\t   (see related: 'ais log show', 'ais log get')"
+
+const shutdownUsage = "shutdown a node, gracefully or immediately;\n" +
+	indent4 + "\tnote: upon shutdown the node won't be decommissioned - it'll remain in the cluster map\n" +
+	indent4 + "\tand can be manually restarted to rejoin the cluster at any later time;\n" +
+	indent4 + "\tsee also: 'ais advanced " + cmdRmSmap + "'"
+
 var (
 	clusterCmdsFlags = map[string][]cli.Flag{
 		cmdCluAttach: {},
@@ -34,7 +45,9 @@ var (
 		cmdShutdown: {
 			yesFlag,
 		},
-		cmdPrimary: {},
+		cmdPrimary: {
+			forceFlag,
+		},
 		cmdJoin: {
 			roleFlag,
 		},
@@ -130,11 +143,8 @@ var (
 				BashComplete: suggestProxies,
 			},
 			{
-				Name: cmdDownloadLogs,
-				Usage: "download log archives from all clustered nodes (one TAR.GZ per node), e.g.:\n" +
-					indent4 + "\t - 'download-logs /tmp/www' - save log archives to /tmp/www directory\n" +
-					indent4 + "\t - 'download-logs --severity w' - errors and warnings to system temporary directory\n" +
-					indent4 + "\t   (see related: 'ais log show', 'ais log get')",
+				Name:      cmdDownloadLogs,
+				Usage:     getCluLogsUsage,
 				ArgsUsage: "[OUT_DIR]",
 				Flags:     []cli.Flag{logSevFlag},
 				Action:    downloadAllLogs,
@@ -190,11 +200,8 @@ var (
 						BashComplete: suggestAllNodes,
 					},
 					{
-						Name: cmdShutdown,
-						Usage: "shutdown a node, gracefully or immediately;\n" +
-							indent4 + "\tnote: upon shutdown the node won't be decommissioned - it'll remain in the cluster map\n" +
-							indent4 + "\tand can be manually restarted to rejoin the cluster at any later time;\n" +
-							indent4 + "\tsee also: 'ais advanced " + cmdRmSmap + "'",
+						Name:         cmdShutdown,
+						Usage:        shutdownUsage,
 						ArgsUsage:    nodeIDArgument,
 						Flags:        clusterCmdsFlags[cmdShutdown+".node"],
 						Action:       nodeMaintShutDecommHandler,
@@ -479,7 +486,7 @@ func setPrimaryHandler(c *cli.Context) error {
 		return fmt.Errorf("%s is non-electable", sname)
 	}
 
-	err = api.SetPrimaryProxy(apiBP, node.ID(), false /*force*/)
+	err = api.SetPrimaryProxy(apiBP, node.ID(), flagIsSet(c, forceFlag))
 	if err == nil {
 		actionDone(c, sname+" is now a new primary")
 	}
@@ -492,7 +499,7 @@ func startClusterRebalanceHandler(c *cli.Context) (err error) {
 
 func stopClusterRebalanceHandler(c *cli.Context) error {
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, OnlyRunning: true}
-	_, snap, err := getXactSnap(&xargs)
+	_, snap, err := getAnyXactSnap(&xargs)
 	if err != nil {
 		return err
 	}

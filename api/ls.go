@@ -1,4 +1,4 @@
-// Package api provides Go based AIStore API/SDK over HTTP(S)
+// Package api provides native Go-based API/SDK over HTTP(S).
 /*
  * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
@@ -39,7 +39,8 @@ type (
 	ListArgs struct {
 		Callback  LsoCB
 		CallAfter time.Duration
-		Limit     uint
+		Header    http.Header // to optimize listing very large buckets, e.g.: Header.Set(apc.HdrInventory, "true")
+		Limit     int64
 	}
 )
 
@@ -83,7 +84,7 @@ func QueryBuckets(bp BaseParams, qbck cmn.QueryBcks, fltPresence int) (bool, err
 }
 
 // ListObjects returns a list of objects in a bucket - a slice of structures in the
-// `cmn.LsoResult` that look like `cmn.LsoEntry`.
+// `cmn.LsoRes` that look like `cmn.LsoEnt`.
 //
 // The `numObjects` argument is the maximum number of objects to be returned
 // (where 0 (zero) means returning all objects in the bucket).
@@ -103,32 +104,15 @@ func QueryBuckets(bp BaseParams, qbck cmn.QueryBcks, fltPresence int) (bool, err
 // listed page along with associated _continuation token_.
 //
 // See also:
-// - `ListObjectsPage`
-// - usage examples in CLI docs under docs/cli.
-func ListObjects(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (*cmn.LsoResult, error) {
-	var (
-		q    url.Values
-		path = apc.URLPathBuckets.Join(bck.Name)
-		hdr  = http.Header{
-			cos.HdrAccept:      []string{cos.ContentMsgPack},
-			cos.HdrContentType: []string{cos.ContentJSON},
-		}
-	)
-	bp.Method = http.MethodGet
+// - docs/cli/* for CLI usage examples
+// - `apc.LsoMsg`
+// - `api.ListObjectsPage`
+func ListObjects(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (*cmn.LsoRes, error) {
+	reqParams := lsoReq(bp, bck, &args)
 	if lsmsg == nil {
 		lsmsg = &apc.LsoMsg{}
-	}
-	q = bck.AddToQuery(q)
-	lsmsg.UUID = ""
-	lsmsg.ContinuationToken = ""
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = path
-		reqParams.Header = hdr
-		reqParams.Query = q
-
-		reqParams.buf = allocMbuf() // mem-pool msgpack
+	} else {
+		lsmsg.UUID, lsmsg.ContinuationToken = "", "" // new
 	}
 	lst, err := lso(reqParams, lsmsg, args)
 
@@ -137,11 +121,36 @@ func ListObjects(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (
 	return lst, err
 }
 
+func lsoReq(bp BaseParams, bck cmn.Bck, args *ListArgs) *ReqParams {
+	hdr := args.Header
+	if hdr == nil {
+		hdr = make(http.Header, 2)
+	}
+
+	// NOTE:
+	// unlike S3 API (that aistore also provides), native Go-based API always utilizes
+	// message pack serialization (of the list-objects results), with performance
+	// improvement that proved to be _significant_, esp. in large-scale benchmarks
+
+	hdr.Set(cos.HdrAccept, cos.ContentMsgPack)
+	hdr.Set(cos.HdrContentType, cos.ContentJSON)
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
+		reqParams.Header = hdr
+		reqParams.Query = bck.NewQuery()
+		reqParams.buf = allocMbuf() // msgpack
+	}
+	return reqParams
+}
+
 // `toRead` holds the remaining number of objects to list (that is, unless we are listing
 // the entire bucket). Each iteration lists a page of objects and reduces `toRead`
 // accordingly. When the latter gets below page size, we perform the final
 // iteration for the reduced page.
-func lso(reqParams *ReqParams, lsmsg *apc.LsoMsg, args ListArgs) (lst *cmn.LsoResult, _ error) {
+func lso(reqParams *ReqParams, lsmsg *apc.LsoMsg, args ListArgs) (lst *cmn.LsoRes, _ error) {
 	var (
 		ctx     *LsoCounter
 		toRead  = args.Limit
@@ -182,16 +191,16 @@ func lso(reqParams *ReqParams, lsmsg *apc.LsoMsg, args ListArgs) (lst *cmn.LsoRe
 		if page.ContinuationToken == "" { // listed all pages
 			break
 		}
-		toRead = uint(max(int(toRead)-len(page.Entries), 0))
+		toRead = max(toRead-int64(len(page.Entries)), 0)
 		lsmsg.ContinuationToken = page.ContinuationToken
 	}
 	return lst, nil
 }
 
 // w/ limited retry and increasing timeout
-func lsoPage(reqParams *ReqParams) (_ *cmn.LsoResult, err error) {
-	for i := 0; i < maxListPageRetries; i++ {
-		page := &cmn.LsoResult{}
+func lsoPage(reqParams *ReqParams) (_ *cmn.LsoRes, err error) {
+	for range maxListPageRetries {
+		page := &cmn.LsoRes{}
 		if _, err = reqParams.DoReqAny(page); err == nil {
 			return page, nil
 		}
@@ -208,31 +217,20 @@ func lsoPage(reqParams *ReqParams) (_ *cmn.LsoResult, err error) {
 // ListObjectsPage returns the first page of bucket objects.
 // On success the function updates `lsmsg.ContinuationToken` which client then can reuse
 // to fetch the next page.
-// See also: CLI and CLI usage examples
-// See also: `apc.LsoMsg`
-// See also: `api.ListObjectsInvalidateCache`
-// See also: `api.ListObjects`
-func ListObjectsPage(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg) (*cmn.LsoResult, error) {
-	bp.Method = http.MethodGet
+// See also:
+// - docs/cli/* for CLI usage examples
+// - `apc.LsoMsg`
+// - `api.ListObjects`
+func ListObjectsPage(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (*cmn.LsoRes, error) {
+	reqParams := lsoReq(bp, bck, &args)
 	if lsmsg == nil {
 		lsmsg = &apc.LsoMsg{}
 	}
 	actMsg := apc.ActMsg{Action: apc.ActList, Value: lsmsg}
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
-		reqParams.Header = http.Header{
-			cos.HdrAccept:      []string{cos.ContentMsgPack},
-			cos.HdrContentType: []string{cos.ContentJSON},
-		}
-		reqParams.Query = bck.AddToQuery(url.Values{})
-		reqParams.Body = cos.MustMarshal(actMsg)
+	reqParams.Body = cos.MustMarshal(actMsg)
 
-		reqParams.buf = allocMbuf() // mem-pool msgpack
-	}
 	// no need to preallocate bucket entries slice (msgpack does it)
-	page := &cmn.LsoResult{}
+	page := &cmn.LsoRes{}
 	_, err := reqParams.DoReqAny(page)
 	freeMbuf(reqParams.buf)
 	FreeRp(reqParams)

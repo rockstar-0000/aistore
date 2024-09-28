@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains implementation of the top-level `show` command.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -35,9 +35,9 @@ type (
 	}
 
 	targetMpath struct {
-		DaemonID  string
-		Mpl       *apc.MountpathList
-		TargetCDF fs.TargetCDF
+		DaemonID string
+		Mpl      *apc.MountpathList
+		Tcdf     fs.Tcdf
 	}
 )
 
@@ -51,6 +51,7 @@ var (
 			noHeaderFlag,
 			verboseJobFlag,
 			unitsFlag,
+			dateTimeFlag,
 			// download and dsort only
 			progressFlag,
 			dsortLogFlag,
@@ -60,13 +61,15 @@ var (
 			allPropsFlag,
 			objNotCachedPropsFlag,
 			noHeaderFlag,
-			jsonFlag,
+			unitsFlag,
 			silentFlag,
 		},
 		cmdCluster: append(
 			longRunFlags,
 			jsonFlag,
 			noHeaderFlag,
+			unitsFlag,
+			nonverboseFlag,
 		),
 		cmdSmap: append(
 			longRunFlags,
@@ -110,6 +113,7 @@ var (
 			showCmdRemoteAIS,
 			showCmdJob,
 			showCmdLog,
+			showTLS,
 		},
 	}
 
@@ -128,7 +132,7 @@ var (
 	}
 	showCmdObject = cli.Command{
 		Name:         cmdObject,
-		Usage:        "show object details",
+		Usage:        "show object properties",
 		ArgsUsage:    objectArgument,
 		Flags:        showCmdsFlags[cmdObject],
 		Action:       showObjectHandler,
@@ -136,7 +140,7 @@ var (
 	}
 	showCmdCluster = cli.Command{
 		Name:         cmdCluster,
-		Usage:        "show cluster nodes and utilization",
+		Usage:        "main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)",
 		ArgsUsage:    showClusterArgument,
 		Flags:        showCmdsFlags[cmdCluster],
 		Action:       showClusterHandler,
@@ -144,7 +148,7 @@ var (
 		Subcommands: []cli.Command{
 			{
 				Name:         cmdSmap,
-				Usage:        "show Smap (cluster map)",
+				Usage:        "show cluster map (Smap)",
 				ArgsUsage:    optionalNodeIDArgument,
 				Flags:        showCmdsFlags[cmdSmap],
 				Action:       showSmapHandler,
@@ -152,7 +156,7 @@ var (
 			},
 			{
 				Name:         cmdBMD,
-				Usage:        "show BMD (bucket metadata)",
+				Usage:        "show bucket metadata (BMD)",
 				ArgsUsage:    optionalNodeIDArgument,
 				Flags:        showCmdsFlags[cmdBMD],
 				Action:       showBMDHandler,
@@ -376,7 +380,11 @@ func showClusterHandler(c *cli.Context) error {
 	}
 	if c.NArg() > 1 {
 		arg := c.Args().Get(1)
-		if sid != "" { // not "what"
+		if sid != "" { // already set above, must be the last arg
+			if err := errTailArgsContainFlag(c.Args()[1:]); err != nil {
+				tip := reorderTailArgs("ais show cluster", c.Args()[1:], sid)
+				return fmt.Errorf("%v (tip: try '%s')", err, tip)
+			}
 			return incorrectUsageMsg(c, "", arg)
 		}
 		node, _, err := getNode(c, arg)
@@ -384,6 +392,10 @@ func showClusterHandler(c *cli.Context) error {
 			return err
 		}
 		sid, daeType = node.ID(), node.Type()
+		if err := errTailArgsContainFlag(c.Args()[2:]); err != nil {
+			tip := reorderTailArgs("ais show cluster", c.Args()[2:], daeType, sid)
+			return fmt.Errorf("%v (tip: try '%s')", err, tip)
+		}
 	}
 
 	setLongRunParams(c)
@@ -396,10 +408,8 @@ func showClusterHandler(c *cli.Context) error {
 	if err != nil {
 		return V(err)
 	}
-	if sid != "" {
-		return cluDaeStatus(c, smap, tstatusMap, pstatusMap, cluConfig, sid)
-	}
-	return cluDaeStatus(c, smap, tstatusMap, pstatusMap, cluConfig, what)
+
+	return cluDaeStatus(c, smap, tstatusMap, pstatusMap, cluConfig, cos.Left(sid, what))
 }
 
 func xactList(c *cli.Context, xargs *xact.ArgsMsg, caption bool) (int, error) {
@@ -409,7 +419,7 @@ func xactList(c *cli.Context, xargs *xact.ArgsMsg, caption bool) (int, error) {
 		xargs.OnlyRunning = false
 	}
 
-	xs, err := queryXactions(xargs)
+	xs, _, err := queryXactions(xargs, false /*summarize*/)
 	if err != nil {
 		return 0, err
 	}
@@ -491,12 +501,13 @@ func xlistByKindID(c *cli.Context, xargs *xact.ArgsMsg, caption bool, xs xact.Mu
 		usejs       = flagIsSet(c, jsonFlag)
 		hideHeader  = flagIsSet(c, noHeaderFlag)
 		units, errU = parseUnitsFlag(c, unitsFlag)
+		datedTime   = flagIsSet(c, dateTimeFlag)
 	)
 	if errU != nil {
 		actionWarn(c, errU.Error())
 		units = ""
 	}
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(units), UseJSON: usejs}
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(units, datedTime), UseJSON: usejs}
 	switch xargs.Kind {
 	case apc.ActECGet:
 		if hideHeader {
@@ -569,7 +580,8 @@ func showObjectHandler(c *cli.Context) error {
 	if _, err := headBucket(bck, true /* don't add */); err != nil {
 		return err
 	}
-	return showObjProps(c, bck, object)
+	_, err = showObjProps(c, bck, object)
+	return err
 }
 
 func showBckPropsHandler(c *cli.Context) error {
@@ -714,7 +726,18 @@ func showClusterConfig(c *cli.Context, section string) error {
 	if usejs {
 		return teb.Print(cluConfig, "", teb.Jopts(usejs))
 	}
-	flat := flattenJSON(cluConfig, section)
+
+	var flat nvpairList
+	if section != "backend" {
+		flat = flattenJSON(cluConfig, section)
+	} else {
+		backends, err := api.GetConfiguredBackends(apiBP)
+		if err != nil {
+			return V(err)
+		}
+		flat = flattenBackends(backends)
+	}
+
 	if flagIsSet(c, noHeaderFlag) {
 		err = teb.Print(flat, teb.PropValTmplNoHdr)
 	} else {
@@ -770,6 +793,10 @@ func showNodeConfig(c *cli.Context) error {
 		}
 	}
 
+	if section == "backend" {
+		// NOTE compare with showClusterConfig above (ref 080235)
+		usejs = true
+	}
 	if usejs {
 		opts := teb.Jopts(true)
 		warn := "option " + qflprn(jsonFlag) + " won't show node <=> cluster configuration differences, if any."
@@ -840,6 +867,7 @@ func showNodeConfig(c *cli.Context) error {
 	return err
 }
 
+// TODO -- FIXME: check backend.conf <new JSON formatted value>
 func showRemoteAISHandler(c *cli.Context) error {
 	const (
 		warnRemAisOffline = `remote ais cluster at %s is currently unreachable.

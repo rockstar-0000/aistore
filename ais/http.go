@@ -13,10 +13,10 @@ import (
 
 type global struct {
 	netServ struct {
-		pub     *netServer
-		control *netServer
-		data    *netServer
-		pub2    *netServer
+		pub      *netServer
+		pubExtra []*netServer
+		control  *netServer
+		data     *netServer
 	}
 	client struct {
 		control *http.Client // http client for intra-cluster comm
@@ -27,7 +27,7 @@ type global struct {
 var g global
 
 func handlePub(path string, handler func(http.ResponseWriter, *http.Request)) {
-	for _, v := range allHTTPverbs {
+	for _, v := range htverbs {
 		g.netServ.pub.muxers[v].HandleFunc(path, handler)
 		if !cos.IsLastB(path, '/') {
 			g.netServ.pub.muxers[v].HandleFunc(path+"/", handler)
@@ -36,7 +36,7 @@ func handlePub(path string, handler func(http.ResponseWriter, *http.Request)) {
 }
 
 func handleControl(path string, handler func(http.ResponseWriter, *http.Request)) {
-	for _, v := range allHTTPverbs {
+	for _, v := range htverbs {
 		g.netServ.control.muxers[v].HandleFunc(path, handler)
 		if !cos.IsLastB(path, '/') {
 			g.netServ.control.muxers[v].HandleFunc(path+"/", handler)
@@ -45,7 +45,7 @@ func handleControl(path string, handler func(http.ResponseWriter, *http.Request)
 }
 
 func handleData(path string, handler func(http.ResponseWriter, *http.Request)) {
-	for _, v := range allHTTPverbs {
+	for _, v := range htverbs {
 		g.netServ.data.muxers[v].HandleFunc(path, handler)
 		if !cos.IsLastB(path, '/') {
 			g.netServ.data.muxers[v].HandleFunc(path+"/", handler)
@@ -94,8 +94,8 @@ func initDataClient(config *cmn.Config) {
 func shuthttp() {
 	config := cmn.GCO.Get()
 	g.netServ.pub.shutdown(config)
-	if g.netServ.pub2 != nil {
-		g.netServ.pub2.shutdown(config)
+	for _, server := range g.netServ.pubExtra {
+		server.shutdown(config)
 	}
 	if config.HostNet.UseIntraControl {
 		g.netServ.control.shutdown(config)

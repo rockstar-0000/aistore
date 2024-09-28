@@ -15,7 +15,7 @@ In this [white paper](https://arxiv.org/abs/2001.01858) we describe AIStore (AIS
 
 See also:
 
-* [blog](https://aiatscale.org/blog)
+* [blog](https://aistore.nvidia.com/blog)
 * [white paper](https://arxiv.org/abs/2001.01858)
 * [at-a-glance poster](https://storagetarget.files.wordpress.com/2019/12/deep-learning-large-scale-phys-poster-1.pdf)
 
@@ -25,6 +25,7 @@ The rest of this document is structured as follows:
 - [Terminology](#terminology)
 - [Design Philosophy](#design-philosophy)
 - [Key Concepts and Diagrams](#key-concepts-and-diagrams)
+- [AIStore API](#aistore-api)
 - [Traffic Patterns](#traffic-patterns)
 - [Read-after-write consistency](#read-after-write-consistency)
 - [Open Format](#open-format)
@@ -56,9 +57,13 @@ All user data is equally distributed (or [balanced](/docs/rebalance.md)) across 
 
 ## Terminology
 
-* [Backend Provider](providers.md) - an abstraction, and simultaneously an API-supported option, that allows to delineate between "remote" and "local" buckets with respect to a given AIS cluster.
+* **Target** - a storage node. To store user data, targets utilize **mountpaths** (see next). In the docs and the code, instead of saying something like "storage node in an aistore cluster" we simply say: "target."
 
-* [Unified Global Namespace](providers.md) - AIS clusters *attached* to each other, effectively, form a super-cluster providing unified global namespace whereby all buckets and all objects of all included clusters are uniformly accessible via any and all individual access points (of those clusters).
+* **Proxy** - a **gateway** providing [API](#aistore-api) access point. Proxies are diskless - they do not have direct access to user data, and do not "see" user data in-flight. One of the proxies is elected, or designated, as the _primary_ (or leader) of the cluster. There may be any number of ais proxies/gateways (but only one _primary_ at any given time).
+
+> AIS proxy/gateway implements RESTful APIs, both [native](#aistore-api) and S3 compatible. Upon _primary_ failure, remaining proxies collaborate with each other to perform majority-voted HA failover. The terms "proxy" and "gateway" are used interchangeably.
+
+> In AIS cluster, there is no correlation between the numbers of proxies and targets, although for symmetry we usually deploy one proxy for each target (storage) node.
 
 * [Mountpath](configuration.md) - a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS can fully own and utilize (to store user data and system metadata). Note that any given disk (or RAID) can have (at most) one mountpath - meaning **no disk sharing**. Secondly, mountpath directories cannot be nested. Further:
    - a mountpath can be temporarily disabled and (re)enabled;
@@ -66,7 +71,11 @@ All user data is equally distributed (or [balanced](/docs/rebalance.md)) across 
    - it is safe to execute the 4 listed operations (enable, disable, attach, detach) at any point during runtime;
    - in a typical deployment, the total number of mountpaths would compute as a direct product of (number of storage targets) x (number of disks in each target).
 
-* [Xaction](/xact/README.md) - asynchronous batch operations that may take many seconds (minutes, hours, etc.) to execute - are called *eXtended actions* or simply *xactions*. CLI and [CLI documentation](/docs/cli) refers to such operations as **jobs** - the more familiar term that can be used interchangeably. Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, archiving multiple objects, copying buckets, and many more. All [eXtended actions](/xact/README.md) support generic [API](/api/xaction.go) and [CLI](/docs/cli/job.md#show-job-statistics) to show both common counters (byte and object numbers) as well as operation-specific extended statistics.
+* [Backend Provider](providers.md) - an abstraction, and simultaneously an API-supported option, that allows to delineate between "remote" and "local" buckets with respect to a given AIS cluster.
+
+* [Unified Global Namespace](providers.md) - AIS clusters *attached* to each other, effectively, form a super-cluster providing unified global namespace whereby all buckets and all objects of all included clusters are uniformly accessible via any and all individual access points (of those clusters).
+
+* [Xaction](https://github.com/NVIDIA/aistore/blob/main/xact/README.md) - asynchronous batch operations that may take many seconds (minutes, hours, etc.) to execute - are called *eXtended actions* or simply *xactions*. CLI and [CLI documentation](/docs/cli) refers to such operations as **jobs** - the more familiar term that can be used interchangeably. Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, archiving multiple objects, copying buckets, and many more. All [eXtended actions](https://github.com/NVIDIA/aistore/blob/main/xact/README.md) support generic [API](/api/xaction.go) and [CLI](/docs/cli/job.md#show-job-statistics) to show both common counters (byte and object numbers) as well as operation-specific extended statistics.
 
 ## Design Philosophy
 
@@ -102,6 +111,20 @@ If (compute + storage) rack is a *unit of deployment*, it may as well look as fo
 Finally, AIS target provides a number of storage services with [S3-like RESTful API](http_api.md) on top and a MapReduce layer that we call [dSort](#dsort).
 
 ![AIS target block diagram](images/ais-target-20-block.png)
+
+## AIStore API
+
+In addition to industry-standard [S3](/docs/s3compat.md), AIS provides its own (value-added) native API that can be (conveniently) called directly from Go and Python programs:
+
+- [Go API](https://github.com/NVIDIA/aistore/tree/main/api)
+- [Python API](https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk)
+- [HTTP REST](/docs/http_api.md)
+
+For Amazon S3 compatibility and related topics, see also:
+  - [`s3cmd` client](/docs/s3cmd.md)
+  - [S3 compatibility](/docs/s3compat.md)
+  - [Presigned S3 requests](/docs/s3compat.md#presigned-s3-requests)
+  - [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch)
 
 ## Traffic Patterns
 
@@ -167,9 +190,9 @@ Notwithstanding, AIS stores and then maintains object replicas, erasure-coded sl
 
 Common way to use AIStore include the most fundamental and, often, the very first step: populating AIS cluster with an existing dataset, or datasets. Those (datasets) can come from remote buckets (AWS, Google Cloud, Azure), HDFS directories, NFS shares, local files, or any vanilla HTTP(S) locations.
 
-To this end, AIS provides 6 (six) easy ways ranging from the conventional on-demand caching to *promoting* colocated files and directories, and more.
+To this end, AIS provides 6 (six) easy ways ranging from the conventional on-demand caching to *promoting* colocated files and directories.
 
-> Related references and examples include this [technical blog](https://aiatscale.org/blog/2021/12/07/cp-files-to-ais) that shows how to copy a file-based dataset in two easy steps.
+> Related references and examples include this [technical blog](https://aistore.nvidia.com/blog/2021/12/07/cp-files-to-ais) that shows how to copy a file-based dataset in two easy steps.
 
 1. [Cold GET](#existing-datasets-cold-get)
 2. [Prefetch](#existing-datasets-batch-prefetch)
@@ -178,8 +201,8 @@ To this end, AIS provides 6 (six) easy ways ranging from the conventional on-dem
 5. [Promote local or shared files](#promote-local-or-shared-files)
 6. [Backend Bucket](bucket.md#backend-bucket)
 7. [Download very large objects (BLOBs)](/docs/cli/blob-downloader.md)
-8. [Copy remote bucket](/docs/cli/bucket.md#copy-bucket)
-9. [Copy multiple remote objects](/docs/cli/bucket.md#copy-multiple-objects)
+8. [Copy remote bucket](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+9. [Copy multiple remote objects](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 In particular:
 
@@ -206,24 +229,6 @@ For CLI usage, see:
 But what if the dataset in question exists in the form of (vanilla) HTTP/HTTPS URL(s)? What if there's a popular bucket in, say, Google Cloud that contains images that you'd like to bring over into your Data Center and make available locally for AI researchers?
 
 For these and similar use cases we have [AIS Downloader](/docs/downloader.md) - an integrated tool that can execute massive download requests, track their progress, and populate AIStore directly from the Internet.
-
-### Existing Datasets: HTTP(S) Datasets
-
-AIS can also be designated as HTTP proxy vis-à-vis 3rd party object storages. This mode of operation requires:
-
-1. HTTP(s) client side: set the `http_proxy` (`https_proxy` - for HTTPS) environment
-2. Disable proxy for AIS cluster IP addresses/hostnames (for `curl` use option `--noproxy`)
-
-Note that `http_proxy` is supported by most UNIX systems and is recognized by most (but not all) HTTP clients:
-
-WARNING: Currently HTTP(S) based datasets can only be used with clients which support an option of overriding the proxy for certain hosts (for e.g. `curl ... --noproxy=$(curl -s G/v1/cluster?what=target_ips)`).
-If used otherwise, we get stuck in a redirect loop, as the request to target gets redirected via proxy.
-
-```console
-$ export http_proxy=<AIS proxy IPv4 or hostname>
-```
-
-In combination, these two settings have an effect of redirecting all **unmodified** client-issued HTTP(S) requests to the AIS proxy/gateway with subsequent execution transparently from the client perspective. AIStore will on the fly create a bucket to store and cache HTTP(S) reachable files all the while supporting the entire gamut of functionality including ETL. Examples for HTTP(S) datasets can be found in [this readme](bucket.md#public-https-dataset)
 
 ### Promote local or shared files
 
@@ -373,11 +378,11 @@ By design, dSort tightly integrates with the AIS-object to take full advantage o
 AIStore includes an easy-to-use management-and-monitoring facility called [AIS CLI](/docs/cli.md). Once [installed](/docs/cli.md#getting-started), to start using it, simply execute:
 
  ```console
-$ export AIS_ENDPOINT=http://G
+$ export AIS_ENDPOINT=http://ais-gateway:port
 $ ais --help
  ```
 
-where `G` (above) denotes a `hostname:port` address of any AIS gateway (for developers it'll often be `localhost:8080`). Needless to say, the "exporting" must be done only once.
+where `ais-gateway:port` (above) denotes a `hostname:port` address of any AIS gateway (for developers it'll often be `localhost:8080`). Needless to say, the "exporting" must be done only once.
 
 One salient feature of AIS CLI is its Bash style [auto-completions](/docs/cli.md#ais-cli-shell-auto-complete) that allow users to easily navigate supported operations and options by simply pressing the TAB key:
 

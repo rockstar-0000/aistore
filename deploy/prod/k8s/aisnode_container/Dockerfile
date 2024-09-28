@@ -2,46 +2,37 @@
 # Dockerfile to build an aisnode Docker image
 #
 
-FROM golang:1.21 AS builder
+ARG INSTALLER_IMAGE=debian:bookworm
+ARG BUILDER_IMAGE=golang:1.22
+ARG BASE_IMAGE=gcr.io/distroless/base-debian12
+
+
+FROM --platform=${TARGETPLATFORM:-linux/amd64} ${INSTALLER_IMAGE} as installer
+
+RUN apt-get update -yq && apt-get install -y --no-install-recommends \
+    ca-certificates
+
+
+FROM --platform=${BUILDPLATFORM:-linux/amd64} ${BUILDER_IMAGE} AS builder
+
+WORKDIR /go/src/aistore
+
+COPY . .
 
 ARG mode
 ARG providers
+ARG TARGETOS
+ARG TARGETARCH
 
-ENV GOPATH="/go"
-ENV PATH="${GOPATH}/bin:${PATH}"
-
-RUN mkdir -p /go/src/github.com/NVIDIA/aistore
-WORKDIR /go/src/github.com/NVIDIA/aistore
-COPY . .
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    MODE=${mode} AIS_BACKEND_PROVIDERS=${providers:-"aws gcp"} \
+    make node
 
 
-RUN MODE=${mode} AIS_BACKEND_PROVIDERS=${providers:-"aws gcp"} make node cli xmeta
+FROM --platform=${TARGETPLATFORM:-linux/amd64} ${BASE_IMAGE} as base
 
-FROM ubuntu:22.04
+COPY --from=installer /etc/ssl/certs /etc/ssl/certs
 
-RUN apt-get update -yq && apt-get dist-upgrade -y
-RUN apt-get install -y --no-install-recommends \
-	sysstat \
-	attr \
-	git \
-	make \
-	coreutils \
-	lsof \
-	util-linux \
-	bash \
-	ca-certificates \
-	curl
+COPY --from=builder /go/bin/aisnode /usr/bin/aisnode
 
-RUN cd /opt && git clone https://github.com/etsy/statsd.git
-
-RUN mkdir -p /usr/local/bin
-ENV PATH="/usr/local/bin:${PATH}"
-
-# Copy over the binaries.
-COPY --from=builder /go/bin /usr/local/bin/
-
-COPY deploy/prod/k8s/aisnode_container/ais_docker_start.sh /ais_docker_start.sh
-COPY deploy/prod/k8s/aisnode_container/ais_readiness.sh /ais_readiness.sh
-RUN chmod a+x /ais_docker_start.sh /ais_readiness.sh
-
-CMD ["bash", "-c", "/ais_docker_start.sh"]
+ENTRYPOINT ["aisnode"]

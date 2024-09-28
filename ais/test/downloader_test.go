@@ -224,16 +224,18 @@ func abortDownload(t *testing.T, id string) {
 }
 
 func verifyProps(t *testing.T, bck cmn.Bck, objName string, size int64, version string) *cmn.ObjectProps {
-	objProps, err := api.HeadObject(tools.BaseAPIParams(), bck, objName, apc.FltPresent, false /*silent*/)
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+	objProps, err := api.HeadObject(tools.BaseAPIParams(), bck, objName, hargs)
 	tassert.CheckFatal(t, err)
 
 	tassert.Errorf(
 		t, objProps.Size == size,
 		"size mismatch (%d vs %d)", objProps.Size, size,
 	)
+	v := objProps.Version()
 	tassert.Errorf(
-		t, objProps.Ver == version || objProps.Ver == "",
-		"version mismatch (%s vs %s)", objProps.Ver, version,
+		t, v == version || v == "",
+		"version mismatch (%q vs %q)", v, version,
 	)
 	return objProps
 }
@@ -532,7 +534,7 @@ func TestDownloadRemote(t *testing.T) {
 			tlog.Logf("putting %d objects into remote bucket %s...\n", fileCnt, test.srcBck)
 
 			expectedObjs := make([]string, 0, fileCnt)
-			for i := 0; i < fileCnt; i++ {
+			for i := range fileCnt {
 				reader, err := readers.NewRand(256, cos.ChecksumNone)
 				tassert.CheckFatal(t, err)
 
@@ -874,7 +876,7 @@ func TestDownloadMountpath(t *testing.T) {
 
 	// Prepare objects to be downloaded. Multiple objects to make
 	// sure that at least one of them gets into target with disabled mountpath.
-	for i := 0; i < objsCnt; i++ {
+	for i := range objsCnt {
 		m[strconv.FormatInt(int64(i), 10)] = "https://raw.githubusercontent.com/NVIDIA/aistore/main/README.md"
 	}
 
@@ -899,7 +901,7 @@ func TestDownloadMountpath(t *testing.T) {
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, len(mpathList.Available) >= 2, "%s requires 2 or more mountpaths", t.Name())
 
-	mpathID := cos.NowRand().Intn(len(mpathList.Available))
+	mpathID := cos.NowRand().IntN(len(mpathList.Available))
 	removeMpath := mpathList.Available[mpathID]
 	tlog.Logf("Disabling mountpath %q at %s\n", removeMpath, selectedTarget.StringEx())
 	err = api.DisableMountpath(baseParams, selectedTarget, removeMpath, true /*dont-resil*/)
@@ -928,9 +930,18 @@ func TestDownloadMountpath(t *testing.T) {
 	tassert.CheckFatal(t, err)
 	tlog.Logf("Started download job %s, waiting for it to finish\n", id2)
 
+	time.Sleep(3 * time.Second)
 	waitForDownload(t, id2, time.Minute)
 	objs, err = tools.ListObjectNames(proxyURL, bck, "", 0, true /*cached*/)
 	tassert.CheckError(t, err)
+
+	if len(objs) == 0 {
+		tlog.Logln("Listed zero objects - waiting a bit, retrying...")
+		time.Sleep(8 * time.Second)
+		objs, err = tools.ListObjectNames(proxyURL, bck, "", 0, true /*cached*/)
+		tassert.CheckError(t, err)
+	}
+
 	tassert.Fatalf(t, len(objs) == objsCnt, "Expected %d objects to be present, got: %d", objsCnt, len(objs))
 }
 
@@ -1359,7 +1370,7 @@ func TestDownloadJobConcurrency(t *testing.T) {
 		concurrentJobs bool
 		resp1, resp2   *dload.StatusResp
 	)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		resp1, err = api.DownloadStatus(baseParams, id1, false /*onlyActive*/)
 		tassert.CheckFatal(t, err)
 

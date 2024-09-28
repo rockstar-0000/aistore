@@ -7,7 +7,6 @@ package ais
 import (
 	"fmt"
 	"net/http"
-	"strconv"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -120,9 +119,9 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 		debug.Assert(xact.IsValidKind(xargs.Kind), xargs.String())
 		if xargs.Kind == apc.ActPrefetchObjects {
 			// TODO: consider adding `Value any` to generic `xact.ArgsMsg`
-			errCode, err := t.runPrefetch(xargs.ID, bck, &apc.PrefetchMsg{})
+			ecode, err := t.runPrefetch(xargs.ID, bck, &apc.PrefetchMsg{})
 			if err != nil {
-				t.writeErr(w, r, err, errCode)
+				t.writeErr(w, r, err, ecode)
 			}
 			return
 		}
@@ -132,9 +131,8 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 			t.writeErr(w, r, err)
 			return
 		}
-		if l := len(xid); l > 0 {
-			w.Header().Set(cos.HdrContentLength, strconv.Itoa(l))
-			w.Write([]byte(xid))
+		if xid != "" {
+			writeXid(w, xid)
 		}
 	case apc.ActXactStop:
 		debug.Assert(xact.IsValidKind(xargs.Kind) || xact.IsValidUUID(xargs.ID), xargs.String())
@@ -236,8 +234,11 @@ func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck, msg *apc.ActMsg) (xid
 		lom := core.AllocLOM(msg.Name)
 		err := lom.InitBck(&args.Bck)
 		if err == nil {
-			// default tunables when executing via x-start API
-			xid, _, err = t.blobdl(lom, nil /*oa*/, &apc.BlobMsg{}, nil /*writer*/)
+			params := &core.BlobParams{
+				Lom: lom,
+				Msg: &apc.BlobMsg{}, // default tunables when executing via x-start API
+			}
+			xid, _, err = t.blobdl(params, nil /*oa*/)
 		}
 		if err != nil {
 			core.FreeLOM(lom)
@@ -267,7 +268,7 @@ func (t *target) httpxpost(w http.ResponseWriter, r *http.Request) {
 		err    error
 		xctn   core.Xact
 		amsg   *apc.ActMsg
-		tcomsg cmn.TCObjsMsg
+		tcomsg cmn.TCOMsg
 	)
 	if amsg, err = t.readActionMsg(w, r); err != nil {
 		return

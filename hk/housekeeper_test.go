@@ -1,25 +1,25 @@
 // Package hk provides mechanism for registering cleanup
 // functions which are invoked at specified intervals.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package hk_test
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/hk"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Housekeeper", func() {
 	It("should register the callback and fire it", func() {
 		fired := false
-		hk.Reg("foo", func() time.Duration {
+		hk.Reg("foo", func(int64) time.Duration {
 			fired = true
 			return time.Second
 		}, 0)
@@ -37,7 +37,7 @@ var _ = Describe("Housekeeper", func() {
 
 	It("should register the callback and fire it after initial interval", func() {
 		fired := false
-		hk.Reg("foo", func() time.Duration {
+		hk.Reg("foo", func(int64) time.Duration {
 			fired = true
 			return time.Second
 		}, time.Second)
@@ -52,12 +52,12 @@ var _ = Describe("Housekeeper", func() {
 
 	It("should register multiple callbacks and fire it in correct order", func() {
 		fired := make([]bool, 2)
-		hk.Reg("foo", func() time.Duration {
+		hk.Reg("foo", func(int64) time.Duration {
 			fired[0] = true
 			return 2 * time.Second
 		}, 0)
 		defer hk.Unreg("foo")
-		hk.Reg("bar", func() time.Duration {
+		hk.Reg("bar", func(int64) time.Duration {
 			fired[1] = true
 			return time.Second + 500*time.Millisecond
 		}, 0)
@@ -65,7 +65,7 @@ var _ = Describe("Housekeeper", func() {
 
 		time.Sleep(20 * time.Millisecond)
 		// "foo" and "bar" should fire at the start (no initial interval)
-		for idx := 0; idx < len(fired); idx++ {
+		for idx := range fired {
 			Expect(fired[idx]).To(BeTrue())
 			fired[idx] = false
 		}
@@ -96,11 +96,11 @@ var _ = Describe("Housekeeper", func() {
 
 	It("should unregister callback", func() {
 		fired := make([]bool, 2)
-		hk.Reg("bar", func() time.Duration {
+		hk.Reg("bar", func(int64) time.Duration {
 			fired[0] = true
 			return 400 * time.Millisecond
 		}, 400*time.Millisecond)
-		hk.Reg("foo", func() time.Duration {
+		hk.Reg("foo", func(int64) time.Duration {
 			fired[1] = true
 			return 200 * time.Millisecond
 		}, 200*time.Millisecond)
@@ -119,13 +119,13 @@ var _ = Describe("Housekeeper", func() {
 	})
 
 	It("should unregister callback that returns UnregInterval", func() {
-		for i := 0; i < 3; i++ {
+		for range 3 {
 			fired := make([]bool, 2)
-			hk.Reg("bar", func() time.Duration {
+			hk.Reg("bar", func(int64) time.Duration {
 				fired[0] = true
 				return 400 * time.Millisecond
 			}, 400*time.Millisecond)
-			hk.Reg("foo", func() time.Duration {
+			hk.Reg("foo", func(int64) time.Duration {
 				fired[1] = true
 				return hk.UnregInterval
 			}, 100*time.Millisecond)
@@ -147,7 +147,7 @@ var _ = Describe("Housekeeper", func() {
 		var fired bool
 		f := func(name string) {
 			Expect(fired).To(BeFalse())
-			hk.Reg(name, func() time.Duration {
+			hk.Reg(name, func(int64) time.Duration {
 				fired = true
 				return 100 * time.Millisecond
 			}, 100*time.Millisecond)
@@ -181,7 +181,7 @@ var _ = Describe("Housekeeper", func() {
 			fired   = make([]int32, actionCnt)
 		)
 
-		for i := 0; i < actionCnt; i++ {
+		for i := range actionCnt {
 			durs = append(durs, action{
 				d:       50*time.Millisecond + time.Duration(40*i)*time.Millisecond,
 				origIdx: i,
@@ -193,9 +193,9 @@ var _ = Describe("Housekeeper", func() {
 			durs[i], durs[j] = durs[j], durs[i]
 		})
 
-		for i := 0; i < actionCnt; i++ {
+		for i := range actionCnt {
 			index := i
-			hk.Reg(strconv.Itoa(index), func() time.Duration {
+			hk.Reg(strconv.Itoa(index), func(int64) time.Duration {
 				if fired[index] == -1 {
 					fired[index] = counter.Inc() - 1
 				}
@@ -205,7 +205,7 @@ var _ = Describe("Housekeeper", func() {
 
 		time.Sleep(100 * actionCnt * time.Millisecond)
 
-		for i := 0; i < actionCnt; i++ {
+		for i := range actionCnt {
 			Expect(durs[i].origIdx).To(BeEquivalentTo(fired[i]))
 		}
 	})

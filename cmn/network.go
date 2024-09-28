@@ -1,12 +1,13 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"time"
 
@@ -35,7 +36,7 @@ const (
 	DefaultSendRecvBufferSize  = 128 * cos.KiB
 )
 
-var KnownNetworks = []string{NetPublic, NetIntraControl, NetIntraData}
+var KnownNetworks = [...]string{NetPublic, NetIntraControl, NetIntraData}
 
 func NetworkIsKnown(net string) bool {
 	return net == NetPublic || net == NetIntraControl || net == NetIntraData
@@ -55,4 +56,25 @@ func ValidatePort(port int) (int, error) {
 		return 0, fmt.Errorf("port number (%d) should be between 1 and 65535", port)
 	}
 	return port, nil
+}
+
+func Host2IP(host string) (net.IP, error) {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip, nil
+		}
+	}
+	return nil, fmt.Errorf("failed to locally resolve %q (have IPs %v)", host, ips)
+}
+
+func ParseHost2IP(host string) (net.IP, error) {
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return ip, nil // is a parse-able IP addr
+	}
+	return Host2IP(host)
 }

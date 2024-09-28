@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
@@ -21,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
@@ -37,22 +37,14 @@ type bsummCtx struct {
 	l       int
 	n       int
 	res     cmn.AllBsummResults
-	// waiting
-	longWaitTime   time.Duration
-	longWaitPrompt string
-	dontWait       bool
 }
 
 var (
 	mpathCmdsFlags = map[string][]cli.Flag{
 		cmdMpathAttach: {
-			forceFlag,
+			mountpathLabelFlag,
 		},
-		cmdMpathEnable: {},
-		cmdMpathDetach: {
-			noResilverFlag,
-		},
-		cmdMpathDisable: {
+		"default": {
 			noResilverFlag,
 		},
 	}
@@ -65,7 +57,7 @@ var (
 			makeAlias(showCmdMpath, "", true, commandShow), // alias for `ais show`
 			{
 				Name:         cmdMpathAttach,
-				Usage:        "attach mountpath (i.e., formatted disk or RAID) to a target node",
+				Usage:        "attach mountpath to a given target node",
 				ArgsUsage:    nodeMountpathPairArgument,
 				Flags:        mpathCmdsFlags[cmdMpathAttach],
 				Action:       mpathAttachHandler,
@@ -75,25 +67,43 @@ var (
 				Name:         cmdMpathEnable,
 				Usage:        "(re)enable target's mountpath",
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags[cmdMpathEnable],
 				Action:       mpathEnableHandler,
-				BashComplete: func(c *cli.Context) { suggestTargetMpath(c, cmdMpathEnable) },
+				BashComplete: suggestMpathEnable,
 			},
 			{
 				Name:         cmdMpathDetach,
-				Usage:        "detach mountpath (i.e., formatted disk or RAID) from a target node",
+				Usage:        "detach mountpath from a target node (disable and remove it from the target's volume)",
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags[cmdMpathDetach],
+				Flags:        mpathCmdsFlags["default"],
 				Action:       mpathDetachHandler,
-				BashComplete: func(c *cli.Context) { suggestTargetMpath(c, cmdMpathDetach) },
+				BashComplete: suggestMpathDetach,
 			},
 			{
 				Name:         cmdMpathDisable,
-				Usage:        "disable mountpath (deactivate but keep in a target's volume)",
+				Usage:        "disable mountpath (deactivate but keep in a target's volume for possible future activation)",
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags[cmdMpathDisable],
+				Flags:        mpathCmdsFlags["default"],
 				Action:       mpathDisableHandler,
-				BashComplete: func(c *cli.Context) { suggestTargetMpath(c, cmdMpathDisable) },
+				BashComplete: suggestMpathActive,
+			},
+			//
+			// advanced usage
+			//
+			{
+				Name: cmdMpathRescanDisks,
+				Usage: "re-resolve (mountpath, filesystem) to its underlying disk(s) and revalidate the disks\n" +
+					indent1 + "\t(advanced use only)",
+				ArgsUsage:    nodeMountpathPairArgument,
+				Flags:        mpathCmdsFlags["default"],
+				Action:       mpathRescanHandler,
+				BashComplete: suggestMpathActive,
+			},
+			{
+				Name:         cmdMpathFshc,
+				Usage:        "run filesystem health checker (FSHC) to test selected mountpath for read and write errors",
+				ArgsUsage:    nodeMountpathPairArgument,
+				Action:       mpathFshcHandler,
+				BashComplete: suggestMpathActive,
 			},
 		},
 	}
@@ -295,7 +305,7 @@ func showDiskStats(c *cli.Context, tid string) error {
 		}
 	}
 
-	dsh, err := getDiskStats(smap, tid)
+	dsh, withCap, err := getDiskStats(c, smap, tid)
 	if err != nil {
 		return err
 	}
@@ -309,9 +319,9 @@ func showDiskStats(c *cli.Context, tid string) error {
 	// TODO: check config.TestingEnv (or DeploymentType == apc.DeploymentDev)
 	var totalsHdr string
 	if l := int64(len(dsh)); l > 1 {
-		totalsHdr = cluTotal
+		totalsHdr = teb.ClusterTotal
 		if tid != "" {
-			totalsHdr = tgtTotal
+			totalsHdr = teb.TargetTotal
 		}
 		tally := teb.DiskStatsHelper{TargetID: totalsHdr}
 		for _, ds := range dsh {
@@ -325,17 +335,18 @@ func showDiskStats(c *cli.Context, tid string) error {
 		tally.Stat.Wavg = cos.DivRound(tally.Stat.Wavg, l)
 		tally.Stat.Util = cos.DivRound(tally.Stat.Util, l)
 
-		dsh = append(dsh, tally)
+		dsh = append(dsh, &tally)
 	}
 
-	table := teb.NewDiskTab(dsh, smap, regex, units, totalsHdr)
+	table := teb.NewDiskTab(dsh, smap, regex, units, totalsHdr, withCap)
 	out := table.Template(hideHeader)
 	return teb.Print(dsh, out)
 }
 
-//
-// summary (compare with `listBckTableWithSummary` - fast)
-//
+// storage summary (a.k.a. bucket summary)
+// NOTE:
+// - compare with `listBckTableWithSummary` - fast
+// - currently, only in-cluster buckets - TODO
 
 func summaryStorageHandler(c *cli.Context) error {
 	uri := c.Args().Get(0)
@@ -343,16 +354,15 @@ func summaryStorageHandler(c *cli.Context) error {
 	if errV != nil {
 		return errV
 	}
-
-	units, errU := parseUnitsFlag(c, unitsFlag)
-	if errU != nil {
-		return errU
+	var (
+		prefix     = parseStrFlag(c, bsummPrefixFlag)
+		objCached  = flagIsSet(c, listObjCachedFlag)
+		bckPresent = true // currently, only in-cluster buckets
+	)
+	ctx, err := newBsummCtxMsg(c, qbck, prefix, objCached, bckPresent)
+	if err != nil {
+		return err
 	}
-
-	// TODO: remote buckets not in BMD - see ais ls --summary and `listBckTableWithSummary`
-	dontWait := flagIsSet(c, dontWaitFlag)
-	ctx := newBsummContext(c, units, qbck, true /*bckPresent*/, dontWait)
-
 	setLongRunParams(c)
 
 	var news = true
@@ -360,7 +370,10 @@ func summaryStorageHandler(c *cli.Context) error {
 		ctx.msg.UUID = xid
 		news = false
 	}
-	xid, summaries, err := ctx.slow() // execute
+
+	// execute
+	err = ctx.get()
+	xid, summaries := ctx.xid, ctx.res
 
 	f := func() string {
 		verb := "has started"
@@ -371,6 +384,7 @@ func summaryStorageHandler(c *cli.Context) error {
 			"see %s for more options",
 			cmdSummary, xid, verb, uri, xid, flprn(dontWaitFlag), xid, qflprn(cli.HelpFlag))
 	}
+	dontWait := flagIsSet(c, dontWaitFlag)
 	if err == nil && dontWait && len(summaries) == 0 {
 		actionDone(c, f())
 		return nil
@@ -395,7 +409,7 @@ func summaryStorageHandler(c *cli.Context) error {
 		return err
 	}
 
-	altMap := teb.FuncMapUnits(units)
+	altMap := teb.FuncMapUnits(ctx.units, false /*incl. calendar date*/)
 	opts := teb.Opts{AltMap: altMap}
 	hideHeader := flagIsSet(c, noHeaderFlag)
 	if hideHeader {
@@ -404,43 +418,32 @@ func summaryStorageHandler(c *cli.Context) error {
 	return teb.Print(summaries, teb.BucketsSummariesTmpl, opts)
 }
 
-func newBsummContext(c *cli.Context, units string, qbck cmn.QueryBcks, bckPresent, dontWait bool) *bsummCtx {
-	ctx := &bsummCtx{
-		c:        c,
-		units:    units,
-		qbck:     qbck,
-		started:  mono.NanoTime(),
-		dontWait: dontWait,
+func newBsummCtxMsg(c *cli.Context, qbck cmn.QueryBcks, prefix string, objCached, bckPresent bool) (*bsummCtx, error) {
+	units, errU := parseUnitsFlag(c, unitsFlag)
+	if errU != nil {
+		return nil, errU
 	}
-	ctx.msg.Prefix = parseStrFlag(c, bsummPrefixFlag)
-	ctx.msg.ObjCached = flagIsSet(c, listObjCachedFlag)
+	ctx := &bsummCtx{
+		c:       c,
+		units:   units,
+		qbck:    qbck,
+		started: mono.NanoTime(),
+	}
+	ctx.msg.Prefix = prefix
+	ctx.msg.ObjCached = objCached
 	ctx.msg.BckPresent = bckPresent
 
-	ctx.args.DontWait = dontWait
-
-	if flagIsSet(c, refreshFlag) {
-		ctx.args.CallAfter = parseDurationFlag(c, refreshFlag)
-		ctx.args.Callback = ctx.progress
-		ctx.longWaitTime = 0 // have refresh callback
-	} else if !dontWait {
-		ctx.longWaitTime = listObjectsWaitTime
-		if ctx.msg.UUID != "" {
-			ctx.longWaitPrompt = "Please wait, the operation may take some time.\n" +
-				"To monitor, run 'ais storage summary " + ctx.msg.UUID // TODO -- FIXME
+	if ctx.args.DontWait = flagIsSet(c, dontWaitFlag); ctx.args.DontWait {
+		if showProgress := flagIsSet(c, progressFlag); showProgress {
+			return nil, fmt.Errorf(errFmtExclusive, qflprn(dontWaitFlag), qflprn(progressFlag))
 		}
+		return ctx, nil
 	}
-	return ctx
-}
 
-// "slow" version of the bucket-summary (compare with `listBuckets` => `listBckTableWithSummary`)
-func (ctx *bsummCtx) slow() (xid string, res cmn.AllBsummResults, err error) {
-	if ctx.longWaitTime > 0 {
-		err = waitForFunc(ctx.get, ctx.longWaitTime, ctx.longWaitPrompt)
-	} else {
-		err = ctx.get()
-	}
-	xid, res = ctx.xid, ctx.res
-	return
+	// otherwise, call back periodically
+	ctx.args.CallAfter = _refreshRate(c)
+	ctx.args.Callback = ctx.progress
+	return ctx, nil
 }
 
 func (ctx *bsummCtx) get() (err error) {
@@ -556,9 +559,9 @@ func showMpathHandler(c *cli.Context) error {
 				erCh <- err
 			} else {
 				mpCh <- &targetMpath{
-					DaemonID:  node.ID(),
-					Mpl:       mpl,
-					TargetCDF: tstatusMap[node.ID()].TargetCDF,
+					DaemonID: node.ID(),
+					Mpl:      mpl,
+					Tcdf:     tstatusMap[node.ID()].Tcdf,
 				}
 			}
 			wg.Done()
@@ -582,10 +585,12 @@ func showMpathHandler(c *cli.Context) error {
 	return teb.Print(mpls, teb.MpathListTmpl, teb.Jopts(usejs))
 }
 
-func mpathAttachHandler(c *cli.Context) (err error)  { return mpathAction(c, apc.ActMountpathAttach) }
-func mpathEnableHandler(c *cli.Context) (err error)  { return mpathAction(c, apc.ActMountpathEnable) }
-func mpathDetachHandler(c *cli.Context) (err error)  { return mpathAction(c, apc.ActMountpathDetach) }
-func mpathDisableHandler(c *cli.Context) (err error) { return mpathAction(c, apc.ActMountpathDisable) }
+func mpathAttachHandler(c *cli.Context) error  { return mpathAction(c, apc.ActMountpathAttach) }
+func mpathEnableHandler(c *cli.Context) error  { return mpathAction(c, apc.ActMountpathEnable) }
+func mpathDetachHandler(c *cli.Context) error  { return mpathAction(c, apc.ActMountpathDetach) }
+func mpathDisableHandler(c *cli.Context) error { return mpathAction(c, apc.ActMountpathDisable) }
+func mpathRescanHandler(c *cli.Context) error  { return mpathAction(c, apc.ActMountpathRescan) }
+func mpathFshcHandler(c *cli.Context) error    { return mpathAction(c, apc.ActMountpathFSHC) }
 
 func mpathAction(c *cli.Context, action string) error {
 	if c.NArg() == 0 {
@@ -623,12 +628,13 @@ func mpathAction(c *cli.Context, action string) error {
 				return &errDoesNotExist{what: "node", name: nodeID}
 			}
 			return fmt.Errorf("node %q is a proxy "+
-				"(hint: press <TAB-TAB> or run \"ais show cluster target\" to select a target)", nodeID)
+				"(hint: press <TAB-TAB> or run 'ais show cluster target' to select)", nodeID)
 		}
 		switch action {
 		case apc.ActMountpathAttach:
 			acted = "attached"
-			err = api.AttachMountpath(apiBP, si, mountpath, flagIsSet(c, forceFlag))
+			label := parseStrFlag(c, mountpathLabelFlag)
+			err = api.AttachMountpath(apiBP, si, mountpath, ios.Label(label))
 		case apc.ActMountpathEnable:
 			acted = "enabled"
 			err = api.EnableMountpath(apiBP, si, mountpath)
@@ -638,13 +644,25 @@ func mpathAction(c *cli.Context, action string) error {
 		case apc.ActMountpathDisable:
 			acted = "disabled"
 			err = api.DisableMountpath(apiBP, si, mountpath, flagIsSet(c, noResilverFlag))
+		case apc.ActMountpathRescan:
+			acted = "re-scanned for attached and/or lost disks (found neither)"
+			err = api.RescanMountpath(apiBP, si, mountpath, flagIsSet(c, noResilverFlag))
+		case apc.ActMountpathFSHC:
+			err = api.FshcMountpath(apiBP, si, mountpath)
+			if err == nil {
+				done := fmt.Sprintf("%s: started filesystem health check on mountpath %q", si.StringEx(), mountpath)
+				actionDone(c, done)
+			}
 		default:
 			return incorrectUsageMsg(c, "invalid mountpath action %q", action)
 		}
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(c.App.Writer, "Node %q %s mountpath %q\n", si.ID(), acted, mountpath)
+		if acted != "" {
+			done := fmt.Sprintf("%s: mountpath %q is now %s", si.StringEx(), mountpath, acted)
+			actionDone(c, done)
+		}
 	}
 	return nil
 }

@@ -14,7 +14,10 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 )
+
+// for background, see: docs/on_disk_layout.md
 
 const (
 	prefCT       = '%'
@@ -36,15 +39,17 @@ const (
 
 type ParsedFQN struct {
 	Mountpath   *Mountpath
-	ContentType string
-	Bck         cmn.Bck
+	ContentType string // enum: { ObjectType, WorkfileType, ECSliceType, ... }
 	ObjName     string
 	Digest      uint64
+	Bck         cmn.Bck
 }
 
-// ParseFQN splits a provided FQN (created by `MakePathFQN`) or reports
-// an error.
-func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
+///////////////
+// ParsedFQN //
+///////////////
+
+func (parsed *ParsedFQN) Init(fqn string) (err error) {
 	var (
 		rel           string
 		itemIdx, prev int
@@ -53,7 +58,7 @@ func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
 	if err != nil {
 		return
 	}
-	for i := 0; i < len(rel); i++ {
+	for i := range len(rel) {
 		if rel[i] != filepath.Separator {
 			continue
 		}
@@ -123,74 +128,68 @@ func ParseFQN(fqn string) (parsed ParsedFQN, err error) {
 		prev = i + 1
 	}
 
-	err = fmt.Errorf("fqn %s is invalid", fqn)
-	return
+	return fmt.Errorf("fqn %s is invalid", fqn)
 }
 
-// FQN2Mpath matches FQN to mountpath and returns the mountpath and the relative path.
+//
+// supporting helpers
+//
+
+// match FQN to mountpath and return the former and the relative path
 func FQN2Mpath(fqn string) (found *Mountpath, relativePath string, err error) {
+	debug.Assert(fqn != "")
 	avail := GetAvail()
 	if len(avail) == 0 {
-		err = cmn.ErrNoMountpaths
-		return
+		return nil, "", cmn.ErrNoMountpaths
 	}
 	for mpath, mi := range avail {
 		l := len(mpath)
 		if len(fqn) > l && fqn[0:l] == mpath && fqn[l] == filepath.Separator {
-			found = mi
-			relativePath = fqn[l+1:]
-			return
+			return mi, fqn[l+1:], nil
 		}
 	}
 
 	// make an extra effort to lookup in disabled
-	_, disabled := Get()
+	disabled := getDisabled()
 	for mpath := range disabled {
 		l := len(mpath)
 		if len(fqn) > l && fqn[0:l] == mpath && fqn[l] == filepath.Separator {
-			err = cmn.NewErrMountpathNotFound("" /*mpath*/, fqn, true /*disabled*/)
-			return
+			return nil, "", cmn.NewErrMpathNotFound(mpath, fqn, true /*disabled*/)
 		}
 	}
-	err = cmn.NewErrMountpathNotFound("" /*mpath*/, fqn, false /*disabled*/)
-	return
+	return nil, "", cmn.NewErrMpathNotFound("" /*mpath*/, fqn, false /*disabled*/)
 }
 
-// Path2Mpath takes in any file path (e.g., ../../a/b/c) and returns the matching `mi`,
-// if exists
-func Path2Mpath(path string) (found *Mountpath, err error) {
-	found, _, err = FQN2Mpath(filepath.Clean(path))
-	return
-}
-
-// TODO: define fs.PathErr to return "ais://nnn/shard-99.tar not found"
-// instead of the current "  no such file or directory"
 func CleanPathErr(err error) {
-	var (
-		pathErr *fs.PathError
-		what    string
-	)
+	var pathErr *fs.PathError
 	if !errors.As(err, &pathErr) {
 		return
 	}
-	parsed, errV := ParseFQN(pathErr.Path)
-	if errV != nil {
+	if pathErr.Path == "" {
 		return
 	}
+
+	var parsed ParsedFQN
+	if errV := parsed.Init(pathErr.Path); errV != nil {
+		return
+	}
+
+	// replace
 	pathErr.Path = parsed.Bck.Cname(parsed.ObjName)
 	pathErr.Op = "[fs-path]"
 	if strings.Contains(pathErr.Err.Error(), "no such file") {
+		var what string
 		switch parsed.ContentType {
 		case ObjectType:
-			what = "object"
+			what = "'object'"
 		case WorkfileType:
-			what = "work file"
+			what = "'work file'"
 		case ECSliceType:
-			what = "ec slice"
+			what = "'ec slice'"
 		case ECMetaType:
-			what = "ec metadata"
+			what = "'ec metadata'"
 		default:
-			what = parsed.ContentType + "(?)"
+			what = fmt.Sprintf("'%s'(?)", parsed.ContentType)
 		}
 		pathErr.Err = cos.NewErrNotFound(nil, "content type "+what)
 	}

@@ -1,7 +1,7 @@
 // Package ios is a collection of interfaces to the local storage subsystem;
 // the package includes OS-dependent implementations for those interfaces.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ios
 
@@ -56,5 +56,5 @@ func (ds *blockStats) ReadMs() int64     { return ds.readMs }
 // * nvmeInN:     instance I namespace N
 // * nvmeIcCnN:   instance I controller C namespace N
 
-func icn(string, string) string           { return "" }
+func icn(string, string) (string, error)  { return "", nil }
 func icnPath(string, string, string) bool { return false }

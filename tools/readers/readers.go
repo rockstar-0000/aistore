@@ -1,16 +1,16 @@
 // Package readers provides implementation for common reader types
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package readers
 
 import (
 	"archive/tar"
 	"bytes"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"path"
 
@@ -42,7 +42,7 @@ type (
 	}
 	randReader struct {
 		seed   int64
-		rnd    *rand.Rand
+		rnd    *seededReader
 		size   int64
 		offset int64
 		cksum  *cos.Cksum
@@ -53,7 +53,7 @@ type (
 		cksum *cos.Cksum
 	}
 	rrLimited struct {
-		random *rand.Rand
+		random *seededReader
 		size   int64
 		off    int64
 	}
@@ -98,7 +98,7 @@ func NewRand(size int64, cksumType string) (Reader, error) {
 		cksum *cos.Cksum
 		seed  = mono.NanoTime()
 	)
-	rand1 := rand.New(rand.NewSource(seed))
+	rand1 := newSeededReader(uint64(seed))
 	if cksumType != cos.ChecksumNone {
 		rr := &rrLimited{rand1, size, 0}
 		_, cksumHash, err := cos.CopyAndChecksum(io.Discard, rr, nil, cksumType)
@@ -107,7 +107,7 @@ func NewRand(size int64, cksumType string) (Reader, error) {
 		}
 		cksum = cksumHash.Clone()
 	}
-	rand1dup := rand.New(rand.NewSource(seed))
+	rand1dup := newSeededReader(uint64(seed))
 	return &randReader{
 		seed:  seed,
 		rnd:   rand1dup,
@@ -138,7 +138,7 @@ func (r *randReader) Read(buf []byte) (int, error) {
 func (r *randReader) Open() (cos.ReadOpenCloser, error) {
 	return &randReader{
 		seed:  r.seed,
-		rnd:   rand.New(rand.NewSource(r.seed)),
+		rnd:   newSeededReader(uint64(r.seed)),
 		size:  r.size,
 		cksum: r.cksum,
 	}, nil
@@ -171,7 +171,7 @@ func (r *randReader) Seek(offset int64, whence int) (int64, error) {
 		return r.offset, nil
 	}
 
-	r.rnd = rand.New(rand.NewSource(r.seed))
+	r.rnd = newSeededReader(uint64(r.seed))
 	r.offset = 0
 	actual, err := io.CopyN(io.Discard, r, abs)
 	if err != nil {
@@ -227,7 +227,7 @@ func NewRandFile(filepath, name string, size int64, cksumType string) (Reader, e
 		}
 	} else {
 		// Write random file
-		cksumHash, err = copyRandWithHash(f, size, cksumType, cos.NowRand())
+		cksumHash, err = copyRandWithHash(f, size, cksumType)
 	}
 	if err == nil {
 		_, err = f.Seek(0, io.SeekStart)
@@ -274,7 +274,7 @@ func (r *fileReader) Cksum() *cos.Cksum {
 func NewSG(sgl *memsys.SGL, size int64, cksumType string) (Reader, error) {
 	var cksum *cos.Cksum
 	if size > 0 {
-		cksumHash, err := copyRandWithHash(sgl, size, cksumType, cos.NowRand())
+		cksumHash, err := copyRandWithHash(sgl, size, cksumType)
 		if err != nil {
 			return nil, err
 		}
@@ -363,7 +363,7 @@ func New(p Params, cksumType string) (Reader, error) {
 // copyRandWithHash reads data from random source and writes it to a writer while
 // optionally computing xxhash
 // See related: memsys_test.copyRand
-func copyRandWithHash(w io.Writer, size int64, cksumType string, rnd *rand.Rand) (*cos.CksumHash, error) {
+func copyRandWithHash(w io.Writer, size int64, cksumType string) (*cos.CksumHash, error) {
 	var (
 		cksum   *cos.CksumHash
 		rem     = size
@@ -377,7 +377,7 @@ func copyRandWithHash(w io.Writer, size int64, cksumType string, rnd *rand.Rand)
 	}
 	for i := int64(0); i <= size/blkSize; i++ {
 		n := int(min(blkSize, rem))
-		rnd.Read(buf[:n])
+		cryptorand.Read(buf[:n])
 		m, err := w.Write(buf[:n])
 		if err != nil {
 			return nil, err

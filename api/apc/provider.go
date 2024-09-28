@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -14,18 +14,15 @@ const (
 	AWS   = "aws"
 	Azure = "azure"
 	GCP   = "gcp"
-	HDFS  = "hdfs"
-	HTTP  = "ht"
+	HT    = "ht"
 
-	AllProviders = "ais, aws (s3://), gcp (gs://), azure (az://), hdfs://, ht://" // NOTE: must include all
+	AllProviders = "ais, aws (s3://), gcp (gs://), azure (az://), ht://" // NOTE: must include all
 
 	NsUUIDPrefix = '@' // BEWARE: used by on-disk layout
 	NsNamePrefix = '#' // BEWARE: used by on-disk layout
 
 	// consistent with rfc2396.txt "Uniform Resource Identifiers (URI): Generic Syntax"
 	BckProviderSeparator = "://"
-
-	BckObjnameSeparator = "/"
 
 	// scheme://
 	DefaultScheme = "https"
@@ -35,7 +32,9 @@ const (
 	AISScheme     = "ais"
 )
 
-var Providers = cos.NewStrSet(AIS, GCP, AWS, Azure, HDFS, HTTP)
+const RemAIS = "remais" // to differentiate ais vs ais; also, default (remote ais cluster) alias
+
+var Providers = cos.NewStrSet(AIS, GCP, AWS, Azure, HT)
 
 func IsProvider(p string) bool { return Providers.Contains(p) }
 
@@ -43,8 +42,9 @@ func IsCloudProvider(p string) bool {
 	return p == AWS || p == GCP || p == Azure
 }
 
+// NOTE: not to confuse w/ bck.IsRemote() which also includes remote AIS
 func IsRemoteProvider(p string) bool {
-	return IsCloudProvider(p) || p == HDFS || p == HTTP
+	return IsCloudProvider(p) || p == HT
 }
 
 func ToScheme(p string) string {
@@ -88,9 +88,7 @@ func DisplayProvider(p string) string {
 		return "Azure"
 	case GCP, GSScheme:
 		return "GCP"
-	case HDFS:
-		return "HDFS"
-	case HTTP:
+	case HT:
 		return "HTTP(S)"
 	default:
 		return p

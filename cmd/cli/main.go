@@ -1,6 +1,6 @@
 // Package cli is used as command-line interpreter for AIS
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -30,9 +30,10 @@ func dispatchInterruptHandler() {
 func main() {
 	dispatchInterruptHandler()
 
-	if err := cli.Init(); err != nil {
+	if err := cli.Init(os.Args); err != nil {
 		exitf("%v", err)
 	}
+
 	if err := cli.Run(cmn.VersionCLI+"."+build, buildtime, os.Args); err != nil {
 		exitf("%v", err)
 	}

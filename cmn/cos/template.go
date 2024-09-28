@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -13,6 +13,13 @@ import (
 	"strings"
 	"unicode"
 )
+
+const (
+	WildcardMatchAll = "*"
+	EmptyMatchAll    = ""
+)
+
+func MatchAll(template string) bool { return template == EmptyMatchAll || template == WildcardMatchAll }
 
 // Supported syntax includes 3 standalone variations, 3 alternative formats:
 // 1. bash (or shell) brace expansion:
@@ -76,7 +83,7 @@ func (e *errTemplateInvalid) Error() string { return e.msg }
 ////////////////////
 
 func NewParsedTemplate(template string) (parsed ParsedTemplate, err error) {
-	if template == "" || template == "*" {
+	if MatchAll(template) {
 		err = ErrEmptyTemplate
 		return
 	}
@@ -117,20 +124,15 @@ func (pt *ParsedTemplate) Count() int64 {
 
 // maxLen specifies maximum objects to be returned
 func (pt *ParsedTemplate) ToSlice(maxLen ...int) []string {
-	var ( //nolint:prealloc // objs is preallocated farther down
-		max  = math.MaxInt64
-		objs []string
-	)
+	var i, n int
 	if len(maxLen) > 0 && maxLen[0] >= 0 {
-		max = maxLen[0]
-		objs = make([]string, 0, max)
+		n = maxLen[0]
 	} else {
-		objs = make([]string, 0, pt.Count())
+		n = int(pt.Count())
 	}
-
+	objs := make([]string, 0, n)
 	pt.InitIter()
-	i := 0
-	for objName, hasNext := pt.Next(); hasNext && i < max; objName, hasNext = pt.Next() {
+	for objName, hasNext := pt.Next(); hasNext && i < n; objName, hasNext = pt.Next() {
 		objs = append(objs, objName)
 		i++
 	}
@@ -272,7 +274,7 @@ func ParseBashTemplate(template string) (pt ParsedTemplate, err error) {
 				return
 			}
 			tr.Step = 1
-			tr.DigitCount = Min(len(numbers[0]), len(numbers[1]))
+			tr.DigitCount = min(len(numbers[0]), len(numbers[1]))
 		} else if len(numbers) == 3 { // {0001..0999..2} case
 			if tr.Start, err = strconv.ParseInt(numbers[0], 10, 64); err != nil {
 				return
@@ -283,7 +285,7 @@ func ParseBashTemplate(template string) (pt ParsedTemplate, err error) {
 			if tr.Step, err = strconv.ParseInt(numbers[2], 10, 64); err != nil {
 				return
 			}
-			tr.DigitCount = Min(len(numbers[0]), len(numbers[1]))
+			tr.DigitCount = min(len(numbers[0]), len(numbers[1]))
 		}
 		if err = validateBoundaries("bash", template, tr.Start, tr.End, tr.Step); err != nil {
 			return

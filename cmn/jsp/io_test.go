@@ -1,14 +1,14 @@
 // Package jsp (JSON persistence) provides utilities to store and load arbitrary
 // JSON-encoded structures with optional checksumming and compression.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package jsp_test
 
 import (
 	"bytes"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"reflect"
 	"strconv"
 	"testing"
@@ -42,17 +42,17 @@ func (ts *testStruct) equal(other testStruct) bool {
 }
 
 func makeRandStruct() (ts testStruct) {
-	if rand.Intn(2) == 0 {
+	if rand.IntN(2) == 0 {
 		ts.I = rand.Int()
 	}
-	ts.S = trand.String(rand.Intn(100))
-	if rand.Intn(2) == 0 {
-		ts.B = []byte(trand.String(rand.Intn(200)))
+	ts.S = trand.String(rand.IntN(100))
+	if rand.IntN(2) == 0 {
+		ts.B = []byte(trand.String(rand.IntN(200)))
 	}
-	ts.ST.I64 = rand.Int63()
-	if rand.Intn(2) == 0 {
+	ts.ST.I64 = rand.Int64()
+	if rand.IntN(2) == 0 {
 		ts.M = make(map[string]string)
-		for i := 0; i < rand.Intn(100)+1; i++ {
+		for range rand.IntN(100) + 1 {
 			ts.M[trand.String(10)] = trand.String(20)
 		}
 	}
@@ -63,9 +63,9 @@ func makeStaticStruct() (ts testStruct) {
 	ts.I = rand.Int()
 	ts.S = trand.String(100)
 	ts.B = []byte(trand.String(200))
-	ts.ST.I64 = rand.Int63()
+	ts.ST.I64 = rand.Int64()
 	ts.M = make(map[string]string, 10)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		ts.M[trand.String(10)] = trand.String(20)
 	}
 	return
@@ -124,7 +124,7 @@ func TestDecodeAndEncodeFuzz(t *testing.T) {
 	b := mmsa.NewSGL(cos.MiB)
 	defer b.Free()
 
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		var (
 			x, v string
 			opts = jsp.Options{Signature: true, Checksum: true}
@@ -168,7 +168,7 @@ func BenchmarkEncode(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				err := jsp.Encode(body, bench.v, bench.opts)
 				tassert.CheckFatal(b, err)
 				body.Reset()
@@ -204,7 +204,7 @@ func BenchmarkDecode(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				var (
 					v testStruct
 					r = io.NopCloser(bytes.NewReader(network))

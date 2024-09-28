@@ -138,7 +138,7 @@ func (c *rwConnector) connectReader(key string, r io.Reader, size int64) (err er
 	c.mu.Unlock()
 
 	if !all {
-		rw.sgl = g.mm.NewSGL(size)
+		rw.sgl = g.mem.NewSGL(size)
 		_, err = io.Copy(rw.sgl, r)
 		rw.wgr.Done()
 		return
@@ -455,7 +455,12 @@ func (ds *dsorterMem) connectOrSend(rec *shard.Record, obj *shard.RecordObj, tsi
 		}
 		fullContentPath = ds.m.recm.FullContentPath(obj)
 	)
+
 	ct, err := core.NewCTFromBO(&ds.m.Pars.OutputBck, fullContentPath, nil)
+	if err != nil {
+		return err
+	}
+
 	ds.creationPhase.adjuster.read.acquireSema(ct.Mountpath())
 	defer func() {
 		if !resp.decRef {
@@ -464,9 +469,6 @@ func (ds *dsorterMem) connectOrSend(rec *shard.Record, obj *shard.RecordObj, tsi
 		ds.creationPhase.adjuster.read.releaseSema(ct.Mountpath())
 	}()
 
-	if err != nil {
-		return err
-	}
 	if ds.m.aborted() {
 		return ds.m.newErrAborted()
 	}

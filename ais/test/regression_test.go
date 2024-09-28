@@ -7,7 +7,7 @@ package integration_test
 import (
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,7 +26,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/readers"
@@ -76,7 +75,7 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 	m.puts()
 
 	msg := &apc.LsoMsg{Props: apc.GetPropsLocation}
-	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: uint(m.num)})
+	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: int64(m.num)})
 	tassert.CheckFatal(t, err)
 
 	if len(lst.Entries) != m.num {
@@ -108,7 +107,7 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 			if i == 0 {
 				tlog.Logln("Modifying config to enforce intra-cluster access, expecting errors...\n")
 			}
-			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.Value()})
+			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.String()})
 			t.Cleanup(func() {
 				tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
 			})
@@ -128,7 +127,7 @@ func TestListObjectsLocalGetLocation(t *testing.T) {
 
 	// Ensure no target URLs are returned when the property is not requested
 	msg.Props = ""
-	lst, err = api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: uint(m.num)})
+	lst, err = api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: int64(m.num)})
 	tassert.CheckFatal(t, err)
 
 	if len(lst.Entries) != m.num {
@@ -196,7 +195,7 @@ func TestListObjectsCloudGetLocation(t *testing.T) {
 			if i == 0 {
 				tlog.Logln("Modifying config to enforce intra-cluster access, expecting errors...\n")
 			}
-			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.Value()})
+			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.String()})
 			_, err = api.GetObject(baseParams, m.bck, e.Name, nil)
 
 			if err == nil {
@@ -497,10 +496,10 @@ func TestReregisterMultipleTargets(t *testing.T) {
 	// Step 0: Collect rebalance stats
 	clusterStats := tools.GetClusterStats(t, m.proxyURL)
 	for targetID, targetStats := range clusterStats.Target {
-		filesSentOrig[targetID] = tools.GetNamedStatsVal(targetStats, stats.StreamsOutObjCount)
-		filesRecvOrig[targetID] = tools.GetNamedStatsVal(targetStats, stats.StreamsInObjCount)
-		bytesSentOrig[targetID] = tools.GetNamedStatsVal(targetStats, stats.StreamsOutObjSize)
-		bytesRecvOrig[targetID] = tools.GetNamedStatsVal(targetStats, stats.StreamsInObjSize)
+		filesSentOrig[targetID] = tools.GetNamedStatsVal(targetStats, cos.StreamsOutObjCount)
+		filesRecvOrig[targetID] = tools.GetNamedStatsVal(targetStats, cos.StreamsInObjCount)
+		bytesSentOrig[targetID] = tools.GetNamedStatsVal(targetStats, cos.StreamsOutObjSize)
+		bytesRecvOrig[targetID] = tools.GetNamedStatsVal(targetStats, cos.StreamsInObjSize)
 	}
 
 	// Step 1: Unregister multiple targets
@@ -514,7 +513,7 @@ func TestReregisterMultipleTargets(t *testing.T) {
 	}()
 
 	targets := m.smap.Tmap.ActiveNodes()
-	for i := 0; i < targetsToUnregister; i++ {
+	for i := range targetsToUnregister {
 		tlog.Logf("Put %s in maintenance (no rebalance)\n", targets[i].StringEx())
 		args := &apc.ActValRmNode{DaemonID: targets[i].ID(), SkipRebalance: true}
 		_, err := api.StartMaintenance(baseParams, args)
@@ -536,7 +535,7 @@ func TestReregisterMultipleTargets(t *testing.T) {
 
 	// Step 4: Simultaneously reregister each
 	wg := &sync.WaitGroup{}
-	for i := 0; i < targetsToUnregister; i++ {
+	for i := range targetsToUnregister {
 		wg.Add(1)
 		go func(r int) {
 			defer wg.Done()
@@ -554,10 +553,10 @@ func TestReregisterMultipleTargets(t *testing.T) {
 
 	clusterStats = tools.GetClusterStats(t, m.proxyURL)
 	for targetID, targetStats := range clusterStats.Target {
-		filesSent += tools.GetNamedStatsVal(targetStats, stats.StreamsOutObjCount) - filesSentOrig[targetID]
-		filesRecv += tools.GetNamedStatsVal(targetStats, stats.StreamsInObjCount) - filesRecvOrig[targetID]
-		bytesSent += tools.GetNamedStatsVal(targetStats, stats.StreamsOutObjSize) - bytesSentOrig[targetID]
-		bytesRecv += tools.GetNamedStatsVal(targetStats, stats.StreamsInObjSize) - bytesRecvOrig[targetID]
+		filesSent += tools.GetNamedStatsVal(targetStats, cos.StreamsOutObjCount) - filesSentOrig[targetID]
+		filesRecv += tools.GetNamedStatsVal(targetStats, cos.StreamsInObjCount) - filesRecvOrig[targetID]
+		bytesSent += tools.GetNamedStatsVal(targetStats, cos.StreamsOutObjSize) - bytesSentOrig[targetID]
+		bytesRecv += tools.GetNamedStatsVal(targetStats, cos.StreamsInObjSize) - bytesRecvOrig[targetID]
 	}
 
 	// Step 5: Log rebalance stats
@@ -600,23 +599,19 @@ func TestGetClusterStats(t *testing.T) {
 		tStats, err := api.GetDaemonStats(baseParams, tsi)
 		tassert.CheckFatal(t, err)
 
-		vCDF := vStats.TargetCDF
-		tCDF := tStats.TargetCDF
+		vCDF := vStats.Tcdf
+		tCDF := tStats.Tcdf
 		if vCDF.PctMax != tCDF.PctMax || vCDF.PctAvg != tCDF.PctAvg {
 			t.Errorf("%s: stats are different: [%+v] vs [%+v]\n", tname, vCDF, tCDF)
 		}
 		if len(vCDF.Mountpaths) != len(tCDF.Mountpaths) {
 			t.Errorf("%s: num mountpaths is different: [%+v] vs [%+v]\n", tname, vCDF, tCDF)
 		}
-		var printed bool
 		for mpath := range vCDF.Mountpaths {
-			vcdf, tcdf := vCDF.Mountpaths[mpath], tCDF.Mountpaths[mpath]
+			tcdf := tCDF.Mountpaths[mpath]
 			s := tname + mpath
-			if vcdf.Capacity != tcdf.Capacity {
-				t.Errorf("%-30s capacity is different: [%+v] vs [%+v]\n", s, vcdf, tcdf)
-			} else if !printed {
-				tlog.Logf("%-30s %+v(%+v), %s\n", s, vcdf.Disks, tcdf.Disks, tcdf.FS)
-				printed = true
+			if tcdf.Capacity.Used != 0 {
+				tlog.Logf("%-30s %+v %+v\n", s, tcdf.Disks, tcdf.Capacity)
 			}
 		}
 	}
@@ -649,10 +644,10 @@ func TestLRU(t *testing.T) {
 	)
 
 	// Find out min usage % across all targets
-	for k, v := range cluStats.Target {
-		filesEvicted[k] = tools.GetNamedStatsVal(v, "lru.evict.n")
-		bytesEvicted[k] = tools.GetNamedStatsVal(v, "lru.evict.size")
-		for _, c := range v.TargetCDF.Mountpaths {
+	for tid, v := range cluStats.Target {
+		filesEvicted[tid] = tools.GetNamedStatsVal(v, "lru.evict.n")
+		bytesEvicted[tid] = tools.GetNamedStatsVal(v, "lru.evict.size")
+		for _, c := range v.Tcdf.Mountpaths {
 			usedPct = min(usedPct, c.PctUsed)
 		}
 	}
@@ -668,7 +663,7 @@ func TestLRU(t *testing.T) {
 	}
 
 	tlog.Logf("LRU: current min space usage in the cluster: %d%%\n", usedPct)
-	tlog.Logf("setting 'space.lowm=%d' and 'space.highwm=%d'\n", lowWM, highWM)
+	tlog.Logf("setting 'space.lowwm=%d' and 'space.highwm=%d'\n", lowWM, highWM)
 
 	// All targets: set new watermarks; restore upon exit
 	oconfig := tools.GetClusterConfig(t)
@@ -803,7 +798,7 @@ func TestDeleteList(t *testing.T) {
 		)
 
 		// 1. Put files to delete
-		for i := 0; i < objCnt; i++ {
+		for i := range objCnt {
 			r, err := readers.NewRand(fileSize, bck.Props.Cksum.Type)
 			tassert.CheckFatal(t, err)
 
@@ -946,7 +941,7 @@ func TestDeleteRange(t *testing.T) {
 		)
 
 		// 1. Put files to delete
-		for i := 0; i < objCnt; i++ {
+		for i := range objCnt {
 			r, err := readers.NewRand(fileSize, bck.Props.Cksum.Type)
 			tassert.CheckFatal(t, err)
 
@@ -975,11 +970,11 @@ func TestDeleteRange(t *testing.T) {
 		if len(bktlst.Entries) != objCnt-smallrangesize {
 			t.Errorf("Incorrect number of remaining files: %d, should be %d", len(bktlst.Entries), objCnt-smallrangesize)
 		}
-		filemap := make(map[string]*cmn.LsoEntry)
+		filemap := make(map[string]*cmn.LsoEnt)
 		for _, en := range bktlst.Entries {
 			filemap[en.Name] = en
 		}
-		for i := 0; i < objCnt; i++ {
+		for i := range objCnt {
 			keyname := fmt.Sprintf("%s%04d", prefix, i)
 			_, ok := filemap[keyname]
 			if ok && i >= quarter && i <= third {
@@ -1036,8 +1031,8 @@ func TestStressDeleteRange(t *testing.T) {
 
 	// 1. PUT
 	tlog.Logln("putting objects...")
-	for i := 0; i < numReaders; i++ {
-		size := rand.Int63n(cos.KiB*128) + cos.KiB/3
+	for i := range numReaders {
+		size := rand.Int64N(cos.KiB*128) + cos.KiB/3
 		tassert.CheckFatal(t, err)
 		reader, err := readers.NewRand(size, cksumType)
 		tassert.CheckFatal(t, err)
@@ -1046,7 +1041,7 @@ func TestStressDeleteRange(t *testing.T) {
 		go func(i int, reader readers.Reader) {
 			defer wg.Done()
 
-			for j := 0; j < numFiles/numReaders; j++ {
+			for j := range numFiles / numReaders {
 				objName := fmt.Sprintf("%s%d", objNamePrefix, i*numFiles/numReaders+j)
 				putArgs := api.PutArgs{
 					BaseParams: baseParams,
@@ -1084,11 +1079,11 @@ func TestStressDeleteRange(t *testing.T) {
 			len(lst.Entries), expectedRemaining)
 	}
 
-	objNames := make(map[string]*cmn.LsoEntry)
+	objNames := make(map[string]*cmn.LsoEnt)
 	for _, en := range lst.Entries {
 		objNames[en.Name] = en
 	}
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		objName := fmt.Sprintf("%s%d", objNamePrefix, i)
 		_, ok := objNames[objName]
 		if ok && i < numFiles-tenth {

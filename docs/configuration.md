@@ -29,30 +29,65 @@ Majority of the configuration knobs can be changed at runtime (and at any time).
 
 For the most part, commands to view and update (CLI, cluster, node) configuration can be found [here](/docs/cli/config.md).
 
-The [same document](docs/cli/config.md) also contains a brief theory of operation, command descriptions, numerous usage examples, and more.
+The [same document](/docs/cli/config.md) also contains a brief theory of operation, command descriptions, numerous usage examples and more.
 
 > **Important:** as an input, CLI accepts both plain text and JSON-formatted values. For the latter, make sure to embed the (JSON value) argument into single quotes, e.g.:
 
 ```console
-$ ais config cluster backend.conf='{"gcp":{}, "aws":{}}'
+$ ais config cluster checksum.type='{"type":"md5"}'
 ```
 
-To show the update in plain text and JSON:
+However, plain-text updating is more common, e.g.:
+
+```console
+$ ais config cluster log.level 4
+
+$ ais config cluster log.modules <TAB-TAB>
+transport    memsys       fs           ec           ios          backend      mirror       downloader   s3
+ais          cluster      reb          stats        xs           space        dsort        etl          none
+
+$ ais config cluster log.modules space,s3
+```
+
+To show the current cluster config in plain text and JSON:
+
+```console
+$ ais config cluster log
+PROPERTY         VALUE
+log.level        4 (modules: space,s3)
+log.max_size     4MiB
+log.max_total    128MiB
+log.flush_time   40s
+log.stats_time   1m
+log.to_stderr    false
+```
+
+And the same in JSON:
+
+```console
+$ ais config cluster log --json
+
+    "log": {
+        "level": "540676",
+        "max_size": "4MiB",
+        "max_total": "128MiB",
+        "flush_time": "40s",
+        "stats_time": "1m",
+        "to_stderr": false
+    }
+```
+
+**Note:** some config values are read-only or otherwise protected and can be only listed, e.g.:
 
 ```console
 $ ais config cluster backend.conf --json
-
-    "backend": {"aws":{},"gcp":{}}
-
-$ ais config cluster backend.conf
-PROPERTY         VALUE
-backend.conf     map[aws:map[] gcp:map[]]
+    "backend": {"aws":{},"azure":{},"gcp":{}}
 ```
 
 See also:
 
 * [Backend providers and supported backends](/docs/providers.md)
-
+* [Disable/Enable cloud backend at runtime](/docs/cli/advanced.mdi#disableenable-cloud-backend-at-runtime)
 
 ## Configuring for production
 
@@ -93,7 +128,7 @@ $ ais config node t[fbarswQP] local --json
         "port_intra_control": "51082",
         "port_intra_data": "51083"
     },
-    "fspaths": {"/ais/nvme0n1":{},"/ais/nvme1n1":{},"/ais/nvme2n1":{}},
+    "fspaths": {"/ais/nvme0n1": "","/ais/nvme1n1": "","/ais/nvme2n1": ""},
     "test_fspaths": {
         "root": "",
         "count": 0,
@@ -128,7 +163,7 @@ The example above may serve as a simple illustration whereby `t[fbarswQP]` becom
 
 ## References
 
-* For Kubernetes deployment, please refer to a separate [ais-k8s](https://github.com/NVIDIA/ais-k8s) repository that also contains [AIS/K8s Operator](https://github.com/NVIDIA/ais-k8s/blob/master/operator/README.md) and its configuration-defining [resources](https://github.com/NVIDIA/ais-k8s/blob/master/operator/pkg/resources/cmn/config.go).
+* For Kubernetes deployment, please refer to a separate [ais-k8s](https://github.com/NVIDIA/ais-k8s) repository that also contains [AIS/K8s Operator](https://github.com/NVIDIA/ais-k8s/blob/main/operator/README.md) and its configuration-defining [resources](https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/config.go).
 * To configure an optional AIStore authentication server, run `$ AIS_AUTHN_ENABLED=true make deploy`. For information on AuthN server, please see [AuthN documentation](/docs/authn.md).
 * AIS [CLI](/docs/cli.md) is an easy-to-use convenient command-line management/monitoring tool. To get started with CLI, run `make cli` (that generates `ais` executable) and follow the prompts.
 
@@ -221,7 +256,7 @@ $ ais show config CCDpt8088 --json | tail -20
         "port_intra_control": "51082",
         "port_intra_data": "51083"
     },
-    "fspaths": {"/ais/mp1":{},"/ais/mp2":{},"/ais/mp3":{},"/ais/mp4":{}},
+    "fspaths": {"/ais/mp1": "","/ais/mp2": "","/ais/mp3":{},"/ais/mp4": ""},
     "test_fspaths": {
         "root": "/tmp/ais",
         "count": 0,
@@ -229,7 +264,10 @@ $ ais show config CCDpt8088 --json | tail -20
     }
 ```
 
-### Example: use `--type` option to show only local config
+See also:
+*  [local playground with two data drives](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/local/README.md)
+
+###Example: use `--type` option to show only local config
 
 ```console
 # ais show config koLAt8081 --type local
@@ -290,7 +328,6 @@ In the `DEFAULT` column above hyphen (`-`) indicates that the corresponding valu
 - [Enabling HTTPS](#enabling-https)
 - [Filesystem Health Checker](#filesystem-health-checker)
 - [Networking](#networking)
-- [Reverse proxy](#reverse-proxy)
 - [Curl examples](#curl-examples)
 - [CLI examples](#cli-examples)
 
@@ -333,7 +370,7 @@ $ ais config node t[fbarswQP] local --json
         "port_intra_control": "51082",
         "port_intra_data": "51083"
     },
-    "fspaths": {"/ais/nvme0n1":{},"/ais/nvme1n1":{},"/ais/nvme2n1":{}},
+    "fspaths": {"/ais/nvme0n1": "","/ais/nvme1n1": "","/ais/nvme2n1": ""},
     "test_fspaths": {
         "root": "",
         "count": 0,
@@ -341,6 +378,9 @@ $ ais config node t[fbarswQP] local --json
     }
 }
 ```
+
+See also:
+*  [local playground with two data drives](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/local/README.md)
 
 ## Basics
 
@@ -493,12 +533,16 @@ If extended attributes are disabled globally when deploying a cluster, node IDs 
 
 ## Enabling HTTPS
 
-To switch from HTTP protocol to an encrypted HTTPS, configure `net.http.use_https`=`true` and modify `net.http.server_crt` and `net.http.server_key` values so they point to your OpenSSL certificate and key files respectively (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh)).
+To switch from HTTP protocol to an encrypted HTTPS, configure `net.http.use_https`=`true` and modify `net.http.server_crt` and `net.http.server_key` values so they point to your TLS certificate and key files respectively (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh)).
 
-See also:
+The following HTTPS topics are also covered elsewhere:
 
-* [HTTPS from scratch](/docs/getting_started.md)
-* [Switching an already deployed cluster between HTTP and HTTPS](/docs/switch_https.md)
+- [Generating self-signed certificates](https.md#generating-self-signed-certificates)
+- [Deploying: 4 targets, 1 gateway, 6 mountpaths, AWS backend](https.md#deploying-4-targets-1-gateway-6-mountpaths-aws-backend)
+- [Accessing the cluster](https.md#accessing-the-cluster)
+- [Testing with self-signed certificates](https.md#testing-with-self-signed-certificates)
+- [Updating and reloading X.509 certificates](https.md#updating-and-reloading-x509-certificates)
+- [Switching cluster between HTTP and HTTPS](https.md#switching-cluster-between-http-and-https)
 
 ## Filesystem Health Checker
 
@@ -563,10 +607,6 @@ Separately, there's a **multi-homing** capability motivated by the fact that tod
 ```
 
 No other changes. Just add the second NIC - second IPv4 addr `10.50.56.206` above, and that's all.
-
-## Reverse proxy
-
-AIStore gateway can act as a reverse proxy vis-à-vis AIStore storage targets. This functionality is limited to GET requests only and must be used with caution and consideration. Related [configuration variable](/deploy/dev/local/aisnode_config.sh) is called `rproxy` - see sub-section `http` of the section `net`. For further details, please refer to [this readme](rproxy.md).
 
 ## Curl examples
 

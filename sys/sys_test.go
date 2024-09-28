@@ -1,6 +1,6 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package sys_test
 
@@ -39,14 +39,13 @@ func TestLoadAvg(t *testing.T) {
 		"All load average must be positive ones")
 }
 
-func TestLimitMaxProc(t *testing.T) {
-	prev := runtime.GOMAXPROCS(0)
-	defer runtime.GOMAXPROCS(prev)
+func TestMaxProcs(t *testing.T) {
+	newval := 4
+	prev := runtime.GOMAXPROCS(newval)
+	tassert.Errorf(t, runtime.GOMAXPROCS(0) == newval, "Failed to set GOMAXPROCS to %d", newval)
 
-	ncpu := sys.NumCPU()
-	sys.SetMaxProcs()
-	curr := runtime.GOMAXPROCS(0)
-	tassert.Errorf(t, ncpu == curr, "Failed to set GOMAXPROCS to %d, current value is %d", ncpu, curr)
+	runtime.GOMAXPROCS(prev)
+	tassert.Errorf(t, runtime.GOMAXPROCS(0) == prev, "Failed to restore GOMAXPROCS to %d", prev)
 }
 
 func TestMemoryStats(t *testing.T) {
@@ -90,7 +89,7 @@ func TestProc(t *testing.T) {
 
 	// burn CPU for a few seconds by calculating prime numbers
 	// and make a short break to make usage lower than 100%
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		n := int64(1)<<52 + int64((i*2)|1)
 		middle := int64(math.Sqrt(float64(n)))
 		divider := int64(3)

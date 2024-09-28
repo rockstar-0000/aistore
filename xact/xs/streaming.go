@@ -6,7 +6,6 @@
 package xs
 
 import (
-	"strconv"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
@@ -73,11 +72,30 @@ func (p *streamingF) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 // independently on (by) all targets and using the latter as both xaction ID and receive endpoint (trname)
 // for target=>target streams.
 
+func (p *streamingF) _tag(fromBck, toBck *meta.Bck) (tag []byte) {
+	var (
+		from = fromBck.MakeUname("")
+		to   = toBck.MakeUname("")
+		bmd  = core.T.Bowner().Get()
+		l    = cos.PackedStrLen(p.kind) + 1 + cos.PackedBytesLen(from) + 1 + cos.PackedBytesLen(to) + 1 + cos.SizeofI64
+		pack = cos.NewPacker(nil, l)
+	)
+	pack.WriteString(p.kind)
+	pack.WriteByte('|')
+	pack.WriteBytes(from)
+	pack.WriteByte('|')
+	pack.WriteBytes(to)
+	pack.WriteByte('|')
+	pack.WriteInt64(bmd.Version)
+	tag = pack.Bytes()
+	debug.Assert(len(tag) == l, len(tag), " vs ", l)
+	return tag
+}
+
 func (p *streamingF) genBEID(fromBck, toBck *meta.Bck) (string, error) {
 	var (
 		div = uint64(xact.IdleDefault)
-		bmd = core.T.Bowner().Get()
-		tag = p.kind + "|" + fromBck.MakeUname("") + "|" + toBck.MakeUname("") + "|" + strconv.FormatInt(bmd.Version, 10)
+		tag = p._tag(fromBck, toBck)
 	)
 	beid, prev, err := xreg.GenBEID(div, tag)
 	if beid != "" {
@@ -85,7 +103,7 @@ func (p *streamingF) genBEID(fromBck, toBck *meta.Bck) (string, error) {
 		return beid, nil
 	}
 	if prev != nil {
-		err = cmn.NewErrBusy("node", core.T, "running "+prev.Name())
+		err = cmn.NewErrBusy("node", core.T.String(), "running "+prev.Name())
 	}
 	return "", err
 }
@@ -172,13 +190,13 @@ func (r *streamingX) fin(unreg bool) {
 	}
 }
 
-func (r *streamingX) wurr() time.Duration {
+func (r *streamingX) wurr(int64) time.Duration {
 	if cnt := r.wiCnt.Load(); cnt > 0 {
 		r.maxWt += waitUnregRecv
 		if r.maxWt < waitUnregMax {
 			return waitUnregRecv
 		}
-		nlog.Errorf("%s: unreg timeout %v, cnt %d", r, r.maxWt, cnt)
+		nlog.Errorln(r.String(), "unreg timeout", r.maxWt, "count", cnt)
 	}
 	r.p.dm.UnregRecv()
 	return hk.UnregInterval

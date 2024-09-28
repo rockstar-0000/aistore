@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -10,6 +10,7 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -17,7 +18,7 @@ import (
 // for those (very few) clients that don't have their own custom implementation
 
 type WalkBckOpts struct {
-	ValidateCallback walkFunc // should return filepath.SkipDir to skip directory without an error
+	ValidateCb walkFunc // should return filepath.SkipDir to skip directory without an error
 	WalkOpts
 }
 
@@ -43,6 +44,7 @@ type (
 	wbeHeap []wbeInfo
 )
 
+// lso and tests
 func WalkBck(opts *WalkBckOpts) error {
 	debug.Assert(opts.Mi == nil && opts.Sorted) // TODO: support `opts.Sorted == false`
 	var (
@@ -57,24 +59,24 @@ func WalkBck(opts *WalkBckOpts) error {
 		jg := &joggerBck{
 			workCh:   workCh,
 			mi:       mi,
-			validate: opts.ValidateCallback,
+			validate: opts.ValidateCb,
 			ctx:      ctx,
 			opts:     opts.WalkOpts,
 		}
-		jg.opts.Callback = jg.cb
+		jg.opts.Callback = jg.cb // --> jg.validate --> opts.ValidateCb
 		jg.opts.Mi = mi
 		joggers[idx] = jg
 		idx++
 	}
 
-	for i := 0; i < l; i++ {
+	for i := range l {
 		group.Go(joggers[i].walk)
 	}
 	group.Go(func() error {
 		h := &wbeHeap{}
 		heap.Init(h)
 
-		for i := 0; i < l; i++ {
+		for i := range l {
 			if wbe, ok := <-joggers[i].workCh; ok {
 				heap.Push(h, wbeInfo{mpathIdx: i, fqn: wbe.fqn, dirEntry: wbe.dirEntry})
 			}
@@ -99,25 +101,29 @@ func WalkBck(opts *WalkBckOpts) error {
 // joggerBck //
 ///////////////
 
-func (jg *joggerBck) walk() (err error) {
-	err = Walk(&jg.opts)
-	close(jg.workCh)
-	return
+func (j *joggerBck) walk() (err error) {
+	if err = j.opts.Mi.CheckFS(); err != nil {
+		nlog.Errorln(err)
+		mfs.hc.FSHC(err, j.opts.Mi, "")
+	} else {
+		err = Walk(&j.opts)
+	}
+	close(j.workCh)
+	return err
 }
 
-func (jg *joggerBck) cb(fqn string, de DirEntry) error {
+func (j *joggerBck) cb(fqn string, de DirEntry) error {
 	const tag = "fs-walk-bck-mpath"
 	select {
-	case <-jg.ctx.Done():
-		return cmn.NewErrAborted(jg.mi.String(), tag, nil)
+	case <-j.ctx.Done():
+		return cmn.NewErrAborted(j.mi.String(), tag, nil)
 	default:
 		break
 	}
-	if jg.validate != nil {
-		if err := jg.validate(fqn, de); err != nil {
-			// If err != filepath.SkipDir, Walk will propagate the error
-			// to group.Go. Then context will be canceled, which terminates
-			// all other go routines running.
+	if j.validate != nil {
+		if err := j.validate(fqn, de); err != nil {
+			// If err != filepath.SkipDir, the Walk will propagate the error to group.Go.
+			// Context will be canceled, which then will terminate all running goroutines.
 			return err
 		}
 	}
@@ -125,9 +131,9 @@ func (jg *joggerBck) cb(fqn string, de DirEntry) error {
 		return nil
 	}
 	select {
-	case <-jg.ctx.Done():
-		return cmn.NewErrAborted(jg.mi.String(), tag, nil)
-	case jg.workCh <- &wbe{de, fqn}:
+	case <-j.ctx.Done():
+		return cmn.NewErrAborted(j.mi.String(), tag, nil)
+	case j.workCh <- &wbe{de, fqn}:
 		return nil
 	}
 }
@@ -141,13 +147,15 @@ func (h wbeHeap) Less(i, j int) bool { return h[i].objName < h[j].objName }
 func (h wbeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 
 func (h *wbeHeap) Push(x any) {
-	info := x.(wbeInfo)
+	var (
+		parsed ParsedFQN
+		info   = x.(wbeInfo)
+	)
 	debug.Assert(info.objName == "")
-	parsedFQN, err := ParseFQN(info.fqn)
-	if err != nil {
+	if err := parsed.Init(info.fqn); err != nil {
 		return
 	}
-	info.objName = parsedFQN.ObjName
+	info.objName = parsed.ObjName
 	*h = append(*h, info)
 }
 

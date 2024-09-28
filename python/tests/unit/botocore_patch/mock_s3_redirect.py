@@ -6,11 +6,11 @@
 import logging
 import wrapt
 
-# Patch moto - an S3 stubbing library - to
-# issue redirects for us.
-
-# When running tests, fake HTTP redirects
-# for the following.
+# Patch moto - an S3 mocking library to simulate HTTP redirects,
+# which might happen on AIStore but the moto library don't.
+# This enhances moto to emulate AIStore behavior more comprehensively,
+# Specifically, if the `redirections_enabled` is set to `True` by user,
+# fake HTTP redirects for the following operations.
 #
 # Not all response operatons found in moto's
 # S3Response are found below; they don't all
@@ -51,6 +51,7 @@ def s3_response_wrapper(
 
     logging.debug("s3_response_wrapper: intercepted %s", wrapped.__name__)
     method = None
+    attempt = None
     try:
         method = operation.split("_").pop().upper()
         if method == "GET":

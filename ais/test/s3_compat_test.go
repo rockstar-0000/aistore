@@ -18,6 +18,7 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/feat"
@@ -67,23 +68,49 @@ func newS3Client() *http.Client {
 	}
 }
 
-func TestS3PassThroughPutGet(t *testing.T) {
+func setBucketFeatures(t *testing.T, bck cmn.Bck, bprops *cmn.Bprops, nf feat.Flags) {
+	if bprops.Features.IsSet(nf) {
+		return // nothing to do
+	}
+	props := &cmn.BpropsToSet{Features: &nf}
+	_, err := api.SetBucketProps(baseParams, bck, props)
+	tassert.CheckFatal(t, err)
+
+	t.Cleanup(func() {
+		// restore original feature flags
+		props := &cmn.BpropsToSet{Features: &bprops.Features}
+		_, err := api.SetBucketProps(baseParams, bck, props)
+		tassert.CheckFatal(t, err)
+	})
+}
+
+func TestS3PresignedPutGet(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Bck: cliBck, RequiresTLS: true, RequiredCloudProvider: apc.AWS})
 
 	var (
 		bck     = cliBck
 		objName = "object.txt"
 	)
+	bprops, err := api.HeadBucket(baseParams, bck, false)
+	tassert.CheckFatal(t, err)
 
-	tools.SetClusterConfig(t, cos.StrKVs{"features": feat.PassThroughSignedS3Req.Value()})
+	setBucketFeatures(t, bck, bprops, feat.S3PresignedRequest)
+
+	tools.SetClusterConfig(t, cos.StrKVs{"features": feat.S3ReverseProxy.String()})
 	t.Cleanup(func() {
 		tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
 	})
 
-	_, err := api.HeadBucket(baseParams, bck, false)
+	/* TODO -- FIXME: alternatively, use env vars AWS_PROFILE et al:
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithSharedConfigProfile("default"),
+	)
 	tassert.CheckFatal(t, err)
-
-	s3Client := s3.New(s3.Options{HTTPClient: newS3Client(), Region: cmn.AwsDefaultRegion})
+	cfg.HTTPClient = newS3Client()
+	s3Client := s3.NewFromConfig(cfg)
+	*/
+	s3Client := s3.New(s3.Options{HTTPClient: newS3Client(), Region: env.AwsDefaultRegion()})
 
 	putOutput, err := s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String(bck.Name),
@@ -108,23 +135,24 @@ func TestS3PassThroughPutGet(t *testing.T) {
 	tassert.Errorf(t, *putOutput.ETag == *getOutput.ETag, "ETag does not match between PUT and GET operation (%s != %s)", *putOutput.ETag, *getOutput.ETag)
 }
 
-func TestS3PassThroughMultipart(t *testing.T) {
+func TestS3PresignedMultipart(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, Bck: cliBck, RequiresTLS: true, RequiredCloudProvider: apc.AWS})
 
 	var (
 		bck     = cliBck
 		objName = "object.txt"
 	)
+	bprops, err := api.HeadBucket(baseParams, bck, false)
+	tassert.CheckFatal(t, err)
 
-	tools.SetClusterConfig(t, cos.StrKVs{"features": feat.PassThroughSignedS3Req.Value()})
+	setBucketFeatures(t, bck, bprops, feat.S3PresignedRequest)
+
+	tools.SetClusterConfig(t, cos.StrKVs{"features": feat.S3ReverseProxy.String()})
 	t.Cleanup(func() {
 		tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
 	})
 
-	_, err := api.HeadBucket(baseParams, bck, false)
-	tassert.CheckFatal(t, err)
-
-	s3Client := s3.New(s3.Options{HTTPClient: newS3Client(), Region: cmn.AwsDefaultRegion})
+	s3Client := s3.New(s3.Options{HTTPClient: newS3Client(), Region: env.AwsDefaultRegion()})
 
 	createMultipartUploadOutput, err := s3Client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bck.Name),
@@ -180,11 +208,9 @@ func TestS3PassThroughMultipart(t *testing.T) {
 	)
 }
 
-// FIXME: This test should be enabled once implementation is fixed.
 // This tests checks that when there is no object locally in the AIStore, we
 // won't get it from S3.
-func TestWriteThroughCacheNoColdGet(t *testing.T) {
-	t.Skip()
+func TestDisableColdGet(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Bck: cliBck, RequiresTLS: true, RequiredCloudProvider: apc.AWS})
 
 	var (
@@ -192,15 +218,17 @@ func TestWriteThroughCacheNoColdGet(t *testing.T) {
 		objName = "object.txt"
 	)
 
-	tools.SetClusterConfig(t, cos.StrKVs{"features": feat.PassThroughSignedS3Req.Value()})
+	bprops, err := api.HeadBucket(baseParams, bck, false)
+	tassert.CheckFatal(t, err)
+
+	setBucketFeatures(t, bck, bprops, feat.S3PresignedRequest|feat.DisableColdGET)
+
+	tools.SetClusterConfig(t, cos.StrKVs{"features": feat.S3ReverseProxy.String()})
 	t.Cleanup(func() {
 		tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
 	})
 
-	_, err := api.HeadBucket(baseParams, bck, false)
-	tassert.CheckFatal(t, err)
-
-	s3Client := s3.New(s3.Options{HTTPClient: newS3Client(), Region: cmn.AwsDefaultRegion})
+	s3Client := s3.New(s3.Options{HTTPClient: newS3Client(), Region: env.AwsDefaultRegion()})
 
 	putOutput, err := s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String(bck.Name),

@@ -1,12 +1,13 @@
 // Package xs_test contains xs unit test.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs_test
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
+	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/xact"
@@ -31,10 +33,12 @@ func init() {
 	config.Timeout.CplaneOperation = cos.Duration(2 * time.Second)
 	config.Timeout.MaxKeepalive = cos.Duration(4 * time.Second)
 	config.Timeout.MaxHostBusy = cos.Duration(20 * time.Second)
+	config.TestFSP.Count = 1
 	cmn.GCO.CommitUpdate(config)
 
 	xreg.Init()
 	xs.Xreg(false)
+	fs.TestNew(nil)
 }
 
 // Smoke tests for xactions
@@ -51,7 +55,7 @@ func TestXactionRenewLRU(t *testing.T) {
 	cos.InitShortID(0)
 
 	wg.Add(num)
-	for i := 0; i < num; i++ {
+	for range num {
 		go func() {
 			xactCh <- xreg.RenewLRU(cos.GenUUID())
 			wg.Done()
@@ -83,6 +87,11 @@ func TestXactionRenewPrefetch(t *testing.T) {
 	xreg.TestReset()
 	bmd.Add(bck)
 
+	_ = cos.CreateDir("/tmp/prefetch")
+	_, err := fs.Add("/tmp/prefetch", tMock.SID())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ignoring:", err)
+	}
 	xreg.RegBckXact(&xs.TestXFactory{})
 	defer xreg.AbortAll(nil)
 	cos.InitShortID(0)
@@ -90,7 +99,7 @@ func TestXactionRenewPrefetch(t *testing.T) {
 	ch := make(chan xreg.RenewRes, 10)
 	wg := &sync.WaitGroup{}
 	wg.Add(10)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		go func() {
 			defer wg.Done()
 			ch <- xreg.RenewPrefetch(cos.GenUUID(), bck, msg)
@@ -107,7 +116,7 @@ func TestXactionRenewPrefetch(t *testing.T) {
 		}
 	}
 
-	tassert.Errorf(t, len(res) > 0, "expected some evictDelete xactions to be created, got %d", len(res))
+	tassert.Errorf(t, len(res) > 0, "expected xactions to be created")
 }
 
 func TestXactionAbortAll(t *testing.T) {
@@ -300,10 +309,12 @@ func TestBeid(t *testing.T) {
 
 	var (
 		ids  = make(map[string]struct{}, num)
-		tags = []string{"tag1", "tag2"}
+		tag1 = []byte{'t', 'a', 'g', '1'}
+		tag2 = []byte{'t', 'a', 'g', '2'}
+		tags = [][]byte{tag1, tag2}
 		cnt  int
 	)
-	for i := 0; i < num; i++ {
+	for i := range num {
 		beid, _, _ := xreg.GenBEID(div, tags[i%2])
 		if _, ok := ids[beid]; ok {
 			t.Fatalf("%d: %s duplicated", i, beid)

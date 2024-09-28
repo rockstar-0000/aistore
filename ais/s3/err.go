@@ -18,6 +18,8 @@ import (
 	"github.com/NVIDIA/aistore/memsys"
 )
 
+const ErrPrefix = "aws-error"
+
 type Error struct {
 	Code      string
 	Message   string
@@ -32,7 +34,7 @@ func (e *Error) mustMarshal(sgl *memsys.SGL) {
 }
 
 // with user-friendly tip
-func WriteMptErr(w http.ResponseWriter, r *http.Request, err error, errCode int, lom *core.LOM, uploadID string) {
+func WriteMptErr(w http.ResponseWriter, r *http.Request, err error, ecode int, lom *core.LOM, uploadID string) {
 	// specifically, for s3cmd example
 	name := strings.Replace(lom.Cname(), apc.AISScheme+apc.BckProviderSeparator, apc.S3Scheme+apc.BckProviderSeparator, 1)
 	s3cmd := "s3cmd abortmp " + name + " " + uploadID
@@ -40,13 +42,13 @@ func WriteMptErr(w http.ResponseWriter, r *http.Request, err error, errCode int,
 		s3cmd = "\n  " + s3cmd
 	}
 	e := fmt.Errorf("%v\nUse upload ID %q to cleanup, e.g.: %s", err, uploadID, s3cmd)
-	if errCode == 0 {
-		errCode = http.StatusInternalServerError
+	if ecode == 0 {
+		ecode = http.StatusInternalServerError
 	}
-	WriteErr(w, r, e, errCode)
+	WriteErr(w, r, e, ecode)
 }
 
-func WriteErr(w http.ResponseWriter, r *http.Request, err error, errCode int) {
+func WriteErr(w http.ResponseWriter, r *http.Request, err error, ecode int) {
 	var (
 		out       Error
 		in        *cmn.ErrHTTP
@@ -54,7 +56,7 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, errCode int) {
 		allocated bool
 	)
 	if in, ok = err.(*cmn.ErrHTTP); !ok {
-		in = cmn.InitErrHTTP(r, err, errCode)
+		in = cmn.InitErrHTTP(r, err, ecode)
 		allocated = true
 	}
 	out.Message = in.Message
@@ -63,8 +65,19 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, errCode int) {
 		out.Code = "BucketAlreadyExists"
 	case cmn.IsErrBckNotFound(err):
 		out.Code = "NoSuchBucket"
-	default:
+	case in.TypeCode != "":
 		out.Code = in.TypeCode
+	default:
+		l := len(ErrPrefix)
+		// e.g. "aws-error[NotFound: blah]" as per backend/aws.go _awsErr() formatting
+		if strings.HasPrefix(out.Message, ErrPrefix) {
+			if i := strings.Index(out.Message[l+1:], ":"); i > 4 {
+				code := out.Message[l+1 : l+i+1]
+				if cos.IsAlphaNice(code) && code[0] >= 'A' && code[0] <= 'Z' {
+					out.Code = code
+				}
+			}
+		}
 	}
 	sgl := memsys.PageMM().NewSGL(0)
 	out.mustMarshal(sgl)
@@ -73,7 +86,7 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, errCode int) {
 	w.Header().Set(cos.HdrContentTypeOptions, "nosniff")
 
 	w.WriteHeader(in.Status)
-	sgl.WriteTo(w)
+	sgl.WriteTo2(w)
 	sgl.Free()
 	if allocated {
 		cmn.FreeHterr(in)

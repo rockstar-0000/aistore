@@ -91,7 +91,9 @@ In particular, all API requests that operate on a bucket carry the bucket's spec
 
 > For developers and first-time users: if you deployed AIS locally having followed [these instructions](/README.md#local-non-containerized) then most likely you will have `http://localhost:8080` as the primary proxy, and generally, `http://localhost:808x` for all locally-deployed AIS daemons.
 
-> The reference below is "formulated" in `curl` - i.e., using `curl` command lines. It is possible, however, and often much easier (and, therefore, **preferable**), to execute the same operations using [AIS CLI](/docs/cli.md).
+> The reference below is "formulated" in [curl](https://curl.se/) - i.e., using `curl` command lines. It is possible, however, and often much easier (and, therefore, **preferable**), to execute the same operations using [AIS CLI](/docs/cli.md). For more `curl` examples, please also see:
+
+* [Assorted Curl](/docs/getting_started.md#assorted-curl)
 
 6. And finally, **HTTP request and response headers**
 
@@ -143,7 +145,7 @@ $ curl -s -L -X GET 'http://aistore/gs/my-google-bucket' | jq
 
 > AIS provides S3 compatibility layer via its "/s3" endpoint. [S3 compatibility](/docs/s3compat.md) shall not be confused with "easy URL" mapping, whereby a path (e.g.) "gs/mybucket/myobject" gets replaced with "v1/objects/mybucket/myobject?provider=gcp" with _no_ other changes to the request and response parameters and components.
 
-> For detals and more usage examples, please see [easy URL readme](/docs/easy_url.md).
+> For detals and additional usage examples, please see [easy URL readme](/docs/easy_url.md).
 
 ## API Reference
 
@@ -187,7 +189,7 @@ This and the next section reference a variety of URL paths (e.g., `/v1/cluster`)
 | Get Cluster Map from a specific node (any node in the cluster) | See [Querying information](#querying-information) section below | (to be added) | `api.GetNodeClusterMap` |
 | Get Cluster System information | GET /v1/cluster | See [Querying information](#querying-information) section below | `api.GetClusterSysInfo` |
 | Get Cluster statistics | GET /v1/cluster | See [Querying information](#querying-information) section below | `api.GetClusterStats` |
-| Get remote AIS-cluster information (access URL, primary gateway, cluster map version, and more) | GET /v1/cluster | See [Querying information](#querying-information) section below | `api.GetRemoteAIS` |
+| Get remote AIS-cluster information (access URL, primary gateway, cluster map version and more) | GET /v1/cluster | See [Querying information](#querying-information) section below | `api.GetRemoteAIS` |
 | Attach remote AIS cluster | PUT /v1/cluster/attach | (to be added) | `api.AttachRemoteAIS` |
 | Detach remote AIS cluster | PUT /v1/cluster/detach | (to be added) | `api.DetachRemoteAIS` |
 
@@ -214,7 +216,7 @@ The operations that are limited in scope to a single specified node and that usu
 In this section, two quick `curl` examples. Notice response headers that show both the cluster and the responding node's respective uptimes (in nanoseconds):
 
 ```console
-$ curl -i http://localhost:8080//v1/health
+$ curl -i http://localhost:8080/v1/health
 HTTP/1.1 200 OK
 Ais-Cluster-Uptime: 295433144686
 Ais-Node-Uptime: 310453738871
@@ -222,10 +224,12 @@ Date: Tue, 08 Nov 2022 14:11:57 GMT
 Content-Length: 0
 ```
 
+> Note: `http://localhost:8080` address (above and elsewhere) must be understood as a placeholder for an _arbitrary_ AIStore endpoint (`AIS_ENDPOINT`).
+
 And here's a health probe executed during cluster startup:
 
 ```console
-$ curl -i http://localhost:8080//v1/health?prr=true
+$ curl -i http://localhost:8080/v1/health?prr=true
 HTTP/1.1 503 Service Unavailable
 Ais-Cluster-Uptime: 5578879646
 Ais-Node-Uptime: 20603416072
@@ -288,10 +292,10 @@ and more.
 | List objects (`list-objects`) in a given [bucket](/docs/bucket.md) | GET {"action": "list", "value": { properties-and-options... }} /v1/buckets/bucket-name | `curl -X GET -L -H 'Content-Type: application/json' -d '{"action": "list", "value":{"props": "size"}}' 'http://G/v1/buckets/myS3bucket'` <sup id="a2">[2](#ft2)</sup> | `api.ListObjects` (see also `api.ListObjectsPage` and section [Listing objects](#listing-objects) below |
 | Get [bucket properties](/docs/bucket.md#bucket-properties) | HEAD /v1/buckets/bucket-name | `curl -s -L --head 'http://G/v1/buckets/mybucket'` | `api.HeadBucket` |
 | Get object props | HEAD /v1/objects/bucket-name/object-name | `curl -s -L --head 'http://G/v1/objects/mybucket/myobject'` | `api.HeadObject` |
-| Set object's custom (user-defined) properties | (to be added) | (to be added) | `api.SetObjectCustomProps` |
+| Set object's custom (user-defined) properties | PATCH /v1/objects/bucket-name/object-name | `curl -i -L -X PATCH -H 'Content-Type: application/json' -d '{"value": {"key": "value"}}' 'http://G/v1/objects/bucket/object'` | `api.SetObjectCustomProps` |
 | PUT object | PUT /v1/objects/bucket-name/object-name | `curl -s -L -X PUT 'http://G/v1/objects/myS3bucket/myobject' -T filenameToUpload` | `api.PutObject` |
-| APPEND to object | PUT /v1/objects/bucket-name/object-name?appendty=append&handle= | `curl -s -L -X PUT 'http://G/v1/objects/myS3bucket/myobject?appendty=append&handle=' -T filenameToUpload-partN`  <sup>[8](#ft8)</sup> | `api.AppendObject` |
-| Finalize APPEND | PUT /v1/objects/bucket-name/object-name?appendty=flush&handle=obj-handle | `curl -s -L -X PUT 'http://G/v1/objects/myS3bucket/myobject?appendty=flush&handle=obj-handle'`  <sup>[8](#ft8)</sup> | `api.FlushObject` |
+| APPEND to object | PUT /v1/objects/bucket-name/object-name?append_type=append&append_handle= | `curl -s -L -X PUT 'http://G/v1/objects/myS3bucket/myobject?append_type=append&append_handle=' -T filenameToUpload-partN`  <sup>[8](#ft8)</sup> | `api.AppendObject` |
+| Finalize APPEND | PUT /v1/objects/bucket-name/object-name?append_type=flush&append_handle=obj-handle | `curl -s -L -X PUT 'http://G/v1/objects/myS3bucket/myobject?append_type=flush&append_handle=obj-handle'`  <sup>[8](#ft8)</sup> | `api.FlushObject` |
 | Delete object | DELETE /v1/objects/bucket-name/object-name | `curl -i -X DELETE -L 'http://G/v1/objects/mybucket/myobject'` | `api.DeleteObject` |
 | Set [bucket properties](/docs/bucket.md#bucket-properties) (proxy) | PATCH {"action": "set-bprops"} /v1/buckets/bucket-name | `curl -i -X PATCH -H 'Content-Type: application/json' -d '{"action":"set-bprops", "value": {"checksum": {"type": "sha256"}, "mirror": {"enable": true}, "force": false}' 'http://G/v1/buckets/abc'`  <sup id="a9">[9](#ft9)</sup> | `api.SetBucketProps` |
 | Reset [bucket properties](/docs/bucket.md#bucket-properties) (proxy) | PATCH {"action": "reset-bprops"} /v1/buckets/bucket-name | `curl -i -X PATCH -H 'Content-Type: application/json' -d '{"action":"reset-bprops"}' 'http://G/v1/buckets/abc'` | `api.ResetBucketProps` |
@@ -711,7 +715,7 @@ Following is a brief summary of the majority of supported monitoring operations 
 $ curl -X GET http://G/v1/cluster?what=stats
 ```
 
-Execution flow for this single command causes intra-cluster broadcast whereby requesting proxy (which could be any proxy in the cluster) consolidates all  results from all other nodes in a JSON-formatted output. The latter contains both http proxy and storage targets request counters, per-target used/available capacities, and more. For example:
+Execution flow for this single command causes intra-cluster broadcast whereby requesting proxy (which could be any proxy in the cluster) consolidates all  results from all other nodes in a JSON-formatted output. The latter contains both http proxy and storage targets request counters, per-target used/available capacitiesand more. For example:
 
 ![AIStore statistics](images/ais-get-stats.png)
 
@@ -737,6 +741,6 @@ For API Reference of ETL please refer to [ETL Readme](/docs/etl.md#api-reference
 
 <a name="ft7">7</a>) The request promotes files to objects; note that the files must be present inside AIStore targets and be referenceable via local directories or fully qualified names. The example request promotes recursively all files of a directory `/user/dir` that is on the target with ID `234ed78` to objects of a bucket `abc`. As `trim_prefix` is set, the names of objects are the file paths with the base trimmed: `dir/file1`, `dir/file2`, `dir/subdir/file3` etc. [↩](#a7)
 
-<a name="ft8">8</a>) When putting the first part of an object, `handle` value must be empty string or omitted. On success, the first request returns an object handle. The subsequent `AppendObject` and `FlushObject` requests must pass the handle to the API calls. The object gets accessible and appears in a bucket only after `FlushObject` is done.
+<a name="ft8">8</a>) When putting the first part of an object, `append_handle` value must be empty string or omitted. On success, the first request returns an object handle. The subsequent `AppendObject` and `FlushObject` requests must pass the handle to the API calls. The object gets accessible and appears in a bucket only after `FlushObject` is done.
 
 <a name="ft9">9</a>) Use option `"force": true` to ignore non-critical errors. E.g, to modify `ec.objsize_limit` when EC is already enabled, or to enable EC if the number of target is less than `ec.data_slices + ec.parity_slices + 1`. [↩](#a9)

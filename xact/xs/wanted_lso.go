@@ -37,7 +37,7 @@ func wanted(msg *apc.LsoMsg) (flags cos.BitFlags) {
 	return
 }
 
-func (wi *walkInfo) setWanted(e *cmn.LsoEntry, lom *core.LOM) {
+func (wi *walkInfo) setWanted(e *cmn.LsoEnt, lom *core.LOM) {
 	var (
 		custom  = e.Custom
 		version = e.Version
@@ -52,10 +52,10 @@ func (wi *walkInfo) setWanted(e *cmn.LsoEntry, lom *core.LOM) {
 		case apc.GetPropsCached: // via obj.SetPresent()
 
 		case apc.GetPropsSize:
-			if e.Size > 0 && lom.SizeBytes() != e.Size {
+			if e.Size > 0 && lom.Lsize() != e.Size {
 				e.SetVerChanged()
 			}
-			e.Size = lom.SizeBytes()
+			e.Size = lom.Lsize()
 		case apc.GetPropsVersion:
 			e.Version = lom.Version()
 		case apc.GetPropsChecksum:
@@ -84,7 +84,7 @@ func (wi *walkInfo) setWanted(e *cmn.LsoEntry, lom *core.LOM) {
 			var oa cmn.ObjAttrs
 			oa.CustomMD = md
 			oa.Size = e.Size
-			if !lom.Equal(&oa) {
+			if lom.CheckEq(&oa) != nil {
 				e.SetVerChanged()
 			}
 		}

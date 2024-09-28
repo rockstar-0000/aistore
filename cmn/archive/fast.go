@@ -15,9 +15,12 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
-// fast.go provides "fast append"
-
-// Opens TAR and uses its reader's Next() to skip to the position
+// Fast Append -------------------------------------------------------
+// Standard library does not support appending to tgz, zip, and such;
+// for TAR there is an optimizing workaround not requiring a full copy.
+//
+// Execution:
+// OpensTAR and use its reader's Next() to skip to the position
 // right _after_ the last file in the TAR (padding bytes including).
 //
 // Background:
@@ -25,17 +28,19 @@ import (
 // The blocks must be overwritten, otherwise newly added files won't be
 // accessible. Different TAR formats (such as `ustar`, `pax` and `GNU`)
 // write different number of zero blocks.
-func OpenTarSeekEnd(cname, workFQN string) (rwfh *os.File, tarFormat tar.Format, err error) {
+// --------------------------------------------------------------------
+
+func OpenTarForAppend(cname, workFQN string) (rwfh *os.File, tarFormat tar.Format, offset int64, err error) {
 	if rwfh, err = os.OpenFile(workFQN, os.O_RDWR, cos.PermRWR); err != nil {
 		return
 	}
-	if tarFormat, err = _seekTarEnd(cname, rwfh); err != nil {
+	if tarFormat, offset, err = _seekTarEnd(cname, rwfh); err != nil {
 		rwfh.Close() // always close on err
 	}
 	return
 }
 
-func _seekTarEnd(cname string, fh *os.File) (tarFormat tar.Format, _ error) {
+func _seekTarEnd(cname string, fh *os.File) (tarFormat tar.Format, offset int64, err error) {
 	var (
 		twr     = tar.NewReader(fh)
 		size    int64
@@ -43,14 +48,15 @@ func _seekTarEnd(cname string, fh *os.File) (tarFormat tar.Format, _ error) {
 		unknown bool
 	)
 	for {
-		hdr, err := twr.Next()
+		var hdr *tar.Header
+		hdr, err = twr.Next()
 		if err != nil {
 			if err != io.EOF {
-				return tarFormat, err // invalid TAR format
+				return tarFormat, 0, err // invalid TAR format
 			}
 			// EOF
 			if pos < 0 {
-				return tarFormat, ErrTarIsEmpty
+				return tarFormat, 0, ErrTarIsEmpty // still ok
 			}
 			break
 		}
@@ -65,14 +71,18 @@ func _seekTarEnd(cname string, fh *os.File) (tarFormat tar.Format, _ error) {
 		pos, err = fh.Seek(0, io.SeekCurrent)
 		if err != nil {
 			debug.AssertNoErr(err) // unlikely
-			return tarFormat, err
+			return tarFormat, -1, err
 		}
 		size = hdr.Size
 	}
 	if pos == 0 {
-		return tarFormat, fmt.Errorf("failed to seek end of the TAR %s", cname)
+		return tarFormat, 0, fmt.Errorf("failed to seek end of the TAR %s", cname)
 	}
+
 	padded := cos.CeilAlignInt64(size, TarBlockSize)
-	_, err := fh.Seek(pos+padded, io.SeekStart)
-	return tarFormat, err
+	offset, err = fh.Seek(pos+padded, io.SeekStart)
+	debug.AssertNoErr(err)
+	debug.Assert(offset > 0)
+
+	return tarFormat, offset, err
 }

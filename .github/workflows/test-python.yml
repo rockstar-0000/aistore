@@ -1,4 +1,4 @@
-name: python/aistore
+name: Python SDK Tests
 on:
   push:
     branches:
@@ -7,12 +7,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  test:
     strategy:
       matrix:
-        go-version: ['1.21.x']
+        go-version: ['1.22.x']
         os: [ubuntu-latest, macos-latest]
-        python-version: ['3.11']
+        python-version: ['3.8','3.9','3.10','3.11']
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Go
@@ -21,25 +21,28 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup additional system libraries
-        if: startsWith(matrix.os, 'ubuntu')
+      - name: Remove unnecessary directories to free up space
         run: |
-          sudo apt update
-          sudo apt install -y xattr attr
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
 
       - name: Run AIStore
         run: |
           export GOPATH="$(go env GOPATH)"
-          deploy/scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt 1
+          AIS_SPACE_LOWWM=90 AIS_SPACE_HIGHWM=96 AIS_SPACE_OOS=99 scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt 1
 
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Run python tests
+      - name: Run Python tests
         run: |
           cd python
           make python_sdk_tests

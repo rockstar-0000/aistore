@@ -98,14 +98,42 @@ func arg0Node(c *cli.Context) (node *meta.Snode, sname string, err error) {
 	return
 }
 
-func errMisplacedFlag(c *cli.Context, arg string) (err error) {
+//
+// misplaced or mistyped flag(s)
+//
+
+func errArgIsFlag(c *cli.Context, arg string) (err error) {
 	if len(arg) > 1 && arg[0] == '-' {
 		err = incorrectUsageMsg(c, "missing command line argument (hint: flag '%s' misplaced?)", arg)
 	}
 	return err
 }
 
-func isWebURL(url string) bool { return cos.IsHTTP(url) || cos.IsHTTPS(url) }
+func errTailArgsContainFlag(tail []string) error {
+	for _, arg := range tail {
+		if len(arg) > 1 && arg[0] == '-' {
+			return fmt.Errorf("unrecognized or misplaced option %q", arg)
+		}
+	}
+	return nil
+}
+
+func reorderTailArgs(left string, middle []string, right ...string) string {
+	var sb strings.Builder
+	sb.WriteString(left)
+	sb.WriteByte(' ')
+	for _, s := range middle {
+		sb.WriteString(s)
+		sb.WriteByte(' ')
+	}
+	for _, s := range right {
+		sb.WriteString(s)
+		sb.WriteByte(' ')
+	}
+	return strings.TrimSuffix(sb.String(), " ")
+}
+
+func isWebURL(url string) bool { return cos.IsHT(url) || cos.IsHTTPS(url) }
 
 func jsonMarshalIndent(v any) ([]byte, error) { return jsoniter.MarshalIndent(v, "", "    ") }
 
@@ -125,7 +153,7 @@ func findClosestCommand(cmd string, candidates []cli.Command) (result string, di
 		minDist     = math.MaxInt64
 		closestName string
 	)
-	for i := 0; i < len(candidates); i++ {
+	for i := range candidates {
 		dist := DamerauLevenstheinDistance(cmd, candidates[i].Name)
 		if dist < minDist {
 			minDist = dist
@@ -137,23 +165,6 @@ func findClosestCommand(cmd string, candidates []cli.Command) (result string, di
 
 func briefPause(seconds time.Duration) {
 	time.Sleep(seconds * time.Second) //nolint:durationcheck // false positive
-}
-
-// Get config from a random target.
-func getRandTargetConfig(c *cli.Context) (*cmn.Config, error) {
-	smap, err := getClusterMap(c)
-	if err != nil {
-		return nil, err
-	}
-	tsi, err := smap.GetRandTarget()
-	if err != nil {
-		return nil, err
-	}
-	cfg, err := api.GetDaemonConfig(apiBP, tsi)
-	if err != nil {
-		return nil, V(err)
-	}
-	return cfg, err
 }
 
 func isConfigProp(s string) bool {
@@ -208,7 +219,7 @@ func makePairs(args []string) (nvs cos.StrKVs, err error) {
 		case i < ll-2 && args[i+1] == keyAndValueSeparator:
 			nvs[args[i]] = args[i+2]
 			i += 3
-		case args[i] == feat.FeaturesPropName && i < ll-1:
+		case args[i] == feat.PropName && i < ll-1:
 			nvs[args[i]] = strings.Join(args[i+1:], ",") // NOTE: only features nothing else in the tail
 			return
 		case args[i] == confLogModules && i < ll-1:
@@ -253,7 +264,7 @@ func isJSON(arg string) bool {
 	if possibleJSON == "" {
 		return false
 	}
-	if possibleJSON[0] == '\'' && possibleJSON[len(possibleJSON)-1] == '\'' {
+	if possibleJSON[0] == '\'' && cos.IsLastB(possibleJSON, '\'') {
 		possibleJSON = possibleJSON[1 : len(possibleJSON)-1]
 	}
 	if len(possibleJSON) >= 2 {
@@ -262,7 +273,7 @@ func isJSON(arg string) bool {
 	return false
 }
 
-func parseBucketAccessValues(values []string, idx int) (access apc.AccessAttrs, newIdx int, err error) {
+func parseBucketACL(values []string, idx int) (access apc.AccessAttrs, newIdx int, err error) {
 	var (
 		acc apc.AccessAttrs
 		val uint64
@@ -270,7 +281,7 @@ func parseBucketAccessValues(values []string, idx int) (access apc.AccessAttrs, 
 	if len(values) == 0 {
 		return access, idx, nil
 	}
-	// Case: `access GET,PUT`
+	// 1: `access GET,PUT`
 	if strings.Index(values[idx], ",") > 0 {
 		newIdx = idx + 1
 		lst := splitCsv(values[idx])
@@ -279,54 +290,79 @@ func parseBucketAccessValues(values []string, idx int) (access apc.AccessAttrs, 
 			if perm == "" {
 				continue
 			}
-			acc, err = apc.StrToAccess(perm)
-			if err != nil {
-				return
+			if acc, err = apc.StrToAccess(perm); err != nil {
+				return access, newIdx, err
 			}
 			access |= acc
 		}
 		return
 	}
+
+	// 2: direct hexadecimal input, e.g. `access 0x342`
+	// 3: `access HEAD`
 	for newIdx = idx; newIdx < len(values); {
-		// Case: `access 0x342`
-		val, err = parseHexOrUint(values[newIdx])
-		if err == nil {
-			access |= apc.AccessAttrs(val)
-			newIdx++
-			continue
-		}
-		// Case: `access HEAD`
-		acc, err = apc.StrToAccess(values[newIdx])
-		if err != nil {
-			break
+		if val, err = parseHexOrUint(values[newIdx]); err == nil {
+			acc = apc.AccessAttrs(val)
+		} else if acc, err = apc.StrToAccess(values[newIdx]); err != nil {
+			return access, newIdx, err
 		}
 		access |= acc
 		newIdx++
 	}
-	if idx == newIdx {
-		return 0, newIdx, err
-	}
 	return access, newIdx, nil
 }
 
-func parseFeatureFlags(v string) (res feat.Flags, err error) {
-	if v == "" || v == NilValue {
-		return 0, nil
+func parseFeatureFlags(values []string, idx int) (res feat.Flags, newIdx int, err error) {
+	if len(values) == 0 {
+		return 0, idx, nil
 	}
-	values := splitCsv(v)
-	for _, v := range values {
-		var f feat.Flags
-		if f, err = feat.StrToFeat(v); err != nil {
-			return
+	if values[idx] == apc.NilValue {
+		return 0, idx + 1, nil
+	}
+	// 1: parse (comma-separated) feat.Flags.String()
+	if strings.Index(values[idx], ",") > 0 {
+		newIdx = idx + 1
+		lst := splitCsv(values[idx])
+		for _, vv := range lst {
+			var (
+				f feat.Flags
+				v = strings.TrimSpace(vv)
+			)
+			if v == "" {
+				continue
+			}
+			if f, err = feat.CSV2Feat(v); err != nil {
+				return res, idx, err
+			}
+			res = res.Set(f)
 		}
-		res |= f // TODO -- FIXME: use res.Set(f)
+		return res, newIdx, nil
 	}
-	return
+
+	// 2: direct hexadecimal input, e.g. `features 0x342`
+	// 3: `features F3`
+	for newIdx = idx; newIdx < len(values); {
+		var (
+			f   feat.Flags
+			val uint64
+		)
+		if val, err = parseHexOrUint(values[newIdx]); err == nil {
+			f = feat.Flags(val)
+		} else if f, err = feat.CSV2Feat(values[newIdx]); err != nil {
+			return res, idx, err
+		}
+		res = res.Set(f)
+		newIdx++
+	}
+	return res, newIdx, nil
 }
 
 // TODO: support `allow` and `deny` verbs/operations on existing access permissions
 func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
-	props := make([]string, 0, 20)
+	var (
+		cmd   string
+		props = make([]string, 0, 20)
+	)
 	err = cmn.IterFields(&cmn.BpropsToSet{}, func(tag string, _ cmn.IterField) (error, bool) {
 		props = append(props, tag)
 		return nil, false
@@ -335,10 +371,6 @@ func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 		return
 	}
 
-	var (
-		access apc.AccessAttrs
-		cmd    string
-	)
 	nvs = make(cos.StrKVs, 8)
 	for idx := 0; idx < len(values); {
 		pos := strings.Index(values[idx], "=")
@@ -366,14 +398,31 @@ func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 			cmd = ""
 			continue
 		}
+
 		cmd = values[idx]
 		idx++
+		if idx >= len(values) {
+			break
+		}
+
+		// two special cases: access and feature flags
 		if cmd == cmn.PropBucketAccessAttrs {
-			access, idx, err = parseBucketAccessValues(values, idx)
+			var access apc.AccessAttrs
+			access, idx, err = parseBucketACL(values, idx)
 			if err != nil {
 				return nil, err
 			}
-			nvs[cmd] = strconv.FormatUint(uint64(access), 10)
+			nvs[cmd] = access.String() // FormatUint
+			cmd = ""
+			continue
+		}
+		if cmd == feat.PropName {
+			var features feat.Flags
+			features, idx, err = parseFeatureFlags(values, idx)
+			if err != nil {
+				return nil, err
+			}
+			nvs[cmd] = features.String() // FormatUint
 			cmd = ""
 		}
 	}
@@ -484,7 +533,7 @@ func headBucket(bck cmn.Bck, dontAddBckMD bool) (p *cmn.Bprops, err error) {
 // - otherwise, prints everything until the end of one of the args
 func limitedLineWriter(w io.Writer, maxLines int, fmtStr string, args ...[]string) {
 	objs := make([]any, 0, len(args))
-	if fmtStr == "" || fmtStr[len(fmtStr)-1] != '\n' {
+	if fmtStr == "" || !cos.IsLastB(fmtStr, '\n') {
 		fmtStr += "\n"
 	}
 
@@ -529,7 +578,7 @@ func bckPropList(props *cmn.Bprops, verbose bool) (propList nvpairList) {
 			{"lru", props.LRU.String()},
 			{"versioning", props.Versioning.String()},
 		}
-		if props.Provider == apc.HTTP {
+		if props.Provider == apc.HT {
 			origURL := props.Extra.HTTP.OrigURLBck
 			if origURL != "" {
 				propList = append(propList, nvpair{Name: "original-url", Value: origURL})
@@ -544,7 +593,8 @@ func bckPropList(props *cmn.Bprops, verbose bool) (propList nvpairList) {
 			case cmn.PropBucketAccessAttrs:
 				value = props.Access.Describe(true /*incl. all*/)
 			default:
-				value = fmt.Sprintf("%v", field.Value())
+				v := field.Value()
+				value = _toStr(v)
 			}
 			propList = append(propList, nvpair{Name: tag, Value: value})
 			return nil, false
@@ -587,7 +637,7 @@ func isUnsetTime(c *cli.Context, ts string) bool {
 }
 
 func readValue(c *cli.Context, prompt string) string {
-	fmt.Fprintf(c.App.Writer, prompt+": ")
+	fmt.Fprint(c.App.Writer, prompt+": ")
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -619,7 +669,7 @@ func isBucketEmpty(bck cmn.Bck, cached bool) (bool, error) {
 		msg.SetFlag(apc.LsObjCached)
 	}
 	msg.SetFlag(apc.LsNameOnly)
-	objList, err := api.ListObjectsPage(apiBP, bck, msg)
+	objList, err := api.ListObjectsPage(apiBP, bck, msg, api.ListArgs{})
 	if err != nil {
 		return false, V(err)
 	}
@@ -648,10 +698,10 @@ func ensureRemoteProvider(bck cmn.Bck) error {
 }
 
 func parseURLtoBck(strURL string) (bck cmn.Bck) {
-	if strURL[len(strURL)-1:] != apc.BckObjnameSeparator {
-		strURL += apc.BckObjnameSeparator
+	if !cos.IsLastB(strURL, '/') {
+		strURL += "/"
 	}
-	bck.Provider = apc.HTTP
+	bck.Provider = apc.HT
 	bck.Name = cmn.OrigURLBck2Name(strURL)
 	return
 }
@@ -669,10 +719,34 @@ func flattenJSON(jstruct any, section string) (flat nvpairList) {
 	return flat
 }
 
-// NOTE: remove secrets if any
+func flattenBackends(backends []string) (flat nvpairList) {
+	for _, b := range backends {
+		nv := nvpair{Name: b}
+		switch b {
+		case "aws":
+			nv.Value = "Amazon S3"
+		case "gcp":
+			nv.Value = "Google Cloud Storage"
+		case "azure":
+			nv.Value = "Azure Blob Storage"
+		}
+		flat = append(flat, nv)
+	}
+	return
+}
+
+// remove secrets, if any
 func _toStr(v any) (s string) {
 	m, ok := v.(map[string]any)
 	if !ok {
+		// feature flags: custom formatting
+		if f, ok := v.(feat.Flags); ok {
+			if f == 0 {
+				v = apc.NilValue
+			} else {
+				v = strings.Join(f.Names(), "\n\t ")
+			}
+		}
 		return fmt.Sprintf("%v", v)
 	}
 	// prune
@@ -765,7 +839,7 @@ func _printSection(c *cli.Context, in any, section string) (done bool) {
 		// resort to counting nested structures
 		var cnt, off int
 		res = out[from[0]:]
-		for off = 0; off < len(res); off++ {
+		for off = range res {
 			if res[off] == '{' {
 				cnt++
 			} else if res[off] == '}' {

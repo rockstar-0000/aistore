@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
@@ -51,6 +52,7 @@ type (
 		LRU         LRUConf         `json:"lru"`                            // LRU (watermarks and enabled/disabled)
 		Mirror      MirrorConf      `json:"mirror"`                         // mirroring
 		Access      apc.AccessAttrs `json:"access,string"`                  // access permissions
+		Features    feat.Flags      `json:"features,string"`                // assorted features from feat.Bucket
 		BID         uint64          `json:"bid,string" list:"omit"`         // unique ID
 		Created     int64           `json:"created,string" list:"readonly"` // creation timestamp
 		Versioning  VersionConf     `json:"versioning"`                     // versioning (see "inherit")
@@ -59,12 +61,12 @@ type (
 	ExtraProps struct {
 		AWS  ExtraPropsAWS  `json:"aws,omitempty" list:"omitempty"`
 		HTTP ExtraPropsHTTP `json:"http,omitempty" list:"omitempty"`
-		HDFS ExtraPropsHDFS `json:"hdfs,omitempty" list:"omitempty"`
+		HDFS ExtraPropsHDFS `json:"hdfs,omitempty" list:"omitempty"` // NOTE: obsolete; rm with meta-version
 	}
 	ExtraToSet struct { // ref. bpropsFilterExtra
 		AWS  *ExtraPropsAWSToSet  `json:"aws"`
 		HTTP *ExtraPropsHTTPToSet `json:"http"`
-		HDFS *ExtraPropsHDFSToSet `json:"hdfs"`
+		HDFS *ExtraPropsHDFSToSet `json:"hdfs"` // ditto
 	}
 
 	ExtraPropsAWS struct {
@@ -85,13 +87,13 @@ type (
 		// - https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-pagination.html#cli-usage-pagination-serverside
 		// vs OpenStack Swift: 10,000
 		// - https://docs.openstack.org/swift/latest/api/pagination.html
-		MaxPageSize uint `json:"max_pagesize,omitempty"`
+		MaxPageSize int64 `json:"max_pagesize,omitempty"`
 	}
 	ExtraPropsAWSToSet struct {
 		CloudRegion *string `json:"cloud_region"`
 		Endpoint    *string `json:"endpoint"`
 		Profile     *string `json:"profile"`
-		MaxPageSize *uint   `json:"max_pagesize"`
+		MaxPageSize *int64  `json:"max_pagesize"`
 	}
 
 	ExtraPropsHTTP struct {
@@ -121,6 +123,7 @@ type (
 		Mirror      *MirrorConfToSet      `json:"mirror,omitempty"`
 		EC          *ECConfToSet          `json:"ec,omitempty"`
 		Access      *apc.AccessAttrs      `json:"access,string,omitempty"`
+		Features    *feat.Flags           `json:"features,string,omitempty"`
 		WritePolicy *WritePolicyConfToSet `json:"write_policy,omitempty"`
 		Extra       *ExtraToSet           `json:"extra,omitempty"`
 		Force       bool                  `json:"force,omitempty" copy:"skip" list:"omit"`
@@ -172,6 +175,7 @@ func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
 		Access:      apc.AccessAll,
 		EC:          c.EC,
 		WritePolicy: wp,
+		Features:    c.Features,
 	}
 }
 
@@ -211,6 +215,8 @@ func (bp *Bprops) Validate(targetCnt int) error {
 			return fmt.Errorf("backend bucket %q must be remote", bp.BackendBck)
 		}
 	}
+
+	// run assorted props validators
 	var softErr error
 	for _, pv := range []PropsValidator{&bp.Cksum, &bp.Mirror, &bp.EC, &bp.Extra, &bp.WritePolicy} {
 		var err error
@@ -222,7 +228,7 @@ func (bp *Bprops) Validate(targetCnt int) error {
 			err = pv.ValidateAsProps()
 		}
 		if err != nil {
-			if !IsErrSoft(err) {
+			if !IsErrWarning(err) {
 				return err
 			}
 			softErr = err
@@ -231,11 +237,19 @@ func (bp *Bprops) Validate(targetCnt int) error {
 	if bp.Mirror.Enabled && bp.EC.Enabled {
 		nlog.Warningln("n-way mirroring and EC are both enabled at the same time on the same bucket")
 	}
+
+	// not inheriting cluster-scope features
+	names := bp.Features.Names()
+	for _, n := range names {
+		if !feat.IsBucketScope(n) {
+			bp.Features = bp.Features.ClearName(n)
+		}
+	}
 	return softErr
 }
 
 func (bp *Bprops) Apply(propsToSet *BpropsToSet) {
-	err := copyProps(propsToSet, bp, apc.Daemon)
+	err := CopyProps(propsToSet, bp, apc.Daemon)
 	debug.AssertNoErr(err)
 }
 
@@ -265,15 +279,8 @@ func NewBpropsToSet(nvs cos.StrKVs) (props *BpropsToSet, err error) {
 func (c *ExtraProps) ValidateAsProps(arg ...any) error {
 	provider, ok := arg[0].(string)
 	debug.Assert(ok)
-	switch provider {
-	case apc.HDFS:
-		if c.HDFS.RefDirectory == "" {
-			return errors.New("reference directory must be set for a bucket with HDFS provider")
-		}
-	case apc.HTTP:
-		if c.HTTP.OrigURLBck == "" {
-			return errors.New("original bucket URL must be set for a bucket with HTTP provider")
-		}
+	if provider == apc.HT && c.HTTP.OrigURLBck == "" {
+		return errors.New("original bucket URL must be set for a bucket with HTTP provider")
 	}
 	return nil
 }
@@ -327,6 +334,7 @@ func (s AllBsummResults) Finalize(dsize map[string]uint64, testingEnv bool) {
 	var totalDisksSize uint64
 	for _, tsiz := range dsize {
 		totalDisksSize += tsiz
+		// TODO -- FIXME: (local-playground + losetup, etc.)
 		if testingEnv {
 			break
 		}
@@ -335,7 +343,9 @@ func (s AllBsummResults) Finalize(dsize map[string]uint64, testingEnv bool) {
 		if summ.ObjCount.Present > 0 {
 			summ.ObjSize.Avg = int64(cos.DivRoundU64(summ.TotalSize.PresentObjs, summ.ObjCount.Present))
 		}
-		summ.UsedPct = cos.DivRoundU64(summ.TotalSize.OnDisk*100, totalDisksSize)
+		if totalDisksSize > 0 {
+			summ.UsedPct = cos.DivRoundU64(summ.TotalSize.OnDisk*100, totalDisksSize)
+		}
 	}
 }
 
@@ -356,9 +366,9 @@ type (
 	}
 
 	//  Multi-object copy & transform (see also: TCBMsg)
-	TCObjsMsg struct {
+	TCOMsg struct {
 		ToBck Bck `json:"tobck"`
-		apc.TCObjsMsg
+		apc.TCOMsg
 	}
 )
 

@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains util functions and types.
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -21,20 +21,25 @@ import (
 	"github.com/urfave/cli"
 )
 
+// TODO: target only - won't show put/get etc. counters and error counters (e.g. keep-alive) from proxies' perspective
+
 type (
 	perfcb func(c *cli.Context,
 		metrics cos.StrKVs, mapBegin, mapEnd teb.StstMap, elapsed time.Duration) bool
 )
 
-// _statically_ defined for `latency` table (compare with counter and throughput tabs)
-var selectedLatency = []string{
-	stats.GetLatency, stats.GetSize, stats.GetCount, stats.GetColdCount, stats.GetColdSize, stats.GetRedirLatency, stats.GetColdRwLatency,
-	stats.PutLatency, stats.PutSize, stats.PutCount, stats.PutRedirLatency,
-	stats.AppendLatency, stats.AppendCount,
-}
-
 // true when called by top-level handler
 var allPerfTabs bool
+
+var verboseCounters = [...]string{
+	stats.LcacheCollisionCount,
+	stats.LcacheEvictedCount,
+	stats.LcacheFlushColdCount,
+	cos.StreamsOutObjCount,
+	cos.StreamsOutObjSize,
+	cos.StreamsInObjCount,
+	cos.StreamsInObjSize,
+}
 
 var (
 	showPerfFlags = append(
@@ -43,16 +48,10 @@ var (
 		regexColsFlag,
 		unitsFlag,
 		averageSizeFlag,
+		nonverboseFlag,
+		verboseFlag,
 	)
 
-	// alias
-	perfCmd = cli.Command{
-		Name:  commandPerf,
-		Usage: showPerfArgument,
-		Subcommands: []cli.Command{
-			makeAlias(showCmdPeformance, "", true, commandShow),
-		},
-	}
 	// `show performance` command
 	showCmdPeformance = cli.Command{
 		Name:      commandPerf,
@@ -131,6 +130,14 @@ func showPerfHandler(c *cli.Context) error {
 	return nil
 }
 
+func _warnThruLatIters(c *cli.Context) {
+	if flagIsSet(c, refreshFlag) || flagIsSet(c, nonverboseFlag) {
+		return
+	}
+	warn := fmt.Sprintf("for better results, use %s option and/or run several iterations\n", qflprn(refreshFlag))
+	actionWarn(c, warn)
+}
+
 func perfCptn(c *cli.Context, tab string) {
 	stamp := cos.FormatNowStamp()
 	repeat := 40 - len(stamp) - len(tab)
@@ -148,6 +155,14 @@ func showCountersHandler(c *cli.Context) error {
 
 	for name, kind := range metrics {
 		if metrics[name] == stats.KindCounter || metrics[name] == stats.KindSize {
+			//
+			// skip assorted internal counters and sizes, unless verbose
+			//
+			if !flagIsSet(c, verboseFlag) {
+				if cos.StringInSlice(name, verboseCounters[:]) {
+					continue
+				}
+			}
 			selected[name] = kind
 		}
 	}
@@ -162,16 +177,25 @@ func showThroughputHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	_warnThruLatIters(c)
+
 	selected := make(cos.StrKVs, len(metrics))
 	for name, kind := range metrics {
+		switch name {
+		case stats.GetSize, stats.GetCount, stats.PutSize, stats.PutCount:
+			selected[name] = kind
+			continue
+		}
+
 		switch {
 		case kind == stats.KindThroughput:
 			// 1. all throughput
 			selected[name] = kind
 			totals[name] = 0
-		case name == stats.GetSize || name == stats.GetColdSize || name == stats.PutSize ||
-			name == stats.GetCount || name == stats.GetColdCount || name == stats.PutCount:
-			// 2. to show average get/put sizes
+		case strings.HasSuffix(name, "."+stats.GetCount) || strings.HasSuffix(name, "."+stats.GetSize):
+			selected[name] = kind
+		case strings.HasSuffix(name, "."+stats.PutCount) || strings.HasSuffix(name, "."+stats.PutSize):
 			selected[name] = kind
 		case stats.IsErrMetric(name):
 			// 3. errors
@@ -204,8 +228,12 @@ func _throughput(c *cli.Context, metrics cos.StrKVs, mapBegin, mapEnd teb.StstMa
 			}
 			vend := end.Tracker[name]
 			if vend.Value <= v.Value {
+				// no changes, nothing to show
+				v.Value = 0
+				begin.Tracker[name] = v
 				continue
 			}
+
 			v.Value = (vend.Value - v.Value) / seconds
 			begin.Tracker[name] = v
 			num++
@@ -215,6 +243,8 @@ func _throughput(c *cli.Context, metrics cos.StrKVs, mapBegin, mapEnd teb.StstMa
 	return
 }
 
+// TODO -- FIXME: transition to using totals (ais/backend/common.go)
+
 // NOTE: two built-in assumptions: one cosmetic, another major
 // - ".ns" => ".n" correspondence is the cosmetic one
 // - the naive way to recompute latency using the total elapsed, not the actual, time to execute so many requests...
@@ -223,17 +253,29 @@ func showLatencyHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	// statically filter metrics (names)
-	selected := make(cos.StrKVs, len(selectedLatency))
+
+	_warnThruLatIters(c)
+
+	// statically filter metrics (names):
+	// take sizes and latencies that _map_ to their respective counters
+
+	selected := make(cos.StrKVs, len(metrics))
 	for name, kind := range metrics {
-		if cos.StringInSlice(name, selectedLatency) {
+		if name == stats.GetSize || name == stats.PutSize {
 			selected[name] = kind
-		} else if stats.IsErrMetric(name) {
-			if strings.Contains(name, "get") || strings.Contains(name, "put") || strings.Contains(name, "append") {
-				selected[name] = kind
-			}
+			continue
 		}
+		if kind != stats.KindLatency && kind != stats.KindTotal {
+			continue
+		}
+		ncounter := stats.LatencyToCounter(name)
+		if ncounter == "" {
+			continue
+		}
+		selected[name] = kind
+		selected[ncounter] = stats.KindCounter
 	}
+
 	// `true` to show (and put request latency numbers in perspective)
 	return showPerfTab(c, selected, _latency, cmdShowLatency, nil, true)
 }
@@ -249,20 +291,17 @@ func _latency(c *cli.Context, metrics cos.StrKVs, mapBegin, mapEnd teb.StstMap, 
 			continue
 		}
 		for name, v := range begin.Tracker {
-			if kind, ok := metrics[name]; !ok || kind != stats.KindLatency {
+			kind, ok := metrics[name]
+			if !ok {
+				continue
+			}
+			if kind != stats.KindLatency && kind != stats.KindTotal {
 				continue
 			}
 			vend := end.Tracker[name]
-			ncounter := name[:len(name)-1] // ".ns" => ".n"
-			switch name {
-			case stats.GetLatency, stats.GetRedirLatency:
-				ncounter = stats.GetCount
-			case stats.GetColdRwLatency:
-				ncounter = stats.GetColdCount
-			case stats.PutLatency, stats.PutRedirLatency:
-				ncounter = stats.PutCount
-			case stats.AppendLatency:
-				ncounter = stats.AppendCount
+			ncounter := stats.LatencyToCounter(name)
+			if ncounter == "" {
+				continue
 			}
 			if cntBegin, ok1 := begin.Tracker[ncounter]; ok1 {
 				if cntEnd, ok2 := end.Tracker[ncounter]; ok2 && cntEnd.Value > cntBegin.Value {
@@ -273,6 +312,7 @@ func _latency(c *cli.Context, metrics cos.StrKVs, mapBegin, mapEnd teb.StstMap, 
 					continue
 				}
 			}
+			// no changes, nothing to show
 			v.Value = 0
 			begin.Tracker[name] = v
 		}
@@ -314,6 +354,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		}
 	}
 
+	// TODO: target only - won't show proxies' put/get etc. counters and error counters (e.g. keep-alive)
 	smap, tstatusMap, _, err := fillNodeStatusMap(c, apc.Target)
 	if err != nil {
 		return err
@@ -396,7 +437,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		perfCptn(c, tag)
 
 		// tally up recomputed
-		totalsHdr := cluTotal
+		totalsHdr := teb.ClusterTotal
 		if totals != nil {
 			for _, begin := range mapBegin {
 				for name, v := range begin.Tracker {
@@ -404,7 +445,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 						totals[name] += v.Value
 					}
 				}
-				// TODO: avoid summing up with oneself - check TargetCDF mountpaths
+				// TODO: avoid summing up with oneself - check Tcdf mountpaths
 			}
 		}
 

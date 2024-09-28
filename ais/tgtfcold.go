@@ -6,7 +6,6 @@ package ais
 
 import (
 	"io"
-	"os"
 
 	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/cmn"
@@ -19,25 +18,27 @@ import (
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/stats"
 )
 
 const ftcg = "Warning: failed to cold-GET"
 
-func (goi *getOI) coldSeek(res *core.GetReaderResult) error {
+func (goi *getOI) coldReopen(res *core.GetReaderResult) error {
 	var (
-		t, lom = goi.t, goi.lom
-		fqn    = lom.FQN
+		err    error
+		lmfh   cos.LomReader
+		wfh    cos.LomWriter
+		t      = goi.t
+		lom    = goi.lom
 		revert string
 	)
 	if goi.verchanged {
 		revert = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileColdget)
-		if err := os.Rename(lom.FQN, revert); err != nil {
-			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.FQN, "=>", revert)
+		if errV := lom.RenameMainTo(revert); errV != nil {
+			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.Cname(), "=>", revert)
 			revert = ""
 		}
 	}
-	lmfh, err := lom.CreateFileRW(fqn)
+	wfh, err = lom.Create()
 	if err != nil {
 		cos.Close(res.R)
 		goi._cleanup(revert, nil, nil, nil, err, "(fcreate)")
@@ -47,66 +48,66 @@ func (goi *getOI) coldSeek(res *core.GetReaderResult) error {
 	// read remote, write local
 	var (
 		written   int64
-		buf, slab = t.gmm.AllocSize(min(res.Size, 64*cos.KiB))
-		cksum     = cos.NewCksumHash(lom.CksumConf().Type)
-		mw        = cos.NewWriterMulti(lmfh, cksum.H)
+		buf, slab = t.gmm.AllocSize(min(res.Size, memsys.DefaultBuf2Size))
+		cksumH    = cos.NewCksumHash(lom.CksumConf().Type)
+		mw        = cos.NewWriterMulti(wfh, cksumH.H)
 	)
 	written, err = cos.CopyBuffer(mw, res.R, buf)
 	cos.Close(res.R)
 
 	if err != nil {
-		goi._cleanup(revert, lmfh, buf, slab, err, "(rr/wl)")
+		goi._cleanup(revert, wfh, buf, slab, err, "(rr/wl)")
 		return err
 	}
-	debug.Assertf(written == res.Size, "%s: expected size=%d, got %d", lom.Cname(), res.Size, written)
+	debug.Assertf(written == res.Size, "%s: remote-size %d != %d written", lom.Cname(), res.Size, written)
 
-	// fsync (flush), if requested
-	if cmn.Rom.Features().IsSet(feat.FsyncPUT) {
-		if err = lmfh.Sync(); err != nil {
-			goi._cleanup(revert, lmfh, buf, slab, err, "(fsync)")
+	if lom.IsFeatureSet(feat.FsyncPUT) {
+		// fsync (flush)
+		if err = wfh.Sync(); err != nil {
+			goi._cleanup(revert, wfh, buf, slab, err, "(fsync)")
 			return err
 		}
 	}
-
-	// persist lom (main repl.)
-	lom.SetSize(written)
-	if cksum != nil {
-		cksum.Finalize()
-		lom.SetCksum(&cksum.Cksum)
+	err = wfh.Close()
+	wfh = nil
+	if err != nil {
+		goi._cleanup(revert, wfh, buf, slab, err, "(fclose)")
+		return err
 	}
+
+	// lom (main replica)
+	lom.SetSize(written)
+	cksumH.Finalize()
+	lom.SetCksum(&cksumH.Cksum) // and return via whdr as well
 	if lom.HasCopies() {
 		if err := lom.DelAllCopies(); err != nil {
 			nlog.Errorln(err)
 		}
 	}
 	if err = lom.PersistMain(); err != nil {
-		goi._cleanup(revert, lmfh, buf, slab, err, "(persist)")
+		goi._cleanup(revert, wfh, buf, slab, err, "(persist)")
 		return err
 	}
-	// with remaining stats via goi.stats()
-	goi.t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetColdSize, Value: res.Size},
-		cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(goi.ltime)},
-	)
 
-	// fseek and r-range, if req
-	if _, err = lmfh.Seek(0, io.SeekStart); err != nil {
-		goi._cleanup(revert, lmfh, buf, slab, err, "(seek)")
+	// reopen & transmit ---
+	lmfh, err = lom.Open()
+	if err != nil {
+		goi._cleanup(revert, nil, buf, slab, err, "(seek)")
 		return err
 	}
 	var (
 		hrng   *htrange
-		size             = lom.SizeBytes()
+		size             = lom.Lsize()
 		reader io.Reader = lmfh
 		whdr             = goi.w.Header()
 	)
 	if goi.ranges.Range != "" {
-		rsize := goi.lom.SizeBytes()
+		// (not here if range checksum enabled)
+		rsize := goi.lom.Lsize()
 		if goi.ranges.Size > 0 {
 			rsize = goi.ranges.Size
 		}
-		if hrng, _, err = goi.parseRange(whdr, rsize); err != nil {
+		if hrng, _, err = goi.rngToHeader(whdr, rsize); err != nil {
 			goi._cleanup(revert, lmfh, buf, slab, err, "(seek)")
 			return err
 		}
@@ -114,10 +115,10 @@ func (goi *getOI) coldSeek(res *core.GetReaderResult) error {
 		reader = io.NewSectionReader(lmfh, hrng.Start, hrng.Length)
 	}
 
-	// transmit
 	whdr.Set(cos.HdrContentType, cos.ContentBinary)
-	cmn.ToHeader(lom.ObjAttrs(), whdr)
-	if goi.isS3 {
+	cmn.ToHeader(lom.ObjAttrs(), whdr, size)
+	if goi.dpq.isS3 {
+		// (expecting user to set bucket checksum = md5)
 		s3.SetEtag(whdr, goi.lom)
 	}
 
@@ -126,49 +127,158 @@ func (goi *getOI) coldSeek(res *core.GetReaderResult) error {
 		goi._cleanup(revert, lmfh, buf, slab, err, "(transmit)")
 		return errSendingResp
 	}
-	debug.Assertf(written == size, "written %d != %d exp. size", written, size)
+	debug.Assertf(written == size, "%s: transmit-size %d != %d expected", lom.Cname(), written, size)
 
-	slab.Free(buf)
 	cos.Close(lmfh)
+	slab.Free(buf)
+
+	return goi._fini(revert, res.Size, written)
+}
+
+// stats and redundancy (compare w/ goi.txfini)
+func (goi *getOI) _fini(revert string, fullSize, txSize int64) error {
+	// latency from cold-get start time.
+	goi.rltime = mono.SinceNano(goi.rstarttime)
+	lom := goi.lom
 	if revert != "" {
-		if errV := cos.RemoveFile(revert); errV != nil {
-			nlog.Infoln(ftcg+"(rm-revert)", lom, err)
+		if err := cos.RemoveFile(revert); err != nil {
+			nlog.InfoDepth(1, ftcg, "(rm-revert)", lom, err)
 		}
 	}
 
 	// make copies and slices (async)
-	if err = ec.ECM.EncodeObject(lom, nil); err != nil && err != ec.ErrorECDisabled {
-		nlog.Infoln(ftcg+"(ec)", lom, err)
+	if err := ec.ECM.EncodeObject(lom, nil); err != nil && err != ec.ErrorECDisabled {
+		nlog.InfoDepth(1, ftcg, "(ec)", lom, err)
 	}
-	t.putMirror(lom)
+	goi.t.putMirror(lom)
 
-	// load; inc stats
-	if err = lom.Load(true /*cache it*/, true /*locked*/); err != nil {
+	// load
+	if err := lom.Load(true /*cache it*/, true /*locked*/); err != nil {
 		goi.lom.Unlock(true)
-		nlog.Infoln(ftcg+"(load)", lom, err) // (unlikely)
+		nlog.InfoDepth(1, ftcg, "(load)", lom, err) // (unlikely)
 		return errSendingResp
 	}
+	debug.Assert(lom.Lsize() == fullSize)
 	goi.lom.Unlock(true)
 
-	goi.stats(written)
+	// regular get stats
+	goi.stats(txSize)
 	return nil
 }
 
-func (goi *getOI) _cleanup(revert string, fh *os.File, buf []byte, slab *memsys.Slab, err error, tag string) {
-	if fh != nil {
-		fh.Close()
+func (goi *getOI) _cleanup(revert string, lmfh io.Closer, buf []byte, slab *memsys.Slab, err error, tag string) {
+	if lmfh != nil {
+		lmfh.Close()
 	}
 	if slab != nil {
 		slab.Free(buf)
 	}
-	if err != nil {
-		goi.lom.Remove()
-		if revert != "" {
-			if errV := os.Rename(revert, goi.lom.FQN); errV != nil {
-				nlog.Infoln(ftcg+tag+"(revert)", errV)
-			}
-		}
-		nlog.InfoDepth(1, ftcg+tag, err)
+	if err == nil {
+		goi.lom.Unlock(true)
+		return
 	}
-	goi.lom.Unlock(true)
+
+	lom := goi.lom
+	cname := lom.Cname()
+	if errV := lom.RemoveMain(); errV != nil {
+		nlog.Warningln("failed to remove work-main", cname, errV)
+	}
+	if revert != "" {
+		if errV := lom.RenameToMain(revert); errV != nil {
+			nlog.Warningln("failed to revert", cname, errV)
+		} else {
+			nlog.Infoln("reverted", cname)
+		}
+	}
+	lom.Unlock(true)
+
+	s := err.Error()
+	if cos.IsErrBrokenPipe(err) {
+		s = "[broken pipe]" // EPIPE
+	}
+	nlog.InfoDepth(1, ftcg, tag, cname, "err:", s)
+}
+
+// NOTE:
+// Streaming cold GET feature (`feat.StreamingColdGET`) puts response header on the wire _prior_
+// to finalizing in-cluster object. Use it at your own risk.
+// (under wlock)
+func (goi *getOI) coldStream(res *core.GetReaderResult) error {
+	var (
+		t, lom = goi.t, goi.lom
+		revert string
+	)
+	if goi.verchanged {
+		revert = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileColdget)
+		if err := lom.RenameMainTo(revert); err != nil {
+			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.FQN, "=>", revert)
+			revert = ""
+		}
+	}
+	lmfh, err := lom.Create()
+	if err != nil {
+		cos.Close(res.R)
+		goi._cleanup(revert, nil, nil, nil, err, "(fcreate)")
+		return err
+	}
+
+	// read remote, write local, transmit --
+
+	var (
+		written   int64
+		buf, slab = t.gmm.AllocSize(min(res.Size, memsys.DefaultBuf2Size))
+		cksum     = cos.NewCksumHash(lom.CksumConf().Type)
+		mw        = cos.NewWriterMulti(goi.w, lmfh, cksum.H)
+		whdr      = goi.w.Header()
+	)
+
+	// response header
+	whdr.Set(cos.HdrContentType, cos.ContentBinary)
+	cmn.ToHeader(lom.ObjAttrs(), whdr, res.Size)
+	if goi.dpq.isS3 {
+		// (expecting user to set bucket checksum = md5)
+		s3.SetEtag(whdr, goi.lom)
+	}
+
+	written, err = cos.CopyBuffer(mw, res.R, buf)
+	cos.Close(res.R)
+
+	if err != nil {
+		goi._cleanup(revert, lmfh, buf, slab, err, "(rr/wl)")
+		return errSendingResp // NOTE: cannot return err: whdr is already on the wire
+	}
+	debug.Assertf(written == res.Size, "%s: remote-size %d != %d written/transmitted", lom.Cname(), res.Size, written)
+
+	if lom.IsFeatureSet(feat.FsyncPUT) {
+		// fsync (flush)
+		if err = lmfh.Sync(); err != nil {
+			goi._cleanup(revert, lmfh, buf, slab, err, "(fsync)")
+			return errSendingResp // ditto
+		}
+	}
+
+	err = lmfh.Close()
+	lmfh = nil
+	if err != nil {
+		goi._cleanup(revert, lmfh, buf, slab, err, "(fclose)")
+		return errSendingResp // ditto
+	}
+
+	// lom (main replica)
+	lom.SetSize(written)
+	cksum.Finalize()
+	lom.SetCksum(&cksum.Cksum)
+	if lom.HasCopies() {
+		if err := lom.DelAllCopies(); err != nil {
+			nlog.Errorln(err)
+		}
+	}
+	if err = lom.PersistMain(); err != nil {
+		goi._cleanup(revert, lmfh, buf, slab, err, "(persist)")
+		return errSendingResp
+	}
+
+	slab.Free(buf)
+
+	return goi._fini(revert, res.Size, written)
 }

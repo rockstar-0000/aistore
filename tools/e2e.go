@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -8,11 +8,10 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 
@@ -24,7 +23,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
@@ -44,7 +43,7 @@ func (f *E2EFramework) RunE2ETest(fileName string) {
 		space      = regexp.MustCompile(`\s+`) // Used to replace all whitespace with single spaces.
 		target     = randomTarget()
 		mountpath  = randomMountpath(target)
-		backends   = retrieveBackendProviders()
+		backends   = getConfiguredBackends()
 		etlName    = "etlname-" + strings.ToLower(trand.String(4))
 
 		inputFileName   = fileName + ".in"
@@ -268,20 +267,12 @@ func randomMountpath(target *meta.Snode) string {
 	mpaths, err := api.GetMountpaths(BaseAPIParams(proxyURLReadOnly), target)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	gomega.Expect(len(mpaths.Available)).NotTo(gomega.Equal(0))
-	return mpaths.Available[rand.Intn(len(mpaths.Available))]
+	return mpaths.Available[rand.IntN(len(mpaths.Available))]
 }
 
-func retrieveBackendProviders() []string {
-	target := randomTarget()
-	config, err := api.GetDaemonConfig(BaseAPIParams(proxyURLReadOnly), target)
+func getConfiguredBackends() []string {
+	backends, err := api.GetConfiguredBackends(BaseAPIParams(proxyURLReadOnly))
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	set := cos.NewStrSet()
-	for b := range config.Backend.Providers {
-		set.Set(b)
-	}
-	set.Set(apc.AIS)
-	backends := set.ToSlice()
-	sort.Strings(backends)
 	return backends
 }
 

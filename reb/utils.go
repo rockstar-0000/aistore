@@ -7,6 +7,7 @@ package reb
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
@@ -38,16 +39,25 @@ func (reb *Reb) xctn() *xs.Rebalance        { return reb.xreb.Load() }
 func (reb *Reb) setXact(xctn *xs.Rebalance) { reb.xreb.Store(xctn) }
 
 func (reb *Reb) logHdr(rebID int64, smap *meta.Smap, initializing ...bool) string {
-	smapv := "v<???>"
+	var sb strings.Builder
+
+	sb.WriteString(core.T.String())
+	sb.WriteString("[g")
+	sb.WriteString(strconv.FormatInt(rebID, 10))
+	sb.WriteByte(',')
 	if smap != nil {
-		smapv = "v" + strconv.FormatInt(smap.Version, 10)
+		sb.WriteString(strconv.FormatInt(smap.Version, 10))
+	} else {
+		sb.WriteString("v<???>")
 	}
-	s := fmt.Sprintf("%s[g%d,%s", core.T, rebID, smapv)
 	if len(initializing) > 0 {
-		return s + "]"
+		sb.WriteByte(']')
+		return sb.String() // "%s[g%d,%s]"
 	}
-	stage := stages[reb.stages.stage.Load()]
-	return fmt.Sprintf("%s,%s]", s, stage)
+	sb.WriteByte(',')
+	sb.WriteString(stages[reb.stages.stage.Load()])
+	sb.WriteByte(']')
+	return sb.String() // "%s[g%d,%s,%s]"
 }
 
 func (reb *Reb) warnID(remoteID int64, tid string) (s string) {
@@ -100,7 +110,7 @@ func (reb *Reb) changeStage(newStage uint32) {
 	hdr.Opaque = reb.encodeStageNtfn(&req)
 	// second, notify all
 	if err := reb.pushes.Send(&transport.Obj{Hdr: hdr}, nil); err != nil {
-		nlog.Warningf("Failed to broadcast ack %s: %v", stages[newStage], err)
+		nlog.Warningln("Failed to push new-stage notif:", req.rebID, stages[newStage], "err:", err)
 	}
 }
 
@@ -165,7 +175,7 @@ func (reb *Reb) delLomAck(lom *core.LOM, rebID int64, freeLOM bool) {
 			if freeLOM {
 				// counting acknowledged migrations (as initiator)
 				xreb := reb.xctn()
-				xreb.ObjsAdd(1, lomOrig.SizeBytes())
+				xreb.ObjsAdd(1, lomOrig.Lsize())
 
 				core.FreeLOM(lomOrig)
 			}

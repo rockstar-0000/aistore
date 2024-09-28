@@ -1,14 +1,12 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -145,51 +143,91 @@ func (m *smapX) init(tsize, psize int) {
 	m.Pmap = make(meta.NodeMap, psize)
 }
 
-func (m *smapX) _fillIC() {
-	if m.ICCount() >= meta.DfltCountIC {
-		return
-	}
+//
+// begin IC -----------
+//
 
-	// try to select the missing members - upto DefaultICSize - if available
-	for _, si := range m.Pmap {
-		if si.Flags.IsSet(meta.SnodeNonElectable) {
-			continue
-		}
-		m.addIC(si)
-		if m.ICCount() >= meta.DfltCountIC {
-			return
-		}
-	}
-}
-
-// only used by primary
-func (m *smapX) staffIC() {
-	m.addIC(m.Primary)
+// executed only by primary
+func (m *smapX) staffIC() (count int) {
+	_ = m._setIC(m.Primary)
 	m.Primary = m.GetNode(m.Primary.ID())
-	m._fillIC()
-	m.evictIC()
+
+	count = m.ICCount()
+	if count < meta.DfltCountIC {
+		// assign additional IC members, if available
+		for _, psi := range m.Pmap {
+			if psi.Flags.IsSet(meta.SnodeNonElectable) || !m._setIC(psi) {
+				continue
+			}
+			count++
+			if count >= meta.DfltCountIC {
+				return count
+			}
+		}
+	} else if count > meta.DfltCountIC {
+		if m.unstaffIC() {
+			count--
+		}
+	}
+	return count
 }
 
-// ensure num IC members doesn't exceed max value
-// Evict the most recently added IC member
-func (m *smapX) evictIC() {
-	if m.ICCount() <= meta.DfltCountIC {
-		return
-	}
-	for sid, si := range m.Pmap {
-		if sid == m.Primary.ID() || !m.IsIC(si) {
+// remove one
+func (m *smapX) unstaffIC() bool {
+	for pid, psi := range m.Pmap {
+		if pid == m.Primary.ID() || !m.IsIC(psi) {
 			continue
 		}
-		m.clearNodeFlags(sid, meta.SnodeIC)
-		break
+		m.clearNodeFlags(pid, meta.SnodeIC)
+		return true
 	}
+	return false
 }
 
-func (m *smapX) addIC(psi *meta.Snode) {
+func (m *smapX) _setIC(psi *meta.Snode) (ok bool) {
 	if !m.IsIC(psi) {
 		m.setNodeFlags(psi.ID(), meta.SnodeIC)
+		ok = true
 	}
+	return ok
 }
+
+// check configured "original" and "discovery" URLs vs IC members' control,
+// or pick IC members to provide alternative ones
+func (m *smapX) configURLsIC(original, discovery string) (orig, disc string) {
+	// extra effort to avoid changing existing URLs if they work
+	for _, psi := range m.Pmap {
+		if !m.IsIC(psi) {
+			continue
+		}
+		if orig == "" && original != "" && psi.URL(cmn.NetIntraControl) == original {
+			orig = original
+		} else if disc == "" && discovery != "" && psi.URL(cmn.NetIntraControl) == discovery {
+			disc = discovery
+		}
+		if orig != "" && disc != "" {
+			return orig, disc
+		}
+	}
+	// pick alternatives
+	for _, psi := range m.Pmap {
+		if !m.IsIC(psi) {
+			continue
+		}
+		if orig == "" {
+			orig = psi.URL(cmn.NetIntraControl)
+		} else if disc == "" {
+			disc = psi.URL(cmn.NetIntraControl)
+		} else {
+			break
+		}
+	}
+	return orig, disc
+}
+
+//
+// end IC -----------
+//
 
 // to be used exclusively at startup - compare with validate() below
 func (m *smapX) isValid() bool {
@@ -248,6 +286,7 @@ func (m *smapX) addTarget(tsi *meta.Snode) {
 		cos.Assertf(false, "FATAL: duplicate SID: new %s vs %s", tsi.StringEx(), si.StringEx())
 	}
 	tsi.SetName()
+	tsi.InitNetNamer()
 	m.Tmap[tsi.ID()] = tsi
 	m.Version++
 }
@@ -289,7 +328,7 @@ func (m *smapX) putNode(nsi *meta.Snode, flags cos.BitFlags, silent bool) {
 		}
 		m.addProxy(nsi)
 		if flags.IsSet(meta.SnodeNonElectable) {
-			nlog.Warningf("%s won't be electable", nsi)
+			nlog.Warningln(nsi.String(), "won't be electable")
 		}
 	} else {
 		debug.Assert(nsi.IsTarget())
@@ -299,9 +338,9 @@ func (m *smapX) putNode(nsi *meta.Snode, flags cos.BitFlags, silent bool) {
 		m.addTarget(nsi)
 	}
 	if old != nil {
-		nlog.Errorf("Warning: same ID %s vs (joining) %s, %s", old.StringEx(), nsi.StringEx(), m.StringEx())
+		nlog.Warningln("same ID", old.StringEx(), "vs (joining)", nsi.StringEx(), "->", m.StringEx())
 	} else if !silent {
-		nlog.Infof("joined %s, %s", nsi, m.StringEx())
+		nlog.Infoln("joined", nsi.String(), "->", m.StringEx())
 	}
 }
 
@@ -426,6 +465,32 @@ func (m *smapX) clearNodeFlags(id string, flags cos.BitFlags) {
 	m._applyFlags(si, si.Flags.Clear(flags))
 }
 
+func (m *smapX) mergeFlags(from *smapX) (clone *smapX) {
+	all := []meta.NodeMap{from.Tmap, from.Pmap}
+	for _, mm := range all {
+		for _, osi := range mm {
+			nsi := m.GetNode(osi.ID())
+			if nsi == nil {
+				continue
+			}
+			if osi.Flags == nsi.Flags {
+				continue
+			}
+			if clone == nil {
+				clone = m.clone()
+			}
+			nsi = clone.GetNode(osi.ID())
+			nsi.Flags = osi.Flags
+			if nsi.IsTarget() {
+				clone.Tmap[nsi.ID()] = nsi
+			} else {
+				clone.Pmap[nsi.ID()] = nsi
+			}
+		}
+	}
+	return clone
+}
+
 ///////////////
 // smapOwner //
 ///////////////
@@ -458,14 +523,26 @@ func (r *smapOwner) Listeners() meta.SmapListeners { return r.sls }
 // private
 //
 
+// put new smap version
 func (r *smapOwner) put(smap *smapX) {
+	// residual (in-memory) initialization
 	smap.InitDigests()
 	smap.vstr = strconv.FormatInt(smap.Version, 10)
+
+	for _, psi := range smap.Pmap {
+		psi.SetName()
+	}
+	for _, tsi := range smap.Tmap {
+		tsi.SetName()
+		tsi.InitNetNamer()
+	}
+
+	// put and notify
 	r.smap.Store(smap)
 	r.sls.notify(smap.version())
 }
 
-func (r *smapOwner) get() (smap *smapX) { return r.smap.Load() }
+func (r *smapOwner) get() *smapX { return r.smap.Load() }
 
 func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayload, cb smapUpdatedCB) (err error) {
 	if err = newSmap.validate(); err != nil {
@@ -523,7 +600,7 @@ func (r *smapOwner) persistBytes(payload msPayload) (done bool) {
 	}
 	var (
 		smap *meta.Smap
-		wto  = bytes.NewBuffer(smapValue)
+		wto  = cos.NewBuffer(smapValue)
 		err  = jsp.SaveMeta(r.fpath, smap, wto)
 	)
 	done = err == nil
@@ -532,16 +609,13 @@ func (r *smapOwner) persistBytes(payload msPayload) (done bool) {
 
 // Must be called under lock
 func (r *smapOwner) persist(newSmap *smapX) error {
-	var wto io.WriterTo
-	if newSmap._sgl != nil {
-		wto = newSmap._sgl
-	} else {
-		sgl := newSmap._encode(r.immSize)
+	sgl := newSmap._sgl
+	if sgl == nil {
+		sgl = newSmap._encode(r.immSize)
 		r.immSize = max(r.immSize, sgl.Len())
 		defer sgl.Free()
-		wto = sgl
 	}
-	return jsp.SaveMeta(r.fpath, newSmap, wto)
+	return jsp.SaveMeta(r.fpath, newSmap, sgl)
 }
 
 // executes under lock
@@ -650,7 +724,7 @@ func (sls *sls) notify(ver int64) {
 		return
 	}
 	sls.postCh <- ver
-	if len(sls.postCh) == cap(sls.postCh) {
-		nlog.ErrorDepth(1, "sls channel full: Smap v", ver) // unlikely
+	if l, c := len(sls.postCh), cap(sls.postCh); l > c/2 {
+		nlog.ErrorDepth(1, cos.ErrWorkChanFull, l, c, "Smap version:", ver) // unlikely
 	}
 }

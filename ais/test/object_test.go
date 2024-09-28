@@ -9,7 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,10 +19,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/tools"
@@ -183,6 +186,7 @@ func TestRemoteBucketObject(t *testing.T) {
 }
 
 func TestHttpProviderObjectGet(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true}) // NOTE: ht:// is now conditionally linked, requires 'ht' build tag
 	var (
 		proxyURL   = tools.RandomProxyURL()
 		baseParams = tools.BaseAPIParams(proxyURL)
@@ -412,11 +416,13 @@ func TestSameBucketName(t *testing.T) {
 	_, err = api.PutObject(&putArgsRemote)
 	tassert.CheckFatal(t, err)
 
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+
 	// Check that ais bucket has 2 objects
 	tlog.Logf("Validating that ais bucket contains %s and %s ...\n", fileName1, fileName2)
-	_, err = api.HeadObject(baseParams, bckLocal, fileName1, apc.FltPresent, false /*silent*/)
+	_, err = api.HeadObject(baseParams, bckLocal, fileName1, hargs)
 	tassert.CheckFatal(t, err)
-	_, err = api.HeadObject(baseParams, bckLocal, fileName2, apc.FltPresent, false /*silent*/)
+	_, err = api.HeadObject(baseParams, bckLocal, fileName2, hargs)
 	tassert.CheckFatal(t, err)
 
 	// Prefetch/Evict should work
@@ -452,20 +458,21 @@ func TestSameBucketName(t *testing.T) {
 	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
-	_, err = api.HeadObject(baseParams, bckLocal, fileName1, apc.FltPresent, false /*silent*/)
+	_, err = api.HeadObject(baseParams, bckLocal, fileName1, hargs)
 	if err == nil || !strings.Contains(err.Error(), strconv.Itoa(http.StatusNotFound)) {
 		t.Errorf("Local file %s not deleted", fileName1)
 	}
-	_, err = api.HeadObject(baseParams, bckLocal, fileName2, apc.FltPresent, false /*silent*/)
+	_, err = api.HeadObject(baseParams, bckLocal, fileName2, hargs)
 	if err == nil || !strings.Contains(err.Error(), strconv.Itoa(http.StatusNotFound)) {
 		t.Errorf("Local file %s not deleted", fileName2)
 	}
 
-	_, err = api.HeadObject(baseParams, bckRemote, fileName1, apc.FltExists, false /*silent*/)
+	hargsRemote := api.HeadArgs{FltPresence: apc.FltExists}
+	_, err = api.HeadObject(baseParams, bckRemote, fileName1, hargsRemote)
 	if err == nil {
 		t.Errorf("remote file %s not deleted", fileName1)
 	}
-	_, err = api.HeadObject(baseParams, bckRemote, fileName2, apc.FltExists, false /*silent*/)
+	_, err = api.HeadObject(baseParams, bckRemote, fileName2, hargsRemote)
 	if err == nil {
 		t.Errorf("remote file %s not deleted", fileName2)
 	}
@@ -571,7 +578,7 @@ func Test_SameAISAndRemoteBucketName(t *testing.T) {
 	}
 
 	// Check that cloud object is deleted
-	_, err = api.HeadObject(baseParams, bckRemote, fileName, apc.FltExistsOutside, false /*silent*/)
+	_, err = api.HeadObject(baseParams, bckRemote, fileName, api.HeadArgs{FltPresence: apc.FltExistsOutside})
 	if !strings.Contains(err.Error(), strconv.Itoa(http.StatusNotFound)) {
 		t.Errorf("Remote file %s not deleted", fileName)
 	}
@@ -788,7 +795,6 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 	m.init(true /*cleanup*/)
 
 	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
-
 	if docker.IsRunning() {
 		t.Skipf("test %q requires xattrs to be set, doesn't work with docker", t.Name())
 	}
@@ -819,7 +825,7 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 		m.del()
 	})
 
-	objName := m.objNames[0]
+	objName := m.nextObjName()
 	_, err = api.GetObjectWithValidation(baseParams, m.bck, objName, nil)
 	tassert.CheckError(t, err)
 
@@ -844,7 +850,7 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 	validateGETUponFileChangeForChecksumValidation(t, proxyURL, objName, fqn, oldFileInfo)
 
 	// Test when the xxHash of the file is changed
-	objName = m.objNames[1]
+	objName = m.nextObjName()
 	fqn = findObjOnDisk(m.bck, objName)
 	tools.CheckPathExists(t, fqn, false /*dir*/)
 	oldFileInfo, _ = os.Stat(fqn)
@@ -855,7 +861,7 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 	validateGETUponFileChangeForChecksumValidation(t, proxyURL, objName, fqn, oldFileInfo)
 
 	// Test for no checksum algo
-	objName = m.objNames[2]
+	objName = m.nextObjName()
 	fqn = findObjOnDisk(m.bck, objName)
 
 	if p.Cksum.Type != cos.ChecksumNone {
@@ -874,6 +880,158 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 
 	_, err = api.GetObject(baseParams, m.bck, objName, nil)
 	tassert.Errorf(t, err == nil, "A GET on an object when checksum algo is none should pass. Error: %v", err)
+}
+
+func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
+	var (
+		m = ioContext{
+			t:        t,
+			bck:      cliBck,
+			num:      10,
+			fileSize: cos.KiB,
+			prefix:   "validate/obj-",
+		}
+
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+	)
+
+	m.init(true /*cleanup*/)
+
+	tools.CheckSkip(t, &tools.SkipTestArgs{CloudBck: true, Bck: m.bck})
+	if docker.IsRunning() {
+		t.Skipf("test %q requires xattrs to be set, doesn't work with docker", t.Name())
+	}
+
+	p, err := api.HeadBucket(baseParams, m.bck, false /*don't add*/)
+	tassert.CheckFatal(t, err)
+
+	tMock := mock.NewTarget(mock.NewBaseBownerMock(
+		meta.NewBck(
+			m.bck.Name, m.bck.Provider, cmn.NsGlobal,
+			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}, Extra: p.Extra, BID: 0xa73b9f11},
+		),
+	))
+
+	// add mock backend
+	var mockBackend core.Backend
+	switch m.bck.Provider {
+	case apc.AWS:
+		mockBackend, _ = backend.NewAWS(tMock, mock.NewStatsTracker())
+	case apc.GCP:
+		mockBackend, _ = backend.NewGCP(tMock, mock.NewStatsTracker())
+	case apc.Azure:
+		mockBackend, _ = backend.NewAzure(tMock, mock.NewStatsTracker())
+	default:
+		t.Fatalf("unexpected backend provider %q", m.bck.Provider)
+	}
+	tMock.Backends = map[string]core.Backend{m.bck.Provider: mockBackend}
+
+	initMountpaths(t, proxyURL)
+
+	m.puts()
+
+	if !p.Cksum.ValidateWarmGet {
+		propsToSet := &cmn.BpropsToSet{
+			Versioning: &cmn.VersionConfToSet{ValidateWarmGet: apc.Ptr(true)},
+			Cksum: &cmn.CksumConfToSet{
+				Type:            apc.Ptr(cos.ChecksumXXHash),
+				ValidateWarmGet: apc.Ptr(true),
+			},
+		}
+		_, err = api.SetBucketProps(baseParams, m.bck, propsToSet)
+		tassert.CheckFatal(t, err)
+	}
+	t.Cleanup(func() {
+		propsToSet := &cmn.BpropsToSet{
+			Versioning: &cmn.VersionConfToSet{
+				ValidateWarmGet: apc.Ptr(p.Versioning.ValidateWarmGet),
+			},
+			Cksum: &cmn.CksumConfToSet{
+				Type:            apc.Ptr(p.Cksum.Type),
+				ValidateWarmGet: apc.Ptr(p.Cksum.ValidateWarmGet),
+			},
+		}
+		_, err = api.SetBucketProps(baseParams, m.bck, propsToSet)
+		tassert.CheckError(t, err)
+		m.del()
+	})
+
+	// FIXME: We should also have tests for `ColdGetEnabled`.
+
+	t.Run("ColdGetDisabled", func(t *testing.T) {
+		propsToSet := &cmn.BpropsToSet{Features: apc.Ptr(feat.DisableColdGET)}
+		_, err = api.SetBucketProps(baseParams, m.bck, propsToSet)
+		tassert.CheckFatal(t, err)
+		t.Cleanup(func() {
+			propsToSet := &cmn.BpropsToSet{Features: apc.Ptr(p.Features)}
+			_, err = api.SetBucketProps(baseParams, m.bck, propsToSet)
+			tassert.CheckError(t, err)
+		})
+
+		for name, test := range map[string]struct {
+			beforeTest func(*testing.T)
+			modify     func(*testing.T, *core.LOM)
+		}{
+			"checksum": {modify: func(_ *testing.T, lom *core.LOM) {
+				lom.SetCksum(cos.NewCksum(cos.ChecksumXXHash, "01234"))
+			}},
+			"local_content": {modify: func(t *testing.T, lom *core.LOM) {
+				err := os.WriteFile(lom.FQN, []byte("modified"), cos.PermRWR)
+				tassert.CheckFatal(t, err)
+			}},
+			"remote_content": {
+				modify: func(t *testing.T, lom *core.LOM) {
+					if tMock.Backend(lom.Bck()) == nil {
+						t.Skipf(`Skipping because tests are not built with '-tags="%s"' option`, lom.Bck().Provider)
+					}
+
+					r := io.NopCloser(bytes.NewReader([]byte("modified")))
+					_, err := tMock.Backend(lom.Bck()).PutObj(r, lom, nil)
+					tassert.CheckFatal(t, err)
+				},
+			},
+			"remote_version": {
+				beforeTest: func(t *testing.T) {
+					if !p.Versioning.Enabled {
+						t.Skip("Validation is not enabled for this bucket")
+					}
+				},
+				modify: func(t *testing.T, lom *core.LOM) {
+					// We override remote object with the same content - it should
+					// bump the version without changing the other metadata.
+					data, err := os.ReadFile(lom.FQN)
+					tassert.CheckFatal(t, err)
+					r := io.NopCloser(bytes.NewReader(data))
+					backend := tMock.Backend(lom.Bck())
+
+					if backend == nil {
+						t.Skipf("Warning: mock backend is nil, most likely reason: missing build tag\n"+
+							"(try running this test with -tags=%q)\n\n", "debug,aws,gcp,azure")
+					}
+
+					_, err = backend.PutObj(r, lom, nil)
+					tassert.CheckFatal(t, err)
+				},
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				if test.beforeTest != nil {
+					test.beforeTest(t)
+				}
+
+				objName := m.nextObjName()
+
+				// Modify local version.
+				fqn := findObjOnDisk(m.bck, objName)
+				tools.ModifyLOM(t, fqn, m.bck, test.modify)
+
+				// Make sure that object is not returned.
+				_, err = api.GetObjectWithValidation(baseParams, m.bck, objName, nil)
+				tassert.Fatalf(t, err != nil, "Expected error to occur")
+			})
+		}
+	})
 }
 
 func TestEvictRemoteBucket(t *testing.T) {
@@ -1234,7 +1392,7 @@ func verifyValidRanges(t *testing.T, proxyURL string, bck cmn.Bck, cksumType, ob
 		t.Errorf("Returned bytes don't match expected length. Expected length: [%d]. Output length: [%d]",
 			expectedLength, len(outputBytes))
 	}
-	for i := 0; i < len(expectedBytes); i++ {
+	for i := range expectedBytes {
 		if expectedBytes[i] != outputBytes[i] {
 			t.Errorf("Byte mismatch. Expected: %v, Actual: %v", string(expectedBytes), string(outputBytes))
 		}
@@ -1372,14 +1530,14 @@ func corruptSingleBitInFile(t *testing.T, bck cmn.Bck, objName string) {
 		b       = []byte{0}
 	)
 	tassert.CheckFatal(t, err)
-	off := rand.Int63n(fi.Size())
+	off := rand.Int64N(fi.Size())
 	file, err := os.OpenFile(fqn, os.O_RDWR, cos.PermRWR)
 	tassert.CheckFatal(t, err)
 	_, err = file.Seek(off, 0)
 	tassert.CheckFatal(t, err)
 	_, err = file.Read(b)
 	tassert.CheckFatal(t, err)
-	bit := rand.Intn(8)
+	bit := rand.IntN(8)
 	b[0] ^= 1 << bit
 	_, err = file.Seek(off, 0)
 	tassert.CheckFatal(t, err)
@@ -1451,7 +1609,7 @@ func TestPutObjectWithChecksum(t *testing.T) {
 			t.Errorf("Bad checksum provided by the user, Expected an error")
 		}
 
-		_, err = api.HeadObject(baseParams, bck, fileName, apc.FltExists, false /*silent*/)
+		_, err = api.HeadObject(baseParams, bck, fileName, api.HeadArgs{FltPresence: apc.FltExists})
 		if err == nil || !strings.Contains(err.Error(), strconv.Itoa(http.StatusNotFound)) {
 			t.Errorf("Object %s exists despite bad checksum", fileName)
 		}
@@ -1460,13 +1618,13 @@ func TestPutObjectWithChecksum(t *testing.T) {
 		if err != nil {
 			t.Errorf("Correct checksum provided, Err encountered %v", err)
 		}
-		op, err := api.HeadObject(baseParams, bck, fileName, apc.FltPresent, false /*silent*/)
+		op, err := api.HeadObject(baseParams, bck, fileName, api.HeadArgs{FltPresence: apc.FltPresent})
 		if err != nil {
 			t.Errorf("Object %s does not exist despite correct checksum", fileName)
 		}
 		attrs1 := oah.Attrs()
 		attrs2 := op.ObjAttrs
-		tassert.Errorf(t, attrs1.Equal(&attrs2), "PUT(obj) attrs %s != %s HEAD\n", attrs1.String(), attrs2.String())
+		tassert.Errorf(t, attrs1.CheckEq(&attrs2) == nil, "PUT(obj) attrs %s != %s HEAD\n", attrs1.String(), attrs2.String())
 	}
 }
 
@@ -1489,7 +1647,7 @@ func TestOperationsWithRanges(t *testing.T) {
 					cksumType = bck.Props.Cksum.Type
 				)
 
-				for i := 0; i < objCnt/2; i++ {
+				for i := range objCnt / 2 {
 					objList = append(objList,
 						fmt.Sprintf("test/a-%04d", i),
 						fmt.Sprintf("test/b-%04d", i),

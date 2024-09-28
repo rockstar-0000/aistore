@@ -1,13 +1,13 @@
 // Package integration_test.
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
 	"fmt"
 	iofs "io/fs"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -224,7 +224,7 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	tlog.Logln("Running test case _not_ to overwrite destination...")
 	l := len(list.Entries)
 	numDel := max(l/100, 2)
-	idx := rand.Intn(l)
+	idx := rand.IntN(l)
 	if idx+numDel >= l {
 		if numDel >= l {
 			idx, numDel = 0, l
@@ -233,7 +233,7 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 		}
 	}
 	tlog.Logf("Deleting %d random objects\n", numDel)
-	for i := 0; i < numDel; i++ {
+	for i := range numDel {
 		name := list.Entries[idx+i].Name
 		err := api.DeleteObject(baseParams, m.bck, name)
 		tassert.CheckFatal(t, err)

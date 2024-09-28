@@ -83,15 +83,39 @@ $ make help
 
 ### Clean deploy
 
-```
-./clean_deploy.sh [--target-cnt TARGET_CNT] [--proxy-cnt PROXY_CNT] [--mountpath-cnt MOUNTPATH_CNT] [--https] [--deployment local|remote|all] [--remote-alias REMOTE_ALIAS] [--PROVIDER ...] [--debug PKG=LOG_LEVEL[,PKG=LOG_LEVEL]] [--loopback SIZE]
+```console
+$ ./scripts/clean_deploy.sh -h
+NAME:
+  clean_deploy.sh - locally deploy AIS cluster(s)
+
+USAGE:
+  ./clean_deploy.sh [options...]
+
+OPTIONS:
+  --target-cnt        Number of target nodes in the cluster (default: 5)
+  --proxy-cnt         Number of proxies/gateways (default: 5)
+  --mountpath-cnt     Number of mountpaths (default: 5)
+  --cleanup           Cleanup data and metadata from the previous deployments
+  --deployment        Choose which AIS cluster(s) to deploy, one of: 'local', 'remote', 'all' (default: 'local')
+  --remote-alias      Alias to assign to the remote cluster (default: 'remais')
+  --aws               Build with AWS S3 backend
+  --gcp               Build with Google Cloud Storage backend
+  --azure             Build with Azure Blob Storage backend
+  --ht                Build with ht:// backend (experimental)
+  --loopback          Loopback device size, e.g. 10G, 100M (default: 0). Zero size means emulated mountpaths (with no loopback devices).
+  --dir               The root directory of the aistore repository
+  --https             Use HTTPS (note: X.509 certificates may be required)
+  --standby           When starting up, do not join cluster - wait instead for admin request (advanced usage, target-only)
+  --transient         Do not store config changes, keep all the updates in memory
+  -h, --help          Show this help text
 ```
 
-Performs cleanup and then deploys a new instance of an AIS cluster.
+Deploys a new instance of an AIS cluster after shutting down currently running cluster(s), if any.
+
 To make it even more convenient, consider setting up an alias:
 
 ```bash
-alias cais="bash ${GOPATH}/src/github.com/NVIDIA/aistore/deploy/scripts/clean-deploy --aws --gcp"
+alias cais="bash ${GOPATH}/src/github.com/NVIDIA/aistore/scripts/clean-deploy --aws --gcp"
 ```
 
 #### Example: minimal remote cluster
@@ -107,13 +131,13 @@ The script will not only deploy the two clusters - it will also assign the remot
 and attach one cluster to another, thus forming a [global namespace](providers.md#remote-ais-cluster).
 
 ```console
-$ deploy/scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt 4 --deployment all --remote-alias remais
+$ scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt 4 --deployment all --remote-alias remais
 ```
 
 Here's another example that illustrates multi-node (6 + 6) cluster with storage targets utilizing loopback devices to simulate actual non-shared storage disks (one disk per target mountpath):
 
 ```console
-$ deploy/scripts/clean_deploy.sh --target-cnt 6 --proxy-cnt 6 --mountpath-cnt 4 --deployment all --loopback 123M --remote-alias remais --gcp --aws
+$ scripts/clean_deploy.sh --target-cnt 6 --proxy-cnt 6 --mountpath-cnt 4 --deployment all --loopback 123M --remote-alias remais --gcp --aws
 ```
 
 > Overall, this line above will create 4 loopbacks of total size 123M * 4 = 0.5GiB. It'll take maybe a few extra seconds but only at the very first run - subsequent cluster restarts will utilize already provisioned devices and other persistent configuration.
@@ -145,7 +169,7 @@ The command below starts a cluster with 5 proxies and 5 targets with GCP cloud e
 Remember to set `GOOGLE_APPLICATION_CREDENTIALS` env when using GCP cloud!
 
 ```console
-$ bash ./deploy/scripts/clean-deploy --gcp
+$ bash ./scripts/clean-deploy --gcp
 ```
 
 The example below deploys:
@@ -155,7 +179,7 @@ The example below deploys:
 - with AWS support
 
 ```console
-$ bash ./deploy/scripts/clean-deploy --deployment all --remote-alias remoteAIS --target-cnt 3 --proxy-cnt 3 --aws
+$ bash ./scripts/clean-deploy --deployment all --remote-alias remoteAIS --target-cnt 3 --proxy-cnt 3 --aws
 ```
 
 #### Options
@@ -165,7 +189,7 @@ $ bash ./deploy/scripts/clean-deploy --deployment all --remote-alias remoteAIS -
 | `--target-cnt` | Number of targets to start (default: 5) |
 | `--proxy-cnt` | Number of proxies to start (default: 5) |
 | `--mountpath-cnt` | Number of mountpaths to use (default: 5) |
-| `--PROVIDER` | Specifies the backend provider(s). Can be: `--aws`, `--azure`, `--gcp`, `--hdfs` |
+| `--PROVIDER` | Specifies the backend provider(s). Can be: `--aws`, `--azure`, `--gcp` |
 | `--loopback` | Loopback device size, e.g. 10G, 100M (default: 0). Zero size means: no loopbacks. The minimum size is 100M. |
 | `--deployment` | Choose which AIS cluster to deploy. `local` to deploy only one AIS cluster, `remote` to only start an AIS-behind-AIS cluster, and `all` to deploy both the local and remote clusters. |
 | `--remote-alias` | Alias to assign to the remote cluster |
@@ -196,7 +220,7 @@ It also can quickly provide an answer if the change that was made actually impro
 The command below will compare the benchmark(s) `BenchmarkRandom*` between the current commit and `f9a1536f...`.
 
 ```console
-$ bash ./deploy/scripts/bootstrap.sh bench cmp f9a1536f4c9af0d1ac84c200e68f2ba73676c487 --dir bench/tools/aisloader --bench BenchmarkRandom
+$ bash ./scripts/bootstrap.sh bench cmp f9a1536f4c9af0d1ac84c200e68f2ba73676c487 --dir bench/tools/aisloader --bench BenchmarkRandom
 ```
 
 #### Options

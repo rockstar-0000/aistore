@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -11,6 +11,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/stats"
@@ -22,6 +23,10 @@ type unitsCtx struct {
 
 func (ctx *unitsCtx) sizeSig(siz int64, digits int) string {
 	return FmtSize(siz, ctx.units, digits)
+}
+
+func (ctx *unitsCtx) sizeSig2(siz int64, digits int, flags uint16) string {
+	return fmtSize2(siz, ctx.units, digits, flags)
 }
 
 func (ctx *unitsCtx) sizeUns(siz uint64, digits int) string {
@@ -40,15 +45,22 @@ func (ctx *unitsCtx) durHuman(dur time.Duration) string {
 	return FmtDuration(dur.Nanoseconds(), ctx.units)
 }
 
-func FuncMapUnits(units string) (m template.FuncMap) {
+func FuncMapUnits(units string, datedTime bool) (m template.FuncMap) {
 	ctx := &unitsCtx{units}
-	m = make(template.FuncMap, 4)
+	m = make(template.FuncMap, 8)
+
 	m["FormatBytesSig"] = ctx.sizeSig
+	m["FormatBytesSig2"] = ctx.sizeSig2
 	m["FormatBytesUns"] = ctx.sizeUns
 	m["FormatMAM"] = ctx.sizeMam
 	m["FormatMilli"] = ctx.durMilli
 	m["FormatDuration"] = ctx.durHuman
-	return
+
+	if datedTime {
+		m["FormatStart"] = FmtDateTime
+		m["FormatEnd"] = FmtDateTime
+	}
+	return m
 }
 
 func ValidateUnits(units string) error {
@@ -89,13 +101,20 @@ func toSizeSI(b int64, digits int) string {
 	}
 }
 
+func fmtSize2(size int64, units string, digits int, flags uint16) string {
+	if flags&apc.EntryIsDir != 0 {
+		return ""
+	}
+	return FmtSize(size, units, digits)
+}
+
 // (with B, ns, and /s suffix)
 func FmtStatValue(name, kind string, value int64, units string) string {
 	if value == 0 {
 		return "0"
 	}
 	// uptime
-	if strings.HasSuffix(name, ".time") || kind == stats.KindLatency {
+	if strings.HasSuffix(name, ".time") || kind == stats.KindLatency || kind == stats.KindTotal {
 		return FmtDuration(value, units)
 	}
 	// units (enum)

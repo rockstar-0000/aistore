@@ -16,7 +16,7 @@ AIStore supports multiple ways to populate itself with existing datasets, includ
 * **copy** multiple matching objects;
 * **archive** multiple objects
 * **prefetch** remote bucket or parts of thereof;
-* **download** raw http(s) addressible directories, including (but not limited to) Cloud storages;
+* **download** raw http(s) addressable directories, including (but not limited to) Cloud storages;
 * **promote** NFS or SMB shares accessible by one or multiple (or all) AIS target nodes;
 
 > The on-demand "way" is maybe the most popular, whereby users just start running their workloads against a [remote bucket](docs/providers.md) with AIS cluster positioned as an intermediate fast tier.
@@ -36,7 +36,6 @@ User can control (or tune-up) the number of workers and the chunk size(s), among
 | default chunk size  | 2 MiB |
 | minimum chunk size  | 32 KiB |
 | maximum chunk size  | 16 MiB |
-| default chunk size  | 2MiB |
 | default number of workers | 4 |
 
 In addition to massively parallel reading (**), blob downloader also:
@@ -115,9 +114,11 @@ To meet this motivation, AIS now supports `GET` request with additional (and opt
 
 | Header | Values (examples) | Comments |
 | --- | --- | --- |
-| `ais-blob-download` | "true", ""  | NOTE: to engage blob downloader, this header must be present and must be "true" (or "yes", etc.) |
+| `ais-blob-download` | "true", ""  | NOTE: to engage blob downloader, this http header must be present and must be "true" (or "y", "yes", "on" case-insensitive) |
 | `ais-blob-chunk` | "1mb", "1234567", "128KiB"  | [system defaults](#blob-downloader) above |
 | `ais-blob-workers` | "3", "7", "16"  | ditto |
+
+* HTTP headers that AIStore recognizes and supports are always prefixed with "ais-". For the most recently updated list (of headers), please see [the source](https://github.com/NVIDIA/aistore/blob/main/api/apc/headers.go).
 
 ## 3. Prefetch remote buckets w/ blob size threshold
 

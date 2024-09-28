@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -24,6 +24,10 @@ import (
 	"github.com/NVIDIA/aistore/memsys"
 	jsoniter "github.com/json-iterator/go"
 )
+
+//
+// [TODO] retry to pub-addr, if different (currently, cmn.NetIntraControl only; see palive.retry)
+//
 
 // Metasync provides two methods to the rest of the `ais` code:
 // * sync - to synchronize cluster-level metadata (the main method)
@@ -94,6 +98,13 @@ const (
 
 const failsync = "failing to sync"
 
+const (
+	retrySyncRefused   = 4
+	retryNotifyRefused = 2
+)
+
+const workChanCap = 32
+
 type (
 	revs interface {
 		tag() string         // enum { revsSmapTag, ... }
@@ -111,7 +122,7 @@ type (
 		wg        *sync.WaitGroup
 		failedCnt *atomic.Int32
 		pairs     []revsPair
-		reqType   int // enum: reqSync, etc.
+		ty        int // enum: { reqSync, reqNotify }
 	}
 	msPayload map[string][]byte     // tag => revs' body
 	ndRevs    map[string]int64      // tag => version (see nodesRevs)
@@ -130,8 +141,8 @@ type (
 	}
 	// metasync Rx structured error
 	errMsync struct {
-		Message string      `json:"message"`
-		Cii     clusterInfo `json:"cii"`
+		Message string            `json:"message"`
+		Cii     cos.NodeStateInfo `json:"nsti"`
 	}
 )
 
@@ -153,7 +164,7 @@ func newMetasyncer(p *proxy) (y *metasyncer) {
 	y.lastSynced = make(map[string]revs, revsMaxTags)
 
 	y.stopCh = make(chan struct{}, 1)
-	y.workCh = make(chan revsReq, 32)
+	y.workCh = make(chan revsReq, workChanCap)
 
 	y.retryTimer = time.NewTimer(time.Hour)
 	y.retryTimer.Stop()
@@ -162,9 +173,8 @@ func newMetasyncer(p *proxy) (y *metasyncer) {
 }
 
 func (y *metasyncer) Run() error {
-	nlog.Infof("Starting %s", y.Name())
+	nlog.Infoln("Starting", y.Name())
 	for {
-		config := cmn.GCO.Get()
 		select {
 		case revsReq, ok := <-y.workCh:
 			if !ok {
@@ -178,14 +188,17 @@ func (y *metasyncer) Run() error {
 				y.timerStopped = true
 				break
 			}
-			failedCnt := y.do(revsReq.pairs, revsReq.reqType)
+			failedCnt := y.do(revsReq.pairs, revsReq.ty)
 			if revsReq.wg != nil {
 				if revsReq.failedCnt != nil {
 					revsReq.failedCnt.Store(int32(failedCnt))
 				}
 				revsReq.wg.Done()
 			}
-			if y.timerStopped && failedCnt > 0 {
+
+			// timed retry, via handlePending()
+			if y.timerStopped && failedCnt > 0 && revsReq.ty != reqNotify {
+				config := cmn.GCO.Get()
 				y.retryTimer.Reset(config.Periodic.RetrySyncTime.D())
 				y.timerStopped = false
 			}
@@ -195,8 +208,14 @@ func (y *metasyncer) Run() error {
 		case <-y.retryTimer.C:
 			failedCnt := y.handlePending()
 			if failedCnt > 0 {
+				config := cmn.GCO.Get()
 				y.retryTimer.Reset(config.Periodic.RetrySyncTime.D())
 				y.timerStopped = false
+
+				if l, c := len(y.workCh), cap(y.workCh); l > c/2 {
+					nlog.Errorln("Warning:", y.p.String(), "[hp]:", cos.ErrWorkChanFull, "len", l, "cap", c,
+						"failed", failedCnt)
+				}
 			} else {
 				y.timerStopped = true
 			}
@@ -208,8 +227,11 @@ func (y *metasyncer) Run() error {
 }
 
 func (y *metasyncer) Stop(err error) {
-	nlog.Infof("Stopping %s: %v", y.Name(), err)
-
+	if err == nil {
+		nlog.Infoln("Stopping", y.Name())
+	} else {
+		nlog.Infoln("Stopping", y.Name()+":", err)
+	}
 	y.stopCh <- struct{}{}
 	close(y.stopCh)
 }
@@ -218,7 +240,7 @@ func (y *metasyncer) Stop(err error) {
 func (y *metasyncer) notify(wait bool, pair revsPair) (failedCnt int) {
 	var (
 		failedCntAtomic = atomic.NewInt32(0)
-		req             = revsReq{pairs: []revsPair{pair}}
+		req             = revsReq{pairs: []revsPair{pair}, ty: reqNotify}
 	)
 	if y.isPrimary() != nil {
 		return
@@ -227,7 +249,6 @@ func (y *metasyncer) notify(wait bool, pair revsPair) (failedCnt int) {
 		req.wg = &sync.WaitGroup{}
 		req.wg.Add(1)
 		req.failedCnt = failedCntAtomic
-		req.reqType = reqNotify
 	}
 	y.workCh <- req
 
@@ -247,7 +268,7 @@ func (y *metasyncer) sync(pairs ...revsPair) *sync.WaitGroup {
 		return req.wg
 	}
 	req.wg.Add(1)
-	req.reqType = reqSync
+	req.ty = reqSync
 	y.workCh <- req
 	return req.wg
 }
@@ -279,8 +300,8 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 	if reqT == reqNotify {
 		method = http.MethodPost
 	}
-	if daemon.stopping.Load() {
-		return
+	if nlog.Stopping() {
+		return 0
 	}
 
 	// step: build payload and update last sync-ed
@@ -325,11 +346,13 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 		body    = payload.marshal(y.p.gmm)
 		to      = core.AllNodes
 		smap    = y.p.owner.smap.get()
+		retries = retrySyncRefused // connection-refused
 	)
 	defer body.Free()
 
 	if reqT == reqNotify {
 		to = core.Targets
+		retries = retryNotifyRefused
 	}
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{Method: method, Path: urlPath, BodyR: body}
@@ -367,9 +390,10 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 		}
 	}
 	freeBcastRes(results)
+
 	// step: handle connection-refused right away
 	lr := len(refused)
-	for i := 0; i < 4; i++ {
+	for range retries {
 		if len(refused) == 0 {
 			if lr > 0 {
 				nlog.Infof("%s: %d node%s sync-ed", y.p, lr, cos.Plural(lr))
@@ -380,12 +404,13 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 		smap = y.p.owner.smap.get()
 		if !smap.isPrimary(y.p.si) {
 			y.becomeNonPrimary()
-			return
+			return 0
 		}
 		if !y.handleRefused(method, urlPath, body, refused, pairs, smap) {
 			break
 		}
 	}
+
 	// step: housekeep and return new pending
 	smap = y.p.owner.smap.get()
 	for sid := range y.nodesRevs {
@@ -395,7 +420,7 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 		}
 	}
 	failedCnt += len(refused)
-	return
+	return failedCnt
 }
 
 func (y *metasyncer) jit(pair revsPair) revs {
@@ -459,7 +484,7 @@ func (y *metasyncer) handleRefused(method, urlPath string, body io.Reader, refus
 		// failing to sync
 		if res.status == http.StatusConflict {
 			if e := err2MsyncErr(res.err); e != nil {
-				msg := fmt.Sprintf("%s [hr]: %s %s: %s [%v]", y.p.si, failsync, res.si, e.Message, e.Cii)
+				msg := fmt.Sprintf("%s [hr]: %s %s: %s [%v]", y.p, failsync, res.si, e.Message, e.Cii)
 				if !y.remainPrimary(e, res.si, smap) {
 					nlog.Errorln(msg + " - aborting")
 					freeBcastRes(results)
@@ -521,8 +546,11 @@ func (y *metasyncer) _pending() (pending meta.NodeMap, smap *smapX) {
 func (y *metasyncer) handlePending() (failedCnt int) {
 	pending, smap := y._pending()
 	if len(pending) == 0 {
-		nlog.Infof("no pending revs - all good")
-		return
+		nlog.Infoln("no pending revs - all good")
+		return 0
+	}
+	if nlog.Stopping() {
+		return 0
 	}
 	var (
 		l       = len(y.lastSynced)
@@ -581,7 +609,7 @@ func (y *metasyncer) handlePending() (failedCnt int) {
 		nlog.Warningf("%s [hp]: %s %s: %v(%d)", y.p, failsync, res.si, res.err, res.status)
 	}
 	freeBcastRes(results)
-	return
+	return failedCnt
 }
 
 // cie and isPrimary checks versus remote clusterInfo
@@ -607,7 +635,7 @@ func (y *metasyncer) remainPrimary(e *errMsync, from *meta.Snode, smap *smapX) b
 		return true
 	}
 	nlog.Errorf("%s: [%s %s] vs %v from %s", ciError(90), y.p, smap.StringEx(), e.Cii, from)
-	return true // TODO: iffy; may need to do more
+	return true
 }
 
 func (y *metasyncer) isPrimary() (err error) {

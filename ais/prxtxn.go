@@ -18,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -208,7 +209,7 @@ func (p *proxy) createBucket(msg *apc.ActMsg, bck *meta.Bck, remoteHdr http.Head
 		if bck.IsCloud() {
 			return cmn.NewErrNotImpl("create", bck.Provider+"(cloud) bucket")
 		}
-		if bck.IsHTTP() {
+		if bck.IsHT() {
 			return cmn.NewErrNotImpl("create", "bucket for HTTP provider")
 		}
 		// can do remote ais though
@@ -376,6 +377,12 @@ func (p *proxy) setBprops(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.Bprops) (s
 	}
 	bck.Props = bprops
 
+	if nprops.EC.Enabled && cmn.Rom.EcStreams() > 0 {
+		if err := p._onEC(mono.NanoTime()); err != nil {
+			return "", err
+		}
+	}
+
 	// 2. begin
 	switch msg.Action {
 	case apc.ActSetBprops:
@@ -514,6 +521,7 @@ func (p *proxy) renameBucket(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg) (xid str
 			clone.inc()
 			clone.Resilver = cos.GenUUID()
 		},
+		smapCtx: &smapModifier{smap: p.owner.smap.get()},
 	}
 	rmd, err := p.owner.rmd.modify(ctx)
 	if err != nil {
@@ -638,7 +646,7 @@ func (p *proxy) tcb(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (xid
 }
 
 // transform or copy a list or a range of objects
-func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, config *cmn.Config, msg *apc.ActMsg, tcomsg *cmn.TCObjsMsg) (string, error) {
+func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, config *cmn.Config, msg *apc.ActMsg, tcomsg *cmn.TCOMsg) (string, error) {
 	// 1. prep
 	var (
 		_, existsTo = p.owner.bmd.get().Get(bckTo) // cleanup on fail: destroy if created
@@ -646,8 +654,11 @@ func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, config *cmn.Config, msg *apc.Ac
 	)
 	c := &txnCln{
 		p:    p,
-		uuid: cos.GenUUID(), // TODO -- FIXME tcomsg.TxnUUID, // (via target-local xreg.GenBEID)
+		uuid: tcomsg.TxnUUID, // (ref050724)
 		smap: p.owner.smap.get(),
+	}
+	if c.uuid == "" {
+		c.uuid = cos.GenUUID()
 	}
 	c.init(msg, bckFrom, config, waitmsync)
 
@@ -731,7 +742,7 @@ func (p *proxy) ecEncode(bck *meta.Bck, msg *apc.ActMsg) (xid string, err error)
 	}
 
 	if !nlp.TryLock(cmn.Rom.CplaneOperation() / 2) {
-		err = cmn.NewErrBusy("bucket", bck, "")
+		err = cmn.NewErrBusy("bucket", bck.Cname(""))
 		return
 	}
 	defer nlp.Unlock()
@@ -1092,9 +1103,6 @@ func (p *proxy) makeNewBckProps(bck *meta.Bck, propsToUpdate *cmn.BpropsToSet, c
 				p.si, bck, _versioning(bv))
 			return
 		}
-	} else if bck.IsHDFS() {
-		nprops.Versioning.Enabled = false
-		// TODO: Check if the `RefDirectory` does not overlap with other buckets.
 	}
 	if bprops.EC.Enabled && nprops.EC.Enabled {
 		sameSlices := bprops.EC.DataSlices == nprops.EC.DataSlices && bprops.EC.ParitySlices == nprops.EC.ParitySlices
@@ -1128,11 +1136,11 @@ func (p *proxy) makeNewBckProps(bck *meta.Bck, propsToUpdate *cmn.BpropsToSet, c
 	remirror := _reMirror(bprops, nprops)
 	targetCnt, reec := _reEC(bprops, nprops, bck, p.owner.smap.get())
 	if len(creating) == 0 && remirror && reec {
-		err = cmn.NewErrBusy("bucket", bck, "")
+		err = cmn.NewErrBusy("bucket", bck.Cname(""))
 		return
 	}
 	err = nprops.Validate(targetCnt)
-	if cmn.IsErrSoft(err) && propsToUpdate.Force {
+	if cmn.IsErrWarning(err) && propsToUpdate.Force {
 		nlog.Warningln("Ignoring soft error:", err)
 		err = nil
 	}

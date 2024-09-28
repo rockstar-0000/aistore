@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
 )
 
@@ -21,7 +22,7 @@ const (
 	colUtil     = "UTIL(%)"
 )
 
-func NewDiskTab(dsh []DiskStatsHelper, smap *meta.Smap, regex *regexp.Regexp, units, totalsHdr string) *Table {
+func NewDiskTab(dsh []*DiskStatsHelper, smap *meta.Smap, regex *regexp.Regexp, units, totalsHdr string, withCap bool) *Table {
 	// 1. columns
 	cols := []*header{
 		{name: colTarget},
@@ -31,6 +32,9 @@ func NewDiskTab(dsh []DiskStatsHelper, smap *meta.Smap, regex *regexp.Regexp, un
 		{name: colWrite},
 		{name: colWriteAvg},
 		{name: colUtil},
+	}
+	if withCap {
+		cols = append(cols, &header{name: colCapUsed}, &header{name: colCapAvail})
 	}
 	if regex != nil {
 		cols = _flt(cols, regex)
@@ -64,9 +68,34 @@ func NewDiskTab(dsh []DiskStatsHelper, smap *meta.Smap, regex *regexp.Regexp, un
 			row = append(row, FmtStatValue("", "", stat.Util, units)+"%")
 		}
 
-		if ds.TargetID == totalsHdr {
+		var haveCap bool
+		if withCap {
+			// this disk (used%, avail)
+			if ds.Tcdf != nil {
+				for _, cdf := range ds.Tcdf.Mountpaths {
+					// TODO: multi-disk mountpath
+					if cdf.Disks[0] != ds.DiskName {
+						continue
+					}
+					used := FmtStatValue("", "", int64(cdf.PctUsed), units) + "%"
+					avail := FmtSize(int64(cdf.Avail), units, 2)
+					row = append(row, used, avail)
+					haveCap = true
+					break
+				}
+			}
+		}
+		if withCap && !haveCap {
+			row = append(row, unknownVal, unknownVal)
+		}
+
+		// (alert | total)
+		if a, i := fs.HasAlert([]string{ds.DiskName}); i > 0 {
+			row[len(row)-1] += fred(" <--- " + a)
+		} else if ds.TargetID == totalsHdr { // (cluTotal = "--- Cluster:")
 			row[len(row)-1] += fcyan(" ---")
 		}
+
 		table.addRow(row)
 	}
 	return table
@@ -90,7 +119,7 @@ func _flt(cols []*header, regex *regexp.Regexp) []*header {
 }
 
 func _idx(cols []*header, name string) int {
-	for i := 0; i < len(cols); i++ {
+	for i := range cols {
 		if cols[i].name == name {
 			return i
 		}

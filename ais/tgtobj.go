@@ -47,7 +47,7 @@ import (
 
 type (
 	putOI struct {
-		req        *http.Request
+		oreq       *http.Request
 		r          io.ReadCloser // content reader
 		xctn       core.Xact     // xaction that puts
 		t          *target       // this
@@ -58,6 +58,7 @@ type (
 		workFQN    string        // temp fqn to be renamed
 		atime      int64         // access time.Now()
 		ltime      int64         // mono.NanoTime, to measure latency
+		rltime     int64         // mono.NanoTime, to measure remote bucket latency
 		size       int64         // aka Content-Length
 		owt        cmn.OWT       // object write transaction enum { OwtPut, ..., OwtGet* }
 		restful    bool          // being invoked via RESTful API
@@ -65,6 +66,7 @@ type (
 		skipEC     bool          // do not erasure-encode when finalizing
 		skipVC     bool          // skip loading existing Version and skip comparing Checksums (skip VC)
 		coldGET    bool          // (one implication: proceed to write)
+		remoteErr  bool          // to exclude `putRemote` errors when counting soft IO errors
 	}
 
 	getOI struct {
@@ -73,18 +75,19 @@ type (
 		ctx        context.Context // context used when getting object from remote backend (access creds)
 		t          *target         // this
 		lom        *core.LOM       // obj
-		archive    archiveQuery    // archive query
-		ranges     byteRanges      // range read (see https://www.rfc-editor.org/rfc/rfc7233#section-2.1)
-		atime      int64           // access time.Now()
-		ltime      int64           // mono.NanoTime, to measure latency
-		isGFN      bool            // is GFN
-		chunked    bool            // chunked transfer (en)coding: https://tools.ietf.org/html/rfc7230#page-36
-		unlocked   bool            // internal
-		verchanged bool            // version changed
-		retry      bool            // once
-		cold       bool            // true if executed backend.Get
-		latestVer  bool            // QparamLatestVer || 'versioning.*_warm_get'
-		isS3       bool            // calling via /s3 API
+		dpq        *dpq
+		ranges     byteRanges // range read (see https://www.rfc-editor.org/rfc/rfc7233#section-2.1)
+		atime      int64      // access time.Now()
+		ltime      int64      // mono.NanoTime, to measure latency
+		rstarttime int64      // mono.NanoTime, mark start of remote GET to measure latency
+		rltime     int64      // mono.NanoTime, to measure remote bucket latency
+		chunked    bool       // chunked transfer (en)coding: https://tools.ietf.org/html/rfc7230#page-36
+		unlocked   bool       // internal
+		verchanged bool       // version changed
+		retry      bool       // once
+		cold       bool       // true if executed backend.Get
+		latestVer  bool       // QparamLatestVer || 'versioning.*_warm_get'
+		isIOErr    bool       // to count GET error as a "IO error"; see `Trunner._softErrs()`
 	}
 
 	// textbook append: (packed) handle and control structure (see also `putA2I` arch below)
@@ -137,7 +140,7 @@ type (
 // poi.restful entry point
 func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (int, error) {
 	{
-		poi.req = r
+		poi.oreq = r
 		poi.r = r.Body
 		poi.resphdr = resphdr
 		poi.workFQN = fs.CSM.Gen(poi.lom, fs.WorkfileType, fs.WorkfilePut)
@@ -166,13 +169,13 @@ func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (int, error
 	return poi.putObject()
 }
 
-func (poi *putOI) putObject() (errCode int, err error) {
+func (poi *putOI) putObject() (ecode int, err error) {
 	poi.ltime = mono.NanoTime()
 	// PUT is a no-op if the checksums do match
 	if !poi.skipVC && !poi.coldGET && !poi.cksumToUse.IsEmpty() {
 		if poi.lom.EqCksum(poi.cksumToUse) {
 			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-				nlog.Infof("destination %s has identical %s: PUT is a no-op", poi.lom, poi.cksumToUse)
+				nlog.Infoln(poi.lom.String(), "has identical", poi.cksumToUse.String(), "- PUT is a no-op")
 			}
 			cos.DrainReader(poi.r)
 			return 0, nil
@@ -182,11 +185,11 @@ func (poi *putOI) putObject() (errCode int, err error) {
 	buf, slab, lmfh, erw := poi.write()
 	poi._cleanup(buf, slab, lmfh, erw)
 	if erw != nil {
-		err, errCode = erw, http.StatusInternalServerError
+		err, ecode = erw, http.StatusInternalServerError
 		goto rerr
 	}
 
-	if errCode, err = poi.finalize(); err != nil {
+	if ecode, err = poi.finalize(); err != nil {
 		goto rerr
 	}
 
@@ -196,38 +199,62 @@ func (poi *putOI) putObject() (errCode int, err error) {
 		// same-checksum-skip-writing, on the other
 		if poi.owt == cmn.OwtPut && poi.restful {
 			debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
-			poi.t.statsT.AddMany(
-				cos.NamedVal64{Name: stats.PutCount, Value: 1},
-				cos.NamedVal64{Name: stats.PutThroughput, Value: poi.lom.SizeBytes()},
-				cos.NamedVal64{Name: stats.PutLatency, Value: mono.SinceNano(poi.ltime)},
-			)
+			poi.stats()
 			// RESTful PUT response header
 			if poi.resphdr != nil {
-				cmn.ToHeader(poi.lom.ObjAttrs(), poi.resphdr)
-				poi.resphdr.Del(cos.HdrContentLength)
+				cmn.ToHeader(poi.lom.ObjAttrs(), poi.resphdr, 0 /*skip setting content-length*/)
 			}
 		}
 	} else if poi.xctn != nil && poi.owt == cmn.OwtPromote {
 		// xaction in-objs counters, promote first
-		poi.xctn.InObjsAdd(1, poi.lom.SizeBytes())
+		poi.xctn.InObjsAdd(1, poi.lom.Lsize())
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 		nlog.Infoln(poi.loghdr())
 	}
-	return
+
+	return 0, nil
 rerr:
 	if poi.owt == cmn.OwtPut && poi.restful && !poi.t2t {
-		poi.t.statsT.IncErr(stats.PutCount)
+		poi.t.statsT.IncErr(stats.ErrPutCount)
+		if err != cmn.ErrSkip && !poi.remoteErr && err != io.ErrUnexpectedEOF && !cos.IsRetriableConnErr(err) {
+			poi.t.statsT.IncErr(stats.IOErrPutCount)
+		}
 	}
-	return
+	return ecode, err
+}
+
+func (poi *putOI) stats() {
+	var (
+		bck   = poi.lom.Bck()
+		size  = poi.lom.Lsize()
+		delta = mono.SinceNano(poi.ltime)
+	)
+	poi.t.statsT.AddMany(
+		cos.NamedVal64{Name: stats.PutCount, Value: 1},
+		cos.NamedVal64{Name: stats.PutSize, Value: size},
+		cos.NamedVal64{Name: stats.PutThroughput, Value: size},
+		cos.NamedVal64{Name: stats.PutLatency, Value: delta},
+		cos.NamedVal64{Name: stats.PutLatencyTotal, Value: delta},
+	)
+	if poi.rltime > 0 {
+		debug.Assert(bck.IsRemote())
+		backend := poi.t.Backend(bck)
+		poi.t.statsT.AddMany(
+			cos.NamedVal64{Name: backend.MetricName(stats.PutCount), Value: 1},
+			cos.NamedVal64{Name: backend.MetricName(stats.PutLatencyTotal), Value: poi.rltime},
+			cos.NamedVal64{Name: backend.MetricName(stats.PutE2ELatencyTotal), Value: delta},
+			cos.NamedVal64{Name: backend.MetricName(stats.PutSize), Value: size},
+		)
+	}
 }
 
 // verbose only
 func (poi *putOI) loghdr() string {
-	sb := strings.Builder{}
+	var sb strings.Builder
 	sb.WriteString(poi.owt.String())
 	sb.WriteString(", ")
-	sb.WriteString(poi.lom.String())
+	sb.WriteString(poi.lom.Cname())
 	if poi.xctn != nil {
 		sb.WriteString(", ")
 		sb.WriteString(poi.xctn.String())
@@ -244,30 +271,30 @@ func (poi *putOI) loghdr() string {
 	return sb.String()
 }
 
-func (poi *putOI) finalize() (errCode int, err error) {
-	if errCode, err = poi.fini(); err != nil {
+func (poi *putOI) finalize() (ecode int, err error) {
+	if ecode, err = poi.fini(); err != nil {
 		if err1 := cos.Stat(poi.workFQN); err1 == nil || !os.IsNotExist(err1) {
+			// cleanup: rm work-fqn
 			if err1 == nil {
 				err1 = err
 			}
-			poi.t.fsErr(err1, poi.workFQN)
 			if err2 := cos.RemoveFile(poi.workFQN); err2 != nil && !os.IsNotExist(err2) {
 				nlog.Errorf(fmtNested, poi.t, err1, "remove", poi.workFQN, err2)
 			}
 		}
 		poi.lom.Uncache()
-		if errCode != http.StatusInsufficientStorage && cmn.IsErrCapExceeded(err) {
-			errCode = http.StatusInsufficientStorage
+		if ecode != http.StatusInsufficientStorage && cmn.IsErrCapExceeded(err) {
+			ecode = http.StatusInsufficientStorage
 		}
-		return errCode, err
+		return ecode, err
 	}
 	if !poi.skipEC {
 		if ecErr := ec.ECM.EncodeObject(poi.lom, nil); ecErr != nil && ecErr != ec.ErrorECDisabled {
 			err = ecErr
-			if errCode != http.StatusInsufficientStorage && cmn.IsErrCapExceeded(err) {
-				errCode = http.StatusInsufficientStorage
+			if ecode != http.StatusInsufficientStorage && cmn.IsErrCapExceeded(err) {
+				ecode = http.StatusInsufficientStorage
 			}
-			return errCode, err
+			return ecode, err
 		}
 	}
 	poi.t.putMirror(poi.lom)
@@ -275,25 +302,26 @@ func (poi *putOI) finalize() (errCode int, err error) {
 }
 
 // poi.workFQN => LOM
-func (poi *putOI) fini() (errCode int, err error) {
+func (poi *putOI) fini() (ecode int, err error) {
 	var (
 		lom = poi.lom
 		bck = lom.Bck()
 	)
 	// put remote
 	if bck.IsRemote() && poi.owt < cmn.OwtRebalance {
-		errCode, err = poi.putRemote()
+		ecode, err = poi.putRemote()
 		if err != nil {
 			loghdr := poi.loghdr()
-			nlog.Errorf("PUT (%s): %v(%d)", loghdr, err, errCode)
-			if errCode != http.StatusServiceUnavailable {
-				return
+			nlog.Errorf("PUT (%s): %v(%d)", loghdr, err, ecode)
+			if ecode != http.StatusServiceUnavailable {
+				return ecode, err
 			}
+			// retry 503 only once; e.g. error message:
 			// (googleapi: "Error 503: We encountered an internal error. Please try again.")
 			time.Sleep(time.Second)
-			errCode, err = poi.putRemote()
+			ecode, err = poi.putRemote()
 			if err != nil {
-				return
+				return ecode, err
 			}
 			nlog.Infof("PUT (%s): retried OK", loghdr)
 		}
@@ -303,7 +331,7 @@ func (poi *putOI) fini() (errCode int, err error) {
 	// (see GetCold() implementation and cmn.OWT enum)
 	switch poi.owt {
 	case cmn.OwtGetTryLock, cmn.OwtGetLock, cmn.OwtGet:
-		debug.AssertFunc(func() bool { _, exclusive := lom.IsLocked(); return exclusive })
+		// do nothing: lom is already wlocked
 	case cmn.OwtGetPrefetchLock:
 		if !lom.TryLock(true) {
 			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
@@ -313,8 +341,7 @@ func (poi *putOI) fini() (errCode int, err error) {
 		}
 		defer lom.Unlock(true)
 	default:
-		// expecting valid atime passed with `poi`
-		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
+		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime) // expecting valid atime
 		lom.Lock(true)
 		defer lom.Unlock(true)
 		lom.SetAtimeUnix(poi.atime)
@@ -328,15 +355,15 @@ func (poi *putOI) fini() (errCode int, err error) {
 				debug.AssertNoErr(err)
 			} else if remSrc, ok := lom.GetCustomKey(cmn.SourceObjMD); !ok || remSrc == "" {
 				if err = lom.IncVersion(); err != nil {
-					nlog.Errorln(err)
+					nlog.Errorln(err) // (unlikely)
 				}
 			}
 		}
 	}
 
 	// done
-	if err = lom.RenameFrom(poi.workFQN); err != nil {
-		return
+	if err = lom.RenameFinalize(poi.workFQN); err != nil {
+		return 0, err
 	}
 	if lom.HasCopies() {
 		if errdc := lom.DelAllCopies(); errdc != nil {
@@ -346,39 +373,42 @@ func (poi *putOI) fini() (errCode int, err error) {
 	if lom.AtimeUnix() == 0 { // (is set when migrating within cluster; prefetch special case)
 		lom.SetAtimeUnix(poi.atime)
 	}
-	err = lom.PersistMain()
-	return
+	return 0, lom.PersistMain()
 }
 
 // via backend.PutObj()
-func (poi *putOI) putRemote() (errCode int, err error) {
+func (poi *putOI) putRemote() (int, error) {
 	var (
-		lom     = poi.lom
-		backend = poi.t.Backend(lom.Bck())
+		lom       = poi.lom
+		startTime = mono.NanoTime()
 	)
 	lmfh, err := cos.NewFileHandle(poi.workFQN)
 	if err != nil {
-		err = cmn.NewErrFailedTo(poi.t, "open", poi.workFQN, err)
-		return
+		return 0, cmn.NewErrFailedTo(poi.t, "open", poi.workFQN, err)
 	}
 	if poi.owt == cmn.OwtPut && !lom.Bck().IsRemoteAIS() {
 		// some/all of those are set by the backend.PutObj()
 		lom.ObjAttrs().DelCustomKeys(cmn.SourceObjMD, cmn.CRC32CObjMD, cmn.ETag, cmn.MD5ObjMD, cmn.VersionObjMD)
 	}
-
-	errCode, err = backend.PutObj(lmfh, lom, &core.ExtraArgsPut{
-		DataClient: g.client.data,
-		Req:        poi.req,
-	})
-	if err == nil && !lom.Bck().IsRemoteAIS() {
-		lom.SetCustomKey(cmn.SourceObjMD, backend.Provider())
+	var (
+		ecode   int
+		backend = poi.t.Backend(lom.Bck())
+	)
+	ecode, err = backend.PutObj(lmfh, lom, poi.oreq)
+	if err == nil {
+		if !lom.Bck().IsRemoteAIS() {
+			lom.SetCustomKey(cmn.SourceObjMD, backend.Provider())
+		}
+		poi.rltime = mono.SinceNano(startTime)
+		return 0, nil
 	}
-	return
+	poi.remoteErr = true
+	return ecode, err
 }
 
 // LOM is updated at the end of this call with size and checksum.
 // `poi.r` (reader) is also closed upon exit.
-func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh *os.File, err error) {
+func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, err error) {
 	var (
 		written int64
 		cksums  = struct {
@@ -389,7 +419,7 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh *os.File, err err
 		}{}
 		ckconf = poi.lom.CksumConf()
 	)
-	if lmfh, err = poi.lom.CreateFile(poi.workFQN); err != nil {
+	if lmfh, err = poi.lom.CreateWork(poi.workFQN); err != nil {
 		return
 	}
 	if poi.size <= 0 {
@@ -436,7 +466,7 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh *os.File, err err
 		cksums.finalized = cksums.compt == cksums.store
 		cksums.compt.Finalize()
 		if !cksums.compt.Equal(cksums.expct) {
-			err = cos.NewErrDataCksum(cksums.expct, &cksums.compt.Cksum, poi.lom.String())
+			err = cos.NewErrDataCksum(cksums.expct, &cksums.compt.Cksum, poi.lom.Cname())
 			poi.t.statsT.AddMany(
 				cos.NamedVal64{Name: stats.ErrCksumCount, Value: 1},
 				cos.NamedVal64{Name: stats.ErrCksumSize, Value: written},
@@ -446,7 +476,7 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh *os.File, err err
 	}
 
 	// ok
-	if cmn.Rom.Features().IsSet(feat.FsyncPUT) {
+	if poi.lom.IsFeatureSet(feat.FsyncPUT) {
 		err = lmfh.Sync() // compare w/ cos.FlushClose
 		debug.AssertNoErr(err)
 	}
@@ -454,7 +484,7 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh *os.File, err err
 	cos.Close(lmfh)
 	lmfh = nil
 
-	poi.lom.SetSize(written) // TODO: compare with non-zero lom.SizeBytes() that may have been set via oa.FromHeader()
+	poi.lom.SetSize(written) // TODO: compare with non-zero lom.Lsize() that may have been set via oa.FromHeader()
 	if cksums.store != nil {
 		if !cksums.finalized {
 			cksums.store.Finalize()
@@ -465,7 +495,7 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh *os.File, err err
 }
 
 // post-write close & cleanup
-func (poi *putOI) _cleanup(buf []byte, slab *memsys.Slab, lmfh *os.File, err error) {
+func (poi *putOI) _cleanup(buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, err error) {
 	if buf != nil {
 		slab.Free(buf)
 	}
@@ -503,18 +533,18 @@ func (poi *putOI) validateCksum(c *cmn.CksumConf) (v bool) {
 // GET(object)
 //
 
-func (goi *getOI) getObject() (errCode int, err error) {
+func (goi *getOI) getObject() (ecode int, err error) {
 	debug.Assert(!goi.unlocked)
 	goi.lom.Lock(false)
-	errCode, err = goi.get()
+	ecode, err = goi.get()
 	if !goi.unlocked {
 		goi.lom.Unlock(false)
 	}
-	return errCode, err
+	return ecode, err
 }
 
 // is under rlock
-func (goi *getOI) get() (errCode int, err error) {
+func (goi *getOI) get() (ecode int, err error) {
 	var (
 		cs          fs.CapStatus
 		doubleCheck bool
@@ -526,44 +556,56 @@ do:
 	if err != nil {
 		cold = cos.IsNotExist(err, 0)
 		if !cold {
+			goi.isIOErr = true
 			return http.StatusInternalServerError, err
+		}
+		if goi.lom.IsFeatureSet(feat.DisableColdGET) && goi.lom.Bck().IsRemote() {
+			return http.StatusNotFound, fmt.Errorf("%w (cold GET disabled)", err)
 		}
 		cs = fs.Cap()
 		if cs.IsOOS() {
 			return http.StatusInsufficientStorage, cs.Err()
 		}
+		if errN := cmn.ValidateObjName(goi.lom.ObjName); errN != nil {
+			return 0, errN
+		}
 	}
 
-	if cold {
-		if goi.lom.Bck().IsAIS() { // ais bucket with no backend - try lookup and restore
-			goi.lom.Unlock(false)
-			doubleCheck, errCode, err = goi.restoreFromAny(false /*skipLomRestore*/)
-			if doubleCheck && err != nil {
-				lom2 := core.AllocLOM(goi.lom.ObjName)
-				er2 := lom2.InitBck(goi.lom.Bucket())
-				if er2 == nil {
-					er2 = lom2.Load(true /*cache it*/, false /*locked*/)
-				}
-				if er2 == nil {
-					core.FreeLOM(goi.lom)
-					goi.lom = lom2
-					err = nil
-				} else {
-					core.FreeLOM(lom2)
-				}
+	switch {
+	case cold && goi.lom.Bck().IsAIS():
+		// ais bucket with no backend - try recover
+		goi.lom.Unlock(false)
+		doubleCheck, ecode, err = goi.restoreFromAny(false /*skipLomRestore*/)
+		if doubleCheck && err != nil {
+			lom2 := core.AllocLOM(goi.lom.ObjName)
+			er2 := lom2.InitBck(goi.lom.Bucket())
+			if er2 == nil {
+				er2 = lom2.Load(true /*cache it*/, false /*locked*/)
+				goi.isIOErr = true
 			}
-			if err != nil {
-				goi.unlocked = true
-				return errCode, err
+			if er2 == nil {
+				core.FreeLOM(goi.lom)
+				goi.lom = lom2
+				err = nil
+			} else {
+				core.FreeLOM(lom2)
 			}
-			goi.lom.Lock(false)
-			if err = goi.lom.Load(true /*cache it*/, true /*locked*/); err != nil {
-				return 0, err
-			}
-			goto fin
 		}
-	} else if goi.latestVer { // apc.QparamLatestVer or 'versioning.validate_warm_get'
-		res := goi.lom.CheckRemoteMD(true /* rlocked */, false /*synchronize*/)
+		if err != nil {
+			goi.unlocked = true
+			return ecode, err
+		}
+		goi.lom.Lock(false)
+		if err = goi.lom.Load(true /*cache it*/, true /*locked*/); err != nil {
+			goi.isIOErr = true
+			return 0, err
+		}
+		goto fin // ok, done
+	case cold:
+		// have remote backend - use it
+	case goi.latestVer:
+		// apc.QparamLatestVer or 'versioning.validate_warm_get'
+		res := goi.lom.CheckRemoteMD(true /* rlocked */, false /*synchronize*/, goi.req)
 		if res.Err != nil {
 			return res.ErrCode, res.Err
 		}
@@ -571,41 +613,27 @@ do:
 			cold, goi.verchanged = true, true
 		}
 		// TODO: utilize res.ObjAttrs
-	} else if cmn.Rom.Features().IsSet(feat.PassThroughSignedS3Req) {
-		cold = false
-		q := goi.req.URL.Query()
-		pts := s3.NewPassThroughSignedReq(g.client.control, goi.req, goi.lom, nil, q)
-		resp, err := pts.Do()
-		if err != nil {
-			return resp.StatusCode, err
-		}
-		if resp != nil {
-			oa := resp.ObjAttrs()
-			if !goi.lom.Equal(oa) {
-				err := fmt.Errorf("%s: checksum doesn't match, object should be retrieved from S3", goi.lom.Cname())
-				return http.StatusGone, err
-			}
-		}
 	}
 
-	if !cold && goi.lom.CksumConf().ValidateWarmGet { // validate checksums and recover (self-heal) if corrupted
-		cold, errCode, err = goi.validateRecover()
+	// validate checksums and recover (a.k.a. self-heal) if corrupted
+	if !cold && goi.lom.CksumConf().ValidateWarmGet {
+		cold, ecode, err = goi.validateRecover()
 		if err != nil {
 			if !cold {
 				nlog.Errorln(err)
-				return errCode, err
+				return ecode, err
 			}
-			nlog.Errorf("%v - proceeding to cold-GET from %s", err, goi.lom.Bck())
+			nlog.Errorln(err, "- proceeding to cold-GET from", goi.lom.Bck().Cname(""))
 		}
 	}
 
 	// cold-GET: upgrade rlock => wlock, call t.Backend.GetObjReader
 	if cold {
 		var (
-			res    core.GetReaderResult
-			ckconf = goi.lom.CksumConf()
-			fast   = !cmn.Rom.Features().IsSet(feat.DisableFastColdGET) // can be disabled
-			loaded bool
+			res     core.GetReaderResult
+			ckconf  = goi.lom.CksumConf()
+			backend = goi.t.Backend(goi.lom.Bck())
+			loaded  bool
 		)
 		if cs.IsNil() {
 			cs = fs.Cap()
@@ -615,6 +643,7 @@ do:
 		}
 		goi.lom.SetAtimeUnix(goi.atime)
 
+		// upgrade rlock => wlock
 		if loaded, err = goi._coldLock(); err != nil {
 			return 0, err
 		}
@@ -625,8 +654,9 @@ do:
 		// zero-out prev. version custom metadata, if any
 		goi.lom.SetCustomMD(nil)
 
+		goi.rstarttime = mono.NanoTime()
 		// get remote reader (compare w/ t.GetCold)
-		res = goi.t.Backend(goi.lom.Bck()).GetObjReader(goi.ctx, goi.lom, 0, 0)
+		res = backend.GetObjReader(goi.ctx, goi.lom, 0, 0)
 		if res.Err != nil {
 			goi.lom.Unlock(true)
 			goi.unlocked = true
@@ -637,57 +667,50 @@ do:
 		}
 		goi.cold = true
 
-		// fast path limitations: read archived; compute more checksums (TODO: reduce)
-		fast = fast && goi.archive.filename == "" &&
-			(ckconf.Type == cos.ChecksumNone || (!ckconf.ValidateColdGet && !ckconf.EnableReadRange))
-
-		// fast path
-		if fast {
-			err = goi.coldSeek(&res)
+		// 3 alternative ways to perform cold GET
+		if goi.dpq.arch.path == "" && goi.dpq.arch.regx == "" &&
+			(ckconf.Type == cos.ChecksumNone || (!ckconf.ValidateColdGet && !ckconf.EnableReadRange)) {
+			if goi.ranges.Range == "" && goi.lom.IsFeatureSet(feat.StreamingColdGET) {
+				err = goi.coldStream(&res)
+			} else {
+				err = goi.coldReopen(&res)
+			}
 			goi.unlocked = true // always
 			return 0, err
 		}
-
-		// regular path
-		errCode, err = goi._coldPut(&res)
+		// otherwise, regular path
+		ecode, err = goi._coldPut(&res)
 		if err != nil {
 			goi.unlocked = true
-			return errCode, err
+			return ecode, err
 		}
-		// with remaining stats via goi.stats()
-		goi.t.statsT.AddMany(
-			cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-			cos.NamedVal64{Name: stats.GetColdSize, Value: res.Size},
-			cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(goi.ltime)},
-		)
+		goi.rltime = mono.SinceNano(goi.rstarttime)
 	}
 
 	// read locally and stream back
 fin:
-	errCode, err = goi.finalize()
+	ecode, err = goi.txfini()
 	if err == nil {
-		debug.Assert(errCode == 0, errCode)
 		return 0, nil
 	}
 	goi.lom.Uncache()
 	if goi.retry {
 		goi.retry = false
 		if !retried {
-			nlog.Warningf("GET %s: retrying...", goi.lom)
-			retried = true // only once
+			nlog.Warningln("retrying", goi.lom.String(), err)
+			retried = true
 			goto do
 		}
-		nlog.Warningf("GET %s: failed retrying %v(%d)", goi.lom, err, errCode)
 	}
-	return errCode, err
+	return ecode, err
 }
 
 // upgrade rlock => wlock
 // done early to prevent multiple cold-readers duplicating network/disk operation and overwriting each other
 func (goi *getOI) _coldLock() (loaded bool, err error) {
 	var (
-		t, lom = goi.t, goi.lom
-		now    int64
+		lom = goi.lom
+		now int64
 	)
 outer:
 	for lom.UpgradeLock() {
@@ -701,9 +724,9 @@ outer:
 			now = mono.NanoTime()
 			fallthrough
 		case mono.Since(now) < max(cmn.Rom.CplaneOperation(), 2*time.Second):
-			nlog.Errorln(t.String()+": failed to load", lom.String(), err, "- retrying...")
+			nlog.Errorln("failed to load", lom.String(), "err:", err, "- retrying...")
 		default:
-			err = cmn.NewErrBusy("object", lom, "")
+			err = cmn.NewErrBusy("object", lom.Cname())
 			break outer
 		}
 	}
@@ -748,9 +771,11 @@ func (goi *getOI) _coldPut(res *core.GetReaderResult) (int, error) {
 	return 0, nil
 }
 
-// - validate checksums
-// - if corrupted and IsAIS, try to recover from redundant replicas or EC slices
-// - otherwise, rely on the remote backend for recovery (tradeoff; TODO: make it configurable)
+// validateRecover first validates and tries to recover a corrupted object:
+//   - validate checksums
+//   - if corrupted and IsAIS or coldGET not permitted, try to recover from redundant
+//     replicas or EC slices
+//   - otherwise, rely on the remote backend for recovery (tradeoff; TODO: make it configurable)
 func (goi *getOI) validateRecover() (coldGet bool, code int, err error) {
 	var (
 		lom     = goi.lom
@@ -768,13 +793,13 @@ validate:
 	if _, ok := err.(*cos.ErrBadCksum); !ok {
 		return
 	}
-	if !lom.Bck().IsAIS() {
+	if !lom.Bck().IsAIS() && !goi.lom.IsFeatureSet(feat.DisableColdGET) {
 		coldGet = true
 		return
 	}
 
 	nlog.Warningln(err)
-	redundant := lom.HasCopies() || lom.Bprops().EC.Enabled
+	redundant := lom.HasCopies() || lom.ECEnabled()
 	//
 	// return err if there's no redundancy OR already recovered once (and failed)
 	//
@@ -782,7 +807,7 @@ validate:
 		//
 		// TODO: mark `deleted` and postpone actual deletion
 		//
-		if erl := lom.Remove(true /*force through rlock*/); erl != nil {
+		if erl := lom.RemoveObj(true /*force through rlock*/); erl != nil {
 			nlog.Warningf("%s: failed to remove corrupted %s, err: %v", goi.t, lom, erl)
 		}
 		return
@@ -790,7 +815,7 @@ validate:
 	//
 	// try to recover from BAD CHECKSUM
 	//
-	cos.RemoveFile(lom.FQN) // TODO: ditto
+	lom.RemoveMain()
 
 	if lom.HasCopies() {
 		retried = true
@@ -804,10 +829,10 @@ validate:
 			goto validate
 		}
 	}
-	if lom.Bprops().EC.Enabled {
+	if lom.ECEnabled() {
 		retried = true
 		goi.lom.Unlock(false)
-		cos.RemoveFile(lom.FQN)
+		lom.RemoveMain()
 		_, code, err = goi.restoreFromAny(true /*skipLomRestore*/)
 		goi.lom.Lock(false)
 		if err == nil {
@@ -818,7 +843,7 @@ validate:
 	}
 
 	// TODO: ditto
-	if erl := lom.Remove(true /*force through rlock*/); erl != nil {
+	if erl := lom.RemoveObj(true /*force through rlock*/); erl != nil {
 		nlog.Warningf("%s: failed to remove corrupted %s, err: %v", goi.t, lom, erl)
 	}
 	return
@@ -829,7 +854,7 @@ validate:
 // 2) other targets (when resilvering or rebalancing is running (aka GFN))
 // 3) other targets if the bucket erasure coded
 // 4) Cloud
-func (goi *getOI) restoreFromAny(skipLomRestore bool) (doubleCheck bool, errCode int, err error) {
+func (goi *getOI) restoreFromAny(skipLomRestore bool) (doubleCheck bool, ecode int, err error) {
 	var (
 		tsi  *meta.Snode
 		smap = goi.t.owner.smap.get()
@@ -862,7 +887,7 @@ func (goi *getOI) restoreFromAny(skipLomRestore bool) (doubleCheck bool, errCode
 		marked    = xreg.GetRebMarked()
 		running   = marked.Xact != nil
 		gfnActive = reb.IsGFN() // GFN(global rebalance)
-		ecEnabled = goi.lom.Bprops().EC.Enabled
+		ecEnabled = goi.lom.ECEnabled()
 		// TODO: when not enough EC targets to restore a sliced object,
 		// we might still be able to restore from the object's full replica
 		enoughECRestoreTargets = goi.lom.Bprops().EC.RequiredRestoreTargets() <= smap.CountActiveTs()
@@ -891,26 +916,28 @@ gfn:
 	ecErr := ec.ECM.RestoreObject(goi.lom)
 	if ecErr == nil {
 		ecErr = goi.lom.Load(true /*cache it*/, false /*locked*/) // TODO: optimize locking
-		debug.AssertNoErr(ecErr)
 		if ecErr == nil {
-			nlog.Infoln(goi.t.String(), "EC-recovered", goi.lom.String())
+			nlog.Infoln(goi.t.String(), "EC-recovered", goi.lom.Cname())
 			return
 		}
-		err = cmn.NewErrFailedTo(goi.t, "load EC-recovered", goi.lom, ecErr)
+		err = cmn.NewErrFailedTo(goi.t, "load EC-recovered", goi.lom.Cname(), ecErr)
+		nlog.Errorln(ecErr)
 	} else if ecErr != ec.ErrorECDisabled {
-		err = cmn.NewErrFailedTo(goi.t, "EC-recover", goi.lom, ecErr)
+		err = cmn.NewErrFailedTo(goi.t, "EC-recover", goi.lom.Cname(), ecErr)
 		if cmn.IsErrCapExceeded(ecErr) {
-			errCode = http.StatusInsufficientStorage
+			ecode = http.StatusInsufficientStorage
 		}
 		return
 	}
 
 	if err != nil {
-		err = cmn.NewErrFailedTo(goi.t, "goi-restore-any", goi.lom, err)
+		if _, ok := err.(*cmn.ErrFailedTo); !ok {
+			err = cmn.NewErrFailedTo(goi.t, "goi-restore-any", goi.lom.Cname(), err)
+		}
 	} else {
 		err = cos.NewErrNotFound(goi.t, goi.lom.Cname())
 	}
-	errCode = http.StatusNotFound
+	ecode = http.StatusNotFound
 	return
 }
 
@@ -956,147 +983,191 @@ func (goi *getOI) getFromNeighbor(lom *core.LOM, tsi *meta.Snode) bool {
 		poi.atime = lom.ObjAttrs().Atime
 		poi.cksumToUse = cksumToUse
 	}
-	errCode, erp := poi.putObject()
+	ecode, erp := poi.putObject()
 	freePOI(poi)
 	if erp == nil {
 		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
-			nlog.Infof("%s: gfn %s <= %s", goi.t, goi.lom, tsi)
+			nlog.Infoln(goi.t.String(), "gfn", goi.lom.String(), "<=", tsi.StringEx())
 		}
 		return true
 	}
-	nlog.Errorf("%s: gfn-GET failed to PUT locally: %v(%d)", goi.t, erp, errCode)
+	nlog.Errorf("%s: gfn-GET failed to PUT locally: %v(%d)", goi.t, erp, ecode)
 	return false
 }
 
-func (goi *getOI) finalize() (errCode int, err error) {
+func (goi *getOI) txfini() (ecode int, err error) {
 	var (
 		lmfh *os.File
 		hrng *htrange
 		fqn  = goi.lom.FQN
+		dpq  = goi.dpq
 	)
-	if !goi.cold && !goi.isGFN {
+	if !goi.cold && !dpq.isGFN && !goi.lom.IsChunked() {
 		fqn = goi.lom.LBGet() // best-effort GET load balancing (see also mirror.findLeastUtilized())
 	}
+	// open
+	// TODO -- FIXME: use lom.Open() instead of os.Open(); TestECChecksum
 	lmfh, err = os.Open(fqn)
 	if err != nil {
 		if os.IsNotExist(err) {
-			errCode = http.StatusNotFound
-			goi.retry = true // (!lom.IsAIS() || lom.ECEnabled() || GFN...)
+			// NOTE: retry only once and only when ec-enabled - see goi.restoreFromAny()
+			ecode = http.StatusNotFound
+			goi.retry = goi.lom.ECEnabled()
 		} else {
-			goi.t.fsErr(err, fqn)
-			errCode = http.StatusInternalServerError
-			err = cmn.NewErrFailedTo(goi.t, "goi-finalize", goi.lom, err, errCode)
+			goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
+			ecode = http.StatusInternalServerError
+			err = cmn.NewErrFailedTo(goi.t, "goi-finalize", goi.lom.Cname(), err, ecode)
 		}
-		return
+		return ecode, err
 	}
 
-	hdr := goi.w.Header()
-	if goi.ranges.Range != "" {
-		rsize := goi.lom.SizeBytes()
+	whdr := goi.w.Header()
+
+	// transmit (range, arch, regular)
+	switch {
+	case goi.ranges.Range != "":
+		debug.Assert(!dpq.isArch())
+		rsize := goi.lom.Lsize()
 		if goi.ranges.Size > 0 {
 			rsize = goi.ranges.Size
 		}
-		if hrng, errCode, err = goi.parseRange(hdr, rsize); err != nil {
-			goto ret
+		if hrng, ecode, err = goi.rngToHeader(whdr, rsize); err != nil {
+			break
 		}
-		if goi.archive.filename != "" {
-			err = cmn.NewErrUnsupp("range-read archived file", goi.archive.filename)
-			errCode = http.StatusRequestedRangeNotSatisfiable
-			goto ret
+		err = goi._txrng(fqn, lmfh, whdr, hrng)
+	case dpq.isArch():
+		err = goi._txarch(fqn, lmfh, whdr)
+	default:
+		err = goi._txreg(fqn, lmfh, whdr)
+	}
+
+	cos.Close(lmfh)
+	return ecode, err
+}
+
+func (goi *getOI) _txrng(fqn string, lmfh *os.File, whdr http.Header, hrng *htrange) (err error) {
+	var (
+		r     io.Reader
+		lom   = goi.lom
+		sgl   *memsys.SGL
+		cksum = lom.Checksum()
+		size  int64
+	)
+	ckconf := lom.CksumConf()
+	cksumRange := ckconf.Type != cos.ChecksumNone && ckconf.EnableReadRange
+	size = hrng.Length
+	r = io.NewSectionReader(lmfh, hrng.Start, hrng.Length)
+	if cksumRange {
+		sgl = goi.t.gmm.NewSGL(size)
+		_, cksumH, err := cos.CopyAndChecksum(sgl /*as ReaderFrom*/, r, nil, ckconf.Type)
+		if err != nil {
+			sgl.Free()
+			goi.isIOErr = true
+			return err
+		}
+		r = sgl
+		if cksumH != nil {
+			cksum = &cksumH.Cksum
 		}
 	}
-	errCode, err = goi.fini(fqn, lmfh, hdr, hrng)
-ret:
-	cos.Close(lmfh)
-	return
+
+	// set response header
+	whdr.Set(cos.HdrContentType, cos.ContentBinary)
+	cmn.ToHeader(lom.ObjAttrs(), whdr, size, cksum)
+
+	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.DefaultBuf2Size))
+	err = goi.transmit(r, buf, fqn)
+	slab.Free(buf)
+	if sgl != nil {
+		sgl.Free()
+	}
+	return err
 }
 
 // in particular, setup reader and writer and set headers
-func (goi *getOI) fini(fqn string, lmfh *os.File, hdr http.Header, hrng *htrange) (errCode int, err error) {
+func (goi *getOI) _txreg(fqn string, lmfh *os.File, whdr http.Header) (err error) {
 	var (
-		size   int64
-		reader io.Reader = lmfh
+		dpq   = goi.dpq
+		lom   = goi.lom
+		cksum = lom.Checksum()
+		size  = lom.Lsize()
 	)
-	cmn.ToHeader(goi.lom.ObjAttrs(), hdr) // (defaults)
-	if goi.isS3 {
-		s3.SetEtag(hdr, goi.lom)
+	// set response header
+	whdr.Set(cos.HdrContentType, cos.ContentBinary)
+	cmn.ToHeader(lom.ObjAttrs(), whdr, size, cksum)
+	if dpq.isS3 {
+		// (expecting user to set bucket checksum = md5)
+		s3.SetEtag(whdr, lom)
 	}
-	switch {
-	case goi.archive.filename != "": // archive
-		var (
-			mime string
-			ar   archive.Reader
-			csl  cos.ReadCloseSizer
-		)
-		mime, err = archive.MimeFile(lmfh, goi.t.smm, goi.archive.mime, goi.lom.ObjName)
+
+	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.DefaultBuf2Size))
+	err = goi.transmit(lmfh, buf, fqn)
+	slab.Free(buf)
+	return err
+}
+
+// TODO: checksum
+func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
+	var (
+		ar  archive.Reader
+		dpq = goi.dpq
+		lom = goi.lom
+	)
+	mime, err := archive.MimeFile(lmfh, goi.t.smm, dpq.arch.mime, lom.ObjName)
+	if err != nil {
+		return err
+	}
+	ar, err = archive.NewReader(mime, lmfh, lom.Lsize())
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", lom.Cname(), err)
+	}
+
+	// single
+	if dpq.arch.path != "" {
+		debug.Assert(dpq.arch.mmode == "", dpq.arch.mmode)
+		var csl cos.ReadCloseSizer
+		csl, err = ar.ReadOne(dpq.arch.path)
 		if err != nil {
-			return
-		}
-		ar, err = archive.NewReader(mime, lmfh, goi.lom.SizeBytes())
-		if err != nil {
-			return 0, fmt.Errorf("failed to open %s: %w", goi.lom.Cname(), err)
-		}
-		csl, err = ar.Range(goi.archive.filename, nil)
-		if err != nil {
-			err = cmn.NewErrFailedTo(goi.t, "extract "+goi.archive.filename+" from", goi.lom, err)
-			return
+			goi.isIOErr = true
+			return cmn.NewErrFailedTo(goi.t, "extract "+dpq._archstr()+" from", lom.Cname(), err)
 		}
 		if csl == nil {
-			return http.StatusNotFound,
-				cos.NewErrNotFound(goi.t, goi.archive.filename+" in "+goi.lom.Cname())
+			return cos.NewErrNotFound(goi.t, dpq._archstr()+" in "+lom.Cname())
 		}
 		// found
-		defer func() {
-			csl.Close()
-		}()
-		reader, size = csl, csl.Size()
-		hdr.Del(apc.HdrObjCksumVal)
-		hdr.Del(apc.HdrObjCksumType)
-		hdr.Set(apc.HdrArchmime, mime)
-		hdr.Set(apc.HdrArchpath, goi.archive.filename)
-	case hrng != nil: // range
-		ckconf := goi.lom.CksumConf()
-		cksumRange := ckconf.Type != cos.ChecksumNone && ckconf.EnableReadRange
-		size = hrng.Length
-		reader = io.NewSectionReader(lmfh, hrng.Start, hrng.Length)
-		if cksumRange {
-			var (
-				cksum *cos.CksumHash
-				sgl   = goi.t.gmm.NewSGL(size)
-			)
-			_, cksum, err = cos.CopyAndChecksum(sgl /*as ReaderFrom*/, reader, nil, ckconf.Type)
-			if err != nil {
-				sgl.Free()
-				return
-			}
-			hdr.Set(apc.HdrObjCksumVal, cksum.Value())
-			hdr.Set(apc.HdrObjCksumType, ckconf.Type)
-			reader = sgl
-			defer func() {
-				sgl.Free()
-			}()
-		}
-	default:
-		size = goi.lom.SizeBytes()
+		whdr.Set(cos.HdrContentType, cos.ContentBinary)
+		buf, slab := goi.t.gmm.AllocSize(min(csl.Size(), memsys.DefaultBuf2Size))
+		err = goi.transmit(csl, buf, fqn)
+		slab.Free(buf)
+		csl.Close()
+		return err
 	}
 
-	hdr.Set(cos.HdrContentLength, strconv.FormatInt(size, 10))
-	hdr.Set(cos.HdrContentType, cos.ContentBinary)
-
-	buf, slab := goi.t.gmm.AllocSize(min(size, 64*cos.KiB))
-	err = goi.transmit(reader, buf, fqn)
-	slab.Free(buf)
-
-	return
+	// multi match; writing & streaming tar =>(directly)=> response writer
+	debug.Assert(dpq.arch.mmode != "")
+	rcb := _newRcb(goi.w)
+	whdr.Set(cos.HdrContentType, cos.ContentTar)
+	err = ar.ReadUntil(rcb, dpq.arch.regx, dpq.arch.mmode)
+	if err != nil {
+		goi.isIOErr = true
+		err = cmn.NewErrFailedTo(goi.t, "extract files that match "+dpq._archstr()+" from", lom.Cname(), err)
+	}
+	if err == nil && rcb.num == 0 {
+		// none found
+		return cos.NewErrNotFound(goi.t, dpq._archstr()+" in "+lom.Cname())
+	}
+	rcb.fini()
+	return err
 }
 
 func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string) error {
 	written, err := cos.CopyBuffer(goi.w, r, buf)
 	if err != nil {
-		if !cos.IsRetriableConnErr(err) {
-			goi.t.fsErr(err, fqn)
+		if !cos.IsRetriableConnErr(err) || cmn.Rom.FastV(5, cos.SmoduleAIS) {
+			nlog.Warningln("failed to GET (Tx)", goi.lom.Cname(), err)
+			goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
 		}
-		nlog.Errorln(cmn.NewErrFailedTo(goi.t, "GET", fqn, err))
+
 		// at this point, error is already written into the response -
 		// return special code to indicate just that
 		return errSendingResp
@@ -1104,8 +1175,10 @@ func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string) error {
 	// Update objects sent during GFN. Thanks to this we will not
 	// have to resend them in rebalance. In case of a race between rebalance
 	// and GFN the former wins, resulting in duplicated transmission.
-	if goi.isGFN {
-		goi.t.reb.FilterAdd(cos.UnsafeB(goi.lom.Uname()))
+	if goi.dpq.isGFN {
+		uname := goi.lom.UnamePtr()
+		bname := cos.UnsafeBptr(uname)
+		goi.t.reb.FilterAdd(*bname)
 	} else if !goi.cold { // GFN & cold-GET: must be already loaded w/ atime set
 		if err := goi.lom.Load(false /*cache it*/, true /*locked*/); err != nil {
 			nlog.Errorf("%s: GET post-transmission failure: %v", goi.t, err)
@@ -1122,21 +1195,42 @@ func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string) error {
 }
 
 func (goi *getOI) stats(written int64) {
+	delta := mono.SinceNano(goi.ltime)
 	goi.t.statsT.AddMany(
 		cos.NamedVal64{Name: stats.GetCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetThroughput, Value: written},                // vis-à-vis user (as written m.b. range)
-		cos.NamedVal64{Name: stats.GetLatency, Value: mono.SinceNano(goi.ltime)}, // see also: stats.GetColdRwLatency
+		cos.NamedVal64{Name: stats.GetSize, Value: written},
+		cos.NamedVal64{Name: stats.GetThroughput, Value: written}, // vis-à-vis user (as written m.b. range)
+		cos.NamedVal64{Name: stats.GetLatency, Value: delta},      // see also: per-backend *LatencyTotal below
+		cos.NamedVal64{Name: stats.GetLatencyTotal, Value: delta}, // ditto
 	)
 	if goi.verchanged {
 		goi.t.statsT.AddMany(
 			cos.NamedVal64{Name: stats.VerChangeCount, Value: 1},
-			cos.NamedVal64{Name: stats.VerChangeSize, Value: goi.lom.SizeBytes()},
+			cos.NamedVal64{Name: stats.VerChangeSize, Value: goi.lom.Lsize()},
 		)
+	}
+
+	if goi.rltime > 0 {
+		bck := goi.lom.Bck()
+		backend := goi.t.Backend(bck)
+		goi.t.statsT.AddMany(
+			cos.NamedVal64{Name: backend.MetricName(stats.GetCount), Value: 1},
+			cos.NamedVal64{Name: backend.MetricName(stats.GetE2ELatencyTotal), Value: delta},
+			cos.NamedVal64{Name: backend.MetricName(stats.GetLatencyTotal), Value: goi.rltime},
+			cos.NamedVal64{Name: backend.MetricName(stats.GetSize), Value: written},
+		)
+		if goi.verchanged {
+			goi.t.statsT.AddMany(
+				cos.NamedVal64{Name: backend.MetricName(stats.VerChangeCount), Value: 1},
+				cos.NamedVal64{Name: backend.MetricName(stats.VerChangeSize), Value: goi.lom.Lsize()},
+			)
+		}
 	}
 }
 
-// parse & validate user-spec-ed goi.ranges, and set response header
-func (goi *getOI) parseRange(resphdr http.Header, size int64) (hrng *htrange, errCode int, err error) {
+// - parse and validate user specified read range (goi.ranges)
+// - set response header accordingly
+func (goi *getOI) rngToHeader(resphdr http.Header, size int64) (hrng *htrange, ecode int, err error) {
 	var ranges []htrange
 	ranges, err = parseMultiRange(goi.ranges.Range, size)
 	if err != nil {
@@ -1144,7 +1238,7 @@ func (goi *getOI) parseRange(resphdr http.Header, size int64) (hrng *htrange, er
 			// https://datatracker.ietf.org/doc/html/rfc7233#section-4.2
 			resphdr.Set(cos.HdrContentRange, fmt.Sprintf("%s*/%d", cos.HdrContentRangeValPrefix, size))
 		}
-		errCode = http.StatusRequestedRangeNotSatisfiable
+		ecode = http.StatusRequestedRangeNotSatisfiable
 		return
 	}
 	if len(ranges) == 0 {
@@ -1152,12 +1246,12 @@ func (goi *getOI) parseRange(resphdr http.Header, size int64) (hrng *htrange, er
 	}
 	if len(ranges) > 1 {
 		err = cmn.NewErrUnsupp("multi-range read", goi.lom.Cname())
-		errCode = http.StatusRequestedRangeNotSatisfiable
+		ecode = http.StatusRequestedRangeNotSatisfiable
 		return
 	}
-	if goi.archive.filename != "" {
-		err = cmn.NewErrUnsupp("range-read archived file", goi.archive.filename)
-		errCode = http.StatusRequestedRangeNotSatisfiable
+	if goi.dpq.arch.path != "" {
+		err = cmn.NewErrUnsupp("range-read archived file", goi.dpq.arch.path)
+		ecode = http.StatusRequestedRangeNotSatisfiable
 		return
 	}
 
@@ -1174,7 +1268,7 @@ func (goi *getOI) parseRange(resphdr http.Header, size int64) (hrng *htrange, er
 // - to an existing object, if exists
 //
 
-func (a *apndOI) do(r *http.Request) (packedHdl string, errCode int, err error) {
+func (a *apndOI) do(r *http.Request) (packedHdl string, ecode int, err error) {
 	var (
 		cksumValue    = r.Header.Get(apc.HdrObjCksumVal)
 		cksumType     = r.Header.Get(apc.HdrObjCksumType)
@@ -1192,21 +1286,21 @@ func (a *apndOI) do(r *http.Request) (packedHdl string, errCode int, err error) 
 	switch a.op {
 	case apc.AppendOp:
 		buf, slab := a.t.gmm.Alloc()
-		packedHdl, errCode, err = a.apnd(buf)
+		packedHdl, ecode, err = a.apnd(buf)
 		slab.Free(buf)
 	case apc.FlushOp:
-		errCode, err = a.flush()
+		ecode, err = a.flush()
 	default:
 		err = fmt.Errorf("invalid operation %q (expecting either %q or %q) - check %q query",
 			a.op, apc.AppendOp, apc.FlushOp, apc.QparamAppendType)
 	}
 
-	return packedHdl, errCode, err
+	return packedHdl, ecode, err
 }
 
-func (a *apndOI) apnd(buf []byte) (packedHdl string, errCode int, err error) {
+func (a *apndOI) apnd(buf []byte) (packedHdl string, ecode int, err error) {
 	var (
-		fh      *os.File
+		fh      cos.LomWriter
 		workFQN = a.hdl.workFQN
 	)
 	if workFQN == "" {
@@ -1216,21 +1310,21 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, errCode int, err error) {
 			_, a.hdl.partialCksum, err = cos.CopyFile(a.lom.FQN, workFQN, buf, a.lom.CksumType())
 			a.lom.Unlock(false)
 			if err != nil {
-				errCode = http.StatusInternalServerError
+				ecode = http.StatusInternalServerError
 				return
 			}
-			fh, err = os.OpenFile(workFQN, os.O_APPEND|os.O_WRONLY, cos.PermRWR)
+			fh, err = a.lom.AppendWork(workFQN)
 		} else {
 			a.lom.Unlock(false)
 			a.hdl.partialCksum = cos.NewCksumHash(a.lom.CksumType())
-			fh, err = a.lom.CreateFile(workFQN)
+			fh, err = a.lom.CreateWork(workFQN)
 		}
 	} else {
-		fh, err = os.OpenFile(workFQN, os.O_APPEND|os.O_WRONLY, cos.PermRWR)
+		fh, err = a.lom.AppendWork(workFQN)
 		debug.Assert(a.hdl.partialCksum != nil)
 	}
 	if err != nil { // failed to open or create
-		errCode = http.StatusInternalServerError
+		ecode = http.StatusInternalServerError
 		return
 	}
 
@@ -1238,7 +1332,7 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, errCode int, err error) {
 	_, err = cos.CopyBuffer(w, a.r, buf)
 	cos.Close(fh)
 	if err != nil {
-		errCode = http.StatusInternalServerError
+		ecode = http.StatusInternalServerError
 		return
 	}
 
@@ -1251,7 +1345,7 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, errCode int, err error) {
 		cos.NamedVal64{Name: stats.AppendLatency, Value: lat},
 	)
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		nlog.Infof("APPEND %s: %s", a.lom, lat)
+		nlog.Infoln("APPEND", a.lom.String(), time.Duration(lat))
 	}
 	return
 }
@@ -1346,9 +1440,9 @@ func (coi *copyOI) do(t *target, dm *bundle.DataMover, lom *core.LOM) (size int6
 		return 0, err
 	}
 	if coi.DP != nil {
-		var errCode int
-		size, errCode, err = coi._reader(t, dm, lom, dst)
-		debug.Assert(errCode != http.StatusNotFound || cos.IsNotExist(err, 0), err, errCode)
+		var ecode int
+		size, ecode, err = coi._reader(t, dm, lom, dst)
+		debug.Assert(ecode != http.StatusNotFound || cos.IsNotExist(err, 0), err, ecode)
 	} else {
 		size, err = coi._regular(t, lom, dst)
 	}
@@ -1359,8 +1453,9 @@ func (coi *copyOI) do(t *target, dm *bundle.DataMover, lom *core.LOM) (size int6
 
 func (coi *copyOI) _dryRun(lom *core.LOM, objnameTo string) (size int64, err error) {
 	if coi.DP == nil {
-		if lom.Uname() != coi.BckTo.MakeUname(objnameTo) {
-			size = lom.SizeBytes()
+		uname := coi.BckTo.MakeUname(objnameTo)
+		if lom.Uname() != cos.UnsafeS(uname) {
+			size = lom.Lsize()
 		}
 		return size, nil
 	}
@@ -1393,7 +1488,7 @@ func (coi *copyOI) _reader(t *target, dm *bundle.DataMover, lom, dst *core.LOM) 
 		return 0, 0, errN
 	}
 	if lom.Bck().Equal(coi.BckTo, true, true) {
-		dst.SetVersion(oah.Version())
+		dst.CopyVersion(oah)
 	}
 
 	poi := allocPOI()
@@ -1411,13 +1506,13 @@ func (coi *copyOI) _reader(t *target, dm *bundle.DataMover, lom, dst *core.LOM) 
 	if dm != nil {
 		poi.owt = dm.OWT() // (compare with _send)
 	}
-	errCode, err := poi.putObject()
+	ecode, err := poi.putObject()
 	freePOI(poi)
 	if err == nil {
 		// xaction stats: inc locally processed (and see data mover for in and out objs)
-		size = oah.SizeBytes()
+		size = oah.Lsize()
 	}
-	return size, errCode, err
+	return size, ecode, err
 }
 
 func (coi *copyOI) _regular(t *target, lom, dst *core.LOM) (size int64, _ error) {
@@ -1430,7 +1525,7 @@ func (coi *copyOI) _regular(t *target, lom, dst *core.LOM) (size int64, _ error)
 
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
 		if !cos.IsNotExist(err, 0) {
-			err = cmn.NewErrFailedTo(t, "coi-load", lom, err)
+			err = cmn.NewErrFailedTo(t, "coi-load", lom.Cname(), err)
 		}
 		return 0, err
 	}
@@ -1449,7 +1544,7 @@ func (coi *copyOI) _regular(t *target, lom, dst *core.LOM) (size int64, _ error)
 	}
 	dst2, err := lom.Copy2FQN(dst.FQN, coi.Buf)
 	if err == nil {
-		size = lom.SizeBytes()
+		size = lom.Lsize()
 		if coi.Finalize {
 			t.putMirror(dst2)
 		}
@@ -1498,12 +1593,12 @@ func (coi *copyOI) _send(t *target, lom *core.LOM, sargs *sendArgs) (size int64,
 			if os.IsNotExist(err) {
 				return 0, nil
 			}
-			return 0, cmn.NewErrFailedTo(t, "open", lom.FQN, err)
+			return 0, cmn.NewErrFailedTo(t, "open", lom.Cname(), err)
 		}
 		fi, err := fh.Stat()
 		if err != nil {
 			fh.Close()
-			return 0, cmn.NewErrFailedTo(t, "fstat", lom.FQN, err)
+			return 0, cmn.NewErrFailedTo(t, "fstat", lom.Cname(), err)
 		}
 		size = fi.Size()
 		sargs.reader, sargs.objAttrs = fh, lom
@@ -1519,7 +1614,7 @@ func (coi *copyOI) _send(t *target, lom *core.LOM, sargs *sendArgs) (size int64,
 		if err != nil {
 			return 0, err
 		}
-		size = lom.SizeBytes()
+		size = lom.Lsize()
 		sargs.reader, sargs.objAttrs = reader, lom
 	default:
 		// 3. DP transform (possibly, no-op)
@@ -1529,7 +1624,7 @@ func (coi *copyOI) _send(t *target, lom *core.LOM, sargs *sendArgs) (size int64,
 			return
 		}
 		// returns cos.ContentLengthUnknown (-1) if post-transform size is unknown
-		size = oah.SizeBytes()
+		size = oah.Lsize()
 		sargs.reader, sargs.objAttrs = reader, oah
 	}
 
@@ -1569,7 +1664,7 @@ func (coi *copyOI) put(t *target, sargs *sendArgs) error {
 		hdr   = make(http.Header, 8)
 		query = sargs.bckTo.NewQuery()
 	)
-	cmn.ToHeader(sargs.objAttrs, hdr)
+	cmn.ToHeader(sargs.objAttrs, hdr, sargs.objAttrs.Lsize(true))
 	hdr.Set(apc.HdrT2TPutterID, t.SID())
 	query.Set(apc.QparamOWT, sargs.owt.ToS())
 	if coi.Xact != nil {
@@ -1614,20 +1709,21 @@ func (a *putA2I) do() (int, error) {
 	}
 	// standard library does not support appending to tgz, zip, and such;
 	// for TAR there is an optimizing workaround not requiring a full copy
-	if a.mime == archive.ExtTar && !a.put {
+	if a.mime == archive.ExtTar && !a.put /*append*/ && !a.lom.IsChunked() {
 		var (
 			err       error
 			fh        *os.File
+			offset    int64
 			size      int64
 			tarFormat tar.Format
 			workFQN   = fs.CSM.Gen(a.lom, fs.WorkfileType, fs.WorkfileAppendToArch)
 		)
-		if err = os.Rename(a.lom.FQN, workFQN); err != nil {
+		if err = a.lom.RenameMainTo(workFQN); err != nil {
 			return http.StatusInternalServerError, err
 		}
-		fh, tarFormat, err = archive.OpenTarSeekEnd(a.lom.Cname(), workFQN)
+		fh, tarFormat, offset, err = archive.OpenTarForAppend(a.lom.Cname(), workFQN)
 		if err != nil {
-			if errV := a.lom.RenameFrom(workFQN); errV != nil {
+			if errV := a.lom.RenameToMain(workFQN); errV != nil {
 				return http.StatusInternalServerError, errV
 			}
 			if err == archive.ErrTarIsEmpty {
@@ -1637,13 +1733,12 @@ func (a *putA2I) do() (int, error) {
 			return http.StatusInternalServerError, err
 		}
 		// do - fast
-		if size, err = a.fast(fh, tarFormat); err == nil {
-			// NOTE: checksum traded off
+		if size, err = a.fast(fh, tarFormat, offset); err == nil {
+			// TODO: checksum NIY
 			if err = a.finalize(size, cos.NoneCksum, workFQN); err == nil {
 				return http.StatusInternalServerError, nil // ok
 			}
-		}
-		if errV := a.lom.RenameFrom(workFQN); errV != nil {
+		} else if errV := a.lom.RenameToMain(workFQN); errV != nil {
 			nlog.Errorf(fmtNested, a.t, err, "append and rename back", workFQN, errV)
 		}
 		return http.StatusInternalServerError, err
@@ -1651,11 +1746,12 @@ func (a *putA2I) do() (int, error) {
 
 cpap: // copy + append
 	var (
-		err       error
-		lmfh, wfh *os.File
-		workFQN   string
-		cksum     cos.CksumHashSize
-		aw        archive.Writer
+		err     error
+		wfh     *os.File
+		lmfh    cos.LomReader
+		workFQN string
+		cksum   cos.CksumHashSize
+		aw      archive.Writer
 	)
 	workFQN = fs.CSM.Gen(a.lom, fs.WorkfileType, fs.WorkfileAppendToArch)
 	wfh, err = os.OpenFile(workFQN, os.O_CREATE|os.O_WRONLY, cos.PermRWR)
@@ -1672,14 +1768,14 @@ cpap: // copy + append
 		aw.Fini()
 	} else {
 		// copy + append
-		lmfh, err = os.Open(a.lom.FQN)
+		lmfh, err = a.lom.Open()
 		if err != nil {
 			cos.Close(wfh)
 			return http.StatusNotFound, err
 		}
 		cksum.Init(a.lom.CksumType())
 		aw = archive.NewWriter(a.mime, wfh, &cksum, nil)
-		err = aw.Copy(lmfh, a.lom.SizeBytes())
+		err = aw.Copy(lmfh, a.lom.Lsize())
 		if err == nil {
 			err = aw.Write(a.filename, oah, a.r)
 		}
@@ -1699,7 +1795,7 @@ cpap: // copy + append
 }
 
 // TAR only - fast & direct
-func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format) (size int64, err error) {
+func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format, offset int64) (size int64, err error) {
 	var (
 		buf, slab = a.t.gmm.AllocSize(a.size)
 		tw        = tar.NewWriter(rwfh)
@@ -1717,6 +1813,7 @@ func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format) (size int64, err erro
 	cos.Close(tw)
 	if err == nil {
 		size, err = rwfh.Seek(0, io.SeekCurrent)
+		debug.Assert(err != nil || size > offset, size, " vs ", offset)
 	}
 	slab.Free(buf)
 	cos.Close(rwfh)
@@ -1724,11 +1821,11 @@ func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format) (size int64, err erro
 }
 
 func (*putA2I) reterr(err error) (int, error) {
-	errCode := http.StatusInternalServerError
+	ecode := http.StatusInternalServerError
 	if cmn.IsErrCapExceeded(err) {
-		errCode = http.StatusInsufficientStorage
+		ecode = http.StatusInsufficientStorage
 	}
-	return errCode, err
+	return ecode, err
 }
 
 func (a *putA2I) finalize(size int64, cksum *cos.Cksum, fqn string) error {
@@ -1738,7 +1835,7 @@ func (a *putA2I) finalize(size int64, cksum *cos.Cksum, fqn string) error {
 		debug.Assertf(finfo.Size() == size, "%d != %d", finfo.Size(), size)
 	})
 	// done
-	if err := a.lom.RenameFrom(fqn); err != nil {
+	if err := a.lom.RenameFinalize(fqn); err != nil {
 		return err
 	}
 	a.lom.SetSize(size)
@@ -1747,7 +1844,7 @@ func (a *putA2I) finalize(size int64, cksum *cos.Cksum, fqn string) error {
 	if err := a.lom.Persist(); err != nil {
 		return err
 	}
-	if a.lom.Bprops().EC.Enabled {
+	if a.lom.ECEnabled() {
 		if err := ec.ECM.EncodeObject(a.lom, nil); err != nil && err != ec.ErrorECDisabled {
 			return err
 		}
@@ -1786,6 +1883,45 @@ func (t *target) putMirror(lom *core.LOM) {
 	xctn := rns.Entry.Get()
 	xputlrep := xctn.(*mirror.XactPut)
 	xputlrep.Repl(lom)
+}
+
+// TODO:
+// - CopyBuffer
+// - currently, only tar - add message pack (what else?)
+// - Call(..., *tar.Header) to avoid typecast
+
+type rcbCtx struct {
+	w   io.Writer
+	tw  *tar.Writer
+	num int
+}
+
+var _ archive.ArchRCB = (*rcbCtx)(nil)
+
+func _newRcb(w io.Writer) (c *rcbCtx) {
+	c = &rcbCtx{w: w}
+	return c
+}
+
+func (c *rcbCtx) Call(_ string, reader cos.ReadCloseSizer, hdr any) (_ bool /*stop*/, err error) {
+	if c.tw == nil {
+		debug.Assert(c.num == 0)
+		c.tw = tar.NewWriter(c.w)
+	}
+	c.num++
+	tarHdr, ok := hdr.(*tar.Header)
+	debug.Assert(ok)
+	if err = c.tw.WriteHeader(tarHdr); err == nil {
+		_, err = io.Copy(c.tw, reader)
+	}
+	return false, err
+}
+
+func (c *rcbCtx) fini() {
+	if c.tw != nil {
+		debug.Assert(c.num > 0)
+		c.tw.Close()
+	}
 }
 
 //

@@ -45,25 +45,59 @@ Here's a couple quick usage examples:
 # show `ais config` subcommands:
 $ ais config <TAB-TAB>
 cli    cluster    node    reset    show
+```
 
+```console
 # select `cluster` configuration and see usage and options
 $ ais config cluster --help
+```
 
+```console
 # show the entire cluster configuration in JSON
 $ ais config cluster --json
+```
 
+```console
 # show one selected section (e.g., checksum) from the cluster config
 $ ais config cluster checksum
+```
 
+```console
 # update one value (e.g., checksum type)
 $ ais config cluster checksum=md5
 
-# using JSON-formatted values, update backend configuration;
-# for supported backend providers, see docs/providers.md
-$ ais config cluster backend.conf='{"gcp":{}, "aws":{}}'
+# same using JSON-formatted values, update backend configuration;
+$ ais config cluster checksum.type='{"type":"md5"}'
+```
 
-# e.g., to remove all backends, run:
-# ais config cluster backend.conf='{}'
+More cluster-config-updating examples:
+
+```console
+$ ais config cluster log.level 4
+PROPERTY         VALUE
+log.level        4
+log.max_size     4MiB
+log.max_total    128MiB
+log.flush_time   40s
+log.stats_time   1m
+log.to_stderr    false
+
+Cluster config updated
+
+$ ais config cluster log.modules <TAB-TAB>
+transport    memsys       fs           ec           ios          backend      mirror       downloader   s3
+ais          cluster      reb          stats        xs           space        dsort        etl          none
+
+$ ais config cluster log.modules space,s3
+PROPERTY         VALUE
+log.level        4 (modules: space,s3)
+log.max_size     4MiB
+log.max_total    128MiB
+log.flush_time   40s
+log.stats_time   1m
+log.to_stderr    false
+
+Cluster config updated
 ```
 
 > **Notice** single quotes above. Single or double quotes are required when the value contains spaces and/or wildcards. But single quotes, in particular, are strongly recommended when the value itself contains double quotes.
@@ -387,15 +421,26 @@ If `--path` is set, display only the path to the CLI configuration file.
 ```console
 $ ais config cli show
 PROPERTY                         VALUE
-aliases                          map[get:object get ls:bucket ls put:object put]
-auth.url                         http://127.0.0.1:52001
-cluster.default_ais_host         http://127.0.0.1:8080
-cluster.default_docker_host      http://172.50.0.2:8080
-cluster.skip_verify_crt          false
-cluster.url                      http://127.0.0.1:8080
-default_provider                 ais
-timeout.http_timeout             0s
-timeout.tcp_timeout              60s
+aliases				 cp => 'bucket cp'; create => 'bucket create'; evict => 'bucket evict';
+                                 ls => 'bucket ls'; rmb => 'bucket rm'; start => 'job start';
+				 blob-download => 'job start blob-download'; download => 'job start download';
+				 dsort => 'job start dsort'; stop => 'job stop'; wait => 'job wait';
+				 get => 'object get'; prefetch => 'object prefetch'; put => 'object put';
+				 rmo => 'object rm'
+auth.url			 http://127.0.0.1:52001
+cluster.client_ca_tls
+cluster.client_crt
+cluster.client_crt_key
+cluster.default_ais_host	 http://127.0.0.1:8080
+cluster.default_docker_host	 http://172.50.0.2:8080
+cluster.skip_verify_crt		 false
+cluster.url			 http://127.0.0.1:8080
+default_provider		 ais
+no_color			 false
+no_more				 false
+timeout.http_timeout		 0s
+timeout.tcp_timeout		 60s
+verbose				 false
 
 $ ais config cli show --path
 /home/user/.ais/cli/cli.json
@@ -420,20 +465,38 @@ $ ais config cli show --json
         "url": "http://127.0.0.1:8080",
         "default_ais_host": "http://127.0.0.1:8080",
         "default_docker_host": "http://172.50.0.2:8080",
+        "client_crt": "",
+        "client_crt_key": "",
+        "client_ca_tls": "",
         "skip_verify_crt": false
     },
     "timeout": {
-        "tcp_timeout": "61s",
+        "tcp_timeout": "60s",
         "http_timeout": "0s"
     },
     "auth": {
         "url": "http://127.0.0.1:52001"
     },
     "aliases": {
-        "get": "object get",
+        "wait": "job wait",
+        "cp": "bucket cp",
         "ls": "bucket ls",
-        "put": "object put"
+        "prefetch": "object prefetch",
+        "rmo": "object rm",
+        "dsort": "job start dsort",
+        "get": "object get",
+        "rmb": "bucket rm",
+        "start": "job start",
+        "put": "object put",
+        "stop": "job stop",
+        "blob-download": "job start blob-download",
+        "create": "bucket create",
+        "download": "job start download",
+        "evict": "bucket evict"
     },
-    "default_provider": "ais"
+    "default_provider": "ais",
+    "no_color": false,
+    "verbose": false,
+    "no_more": false
 }
 ```

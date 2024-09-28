@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -76,6 +76,8 @@ type ioContext struct {
 
 	numGetErrs atomic.Uint64
 	numPutErrs int
+
+	objIdx int // Used in `m.nextObjName`
 }
 
 func (m *ioContext) initAndSaveState(cleanup bool) {
@@ -293,7 +295,7 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 	p, err := api.HeadBucket(baseParams, m.bck, false /* don't add */)
 	tassert.CheckFatal(m.t, err)
 
-	for i := 0; i < objCnt; i++ {
+	for i := range objCnt {
 		r, err := readers.NewRand(int64(m.fileSize), p.Cksum.Type)
 		tassert.CheckFatal(m.t, err)
 
@@ -358,7 +360,7 @@ func (m *ioContext) remotePrefetch(prefetchCnt int) {
 		}
 
 		wg.Add(1)
-		go func(obj *cmn.LsoEntry) {
+		go func(obj *cmn.LsoEnt) {
 			_, err := api.GetObject(baseParams, m.bck, obj.Name, nil)
 			tassert.CheckError(m.t, err)
 			wg.Done()
@@ -452,7 +454,7 @@ func (m *ioContext) del(opts ...int) {
 			break
 		}
 		wg.Add(1)
-		go func(obj *cmn.LsoEntry) {
+		go func(obj *cmn.LsoEnt) {
 			m._delOne(baseParams, obj, &errCnt)
 			wg.Done()
 		}(obj)
@@ -460,7 +462,7 @@ func (m *ioContext) del(opts ...int) {
 	wg.Wait()
 }
 
-func (m *ioContext) _delOne(baseParams api.BaseParams, obj *cmn.LsoEntry, errCnt *atomic.Int64) {
+func (m *ioContext) _delOne(baseParams api.BaseParams, obj *cmn.LsoEnt, errCnt *atomic.Int64) {
 	err := api.DeleteObject(baseParams, m.bck, obj.Name)
 	if err == nil {
 		return
@@ -531,7 +533,7 @@ func (m *ioContext) get(baseParams api.BaseParams, idx, totalGets int, getArgs *
 
 	// Tell other tasks they can begin to do work in parallel
 	if totalGets > 0 && idx == totalGets/2 { // only for `m.gets(nil, false)`
-		for i := 0; i < m.otherTasksToTrigger; i++ {
+		for range m.otherTasksToTrigger {
 			m.controlCh <- struct{}{}
 		}
 	}
@@ -550,7 +552,7 @@ func (m *ioContext) gets(getArgs *api.GetArgs, withValidation bool) {
 		}
 	}
 	wg := cos.NewLimitedWaitGroup(20, 0)
-	for i := 0; i < totalGets; i++ {
+	for i := range totalGets {
 		wg.Add(1)
 		go func(idx int) {
 			m.get(baseParams, idx, totalGets, getArgs, withValidation)
@@ -632,6 +634,16 @@ func (m *ioContext) ensureNumCopies(baseParams api.BaseParams, expectedCopies in
 	}
 }
 
+func (m *ioContext) nextObjName() string {
+	if m.objIdx >= len(m.objNames) {
+		m.t.Fatal("not enough objects to get next object name")
+		return ""
+	}
+	objName := m.objNames[m.objIdx]
+	m.objIdx++
+	return objName
+}
+
 func (m *ioContext) ensureNoGetErrors() {
 	m.t.Helper()
 	if m.numGetErrs.Load() > 0 {
@@ -649,7 +661,7 @@ func ensureNumMountpaths(t *testing.T, target *meta.Snode, mpList *apc.Mountpath
 	baseParams := tools.BaseAPIParams()
 	mpl, err := api.GetMountpaths(baseParams, target)
 	tassert.CheckFatal(t, err)
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		if len(mpl.Available) == len(mpList.Available) &&
 			len(mpl.Disabled) == len(mpList.Disabled) &&
 			len(mpl.WaitingDD) == len(mpList.WaitingDD) {
@@ -668,7 +680,7 @@ func ensureNumMountpaths(t *testing.T, target *meta.Snode, mpList *apc.Mountpath
 
 func ensureNoDisabledMountpaths(t *testing.T, target *meta.Snode, mpList *apc.MountpathList) {
 	t.Helper()
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		if len(mpList.WaitingDD) == 0 && len(mpList.Disabled) == 0 {
 			break
 		}
@@ -734,7 +746,7 @@ func (m *ioContext) stopMaintenance(target *meta.Snode) string {
 
 func (m *ioContext) setNonDefaultBucketProps() {
 	baseParams := tools.BaseAPIParams()
-	copies := int64(rand.Intn(2))
+	copies := int64(rand.IntN(2))
 	props := &cmn.BpropsToSet{
 		Mirror: &cmn.MirrorConfToSet{
 			Enabled: apc.Ptr(copies > 0),
@@ -747,7 +759,7 @@ func (m *ioContext) setNonDefaultBucketProps() {
 			ValidateColdGet: apc.Ptr(false),
 		},
 		Extra: &cmn.ExtraToSet{
-			HDFS: &cmn.ExtraPropsHDFSToSet{RefDirectory: apc.Ptr("/abc")},
+			AWS: &cmn.ExtraPropsAWSToSet{CloudRegion: apc.Ptr("us-notheast")},
 		},
 	}
 	_, err := api.SetBucketProps(baseParams, m.bck, props)
@@ -869,175 +881,6 @@ func runProviderTests(t *testing.T, f func(*testing.T, *meta.Bck)) {
 	}
 }
 
-func numberOfFilesWithPrefix(fileNames []string, namePrefix string) int {
-	numFiles := 0
-	for _, fileName := range fileNames {
-		if strings.HasPrefix(fileName, namePrefix) {
-			numFiles++
-		}
-	}
-	return numFiles
-}
-
-func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType string) []string {
-	const (
-		objCnt   = 100
-		fileSize = cos.KiB
-	)
-
-	// Create specific files to test corner cases.
-	var (
-		extraNames = []string{"dir/obj01", "dir/obj02", "dir/obj03", "dir1/dir2/obj04", "dir1/dir2/obj05"}
-		fileNames  = make([]string, 0, objCnt)
-		wg         = &sync.WaitGroup{}
-		errCh      = make(chan error, objCnt+len(extraNames))
-	)
-
-	for i := 0; i < objCnt; i++ {
-		fileName := trand.String(20)
-		keyName := fmt.Sprintf("%s/%s", prefixDir, fileName)
-
-		// NOTE: Since this test is to test prefix fetch, the reader type is ignored, always use rand reader.
-		r, err := readers.NewRand(fileSize, cksumType)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tools.Put(proxyURL, bck, keyName, r, errCh)
-		}()
-		fileNames = append(fileNames, fileName)
-	}
-
-	for _, fName := range extraNames {
-		keyName := fmt.Sprintf("%s/%s", prefixDir, fName)
-		// NOTE: Since this test is to test prefix fetch, the reader type is ignored, always use rand reader.
-		r, err := readers.NewRand(fileSize, cksumType)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tools.Put(proxyURL, bck, keyName, r, errCh)
-		}()
-		fileNames = append(fileNames, fName)
-	}
-
-	wg.Wait()
-	tassert.SelectErr(t, errCh, "put", false)
-	return fileNames
-}
-
-func prefixLookupDefault(t *testing.T, proxyURL string, bck cmn.Bck, fileNames []string) {
-	tlog.Logf("Looking up for files in alphabetic order\n")
-
-	var (
-		letters    = "abcdefghijklmnopqrstuvwxyz"
-		baseParams = tools.BaseAPIParams(proxyURL)
-	)
-	for i := 0; i < len(letters); i++ {
-		key := letters[i : i+1]
-		lookFor := fmt.Sprintf("%s/%s", prefixDir, key)
-		msg := &apc.LsoMsg{Prefix: lookFor}
-		objList, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
-		if err != nil {
-			t.Errorf("List files with prefix failed, err = %v", err)
-			return
-		}
-
-		numFiles := len(objList.Entries)
-		realNumFiles := numberOfFilesWithPrefix(fileNames, key)
-
-		if numFiles == realNumFiles {
-			if numFiles != 0 {
-				tlog.Logf("Found %v files starting with %q\n", numFiles, key)
-			}
-		} else {
-			t.Errorf("Expected number of files with prefix %q is %v but found %v files", key, realNumFiles, numFiles)
-			tlog.Logf("Objects returned:\n")
-			for id, oo := range objList.Entries {
-				tlog.Logf("    %d[%d]. %s\n", i, id, oo.Name)
-			}
-		}
-	}
-}
-
-func prefixLookupCornerCases(t *testing.T, proxyURL string, bck cmn.Bck, objNames []string) {
-	tlog.Logf("Testing corner cases\n")
-
-	tests := []struct {
-		title  string
-		prefix string
-	}{
-		{"Entire list (dir)", "dir"},
-		{"dir/", "dir/"},
-		{"dir1", "dir1"},
-		{"dir1/", "dir1/"},
-	}
-	baseParams := tools.BaseAPIParams(proxyURL)
-	for idx, test := range tests {
-		p := fmt.Sprintf("%s/%s", prefixDir, test.prefix)
-
-		objCount := 0
-		for _, objName := range objNames {
-			fullObjName := fmt.Sprintf("%s/%s", prefixDir, objName)
-			if strings.HasPrefix(fullObjName, p) {
-				objCount++
-			}
-		}
-
-		tlog.Logf("%d. Prefix: %s [%s]\n", idx, test.title, p)
-		msg := &apc.LsoMsg{Prefix: p}
-		objList, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
-		if err != nil {
-			t.Errorf("List files with prefix failed, err = %v", err)
-			return
-		}
-
-		if len(objList.Entries) != objCount {
-			t.Errorf("Expected number of objects with prefix %q is %d but found %d",
-				test.prefix, objCount, len(objList.Entries))
-			tlog.Logf("Objects returned:\n")
-			for id, oo := range objList.Entries {
-				tlog.Logf("    %d[%d]. %s\n", idx, id, oo.Name)
-			}
-		}
-	}
-}
-
-func prefixLookup(t *testing.T, proxyURL string, bck cmn.Bck, fileNames []string) {
-	prefixLookupDefault(t, proxyURL, bck, fileNames)
-	prefixLookupCornerCases(t, proxyURL, bck, fileNames)
-}
-
-func prefixCleanup(t *testing.T, proxyURL string, bck cmn.Bck, fileNames []string) {
-	var (
-		wg    = cos.NewLimitedWaitGroup(40, 0)
-		errCh = make(chan error, len(fileNames))
-	)
-
-	for _, fileName := range fileNames {
-		keyName := fmt.Sprintf("%s/%s", prefixDir, fileName)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tools.Del(proxyURL, bck, keyName, nil, errCh, true)
-		}()
-	}
-	wg.Wait()
-
-	select {
-	case e := <-errCh:
-		tlog.Logf("Failed to DEL: %s\n", e)
-		t.Fail()
-	default:
-	}
-}
-
 func initFS() {
 	proxyURL := tools.GetPrimaryURL()
 	primary, err := tools.GetPrimaryProxy(proxyURL)
@@ -1066,7 +909,6 @@ func initMountpaths(t *testing.T, proxyURL string) {
 	fsOnce.Do(initFS)
 	baseParams := tools.BaseAPIParams(proxyURL)
 	fs.TestNew(nil)
-	fs.TestDisableValidation()
 	smap := tools.GetClusterMap(t, proxyURL)
 	for _, target := range smap.Tmap {
 		mpathList, err := api.GetMountpaths(baseParams, target)

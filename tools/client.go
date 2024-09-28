@@ -7,7 +7,6 @@ package tools
 import (
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"path"
 	"strconv"
@@ -88,7 +87,8 @@ func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh 
 
 func CheckObjIsPresent(proxyURL string, bck cmn.Bck, objName string) bool {
 	bp := BaseAPIParams(proxyURL)
-	_, err := api.HeadObject(bp, bck, objName, apc.FltPresent, true /*silent*/)
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent, Silent: true}
+	_, err := api.HeadObject(bp, bck, objName, hargs)
 	return err == nil
 }
 
@@ -124,7 +124,7 @@ func PutObject(t *testing.T, bck cmn.Bck, objName string, reader readers.Reader)
 }
 
 // ListObjectNames returns a slice of object names of all objects that match the prefix in a bucket
-func ListObjectNames(proxyURL string, bck cmn.Bck, prefix string, objectCountLimit uint, cached bool) ([]string, error) {
+func ListObjectNames(proxyURL string, bck cmn.Bck, prefix string, objectCountLimit int64, cached bool) ([]string, error) {
 	var (
 		bp  = BaseAPIParams(proxyURL)
 		msg = &apc.LsoMsg{Prefix: prefix}
@@ -330,7 +330,7 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 	}
 	workerCnt = min(workerCnt, args.ObjCnt)
 
-	for i := 0; i < args.ObjCnt; i++ {
+	for i := range args.ObjCnt {
 		if args.Ordered {
 			objNames = append(objNames, path.Join(args.ObjPath, strconv.Itoa(i)))
 		} else {
@@ -341,12 +341,15 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 	for i := 0; i < len(objNames); i += chunkSize {
 		group.Go(func(start, end int) func() error {
 			return func() error {
+				rnd := cos.NowRand()
 				for _, objName := range objNames[start:end] {
 					size := args.ObjSize
-					if size == 0 { // Size not specified so generate something.
-						size = uint64(cos.NowRand().Intn(cos.KiB)+1) * cos.KiB
-					} else if !args.FixedSize { // Randomize object size.
-						size += uint64(rand.Int63n(cos.KiB))
+
+					// size not specified | size not fixed
+					if size == 0 {
+						size = (rnd.Uint64N(cos.KiB) + 1) * cos.KiB
+					} else if !args.FixedSize {
+						size += rnd.Uint64N(cos.KiB)
 					}
 
 					if args.CksumType == "" {
@@ -582,7 +585,7 @@ func _waitReToStart(bp api.BaseParams) {
 		timeout = max(10*xactPollSleep, MaxCplaneTimeout)
 		retries = int(timeout / xactPollSleep)
 	)
-	for i := 0; i < retries; i++ {
+	for range retries {
 		for _, kind := range kinds {
 			args := xact.ArgsMsg{Timeout: xactPollSleep, OnlyRunning: true, Kind: kind}
 			status, err := api.GetOneXactionStatus(bp, &args)
@@ -654,6 +657,26 @@ func SetClusterConfigUsingMsg(t *testing.T, toUpdate *cmn.ConfigToSet) {
 	bp := BaseAPIParams(proxyURL)
 	err := api.SetClusterConfigUsingMsg(bp, toUpdate, false /*transient*/)
 	tassert.CheckFatal(t, err)
+}
+
+func EnableRebalance(t *testing.T) {
+	proxyURL := GetPrimaryURL()
+	bp := BaseAPIParams(proxyURL)
+	err := api.EnableRebalance(bp)
+	tassert.CheckError(t, err)
+}
+
+func DisableRebalance(t *testing.T) {
+	proxyURL := GetPrimaryURL()
+	bp := BaseAPIParams(proxyURL)
+	err := api.DisableRebalance(bp)
+	tassert.CheckError(t, err)
+}
+
+func SetRemAisConfig(t *testing.T, nvs cos.StrKVs) {
+	remoteBP := BaseAPIParams(RemoteCluster.URL)
+	err := api.SetClusterConfig(remoteBP, nvs, false /*transient*/)
+	tassert.CheckError(t, err)
 }
 
 func CheckErrIsNotFound(t *testing.T, err error) {

@@ -125,7 +125,7 @@ func (mw *memoryWatcher) watchReserved() {
 func (mw *memoryWatcher) watchExcess(memStat sys.MemStat) {
 	defer mw.excess.wg.Done()
 
-	buf, slab := g.mm.Alloc()
+	buf, slab := g.mem.Alloc()
 	defer slab.Free(buf)
 
 	lastMemoryUsage := memStat.ActualUsed
@@ -154,7 +154,7 @@ func (mw *memoryWatcher) watchExcess(memStat sys.MemStat) {
 				return memExcess > 0 // continue if we need more
 			})
 
-			cos.FreeMemToOS(true /*force*/)
+			cos.FreeMemToOS(false /*force*/)
 		case <-mw.m.listenAborted():
 			return
 		case <-mw.excess.stopCh.Listen():

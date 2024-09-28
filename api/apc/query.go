@@ -4,8 +4,7 @@
  */
 package apc
 
-// URL Query "?name1=val1&name2=..."
-// User query params.
+// see related "GET(what)" set of APIs: api/cluster and api/daemon
 const (
 	QparamWhat = "what" // "smap" | "bmd" | "config" | "stats" | "xaction" ... (enum below)
 
@@ -50,7 +49,8 @@ const (
 	QparamKeepRemote = "keep_bck_md"
 
 	// (api.GetBucketInfo)
-	QparamBsummRemote = "bsumm_remote"
+	// NOTE: non-empty value indicates api.GetBucketInfo; "true" value further requires "with remote obj-s"
+	QparamBinfoWithOrWithoutRemote = "bsumm_remote"
 
 	// "presence" in a given cluster shall not be be confused with "existence" (possibly, remote).
 	// See also:
@@ -70,9 +70,39 @@ const (
 	QparamLogOff  = "offset"
 	QparamAllLogs = "all"
 
-	// Archive filename and format (mime type)
+	// The following 4 (four) QparamArch* parameters are all intended for usage with sharded datasets,
+	// whereby the shards are (.tar, .tgz (or .tar.gz), .zip, and/or .tar.lz4) formatted objects.
+	//
+	// For the most recently updated list of supported serialization formats, please see cmn/archive package.
+	//
+	// "archpath" and "archmime", respectively, specify archived pathname and expected format (mime type)
+	// of the containing shard; the latter is especially usable with non-standard shard name extensions;
 	QparamArchpath = "archpath"
 	QparamArchmime = "archmime"
+
+	// In addition, the following two closely related parameters can be used to select multiple matching files
+	// from a given shard.
+	//
+	// In particular, "archregx" specifies prefix, suffix, WebDataset key, _or_ general-purpose regular expression
+	// that can be used to match archived filenames, and select possibly multiple files
+	// (that will be then archived as a TAR and returned in one shot);
+	QparamArchregx = "archregx"
+
+	// "archmode", on the other hand, tells aistore whether to interpret "archregx" (above) as a
+	// a general-purpose regular expression or, alternatively, use it for a simple and fast string comparison;
+	// the latter is further formalized as `MatchMode` enum in the cmn/archive package,
+	// with enumerated values including: "regexp", "prefix", "suffix", "substr", "wdskey".
+	//
+	// for example:
+	// - given a shard containing (subdir/aaa.jpg, subdir/aaa.json, subdir/bbb.jpg, subdir/bbb.json, ...)
+	//   and "wdskey" = "subdir/aaa", aistore will match and return (subdir/aaa.jpg, subdir/aaa.json).
+	QparamArchmode = "archmode" // see `MatchMode` enum in cmn/archive/read
+
+	// See also:
+	// - https://github.com/webdataset/webdataset                     - for WebDataset
+	// - docs/cli/archive.md                                          - for usage and examples
+	// - docs/cli/archive.md#get-archived-content-multiple-selection  - multi-selection usage and examples
+	// - cmn/archive                                                  - the most recently updated "archmode" enumeration
 
 	// Skip loading existing object's metadata, in part to
 	// compare its Checksum and update its existing Version (if exists).
@@ -92,9 +122,19 @@ const (
 	// - implies remote backend
 	QparamLatestVer = "latest-ver"
 
-	QparamSync = "synchronize" // TODO: in progress
+	// in addition to the latest-ver (above), also entails removing remotely
+	// deleted objects
+	QparamSync = "synchronize"
 
-	QparamSilent = "sln" // when true., skip nlog.Error* (motivation: can be quite numerous and/or ignorable)
+	// validate (ie., recompute and check) in-cluster object's checksums
+	QparamValidateCksum = "validate-checksum"
+
+	// when true, skip nlog.Error and friends
+	// (to opt-out logging too many messages and/or benign warnings)
+	QparamSilent = "sln"
+
+	// (see api.AttachMountpath vs. LocalConfig.FSP)
+	QparamMpathLabel = "mountpath_label"
 )
 
 // QparamFltPresence enum.
@@ -146,7 +186,7 @@ const (
 	QparamIsGFNRequest     = "gfn" // true if the request is a Get-From-Neighbor
 	QparamRebStatus        = "rbs" // true: get detailed rebalancing status
 	QparamRebData          = "rbd" // true: get EC rebalance data (pulling data if push way fails)
-	QparamClusterInfo      = "cii" // true: /Health to return cluster info and status
+	QparamClusterInfo      = "cii" // true: /Health to return `cos.NodeStateInfo` including cluster metadata versions and state flags
 	QparamOWT              = "owt" // object write transaction enum { OwtPut, ..., OwtGet* }
 
 	QparamDontResilver = "dntres" // true: do not resilver data off of mountpaths that are being disabled/detached
@@ -171,34 +211,50 @@ const (
 
 // QparamWhat enum.
 const (
-	// cluster meta
+	// cluster metadata
 	WhatSmap = "smap"
 	WhatBMD  = "bmd"
+
 	// config
-	WhatNodeConfig    = "config" // query specific node for (cluster config + overrides, local config)
-	WhatClusterConfig = "cluster_config"
-	// stats
-	WhatNodeStats          = "stats"
-	WhatNodeStatsAndStatus = "status"
-	WhatMetricNames        = "metrics"
-	WhatDiskStats          = "disk"
+	WhatNodeConfig    = "config"         // query specific node for (cluster config + overrides, local config)
+	WhatClusterConfig = "cluster_config" // as the name implies; identical (compressed, checksummed, versioned) copy on each node
+
+	// configured backends
+	WhatBackends = "backends"
+
+	// stats and status
+	WhatNodeStatsV322          = "stats"       // [ backward compatibility ]
+	WhatNodeStatsAndStatusV322 = "status"      // [ ditto ]
+	WhatNodeStats              = "node_stats"  // redundant
+	WhatNodeStatsAndStatus     = "node_status" // current
+
+	WhatDiskRWUtilCap = "disk" // read/write stats, disk utilization, capacity
+
+	WhatMetricNames = "metrics"
+
 	// assorted
 	WhatMountpaths = "mountpaths"
 	WhatRemoteAIS  = "remote"
 	WhatSmapVote   = "smapvote"
 	WhatSysInfo    = "sysinfo"
 	WhatTargetIPs  = "target_ips" // comma-separated list of all target IPs (compare w/ GetWhatSnode)
+
 	// log
 	WhatLog = "log"
+
 	// xactions
 	WhatOneXactStatus   = "status"      // IC status by uuid (returns a single matching xaction or none)
 	WhatAllXactStatus   = "status_all"  // ditto - all matching xactions
 	WhatXactStats       = "getxstats"   // stats: xaction by uuid
 	WhatQueryXactStats  = "qryxstats"   // stats: all matching xactions
 	WhatAllRunningXacts = "running_all" // e.g. e.g.: put-copies[D-ViE6HEL_j] list[H96Y7bhR2s] ...
+
 	// internal
 	WhatSnode    = "snode"
 	WhatICBundle = "ic_bundle"
+
+	// tls
+	WhatCertificate = "tls_certificate"
 )
 
 // QparamLogSev enum.

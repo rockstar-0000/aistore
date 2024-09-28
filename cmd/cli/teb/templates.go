@@ -8,40 +8,16 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
-	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/urfave/cli"
-)
-
-const (
-	unknownVal = "-"
-	NotSetVal  = "-"
-
-	UnknownStatusVal = "n/a"
-)
-
-const rebalanceForgetTime = 5 * time.Minute
-
-const (
-	primarySuffix       = "[P]"
-	nonElectableSuffix  = "[n/e]"
-	offlineStatusSuffix = "[x]" // (daeStatus, via apc.WhatNodeStatsAndStatus)
-
-	NodeOnline = "online"
-)
-
-const (
-	xfinished     = "Finished"
-	xfinishedErrs = "Finished with errors"
-	xrunning      = "Running"
-	xidle         = "Idle"
-	xaborted      = "Aborted"
 )
 
 // output templates
@@ -64,7 +40,8 @@ const (
 		"{{ range $key, $si := .Smap.Pmap }} " +
 		"{{ $nonElect := $.Smap.NonElectable $si }}" +
 		"{{ if (eq $nonElect true) }} ProxyID: {{$key}}\n{{end}}{{end}}\n" +
-		"Primary Proxy: {{.Smap.Primary.ID}}\nProxies: {{len .Smap.Pmap}}\t Targets: {{len .Smap.Tmap}}\t Smap Version: {{.Smap.Version}}\n"
+		"Primary Proxy:\t{{.Smap.Primary.ID}}\n" +
+		"Summary:\tproxies({{len .Smap.Pmap}}), targets({{len .Smap.Tmap}}), cluster map(v{{.Smap.Version}}), cluster ID(\"{{.Smap.UUID}}\")\n"
 
 	//
 	// Cluster
@@ -73,7 +50,9 @@ const (
 
 	ClusterSummary = indent1 + "Proxies:\t{{FormatProxiesSumm .Smap}}\n" +
 		indent1 + "Targets:\t{{FormatTargetsSumm .Smap .NumDisks}}\n" +
+		indent1 + "Capacity:\t{{.Capacity}}\n" +
 		indent1 + "Cluster Map:\t{{FormatSmap .Smap}}\n" +
+		indent1 + "Software:\t{{FormatCluSoft .Version .BuildTime}}\n" +
 		indent1 + "Deployment:\t{{ ( Deployments .Status) }}\n" +
 		indent1 + "Status:\t{{ ( OnlineStatus .Status) }}\n" +
 		indent1 + "Rebalance:\t{{ ( Rebalance .Status) }}\n" +
@@ -111,8 +90,8 @@ const (
 	dsortListHdr  = "JOB ID\t STATUS\t START\t FINISH\t SRC BUCKET\t DST BUCKET\t SRC SHARDS\n"
 	dsortListBody = "{{$value.ID}}\t " +
 		"{{FormatDsortStatus $value}}\t " +
-		"{{FormatStart $value.StartedTime $value.FinishTime}}\t " +
-		"{{FormatEnd $value.StartedTime $value.FinishTime}}\t " +
+		"{{FormatStart $value.StartedTime}}\t " +
+		"{{FormatEnd $value.FinishTime}}\t " +
 		"{{FormatBckName $value.SrcBck}}\t " +
 		"{{FormatBckName $value.DstBck}}\t " +
 		"{{if (eq $value.Objs 0) }}-{{else}}{{$value.Objs}}{{end}}\n"
@@ -148,8 +127,8 @@ const (
 		"{{FormatBckName $xctn.Bck}}\t " +
 		"{{if (eq $xctn.Stats.Objs 0) }}-{{else}}{{$xctn.Stats.Objs}}{{end}}\t " +
 		"{{if (eq $xctn.Stats.Bytes 0) }}-{{else}}{{FormatBytesSig $xctn.Stats.Bytes 2}}{{end}}\t " +
-		"{{FormatStart $xctn.StartTime $xctn.EndTime}}\t " +
-		"{{FormatEnd $xctn.StartTime $xctn.EndTime}}\t " +
+		"{{FormatStart $xctn.StartTime}}\t " +
+		"{{FormatEnd $xctn.EndTime}}\t " +
 		"{{FormatXactState $xctn}}\n"
 
 	// same as above except for: src-bck, dst-bck columns
@@ -165,8 +144,8 @@ const (
 		"{{FormatBckName $xctn.DstBck}}\t " +
 		"{{if (eq $xctn.Stats.Objs 0) }}-{{else}}{{$xctn.Stats.Objs}}{{end}}\t " +
 		"{{if (eq $xctn.Stats.Bytes 0) }}-{{else}}{{FormatBytesSig $xctn.Stats.Bytes 2}}{{end}}\t " +
-		"{{FormatStart $xctn.StartTime $xctn.EndTime}}\t " +
-		"{{FormatEnd $xctn.StartTime $xctn.EndTime}}\t " +
+		"{{FormatStart $xctn.StartTime}}\t " +
+		"{{FormatEnd $xctn.EndTime}}\t " +
 		"{{FormatXactState $xctn}}\n"
 
 	// same as above for: no bucket column
@@ -180,8 +159,8 @@ const (
 		"{{$xctn.Kind}}\t " +
 		"{{if (eq $xctn.Stats.Objs 0) }}-{{else}}{{$xctn.Stats.Objs}}{{end}}\t " +
 		"{{if (eq $xctn.Stats.Bytes 0) }}-{{else}}{{FormatBytesSig $xctn.Stats.Bytes 2}}{{end}}\t " +
-		"{{FormatStart $xctn.StartTime $xctn.EndTime}}\t " +
-		"{{FormatEnd $xctn.StartTime $xctn.EndTime}}\t " +
+		"{{FormatStart $xctn.StartTime}}\t " +
+		"{{FormatEnd $xctn.EndTime}}\t " +
 		"{{FormatXactState $xctn}}\n"
 
 	XactECGetTmpl      = xactECGetStatsHdr + XactECGetNoHdrTmpl
@@ -191,7 +170,7 @@ const (
 	xactECGetBody      = "{{range $key, $xctn := $daemon.XactSnaps}}" + xactECGetStatsBody + "{{end}}"
 	xactECGetStatsBody = "{{ $daemon.DaemonID }}\t " +
 		"{{if $xctn.ID}}{{$xctn.ID}}{{else}}-{{end}}\t " +
-		"{{if $xctn.Bck.Name}}{{FormatBckName $xctn.Bck}}{{else}}-{{end}}\t " +
+		"{{FormatBckName $xctn.Bck}}\t " +
 		"{{if (eq $xctn.Stats.Objs 0) }}-{{else}}{{$xctn.Stats.Objs}}{{end}}\t " +
 		"{{if (eq $xctn.Stats.Bytes 0) }}-{{else}}{{FormatBytesSig $xctn.Stats.Bytes 2}}{{end}}\t " +
 
@@ -200,8 +179,8 @@ const (
 		"{{if (eq $ext.AvgQueueLen 0.0) }}-{{else}}{{ FormatFloat $ext.AvgQueueLen}}{{end}}\t " +
 		"{{if (eq $ext.AvgObjTime 0) }}-{{else}}{{FormatMilli $ext.AvgObjTime}}{{end}}\t " +
 
-		"{{FormatStart $xctn.StartTime $xctn.EndTime}}\t " +
-		"{{FormatEnd $xctn.StartTime $xctn.EndTime}}\t " +
+		"{{FormatStart $xctn.StartTime}}\t " +
+		"{{FormatEnd $xctn.EndTime}}\t " +
 		"{{FormatXactState $xctn}}\n"
 
 	XactECPutTmpl      = xactECPutStatsHdr + XactECPutNoHdrTmpl
@@ -211,7 +190,7 @@ const (
 	xactECPutBody      = "{{range $key, $xctn := $daemon.XactSnaps}}" + xactECPutStatsBody + "{{end}}"
 	xactECPutStatsBody = "{{ $daemon.DaemonID }}\t " +
 		"{{if $xctn.ID}}{{$xctn.ID}}{{else}}-{{end}}\t " +
-		"{{if $xctn.Bck.Name}}{{FormatBckName $xctn.Bck}}{{else}}-{{end}}\t " +
+		"{{FormatBckName $xctn.Bck}}\t " +
 		"{{if (eq $xctn.Stats.Objs 0) }}-{{else}}{{$xctn.Stats.Objs}}{{end}}\t " +
 		"{{if (eq $xctn.Stats.Bytes 0) }}-{{else}}{{FormatBytesSig $xctn.Stats.Bytes 2}}{{end}}\t " +
 
@@ -221,8 +200,8 @@ const (
 		"{{if (eq $ext.AvgObjTime 0) }}-{{else}}{{FormatMilli $ext.AvgObjTime}}{{end}}\t " +
 		"{{if (eq $ext.AvgEncodeTime 0) }}-{{else}}{{FormatMilli $ext.AvgEncodeTime}}{{end}}\t " +
 
-		"{{FormatStart $xctn.StartTime $xctn.EndTime}}\t " +
-		"{{FormatEnd $xctn.StartTime $xctn.EndTime}}\t " +
+		"{{FormatStart $xctn.StartTime}}\t " +
+		"{{FormatEnd $xctn.EndTime}}\t " +
 		"{{FormatXactState $xctn}}\n"
 
 	listBucketsSummHdr  = "NAME\t PRESENT\t OBJECTS\t SIZE (apparent, objects, remote)\t USAGE(%)\n"
@@ -291,15 +270,17 @@ See '--help' and docs/cli for details.`
 
 	AuthNRoleTmpl = "ROLE\tDESCRIPTION\n" +
 		"{{ range $role := . }}" +
-		"{{ $role.ID }}\t{{ $role.Desc }}\n" +
+		"{{ $role.Name }}\t{{ $role.Description }}\n" +
 		"{{end}}"
 
 	AuthNUserTmpl = "NAME\tROLES\n" +
 		"{{ range $user := . }}" +
-		"{{ $user.ID }}\t{{ JoinList $user.Roles }}\n" +
+		"{{ $user.ID }}\t{{ range $i, $role := $user.Roles }}" +
+		"{{ if $i }}, {{ end }}{{ $role.Name }}" +
+		"{{end}}\n" +
 		"{{end}}"
 
-	AuthNUserVerboseTmpl = "Name\t{{ .ID }}\n" +
+	AuthNUserVerboseTmpl = "Name\t{{ .Name }}\n" +
 		"Roles\t{{ JoinList .Roles }}\n" +
 		"{{ if ne (len .ClusterACLs) 0 }}" +
 		"CLUSTER ID\tALIAS\tPERMISSIONS\n" +
@@ -312,8 +293,8 @@ See '--help' and docs/cli for details.`
 		"{{ $bck }}\t{{ FormatACL $bck.Access }}\n" +
 		"{{end}}{{end}}"
 
-	AuthNRoleVerboseTmpl = "Role\t{{ .ID }}\n" +
-		"Description\t{{ .Desc }}\n" +
+	AuthNRoleVerboseTmpl = "Role\t{{ .Name }}\n" +
+		"Description\t{{ .Description }}\n" +
 		"{{ if ne (len .Roles) 0 }}" +
 		"Roles\t{{ JoinList .Roles }}\n" +
 		"{{ end }}" +
@@ -338,13 +319,13 @@ See '--help' and docs/cli for details.`
 		"\tNo mountpaths\n" +
 		"{{else}}" +
 		"{{if ne (len $p.Mpl.Available) 0}}" +
-		"\tUsed: {{FormatCapPctMAM $p.TargetCDF true}}\t " +
-		"{{if (IsEqS $p.TargetCDF.CsErr \"\")}}{{else}}{{$p.TargetCDF.CsErr}}{{end}}\n" +
+		"\tUsed: {{FormatCapPctMAM $p.Tcdf true}}\t " +
+		"{{if (IsEqS $p.Tcdf.CsErr \"\")}}{{else}}{{$p.Tcdf.CsErr}}{{end}}\n" +
 		"{{range $mp := $p.Mpl.Available }}" +
 		"\t\t{{ $mp }} " +
 
-		"{{range $k, $v := $p.TargetCDF.Mountpaths}}" +
-		"{{if (IsEqS $k $mp)}}{{$v.FS}}{{end}}" +
+		"{{range $k, $v := $p.Tcdf.Mountpaths}}" +
+		"{{if (IsEqS $k $mp)}}{{FormatCDFDisks $v}}{{end}}" +
 		"{{end}}\n" +
 
 		"{{end}}{{end}}" +
@@ -371,20 +352,24 @@ type (
 		TargetID string
 		DiskName string
 		Stat     ios.DiskStats
+		Tcdf     *fs.Tcdf
 	}
 	SmapHelper struct {
 		Smap         *meta.Smap
 		ExtendedURLs bool
 	}
 	StatsAndStatusHelper struct {
-		Pmap StstMap `json:"pmap"`
-		Tmap StstMap `json:"tmap"`
+		Pmap StstMap
+		Tmap StstMap
 	}
 	StatusHelper struct {
-		Smap      *meta.Smap           `json:"smap"`
-		CluConfig *cmn.ClusterConfig   `json:"config"`
-		Status    StatsAndStatusHelper `json:"status"`
-		NumDisks  int                  `json:"-"`
+		Smap      *meta.Smap
+		CluConfig *cmn.ClusterConfig
+		Status    StatsAndStatusHelper
+		Capacity  string
+		Version   string // when all equal
+		BuildTime string // ditto
+		NumDisks  int
 	}
 	ListBucketsHelper struct {
 		XactID string
@@ -402,26 +387,29 @@ var (
 	funcMap = template.FuncMap{
 		// formatting
 		"FormatBytesSig":      func(size int64, digits int) string { return FmtSize(size, cos.UnitsIEC, digits) },
+		"FormatBytesSig2":     fmtSize2,
 		"FormatBytesUns":      func(size uint64, digits int) string { return FmtSize(int64(size), cos.UnitsIEC, digits) },
 		"FormatMAM":           func(u int64) string { return fmt.Sprintf("%-10s", FmtSize(u, cos.UnitsIEC, 2)) },
 		"FormatMilli":         func(dur cos.Duration) string { return fmtMilli(dur, cos.UnitsIEC) },
 		"FormatDuration":      FormatDuration,
-		"FormatStart":         func(s, e time.Time) string { res, _ := FmtStartEnd(s, e); return res },
-		"FormatEnd":           func(s, e time.Time) string { _, res := FmtStartEnd(s, e); return res },
+		"FormatStart":         FmtTime,
+		"FormatEnd":           FmtTime,
 		"FormatDsortStatus":   dsortJobInfoStatus,
 		"FormatLsObjStatus":   fmtLsObjStatus,
 		"FormatLsObjIsCached": fmtLsObjIsCached,
 		"FormatObjCustom":     fmtObjCustom,
 		"FormatDaemonID":      fmtDaemonID,
 		"FormatSmap":          fmtSmap,
+		"FormatCluSoft":       fmtCluSoft,
 		"FormatProxiesSumm":   fmtProxiesSumm,
 		"FormatTargetsSumm":   fmtTargetsSumm,
 		"FormatCapPctMAM":     fmtCapPctMAM,
+		"FormatCDFDisks":      fmtCDFDisks,
 		"FormatFloat":         func(f float64) string { return fmt.Sprintf("%.2f", f) },
 		"FormatBool":          FmtBool,
-		"FormatBckName":       func(bck cmn.Bck) string { return bck.Cname("") },
+		"FormatBckName":       fmtBckName,
 		"FormatACL":           fmtACL,
-		"FormatNameArch":      fmtNameArch,
+		"FormatNameDirArch":   fmtNameDirArch,
 		"FormatXactState":     FmtXactStatus,
 		//  misc. helpers
 		"IsUnsetTime":   isUnsetTime,
@@ -464,9 +452,14 @@ func (sth SmapHelper) forMarshal() any {
 // stats.NodeStatus
 //
 
-func calcCap(daemon *stats.NodeStatus) (total uint64) {
-	for _, cdf := range daemon.TargetCDF.Mountpaths {
+func calcCap(ds *stats.NodeStatus) (total uint64) {
+	for _, cdf := range ds.Tcdf.Mountpaths {
 		total += cdf.Capacity.Avail
+		// TODO: a simplifying local-playground assumption and shortcut - won't work with loop devices, etc.
+		// (ref: 152408)
+		if ds.DeploymentType == apc.DeploymentDev {
+			break
+		}
 	}
 	return total
 }
@@ -540,4 +533,13 @@ func (h *StatsAndStatusHelper) toSlice(jtag string) []string {
 		res = []string{UnknownStatusVal}
 	}
 	return res
+}
+
+func (m StstMap) allStateFlagsOK() bool {
+	for _, ds := range m {
+		if !ds.Cluster.Flags.IsOK() {
+			return false
+		}
+	}
+	return true
 }

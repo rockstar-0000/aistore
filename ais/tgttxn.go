@@ -123,7 +123,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	case apc.ActCopyObjects, apc.ActETLObjects:
 		var (
 			dp     core.DP
-			tcomsg = &cmn.TCObjsMsg{}
+			tcomsg = &cmn.TCOMsg{}
 		)
 		if err := cos.MorphMarshal(c.msg.Value, tcomsg); err != nil {
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, c.msg.Value, err)
@@ -167,7 +167,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	t.transactions.find(c.uuid, ActCleanup)
 
 	if cmn.IsErrCapExceeded(err) {
-		cs := t.OOS(nil)
+		cs := t.oos(cmn.GCO.Get())
 		t.writeErrStatusf(w, r, http.StatusInsufficientStorage, "%s: %v", cs.String(), err)
 	} else {
 		t.writeErr(w, r, err)
@@ -237,7 +237,7 @@ func (t *target) makeNCopies(c *txnSrv) (string, error) {
 		}
 		nlp := newBckNLP(c.bck)
 		if !nlp.TryLock(c.timeout.netw / 2) {
-			return "", cmn.NewErrBusy("bucket", c.bck, "")
+			return "", cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnMakeNCopies(c, curCopies, newCopies)
 		if err := t.transactions.begin(txn, nlp); err != nil {
@@ -321,7 +321,7 @@ func (t *target) setBprops(c *txnSrv) (string, error) {
 		}
 		nlp := newBckNLP(c.bck)
 		if !nlp.TryLock(c.timeout.netw / 2) {
-			return "", cmn.NewErrBusy("bucket", c.bck, "")
+			return "", cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnSetBucketProps(c, nprops)
 		if err := t.transactions.begin(txn, nlp); err != nil {
@@ -425,11 +425,11 @@ func (t *target) renameBucket(c *txnSrv) (string, error) {
 		nlpFrom := newBckNLP(bckFrom)
 		nlpTo := newBckNLP(bckTo)
 		if !nlpFrom.TryLock(c.timeout.netw / 4) {
-			return "", cmn.NewErrBusy("bucket", bckFrom, "")
+			return "", cmn.NewErrBusy("bucket", bckFrom.Cname(""))
 		}
 		if !nlpTo.TryLock(c.timeout.netw / 4) {
 			nlpFrom.Unlock()
-			return "", cmn.NewErrBusy("bucket", bckTo, "")
+			return "", cmn.NewErrBusy("bucket", bckTo.Cname(""))
 		}
 		txn := newTxnRenameBucket(c, bckFrom, bckTo)
 		if err := t.transactions.begin(txn, nlpFrom, nlpTo); err != nil {
@@ -487,8 +487,8 @@ func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *aisMsg) error 
 	if _, present := bmd.Get(bckTo); present {
 		return cmn.NewErrBckAlreadyExists(bckTo.Bucket())
 	}
-	availablePaths := fs.GetAvail()
-	for _, mi := range availablePaths {
+	avail := fs.GetAvail()
+	for _, mi := range avail {
 		path := mi.MakePathCT(bckTo.Bucket(), fs.ObjectType)
 		if err := cos.Stat(path); err != nil {
 			if !os.IsNotExist(err) {
@@ -601,13 +601,13 @@ func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
 		nlpTo          core.NLP
 	)
 	if !nlpFrom.TryRLock(c.timeout.netw / 4) {
-		return cmn.NewErrBusy("bucket", bckFrom, "")
+		return cmn.NewErrBusy("bucket", bckFrom.Cname(""))
 	}
 	if !msg.DryRun && !bckFrom.Equal(bckTo, true, true) {
 		nlpTo = newBckNLP(bckTo)
 		if !nlpTo.TryLock(c.timeout.netw / 4) {
 			nlpFrom.Unlock()
-			return cmn.NewErrBusy("bucket", bckTo, "")
+			return cmn.NewErrBusy("bucket", bckTo.Cname(""))
 		}
 	}
 	custom := &xreg.TCBArgs{Phase: apc.ActBegin, BckFrom: bckFrom, BckTo: bckTo, DP: dp, Msg: msg}
@@ -632,7 +632,7 @@ func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
 // Two IDs:
 // - TxnUUID: transaction (txn) ID
 // - xid: xaction ID (will have "tco-" prefix)
-func (t *target) tcobjs(c *txnSrv, msg *cmn.TCObjsMsg, dp core.DP) (xid string, _ error) {
+func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, dp core.DP) (xid string, _ error) {
 	switch c.phase {
 	case apc.ActBegin:
 		var (
@@ -671,6 +671,8 @@ func (t *target) tcobjs(c *txnSrv, msg *cmn.TCObjsMsg, dp core.DP) (xid string, 
 		xid = xctn.ID()
 
 		xtco := xctn.(*xs.XactTCObjs)
+
+		debug.Assert(msg.TxnUUID == "" || msg.TxnUUID == c.uuid) // (ref050724)
 		msg.TxnUUID = c.uuid
 		txn := newTxnTCObjs(c, bckFrom, xtco, msg)
 		if err := t.transactions.begin(txn); err != nil {
@@ -736,7 +738,7 @@ func (t *target) ecEncode(c *txnSrv) (string, error) {
 		nlp := newBckNLP(c.bck)
 
 		if !nlp.TryLock(c.timeout.netw / 4) {
-			return "", cmn.NewErrBusy("bucket", c.bck, "")
+			return "", cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnECEncode(c, c.bck)
 		if err := t.transactions.begin(txn, nlp); err != nil {
@@ -889,7 +891,7 @@ func (t *target) destroyBucket(c *txnSrv) error {
 	case apc.ActBegin:
 		nlp := newBckNLP(c.bck)
 		if !nlp.TryLock(c.timeout.netw / 2) {
-			return cmn.NewErrBusy("bucket", c.bck, "")
+			return cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnBckBase(c.bck)
 		txn.fillFromCtx(c)

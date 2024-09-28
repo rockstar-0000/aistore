@@ -55,8 +55,8 @@ func blobDownloadHandler(c *cli.Context) error {
 			return err
 		}
 	}
-	if flagIsSet(c, numWorkersFlag) {
-		msg.NumWorkers = parseIntFlag(c, numWorkersFlag)
+	if flagIsSet(c, numBlobWorkersFlag) {
+		msg.NumWorkers = parseIntFlag(c, numBlobWorkersFlag)
 	}
 	msg.LatestVer = flagIsSet(c, latestVerFlag)
 
@@ -202,7 +202,7 @@ func _blobOneProgress(xid string, bar *mpb.Bar, errCh chan error, sleep time.Dur
 		done     bool
 	)
 	for {
-		daemonID, snap, errN := getXactSnap(&xargs)
+		daemonID, snap, errN := getAnyXactSnap(&xargs)
 		if errN != nil {
 			errCh <- errN
 			break

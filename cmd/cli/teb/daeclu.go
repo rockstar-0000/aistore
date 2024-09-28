@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
@@ -23,10 +24,21 @@ const (
 	colLoadAvg   = "LOAD AVERAGE"
 	colRebalance = "REBALANCE"
 	colUptime    = "UPTIME"
+	colPodName   = "K8s POD"
 	colStatus    = "STATUS"
 	colVersion   = "VERSION"
 	colBuildTime = "BUILD TIME"
-	colPodName   = "K8s POD"
+
+	colStateFlags = "ALERT"
+)
+
+// TODO: extend api.GetClusterSysInfo() and api.GetStatsAndStatus to return memsys.Pressure
+const (
+	memPctUsedHigh    = 80
+	memPctUsedExtreme = 90
+
+	memAvailLow = cos.GiB
+	memOOM      = 200 * cos.MiB
 )
 
 func NewDaeStatus(st *stats.NodeStatus, smap *meta.Smap, daeType, units string) *Table {
@@ -60,6 +72,7 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 		pods     = h.pods()
 		status   = h.onlineStatus()
 		versions = h.versions()
+		builds   = h.buildTimes()
 		cols     = []*header{
 			{name: colProxy},
 			{name: colMemUsed},
@@ -68,8 +81,9 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 			{name: colUptime},
 			{name: colPodName, hide: len(pods) == 1 && pods[0] == ""},
 			{name: colStatus, hide: len(status) == 1 && status[0] == NodeOnline},
-			{name: colVersion, hide: len(versions) == 1 && len(ps) > 1},
-			{name: colBuildTime, hide: len(versions) == 1 && len(ps) > 1}, // intended
+			{name: colVersion, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colBuildTime, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colStateFlags, hide: ps.allStateFlagsOK()},
 		}
 		table = newTable(cols...)
 	)
@@ -91,13 +105,16 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 				nstatus,
 				ds.Version,
 				ds.BuildTime,
+				unknownVal,
 			}
 			table.addRow(row)
 			continue
 		}
 
-		memUsed := fmt.Sprintf("%.2f%%", ds.MemCPUInfo.PctMemUsed)
-		memAvail := FmtSize(int64(ds.MemCPUInfo.MemAvail), units, 2)
+		var memAvail string
+		memUsed, high, oom := _memUsed(ds.MemCPUInfo.PctMemUsed)
+		memAvail, ds.Status = _memAvail(int64(ds.MemCPUInfo.MemAvail), units, ds.Status, high, oom)
+
 		load := fmt.Sprintf("[%.1f %.1f %.1f]", ds.MemCPUInfo.LoadAvg.One, ds.MemCPUInfo.LoadAvg.Five, ds.MemCPUInfo.LoadAvg.Fifteen)
 		// older version
 		if ds.MemCPUInfo.LoadAvg.One == 0 && ds.MemCPUInfo.LoadAvg.Five == 0 && ds.MemCPUInfo.LoadAvg.Fifteen == 0 {
@@ -118,10 +135,38 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 			ds.Status,
 			ds.Version,
 			ds.BuildTime,
+			fmtAlerts(ds.Cluster.Flags),
 		}
 		table.addRow(row)
 	}
 	return table
+}
+
+func _memUsed(pctUsed float64) (s string, high, oom bool) {
+	s = fmt.Sprintf("%.2f%%", pctUsed)
+	switch {
+	case pctUsed >= memPctUsedExtreme:
+		oom = true
+	case pctUsed >= memPctUsedHigh:
+		high = true
+	}
+	return
+}
+
+func _memAvail(avail int64, units, status string, high, oom bool) (string, string) {
+	s := FmtSize(avail, units, 2)
+	switch {
+	case avail < memOOM:
+		oom = true
+	case avail < memAvailLow:
+		high = true
+	}
+	if oom {
+		status += fred(" (out of memory)")
+	} else if high {
+		status += fcyan(" (low on memory)")
+	}
+	return s, status
 }
 
 // target(s)
@@ -131,6 +176,7 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 		pods     = h.pods()
 		status   = h.onlineStatus()
 		versions = h.versions()
+		builds   = h.buildTimes()
 		cols     = []*header{
 			{name: colTarget},
 			{name: colMemUsed},
@@ -142,8 +188,9 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 			{name: colUptime},
 			{name: colPodName, hide: len(pods) == 1 && pods[0] == ""},
 			{name: colStatus, hide: len(status) == 1 && status[0] == NodeOnline},
-			{name: colVersion, hide: len(versions) == 1 && len(ts) > 1},
-			{name: colBuildTime, hide: len(versions) == 1 && len(ts) > 1}, // intended
+			{name: colVersion, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colBuildTime, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colStateFlags, hide: ts.allStateFlagsOK()},
 		}
 		table = newTable(cols...)
 	)
@@ -167,13 +214,16 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 				nstatus,
 				ds.Version,
 				ds.BuildTime,
+				unknownVal,
 			}
 			table.addRow(row)
 			continue
 		}
 
-		memUsed := fmt.Sprintf("%.2f%%", ds.MemCPUInfo.PctMemUsed)
-		memAvail := FmtSize(int64(ds.MemCPUInfo.MemAvail), units, 2)
+		var memAvail string
+		memUsed, high, oom := _memUsed(ds.MemCPUInfo.PctMemUsed)
+		memAvail, ds.Status = _memAvail(int64(ds.MemCPUInfo.MemAvail), units, ds.Status, high, oom)
+
 		upns := ds.Tracker[stats.Uptime].Value
 		uptime := FmtDuration(upns, units)
 		if upns == 0 {
@@ -184,7 +234,7 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 		if ds.MemCPUInfo.LoadAvg.One == 0 && ds.MemCPUInfo.LoadAvg.Five == 0 && ds.MemCPUInfo.LoadAvg.Fifteen == 0 {
 			load = UnknownStatusVal
 		}
-		capUsed := fmt.Sprintf("%d%%", ds.TargetCDF.PctAvg)
+		capUsed := fmt.Sprintf("%d%%", ds.Tcdf.PctAvg)
 		v := calcCap(ds)
 		capAvail := FmtSize(int64(v), units, 3)
 		if v == 0 {
@@ -203,6 +253,7 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 			ds.Status,
 			ds.Version,
 			ds.BuildTime,
+			fmtAlerts(ds.Cluster.Flags),
 		}
 		table.addRow(row)
 	}

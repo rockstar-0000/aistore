@@ -226,7 +226,8 @@ func concatObject(c *cli.Context, bck cmn.Bck, objName string, fileNames []strin
 
 func isObjPresent(c *cli.Context, bck cmn.Bck, objName string) error {
 	name := bck.Cname(objName)
-	_, err := api.HeadObject(apiBP, bck, objName, apc.FltPresentNoProps, true)
+	hargs := api.HeadArgs{FltPresence: apc.FltPresentNoProps, Silent: true}
+	_, err := api.HeadObject(apiBP, bck, objName, hargs)
 	if err != nil {
 		if cmn.IsStatusNotFound(err) {
 			fmt.Fprintf(c.App.Writer, "%s is not present (\"not cached\")\n", name)
@@ -251,34 +252,39 @@ func calcPutRefresh(c *cli.Context) time.Duration {
 }
 
 // via `ais ls bucket/object` and `ais show bucket/object`
-func showObjProps(c *cli.Context, bck cmn.Bck, objName string) error {
+func showObjProps(c *cli.Context, bck cmn.Bck, objName string) (notfound bool, _ error) {
 	var (
 		propsFlag     []string
 		selectedProps []string
-		fltPresence   = apc.FltPresentCluster
+		hargs         = api.HeadArgs{
+			FltPresence: apc.FltPresentCluster,
+			Silent:      flagIsSet(c, silentFlag),
+		}
+		units, errU = parseUnitsFlag(c, unitsFlag)
 	)
-	if flagIsSet(c, objNotCachedPropsFlag) || flagIsSet(c, allObjsOrBcksFlag) {
-		fltPresence = apc.FltExists
+	if errU != nil {
+		return false, errU
 	}
-	objProps, err := api.HeadObject(apiBP, bck, objName, fltPresence, flagIsSet(c, silentFlag))
+	if flagIsSet(c, objNotCachedPropsFlag) || flagIsSet(c, allObjsOrBcksFlag) {
+		hargs.FltPresence = apc.FltExists
+	}
+	objProps, err := api.HeadObject(apiBP, bck, objName, hargs)
 	if err != nil {
-		if !cmn.IsStatusNotFound(err) {
-			return err
+		notfound = cmn.IsStatusNotFound(err)
+		if !notfound {
+			return notfound, err
 		}
 		var hint string
-		if apc.IsFltPresent(fltPresence) && bck.IsRemote() {
+		if apc.IsFltPresent(hargs.FltPresence) && bck.IsRemote() {
 			if actionIsHandler(c.Command.Action, listAnyHandler) {
 				hint = fmt.Sprintf(" (tip: try %s option)", qflprn(allObjsOrBcksFlag))
 			} else {
 				hint = fmt.Sprintf(" (tip: try %s option)", qflprn(objNotCachedPropsFlag))
 			}
 		}
-		return fmt.Errorf("%q not found in %s%s", objName, bck.Cname(""), hint)
+		return notfound, fmt.Errorf("%q not found in %s%s", objName, bck.Cname(""), hint)
 	}
 
-	if flagIsSet(c, jsonFlag) {
-		return teb.Print(objProps, teb.PropValTmpl, teb.Jopts(true))
-	}
 	if flagIsSet(c, allPropsFlag) {
 		propsFlag = apc.GetPropsAll
 	} else if flagIsSet(c, objPropsFlag) {
@@ -306,6 +312,16 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) error {
 			if name == apc.GetPropsAtime && isUnsetTime(c, v) {
 				v = teb.NotSetVal
 			}
+			if name == apc.GetPropsSize && units != "" {
+				// reformat
+				size, err := cos.ParseSize(v, "")
+				if err != nil {
+					warn := fmt.Sprintf("failed to parse 'size': %v", err)
+					actionWarn(c, warn)
+				} else {
+					v = teb.FmtSize(size, units, 2)
+				}
+			}
 			propNVs = append(propNVs, nvpair{name, v})
 		}
 	}
@@ -314,9 +330,9 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) error {
 	})
 
 	if flagIsSet(c, noHeaderFlag) {
-		return teb.Print(propNVs, teb.PropValTmplNoHdr)
+		return false, teb.Print(propNVs, teb.PropValTmplNoHdr)
 	}
-	return teb.Print(propNVs, teb.PropValTmpl)
+	return false, teb.Print(propNVs, teb.PropValTmpl)
 }
 
 func propVal(op *cmn.ObjectProps, name string) (v string) {
@@ -330,7 +346,7 @@ func propVal(op *cmn.ObjectProps, name string) (v string) {
 	case apc.GetPropsAtime:
 		v = cos.FormatNanoTime(op.Atime, "")
 	case apc.GetPropsVersion:
-		v = op.Ver
+		v = op.Version()
 	case apc.GetPropsCached:
 		if op.Bck.IsAIS() {
 			debug.Assert(op.Present)
@@ -353,7 +369,7 @@ func propVal(op *cmn.ObjectProps, name string) (v string) {
 	case apc.GetPropsLocation:
 		v = op.Location
 	case apc.GetPropsStatus:
-		// no "object status" in `cmn.ObjectProps` - nothing to do (see also: `cmn.LsoEntry`)
+		// no "object status" in `cmn.ObjectProps` - nothing to do (see also: `cmn.LsoEnt`)
 	default:
 		debug.Assert(false, "obj prop name: \""+name+"\"")
 	}

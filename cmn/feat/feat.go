@@ -13,47 +13,80 @@ import (
 
 type Flags cos.BitFlags
 
-const FeaturesPropName = "features"
+// NOTE:
+// - `Bucket` features(*) are a strict subset of all `Cluster` features, and can be changed
+//    for individual buckets
+// - when making any changes, make sure to update `Cluster` and maybe the `Bucket` enum as well (NOTE)
 
-// NOTE: when making changes, make sure to update `All` names as well
+const (
+	PropName = "features"
+)
 
 const (
 	EnforceIntraClusterAccess = Flags(1 << iota)
-	SkipVC                    // skip loading existing object's metadata, Version and Checksum (VC) in particular
+	SkipVC                    // (*) skip loading existing object's metadata, Version and Checksum (VC) in particular
 	DontAutoDetectFshare      // do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
-	ProvideS3APIviaRoot       // handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)
-	FsyncPUT                  // when finalizing PUT(obj) fflush prior to (close, rename) sequence
+	S3APIviaRoot              // handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)
+	FsyncPUT                  // (*) when finalizing PUT(object): fflush prior to (close, rename) sequence
 	LZ4Block1MB               // .tar.lz4 format, lz4 compression: max uncompressed block size=1MB (default: 256K)
 	LZ4FrameChecksum          // checksum lz4 frames (default: don't)
 	DontAllowPassingFQNtoETL  // do not allow passing fully-qualified name of a locally stored object to (local) ETL containers
 	IgnoreLimitedCoexistence  // run in presence of "limited coexistence" type conflicts (same as e.g. CopyBckMsg.Force but globally)
-	DisableFastColdGET        // use regular datapath to execute cold-GET operations
-	PassThroughSignedS3Req    // pass-through client-authenticated and signed S3 requests
+	S3PresignedRequest        // (*) pass-through client-signed (presigned) S3 requests for subsequent authentication by S3
+	DontOptimizeVirtualDir    // when prefix doesn't end with '/' and is a subdirectory: don't assume there are no _prefixed_ obj names
+	DisableColdGET            // disable cold-GET (from remote bucket)
+	StreamingColdGET          // write and transmit cold-GET content back to user in parallel, without _finalizing_ in-cluster object
+	S3ReverseProxy            // intra-cluster communications: instead of regular HTTP redirects reverse-proxy S3 API calls to designated targets
+	S3UsePathStyle            // use older path-style addressing (as opposed to virtual-hosted style), e.g., https://s3.amazonaws.com/BUCKET/KEY
 )
 
-var All = []string{
+var Cluster = [...]string{
 	"Enforce-IntraCluster-Access",
 	"Skip-Loading-VersionChecksum-MD",
 	"Do-not-Auto-Detect-FileShare",
-	"Provide-S3-API-via-Root",
+	"S3-API-via-Root",
 	"Fsync-PUT",
 	"LZ4-Block-1MB",
 	"LZ4-Frame-Checksum",
 	"Dont-Allow-Passing-FQN-to-ETL",
 	"Ignore-LimitedCoexistence-Conflicts",
-	"Disable-Fast-Cold-GET",
-	"Pass-Through-Signed-S3-Req",
+	"S3-Presigned-Request",
+	"Dont-Optimize-Listing-Virtual-Dirs",
+	"Disable-Cold-GET",
+	"Streaming-Cold-GET",
+	"S3-Reverse-Proxy",
+	"S3-Use-Path-Style", // https://aws.amazon.com/blogs/aws/amazon-s3-path-deprecation-plan-the-rest-of-the-story
+	// "none" ====================
+}
+
+var Bucket = [...]string{
+	"Skip-Loading-VersionChecksum-MD",
+	"Fsync-PUT",
+	"S3-Presigned-Request",
+	"Disable-Cold-GET",
+	"Streaming-Cold-GET",
+	"S3-Use-Path-Style", // https://aws.amazon.com/blogs/aws/amazon-s3-path-deprecation-plan-the-rest-of-the-story
+	// "none" ====================
 }
 
 func (f Flags) IsSet(flag Flags) bool { return cos.BitFlags(f).IsSet(cos.BitFlags(flag)) }
 func (f Flags) Set(flags Flags) Flags { return Flags(cos.BitFlags(f).Set(cos.BitFlags(flags))) }
-func (f Flags) Value() string         { return strconv.FormatUint(uint64(f), 10) }
+func (f Flags) String() string        { return strconv.FormatUint(uint64(f), 10) }
 
-func StrToFeat(s string) (Flags, error) {
+func IsBucketScope(name string) bool {
+	for i := range Bucket {
+		if name == Bucket[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func CSV2Feat(s string) (Flags, error) {
 	if s == "" || s == "none" {
 		return 0, nil
 	}
-	for i, name := range All {
+	for i, name := range Cluster {
 		if s == name {
 			return 1 << i, nil
 		}
@@ -61,14 +94,24 @@ func StrToFeat(s string) (Flags, error) {
 	return 0, errors.New("unknown feature flag '" + s + "'")
 }
 
-func (f Flags) String() (s string) {
-	for i, name := range All {
+func (f Flags) Names() (names []string) {
+	if f == 0 {
+		return names
+	}
+	for i, name := range Cluster {
 		if f&(1<<i) != 0 {
-			s += name + ","
+			names = append(names, name)
 		}
 	}
-	if s == "" {
-		return "none"
+	return names
+}
+
+func (f Flags) ClearName(n string) Flags {
+	for i, name := range Cluster {
+		if name == n {
+			of := Flags(1 << i)
+			return f &^ of
+		}
 	}
-	return s[:len(s)-1]
+	return f
 }

@@ -15,6 +15,9 @@
 # and so on. This rule holds for all AIS "applications" except `aisnode` itself.
 # See https://github.com/NVIDIA/aistore/tree/main/cmn/fname for the most updated locations.
 #
+# NOTE: Prometheus is the Local Playground's default; use TAGS to specify `statsd` and/or
+# any other non-default build tag.
+#
 ############################################
 
 if ! command -v go &> /dev/null; then
@@ -51,8 +54,11 @@ else
   fi
 fi
 
-AISTORE_PATH=$(cd "$(dirname "$0")/../../../"; pwd -P) # absolute path to aistore directory
+## NOTE: absolute path to aistore root
+## (should we use `git rev-parse --show-toplevel` instead?)
+AISTORE_PATH=$(cd "$(dirname "$0")/../../../"; pwd -P)
 source $AISTORE_PATH/deploy/dev/utils.sh
+
 AIS_USE_HTTPS=${AIS_USE_HTTPS:-false}
 AIS_HTTP_CHUNKED_TRANSFER=true
 HTTP_WRITE_BUFFER_SIZE=65536
@@ -75,7 +81,7 @@ if $AIS_USE_HTTPS; then
 fi
 LOG_ROOT="${LOG_ROOT:-/tmp/ais}${NEXT_TIER}"
 #### Authentication setup #########
-AIS_SECRET_KEY="${AIS_SECRET_KEY:-aBitLongSecretKey}"
+AIS_AUTHN_SECRET_KEY="${AIS_AUTHN_SECRET_KEY:-aBitLongSecretKey}"
 AIS_AUTHN_ENABLED="${AIS_AUTHN_ENABLED:-false}"
 AIS_AUTHN_SU_NAME="${AIS_AUTHN_SU_NAME:-admin}"
 AIS_AUTHN_SU_PASS="${AIS_AUTHN_SU_PASS:-admin}"
@@ -96,76 +102,87 @@ mkdir -p $APP_CONF_DIR
 COLLECTD_CONF_FILE="${APP_CONF_DIR}/collectd.conf"
 STATSD_CONF_FILE="${APP_CONF_DIR}/statsd.conf"
 
-
-TEST_FSPATH_COUNT=1
-
 if lsof -Pi :$PORT -sTCP:LISTEN -t >/dev/null; then
   exit_error "TCP port $PORT is not open (check if AIStore is already running)"
 fi
+
 TMPF=$(mktemp /tmp/ais$NEXT_TIER.XXXXXXXXX)
-touch $TMPF;
+touch $TMPF
+
 OS=$(uname -s)
 case $OS in
   Linux) # Linux
-    is_command_available "iostat" "-V"
-    is_command_available "lsblk" "--version"
-    is_command_available "df" "--version"
-    setfattr -n user.comment -v comment $TMPF
+    if ! [ -x "$(command -v setfattr)" ]; then
+      echo "Warning: setfattr not installed" >&2
+    elif ! setfattr -n user.comment -v comment $TMPF; then
+      echo "Warning: bad kernel configuration: extended attributes are not enabled."
+    fi
     ;;
   Darwin) # macOS
-    is_command_available "df" "--version"
-    xattr -w user.comment comment $TMPF
-    echo "WARNING: Darwin architecture is not yet fully supported. You may stumble upon bugs and issues when testing on Mac."
+    if ! xattr -w user.comment comment $TMPF; then
+      echo "Warning: bad macOS configuration: extended attributes are not enabled."
+    fi
+    echo "Warning: Darwin architecture is not yet fully supported. You may stumble upon bugs and issues when testing on Mac."
     ;;
   *)
     rm $TMPF 2>/dev/null
-    exit_error "'${OS}' is not supported"
+    echo "Error: '${OS}' is not supported."
+    exit 1
     ;;
 esac
-if [ $? -ne 0 ]; then
-  rm $TMPF 2>/dev/null
-  exit_error "bad kernel configuration: extended attributes are not enabled"
-fi
+
 rm $TMPF 2>/dev/null
 
-# Read target count
-echo "Enter number of storage targets:"
-read -r TARGET_CNT
-is_number ${TARGET_CNT}
+### begin reading STDIN =================== 5 steps below ========================================
 
-# Read proxy count
-echo "Enter number of proxies (gateways):"
-read -r PROXY_CNT
-is_number ${PROXY_CNT}
-if  [[ ${PROXY_CNT} -lt 1 && -z "${AIS_PRIMARY_HOST}" ]] ; then
-  exit_error "Number of proxies must be at least 1 if no external primary proxy is specified with AIS_PRIMARY_HOST. Received "${PROXY_CNT}""
-fi
-if [[ ${PROXY_CNT} -gt 1 ]] ; then
-  AIS_DISCOVERY_PORT=$((PORT + 1))
-  AIS_DISCOVERY_URL="http://$PRIMARY_HOST:$AIS_DISCOVERY_PORT"
-  if $AIS_USE_HTTPS; then
-    AIS_DISCOVERY_URL="https://$PRIMARY_HOST:$AIS_DISCOVERY_PORT"
+# 1. read target count
+  echo "Enter number of storage targets:"
+  read -r TARGET_CNT
+  is_number ${TARGET_CNT}
+
+# 2. read proxy count
+  echo "Enter number of proxies (gateways):"
+  read -r PROXY_CNT
+  is_number ${PROXY_CNT}
+  if  [[ ${PROXY_CNT} -lt 1 && -z "${AIS_PRIMARY_HOST}" ]] ; then
+    exit_error "Number of proxies must be at least 1 if no external primary proxy is specified with AIS_PRIMARY_HOST. Received "${PROXY_CNT}""
   fi
-fi
+  if [[ ${PROXY_CNT} -gt 1 ]] ; then
+    AIS_DISCOVERY_PORT=$((PORT + 1))
+    AIS_DISCOVERY_URL="http://$PRIMARY_HOST:$AIS_DISCOVERY_PORT"
+    if $AIS_USE_HTTPS; then
+      AIS_DISCOVERY_URL="https://$PRIMARY_HOST:$AIS_DISCOVERY_PORT"
+    fi
+  fi
 
-START=0
-END=$((TARGET_CNT + PROXY_CNT - 1))
+  START=0
+  END=$((TARGET_CNT + PROXY_CNT - 1))
 
-echo "Number of local mountpaths (enter 0 for preconfigured filesystems):"
-read test_fspath_cnt
-is_number ${test_fspath_cnt}
-TEST_FSPATH_COUNT=${test_fspath_cnt}
+# 3. read mountpath count (and notice the default)
+  if [[ ! -n "${TEST_FSPATH_COUNT+x}" ]]; then
+    echo "Number of local mountpaths (enter 0 for preconfigured filesystems):"
+    TEST_FSPATH_COUNT=$(read_fspath_count)
+  fi
+  ## default = 4
+  if [[ -z $TEST_FSPATH_COUNT ]]; then
+    TEST_FSPATH_COUNT=4
+  fi
 
-TEST_LOOPBACK_COUNT=0
+# 4. conditionally linked backends
+  set_env_backends
 
-# If not specified, AIS_BACKEND_PROVIDERS will remain empty (or `0`) and
-# aisnode build will include neither AWS ("aws") nor GCP ("gcp").
+# 5. finally, /dev/loop* devices, if any
+# see also: TEST_LOOPBACK_SIZE
+  TEST_LOOPBACK_COUNT=0
+  create_loopbacks_or_skip
 
-parse_backend_providers
+### end reading STDIN ============================ 5 steps above =================================
 
-create_loopbacks
-
-if ! AIS_BACKEND_PROVIDERS=${AIS_BACKEND_PROVIDERS}  make --no-print-directory -C ${AISTORE_PATH} node; then
+## NOTE: to enable StatsD instead of Prometheus, use build tag `statsd` in the make command, as follows:
+## TAGS=statsd make ...
+## see docs/metrics.md and docs/prometheus.md for more information.
+##
+if ! AIS_BACKEND_PROVIDERS=${AIS_BACKEND_PROVIDERS} make --no-print-directory -C ${AISTORE_PATH} node; then
   exit_error "failed to compile 'aisnode' binary"
 fi
 
@@ -213,10 +230,8 @@ for (( c=START; c<=END; c++ )); do
   pub_port=$(grep "\"port\":" ${AIS_LOCAL_CONF_FILE} | awk '{ print $2 }')
   pub_port=${pub_port:1:$((${#pub_port} - 3))}
   if [[ $c -eq 0 && $PROXY_CNT -gt 0 ]]; then
-    export AIS_IS_PRIMARY="true"
     run_cmd "${CMD} ${PROXY_PARAM}"
     listening_on+=${pub_port}
-    unset AIS_IS_PRIMARY
 
     # Wait for the proxy to start up
     sleep 2

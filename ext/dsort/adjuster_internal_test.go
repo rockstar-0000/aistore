@@ -1,6 +1,6 @@
 // Package dsort provides APIs for distributed archive file shuffling.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -14,7 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -27,7 +27,7 @@ func calcSemaLimit(acquire, release func()) int {
 	wg := &sync.WaitGroup{}
 	ch := make(chan int32, 200)
 
-	for j := 0; j < 200; j++ {
+	for range 200 {
 		acquire()
 		wg.Add(1)
 		go func() {
@@ -48,6 +48,13 @@ func calcSemaLimit(acquire, release func()) int {
 	}
 
 	return int(res)
+}
+
+func _abs(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return a
 }
 
 var _ = Describe("newConcAdjuster", func() {
@@ -100,8 +107,8 @@ var _ = Describe("newConcAdjuster", func() {
 			perfectLimit = 13
 			perfectUtil  = int(cfg.Disk.DiskUtilMaxWM+cfg.Disk.DiskUtilHighWM) / 2
 		)
-		availablePaths := fs.GetAvail()
-		mi := availablePaths[testingConfigDir]
+		avail := fs.GetAvail()
+		mi := avail[testingConfigDir]
 
 		adjuster := newConcAdjuster(0, 1)
 
@@ -116,7 +123,7 @@ var _ = Describe("newConcAdjuster", func() {
 			})
 
 			// If we get enough close we can just break
-			if cos.Abs(curLimit-perfectLimit) <= 1 {
+			if _abs(curLimit-perfectLimit) <= 1 {
 				break
 			}
 

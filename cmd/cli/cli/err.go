@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/cli/config"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
@@ -100,6 +101,10 @@ func isErrDoesNotExist(err error) bool {
 // misc. utils, helpers
 //
 
+func isCertificateVerificationError(err error) bool {
+	return strings.HasPrefix(err.Error(), "CertificateVerificationError")
+}
+
 func isUnreachableError(err error) (msg string, unreachable bool) {
 	switch err := err.(type) {
 	case *cmn.ErrHTTP:
@@ -125,6 +130,21 @@ func isUnreachableError(err error) (msg string, unreachable bool) {
 
 func redErr(err error) error {
 	msg := strings.TrimRight(err.Error(), "\n")
+	if i := strings.Index(msg, "Error:"); i >= 0 && len(msg) > i+10 {
+		// e.g. "CertificateVerificationError: ..."
+		if cos.IsAlphaNice(msg[:i]) {
+			typeCode := msg[:i+6]
+
+			// NOTE (usability vs hardcoded check)
+			// quoting Go source, "OpError is the error type usually returned by functions in the net package."
+			// the "Op" part in it is likely from "operation" - tells nothing...
+			if typeCode == "OpError:" {
+				typeCode = "NetworkError:"
+			}
+
+			return errors.New(fred(typeCode) + msg[i+6:])
+		}
+	}
 	return errors.New(fred("Error: ") + msg)
 }
 
@@ -160,11 +180,31 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 	case trailingShow:
 		sb.WriteString(prefix)
 		sb.WriteString(c.App.Name) // NOTE: the entire command-line (vs cliName)
-		sb.WriteString(" " + commandShow)
-		sb.WriteString(" " + c.Args()[0])
+		sb.WriteByte(' ')
+		sb.WriteString(commandShow)
+		sb.WriteByte(' ')
+		sb.WriteString(c.Args()[0])
 		sbWriteFlags(c, sb)
 		sb.WriteString("'?")
 		sbWriteSearch(sb, cmd, true)
+	case strings.Contains(cmd, apc.BckProviderSeparator):
+		_, objName, err := cmn.ParseBckObjectURI(cmd, cmn.ParseURIOpts{})
+		if err != nil {
+			return ""
+		}
+		sb.WriteString(prefix)
+		sb.WriteString(c.App.Name) // ditto
+		sbWriteTail(c, sb)
+		sb.WriteByte(' ')
+		if objName == "" {
+			sb.WriteString(commandBucket)
+		} else {
+			sb.WriteString(commandObject)
+		}
+		sb.WriteByte(' ')
+		sb.WriteString(cmd)
+		sbWriteFlags(c, sb)
+		sb.WriteString("'?")
 	case len(similar) == 1:
 		sb.WriteString(prefix)
 		msg := fmt.Sprintf("%v", similar)
@@ -176,7 +216,8 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 	case distance < max(incorrectCmdDistance, len(cmd)/2):
 		sb.WriteString(prefix)
 		sb.WriteString(c.App.Name) // ditto
-		sb.WriteString(" " + closestCommand)
+		sb.WriteByte(' ')
+		sb.WriteString(closestCommand)
 		sbWriteTail(c, sb)
 		sbWriteFlags(c, sb)
 		sb.WriteString("'?")
@@ -191,7 +232,8 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 func sbWriteTail(c *cli.Context, sb *strings.Builder) {
 	if c.NArg() > 1 {
 		for _, a := range c.Args()[1:] { // skip the wrong one
-			sb.WriteString(" " + a)
+			sb.WriteByte(' ')
+			sb.WriteString(a)
 		}
 	}
 }
@@ -279,15 +321,6 @@ func _errUsage(c *cli.Context, msg string) *errUsage {
 	}
 }
 
-func mistypedFlag(extraArgs []string) error {
-	for _, arg := range extraArgs {
-		if strings.HasPrefix(arg, flagPrefix) {
-			return fmt.Errorf("unrecognized option %q (a typo? see %s for details)", arg, qflprn(cli.HelpFlag))
-		}
-	}
-	return nil
-}
-
 // prints completion (TAB-TAB) error when calling AIS APIs
 func completionErr(c *cli.Context, err error) {
 	fmt.Fprintln(c.App.ErrWriter)
@@ -316,6 +349,7 @@ func V(err error) error {
 	return err
 }
 
+// with hints and tips (compare with `stripErr` below)
 func formatErr(err error) error {
 	if err == nil {
 		return nil
@@ -337,8 +371,43 @@ func formatErr(err error) error {
 		err.baseErr = formatErr(err.baseErr)
 		return err
 	default:
+		// unwrap and check assorted system error types
+		// (currently, only tls cert validation)
+		const tip = "\n(Tip: review CLI configuration ('ais config cli'), in particular tls and 'skip_verify' settings)"
+		if uerr := errors.Unwrap(err); uerr != nil {
+			if isCertificateVerificationError(uerr) {
+				err = errors.New(uerr.Error() + tip)
+			}
+		}
 		return redErr(err)
 	}
+}
+
+// remove "verb URL" from the error (compare with `formatErr`)
+// TODO: add more apc.URLPath* paths
+func stripErr(err error) error {
+	var (
+		s = err.Error()
+		l int
+	)
+	i := strings.Index(s, apc.URLPathObjects.S)
+	if i < 0 {
+		i = strings.Index(s, apc.URLPathBuckets.S)
+	}
+	if i < 0 {
+		return err
+	}
+
+	k := strings.Index(s[i+l:], " ")
+	if k < 0 || len(s) < i+l+k+5 {
+		return err
+	}
+	return errors.New(s[i+l+k+1:])
+}
+
+func isTimeout(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline")
 }
 
 func isStartingUp(err error) bool {

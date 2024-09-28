@@ -1,11 +1,11 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package fs_test
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -37,7 +37,6 @@ func TestWalkBck(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fs.TestNew(mock.NewIOS())
-			fs.TestDisableValidation()
 			fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
 
 			mpaths := make([]string, 0, test.mpathCnt)
@@ -47,7 +46,7 @@ func TestWalkBck(t *testing.T) {
 				}
 			}()
 
-			for i := 0; i < test.mpathCnt; i++ {
+			for range test.mpathCnt {
 				mpath, err := os.MkdirTemp("", "testwalk")
 				tassert.CheckFatal(t, err)
 
@@ -86,9 +85,10 @@ func TestWalkBck(t *testing.T) {
 					Bck: bck,
 					CTs: []string{fs.ObjectType},
 					Callback: func(fqn string, _ fs.DirEntry) error {
-						parsedFQN, err := fs.ParseFQN(fqn)
+						var parsed fs.ParsedFQN
+						err := parsed.Init(fqn)
 						tassert.CheckError(t, err)
-						objs = append(objs, parsedFQN.ObjName)
+						objs = append(objs, parsed.ObjName)
 						fqns = append(fqns, fqn)
 						return nil
 					},
@@ -124,7 +124,6 @@ func TestWalkBckSkipDir(t *testing.T) {
 	)
 
 	fs.TestNew(mock.NewIOS())
-	fs.TestDisableValidation()
 	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
 
 	defer func() {
@@ -133,7 +132,7 @@ func TestWalkBckSkipDir(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < mpathCnt; i++ {
+	for range mpathCnt {
 		mpath, err := os.MkdirTemp("", "testwalk")
 		tassert.CheckFatal(t, err)
 
@@ -152,7 +151,7 @@ func TestWalkBckSkipDir(t *testing.T) {
 		tassert.CheckFatal(t, err)
 
 		totalFilesCnt := rand.Int()%100 + minObjectsCnt
-		for i := 0; i < totalFilesCnt; i++ {
+		for range totalFilesCnt {
 			f, err := os.CreateTemp(dir, "")
 			tassert.CheckFatal(t, err)
 			f.Close()
@@ -170,18 +169,19 @@ func TestWalkBckSkipDir(t *testing.T) {
 			},
 			Sorted: true,
 		},
-		ValidateCallback: func(fqn string, de fs.DirEntry) error {
+		ValidateCb: func(fqn string, de fs.DirEntry) error {
+			var parsed fs.ParsedFQN
 			if de.IsDir() {
 				return nil
 			}
-			parsedFQN, err := fs.ParseFQN(fqn)
+			err := parsed.Init(fqn)
 			tassert.CheckError(t, err)
-			cos.Assert(!mpaths[parsedFQN.Mountpath.Path].done)
+			cos.Assert(!mpaths[parsed.Mountpath.Path].done)
 			if rand.Int()%10 == 0 {
-				mpaths[parsedFQN.Mountpath.Path].done = true
+				mpaths[parsed.Mountpath.Path].done = true
 				return filepath.SkipDir
 			}
-			mpaths[parsedFQN.Mountpath.Path].total++
+			mpaths[parsed.Mountpath.Path].total++
 			return nil
 		},
 	})

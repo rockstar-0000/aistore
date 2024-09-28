@@ -74,7 +74,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 		bck := meta.CloneBck((*cmn.Bck)(qbck))
 		if err := bck.Init(t.owner.bmd); err != nil {
 			if cmn.IsErrRemoteBckNotFound(err) {
-				if cos.IsParseBool(dpq.dontAddRemote) {
+				if dpq.dontAddRemote {
 					// don't add it - proceed anyway (TODO: assert(wantOnlyRemote) below)
 					err = nil
 				} else {
@@ -84,7 +84,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 				}
 			}
 			if err != nil {
-				t.statsT.IncErr(stats.ListCount)
+				t.statsT.IncErr(stats.ErrListCount)
 				t.writeErr(w, r, err)
 				return
 			}
@@ -103,7 +103,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 			return
 		}
 		if ok := t.listObjects(w, r, bck, lsmsg); !ok {
-			t.statsT.IncErr(stats.ListCount)
+			t.statsT.IncErr(stats.ErrListCount)
 			return
 		}
 		delta := mono.SinceNano(begin)
@@ -143,7 +143,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 		if qbck.IsBucket() {
 			if err := bck.Init(t.owner.bmd); err != nil {
 				if cmn.IsErrRemoteBckNotFound(err) {
-					if bsumMsg.DontAddRemote || cos.IsParseBool(dpq.dontAddRemote) {
+					if bsumMsg.DontAddRemote || dpq.dontAddRemote {
 						// don't add it - proceed anyway
 						err = nil
 					} else {
@@ -175,10 +175,10 @@ func (t *target) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Q
 		code   int
 	)
 	if qbck.Provider != "" {
-		if qbck.IsAIS() || qbck.IsHTTP() { // built-in providers
+		if qbck.IsAIS() || qbck.IsHT() { // built-in providers
 			bcks = bmd.Select(qbck)
 		} else {
-			bcks, code, err = t.blist(qbck, config, bmd)
+			bcks, code, err = t.blist(qbck, config)
 			if err != nil {
 				if _, ok := err.(*cmn.ErrMissingBackend); !ok {
 					err = cmn.NewErrFailedTo(t, "list buckets", qbck.String(), err, code)
@@ -191,10 +191,10 @@ func (t *target) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Q
 		for provider := range apc.Providers {
 			var buckets cmn.Bcks
 			qbck.Provider = provider
-			if qbck.IsAIS() || qbck.IsHTTP() {
+			if qbck.IsAIS() || qbck.IsHT() {
 				buckets = bmd.Select(qbck)
 			} else {
-				buckets, code, err = t.blist(qbck, config, bmd)
+				buckets, code, err = t.blist(qbck, config)
 				if err != nil {
 					if _, ok := err.(*cmn.ErrMissingBackend); !ok { // note on top of this func
 						t.writeErr(w, r, err, code)
@@ -210,10 +210,10 @@ func (t *target) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Q
 	t.writeJSON(w, r, bcks, "list-buckets")
 }
 
-func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config, bmd *bucketMD) (bcks cmn.Bcks, errCode int, err error) {
+func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config) (bcks cmn.Bcks, ecode int, err error) {
 	// validate
 	debug.Assert(!qbck.IsAIS())
-	if qbck.IsCloud() || qbck.IsHDFS() { // must be configured
+	if qbck.IsCloud() { // must be configured
 		if config.Backend.Get(qbck.Provider) == nil {
 			err = &cmn.ErrMissingBackend{Provider: qbck.Provider}
 			return
@@ -225,25 +225,20 @@ func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config, bmd *bucketMD) (
 			// otherwise go ahead and try to list below
 		}
 	}
-	// hdfs cannot list
-	if qbck.IsHDFS() {
-		bcks = bmd.Select(qbck)
-		return
-	}
 	backend := t.Backend((*meta.Bck)(qbck))
 	if qbck.IsBucket() {
 		var (
 			bck = (*meta.Bck)(qbck)
 			ctx = context.Background()
 		)
-		_, errCode, err = backend.HeadBucket(ctx, bck)
+		_, ecode, err = backend.HeadBucket(ctx, bck)
 		if err == nil {
 			bcks = cmn.Bcks{bck.Clone()}
-		} else if errCode == http.StatusNotFound {
+		} else if ecode == http.StatusNotFound {
 			err = nil
 		}
 	} else {
-		bcks, errCode, err = backend.ListBuckets(*qbck)
+		bcks, ecode, err = backend.ListBuckets(*qbck)
 	}
 	if err == nil && len(bcks) > 1 {
 		sort.Sort(bcks)
@@ -251,7 +246,7 @@ func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config, bmd *bucketMD) (
 	return
 }
 
-// returns `cmn.LsoResult` containing object names and (requested) props
+// returns `cmn.LsoRes` containing object names and (requested) props
 // control/scope - via `apc.LsoMsg`
 func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lsmsg *apc.LsoMsg) (ok bool) {
 	// (advanced) user-selected target to execute remote ls
@@ -266,12 +261,12 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 
 	var (
 		xctn core.Xact
-		rns  = xreg.RenewLso(bck, lsmsg.UUID, lsmsg)
+		rns  = xreg.RenewLso(bck, lsmsg.UUID, lsmsg, r.Header)
 	)
 	// check that xaction hasn't finished prior to this page read, restart if needed
 	if rns.Err == xs.ErrGone {
 		runtime.Gosched()
-		rns = xreg.RenewLso(bck, lsmsg.UUID, lsmsg)
+		rns = xreg.RenewLso(bck, lsmsg.UUID, lsmsg, r.Header)
 	}
 	if rns.Err != nil {
 		t.writeErr(w, r, rns.Err)
@@ -322,7 +317,7 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck
 	// never started
 	if xctn == nil {
 		err := cos.NewErrNotFound(t, apc.ActSummaryBck+" job "+msg.UUID)
-		t._erris(w, r, dpq.silent, err, http.StatusNotFound)
+		t._erris(w, r, err, http.StatusNotFound, dpq.silent)
 		return
 	}
 
@@ -370,8 +365,7 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	switch msg.Action {
 	case apc.ActEvictRemoteBck:
 		keepMD := cos.IsParseBool(apireq.query.Get(apc.QparamKeepRemote))
-		// HDFS buckets will always keep metadata so they can re-register later
-		if apireq.bck.IsHDFS() || keepMD {
+		if keepMD {
 			nlp := newBckNLP(apireq.bck)
 			nlp.Lock()
 			defer nlp.Unlock()
@@ -443,8 +437,8 @@ func (t *target) httpbckpost(w http.ResponseWriter, r *http.Request, apireq *api
 		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
 		return
 	}
-	if errCode, err := t.runPrefetch(msg.UUID, apireq.bck, prfMsg); err != nil {
-		t.writeErr(w, r, err, errCode)
+	if ecode, err := t.runPrefetch(msg.UUID, apireq.bck, prfMsg); err != nil {
+		t.writeErr(w, r, err, ecode)
 	}
 }
 
@@ -492,12 +486,12 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 		pid := apireq.query.Get(apc.QparamProxyID)
-		nlog.Infof("%s %s <= %s", r.Method, apireq.bck, pid)
+		nlog.Infoln(r.Method, apireq.bck, "<=", pid)
 	}
 
 	debug.Assert(!apireq.bck.IsAIS())
 
-	if apireq.bck.IsHTTP() {
+	if apireq.bck.IsHT() {
 		originalURL := apireq.query.Get(apc.QparamOrigURL)
 		ctx = context.WithValue(ctx, cos.CtxOriginalURL, originalURL)
 		if !inBMD && originalURL == "" {
@@ -515,7 +509,7 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 				t.writeErr(w, r, err, code, Silent)
 			} else {
 				err = cmn.NewErrFailedTo(t, "HEAD remote bucket", apireq.bck, err, code)
-				t._erris(w, r, apireq.query.Get(apc.QparamSilent), err, code)
+				t._erris(w, r, err, code, cos.IsParseBool(apireq.query.Get(apc.QparamSilent)))
 			}
 			return
 		}

@@ -1,25 +1,44 @@
 // Package env contains environment variables
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package env
 
-// See also: docs/environment-vars.md
+// NOTE not included:
+// - "AIS_READ_HEADER_TIMEOUT"
+// - "AIS_DAEMON_ID"
+// - "AIS_HOST_IP", "AIS_HOST_PORT" - local playground (target only)
+// - "AIS_TARGET_URL"               - ETL
+//
+// See also:
+// - docs/environment-vars.md
 
 var (
 	AIS = struct {
+		// endpoint: client | primary startup
 		Endpoint  string
-		IsPrimary string
-		PrimaryID string
-		UseHTTPS  string
+		PrimaryEP string
+
+		// networking: two CIDR masks
+		LocalRedirectCIDR string
+		PubIPv4CIDR       string
+
+		//
+		// HTTPS
+		// for details and background, see: https://github.com/NVIDIA/aistore/blob/main/docs/environment-vars.md#https
+		//
+		UseHTTPS string
 		// TLS: client side
 		Certificate   string
 		CertKey       string
 		ClientCA      string
 		SkipVerifyCrt string
+		// TLS: server (aistore, AuthN) side (NOTE comment below)
+
 		// tests, CI
 		NumTarget string
 		NumProxy  string
+
 		// K8s
 		K8sPod       string
 		K8sNode      string
@@ -27,17 +46,29 @@ var (
 	}{
 		// the way to designate primary when cluster's starting up
 		Endpoint:  "AIS_ENDPOINT",
-		IsPrimary: "AIS_IS_PRIMARY",
-		PrimaryID: "AIS_PRIMARY_ID",
+		PrimaryEP: "AIS_PRIMARY_EP",
+
+		// two CIDRs, respectively:
+		// 1. differentiate local (same CIDR) clients for faster HTTP redirect
+		// 2. at node startup: when present with multiple choices, select one matching local unicast IP
+		//    to use it as node's public interface
+		LocalRedirectCIDR: "AIS_CLUSTER_CIDR",
+		PubIPv4CIDR:       "AIS_PUBLIC_IP_CIDR",
 
 		// false: HTTP transport, with all the TLS config (below) ignored
 		// true:  HTTPS/TLS
+		// for details and background, see: https://github.com/NVIDIA/aistore/blob/main/docs/environment-vars.md#https
 		UseHTTPS: "AIS_USE_HTTPS", // cluster config: "net.http.use_https"
 
 		// TLS: client side
 		Certificate: "AIS_CRT",
 		CertKey:     "AIS_CRT_KEY",
 		ClientCA:    "AIS_CLIENT_CA",
+
+		// TLS: server (aistore, AuthN) side
+		// "AIS_SERVER_CRT" - TLS certificate (pathname)
+		// "AIS_SERVER_KEY" - private key (ditto)
+
 		// TLS: common
 		SkipVerifyCrt: "AIS_SKIP_VERIFY_CRT", // cluster config: "net.http.skip_verify"
 
@@ -47,7 +78,7 @@ var (
 
 		// via ais-k8s repo
 		// see also:
-		// * https://github.com/NVIDIA/ais-k8s/blob/master/operator/pkg/resources/cmn/env.go
+		// * https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go
 		// * docs/environment-vars.md
 		K8sPod:       "MY_POD",
 		K8sNode:      "MY_NODE",

@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/karrick/godirwalk"
@@ -41,6 +42,7 @@ type (
 		Callback walkFunc
 		Bck      cmn.Bck
 		Dir      string
+		Prefix   string
 		CTs      []string
 		Sorted   bool
 	}
@@ -107,20 +109,25 @@ func Walk(opts *WalkOpts) error {
 		ew   = &errCallbackWrapper{}
 	)
 	if opts.Dir != "" {
+		debug.Assert(opts.Prefix == "")
 		fqns = append(fqns, opts.Dir)
-	} else {
+	} else if opts.Bck.Name != "" {
 		debug.Assert(len(opts.CTs) > 0)
-		if opts.Bck.Name != "" {
-			// walk specific content-types inside the bucket.
-			for _, ct := range opts.CTs {
-				fqns = append(fqns, opts.Mi.MakePathCT(&opts.Bck, ct))
+		// one bucket
+		for _, ct := range opts.CTs {
+			bdir := opts.Mi.MakePathCT(&opts.Bck, ct)
+			if opts.Prefix != "" {
+				fqns = append(fqns, _join(bdir, opts.Prefix))
+			} else {
+				fqns = append(fqns, bdir)
 			}
-		} else {
-			// all content-type paths for all bucket subdirectories
-			fqns, err = allMpathCTpaths(opts)
-			if len(fqns) == 0 || err != nil {
-				return err
-			}
+		}
+	} else {
+		// all buckets
+		debug.Assert(len(opts.CTs) > 0)
+		fqns, err = allMpathCTpaths(opts)
+		if len(fqns) == 0 || err != nil {
+			return err
 		}
 	}
 	scratch, slab := memsys.PageMM().AllocSize(memsys.DefaultBufSize)
@@ -135,9 +142,8 @@ func Walk(opts *WalkOpts) error {
 		if err1 == nil || os.IsNotExist(err1) {
 			continue
 		}
-		// NOTE: mountpath is getting detached or disabled
-		if cmn.IsErrMountpathNotFound(err1) {
-			nlog.Errorln(err1)
+		if cmn.IsErrMpathNotFound(err1) {
+			nlog.Errorln(err1) // mountpath is getting detached or disabled
 			continue
 		}
 		if cmn.IsErrAborted(err1) {
@@ -148,13 +154,32 @@ func Walk(opts *WalkOpts) error {
 			}
 			continue
 		}
-		if err1 != context.Canceled && !cos.IsNotExist(err1, 0) {
-			nlog.Errorln(err1)
+		if err1 != context.Canceled && !cmn.IsErrObjNought(err1) {
+			nlog.Errorln(err)
 		}
 		err = err1
 	}
 	slab.Free(scratch)
 	return err
+}
+
+func _join(bdir, prefix string) string {
+	if cos.IsLastB(prefix, filepath.Separator) {
+		// easy choice: is the sub-directory to walk
+		// (ie., not walking the entire parent - just this one)
+		return bdir + cos.PathSeparator + prefix
+	}
+	if !cmn.Rom.Features().IsSet(feat.DontOptimizeVirtualDir) {
+		sub := bdir + cos.PathSeparator + prefix
+		// uneasy choice: if `sub` is an actual directory we further assume
+		// (unless user says otherwise via feature flag)
+		// _not_ to have the names that contain it as a prefix substring
+		// (as in: "subdir/foo" and "subdir_bar")
+		if finfo, err := os.Stat(sub); err == nil && finfo.IsDir() {
+			return sub
+		}
+	}
+	return bdir
 }
 
 func allMpathCTpaths(opts *WalkOpts) (fqns []string, err error) {
@@ -174,7 +199,12 @@ func allMpathCTpaths(opts *WalkOpts) (fqns []string, err error) {
 			continue
 		}
 		for _, ct := range opts.CTs {
-			fqns = append(fqns, opts.Mi.MakePathCT(&bck, ct))
+			bdir := opts.Mi.MakePathCT(&bck, ct)
+			if opts.Prefix != "" {
+				fqns = append(fqns, _join(bdir, opts.Prefix))
+			} else {
+				fqns = append(fqns, bdir)
+			}
 		}
 	}
 	return

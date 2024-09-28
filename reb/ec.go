@@ -47,12 +47,12 @@ import (
 
 func (reb *Reb) runECjoggers() {
 	var (
-		wg             = &sync.WaitGroup{}
-		availablePaths = fs.GetAvail()
-		cfg            = cmn.GCO.Get()
-		b              = reb.xctn().Bck()
+		wg    = &sync.WaitGroup{}
+		avail = fs.GetAvail()
+		cfg   = cmn.GCO.Get()
+		b     = reb.xctn().Bck()
 	)
-	for _, mi := range availablePaths {
+	for _, mi := range avail {
 		bck := cmn.Bck{Provider: apc.AIS}
 		if b != nil {
 			bck = cmn.Bck{Name: b.Name, Provider: apc.AIS, Ns: b.Ns}
@@ -61,7 +61,7 @@ func (reb *Reb) runECjoggers() {
 		go reb.jogEC(mi, &bck, wg)
 	}
 	for _, provider := range cfg.Backend.Providers {
-		for _, mi := range availablePaths {
+		for _, mi := range avail {
 			bck := cmn.Bck{Provider: provider.Name}
 			if b != nil {
 				bck = cmn.Bck{Name: bck.Name, Provider: provider.Name, Ns: bck.Ns}
@@ -181,7 +181,7 @@ func (reb *Reb) saveCTToDisk(ntfn *stageNtfn, hdr *transport.ObjHdr, data io.Rea
 		err = ec.WriteSliceAndMeta(hdr, args)
 	} else {
 		var lom *core.LOM
-		lom, err = core.AllocLomFromHdr(hdr)
+		lom, err = ec.AllocLomFromHdr(hdr)
 		if err == nil {
 			args := &ec.WriteArgs{Reader: data, MD: md, Cksum: hdr.ObjAttrs.Cksum, Xact: reb.xctn()}
 			err = ec.WriteReplicaAndMeta(lom, args)
@@ -210,7 +210,8 @@ func (reb *Reb) findEmptyTarget(md *ec.Metadata, ct *core.CT, sender string) (*m
 	var (
 		sliceCnt     = md.Data + md.Parity + 2
 		smap         = reb.smap.Load()
-		hrwList, err = smap.HrwTargetList(ct.Bck().MakeUname(ct.ObjectName()), sliceCnt)
+		uname        = ct.UnamePtr()
+		hrwList, err = smap.HrwTargetList(uname, sliceCnt)
 	)
 	if err != nil {
 		return nil, err

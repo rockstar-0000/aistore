@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -47,7 +47,7 @@ type detect struct {
 	offset int
 }
 
-var FileExtensions = []string{ExtTar, ExtTgz, ExtTarGz, ExtZip, ExtTarLz4}
+var FileExtensions = [...]string{ExtTar, ExtTgz, ExtTarGz, ExtZip, ExtTarLz4}
 
 // standard file signatures
 var (
@@ -112,7 +112,7 @@ func byExt(filename string) (string, error) {
 }
 
 // NOTE convention: caller may pass nil `smm` _not_ to spend time (usage: listing and reading)
-func MimeFile(file *os.File, smm *memsys.MMSA, mime, archname string) (m string, err error) {
+func MimeFile(file cos.LomReader, smm *memsys.MMSA, mime, archname string) (m string, err error) {
 	m, err = Mime(mime, archname)
 	if err == nil || IsErrUnknownMime(err) {
 		return
@@ -126,9 +126,11 @@ func MimeFile(file *os.File, smm *memsys.MMSA, mime, archname string) (m string,
 		n         int
 		buf, slab = smm.AllocSize(sizeDetectMime)
 	)
-	m, n, err = _detect(file, archname, buf)
+	m, n, err = _detect(file, archname, m, buf)
 	if n > 0 {
-		_, errV := file.Seek(0, io.SeekStart)
+		fh, ok := file.(*os.File)
+		cos.Assertf(ok, "expecting os.File, got %T", file)
+		_, errV := fh.Seek(0, io.SeekStart)
 		debug.AssertNoErr(errV)
 		if err == nil {
 			err = errV
@@ -158,28 +160,37 @@ func MimeFQN(smm *memsys.MMSA, mime, archname string) (m string, err error) {
 		return "", err
 	}
 	buf, slab := smm.AllocSize(sizeDetectMime)
-	m, _, err = _detect(fh, archname, buf)
+	m, _, err = _detect(fh, archname, m, buf)
 	slab.Free(buf)
 	cos.Close(fh)
 	return
 }
 
-func _detect(file *os.File, archname string, buf []byte) (m string, n int, err error) {
-	n, err = file.Read(buf)
+func _detect(file cos.LomReader, archname, mime string, buf []byte) (string, int, error) {
+	n, err := file.Read(buf)
 	if err != nil {
-		return
+		return "", 0, err
 	}
-	if n < sizeDetectMime {
-		err = NewErrUnknownFileExt(archname, "file is too short")
-		return
+	switch mime {
+	case ExtTar:
+		if n < sizeDetectMime {
+			return "", n, NewErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTar, sizeDetectMime))
+		}
+	case ExtTarGz:
+		if l := magicGzip.offset + len(magicGzip.sig) + 4; n < l {
+			return "", n, NewErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTarGz, l))
+		}
+	case ExtTarLz4:
+		if l := magicLz4.offset + len(magicLz4.sig) + 4; n < l {
+			return "", n, NewErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTarGz, l))
+		}
 	}
 	for _, magic := range allMagics {
 		if n > magic.offset && bytes.HasPrefix(buf[magic.offset:], magic.sig) {
 			return magic.mime, n, nil
 		}
 	}
-	err = fmt.Errorf("failed to detect supported file signatures in %q", archname)
-	return
+	return "", n, fmt.Errorf("failed to detect supported file signatures in %q", archname)
 }
 
 func EqExt(ext1, ext2 string) bool {

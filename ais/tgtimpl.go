@@ -22,33 +22,24 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
-// interface guard
-var _ core.Target = (*target)(nil)
-
-func (t *target) FSHC(err error, path string) { t.fsErr(err, path) }
-func (t *target) PageMM() *memsys.MMSA        { return t.gmm }
-func (t *target) ByteMM() *memsys.MMSA        { return t.smm }
+func (*target) DataClient() *http.Client { return g.client.data }
 
 func (*target) GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	xreg.GetAllRunning(inout, periodic)
 }
 
 func (t *target) Health(si *meta.Snode, timeout time.Duration, query url.Values) ([]byte, int, error) {
-	return t.reqHealth(si, timeout, query, t.owner.smap.get())
+	return t.reqHealth(si, timeout, query, t.owner.smap.get(), false /*retry*/)
 }
 
-func (t *target) Backend(bck *meta.Bck) core.BackendProvider {
+func (t *target) Backend(bck *meta.Bck) core.Backend {
 	if bck.IsRemoteAIS() {
 		return t.backend[apc.AIS]
-	}
-	if bck.IsHTTP() {
-		return t.backend[apc.HTTP]
 	}
 	provider := bck.Provider
 	if bck.Props != nil {
@@ -63,7 +54,7 @@ func (t *target) Backend(bck *meta.Bck) core.BackendProvider {
 		}
 		// nil when configured & not-built
 	}
-	c, _ := backend.NewDummyBackend(t)
+	c, _ := backend.NewDummyBackend(t, nil)
 	return c
 }
 
@@ -89,11 +80,11 @@ func (t *target) PutObject(lom *core.LOM, params *core.PutParams) error {
 	}
 	_, err := poi.putObject()
 	freePOI(poi)
-	debug.Assert(err != nil || params.Size <= 0 || params.Size == lom.SizeBytes(true), lom.String(), params.Size, lom.SizeBytes(true))
+	debug.Assert(err != nil || params.Size <= 0 || params.Size == lom.Lsize(true), lom.String(), params.Size, lom.Lsize(true))
 	return err
 }
 
-func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt cmn.OWT) (errCode int, err error) {
+func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt cmn.OWT) (ecode int, err error) {
 	if err = cos.Stat(workFQN); err != nil {
 		return
 	}
@@ -106,13 +97,13 @@ func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt 
 		poi.owt = owt
 		poi.xctn = xctn
 	}
-	errCode, err = poi.finalize()
+	ecode, err = poi.finalize()
 	freePOI(poi)
 	return
 }
 
-func (t *target) EvictObject(lom *core.LOM) (errCode int, err error) {
-	errCode, err = t.DeleteObject(lom, true /*evict*/)
+func (t *target) EvictObject(lom *core.LOM) (ecode int, err error) {
+	ecode, err = t.DeleteObject(lom, true /*evict*/)
 	return
 }
 
@@ -154,7 +145,7 @@ func (t *target) CopyObject(lom *core.LOM, dm core.DM, params *core.CopyParams) 
 }
 
 // use `backend.GetObj` (compare w/ other instances calling `backend.GetObjReader`)
-func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (errCode int, err error) {
+func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (ecode int, err error) {
 	// 1. lock
 	switch owt {
 	case cmn.OwtGetPrefetchLock:
@@ -163,7 +154,7 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (errCo
 		if owt == cmn.OwtGetTryLock {
 			if !lom.TryLock(true) {
 				if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-					nlog.Warningf("%s: %s(%s) is busy", t, lom, owt)
+					nlog.Warningln(t.String(), lom.String(), owt.String(), "is busy")
 				}
 				return 0, cmn.ErrSkip // e.g. prefetch can skip it and keep on going
 			}
@@ -177,13 +168,16 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (errCo
 	}
 
 	// 2. GET remote object and store it
-	now := mono.NanoTime()
-	if errCode, err = t.Backend(lom.Bck()).GetObj(ctx, lom, owt); err != nil {
+	var (
+		now     = mono.NanoTime()
+		backend = t.Backend(lom.Bck())
+	)
+	if ecode, err = backend.GetObj(ctx, lom, owt, nil /*origReq*/); err != nil {
 		if owt != cmn.OwtGetPrefetchLock {
 			lom.Unlock(true)
 		}
-		nlog.Infoln(t.String()+":", "failed to GET remote", lom.Cname()+":", err, errCode)
-		return errCode, err
+		nlog.Infoln(t.String()+":", "failed to GET remote", lom.Cname()+":", err, ecode)
+		return ecode, err
 	}
 
 	// 3. unlock
@@ -195,30 +189,52 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (errCo
 	}
 
 	// 4. stats
-	t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetColdSize, Value: lom.SizeBytes()},
-		cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(now)},
-	)
+	t.coldstats(backend, lom.Lsize(), now)
 	return 0, nil
 }
 
-func (t *target) GetColdBlob(lom *core.LOM, oa *cmn.ObjAttrs) (xctn core.Xact, err error) {
-	var args apc.BlobMsg
-	_, xctn, err = t.blobdl(lom, oa, &args, nil /*writer*/)
+func (t *target) coldstats(backend core.Backend, size, started int64) {
+	t.statsT.AddMany(
+		cos.NamedVal64{Name: backend.MetricName(stats.GetCount), Value: 1},
+		cos.NamedVal64{Name: backend.MetricName(stats.GetLatencyTotal), Value: mono.SinceNano(started)},
+		cos.NamedVal64{Name: backend.MetricName(stats.GetSize), Value: size},
+	)
+}
+
+func (t *target) GetColdBlob(params *core.BlobParams, oa *cmn.ObjAttrs) (xctn core.Xact, err error) {
+	debug.Assert(params.Lom != nil)
+	debug.Assert(params.Msg != nil)
+	_, xctn, err = t.blobdl(params, oa)
 	return xctn, err
 }
 
-func (t *target) Promote(params *core.PromoteParams) (errCode int, err error) {
+func (t *target) HeadCold(lom *core.LOM, origReq *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
+	var (
+		backend = t.Backend(lom.Bck())
+		now     = mono.NanoTime()
+	)
+	oa, ecode, err = backend.HeadObj(context.Background(), lom, origReq)
+	if err != nil {
+		t.statsT.IncErr(stats.ErrHeadCount)
+	} else {
+		t.statsT.AddMany(
+			cos.NamedVal64{Name: backend.MetricName(stats.HeadCount), Value: 1},
+			cos.NamedVal64{Name: backend.MetricName(stats.HeadLatencyTotal), Value: mono.SinceNano(now)},
+		)
+	}
+	return oa, ecode, err
+}
+
+func (t *target) Promote(params *core.PromoteParams) (ecode int, err error) {
 	lom := core.AllocLOM(params.ObjName)
 	if err = lom.InitBck(params.Bck.Bucket()); err == nil {
-		errCode, err = t._promote(params, lom)
+		ecode, err = t._promote(params, lom)
 	}
 	core.FreeLOM(lom)
 	return
 }
 
-func (t *target) _promote(params *core.PromoteParams, lom *core.LOM) (errCode int, err error) {
+func (t *target) _promote(params *core.PromoteParams, lom *core.LOM) (ecode int, err error) {
 	smap := t.owner.smap.get()
 	tsi, local, erh := lom.HrwTarget(&smap.Smap)
 	if erh != nil {
@@ -226,7 +242,7 @@ func (t *target) _promote(params *core.PromoteParams, lom *core.LOM) (errCode in
 	}
 	var size int64
 	if local {
-		size, errCode, err = t._promLocal(params, lom)
+		size, ecode, err = t._promLocal(params, lom)
 	} else {
 		size, err = t._promRemote(params, lom, tsi, smap)
 		if err == nil && size >= 0 && params.Xact != nil {
@@ -247,7 +263,7 @@ func (t *target) _promote(params *core.PromoteParams, lom *core.LOM) (errCode in
 	return
 }
 
-func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize int64, errCode int, err error) {
+func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize int64, ecode int, err error) {
 	var (
 		cksum     *cos.CksumHash
 		workFQN   string
@@ -319,7 +335,7 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 		poi.xctn = params.Xact
 	}
 	lom.SetSize(fileSize)
-	errCode, err = poi.finalize()
+	ecode, err = poi.finalize()
 	freePOI(poi)
 	return
 }
@@ -346,14 +362,4 @@ func (t *target) _promRemote(params *core.PromoteParams, lom *core.LOM, tsi *met
 	core.FreeCOI(coiParams)
 
 	return size, err
-}
-
-//
-// implements health.fspathDispatcher interface
-//
-
-func (t *target) DisableMpath(mpath, reason string) (err error) {
-	nlog.Warningf("Disabling mountpath %s: %s", mpath, reason)
-	_, err = t.fsprg.disableMpath(mpath, true /*dont-resilver*/) // NOTE: not resilvering upon FSCH calling
-	return
 }

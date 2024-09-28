@@ -27,9 +27,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -76,15 +75,6 @@ const (
 
 	defaultClusterIP   = "localhost"
 	defaultClusterIPv4 = "127.0.0.1"
-
-	// environment variable to globally override the default 'https://s3.amazonaws.com' endpoint
-	// NOTE: the same can be done by passing a flag to aisloader `-s3endpoint`
-	// (`-s3endpoint` flag will always take precedence)
-	awsEnvS3Endpoint = "S3_ENDPOINT"
-
-	// ditto non-default profile (the default is [default] in ~/.aws/credentials)
-	// same NOTE in re precedence
-	awsEnvConfigProfile = "AWS_PROFILE"
 )
 
 type (
@@ -150,6 +140,7 @@ type (
 		traceHTTP     bool // trace http latencies as per httpLatencies & https://golang.org/pkg/net/http/httptrace
 		latest        bool // check in-cluster metadata and possibly GET the latest object version from the associated remote bucket
 		cached        bool // list in-cluster objects - only those objects from a remote bucket that are present (\"cached\")
+		listDirs      bool // do list virtual subdirectories (applies to remote buckets only)
 	}
 
 	// sts records accumulated puts/gets information.
@@ -209,8 +200,9 @@ var (
 
 	s3svc *s3.Client // s3 client - see s3ListObjects
 
-	s3Endpoint string
-	s3Profile  string
+	s3Endpoint     string
+	s3Profile      string
+	s3UsePathStyle bool
 
 	loggedUserToken string
 )
@@ -282,7 +274,10 @@ func Start(version, buildtime string) (err error) {
 			return fmt.Errorf("failed to get cluster map: %v", err)
 		}
 	}
-	loggedUserToken = authn.LoadToken(runParams.tokenFile)
+	loggedUserToken, err = authn.LoadToken(runParams.tokenFile)
+	if err != nil && runParams.tokenFile != "" {
+		return err
+	}
 	runParams.bp.Token = loggedUserToken
 	runParams.bp.UA = ua
 
@@ -296,6 +291,10 @@ func Start(version, buildtime string) (err error) {
 	if isDirectS3() {
 		if err := initS3Svc(); err != nil {
 			return err
+		}
+	} else {
+		if s3UsePathStyle {
+			return errors.New("cannot use '-s3-use-path-style' without '-s3endpoint'")
 		}
 	}
 
@@ -313,7 +312,10 @@ func Start(version, buildtime string) (err error) {
 
 		objsLen := bucketObjsNames.Len()
 		if runParams.putPct == 0 && objsLen == 0 {
-			return errors.New("nothing to read, the bucket is empty")
+			if runParams.subDir == "" {
+				return errors.New("the bucket is empty, cannot run 100% read benchmark")
+			}
+			return errors.New("no objects with prefix '" + runParams.subDir + "' in the bucket, cannot run 100% read benchmark")
 		}
 
 		fmt.Printf("Found %s existing object%s\n\n", cos.FormatBigNum(objsLen), cos.Plural(objsLen))
@@ -351,8 +353,8 @@ func Start(version, buildtime string) (err error) {
 	// init housekeeper and memsys;
 	// empty config to use memsys constants;
 	// alternatively: "memsys": { "min_free": "2gb", ... }
-	hk.Init(&stopping)
-	go hk.DefaultHK.Run()
+	hk.Init()
+	go hk.HK.Run()
 	hk.WaitStarted()
 
 	config := &cmn.Config{}
@@ -382,7 +384,7 @@ func Start(version, buildtime string) (err error) {
 	workCh = make(chan *workOrder, runParams.numWorkers)
 	resCh = make(chan *workOrder, runParams.numWorkers)
 	wg := &sync.WaitGroup{}
-	for i := 0; i < runParams.numWorkers; i++ {
+	for range runParams.numWorkers {
 		wg.Add(1)
 		go worker(workCh, resCh, wg, &numGets)
 	}
@@ -424,7 +426,7 @@ func Start(version, buildtime string) (err error) {
 	preWriteStats(statsWriter, runParams.jsonFormat)
 
 	// Get the workers started
-	for i := 0; i < runParams.numWorkers; i++ {
+	for range runParams.numWorkers {
 		if err = postNewWorkOrder(); err != nil {
 			break
 		}
@@ -524,7 +526,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.IntVar(&p.statsShowInterval, "statsinterval", 10, "interval in seconds to print performance counters; 0 - disabled")
 	f.StringVar(&p.bck.Name, "bucket", "", "bucket name or bucket URI. If empty, a bucket with random name will be created")
 	f.StringVar(&p.bck.Provider, "provider", apc.AIS,
-		"ais - for AIS bucket, \"aws\", \"azure\", \"gcp\", \"hdfs\"  for Azure, Amazon, Google, and HDFS clouds respectively")
+		"ais - for AIS bucket, \"aws\", \"azure\", \"gcp\"  for Azure, Amazon, and Google clouds, respectively")
 
 	f.StringVar(&ip, "ip", defaultClusterIP, "AIS proxy/gateway IP address or hostname")
 	f.StringVar(&port, "port", "8080", "AIS proxy/gateway port")
@@ -534,6 +536,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	//
 	f.StringVar(&s3Endpoint, "s3endpoint", "", "S3 endpoint to read/write s3 bucket directly (with no aistore)")
 	f.StringVar(&s3Profile, "s3profile", "", "other then default S3 config profile referencing alternative credentials")
+	f.BoolVar(&s3UsePathStyle, "s3-use-path-style", false, "use older path-style addressing (as opposed to virtual-hosted style), e.g., https://s3.amazonaws.com/BUCKET/KEY. Should only be used with 's3endpoint' option")
 
 	DurationExtVar(f, &p.duration, "duration", time.Minute,
 		"Benchmark duration (0 - run forever or until Ctrl-C). \n"+
@@ -582,7 +585,8 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 		"when true, generate object names of 32 random characters. This option is ignored when loadernum is defined")
 	f.BoolVar(&p.randomProxy, "randomproxy", false,
 		"when true, select random gateway (\"proxy\") to execute I/O request")
-	f.StringVar(&p.subDir, "subdir", "", "virtual destination directory for all aisloader-generated objects")
+	f.StringVar(&p.subDir, "subdir", "", "when writing: virtual destination directory for all aisloader-generated objects;\n"+
+		"when listing: list objects with names that have the specified prefix (that may or may not be a virtual directory")
 	f.Uint64Var(&p.putShards, "putshards", 0, "spread generated objects over this many subdirectories (max 100k)")
 	f.BoolVar(&p.uniqueGETs, "uniquegets", true,
 		"when true, GET objects randomly and equally. Meaning, make sure *not* to GET some objects more frequently than the others")
@@ -599,6 +603,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.StringVar(&p.cksumType, "cksum-type", cos.ChecksumXXHash, "cksum type to use for put object requests")
 	f.BoolVar(&p.latest, "latest", false, "when true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket")
 	f.BoolVar(&p.cached, "cached", false, "list in-cluster objects - only those objects from a remote bucket that are present (\"cached\")")
+	f.BoolVar(&p.listDirs, "list-dirs", false, "list virtual subdirectories (remote buckets only)")
 
 	// ETL
 	f.StringVar(&p.etlName, "etl", "", "name of an ETL applied to each object on GET request. One of '', 'tar2tf', 'md5', 'echo'")
@@ -633,8 +638,11 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 
 // validate command line and finish initialization
 func _init(p *params) (err error) {
-	if s3Endpoint == "" && os.Getenv(awsEnvS3Endpoint) != "" {
-		s3Endpoint = os.Getenv(awsEnvS3Endpoint)
+	// '--s3endpoint' takes precedence
+	if s3Endpoint == "" {
+		if ep := os.Getenv(env.AWS.Endpoint); ep != "" {
+			s3Endpoint = ep
+		}
 	}
 	if p.bck.Name != "" {
 		if p.cleanUp.Val && isDirectS3() {
@@ -650,7 +658,7 @@ func _init(p *params) (err error) {
 	if p.seed == 0 {
 		p.seed = mono.NanoTime()
 	}
-	rnd = rand.New(rand.NewSource(p.seed))
+	rnd = rand.New(cos.NewRandSource(uint64(p.seed)))
 
 	if p.putSizeUpperBoundStr != "" {
 		if p.putSizeUpperBound, err = cos.ParseSize(p.putSizeUpperBoundStr, cos.UnitsIEC); err != nil {
@@ -810,7 +818,7 @@ func _init(p *params) (err error) {
 		if err != nil {
 			return err
 		}
-		etlSpec, err := io.ReadAll(fh)
+		etlSpec, err := cos.ReadAll(fh)
 		fh.Close()
 		if err != nil {
 			return err
@@ -915,7 +923,7 @@ func _init(p *params) (err error) {
 	if useHTTPS {
 		// environment to override client config
 		cmn.EnvToTLS(&sargs)
-		p.bp.Client = cmn.NewClientTLS(cargs, sargs)
+		p.bp.Client = cmn.NewClientTLS(cargs, sargs, false /*intra-cluster*/)
 	} else {
 		p.bp.Client = cmn.NewClient(cargs)
 	}
@@ -932,7 +940,7 @@ func isDirectS3() bool {
 func loaderMaskFromTotalLoaders(totalLoaders uint64) uint {
 	// take first bigger power of 2, then take first bigger or equal number
 	// divisible by 4. This makes loaderID more visible in hex object name
-	return cos.CeilAlign(cos.FastLog2Ceil(totalLoaders), 4)
+	return cos.CeilAlign(fastLog2Ceil(totalLoaders), 4)
 }
 
 func printArguments(set *flag.FlagSet) {
@@ -1007,7 +1015,10 @@ func setupBucket(runParams *params, created *bool) error {
 		return nil
 	}
 	if runParams.cached && !runParams.bck.IsRemote() {
-		return fmt.Errorf(cachedText+"applies to remote buckets (have %s)", runParams.bck.Cname(""))
+		return fmt.Errorf(cachedText+"applies to remote buckets only (have %s)", runParams.bck.Cname(""))
+	}
+	if runParams.listDirs && !runParams.bck.IsRemote() {
+		return fmt.Errorf("--list-dirs option applies to remote buckets only (have %s)", runParams.bck.Cname(""))
 	}
 
 	//
@@ -1086,7 +1097,7 @@ func cleanup() {
 			n       = objsLen / w
 			wg      = &sync.WaitGroup{}
 		)
-		for i := 0; i < w; i++ {
+		for i := range w {
 			wg.Add(1)
 			go cleanupObjs(bucketObjsNames.Names()[i*n:(i+1)*n], wg)
 		}
@@ -1116,7 +1127,7 @@ func cleanupObjs(objs []string, wg *sync.WaitGroup) {
 	if !runParams.bck.IsAIS() {
 		b := min(t, runParams.batchSize)
 		n := t / b
-		for i := 0; i < n; i++ {
+		for i := range n {
 			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, objs[i*b:(i+1)*b], "" /*template*/)
 			if err != nil {
 				fmt.Println("delete err ", err)
@@ -1178,7 +1189,7 @@ func listObjects() error {
 	case isDirectS3():
 		names, err = s3ListObjects()
 	default:
-		names, err = listObjectNames(runParams.bp, runParams.bck, runParams.subDir, runParams.cached)
+		names, err = listObjectNames(runParams)
 	}
 	if err != nil {
 		return err

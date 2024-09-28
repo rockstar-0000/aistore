@@ -1,12 +1,12 @@
 // Package integration_test.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -57,10 +57,10 @@ func TestCopyMultiObjSimple(t *testing.T) {
 	tlog.Logf("exists = %t\n", exists)
 
 	tools.CreateBucket(t, proxyURL, bckTo, nil, true /*cleanup*/)
-	for i := 0; i < objCnt; i++ {
+	for i := range objCnt {
 		objList = append(objList, fmt.Sprintf("test/a-%04d", i))
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tlog.Logf("PUT %d => %s\n", len(objList), bckFrom.Cname(""))
 		for _, objName := range objList {
 			r, _ := readers.NewRand(objSize, cksumType)
@@ -74,11 +74,11 @@ func TestCopyMultiObjSimple(t *testing.T) {
 			tassert.CheckFatal(t, err)
 		}
 
-		rangeStart := 10 // rand.Intn(objCnt - copyCnt - 1)
+		rangeStart := 10 // rand.IntN(objCnt - copyCnt - 1)
 		template := "test/a-" + fmt.Sprintf("{%04d..%04d}", rangeStart, rangeStart+copyCnt-1)
 		tlog.Logf("[%s] %s => %s\n", template, bckFrom.Cname(""), bckTo.Cname(""))
 
-		msg := cmn.TCObjsMsg{ToBck: bckTo}
+		msg := cmn.TCOMsg{ToBck: bckTo}
 		msg.Template = template
 		xid, err = api.CopyMultiObj(baseParams, bckFrom, &msg)
 		tassert.CheckFatal(t, err)
@@ -92,7 +92,7 @@ func TestCopyMultiObjSimple(t *testing.T) {
 	lst, err := api.ListObjects(baseParams, bckTo, msg, api.ListArgs{})
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, len(lst.Entries) == copyCnt, "%d != %d", copyCnt, len(lst.Entries))
-	rangeStart := 10 // rand.Intn(objCnt - copyCnt - 1)
+	rangeStart := 10 // rand.IntN(objCnt - copyCnt - 1)
 	for i := rangeStart; i < rangeStart+copyCnt; i++ {
 		objName := fmt.Sprintf("test/a-%04d", i)
 		err := api.DeleteObject(baseParams, bckTo, objName)
@@ -190,7 +190,7 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 						var (
 							err error
 							xid string
-							msg = cmn.TCObjsMsg{ToBck: bckTo}
+							msg = cmn.TCOMsg{ToBck: bckTo}
 						)
 						msg.ObjNames = list
 						if m.bck.IsRemote() && test.evictRemoteSrc {
@@ -204,8 +204,8 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 							tlog.Logf("[%s] %2d: cp list %d objects\n", xid, i, numToCopy)
 						}
 					}
-					for j := 0; j < numToCopy; j++ {
-						list = append(list, m.objNames[rand.Intn(m.num)])
+					for range numToCopy {
+						list = append(list, m.objNames[rand.IntN(m.num)])
 					}
 					if !test.createDst && i == 0 {
 						// serialize the very first batch as it entails creating destination bucket
@@ -218,13 +218,13 @@ func testCopyMobj(t *testing.T, bck *meta.Bck) {
 				}
 			} else {
 				for i := 0; i < numToCopy && erv.Load() == nil; i++ {
-					start := rand.Intn(m.num - numToCopy)
+					start := rand.IntN(m.num - numToCopy)
 					ftmpl := func(start int, i int) {
 						var (
 							err      error
 							xid      string
 							template = fmt.Sprintf(fmtRange, m.prefix, start, start+numToCopy-1)
-							msg      = cmn.TCObjsMsg{ToBck: bckTo}
+							msg      = cmn.TCOMsg{ToBck: bckTo}
 						)
 						msg.Template = template
 						if m.bck.IsRemote() && test.evictRemoteSrc {

@@ -1,6 +1,6 @@
 // Package fs_test provides tests for fs package
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package fs_test
 
@@ -256,7 +256,6 @@ func TestParseFQN(t *testing.T) {
 		t.Run(tt.testName, func(t *testing.T) {
 			mios := mock.NewIOS()
 			fs.TestNew(mios)
-			fs.TestDisableValidation()
 
 			for _, mpath := range tt.mpaths {
 				if err := cos.Stat(mpath); os.IsNotExist(err) {
@@ -271,7 +270,8 @@ func TestParseFQN(t *testing.T) {
 			fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
 			fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 
-			parsedFQN, err := fs.ParseFQN(tt.fqn)
+			var parsed fs.ParsedFQN
+			err := parsed.Init(tt.fqn)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("fqn2info() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -280,8 +280,8 @@ func TestParseFQN(t *testing.T) {
 				return
 			}
 			var (
-				gotMpath, gotBck           = parsedFQN.Mountpath.Path, parsedFQN.Bck
-				gotContentType, gotObjName = parsedFQN.ContentType, parsedFQN.ObjName
+				gotMpath, gotBck           = parsed.Mountpath.Path, parsed.Bck
+				gotContentType, gotObjName = parsed.ContentType, parsed.ObjName
 			)
 			if gotMpath != tt.wantMPath {
 				t.Errorf("gotMpath = %v, want %v", gotMpath, tt.wantMPath)
@@ -353,7 +353,6 @@ func TestMakeAndParseFQN(t *testing.T) {
 		t.Run(strings.Join([]string{tt.mpath, tt.bck.String(), tt.contentType, tt.objName}, "|"), func(t *testing.T) {
 			mios := mock.NewIOS()
 			fs.TestNew(mios)
-			fs.TestDisableValidation()
 
 			if err := cos.Stat(tt.mpath); os.IsNotExist(err) {
 				cos.CreateDir(tt.mpath)
@@ -368,13 +367,14 @@ func TestMakeAndParseFQN(t *testing.T) {
 			mpaths := fs.GetAvail()
 			fqn := mpaths[tt.mpath].MakePathFQN(&tt.bck, tt.contentType, tt.objName)
 
-			parsedFQN, err := fs.ParseFQN(fqn)
+			var parsed fs.ParsedFQN
+			err = parsed.Init(fqn)
 			if err != nil {
 				t.Fatalf("failed to parse FQN: %v", err)
 			}
 			var (
-				gotMpath, gotBck           = parsedFQN.Mountpath.Path, parsedFQN.Bck
-				gotContentType, gotObjName = parsedFQN.ContentType, parsedFQN.ObjName
+				gotMpath, gotBck           = parsed.Mountpath.Path, parsed.Bck
+				gotContentType, gotObjName = parsed.ContentType, parsed.ObjName
 			)
 			if gotMpath != tt.mpath {
 				t.Errorf("gotMpath = %v, want %v", gotMpath, tt.mpath)
@@ -392,8 +392,6 @@ func TestMakeAndParseFQN(t *testing.T) {
 	}
 }
 
-var parsedFQN fs.ParsedFQN
-
 func BenchmarkParseFQN(b *testing.B) {
 	var (
 		mpath = "/tmp/mpath"
@@ -402,7 +400,6 @@ func BenchmarkParseFQN(b *testing.B) {
 	)
 
 	fs.TestNew(mios)
-	fs.TestDisableValidation()
 	cos.CreateDir(mpath)
 	defer os.RemoveAll(mpath)
 	fs.Add(mpath, "daeID")
@@ -412,7 +409,8 @@ func BenchmarkParseFQN(b *testing.B) {
 	fqn := mpaths[mpath].MakePathFQN(&bck, fs.ObjectType, "super/long/name")
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		parsedFQN, _ = fs.ParseFQN(fqn)
+	for range b.N {
+		var parsed fs.ParsedFQN
+		parsed.Init(fqn)
 	}
 }

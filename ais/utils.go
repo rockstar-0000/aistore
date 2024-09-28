@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/k8s"
@@ -33,6 +34,8 @@ const (
 	accessNetAll           = accessNetPublic | accessNetIntraData | accessNetIntraControl
 )
 
+const fmtErrParseIP = "failed to parse local unicast IP address: %s"
+
 // Network access of handlers (Public, IntraControl, & IntraData)
 type (
 	netAccess int
@@ -50,6 +53,16 @@ type (
 )
 
 func (na netAccess) isSet(flag netAccess) bool { return na&flag == flag }
+
+func (addr *localIPv4Info) String() string {
+	return fmt.Sprintf("IP: %s (MTU %d)", addr.ipv4, addr.mtu)
+}
+
+func (addr *localIPv4Info) warn() {
+	if addr.mtu <= 1500 {
+		nlog.Warningln("Warning: small MTU")
+	}
+}
 
 //
 // IPV4
@@ -73,9 +86,20 @@ func getLocalIPv4s(config *cmn.Config) (addrlist []*localIPv4Info, err error) {
 	for _, addr := range addrs {
 		curr := &localIPv4Info{}
 		if ipnet, ok := addr.(*net.IPNet); ok {
-			// production or K8s: skip loopbacks
-			if ipnet.IP.IsLoopback() && (!config.TestingEnv() || k8s.IsK8s()) {
-				continue
+			if ipnet.IP.IsLoopback() {
+				// K8s: always exclude 127.0.0.1 loopback
+				if k8s.IsK8s() {
+					continue
+				}
+				// non K8s and fspaths:
+				if !config.TestingEnv() {
+					if excludeLoopbackIP() {
+						if ipnet.IP.To4() != nil {
+							nlog.Warningln("(non-K8s, fspaths) deployment: excluding loopback IP:", ipnet.IP)
+						}
+						continue
+					}
+				}
 			}
 			if ipnet.IP.To4() == nil {
 				continue
@@ -107,6 +131,14 @@ func getLocalIPv4s(config *cmn.Config) (addrlist []*localIPv4Info, err error) {
 	return addrlist, nil
 }
 
+// HACK, to accommodate non-K8s docker deployments and non-containerized
+func excludeLoopbackIP() bool {
+	if _, present := os.LookupEnv("AIS_LOCAL_PLAYGROUND"); present {
+		return false
+	}
+	return true
+}
+
 // given configured list of hostnames, return the first one matching local unicast IPv4
 func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
 	sb := &strings.Builder{}
@@ -130,7 +162,7 @@ func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
 		if net.ParseIP(host) != nil { // parses as IP
 			ipv4 = host
 		} else {
-			ip, err := _resolve(host)
+			ip, err := cmn.Host2IP(host)
 			if err != nil {
 				nlog.Errorln("failed to resolve hostname(?)", host, "err:", err, "[idx:", i, len(hostnames))
 				continue
@@ -151,31 +183,80 @@ func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
 	return "", err
 }
 
-// _localIP takes a list of local IPv4s and returns the best fit for a daemon to listen on it
-func _localIP(addrList []*localIPv4Info) (ip net.IP, err error) {
-	if len(addrList) == 0 {
-		return nil, errors.New("no addresses to choose from")
+// given a list of local IPv4s return the best fit to listen on
+func _localIP(addrList []*localIPv4Info) (ip net.IP, _ error) {
+	l := len(addrList)
+	if l == 0 {
+		return nil, errors.New("no unicast addresses to choose from")
 	}
-	if len(addrList) == 1 {
-		nlog.Infof("Found only one IPv4: %s, MTU %d", addrList[0].ipv4, addrList[0].mtu)
-		if addrList[0].mtu <= 1500 {
-			nlog.Warningf("IPv4 %s MTU size is small: %d\n", addrList[0].ipv4, addrList[0].mtu)
-		}
+
+	if l == 1 {
 		if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
-			return nil, fmt.Errorf("failed to parse IP address: %s", addrList[0].ipv4)
+			return nil, fmt.Errorf(fmtErrParseIP, addrList[0].ipv4)
 		}
+		nlog.Infoln("Found a single", addrList[0].String())
+		addrList[0].warn()
 		return ip, nil
 	}
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		nlog.Infof("%d IPv4s:", len(addrList))
-		for _, addr := range addrList {
-			nlog.Infof("    %#v\n", *addr)
+
+	// NOTE:
+	// - try using environment to eliminate ambiguity
+	// - env.AIS.PubIPv4CIDR ("AIS_PUBLIC_IP_CIDR") takes precedence
+	var (
+		selected     = -1
+		parsed       net.IP
+		network, err = _parseCIDR(env.AIS.LocalRedirectCIDR, env.AIS.PubIPv4CIDR)
+	)
+	if err != nil {
+		return nil, err
+	}
+	if network == nil {
+		goto warn
+	}
+	for j := range l {
+		if ip = net.ParseIP(addrList[j].ipv4); ip == nil {
+			return nil, fmt.Errorf(fmtErrParseIP, addrList[0].ipv4)
+		}
+		if network.Contains(ip) {
+			if selected >= 0 {
+				return nil, fmt.Errorf("CIDR network %s contains multiple local unicast IPs: %s and %s",
+					network, addrList[selected].ipv4, addrList[j].ipv4)
+			}
+			selected, parsed = j, ip
 		}
 	}
-	if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
-		return nil, fmt.Errorf("failed to parse IP address: %s", addrList[0].ipv4)
+	if selected < 0 {
+		nlog.Warningln("CIDR network", network.String(), "does not contain any local unicast IPs")
+		goto warn
 	}
+	nlog.Infoln("CIDR network", network.String(), "contains a single local unicast IP:", addrList[selected].ipv4)
+	addrList[selected].warn()
+	return parsed, nil
+
+warn:
+	if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
+		return nil, fmt.Errorf(fmtErrParseIP, addrList[0].ipv4)
+	}
+	nlog.Warningln("given multiple choice, selecting the first", addrList[0].String())
+	addrList[0].warn()
 	return ip, nil
+}
+
+func _parseCIDR(name, name2 string) (*net.IPNet, error) {
+	cidr := os.Getenv(name)
+	if name2 != "" {
+		if mask := os.Getenv(name2); mask != "" {
+			cidr, name = mask, name2
+		}
+	}
+	if cidr == "" {
+		return nil, nil
+	}
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid '%s=%s': %v", name, cidr, err)
+	}
+	return network, nil
 }
 
 func multihome(configuredIPv4s string) (pub string, extra []string) {
@@ -191,7 +272,7 @@ func multihome(configuredIPv4s string) (pub string, extra []string) {
 		extra[i] = strings.TrimSpace(extra[i])
 		cos.ExitAssertLog(extra[i] != "", "invalid format (empty value):", configuredIPv4s)
 		cos.ExitAssertLog(extra[i] != pub, "duplicated addr or hostname:", configuredIPv4s)
-		for j := 0; j < i; j++ {
+		for j := range i {
 			cos.ExitAssertLog(extra[i] != extra[j], "duplicated addr or hostname:", configuredIPv4s)
 		}
 	}
@@ -216,28 +297,6 @@ func initNetInfo(ni *meta.NetInfo, addrList []*localIPv4Info, proto, configuredI
 	if host, err = _selectHost(addrList, lst); err == nil {
 		ni.Init(proto, host, port)
 	}
-	return
-}
-
-func _resolve(hostName string) (net.IP, error) {
-	ips, err := net.LookupIP(hostName)
-	if err != nil {
-		return nil, err
-	}
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			return ip, nil
-		}
-	}
-	return nil, fmt.Errorf("failed to find non-empty IPv4 in list %v (hostName=%q)", ips, hostName)
-}
-
-func parseOrResolve(hostname string) (err error) {
-	if net.ParseIP(hostname) != nil {
-		// is a parse-able IP addr
-		return
-	}
-	_, err = _resolve(hostname)
 	return
 }
 

@@ -60,19 +60,25 @@ type (
 		URL         string `json:"direct_url"`
 		tcpEndpoint string
 	}
+	errNetInfoChanged struct {
+		sname    string
+		tag      string
+		oep, nep string
+	}
 
 	// Snode - a node (gateway or target) in a cluster
 	Snode struct {
-		LocalNet   *net.IPNet `json:"-"`
-		PubNet     NetInfo    `json:"public_net"` // cmn.NetPublic
-		PubExtra   []NetInfo  `json:"pub_extra,omitempty"`
-		DataNet    NetInfo    `json:"intra_data_net"`    // cmn.NetIntraData
-		ControlNet NetInfo    `json:"intra_control_net"` // cmn.NetIntraControl
-		DaeType    string     `json:"daemon_type"`       // "target" or "proxy"
-		DaeID      string     `json:"daemon_id"`
-		name       string
+		LocalNet   *net.IPNet   `json:"-"`
+		PubNet     NetInfo      `json:"public_net"` // cmn.NetPublic
+		PubExtra   []NetInfo    `json:"pub_extra,omitempty"`
+		DataNet    NetInfo      `json:"intra_data_net"`    // cmn.NetIntraData
+		ControlNet NetInfo      `json:"intra_control_net"` // cmn.NetIntraControl
+		DaeType    string       `json:"daemon_type"`       // "target" or "proxy"
+		DaeID      string       `json:"daemon_id"`
+		name       string       // cached
 		Flags      cos.BitFlags `json:"flags"` // enum { SnodeNonElectable, SnodeIC, ... }
-		idDigest   uint64
+		idDigest   uint64       // cached
+		nmr        NetNamer     // (multihoming)
 	}
 
 	Nodes   []*Snode          // slice of Snodes
@@ -84,7 +90,7 @@ type (
 		Pmap         NodeMap `json:"pmap"` // [pid => Snode]
 		Primary      *Snode  `json:"proxy_si"`
 		Tmap         NodeMap `json:"tmap"`          // [tid => Snode]
-		UUID         string  `json:"uuid"`          // assigned once at creation time and never change
+		UUID         string  `json:"uuid"`          // is assigned once at creation time, never changes
 		CreationTime string  `json:"creation_time"` // creation timestamp
 		Version      int64   `json:"version,string"`
 	}
@@ -94,6 +100,7 @@ type (
 // Snode //
 ///////////
 
+// init self
 func (d *Snode) Init(id, daeType string) {
 	debug.Assert(d.DaeID == "" && d.DaeType == "")
 	debug.Assert(id != "" && daeType != "")
@@ -114,7 +121,7 @@ func (d *Snode) ID() string   { return d.DaeID }
 func (d *Snode) Type() string { return d.DaeType } // enum { apc.Proxy, apc.Target }
 
 func (d *Snode) Name() string   { return d.name }
-func (d *Snode) String() string { return d.Name() }
+func (d *Snode) String() string { return d.name }
 
 func (d *Snode) SetName() {
 	name := d.StringEx()
@@ -145,7 +152,7 @@ func (d *Snode) StringEx() string {
 	return Tname(d.DaeID)
 }
 
-func (d *Snode) nameNets() string {
+func (d *Snode) StrURLs() string {
 	if d.PubNet.URL != d.ControlNet.URL ||
 		d.PubNet.URL != d.DataNet.URL {
 		return fmt.Sprintf("%s(pub: %s, control: %s, data: %s)", d.Name(),
@@ -169,32 +176,33 @@ func (d *Snode) URL(network string) (u string) {
 	return u
 }
 
-// TODO [feature]
-// - support node restart+join with different network(s)
-// - factor in PubExtra as well
-
 func (d *Snode) Eq(o *Snode) (eq bool) {
 	if d == nil || o == nil {
 		return
 	}
 	eq = d.ID() == o.ID()
-	debug.Func(func() {
-		if !eq {
-			return
+	if eq {
+		if err := d.NetEq(o); err != nil {
+			nlog.Warningln(err)
+			eq = false
 		}
-		name := d.StringEx()
-		debug.Assertf(d.DaeType == o.DaeType, "%s: node type %q vs %q", name, d.DaeType, o.DaeType)
-		if !d.PubNet.eq(&o.PubNet) {
-			nlog.Infof("Warning %s: pub %s vs %s", name, d.PubNet.TCPEndpoint(), o.PubNet.TCPEndpoint())
-		}
-		if !d.ControlNet.eq(&o.ControlNet) {
-			nlog.Infof("Warning %s: control %s vs %s", name, d.ControlNet.TCPEndpoint(), o.ControlNet.TCPEndpoint())
-		}
-		if !d.DataNet.eq(&o.DataNet) {
-			nlog.Infof("Warning %s: data %s vs %s", name, d.DataNet.TCPEndpoint(), o.DataNet.TCPEndpoint())
-		}
-	})
+	}
 	return eq
+}
+
+func (d *Snode) NetEq(o *Snode) error {
+	name := d.StringEx()
+	debug.Assertf(d.DaeType == o.DaeType, "%s: node type %q vs %q", name, d.DaeType, o.DaeType)
+	if !d.PubNet.eq(&o.PubNet) {
+		return &errNetInfoChanged{name, "pub", d.PubNet.TCPEndpoint(), o.PubNet.TCPEndpoint()}
+	}
+	if !d.ControlNet.eq(&o.ControlNet) {
+		return &errNetInfoChanged{name, "control", d.ControlNet.TCPEndpoint(), o.ControlNet.TCPEndpoint()}
+	}
+	if !d.DataNet.eq(&o.DataNet) {
+		return &errNetInfoChanged{name, "data", d.DataNet.TCPEndpoint(), o.DataNet.TCPEndpoint()}
+	}
+	return nil
 }
 
 func (d *Snode) Validate() error {
@@ -202,7 +210,7 @@ func (d *Snode) Validate() error {
 		return errors.New("invalid Snode: nil")
 	}
 	if d.ID() == "" {
-		return errors.New("invalid Snode: missing node " + d.nameNets())
+		return errors.New("invalid Snode: missing node " + d.StrURLs())
 	}
 	if d.DaeType != apc.Proxy && d.DaeType != apc.Target {
 		cos.Assertf(false, "invalid Snode type %q", d.DaeType)
@@ -246,6 +254,62 @@ func (d *Snode) isDupNet(n *Snode, smap *Smap) error {
 	return nil
 }
 
+// NOTE: used only for starting-up proxies and assumes that proxy's listening on a single NIC (no multihoming)
+func (d *Snode) HasURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		nlog.Errorf("failed to parse raw URL %q: %v", rawURL, err)
+		return false
+	}
+	var (
+		host, port = u.Hostname(), u.Port()
+		isIP       = net.ParseIP(host) != nil
+		nis        = []NetInfo{d.PubNet, d.ControlNet, d.DataNet}
+		numIPs     int
+		sameHost   bool
+		samePort   bool
+	)
+	for _, ni := range nis {
+		if ni.Hostname == host {
+			if ni.Port == port {
+				return true
+			}
+			sameHost = true
+		} else if ni.Port == port {
+			samePort = true
+		}
+		if net.ParseIP(ni.Hostname) != nil {
+			numIPs++
+		}
+	}
+	if sameHost && samePort {
+		nlog.Warningln("assuming that", d.StrURLs(), "\"contains\"", rawURL)
+		return true
+	}
+	if (numIPs > 0 && isIP) || (numIPs == 0 && !isIP) {
+		return false
+	}
+
+	// slow path: locally resolve (hostname => IPv4) and compare
+	rip, err := cmn.ParseHost2IP(host)
+	if err != nil {
+		nlog.Warningln(host, err)
+		return false
+	}
+	for _, ni := range nis {
+		nip, err := cmn.ParseHost2IP(ni.Hostname)
+		if err != nil {
+			nlog.Warningln(ni.Hostname, err)
+			return false
+		}
+		if rip.Equal(nip) && ni.Port == port {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (d *Snode) IsProxy() bool  { return d.DaeType == apc.Proxy }
 func (d *Snode) IsTarget() bool { return d.DaeType == apc.Target }
 
@@ -281,6 +345,10 @@ func (d *Snode) Fl2S() string {
 /////////////
 // NetInfo //
 /////////////
+
+func (e *errNetInfoChanged) Error() string {
+	return fmt.Sprintf("%s: %s %s vs %s", e.sname, e.tag, e.nep, e.oep)
+}
 
 func _ep(hostname, port string) string { return hostname + ":" + port }
 
@@ -335,14 +403,38 @@ func (m *Smap) String() string {
 }
 
 func (m *Smap) StringEx() string {
+	var sb strings.Builder
 	if m == nil {
 		return "Smap <nil>"
 	}
+	sb.WriteString("Smap v")
+	sb.WriteString(strconv.FormatInt(m.Version, 10))
+	sb.WriteByte('[')
+	sb.WriteString(m.UUID)
 	if m.Primary == nil {
-		return fmt.Sprintf("Smap v%d[%s, nil]", m.Version, m.UUID)
+		sb.WriteString(", nil]")
+		return sb.String()
 	}
-	return fmt.Sprintf("Smap v%d[%s, %s, t=%d, p=%d]", m.Version, m.UUID,
-		m.Primary.StringEx(), m.CountTargets(), m.CountProxies())
+	sb.WriteString(", ")
+	sb.WriteString(m.Primary.StringEx())
+	sb.WriteString(", t=")
+	_counts(&sb, m.CountTargets(), m.CountActiveTs())
+	sb.WriteString(", p=")
+	_counts(&sb, m.CountProxies(), m.CountActivePs())
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+func _counts(sb *strings.Builder, all, active int) {
+	if all == active {
+		sb.WriteString(strconv.Itoa(all))
+	} else {
+		sb.WriteByte('(')
+		sb.WriteString(strconv.Itoa(active))
+		sb.WriteByte('/')
+		sb.WriteString(strconv.Itoa(all))
+		sb.WriteByte(')')
+	}
 }
 
 func (m *Smap) CountTargets() int { return len(m.Tmap) }
@@ -365,6 +457,22 @@ func (m *Smap) HasActiveTs(except string) bool {
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+func (m *Smap) HasPeersToRebalance(except string) bool {
+	for tid, t := range m.Tmap {
+		if tid == except {
+			continue
+		}
+		if !t.InMaintOrDecomm() {
+			return true
+		}
+		// is a "peer" if still transitioning to post-rebalance state
+		if !t.Flags.IsSet(SnodeMaintPostReb) {
+			return true
+		}
 	}
 	return false
 }
@@ -548,8 +656,7 @@ func (m *Smap) StrIC(node *Snode) string {
 	return strings.Join(all, ",")
 }
 
-func (m *Smap) ICCount() int {
-	count := 0
+func (m *Smap) ICCount() (count int) {
 	for _, psi := range m.Pmap {
 		if psi.IsIC() {
 			count++

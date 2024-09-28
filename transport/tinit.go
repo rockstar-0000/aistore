@@ -13,47 +13,44 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
 // transport defaults
 const (
-	dfltBurstNum     = 128 // burst size (see: config.Transport.Burst)
 	dfltTick         = time.Second
 	dfltTickIdle     = dfltTick << 8   // (when there are no streams to _collect_)
 	dfltIdleTeardown = 4 * time.Second // (see config.Transport.IdleTeardown)
 )
 
+const (
+	dfltCollectLog  = 10 * time.Minute
+	dfltCollectChan = 256
+)
+
 type global struct {
-	tstats cos.StatsUpdater // subset of stats.Tracker interface, the minimum required
+	tstats cos.StatsUpdater // strict subset of stats.Tracker interface (the minimum required)
 	mm     *memsys.MMSA
 }
 
 var (
-	g          global
-	dfltMaxHdr int64 // memsys.PageSize or cluster-configurable (`config.Transport.MaxHeaderSize`)
-	verbose    bool
+	g global
 )
 
-func Init(tstats cos.StatsUpdater, config *cmn.Config) *StreamCollector {
-	verbose = cmn.Rom.FastV(5 /*super-verbose*/, cos.SmoduleTransport)
-
+func Init(tstats cos.StatsUpdater) *StreamCollector {
 	g.mm = memsys.PageMM()
 	g.tstats = tstats
 
 	nextSessionID.Store(100)
-	for i := 0; i < numHmaps; i++ {
+	for i := range numHmaps {
 		hmaps[i] = make(hmap, 4)
 	}
 
-	dfltMaxHdr = dfltSizeHeader
-	if config.Transport.MaxHeaderSize > 0 {
-		dfltMaxHdr = int64(config.Transport.MaxHeaderSize)
-	}
 	// real stream collector
 	gc = &collector{
-		ctrlCh:  make(chan ctrl, 64),
+		ctrlCh:  make(chan ctrl, dfltCollectChan),
 		streams: make(map[string]*streamBase, 64),
 		heap:    make([]*streamBase, 0, 64), // min-heap sorted by stream.time.ticks
 	}
@@ -64,10 +61,16 @@ func Init(tstats cos.StatsUpdater, config *cmn.Config) *StreamCollector {
 	return sc
 }
 
-func burst(config *cmn.Config) (burst int) {
-	if burst = config.Transport.Burst; burst == 0 {
-		burst = dfltBurstNum
+func burst(extra *Extra) (burst int) {
+	if extra.ChanBurst > 0 {
+		debug.Assert(extra.ChanBurst <= cmn.MaxTransportBurst, extra.ChanBurst)
+		return min(extra.ChanBurst, cmn.MaxTransportBurst)
 	}
+	if burst = extra.Config.Transport.Burst; burst == 0 {
+		burst = cmn.DfltTransportBurst
+	}
+
+	// (feat)
 	if a := os.Getenv("AIS_STREAM_BURST_NUM"); a != "" {
 		if burst64, err := strconv.ParseInt(a, 10, 0); err != nil {
 			nlog.Errorln(err)

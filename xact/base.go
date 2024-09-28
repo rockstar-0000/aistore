@@ -177,7 +177,7 @@ func (xctn *Base) AddErr(err error, logExtra ...int) {
 		return
 	}
 	debug.Assert(err != nil)
-	fs.CleanPathErr(err)
+
 	xctn.err.Add(err)
 	// just add
 	if len(logExtra) == 0 {
@@ -293,7 +293,7 @@ func (xctn *Base) onFinished(err error, aborted bool) {
 	if xactRecord.RefreshCap {
 		// currently, ignoring returned err-cap and not calling t.OOS()
 		// both (conditions) handled by periodic stats
-		fs.CapRefresh(nil /*config*/, nil /*tcdf*/)
+		fs.CapRefresh(cmn.GCO.Get(), nil /*tcdf*/)
 	}
 
 	IncFinished() // in re: HK cleanup long-time finished
@@ -353,7 +353,7 @@ func (xctn *Base) ObjsAdd(cnt int, size int64) {
 }
 
 // oft. used
-func (xctn *Base) LomAdd(lom *core.LOM) { xctn.ObjsAdd(1, lom.SizeBytes(true)) }
+func (xctn *Base) LomAdd(lom *core.LOM) { xctn.ObjsAdd(1, lom.Lsize(true)) }
 
 // base stats: transmit
 func (xctn *Base) OutObjs() int64  { return xctn.stats.outobjs.Load() }

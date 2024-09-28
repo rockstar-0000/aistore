@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -46,7 +46,7 @@ func GenerateNotConflictingObjectName(baseName, newNamePrefix string, bck cmn.Bc
 }
 
 func GenerateNonexistentBucketName(prefix string, bp api.BaseParams) (string, error) {
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		bck := cmn.Bck{
 			Name:     prefix + trand.String(8),
 			Provider: apc.AIS,
@@ -111,17 +111,8 @@ func BucketExists(tb testing.TB, proxyURL string, bck cmn.Bck) (bool, error) {
 	return false, err
 }
 
-func isRemoteBucket(tb testing.TB, proxyURL string, bck cmn.Bck) bool {
+func isRemoteAndPresentBucket(tb testing.TB, proxyURL string, bck cmn.Bck) bool {
 	if !bck.IsRemote() {
-		return false
-	}
-	exists, err := BucketExists(tb, proxyURL, bck)
-	tassert.CheckFatal(tb, err)
-	return exists
-}
-
-func isCloudBucket(tb testing.TB, proxyURL string, bck cmn.Bck) bool {
-	if !bck.IsCloud() {
 		return false
 	}
 	exists, err := BucketExists(tb, proxyURL, bck)
@@ -148,7 +139,7 @@ func PutObjRR(bp api.BaseParams, bck cmn.Bck, objName string, objSize int64, cks
 func PutRR(tb testing.TB, bp api.BaseParams, objSize int64, cksumType string,
 	bck cmn.Bck, dir string, objCount int) []string {
 	objNames := make([]string, objCount)
-	for i := 0; i < objCount; i++ {
+	for i := range objCount {
 		fname := trand.String(20)
 		objName := filepath.Join(dir, fname)
 		objNames[i] = objName

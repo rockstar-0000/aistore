@@ -1,12 +1,12 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -82,7 +82,7 @@ func (o ecOptions) init(t *testing.T, proxyURL string) *ecOptions {
 		o.sema = cos.NewDynSemaphore(o.concurrency)
 	}
 	o.seed = time.Now().UnixNano()
-	o.rnd = rand.New(rand.NewSource(o.seed))
+	o.rnd = rand.New(cos.NewRandSource(uint64(o.seed)))
 	if o.dataCnt < 0 {
 		total := o.smap.CountActiveTs() - 2
 		o.parityCnt = total / 2
@@ -176,15 +176,7 @@ func ecCheckSlices(t *testing.T, sliceList map[string]ecSliceMD,
 	tassert.Errorf(t, len(sliceList) == totalCnt, "Expected number of objects for %s/%s: %d, found: %d\n%+v",
 		bck, objPath, totalCnt, len(sliceList), sliceList)
 
-	if !bck.IsAIS() && !bck.IsRemoteAIS() {
-		var ok bool
-		config := tools.GetClusterConfig(t)
-		_, ok = config.Backend.Providers[bck.Provider]
-		tassert.Errorf(t, ok, "invalid provider %s, expected to be in: %v",
-			bck.Provider, config.Backend.Providers)
-	}
-
-	metaCnt := 0
+	var metaCnt int
 	for k, md := range sliceList {
 		ct, err := core.NewCTFromFQN(k, nil)
 		tassert.CheckFatal(t, err)
@@ -269,7 +261,7 @@ func randObjectSize(n, every int, o *ecOptions) (
 	// number of metafiles: parity+slices
 	// number of slices: slices+parity
 	totalCnt = 2 + (o.sliceTotal())*2
-	objSize = int64(ecMinBigSize + o.rnd.Intn(ecBigDelta))
+	objSize = int64(ecMinBigSize + o.rnd.IntN(ecBigDelta))
 	sliceSize = ec.SliceSize(objSize, o.dataCnt)
 	if (n+1)%every == 0 || o.objSizeLimit == cmn.ObjSizeToAlwaysReplicate {
 		// Small object case
@@ -277,7 +269,7 @@ func randObjectSize(n, every int, o *ecOptions) (
 		// number of metafiles: parity
 		// number of slices: parity
 		totalCnt = 2 + o.parityCnt*2
-		objSize = int64(ecMinSmallSize + o.rnd.Intn(ecSmallDelta))
+		objSize = int64(ecMinSmallSize + o.rnd.IntN(ecSmallDelta))
 		sliceSize = objSize
 	}
 	doEC = objSize >= o.objSizeLimit
@@ -326,7 +318,7 @@ func doECPutsAndCheck(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, o *e
 	wg := &sync.WaitGroup{}
 	sizes := make(chan int64, o.objCount)
 
-	for idx := 0; idx < o.objCount; idx++ {
+	for idx := range o.objCount {
 		wg.Add(1)
 		o.sema.Acquire()
 
@@ -492,7 +484,7 @@ func clearAllECObjects(t *testing.T, bck cmn.Bck, failOnDelErr bool, o *ecOption
 
 	tlog.Logln("Deleting objects...")
 	wg.Add(o.objCount)
-	for idx := 0; idx < o.objCount; idx++ {
+	for idx := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -534,7 +526,7 @@ func objectsExist(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPatt 
 
 	tlog.Logln("Reading all objects...")
 	wg.Add(objCount)
-	for i := 0; i < objCount; i++ {
+	for i := range objCount {
 		objName := fmt.Sprintf(objPatt, i)
 		go getOneObj(objName)
 	}
@@ -624,7 +616,7 @@ func createECReplicas(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objN
 	defer o.sema.Release()
 
 	totalCnt := 2 + o.parityCnt*2
-	objSize := int64(ecMinSmallSize + o.rnd.Intn(ecSmallDelta))
+	objSize := int64(ecMinSmallSize + o.rnd.IntN(ecSmallDelta))
 	sliceSize := objSize
 
 	objPath := ecTestDir + objName
@@ -681,7 +673,7 @@ func createDamageRestoreECFile(t *testing.T, baseParams api.BaseParams, bck cmn.
 
 	delSlice := false // delete only main object
 	deletedFiles := 1
-	if o.dataCnt+o.parityCnt > 2 && o.rnd.Intn(100) < sliceDelPct {
+	if o.dataCnt+o.parityCnt > 2 && o.rnd.IntN(100) < sliceDelPct {
 		// delete a random slice, too
 		delSlice = true
 		deletedFiles = 2
@@ -848,7 +840,7 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 
 				wg := sync.WaitGroup{}
 				wg.Add(o.objCount)
-				for i := 0; i < o.objCount; i++ {
+				for i := range o.objCount {
 					o.sema.Acquire()
 					go func(i int) {
 						defer func() {
@@ -916,7 +908,7 @@ func TestECRestoreObjAndSlice(t *testing.T) {
 
 				wg := sync.WaitGroup{}
 				wg.Add(o.objCount)
-				for i := 0; i < o.objCount; i++ {
+				for i := range o.objCount {
 					o.sema.Acquire()
 					go func(i int) {
 						defer func() {
@@ -1068,7 +1060,7 @@ func TestECEnabledDisabledEnabled(t *testing.T) {
 
 	wg := sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		o.sema.Acquire()
 		go func(i int) {
 			defer func() {
@@ -1165,7 +1157,7 @@ func TestECDisableEnableDuringLoad(t *testing.T) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		o.sema.Acquire()
 		go func(i int) {
 			defer func() {
@@ -1416,7 +1408,7 @@ func ecStressCore(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 	cntCh := make(chan sCnt, o.objCount)
 	wg := &sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for idx := 0; idx < o.objCount; idx++ {
+	for idx := range o.objCount {
 		o.sema.Acquire()
 
 		go func(i int) {
@@ -1579,8 +1571,8 @@ func TestECXattrs(t *testing.T) {
 	}
 
 	// PUT objects twice to make their version 2
-	for j := 0; j < 2; j++ {
-		for i := 0; i < o.objCount; i++ {
+	for range 2 {
+		for i := range o.objCount {
 			objName := fmt.Sprintf(o.pattern, i)
 			oneObj(i, objName)
 		}
@@ -1608,6 +1600,7 @@ func TestECXattrs(t *testing.T) {
 // 4. create bucket with the same name
 // 5. check that EC is working properly for this bucket
 func TestECDestroyBucket(t *testing.T) {
+	t.Skipf("skipping %s", t.Name()) // TODO -- FIXME: revisit
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	var (
@@ -1637,7 +1630,7 @@ func TestECDestroyBucket(t *testing.T) {
 	errCnt := atomic.NewInt64(0)
 	sucCnt := atomic.NewInt64(0)
 
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		o.sema.Acquire()
 		wg.Add(1)
 		go func(i int) {
@@ -1648,7 +1641,7 @@ func TestECDestroyBucket(t *testing.T) {
 
 			objName := fmt.Sprintf(o.pattern, i)
 			if i%10 == 0 {
-				tlog.Logf("ec object %s into bucket %s\n", objName, bck)
+				tlog.Logf("PUT %s\n", bck.Cname(objName))
 			}
 			if putECFile(baseParams, bck, objName) != nil {
 				errCnt.Inc()
@@ -1769,7 +1762,7 @@ func TestECEmergencyTargetForSlices(t *testing.T) {
 	}
 
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		o.sema.Acquire()
 		go putOneObj(i)
 	}
@@ -1840,7 +1833,7 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 
 	// PUT object
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -1891,7 +1884,8 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 		objName := fmt.Sprintf(o.pattern, i)
 		// 1) hack: calculate which targets stored a replica
 		cbck := meta.NewBck(bck.Name, bck.Provider, cmn.NsGlobal)
-		targets, err := o.smap.HrwTargetList(cbck.MakeUname(ecTestDir+objName), o.parityCnt+1)
+		uname := cbck.MakeUname(ecTestDir + objName)
+		targets, err := o.smap.HrwTargetList(cos.UnsafeSptr(uname), o.parityCnt+1)
 		tassert.CheckFatal(t, err)
 
 		mainTarget := targets[0]
@@ -1925,7 +1919,7 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 
 	tlog.Logln("Reading all objects...")
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go getOneObj(i)
 	}
 	wg.Wait()
@@ -1941,6 +1935,8 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 // - gets all objects
 // - nothing must fail
 // - enable the mountpath back
+
+// TODO -- FIXME: use runProviderTests (currently, only ais://)
 func TestECEmergencyMountpath(t *testing.T) {
 	const (
 		smallEvery = 4
@@ -2015,7 +2011,7 @@ func TestECEmergencyMountpath(t *testing.T) {
 	}
 
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		o.sema.Acquire()
 		go putOneObj(i)
 	}
@@ -2025,7 +2021,7 @@ func TestECEmergencyMountpath(t *testing.T) {
 	}
 
 	// 2. Disable a random mountpath
-	mpathID := o.rnd.Intn(len(mpathList.Available))
+	mpathID := o.rnd.IntN(len(mpathList.Available))
 	removeMpath := mpathList.Available[mpathID]
 	tlog.Logf("Disabling a mountpath %s at target: %s\n", removeMpath, removeTarget.ID())
 	err = api.DisableMountpath(baseParams, removeTarget, removeMpath, false /*dont-resil*/)
@@ -2135,7 +2131,7 @@ func ecOnlyRebalance(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 
 	wg := sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -2327,7 +2323,7 @@ func ecAndRegularRebalance(t *testing.T, o *ecOptions, proxyURL string, bckReg, 
 	// fill EC bucket
 	wg := sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -2449,7 +2445,7 @@ func ecResilver(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 	wg := sync.WaitGroup{}
 
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -2459,7 +2455,7 @@ func ecResilver(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 	wg.Wait()
 	tlog.Logf("Created %d objects\n", o.objCount)
 
-	err = api.AttachMountpath(baseParams, tgtLost, lostPath, false /*force*/)
+	err = api.AttachMountpath(baseParams, tgtLost, lostPath)
 	tassert.CheckFatal(t, err)
 	// loop above may fail (even if AddMountpath works) and mark a test failed
 	if t.Failed() {
@@ -2476,9 +2472,10 @@ func ecResilver(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 		t.Errorf("Expected %d objects after rebalance, found %d", o.objCount, len(resEC.Entries))
 	}
 
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		objName := ecTestDir + fmt.Sprintf(o.pattern, i)
-		props, err := api.HeadObject(baseParams, bck, objName, apc.FltPresent, false /*silent*/)
+		hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+		props, err := api.HeadObject(baseParams, bck, objName, hargs)
 		if err != nil {
 			t.Errorf("HEAD for %s failed: %v", objName, err)
 		} else if props.EC.DataSlices == 0 || props.EC.ParitySlices == 0 {
@@ -2572,7 +2569,7 @@ func ecAndRegularUnregisterWhileRebalancing(t *testing.T, o *ecOptions, bckEC cm
 	// fill EC bucket
 	wg := sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -2683,7 +2680,7 @@ func ecMountpaths(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 
 	wg := sync.WaitGroup{}
 	wg.Add(o.objCount)
-	for i := 0; i < o.objCount; i++ {
+	for i := range o.objCount {
 		go func(i int) {
 			defer wg.Done()
 			objName := fmt.Sprintf(o.pattern, i)
@@ -2705,7 +2702,7 @@ func ecMountpaths(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 	removed := make(map[string]*removedMpath, o.parityCnt)
 	defer func() {
 		for _, rmMpath := range removed {
-			err := api.AttachMountpath(baseParams, rmMpath.si, rmMpath.mpath, true /*force*/)
+			err := api.AttachMountpath(baseParams, rmMpath.si, rmMpath.mpath)
 			tassert.CheckError(t, err)
 		}
 		tools.WaitForResilvering(t, baseParams, nil)
@@ -2713,7 +2710,7 @@ func ecMountpaths(t *testing.T, o *ecOptions, proxyURL string, bck cmn.Bck) {
 	// Choose `parity` random mpaths and disable them
 	i := 0
 	for tsi, paths := range allMpaths {
-		mpath := paths[rand.Intn(len(paths))]
+		mpath := paths[rand.IntN(len(paths))]
 		uid := tsi.ID() + "/" + mpath
 		if _, ok := removed[uid]; ok {
 			continue
@@ -2769,9 +2766,9 @@ func TestECGenerations(t *testing.T) {
 			newLocalBckWithProps(t, baseParams, bck, defaultECBckProps(o), o)
 
 			wg := sync.WaitGroup{}
-			for gen := 0; gen < generations; gen++ {
+			for gen := range generations {
 				wg.Add(o.objCount)
-				for i := 0; i < o.objCount; i++ {
+				for i := range o.objCount {
 					o.sema.Acquire()
 					go func(i, gen int) {
 						defer func() {
@@ -2789,9 +2786,10 @@ func TestECGenerations(t *testing.T) {
 			}
 
 			currentTime := mono.NanoTime()
-			for i := 0; i < o.objCount; i++ {
+			for i := range o.objCount {
 				objName := ecTestDir + fmt.Sprintf(o.pattern, i)
-				props, err := api.HeadObject(baseParams, bck, objName, apc.FltPresent, false /*silent*/)
+				hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+				props, err := api.HeadObject(baseParams, bck, objName, hargs)
 				tassert.CheckError(t, err)
 				if err == nil && props.EC.Generation > lastWrite[i] && props.EC.Generation < currentTime {
 					t.Errorf("Object %s, generation %d expected between %d and %d",

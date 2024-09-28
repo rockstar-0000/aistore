@@ -8,13 +8,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmd/cli/config"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/memsys"
 	"github.com/fatih/color"
 	"github.com/urfave/cli"
 )
@@ -29,7 +33,7 @@ const (
 	cliDescr = `If <TAB-TAB> completion doesn't work:
    * download ` + cmn.GitHubHome + `/tree/main/cmd/cli/autocomplete
    * run 'cmd/cli/autocomplete/install.sh'
-   To install CLI directly from GitHub: ` + cmn.GitHubHome + `/blob/main/deploy/scripts/install_from_binaries.sh`
+   To install CLI directly from GitHub: ` + cmn.GitHubHome + `/blob/main/scripts/install_from_binaries.sh`
 
 	// custom cli.AppHelpTemplate
 	// "You can render custom help text by setting this variable." (from github.com/urfave/cli)
@@ -81,6 +85,7 @@ type (
 	longRun struct {
 		count            int
 		lfooter          int
+		iters            int
 		refreshRate      time.Duration
 		offset           int64
 		mapBegin, mapEnd teb.StstMap
@@ -112,6 +117,41 @@ var helpCommand = cli.Command{
 	},
 }
 
+func paginate(_ io.Writer, templ string, data interface{}) {
+	gmm, err := memsys.NewMMSA("cli-out-buffer", true)
+	if err != nil {
+		exitln("memsys:", err)
+	}
+	sgl := gmm.NewSGL(0)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		exitln("os.pipe:", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(sgl, r); err != nil {
+			exitln("write sgl:", err)
+		}
+		r.Close()
+	}()
+
+	cli.HelpPrinterCustom(w, templ, data, nil)
+	w.Close()
+	wg.Wait()
+
+	cmd := exec.Command("more")
+	cmd.Stdin = sgl
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		exitln("cmd more:", err)
+	}
+}
+
 func cliConfVerbose() bool { return cfg.Verbose } // more warnings, errors with backtraces and details
 
 func helpCmdHandler(c *cli.Context) error {
@@ -119,9 +159,7 @@ func helpCmdHandler(c *cli.Context) error {
 	if args.Present() {
 		return cli.ShowCommandHelp(c, args.First())
 	}
-
-	cli.ShowAppHelp(c)
-	return nil
+	return cli.ShowAppHelp(c)
 }
 
 // main method
@@ -130,7 +168,8 @@ func Run(version, buildtime string, args []string) error {
 	buildTime = buildtime
 
 	// empty command line or 'ais help'
-	debug.Assert(args[0] == cliName, "expecting arg0:", cliName)
+	debug.Assert(filepath.Base(args[0]) == cliName, "expecting basename(arg0) '"+cliName+"'")
+
 	emptyCmdline := len(args) == 1 ||
 		strings.Contains(args[1], "help") ||
 		strings.Contains(args[1], "usage") ||
@@ -152,6 +191,7 @@ func Run(version, buildtime string, args []string) error {
 		}
 		return nil
 	}
+	a.longRun.iters = 1
 	if a.longRun.outFile != nil {
 		defer a.longRun.outFile.Close()
 	}
@@ -167,13 +207,13 @@ func (a *acli) runOnce(args []string) error {
 		return nil
 	}
 	if isStartingUp(err) {
-		for i := 0; i < 4; i++ {
-			briefPause(2)
-			fmt.Fprint(a.app.Writer, ". ")
-			if err = a.app.Run(args); err == nil {
-				fmt.Fprintln(a.app.Writer)
+		fmt.Fprintln(a.app.Writer, "(waiting for cluster to start ...)")
+		briefPause(1)
+		for range 8 { // retry
+			if err = a.app.Run(args); err == nil || !isStartingUp(err) {
 				break
 			}
+			briefPause(1)
 		}
 	}
 	return formatErr(err)
@@ -187,6 +227,7 @@ func (a *acli) runForever(args []string) error {
 		if err := a.runOnce(args); err != nil {
 			return err
 		}
+		a.longRun.iters++
 		a.longRun.mapBegin = a.longRun.mapEnd
 		a.longRun.mapEnd = nil
 	}
@@ -201,12 +242,12 @@ func printLongRunFooter(w io.Writer, repeat int) {
 func (a *acli) runN(args []string) error {
 	delim := fcyan(strings.Repeat("-", 16))
 	fmt.Fprintln(a.outWriter, delim)
-	for i := 2; i <= a.longRun.count; i++ {
+	for ; a.longRun.iters < a.longRun.count; a.longRun.iters++ {
 		time.Sleep(a.longRun.refreshRate)
 		if err := a.runOnce(args); err != nil {
 			return err
 		}
-		if i < a.longRun.count {
+		if a.longRun.iters < a.longRun.count-1 {
 			fmt.Fprintln(a.outWriter, delim)
 		}
 	}
@@ -240,9 +281,10 @@ func (a *acli) init(version string, emptyCmdline bool) {
 	app.Writer = a.outWriter
 	app.ErrWriter = a.errWriter
 	app.Description = cliDescr
-
+	if !cfg.NoMore {
+		cli.HelpPrinter = paginate
+	}
 	cli.AppHelpTemplate = appHelpTemplate
-
 	a.setupCommands(emptyCmdline)
 }
 
@@ -265,7 +307,8 @@ func (a *acli) setupCommands(emptyCmdline bool) {
 		storageCmd,
 		archCmd,
 		logCmd,
-		perfCmd,
+		tlsCmd,
+		showCmdPeformance,
 		remClusterCmd,
 		a.getAliasCmd(),
 	}
@@ -290,8 +333,7 @@ func (a *acli) enableSearch() {
 }
 
 func setupCommandHelp(commands []cli.Command) {
-	lst := splitCsv(cli.HelpFlag.GetName())
-	helpName := lst[0]
+	helpName := fl1n(cli.HelpFlag.GetName())
 	for i := range commands {
 		command := &commands[i]
 
@@ -422,4 +464,9 @@ func setLongRunOutfile(c *cli.Context, file *os.File) {
 func getLongRunOutfile(c *cli.Context) *os.File {
 	params := c.App.Metadata[metadata].(*longRun)
 	return params.outFile
+}
+
+func exitln(prompt string, err error) {
+	fmt.Fprintln(os.Stderr, prompt, err)
+	os.Exit(1)
 }

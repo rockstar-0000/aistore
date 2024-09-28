@@ -53,7 +53,7 @@ ls           promote      concat       evict        mv           cat
 - [Move object](#move-object)
 - [Concat objects](#concat-objects)
 - [Set custom properties](#set-custom-properties)
-- [Operations on Lists and Ranges](#operations-on-lists-and-ranges)
+- [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets)
   - [Prefetch objects](#prefetch-objects)
   - [Delete multiple objects](#delete-multiple-objects)
   - [Evict multiple objects](#evict-multiple-objects)
@@ -73,6 +73,7 @@ Here's in detail:
 
 ```console
 $ ais get --help
+
 NAME:
    ais get - (alias for "object get") get an object, a shard, an archived file, or a range of bytes from all of the above;
               write the content locally with destination options including: filename, directory, STDOUT ('-'), or '/dev/null' (discard);
@@ -86,37 +87,62 @@ USAGE:
    ais get [command options] BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-]
 
 OPTIONS:
-   --offset value    object read offset; must be used together with '--length'; default formatting: IEC (use '--units' to override)
-   --length value    object read length; default formatting: IEC (use '--units' to override)
-   --checksum        validate checksum
-   --yes, -y         assume 'yes' to all questions
-   --check-cached    instead of GET execute HEAD(object) to check if the object is present in aistore
-                     (applies only to buckets with remote backend)
-   --latest          check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
-                     from the associated remote bucket:
-                      - provides operation-level control over object versioning (and version synchronization)
-                        without requiring to change bucket configuration
-                      - the latter can be done using 'ais bucket props set BUCKET versioning'
-                      - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --progress        show progress bar(s) and progress of execution in real time
-   --archpath value  extract the specified file from an archive (shard)
-   --extract, -x     extract all files from archive(s)
-   --prefix value    get objects that start with the specified prefix, e.g.:
-                     '--prefix a/b/c' - get objects from the virtual directory a/b/c and objects from the virtual directory
-                     a/b that have their names (relative to this directory) starting with 'c';
-                     '--prefix ""' - get entire bucket (all objects)
-   --cached          get only those objects from a remote bucket that are present ("cached") in aistore
-   --archive         list archived content (see docs/archive.md for details)
-   --limit value     limit object name count (0 - unlimited) (default: 0)
-   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
-                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                     si  - SI (metric) format, e.g.: KB, MB, GB
-                     raw - do not convert to (or from) human-readable format
-   --verbose, -v     verbose output
-   --silent          server-side flag, an indication for aistore _not_ to log assorted errors (e.g., HEAD(object) failures)
-   --help, -h        show help
+   --offset value       object read offset; must be used together with '--length'; default formatting: IEC (use '--units' to override)
+   --length value       object read length; default formatting: IEC (use '--units' to override)
+   --checksum           validate checksum
+   --yes, -y            assume 'yes' to all questions
+   --check-cached       check whether a given named object is present in cluster
+                        (applies only to buckets with remote backend)
+   --latest             check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
+                        from the associated remote bucket:
+                        - provides operation-level control over object versioning (and version synchronization)
+                          without requiring to change bucket configuration
+                        - the latter can be done using 'ais bucket props set BUCKET versioning'
+                        - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
+   --refresh value      interval for continuous monitoring;
+                        valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress           show progress bar(s) and progress of execution in real time
+   --blob-download      utilize built-in blob-downloader (and the corresponding alternative datapath) to read very large remote objects
+   --chunk-size value   chunk size in IEC or SI units, or "raw" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')
+   --num-workers value  number of concurrent blob-downloading workers (readers); system default when omitted or zero (default: 0)
+   --archpath value     extract the specified file from an object ("shard") formatted as: .tar, .tgz or .tar.gz, .zip, .tar.lz4;
+                        see also: '--archregx'
+   --archmime value     expected format (mime type) of an object ("shard") formatted as: .tar, .tgz or .tar.gz, .zip, .tar.lz4;
+                        especially usable for shards with non-standard extensions
+   --archregx value     prefix, suffix, WebDataset key, or general-purpose regular expression to select possibly multiple matching archived files;
+                        use '--archmode' to specify the "matching mode" (that can be prefix, suffix, WebDataset key, or regex)
+   --archmode value     enumerated "matching mode" that tells aistore how to handle '--archregx', one of:
+                          * regexp - general purpose regular expression;
+                          * prefix - matching filename starts with;
+                          * suffix - matching filename ends with;
+                          * substr - matching filename contains;
+                          * wdskey - WebDataset key, e.g.:
+                        example:
+                          given a shard containing (subdir/aaa.jpg, subdir/aaa.json, subdir/bbb.jpg, subdir/bbb.json, ...)
+                          and wdskey=subdir/aaa, aistore will match and return (subdir/aaa.jpg, subdir/aaa.json)
+   --extract, -x        extract all files from archive(s)
+   --inventory          list objects using _bucket inventory_ (docs/s3inventory.md); requires s3:// backend; will provide significant performance
+                        boost when used with very large s3 buckets; e.g. usage:
+                          1) 'ais ls s3://abc --inventory'
+                          2) 'ais ls s3://abc --inventory --paged --prefix=subdir/'
+                        (see also: docs/s3inventory.md)
+   --inv-name value     bucket inventory name (optional; system default name is '.inventory')
+   --inv-id value       bucket inventory ID (optional; by default, we use bucket name as the bucket's inventory ID)
+   --prefix value       get objects that start with the specified prefix, e.g.:
+                        '--prefix a/b/c' - get objects from the virtual directory a/b/c and objects from the virtual directory
+                        a/b that have their names (relative to this directory) starting with 'c';
+                        '--prefix ""' - get entire bucket (all objects)
+   --cached             get only in-cluster objects - only those objects from a remote bucket that are present ("cached")
+   --archive            list archived content (see docs/archive.md for details)
+   --limit value        maximum number of object names to display (0 - unlimited; see also '--max-pages')
+                        e.g.: 'ais ls gs://abc --limit 1234 --cached --props size,custom (default: 0)
+   --units value        show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                        si  - SI (metric) format, e.g.: KB, MB, GB
+                        raw - do not convert to (or from) human-readable format
+   --verbose, -v        verbose output
+   --silent             server-side flag, an indication for aistore _not_ to log assorted errors (e.g., HEAD(object) failures)
+   --help, -h           show help
 ```
 
 ## Save object to local file
@@ -284,8 +310,7 @@ NAME                                             SIZE
     A.tar/tutorials/etl/compute_md5.md           8.28KiB
     A.tar/tutorials/etl/etl_imagenet_pytorch.md  4.16KiB
     A.tar/tutorials/etl/etl_webdataset.md        3.97KiB
-    A.tar/tutorials/various/hdfs_backend.md      5.39KiB
-Listed: 5 names
+Listed: 4 names
 ```
 
 Now, extract matching files _from_ the bucket to /tmp/out:
@@ -314,8 +339,10 @@ $ tree /tmp/out
     │   ├── etl_imagenet_pytorch.md
     │   └── etl_webdataset.md
     ├── README.md
-    └── various
-        └── hdfs_backend.md
+    └── etl
+        └── compute_md5.md
+        └── etl_imagenet_pytorch.md
+        └── etl_webdataset.md
 ```
 
 > **NOTE:** for more "archival" options and examples, please see [docs/cli/archive.md](archive.md).
@@ -1114,7 +1141,7 @@ version          3
 
 Delete an object or list/range of objects from the bucket.
 
-* For multi-object delete operation, please see: [Operations on Lists and Ranges](#operations-on-lists-and-ranges) below.
+* For multi-object delete operation, please see: [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
 
 ## Delete a single object
 
@@ -1136,7 +1163,7 @@ obj2.tgz deleted from aws://cloudbck bucket
 ```
 
 * NOTE: for each space-separated object name CLI sends a separate request.
-* For multi-object delete that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges](#operations-on-lists-and-ranges) below.
+* For multi-object delete that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
 
 # Evict object
 
@@ -1145,7 +1172,7 @@ obj2.tgz deleted from aws://cloudbck bucket
 [Evict](/docs/bucket.md#prefetchevict-objects) object(s) from a bucket that has [remote backend](/docs/bucket.md).
 
 * NOTE: for each space-separated object name CLI sends a separate request.
-* For multi-object eviction that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges](#operations-on-lists-and-ranges) below.
+* For multi-object eviction that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
 
 ## Evict a single object
 
@@ -1259,7 +1286,7 @@ version          1
 
 Note the flag `--props=all` used to show _all_ object's properties including the custom ones, if available.
 
-# Operations on Lists and Ranges
+# Operations on Lists and Ranges (and entire buckets)
 
 Generally, multi-object operations are supported in 2 different ways:
 
@@ -1282,8 +1309,10 @@ $ ais prefetch --help
 NAME:
    ais prefetch - (alias for "object prefetch") prefetch one remote bucket, multiple remote buckets, or
    selected objects in a given remote bucket or buckets, e.g.:
-     - 'prefetch gs://abc'                                          - prefetch entire bucket (all gs://abc objects that are _not_ present in the cluster);
+     - 'prefetch gs://abc'                                          - prefetch entire bucket (all gs://abc objects that are _not_ in-cluster);
+     - 'prefetch gs://abc --num-workers 32'                         - same as above with 32 concurrent (prefetching) workers;
      - 'prefetch gs:'                                               - prefetch all visible/accessible GCP buckets;
+     - 'prefetch gs: --num-workers=48'                              - same as above employing 48 workers;
      - 'prefetch gs://abc --template images/'                       - prefetch all objects from the virtual subdirectory "images";
      - 'prefetch gs://abc/images/'                                  - same as above;
      - 'prefetch gs://abc --template "shard-{0000..9999}.tar.lz4"'  - prefetch the matching range (prefix + brace expansion);
@@ -1293,37 +1322,42 @@ USAGE:
    ais prefetch [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]
 
 OPTIONS:
-   --list value      comma-separated list of object or file names, e.g.:
-                     --list 'o1,o2,o3'
-                     --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
-                     or, when listing files and/or directories:
-                     --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
-   --template value  template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
-                     (with optional steps and gaps), e.g.:
-                     --template "" # (an empty or '*' template matches eveything)
-                     --template 'dir/subdir/'
-                     --template 'shard-{1000..9999}.tar'
-                     --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
-                     and similarly, when specifying files and directories:
-                     --template '/home/dir/subdir/'
-                     --template "/abc/prefix-{0010..9999..2}-suffix"
-   --wait            wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
-   --timeout value   maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --progress        show progress bar(s) and progress of execution in real time
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --dry-run         preview the results without really running the action
-   --prefix value    select objects that have names starting with the specified prefix, e.g.:
-                     '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
-                     '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
-   --latest          check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
-                     from the associated remote bucket:
-                      - provides operation-level control over object versioning (and version synchronization)
-                        without requiring to change bucket configuration
-                      - the latter can be done using 'ais bucket props set BUCKET versioning'
-                      - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
-   --help, -h        show help
+   --list value            comma-separated list of object or file names, e.g.:
+                           --list 'o1,o2,o3'
+                           --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                           or, when listing files and/or directories:
+                           --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value        template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                           (with optional steps and gaps), e.g.:
+                           --template "" # (an empty or '*' template matches eveything)
+                           --template 'dir/subdir/'
+                           --template 'shard-{1000..9999}.tar'
+                           --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                           and similarly, when specifying files and directories:
+                           --template '/home/dir/subdir/'
+                           --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait                  wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value         maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                           valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress              show progress bar(s) and progress of execution in real time
+   --refresh value         time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                           valid time units: ns, us (or µs), ms, s (default), m, h
+   --dry-run               preview the results without really running the action
+   --prefix value          select objects that have names starting with the specified prefix, e.g.:
+                           '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+                           '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
+   --latest                check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
+                           from the associated remote bucket:
+                           - provides operation-level control over object versioning (and version synchronization)
+                             without requiring to change bucket configuration
+                           - the latter can be done using 'ais bucket props set BUCKET versioning'
+                           - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
+   --blob-threshold value  utilize built-in blob-downloader for remote objects greater than the specified (threshold) size
+                           in IEC or SI units, or "raw" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')
+   --num-workers value     number of concurrent workers (readers); defaults to a number of target mountpaths if omitted or zero;
+                           (-1) is a special value indicating no workers at all (ie., single-threaded execution);
+                           any positive value will be adjusted _not_ to exceed the number of target CPUs (default: 0)
+   --help, -h              show help
 ```
 
 Note usage examples above. You can always run `--help` option to see the most recently updated inline help.

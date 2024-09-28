@@ -1,45 +1,87 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
 import (
+	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
-
-	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
-// fqn2FsInfo is used only at startup to store file systems for each mountpath.
-func fqn2FsInfo(fqn string) (fs, fsType string, err error) {
-	getFSCommand := fmt.Sprintf("df -PT '%s' | awk 'END{print $1,$2}'", fqn)
-	outputBytes, err := exec.Command("sh", "-c", getFSCommand).Output()
-	if err != nil || len(outputBytes) == 0 {
-		return "", "", fmt.Errorf("failed to retrieve FS info from path %q, err: %v", fqn, err)
+const procmounts = "/proc/mounts"
+
+func (mi *Mountpath) resolveFS() error {
+	var fsStats syscall.Statfs_t
+	if err := syscall.Statfs(mi.Path, &fsStats); err != nil {
+		return fmt.Errorf("cannot statfs mountpath %q, err: %w", mi.Path, err)
 	}
-	info := strings.Split(string(outputBytes), " ")
-	if len(info) != 2 {
-		return "", "", fmt.Errorf("failed to retrieve FS info from path %q, err: invalid format", fqn)
+
+	fh, e := os.Open(procmounts)
+	if e != nil {
+		return fmt.Errorf("FATAL: failed to open Linux %q, err: %w", procmounts, e)
 	}
-	return strings.TrimSpace(info[0]), strings.TrimSpace(info[1]), nil
+
+	fs, fsType, err := _resolve(mi.Path, fh)
+	fh.Close()
+	if err != nil {
+		return err
+	}
+
+	mi.Fs = fs
+	mi.FsType = fsType
+	mi.FsID = fsStats.Fsid.X__val
+	return nil
 }
 
-func makeFsInfo(mpath string) (fsInfo cos.FS, err error) {
-	var fsStats syscall.Statfs_t
-	if err := syscall.Statfs(mpath, &fsStats); err != nil {
-		return fsInfo, fmt.Errorf("cannot statfs fspath %q, err: %w", mpath, err)
+// NOTE:
+//   - filepath.Rel() returns '.' not an empty string when there is an exact match.
+//   - mountpath must be either a direct descendant of a mount point, or the mount point itself
+//     (when `rel` == ".")
+func _resolve(path string, fh *os.File) (fs, fsType string, _ error) {
+	var (
+		bestMatch string
+		scanner   = bufio.NewScanner(fh)
+	)
+outer:
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		mountPoint := fields[1]
+		rel, err := filepath.Rel(path, mountPoint)
+		if err != nil {
+			continue
+		}
+		if rel == "." {
+			// when ais mountpath EQ mount point
+			return fields[0], fields[2], nil
+		}
+		for i := range len(rel) {
+			if rel[i] != '.' && rel[i] != filepath.Separator {
+				// mountpath can be a direct descendant (of a mount point),
+				// with `rel` containing one or more "../" snippets
+				continue outer
+			}
+		}
+		if bestMatch == "" || len(rel) < len(bestMatch) /*minimizing `rel`*/ {
+			bestMatch = rel
+			fs = fields[0]
+			fsType = fields[2]
+		}
 	}
-
-	fs, fsType, err := fqn2FsInfo(mpath)
-	if err != nil {
-		return fsInfo, err
+	if err := scanner.Err(); err != nil {
+		return "", "", fmt.Errorf("FATAL: failed reading Linux %q, err: %w", procmounts, err)
 	}
-
-	return cos.FS{Fs: fs, FsType: fsType, FsID: fsStats.Fsid.X__val}, nil
+	if bestMatch == "" {
+		return "", "", fmt.Errorf("failed to resolve mountpath %q: mount point not found", path)
+	}
+	return fs, fsType, nil
 }
 
 // DirectOpen opens a file with direct disk access (with OS caching disabled).

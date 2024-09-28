@@ -1,6 +1,6 @@
 // Package xreg provides registry and (renew, find) functions for AIS eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xreg
 
@@ -188,7 +188,7 @@ func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
 			continue
 		}
 		var (
-			xqn    = k + xact.LeftID + xctn.ID() + xact.RightID // e.g. "make-n-copies[fGhuvvn7t]"
+			xqn    = xctn.Cname() // e.g. "make-n-copies[fGhuvvn7t]"
 			isIdle bool
 		)
 		if inout.Idle != nil {
@@ -303,22 +303,26 @@ func GetSnap(flt Flt) ([]*core.Snap, error) {
 		}
 
 		if onlyRunning {
-			matching := make([]*core.Snap, 0, 10)
+			var matching []*core.Snap
+
+			dreg.entries.mtx.RLock() // ----------
+			matching = make([]*core.Snap, 0, min(len(dreg.entries.active), 8))
 			if flt.Kind == "" {
-				dreg.entries.mtx.RLock()
 				for kind := range xact.Table {
 					entry := dreg.entries.findRunning(Flt{Kind: kind, Bck: flt.Bck})
 					if entry != nil {
 						matching = append(matching, entry.Get().Snap())
 					}
 				}
-				dreg.entries.mtx.RUnlock()
 			} else {
-				entry := dreg.getRunning(Flt{Kind: flt.Kind, Bck: flt.Bck})
-				if entry != nil {
-					matching = append(matching, entry.Get().Snap())
+				for _, entry := range dreg.entries.active {
+					if xctn := entry.Get(); flt.Matches(xctn) {
+						matching = append(matching, xctn.Snap())
+					}
 				}
 			}
+			dreg.entries.mtx.RUnlock() // ----------
+
 			return matching, nil
 		}
 		return dreg.matchingXactsStats(flt.Matches), nil
@@ -388,7 +392,7 @@ func (r *registry) matchingXactsStats(match func(xctn core.Xact) bool) []*core.S
 
 func (r *registry) incFinished() { r.finDelta.Inc() }
 
-func (r *registry) hkPruneActive() time.Duration {
+func (r *registry) hkPruneActive(int64) time.Duration {
 	if r.finDelta.Swap(0) == 0 {
 		return hk.PruneActiveIval
 	}
@@ -409,7 +413,7 @@ func (r *registry) hkPruneActive() time.Duration {
 	return hk.PruneActiveIval
 }
 
-func (r *registry) hkDelOld() time.Duration {
+func (r *registry) hkDelOld(int64) time.Duration {
 	var (
 		toRemove  []string
 		numNonLso int
@@ -418,15 +422,16 @@ func (r *registry) hkDelOld() time.Duration {
 
 	r.entries.mtx.RLock()
 	l := len(r.entries.all)
+
 	// first, cleanup list-objects: walk older to newer while counting non-lso
-	for i := 0; i < l; i++ {
+	for i := range l {
 		xctn := r.entries.all[i].Get()
 		if xctn.Kind() != apc.ActList {
 			numNonLso++
 			continue
 		}
 		if xctn.Finished() {
-			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeLso {
+			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeLsoX {
 				toRemove = append(toRemove, xctn.ID())
 			}
 		}
@@ -434,7 +439,7 @@ func (r *registry) hkDelOld() time.Duration {
 	// all the rest: older to newer, while keeping at least `keepOldThreshold`
 	if numNonLso > keepOldThreshold {
 		var cnt int
-		for i := 0; i < l; i++ {
+		for i := range l {
 			xctn := r.entries.all[i].Get()
 			if xctn.Kind() == apc.ActList {
 				continue
@@ -452,8 +457,12 @@ func (r *registry) hkDelOld() time.Duration {
 	}
 	r.entries.mtx.RUnlock()
 
-	if len(toRemove) == 0 {
-		return hk.DelOldIval
+	d, ll := hk.DelOldIval, len(toRemove)
+	if l-ll > keepOldThreshold<<1 {
+		d >>= 1
+	}
+	if ll == 0 {
+		return d
 	}
 
 	// cleanup
@@ -462,7 +471,8 @@ func (r *registry) hkDelOld() time.Duration {
 		r.entries.del(id)
 	}
 	r.entries.mtx.Unlock()
-	return hk.DelOldIval
+
+	return d
 }
 
 func (r *registry) renewByID(entry Renewable, bck *meta.Bck) (rns RenewRes) {
@@ -650,7 +660,10 @@ func (e *entries) del(id string) {
 	for idx, entry := range e.active {
 		xctn := entry.Get()
 		if xctn.ID() == id {
-			debug.Assert(xctn.Finished(), xctn.String())
+			if !xctn.Finished() {
+				nlog.Errorln("Warning: premature HK call to del-old", xctn.String())
+				break
+			}
 			nlen := len(e.active) - 1
 			e.active[idx] = e.active[nlen]
 			e.active = e.active[:nlen]

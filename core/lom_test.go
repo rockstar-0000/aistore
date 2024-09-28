@@ -1,10 +1,12 @@
+//nolint:dupl // copy-paste benign and can wait
 // Package core_test provides tests for cluster package
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package core_test
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -19,9 +21,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/tools/cryptorand"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -53,7 +53,7 @@ var _ = Describe("LOM", func() {
 		oldCloudProviders = cmn.GCO.Get().Backend.Providers
 	)
 
-	for i := 0; i < numMpaths; i++ {
+	for i := range numMpaths {
 		mpath := fmt.Sprintf("%s/mpath%d", tmpDir, i)
 		mpaths = append(mpaths, mpath)
 		mis = append(mis, &fs.Mountpath{Path: mpath})
@@ -65,7 +65,6 @@ var _ = Describe("LOM", func() {
 	cmn.GCO.CommitUpdate(config)
 
 	fs.TestNew(nil)
-	fs.TestDisableValidation()
 	for _, mpath := range mpaths {
 		_, _ = fs.Add(mpath, "daeID")
 	}
@@ -168,9 +167,10 @@ var _ = Describe("LOM", func() {
 				workObject := "foldr/get.test-obj.ext" + "." + testTieIndex + "." + testPid
 				localFQN := mis[0].MakePathFQN(&cloudBckA, fs.WorkfileType, workObject)
 
-				parsedFQN, _, err := core.ResolveFQN(localFQN)
+				var parsed fs.ParsedFQN
+				_, err := core.ResolveFQN(localFQN, &parsed)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(parsedFQN.ContentType).To(BeEquivalentTo(fs.WorkfileType))
+				Expect(parsed.ContentType).To(BeEquivalentTo(fs.WorkfileType))
 			})
 		})
 
@@ -285,7 +285,7 @@ var _ = Describe("LOM", func() {
 				Expect(persist(lom)).NotTo(HaveOccurred())
 				err = lom.Load(false, false)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(lom.SizeBytes()).To(BeEquivalentTo(testFileSize))
+				Expect(lom.Lsize()).To(BeEquivalentTo(testFileSize))
 			})
 		})
 
@@ -540,7 +540,7 @@ var _ = Describe("LOM", func() {
 					Expect(lom2.Load(false, false)).ToNot(HaveOccurred()) // Calls `FromFS`.
 					Expect(lom2.Checksum()).To(BeEquivalentTo(lom1.Checksum()))
 					Expect(lom2.Version()).To(BeEquivalentTo(lom1.Version()))
-					Expect(lom2.SizeBytes()).To(BeEquivalentTo(testFileSize))
+					Expect(lom2.Lsize()).To(BeEquivalentTo(testFileSize))
 					Expect(time.Unix(0, lom2.AtimeUnix()).After(startTime)).To(BeTrue())
 				})
 			})
@@ -600,7 +600,8 @@ var _ = Describe("LOM", func() {
 					}
 				}
 
-				_, hrw, _ := core.ResolveFQN(fqn)
+				var parsed fs.ParsedFQN
+				hrw, _ := core.ResolveFQN(fqn, &parsed)
 				if defaultLoc && hrw == fqn {
 					return fqn
 				} else if !defaultLoc && hrw != fqn {
@@ -659,7 +660,7 @@ var _ = Describe("LOM", func() {
 			dst, err = lom.Copy2FQN(fqn, make([]byte, testFileSize))
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(dst.FQN).To(BeARegularFile())
-			Expect(dst.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+			Expect(dst.Lsize(true)).To(BeEquivalentTo(testFileSize))
 
 			hrwLom := &core.LOM{ObjName: lom.ObjName}
 			Expect(hrwLom.InitBck(bck.Bucket())).NotTo(HaveOccurred())
@@ -683,7 +684,7 @@ var _ = Describe("LOM", func() {
 				_, cksumValue := copyLOM.Checksum().Get()
 				Expect(cksumValue).To(Equal(expectedHash))
 				Expect(copyLOM.Version()).To(Equal(desiredVersion))
-				Expect(copyLOM.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(copyLOM.Lsize(true)).To(BeEquivalentTo(testFileSize))
 
 				Expect(copyLOM.IsCopy()).To(Equal(copyFQN != defaultLOM.FQN))
 				Expect(copyLOM.HasCopies()).To(BeTrue())
@@ -717,7 +718,7 @@ var _ = Describe("LOM", func() {
 				_, cksumValue := copyLOM.Checksum().Get()
 				Expect(cksumValue).To(Equal(expectedHash))
 				Expect(copyLOM.Version()).To(Equal(desiredVersion))
-				Expect(copyLOM.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(copyLOM.Lsize(true)).To(BeEquivalentTo(testFileSize))
 				Expect(copyLOM.IsCopy()).To(BeFalse())
 				Expect(copyLOM.HasCopies()).To(BeFalse())
 				Expect(copyLOM.NumCopies()).To(Equal(1))
@@ -746,7 +747,7 @@ var _ = Describe("LOM", func() {
 				_, cksumValue := copyLOM.Checksum().Get()
 				Expect(cksumValue).To(Equal(expectedHash))
 				Expect(copyLOM.Version()).To(Equal(desiredVersion))
-				Expect(copyLOM.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(copyLOM.Lsize(true)).To(BeEquivalentTo(testFileSize))
 
 				Expect(copyLOM.IsCopy()).To(BeTrue())
 				Expect(copyLOM.HasCopies()).To(BeTrue())
@@ -824,7 +825,7 @@ var _ = Describe("LOM", func() {
 				_, cksumValue := nonMirroredLOM.Checksum().Get()
 				Expect(cksumValue).To(Equal(expectedHash))
 				Expect(nonMirroredLOM.Version()).To(Equal("1"))
-				Expect(nonMirroredLOM.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(nonMirroredLOM.Lsize(true)).To(BeEquivalentTo(testFileSize))
 
 				Expect(nonMirroredLOM.IsCopy()).To(BeFalse())
 				Expect(nonMirroredLOM.HasCopies()).To(BeFalse())
@@ -858,7 +859,7 @@ var _ = Describe("LOM", func() {
 				_, cksumValue := copyLOM.Checksum().Get()
 				Expect(cksumValue).To(Equal(expectedHash))
 				Expect(copyLOM.Version()).To(Equal(desiredVersion)) // TODO: ???
-				Expect(copyLOM.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(copyLOM.Lsize(true)).To(BeEquivalentTo(testFileSize))
 				Expect(copyLOM.IsHRW()).To(BeTrue())
 				Expect(copyLOM.IsCopy()).To(BeFalse())
 				Expect(copyLOM.HasCopies()).To(BeFalse())
@@ -881,12 +882,12 @@ var _ = Describe("LOM", func() {
 				Expect(lom.NumCopies()).To(Equal(2))
 				Expect(lom.GetCopies()).To(And(HaveKey(mirrorFQNs[0]), HaveKey(mirrorFQNs[1])))
 				Expect(lom.Version()).To(Equal(desiredVersion))
-				Expect(lom.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(lom.Lsize(true)).To(BeEquivalentTo(testFileSize))
 
 				// Check that copy from which HRW object was created is also updated.
 				Expect(copyLOM.FQN).NotTo(Equal(lom.FQN))
 				Expect(copyLOM.Version()).To(Equal(desiredVersion))
-				Expect(copyLOM.SizeBytes(true)).To(BeEquivalentTo(testFileSize))
+				Expect(copyLOM.Lsize(true)).To(BeEquivalentTo(testFileSize))
 				Expect(copyLOM.IsCopy()).To(BeTrue())
 				Expect(copyLOM.HasCopies()).To(BeTrue())
 				Expect(copyLOM.NumCopies()).To(Equal(lom.NumCopies()))
@@ -954,7 +955,7 @@ var _ = Describe("LOM", func() {
 				_, cksumValue := copyLOM.Checksum().Get()
 				Expect(cksumValue).To(Equal(expectedHash))
 				Expect(copyLOM.Version()).To(Equal(desiredVersion))
-				Expect(copyLOM.SizeBytes()).To(BeEquivalentTo(testFileSize))
+				Expect(copyLOM.Lsize()).To(BeEquivalentTo(testFileSize))
 
 				Expect(copyLOM.IsCopy()).To(BeTrue())
 				Expect(copyLOM.HasCopies()).To(BeTrue())
@@ -1011,7 +1012,8 @@ var _ = Describe("LOM", func() {
 			err = lomLocal.Load(false, false)
 			Expect(cos.IsNotExist(err, 0)).To(BeTrue())
 			Expect(lomLocal.FQN).To(Equal(desiredLocalFQN))
-			Expect(lomLocal.Uname()).To(Equal(lomLocal.Bck().MakeUname(testObject)))
+			uname := lomLocal.Bck().MakeUname(testObject)
+			Expect(lomLocal.Uname()).To(Equal(cos.UnsafeS(uname)))
 			Expect(lomLocal.Bck().Provider).To(Equal(apc.AIS))
 			Expect(lomLocal.Mountpath().Path).To(Equal(mpaths[0]))
 			expectEqualBck(lomLocal.Bucket(), &localSameBck)
@@ -1023,7 +1025,9 @@ var _ = Describe("LOM", func() {
 			err = lomCloud.Load(false, false)
 			Expect(cos.IsNotExist(err, 0)).To(BeTrue())
 			Expect(lomCloud.FQN).To(Equal(desiredCloudFQN))
-			Expect(lomCloud.Uname()).To(Equal(lomCloud.Bck().MakeUname(testObject)))
+
+			uname = lomCloud.Bck().MakeUname(testObject)
+			Expect(lomCloud.Uname()).To(Equal(cos.UnsafeS(uname)))
 			Expect(lomCloud.Bck().Provider).To(Equal(apc.AWS))
 			Expect(lomCloud.Mountpath().Path).To(Equal(mpaths[0]))
 			expectEqualBck(lomCloud.Bucket(), &cloudSameBck)

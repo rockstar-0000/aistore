@@ -9,6 +9,7 @@ mkdir -p ${AIS_LOG_DIR}
 export GOCACHE=/tmp/.gocache
 mkdir -p /tmp/.gocache
 touch ${AIS_LOG_DIR}/statsd.log
+source /utils.sh
 source /aisnode_config.sh
 
 exec node /statsd/stats.js ${STATSD_CONF_FILE} 2>&1 | tee -a ${AIS_LOG_DIR}/statsd.log &
@@ -19,5 +20,4 @@ ${GOBIN}/aisnode \
     -role=${AIS_NODE_ROLE} \
     -ntargets=${TARGET_CNT} \
     -nodiskio=${AIS_NO_DISK_IO} \
-    -dryobjsize=${AIS_DRY_OBJ_SIZE} \
-    -allow_shared_no_disks=${AIS_ALLOW_SHARED_NO_DISKS}
+    -dryobjsize=${AIS_DRY_OBJ_SIZE}

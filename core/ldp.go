@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 )
 
 // NOTE: compare with ext/etl/dp.go
@@ -54,7 +55,7 @@ func (lom *LOM) NewDeferROC() (cos.ReadOpenCloser, error) {
 		return &deferROC{fh, lom.LIF()}, nil
 	}
 	lom.Unlock(false)
-	return nil, cmn.NewErrFailedTo(T, "open", lom.FQN, err)
+	return nil, cmn.NewErrFailedTo(T, "open", lom.Cname(), err)
 }
 
 // (compare with ext/etl/dp.go)
@@ -64,11 +65,11 @@ func (*LDP) Reader(lom *LOM, latestVer, sync bool) (cos.ReadOpenCloser, cos.OAH,
 	if loadErr == nil {
 		if latestVer || sync {
 			debug.Assert(lom.Bck().IsRemote(), lom.Bck().String()) // caller's responsibility
-			res := lom.CheckRemoteMD(true /* rlocked*/, sync)
+			res := lom.CheckRemoteMD(true /* rlocked*/, sync, nil /*origReq*/)
 			if res.Err != nil {
 				lom.Unlock(false)
 				if !cos.IsNotExist(res.Err, res.ErrCode) {
-					res.Err = cmn.NewErrFailedTo(T, "head-latest", lom, res.Err)
+					res.Err = cmn.NewErrFailedTo(T, "head-latest", lom.Cname(), res.Err)
 				}
 				return nil, nil, res.Err
 			}
@@ -85,7 +86,7 @@ func (*LDP) Reader(lom *LOM, latestVer, sync bool) (cos.ReadOpenCloser, cos.OAH,
 
 	lom.Unlock(false)
 	if !cos.IsNotExist(loadErr, 0) {
-		return nil, nil, cmn.NewErrFailedTo(T, "ldp-load", lom, loadErr)
+		return nil, nil, cmn.NewErrFailedTo(T, "ldp-load", lom.Cname(), loadErr)
 	}
 	if !lom.Bck().IsRemote() {
 		return nil, nil, cos.NewErrNotFound(T, lom.Cname())
@@ -96,7 +97,7 @@ remote:
 	// (compare w/ T.GetCold)
 	lom.SetAtimeUnix(time.Now().UnixNano())
 	oah := &cmn.ObjAttrs{
-		Ver:   "",            // TODO: differentiate between copying (same version) vs. transforming
+		Ver:   nil,           // TODO: differentiate between copying (same version) vs. transforming
 		Cksum: cos.NoneCksum, // will likely reassign (below)
 		Atime: lom.AtimeUnix(),
 	}
@@ -117,7 +118,7 @@ remote:
 // - [MAY] delete remotely-deleted (non-existing) object and increment associated stats counter
 //
 // Returns NotFound also after having removed local replica (the Sync option)
-func (lom *LOM) CheckRemoteMD(locked, sync bool) (res CRMD) {
+func (lom *LOM) CheckRemoteMD(locked, sync bool, origReq *http.Request) (res CRMD) {
 	bck := lom.Bck()
 	if !bck.HasVersioningMD() {
 		// nothing to do with: in-cluster ais:// bucket, or a remote one
@@ -125,42 +126,47 @@ func (lom *LOM) CheckRemoteMD(locked, sync bool) (res CRMD) {
 		return CRMD{Eq: true}
 	}
 
-	oa, errCode, err := T.Backend(bck).HeadObj(context.Background(), lom)
+	oa, ecode, err := T.HeadCold(lom, origReq)
 	if err == nil {
-		debug.Assert(errCode == 0, errCode)
-		return CRMD{ObjAttrs: oa, Eq: lom.Equal(oa), ErrCode: errCode}
+		e := lom.CheckEq(oa)
+		if !lom.IsFeatureSet(feat.DisableColdGET) || e == nil {
+			debug.Assert(ecode == 0, ecode)
+			return CRMD{ObjAttrs: oa, Eq: e == nil, ErrCode: ecode}
+		}
+		// Cold Get disabled and metadata doesn't match, so we must treat
+		// it as if the object doesn't really exist.
+		err = cmn.NewErrRemoteMetadataMismatch(e)
+		ecode = http.StatusNotFound
 	}
 
-	if errCode == http.StatusNotFound {
+	if ecode == http.StatusNotFound {
 		err = cos.NewErrNotFound(T, lom.Cname())
 	}
 	if !locked {
 		// return info (neq and, possibly, not-found), and be done
-		return CRMD{ErrCode: errCode, Err: err}
+		return CRMD{ErrCode: ecode, Err: err}
 	}
 
 	// rm remotely-deleted
-	if cos.IsNotExist(err, errCode) && (lom.VersionConf().Sync || sync) {
-		errDel := lom.Remove(locked /*force through rlock*/)
+	if cos.IsNotExist(err, ecode) && (lom.VersionConf().Sync || sync) {
+		errDel := lom.RemoveObj(locked /*force through rlock*/)
 		if errDel != nil {
-			errCode, err = 0, errDel
+			ecode, err = 0, errDel
 		} else {
 			g.tstats.Inc(RemoteDeletedDelCount)
 		}
 		debug.Assert(err != nil)
-		return CRMD{ErrCode: errCode, Err: err}
+		return CRMD{ErrCode: ecode, Err: err}
 	}
 
 	lom.Uncache()
-	return CRMD{ErrCode: errCode, Err: err}
+	return CRMD{ErrCode: ecode, Err: err}
 }
 
-// NOTE: must be locked; NOTE: Sync == false (ie., not deleting)
+// NOTE: Sync is false (ie., not deleting)
 func (lom *LOM) LoadLatest(latest bool) (oa *cmn.ObjAttrs, deleted bool, err error) {
-	debug.AssertFunc(func() bool {
-		rc, exclusive := lom.IsLocked()
-		return exclusive || rc > 0
-	})
+	debug.Assert(lom.isLockedRW(), lom.Cname()) // caller must take a lock
+
 	err = lom.Load(true /*cache it*/, true /*locked*/)
 	if err != nil {
 		if !cmn.IsErrObjNought(err) || !latest {
@@ -168,7 +174,7 @@ func (lom *LOM) LoadLatest(latest bool) (oa *cmn.ObjAttrs, deleted bool, err err
 		}
 	}
 	if latest {
-		res := lom.CheckRemoteMD(true /*locked*/, false /*synchronize*/)
+		res := lom.CheckRemoteMD(true /*locked*/, false /*synchronize*/, nil /*origReq*/)
 		if res.Eq {
 			debug.AssertNoErr(res.Err)
 			return nil, false, nil

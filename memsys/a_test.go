@@ -2,7 +2,7 @@
 // with io.Reader and io.Writer interfaces on top of a scatter-gather lists
 // (of reusable buffers)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys_test
 
@@ -58,21 +58,21 @@ func Test_Sleep(*testing.T) {
 
 	wg := &sync.WaitGroup{}
 	random := cos.NowRand()
-	for i := 0; i < 100; i++ {
-		ttl := time.Duration(random.Int63n(int64(time.Millisecond*100))) + time.Millisecond
+	for i := range 100 {
+		ttl := time.Duration(random.Int64N(int64(time.Millisecond*100))) + time.Millisecond
 		var siz, tot int64
 		if i%2 == 0 {
-			siz = random.Int63n(cos.MiB*10) + cos.KiB
+			siz = random.Int64N(cos.MiB*10) + cos.KiB
 		} else {
-			siz = random.Int63n(cos.KiB*100) + cos.KiB
+			siz = random.Int64N(cos.KiB*100) + cos.KiB
 		}
-		tot = random.Int63n(cos.DivCeil(cos.MiB*50, siz))*siz + cos.KiB
+		tot = random.Int64N(cos.DivCeil(cos.MiB*50, siz))*siz + cos.KiB
 		wg.Add(1)
 		go memstress(mem, i, ttl, siz, tot, wg)
 	}
 	c := make(chan struct{}, 1)
 	go printMaxRingLen(mem, c)
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		time.Sleep(duration / 8)
 		mem.FreeSpec(memsys.FreeSpec{IdleDuration: 1, MinSize: cos.MiB})
 	}
@@ -92,15 +92,15 @@ func Test_NoSleep(*testing.T) {
 
 	wg := &sync.WaitGroup{}
 	random := cos.NowRand()
-	for i := 0; i < 500; i++ {
-		siz := random.Int63n(cos.MiB) + cos.KiB
-		tot := random.Int63n(cos.DivCeil(cos.KiB*10, siz))*siz + cos.KiB
+	for i := range 500 {
+		siz := random.Int64N(cos.MiB) + cos.KiB
+		tot := random.Int64N(cos.DivCeil(cos.KiB*10, siz))*siz + cos.KiB
 		wg.Add(1)
 		go memstress(mem, i, time.Millisecond, siz, tot, wg)
 	}
 	c := make(chan struct{}, 1)
 	go printMaxRingLen(mem, c)
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		time.Sleep(duration / 8)
 		mem.FreeSpec(memsys.FreeSpec{Totally: true, ToOS: true, MinSize: cos.MiB * 10})
 	}
@@ -110,7 +110,7 @@ func Test_NoSleep(*testing.T) {
 }
 
 func printMaxRingLen(mem *memsys.MMSA, c chan struct{}) {
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		select {
 		case <-c:
 			return
@@ -159,7 +159,7 @@ func printStats(mem *memsys.MMSA) {
 	for {
 		time.Sleep(mem.TimeIval)
 		stats := mem.GetStats()
-		for i := 0; i < memsys.NumPageSlabs; i++ {
+		for i := range memsys.NumPageSlabs {
 			slab, err := mem.GetSlab(int64(i+1) * memsys.PageSize)
 			cos.AssertNoErr(err)
 			x := ""

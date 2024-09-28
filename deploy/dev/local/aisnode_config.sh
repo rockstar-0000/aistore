@@ -1,19 +1,9 @@
 # NOTE: system environment variables are listed in the `env` package,
 # see https://github.com/NVIDIA/aistore/blob/main/api/env/README.md
 
-backend_desc=()
-for backend in ${AIS_BACKEND_PROVIDERS}; do
-  case $backend in
-    aws)   backend_desc+=('"aws":   {}') ;;
-    azure) backend_desc+=('"azure": {}') ;;
-    gcp)   backend_desc+=('"gcp":   {}') ;;
-    hdfs)  backend_desc+=('"hdfs":  {"user": "root", "addresses": ["localhost:8020", "localhost:9000"], "use_datanode_hostname": true}') ;;
-  esac
-done
-
 cat > $AIS_CONF_FILE <<EOL
 {
-	"backend": {$(IFS=$','; echo "${backend_desc[*]}")},
+	"backend": $(make_backend_conf),
 	"mirror": {
 		"copies":       2,
 		"burst_buffer": 128,
@@ -46,12 +36,13 @@ cat > $AIS_CONF_FILE <<EOL
 		"max_host_busy":        "20s",
 		"startup_time":         "1m",
 		"join_startup_time":    "3m",
-		"send_file_time":       "5m"
+		"send_file_time":       "5m",
+		"ec_streams_time":	"10m"
 	},
 	"client": {
 		"client_timeout":      "10s",
 		"client_long_timeout": "10m",
-		"list_timeout":        "3m"
+		"list_timeout":        "1m"
 	},
 	"proxy": {
 		"primary_url":   "${AIS_PRIMARY_URL}",
@@ -61,9 +52,9 @@ cat > $AIS_CONF_FILE <<EOL
 	},
 	"space": {
 		"cleanupwm":         65,
-		"lowwm":             75,
-		"highwm":            90,
-		"out_of_space":      95
+		"lowwm":             ${AIS_SPACE_LOWWM:-75},
+		"highwm":            ${AIS_SPACE_HIGHWM:-90},
+		"out_of_space":      ${AIS_SPACE_OOS:-95}
 	},
 	"lru": {
 		"dont_evict_time":   "120m",
@@ -132,12 +123,14 @@ cat > $AIS_CONF_FILE <<EOL
 		}
 	},
 	"fshc": {
-		"enabled":     true,
-		"test_files":  4,
-		"error_limit": 2
+		"test_files":     4,
+		"error_limit":    2,
+		"io_err_limit":   10,
+		"io_err_time":    "10s",
+		"enabled":        true
 	},
 	"auth": {
-		"secret":      "$AIS_SECRET_KEY",
+		"secret":      "$AIS_AUTHN_SECRET_KEY",
 		"enabled":     ${AIS_AUTHN_ENABLED:-false}
 	},
 	"keepalivetracker": {
@@ -182,7 +175,7 @@ EOL
 cat > $AIS_LOCAL_CONF_FILE <<EOL
 {
 	"confdir": "${AIS_CONF_DIR:-/etc/ais/}",
-	"log_dir":       "${AIS_LOG_DIR:-/tmp/ais$NEXT_TIER/log}",
+	"log_dir": "${AIS_LOG_DIR:-/tmp/ais$NEXT_TIER/log}",
 	"host_net": {
 		"hostname":                 "${HOSTNAME_LIST}",
 		"hostname_intra_control":   "${HOSTNAME_LIST_INTRA_CONTROL}",

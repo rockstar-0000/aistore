@@ -4,10 +4,9 @@
 
 // NOTE:
 // This is a minor fork of the ServeMux portion of https://golang.org/src/net/http/server.go
-// primarily motivated by the need to dynamically "unhandle" registered handlers.
-// That's what mux.Unhandle does - a separate source in this package.
-// Last update: June 2023.
-// See also: transport (in particular, transport/recv.go).
+// circa Go 1.20
+// See also: transport (in particular, transport/recv.go) with its "secondary" mux there.
+// TODO Mar 2024: revisit and, possibly, remove altogether.
 
 package mux
 
@@ -19,6 +18,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
 // ServeMux is an HTTP request multiplexer.
@@ -87,7 +88,7 @@ func cleanPath(p string) string {
 	np := path.Clean(p)
 	// path.Clean removes trailing slash except for root;
 	// put the trailing slash back if necessary.
-	if p[len(p)-1] == '/' && np != "/" {
+	if cos.IsLastB(p, '/') && np != "/" {
 		// Fast path for common case of p being the string we want:
 		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
 			np = p
@@ -273,7 +274,7 @@ func (mux *ServeMux) _handle(pattern string, handler http.Handler) {
 	}
 	e := muxEntry{h: handler, pattern: pattern}
 	mux.m[pattern] = e
-	if pattern[len(pattern)-1] == '/' {
+	if cos.IsLastB(pattern, '/') {
 		mux.es = appendSorted(mux.es, e)
 	}
 

@@ -1,6 +1,6 @@
-// Package api provides Go based AIStore API/SDK over HTTP(S)
+// Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -34,6 +34,7 @@ type (
 	BinfoArgs struct {
 		BsummArgs
 		UUID          string
+		Prefix        string
 		FltPresence   int
 		Summarize     bool
 		WithRemote    bool
@@ -47,7 +48,7 @@ type (
 // - is obtained via GetBucketInfo() API
 // - and delivered via apc.HdrBucketInfo header (compare with GetBucketSummary)
 // The API uses http.MethodHead and can be considered an extension of HeadBucket (above)
-func GetBucketInfo(bp BaseParams, bck cmn.Bck, args BinfoArgs) (string, *cmn.Bprops, *cmn.BsummResult, error) {
+func GetBucketInfo(bp BaseParams, bck cmn.Bck, args *BinfoArgs) (string, *cmn.Bprops, *cmn.BsummResult, error) {
 	q := make(url.Values, 4)
 	q = bck.AddToQuery(q)
 	q.Set(apc.QparamFltPresence, strconv.Itoa(args.FltPresence))
@@ -56,16 +57,20 @@ func GetBucketInfo(bp BaseParams, bck cmn.Bck, args BinfoArgs) (string, *cmn.Bpr
 	}
 	if args.Summarize {
 		if args.WithRemote {
-			q.Set(apc.QparamBsummRemote, "true")
+			q.Set(apc.QparamBinfoWithOrWithoutRemote, "true")
 		} else {
-			q.Set(apc.QparamBsummRemote, "false")
+			q.Set(apc.QparamBinfoWithOrWithoutRemote, "false")
 		}
 	}
 	bp.Method = http.MethodHead
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
+		if args.Prefix != "" {
+			reqParams.Path = apc.URLPathBuckets.Join(bck.Name, args.Prefix)
+		} else {
+			reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
+		}
 		reqParams.Query = q
 	}
 	xid, p, info, err := _binfo(reqParams, bck, args)
@@ -75,7 +80,7 @@ func GetBucketInfo(bp BaseParams, bck cmn.Bck, args BinfoArgs) (string, *cmn.Bpr
 
 // compare w/ _bsumm
 // TODO: _binfoDontWait w/ ref
-func _binfo(reqParams *ReqParams, bck cmn.Bck, args BinfoArgs) (xid string, p *cmn.Bprops, info *cmn.BsummResult, err error) {
+func _binfo(reqParams *ReqParams, bck cmn.Bck, args *BinfoArgs) (xid string, p *cmn.Bprops, info *cmn.BsummResult, err error) {
 	var (
 		hdr          http.Header
 		status       int
@@ -100,7 +105,7 @@ func _binfo(reqParams *ReqParams, bck cmn.Bck, args BinfoArgs) (xid string, p *c
 	}
 	xid = hdr.Get(apc.HdrXactionID)
 	if xid == "" {
-		debug.Assert(status == http.StatusOK && !args.Summarize)
+		debug.Assert(status == http.StatusOK && !args.Summarize, status, " ", args.Summarize)
 		return
 	}
 	debug.Assert(news || xid == args.UUID)

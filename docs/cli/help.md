@@ -14,7 +14,7 @@ This readme is a loose assortment of quick tips.
 The default destination is /usr/local/bin but here we install into /tmp/www
 
 ```console
-$ deploy/scripts/install_from_binaries.sh --dstdir /tmp/www
+$ scripts/install_from_binaries.sh --dstdir /tmp/www
 Installing aisloader => /tmp/www/aisloader
   % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
                                  Dload  Upload   Total   Spent    Left  Speed
@@ -74,7 +74,7 @@ DESCRIPTION:
    If <TAB-TAB> completion doesn't work:
    * download https://github.com/NVIDIA/aistore/tree/main/cmd/cli/autocomplete
    * run 'cmd/cli/autocomplete/install.sh'
-   To install CLI directly from GitHub: https://github.com/NVIDIA/aistore/blob/main/deploy/scripts/install_from_binaries.sh
+   To install CLI directly from GitHub: https://github.com/NVIDIA/aistore/blob/main/scripts/install_from_binaries.sh
 
 COMMANDS:
    bucket          create/destroy buckets, list bucket's contents, show existing buckets and their properties
@@ -90,7 +90,7 @@ COMMANDS:
    storage         monitor and manage clustered storage
    archive         Create multi-object archive, append files to an existing archive
    log             show log
-   performance     show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   performance     show performance counters, throughput, latency and more (press <TAB-TAB> to select specific view)
    remote-cluster  show attached AIS clusters
    alias           manage top-level aliases
    put             (alias for "object put") PUT or APPEND one file or one directory, or multiple files and/or directories.

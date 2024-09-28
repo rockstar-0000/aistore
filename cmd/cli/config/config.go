@@ -28,14 +28,16 @@ const (
 	defaultDockerIP  = "172.50.0.2"
 )
 
+const tipReset = "To reset config to system defaults, run 'ais config reset'. Or, edit the JSON file (above) directly."
+
 type (
 	ClusterConfig struct {
 		URL               string `json:"url"`
 		DefaultAISHost    string `json:"default_ais_host"`
 		DefaultDockerHost string `json:"default_docker_host"`
 		// TLS
-		Certificate   string `json:"client_crt"`     // X509 certificate
-		CertKey       string `json:"client_crt_key"` // X509 key
+		Certificate   string `json:"client_crt"`     // X.509 certificate
+		CertKey       string `json:"client_crt_key"` // X.509 key
 		ClientCA      string `json:"client_ca_tls"`  // #6410
 		SkipVerifyCrt bool   `json:"skip_verify_crt"`
 	}
@@ -59,6 +61,7 @@ type (
 		DefaultProvider string        `json:"default_provider,omitempty"` // NOTE: not supported yet (see app.go)
 		NoColor         bool          `json:"no_color"`
 		Verbose         bool          `json:"verbose"` // more warnings, errors with backtraces and details
+		NoMore          bool          `json:"no_more"`
 	}
 )
 
@@ -115,6 +118,7 @@ func init() {
 		Aliases:         DefaultAliasConfig,
 		DefaultProvider: apc.AIS,
 		NoColor:         false,
+		NoMore:          false,
 	}
 }
 
@@ -162,28 +166,68 @@ func (c *Config) validate() (err error) {
 	if c.DefaultProvider != "" && !apc.IsProvider(c.DefaultProvider) {
 		return fmt.Errorf("invalid default_provider value %q, expected one of [%s]", c.DefaultProvider, apc.Providers)
 	}
+
 	if c.Aliases == nil {
 		c.Aliases = DefaultAliasConfig
 	}
 	return nil
 }
 
-func Load() (*Config, error) {
-	cfg := &Config{}
-	if err := jsp.LoadAppConfig(ConfigDir, fname.CliConfig, &cfg); err != nil {
+func (c *Config) WarnTLS(server string) {
+	err := cos.Stat(c.Cluster.Certificate)
+	if err == nil {
+		err = cos.Stat(c.Cluster.CertKey)
+	}
+	if err == nil {
+		return
+	}
+	path := filepath.Join(ConfigDir, fname.CliConfig)
+
+	fmt.Fprintln(os.Stderr, "Warning: CLI may have a problem communicating with "+server+" - CLI config at")
+	fmt.Fprintf(os.Stderr, "%s contains invalid public/private key pair (%q,%q), err: %v\n\n",
+		path, c.Cluster.Certificate, c.Cluster.CertKey, err)
+}
+
+func Load(args []string, reset string) (*Config, error) {
+	var (
+		cfg          = &Config{}
+		resetAndExit bool
+	)
+	if err := jsp.LoadAppConfig(ConfigDir, fname.CliConfig, cfg); err != nil {
 		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to load CLI config %q: %v",
-				filepath.Join(ConfigDir, fname.CliConfig), err)
+			if !cos.StringInSlice(reset, args) {
+				path := filepath.Join(ConfigDir, fname.CliConfig)
+				return nil, fmt.Errorf("failed to load CLI config %q: %v\n\n%s", path, err, tipReset)
+			}
+			resetAndExit = true // NOTE: just go ahead and reset
 		}
 
-		// Use default config in case of error.
-		err = Save(&defaultConfig)
-		cfg := &defaultConfig
+		// revert to default config
+		if err = Save(&defaultConfig); err != nil {
+			return nil, err // (unlikely)
+		}
+		if resetAndExit {
+			fmt.Println("Done.")
+			os.Exit(0)
+		}
+		cfg = &defaultConfig
 		return cfg, err
 	}
 
 	if err := cfg.validate(); err != nil {
-		return nil, err
+		path := filepath.Join(ConfigDir, fname.CliConfig)
+		if cos.StringInSlice(reset, args) {
+			fmt.Fprintf(os.Stderr, "CLI config at %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "Resetting config to system defaults...\t")
+			time.Sleep(time.Second)
+			if err = Save(&defaultConfig); err != nil {
+				return nil, err // (unlikely)
+			}
+			fmt.Println("Done.")
+			os.Exit(0)
+		}
+
+		return nil, fmt.Errorf("CLI config at %s: %v\n\n%s", path, err, tipReset)
 	}
 	return cfg, nil
 }

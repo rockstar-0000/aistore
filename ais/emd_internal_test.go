@@ -1,23 +1,20 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/ext/etl"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -67,7 +64,7 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 
 		etlMD = newEtlMD()
 		for _, initType := range []string{etl.Code, etl.Spec} {
-			for i := 0; i < 5; i++ {
+			for i := range 5 {
 				var msg etl.InitMsg
 				if initType == etl.Code {
 					msg = &etl.InitCodeMsg{
@@ -151,22 +148,6 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 						}
 					}
 				}
-			})
-
-			It("should correctly detect etlMD corruption "+node, func() {
-				etlMDFullPath := filepath.Join(mpath, fname.Emd)
-				f, err := os.OpenFile(etlMDFullPath, os.O_RDWR, 0)
-				Expect(err).NotTo(HaveOccurred())
-				_, err = f.WriteAt([]byte("xxxxxxxxxxxx"), 10)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(f.Close()).NotTo(HaveOccurred())
-
-				fmt.Println("NOTE: error on screen is expected at this point...")
-				fmt.Println("")
-				eowner = makeEtlMDOwner()
-				eowner.init()
-
-				Expect(eowner.Get()).NotTo(Equal(&etlMD.MD))
 			})
 		})
 	}

@@ -26,7 +26,6 @@ var (
 	gmm              *MMSA     // page-based system allocator
 	smm              *MMSA     // slab allocator for small sizes in the range 1 - 4K
 	gmmOnce, smmOnce sync.Once // ensures singleton-ness
-	verbose          bool
 )
 
 func Init(gmmName, smmName string, config *cmn.Config) {
@@ -51,16 +50,13 @@ func Init(gmmName, smmName string, config *cmn.Config) {
 	}
 
 	gmm.Init(0)
-	nlog.InfoDepth(1, gmm.Str(&gmm.mem))
+	nlog.InfoDepth(1, "memory:", gmm.Str(&gmm.mem))
 
 	// byte mmsa:
 	smm = &MMSA{Name: smmName + ".smm", defBufSize: DefaultSmallBufSize, slabIncStep: SmallSlabIncStep}
 	smm.Init(0)
 	smm.sibling = gmm
 	gmm.sibling = smm
-
-	// verbosity
-	verbose = cmn.Rom.FastV(5, cos.SmoduleMemsys)
 }
 
 func NewMMSA(name string, silent bool) (mem *MMSA, err error) {
@@ -74,7 +70,7 @@ func NewMMSA(name string, silent bool) (mem *MMSA, err error) {
 	}
 	err = mem.Init(0)
 	if !silent {
-		cos.Infof("%s", mem.Str(&mem.mem))
+		cos.Infoln(mem.Str(&mem.mem))
 	}
 	return
 }
@@ -177,7 +173,7 @@ func (r *MMSA) Init(maxUse int64) (err error) {
 
 	// 3. validate min-free & low-wm
 	if free < min(r.MinFree*2, r.MinFree+minMemFree) {
-		err = fmt.Errorf("insufficient free memory %s (see %s for guidance)", r.Str(&r.mem), readme)
+		err = fmt.Errorf("memsys: insufficient free memory %s (see %s for guidance)", r.Str(&r.mem), readme)
 		cos.Errorf("%v", err)
 		r.lowWM = min(r.lowWM, r.MinFree+minMemFreeTests)
 		r.info = ""
@@ -207,7 +203,7 @@ func (r *MMSA) Init(maxUse int64) (err error) {
 	r.statsSnapshot = &Stats{}
 	r.rings = make([]*Slab, r.numSlabs)
 	r.sorted = make([]*Slab, r.numSlabs)
-	for i := 0; i < r.numSlabs; i++ {
+	for i := range r.numSlabs {
 		bufSize := r.slabIncStep * int64(i+1)
 		slab := &Slab{
 			m:       r,

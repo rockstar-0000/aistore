@@ -332,7 +332,7 @@ func (j *rangeDlJob) getNextObjs() error {
 func newBackendDlJob(id string, bck *meta.Bck, payload *BackendBody, xdl *Xact) (bj *backendDlJob, err error) {
 	if !bck.IsRemote() {
 		return nil, errors.New("bucket download requires a remote bucket")
-	} else if bck.IsHTTP() {
+	} else if bck.IsHT() {
 		return nil, errors.New("bucket download does not support HTTP buckets")
 	}
 	bj = &backendDlJob{}
@@ -377,7 +377,7 @@ func (j *backendDlJob) getNextObjs() error {
 	j.objs = j.objs[:0]
 	for len(j.objs) < downloadBatchSize {
 		var (
-			lst = &cmn.LsoResult{}
+			lst = &cmn.LsoRes{}
 			msg = &apc.LsoMsg{Prefix: j.prefix, ContinuationToken: j.continuationToken, PageSize: j.bck.MaxPageSize()}
 		)
 		_, err := backend.ListObjects(j.bck, msg, lst)

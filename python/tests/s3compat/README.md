@@ -21,7 +21,7 @@ The tests are divided into two sections:
 First, the AIS cluster to test against must be configured to run as an s3 client and run with AWS-style MD5 checksums.
 This can be set with AIS cli. 
 
-    ais config cluster features Provide-S3-API-via-Root
+    ais config cluster features S3-API-via-Root
     ais config cluster checksum.type=md5
 
 ---
@@ -51,10 +51,14 @@ See above [Environment variables](#environment-variables) section for selecting 
 Because these tests use the Minio client rather than boto3, running does not require importing the
 `aistore.botocore_patch` module. 
 
-Run on UNIX systems:
 
-    cd tests/s3compat
-    ./compatibility_test.sh
+From `/python` directory:
+
+    make python_s3_compat_test
+
+Or: 
+- Install the prerequisites from the requirements file: `pip3 install -r tests/s3compat/requirements`
+- Run `python3 tests/s3compat/run_tests.py`
 
 
 ## References

@@ -21,7 +21,6 @@ redirect_from:
 - [Remote Bucket](#remote-bucket)
   - [Public Cloud Buckets](#public-cloud-buckets)
   - [Remote AIS cluster](#remote-ais-cluster)
-  - [Public HTTP(S) Datasets](#public-https-dataset)
   - [Prefetch/Evict Objects](#prefetchevict-objects)
   - [Evict Remote Bucket](#evict-remote-bucket)
   - [Out of band updates](/docs/out_of_band.md)
@@ -41,11 +40,11 @@ AIStore uses the popular and well-known bucket abstraction, originally (likely) 
 
 Similar to S3, AIS bucket is a _container for objects_.
 
-> An object, in turn, is a file **and** a metadata that describes that object and normally includes: checksum, version, references to copies (replicas), size, last access time, source bucket (if object's origin is a Cloud bucket), custom user-defined attributes, and more.
+> An object, in turn, is a file **and** a metadata that describes that object and normally includes: checksum, version, references to copies (replicas), size, last access time, source bucket (if object's origin is a Cloud bucket), custom user-defined attributes and more.
 
 AIS is a flat `<bucket-name>/<object-name>` storage hierarchy where named buckets store user datasets.
 
-In addition, each AIS bucket is a point of applying (per-bucket) management policies: checksumming, versioning, erasure coding, mirroring, LRU eviction, checksum and/or version validation, and more.
+In addition, each AIS bucket is a point of applying (per-bucket) management policies: checksumming, versioning, erasure coding, mirroring, LRU eviction, checksum and/or version validation.
 
 AIS buckets *contain* user data performing the same function as, for instance:
 
@@ -148,7 +147,7 @@ $ ais bucket evict ...
 
 See also:
 
-* [CLI: Operations on Lists and Ranges](/docs/cli/object.md#operations-on-lists-and-ranges)
+* [CLI: Operations on Lists and Ranges](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
 * [api.CreateBucket() and api.SetBucketProps()](/api/bucket.go)
 * [RESTful API](http_api.md)
 * [CLI: listing and setting bucket properties](#cli-examples-listing-and-setting-bucket-properties)
@@ -164,7 +163,6 @@ Backend provider is realized as an optional parameter in the GET, PUT, APPEND, D
 * `aws` or `s3` - for Amazon S3 buckets
 * `azure` or `az` - for Microsoft Azure Blob Storage buckets
 * `gcp` or `gs` - for Google Cloud Storage buckets
-* `hdfs` - for Hadoop/HDFS clusters
 * `ht` - for HTTP(S) based datasets
 
 For API reference, please refer [to the RESTful API and examples](http_api.md).
@@ -386,67 +384,6 @@ Example working with remote AIS cluster (as well as easy-to-use scripts) can be 
 * [readme for developers](development.md)
 * [working with remote AIS cluster](#cli-working-with-remote-ais-cluster)
 
-## Public HTTP(S) Dataset
-
-It is standard in machine learning community to publish datasets in public domains, so they can be accessed by everyone.
-AIStore has integrated tools like [downloader](/docs/downloader.md) which can help in downloading those large datasets straight into provided AIS bucket.
-However, sometimes using such tools is not a feasible solution.
-
-For other cases AIStore has ability to act as a reverese-proxy when accessing **any** URL.
-This enables downloading any HTTP(S) based content into AIStore cluster.
-Assuming that proxy is listening on `localhost:8080`, one can use it as reverse-proxy to download `http://storage.googleapis.com/pub-images/images-train-000000.tar` shard into AIS cluster:
-
-```console
-$ curl -sL --max-redirs 3 -x localhost:8080 --noproxy "$(curl -s localhost:8080/v1/cluster?what=target_ips)" \
-  -X GET "http://storage.googleapis.com/minikube/minikube-0.6.iso.sha256" \
-  > /dev/null
-```
-
-Alternatively, an object can also be downloaded using the `get` and `cat` CLI commands.
-```console
-$ ais get http://storage.googleapis.com/minikube/minikube-0.7.iso.sha256 minikube-0.7.iso.sha256
-```
-
-This will cache shard object inside the AIStore cluster.
-We can confirm this by listing available buckets and checking the content:
-
-```console
-$ ais ls
-AIS Buckets (1)
-  ais://local-bck
-AWS Buckets (1)
-  aws://ais-test
-HTTP(S) Buckets (1)
-  ht://ZDdhNTYxZTkyMzhkNjk3NA (http://storage.googleapis.com/minikube/)
-$ ais ls ht://ZDdhNTYxZTkyMzhkNjk3NA
-NAME                                 SIZE
-minikube-0.6.iso.sha256	              65B
-```
-
-Now, when the object is accessed again, it will be served from AIStore cluster and will **not** be re-downloaded from HTTP(S) source.
-
-Under the hood, AIStore remembers the object's source URL and associates the bucket with this URL.
-In our example, bucket `ht://ZDdhNTYxZTkyMzhkNjk3NA` will be associated with `http://storage.googleapis.com/minikube/` URL.
-Therefore, we can interchangeably use the associated URL for listing the bucket as show below.
-
-```console
-$ ais ls http://storage.googleapis.com/minikube
-NAME                                  SIZE
-minikube-0.6.iso.sha256	              65B
-```
-
-> Note that only the last part (`minikube-0.6.iso.sha256`) of the URL is treated as the object name.
-
-Such connection between bucket and URL allows downloading content without providing URL again:
-
-```console
-$ ais object cat ht://ZDdhNTYxZTkyMzhkNjk3NA/minikube-0.7.iso.sha256 > /dev/null # cache another object
-$ ais ls ht://ZDdhNTYxZTkyMzhkNjk3NA
-NAME                     SIZE
-minikube-0.6.iso.sha256  65B
-minikube-0.7.iso.sha256  65B
-```
-
 ## Prefetch/Evict Objects
 
 Objects within remote buckets are automatically fetched into storage targets when accessed through AIS and are evicted based on the monitored capacity and configurable high/low watermarks when [LRU](storage_svcs.md#lru) is enabled.
@@ -469,7 +406,7 @@ $ ais bucket evict aws://abc --template "__tst/test-{1000..2000}"
 
 ### See also
 
-* [Operations on Lists and Ranges](/docs/cli/object.md#operations-on-lists-and-ranges)
+* [Operations on Lists and Ranges (and entire buckets)](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
 
 ## Evict Remote Bucket
 
@@ -538,7 +475,7 @@ This behavior can be applied to other remote buckets by using the `--keep-md` fl
 
 ### See also
 
-* [Operations on Lists and Ranges](/docs/cli/object.md#operations-on-lists-and-ranges)
+* [Operations on Lists and Ranges (and entire buckets)](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
 
 # Backend Bucket
 
@@ -608,7 +545,7 @@ $ ais bucket props set ais://llm-latest backend_bck=gs://llm-augmented-2023-12-0
 
 Caching wise, when you walk `ais://llm-latest` (or any other aistore bucket with a remote backend), aistore will make sure to perform remote (cold) GETs to update itself when and if required, etc.
 
-> In re "cold GET" vs "warm GET" performance, see [AIStore as a Fast Tier Storage](https://aiatscale.org/blog/2023/11/27/aistore-fast-tier) blog.
+> In re "cold GET" vs "warm GET" performance, see [AIStore as a Fast Tier Storage](https://aistore.nvidia.com/blog/2023/11/27/aistore-fast-tier) blog.
 
 # Bucket Properties
 
@@ -616,7 +553,7 @@ The full list of bucket properties are:
 
 | Bucket Property | JSON | Description | Fields |
 | --- | --- | --- | --- |
-| Provider | `provider` | "ais", "aws", "azure", "gcp", "hdfs" or "ht" | `"provider": "ais"/"aws"/"azure"/"gcp"/"hdfs"/"ht"` |
+| Provider | `provider` | "ais", "aws", "azure", "gcp", or "ht" | `"provider": "ais"/"aws"/"azure"/"gcp"/"ht"` |
 | Cksum | `checksum` | Please refer to [Supported Checksums and Brief Theory of Operations](checksum.md) | |
 | LRU | `lru` | Configuration for [LRU](storage_svcs.md#lru). `space.lowwm` and `space.highwm` is the used capacity low-watermark and high-watermark (% of total local storage capacity) respectively. `space.out_of_space` if exceeded, the target starts failing new PUTs and keeps failing them until its local used-cap gets back below `space.highwm`. `dont_evict_time` denotes the period of time during which eviction of an object is forbidden [atime, atime + `dont_evict_time`]. `capacity_upd_time` denotes the frequency at which AIStore updates local capacity utilization. `enabled` LRU will only run when set to true. | `"lru": {"dont_evict_time": "120m", "capacity_upd_time": "10m", "enabled": bool }`. Note: `space.*` are cluster level properties. |
 | Mirror | `mirror` | Configuration for [Mirroring](storage_svcs.md#n-way-mirror). `copies` represents the number of local copies. `burst_buffer` represents channel buffer size. `enabled` will only generate local copies when set to true. | `"mirror": { "copies": int64, "burst_buffer": int64, "enabled": bool }` |
@@ -690,9 +627,13 @@ For background and usage examples, please see [CLI: AWS-specific bucket configur
 
 # List Objects
 
-> Note: some of the following content **may be outdated**. For the most recent updates, please check [`ais ls`](https://github.com/NVIDIA/aistore/blob/main/docs/cli/bucket.md#list-objects) CLI.
+**Note**: some of the following content **may be outdated**. For the most recent updates, please check:
 
-ListObjects API returns a page of object names and, optionally, their properties (including sizes, access time, checksums, and more), in addition to a token that serves as a cursor, or a marker for the *next* page retrieval.
+- [List objects](/docs/cli/bucket.md#list-objects)
+* [`ais ls`](https://github.com/NVIDIA/aistore/blob/main/docs/cli/bucket.md#list-objects)
+* [Virtual directories](/docs/howto_virt_dirs.md)
+
+`ListObjects` API returns a page of object names and, optionally, their properties (including sizes, access time, checksums), in addition to a token that serves as a cursor, or a marker for the *next* page retrieval.
 
 > Go [ListObjects](https://github.com/NVIDIA/aistore/blob/main/api/bucket.go) API
 

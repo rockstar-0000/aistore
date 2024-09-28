@@ -9,13 +9,13 @@ import (
 	"testing"
 
 	"github.com/NVIDIA/aistore/hk"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 func TestHousekeeper(t *testing.T) {
 	hk.TestInit()
-	go hk.DefaultHK.Run()
+	go hk.HK.Run()
 	hk.WaitStarted()
 	RegisterFailHandler(Fail)
 	RunSpecs(t, t.Name())

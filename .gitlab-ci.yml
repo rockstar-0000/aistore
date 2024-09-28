@@ -12,7 +12,10 @@ include:
     file: /templates/static-analysis/Checkmarx-main-csv.gitlab-ci.yml
 
 variables:
-  MODE: debug # run tests with debug asserts
+  MODE: debug # run aistore and tests with debug asserts enabled
+  RUNNER_TAG: "ais"
+  RUNNER_TAG_K8s: "ais-k8s"
+  SCRIPTS_DIR: "./scripts"
   NUM_TARGET:
     value: "5"
     description: "Number of targets deployed."
@@ -22,34 +25,19 @@ variables:
   FS_CNT:
     value: "6"
     description: "Number of disks defined for each target."
-  AWS_REGION:
-    value: "us-east-2"
-    description: "Region of AWS bucket."
   CLOUD_BCKS:
     value: "aws://ais-blossom gs://ais-ci-kube" # NOTE: additionally used: aws://ais-cicd and aws://ais-ci-python
     description: "Set of buckets used when running cloud tests."
-  S3_COMPAT_RUN_ALL:
-    value: "False"
-    description: "Whether to run all s3 compatibility tests or only verified passing ones"
-  S3_COMPAT_STRICT:
-    value: "True"
-    description: "Whether to fail pipeline stage immediately on s3 compatibility test failure"
+  GOOGLE_APPLICATION_CREDENTIALS:
+    value: "$GCP_JSON_FILE"
+    description: "Gitlab file variable containing credentials for GCP"
+
 
 # Templates
 
 .gather_logs_template: &gather_logs_def
   after_script:
     - make kill # To make sure that nodes flushed the logs.
-    - mkdir $CI_PROJECT_DIR/logs
-    - find /tmp/ais -type f -name "*\.INFO\.*" -exec cp {} $CI_PROJECT_DIR/logs/ \;
-  artifacts:
-    when: on_failure
-    paths: [ logs/ ]
-    expire_in: 1 days
-
-.k8s_long_exit_template: &k8s_long_exit_def
-  after_script:
-    - make kill
     - mkdir $CI_PROJECT_DIR/logs
     - find /tmp/ais -type f -name "*\.INFO\.*" -exec cp {} $CI_PROJECT_DIR/logs/ \;
   artifacts:
@@ -67,8 +55,8 @@ variables:
 .test_short_template: &test_short_def
   stage: test-short
   tags:
-    - ais
-  timeout: 25m
+    - $RUNNER_TAG
+  timeout: 30m
   <<: *default_only_def
   except:
     variables:
@@ -79,8 +67,8 @@ variables:
 .test_short_skip_scheduled_template: &test_short_skip_scheduled_def
   stage: test-short
   tags:
-    - ais
-  timeout: 25m
+    - $RUNNER_TAG
+  timeout: 30m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
@@ -91,8 +79,8 @@ variables:
 .test_short_optional_template: &test_short_optional_def
   stage: test-short
   tags:
-    - ais
-  timeout: 25m
+    - $RUNNER_TAG
+  timeout: 30m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
@@ -103,8 +91,9 @@ variables:
 .test_long_template: &test_long_def
   stage: test-long
   tags:
-    - ais
-  timeout: 200m
+    - $RUNNER_TAG
+  # NOTE: when changing, make sure to update $SCRIPTS_DIR/bootstrap.sh and GitLab /settings/ci_cd
+  timeout: 4h
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "web"'
@@ -115,8 +104,9 @@ variables:
 .test_long_skip_scheduled_template: &test_long_skip_scheduled_def
   stage: test-long
   tags:
-    - ais
-  timeout: 200m
+    - $RUNNER_TAG
+  # NOTE: when changing, make sure to update $SCRIPTS_DIR/bootstrap.sh and GitLab /settings/ci_cd
+  timeout: 4h
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
@@ -128,29 +118,57 @@ variables:
 build:linux:
   stage: build
   tags:
-    - ais
+    - $RUNNER_TAG
   timeout: 10m
   <<: *default_only_def
   script:
     - MODE="" make node # Build node without backends in production mode.
     - MODE="debug" make node # Build node without backends in debug mode.
-    - AIS_BACKEND_PROVIDERS="ais aws azure gcp hdfs" MODE="" make node # Build with all backends (production mode).
-    - AIS_BACKEND_PROVIDERS="ais aws azure gcp hdfs" MODE="debug" make node # Build with all backends (debug mode).
+    - AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="" make node # Build with all Cloud backends (production mode).
+    - AIS_BACKEND_PROVIDERS="aws azure gcp ht" MODE="debug" make node # Build with all backends (debug mode).
     - MEM_PROFILE="/tmp/mem" CPU_PROFILE="/tmp/cpu" make node # Build with profile.
     - TAGS="nethttp" make node # Build with net/http transport support (fasthttp is used by default).
-    - TAGS="s3rproxy" make node # Build with reverse proxy support (redirect is used by default).
     - make authn
     - make cli
     - make aisloader
 
+build:k8s:
+  stage: build
+  image: quay.io/buildah/stable
+  variables:
+    # Use vfs with buildah. Docker offers overlayfs as a default, but Buildah
+    # cannot stack overlayfs on top of another overlayfs filesystem.
+    STORAGE_DRIVER: vfs
+    # Write all image metadata in the docker format, not the standard OCI format.
+    BUILDAH_FORMAT: docker
+    FQ_IMAGE_NAME: "$CI_REGISTRY_IMAGE/aisnode:$CI_COMMIT_SHORT_SHA"
+
+  before_script:
+    - buildah login -u $CI_REGISTRY_USER -p $CI_REGISTRY_TOKEN $CI_REGISTRY
+  script:
+    - buildah images
+    - buildah build -t $FQ_IMAGE_NAME -f deploy/dev/k8s/Dockerfile --build-arg MODE="debug" --build-arg providers="gcp"
+    - buildah images
+    - buildah push $FQ_IMAGE_NAME
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      allow_failure: false
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*etl.*/'
+      allow_failure: false
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
+      allow_failure: false
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*skip-ci.*/'
+      when: never
+
 lint:linux:
   stage: build
   tags:
-    - ais
+    - $RUNNER_TAG
   timeout: 10m
   <<: *default_only_def
   script:
     - make lint
+    - TAGS="statsd ht" make lint
     - make fmt-check
     - make spell-check
 
@@ -160,7 +178,7 @@ test:short:
   variables:
     BUCKET: "ais://test"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
     - make test-short
     - FLAGS="--duration=10s" make test-aisloader
 
@@ -171,36 +189,28 @@ test:short:python:
     AIS_ENDPOINT: "http://localhost:8080"
     BUCKET: "aws://ais-ci-python"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all --aws
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all --aws
     - cd python
     - make python_sdk_tests
     - make python_botocore_tests
-    - make PYAISLOADER_TEST_TYPE=short test-pyaisloader
 
   except:
     variables:
       - $CI_MERGE_REQUEST_LABELS =~ /.*skip-ci.*/
 
-test:short:python-etl:
+test:short:pytorch:
   <<: *test_short_def
-  tags:
-    - ais-k8s
+  variables:
+    AIS_ENDPOINT: "http://localhost:8080"
+    BUCKET: "aws://ais-ci-python"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all --aws
     - cd python
-    - make python_etl_tests
+    - make python_pytorch_tests
   except:
     variables:
       - $CI_MERGE_REQUEST_LABELS =~ /.*skip-ci.*/
-      - $CI_MERGE_REQUEST_LABELS !~ /.*etl.*/
-  retry:
-    max: 2
-    when:
-      - unknown_failure
-      - api_failure
-      - stuck_or_timeout_failure
-      - runner_system_failure
-      - job_execution_timeout
+      - $CI_MERGE_REQUEST_LABELS !~ /.*pytorch.*/
 
 # Runs cluster with 1 proxy and 1 target (with 6 mountpaths).
 test:short:minimal:
@@ -208,19 +218,27 @@ test:short:minimal:
   variables:
     BUCKET: "ais://test"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt $FS_CNT --deployment all
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt $FS_CNT --deployment all
     - NUM_PROXY=1 NUM_TARGET=1 make test-short
 
 test:short:s3-compat:
   <<: *test_short_def
   tags:
-    - ais
+    - $RUNNER_TAG
+  variables:
+    # Run only s3 compat tests we know should pass
+    S3_COMPAT_RUN_ALL:
+      value: "False"
+    # Fail on first failure
+    S3_COMPAT_STRICT:
+      value: "True"
+
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
-    - ais config cluster features Provide-S3-API-via-Root
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
+    - ais config cluster features S3-API-via-Root
     - ais config cluster checksum.type=md5
-    - cd python/tests/s3compat
-    - ./compatibility_test.sh
+    - cd python
+    - make python_s3_compat_test
   except:
     variables:
       - $CI_MERGE_REQUEST_LABELS !~ /.*s3-compat.*/
@@ -237,7 +255,7 @@ test:short:authn:
     BUCKET: "ais://test"
     RE: "TestAuth"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
     - ais auth login $AIS_AUTHN_SU_NAME -p $AIS_AUTHN_SU_PASS
     - make test-run
     - ais auth logout
@@ -253,17 +271,17 @@ test:short:https:
     BUCKET: "ais://ais-ci"
   script:
     - openssl req -x509 -out $AIS_SERVER_CRT -keyout $AIS_SERVER_KEY -newkey rsa:2048 -nodes -sha256 -subj '/CN=localhost' -extensions EXT -config <( printf "[dn]\nCN=localhost\n[req]\ndistinguished_name = dn\n[EXT]\nsubjectAltName=DNS:localhost\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth")
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all --https
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all --https
     - make test-short
 
 test:short:s3rproxy:
   <<: *test_short_skip_scheduled_def
   variables:
     BUCKET: "ais://ais-ci"
-    TAGS: "s3rproxy"
     RE: "S3"
   script:
     - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - ais config cluster features S3-Reverse-Proxy
     - make test-short
 
 test:short:aws:
@@ -271,17 +289,15 @@ test:short:aws:
   variables:
     BUCKET: "aws://ais-cicd"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws
     - make test-short
 
 test:short:gcp:
   <<: *test_short_skip_scheduled_def
   variables:
-    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcs.json"
     BUCKET: "gs://ais-ci"
   script:
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
     - make test-short
 
 test:short:azure:
@@ -289,7 +305,7 @@ test:short:azure:
   variables:
     BUCKET: "az://ais-ci"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
     - make test-short
 
 test:long:
@@ -298,7 +314,7 @@ test:long:
     NUM_PROXY: 6
     BUCKET: "ais://ais-ci"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --ht
     - make test-long
 
 test:long:aws:
@@ -307,18 +323,16 @@ test:long:aws:
     NUM_PROXY: 6
     BUCKET: "aws://ais-cicd"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws --ht
     - make test-long
 
 test:long:gcp:
   <<: *test_long_def
   variables:
     NUM_PROXY: 6
-    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcs.json"
     BUCKET: "gs://ais-ci"
   script:
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp --ht
     - make test-long
 
 test:long:azure:
@@ -327,65 +341,104 @@ test:long:azure:
     NUM_PROXY: 6
     BUCKET: "az://ais-ci"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure --ht
     - make test-long
-
-# test:long:hdfs:
-#   image: aistorage/hdfs-ci
-#   <<: *test_long_skip_scheduled_def
-#   variables:
-#     NUM_PROXY: 6
-#     BUCKET: "hdfs://ais-ci"
-#   script:
-#     - bash deploy/ci/setup_hdfs.sh
-#     - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --hdfs
-#     - ais bucket create "${BUCKET}" --props="extra.hdfs.ref_directory=/"
-#     - make test-long
 
 test:long:aisloader:
   stage: test-long
   tags:
-    - ais
-  timeout: 10m
+    - $RUNNER_TAG
+  timeout: 15m
   variables:
     AIS_ENDPOINT: "http://localhost:8080"
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
     - sleep 10 # make sure that cluster properly starts
     - FLAGS="--duration=5m" make test-aisloader
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
+test:long:pyaisloader:
+  stage: test-long
+  tags:
+    - $RUNNER_TAG
+  timeout: 15m
+  variables:
+    AIS_ENDPOINT: "http://localhost:8080"
+  script:
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - sleep 10 # make sure that cluster properly starts
     - cd ./python; make PYAISLOADER_TEST_TYPE=long test-pyaisloader
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
       allow_failure: true
 
+test:long:ishard:
+  stage: test-long
+  tags:
+    - $RUNNER_TAG
+  timeout: 1h
+  variables:
+    AIS_ENDPOINT: "http://localhost:8080"
+  script:
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - sleep 10 # make sure that cluster properly starts
+    - cd ./cmd/ishard/ishard; go test -v -timeout=10h -run=^TestIshard
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
 
 #
 # Kubernetes stages
 #
 
-.test_k8s_short_template: &test_k8s_short_def
-  stage: test-short
+.test_k8s:
   tags:
-    - ais-k8s
+    - $RUNNER_TAG_K8s
   variables:
-    NUM_TARGET: 1
-    NUM_PROXY: 1
-    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcs.json"
     BUCKET: "gs://ais-ci-kube"
-    RE: "TestETL|TestConfig|TestMountpath"
     TESTS_DIR: "ais/test"
+    AISNODE_IMAGE: "$CI_REGISTRY_IMAGE/aisnode:$CI_COMMIT_SHORT_SHA"
+    AIS_ENDPOINT: "http://ais-proxy-0.default.svc.cluster.local:8080"
+    FS_CNT: 6
+    RE: "TestETL|TestConfig|TestMountpath"
+    PROVIDERS: gcp
   before_script:
     - kubectl delete pods,services -l nvidia.com/ais-etl-name # TODO: this can be removed once the lifecycle of transformers is implemented.
-  <<: *gather_logs_def
+    - cd deploy/dev/k8s
+    - make deploy-ci
+    - cd ../../..
+    - make cli
+  after_script:
+    - mkdir $CI_PROJECT_DIR/logs
+    - find /tmp/ais -type f -name "*\.INFO\.*" -exec cp {} $CI_PROJECT_DIR/logs/ \;
+    - cd deploy/dev/k8s
+    - make cleanup-ci
+  artifacts:
+    when: on_failure
+    paths: [ logs/ ]
+    expire_in: 1 days
 
-.test_k8s_long_template: &test_k8s_long_def
-  extends: .test_k8s_short_template
+.test_k8s_short_template:
+  stage: test-short
+  extends: .test_k8s
+  variables:
+    NUM_PROXY: 1
+    NUM_TARGET: 1
+
+.test_k8s_long_template:
   stage: test-long
+  extends: .test_k8s
+  variables:
+    NUM_PROXY: 1
+    NUM_TARGET: 5
 
 test:short:k8s:
-  stage: test-short
-  <<: *test_k8s_short_def
+  extends: .test_k8s_short_template
   timeout: 1h
   only:
     - merge_requests
@@ -395,42 +448,78 @@ test:short:k8s:
       - $CI_MERGE_REQUEST_LABELS =~ /.*skip-ci.*/
       - $CI_MERGE_REQUEST_LABELS =~ /.*python-tests-only.*/
       - $CI_MERGE_REQUEST_LABELS !~ /.*etl.*/
+  variables:
+    RE: "TestETL|TestConfig|TestMountpath"
   script:
-    - export NUM_TARGET=3
-    - export NUM_PROXY=3
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
     - make test-short
-    - status=$? make kill && exit $status
+
+test:short:python-authn:
+  stage: test-short
+  tags:
+    - $RUNNER_TAG
+  timeout: 20m
+  <<: *gather_logs_def
+  variables:
+    AIS_AUTHN_ENABLED: "true"
+    AIS_AUTHN_SU_NAME: "admin"
+    AIS_AUTHN_SU_PASS: "admin"
+    AIS_AUTHN_URL: "http://localhost:52001"
+  script:
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - cd python/
+    - make python_authn_tests
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*authn.*/'
+      changes:
+        - python/aistore/sdk/authn/**/*
+        - python/tests/integration/sdk/authn/**/*
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      changes:
+        - python/aistore/sdk/authn/**/*
+        - python/tests/integration/sdk/authn/**/*
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
+test:short:python-etl:
+  extends: .test_k8s_short_template
+  <<: *default_only_def
+  except:
+    variables:
+      - $CI_MERGE_REQUEST_LABELS =~ /.*skip-ci.*/
+      - $CI_MERGE_REQUEST_LABELS !~ /.*etl.*/
+  retry:
+    max: 2
+    when:
+      - unknown_failure
+      - api_failure
+      - stuck_or_timeout_failure
+      - runner_system_failure
+      - job_execution_timeout
+  script:
+    - cd python
+    - make python_etl_tests
+    
 
 #  e.g. RE: "ETLBucket|ETLConnectionError|ETLInitCode" (or any other regex to select tests)
 test:short:assorted:k8s:
-  stage: test-short
-  tags:
-    - ais-k8s
+  extends: .test_k8s_short_template
   timeout: 30m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
       allow_failure: true
   variables:
-    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcs.json"
-    BUCKET: "gs://ais-ci-kube"
-    TESTS_DIR: "ais/test"
     RE: "ETLAnyToAny|ETLMultiObj"
   script:
-    - export NUM_TARGET=3
-    - export NUM_PROXY=3
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
     - make test-run
-    - status=$? make kill && exit $status
-  <<: *gather_logs_def
 
 test:long:k8s:
-  stage: test-long
-  <<: *test_k8s_long_def
-  timeout: 200m
+  extends: .test_k8s_long_template
+  ## NOTE: when changing, make sure to update $SCRIPTS_DIR/bootstrap.sh and GitLab /settings/ci_cd
+  timeout: 4h
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
@@ -438,33 +527,23 @@ test:long:k8s:
       when: manual
       allow_failure: true
   script:
-    - export NUM_TARGET=5
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
     - make test-run
-    - status=$? make kill && exit $status
-  <<: *k8s_long_exit_def
 
 test:long:k8s:single-target:
-  stage: test-long
-  <<: *test_k8s_long_def
-  timeout: 200m
+  extends: .test_k8s_long_template
+  timeout: 4h
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
       allow_failure: true
+  variables:
+    NUM_TARGET: 1
   script:
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
-    - status=0
     - make test-run
-    - status=$? make kill && exit $status
-  <<: *k8s_long_exit_def
 
 test:long:k8s:aisloader:
-  stage: test-long
-  <<: *test_k8s_long_def
+  extends: .test_k8s_long_template
   timeout: 15m
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
@@ -472,31 +551,41 @@ test:long:k8s:aisloader:
       when: manual
       allow_failure: true
   script:
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
     - sleep 10 # Give some time for the cluster to stabilize.
+    - make aisloader
     - BUCKET="ais://test" FLAGS="--duration=2m --etl" make test-aisloader
-    - status=$? make kill && exit $status
+
+test:long:k8s:pyaisloader:
+  extends: .test_k8s_long_template
+  timeout: 15m
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+  script:
+    - sleep 10 # Give some time for the cluster to stabilize.
+    - cd ./python; make PYAISLOADER_TEST_TYPE=etl test-pyaisloader
 
 test:long:k8s:all:
-  stage: test-long
-  tags:
-    - ais-k8s
-  variables:
-    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcs.json"
+  extends: .test_k8s_long_template
   timeout: 5h
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*k8s-ci.*/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
       allow_failure: true
+  variables: 
+    PROVIDERS: "gcp,aws"
   before_script:
     - kubectl delete pods,services -l nvidia.com/ais-etl-name # TODO: this can be removed once the lifecycle of transformers is implemented.
+    - cd deploy/dev/k8s
+    - make deploy-ci
+    - cd ../../..
     # Make sure that metrics collection is enabled.
     - git clone https://github.com/prometheus-operator/kube-prometheus.git
     - kubectl apply -f kube-prometheus/manifests/setup && kubectl apply -f kube-prometheus/manifests && rm -rf kube-prometheus
   script:
-    - echo "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
-    - deploy/scripts/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp --aws
     - |
       echo "----- RUNNING K8S TESTS -----"
       BUCKET="aws://ais-blossom" RE="TestETL|TestConfig|TestMountpath" make test-run
@@ -511,8 +600,6 @@ test:long:k8s:all:
         result=$((result + exit_code))
         echo "----- LONG TESTS FINISHED WITH: ${exit_code} -----"
       done
-    - make kill && exit $result
-  <<: *k8s_long_exit_def
 
 checkmarx-scan-csv:
   stage: security

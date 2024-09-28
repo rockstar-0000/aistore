@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that create entities in the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -233,7 +233,7 @@ func wrapAuthN(f cli.ActionFunc) cli.ActionFunc {
 }
 
 func readMasked(c *cli.Context, prompt string) string {
-	fmt.Fprintf(c.App.Writer, prompt+": ")
+	fmt.Fprint(c.App.Writer, prompt+": ")
 	bytePass, err := term.ReadPassword(0)
 	if err != nil {
 		return ""
@@ -242,11 +242,7 @@ func readMasked(c *cli.Context, prompt string) string {
 }
 
 func cliAuthnURL(cfg *config.Config) string {
-	authURL := os.Getenv(env.AuthN.URL)
-	if authURL == "" {
-		authURL = cfg.Auth.URL
-	}
-	return authURL
+	return cos.Right(cfg.Auth.URL, os.Getenv(env.AuthN.URL))
 }
 
 func lookupClusterID(cluID string) (string, error) {
@@ -313,20 +309,26 @@ func cliAuthnUserPassword(c *cli.Context, omitEmpty bool) string {
 	return pass
 }
 
-func updateAuthUserHandler(c *cli.Context) (err error) {
-	user := userFromArgsOrStdin(c, true)
-	return authn.UpdateUser(authParams, user)
-}
-
-func addAuthUserHandler(c *cli.Context) (err error) {
-	user := userFromArgsOrStdin(c, false /*omitEmpty*/)
-	list, err := authn.GetAllUsers(authParams)
+func updateAuthUserHandler(c *cli.Context) error {
+	user, err := userFromArgsOrStdin(c, true)
 	if err != nil {
 		return err
 	}
-	for _, uInfo := range list {
-		if uInfo.ID == user.ID {
-			return fmt.Errorf("user %q already exists", uInfo.ID)
+	return authn.UpdateUser(authParams, user)
+}
+
+func addAuthUserHandler(c *cli.Context) error {
+	user, err := userFromArgsOrStdin(c, false)
+	if err != nil {
+		return err
+	}
+	existingUsers, err := authn.GetAllUsers(authParams)
+	if err != nil {
+		return err
+	}
+	for _, u := range existingUsers {
+		if u.ID == user.ID {
+			return fmt.Errorf("user %q already exists", u.ID)
 		}
 	}
 	fmt.Fprintln(c.App.Writer)
@@ -364,39 +366,33 @@ func loginUserHandler(c *cli.Context) (err error) {
 			return err
 		}
 	}
-	token, err := authn.LoginUser(authParams, name, password, cluID, expireIn)
+	token, err := authn.LoginUser(authParams, name, password, expireIn)
 	if err != nil {
 		return err
 	}
-	tokenFile, err := tokfile(c)
-	if err == nil {
-		msg := fmt.Sprintf("token %q exists - overwriting.\n", tokenFile)
-		actionWarn(c, msg)
-	} else if !os.IsNotExist(err) {
+	tokenFilePath, err := getTokenFilePath(c)
+	if err != nil {
 		return err
 	}
-	if err := jsp.Save(tokenFile, token, jsp.Plain(), nil); err != nil {
-		return fmt.Errorf("failed to write token %q: %v", tokenFile, err)
+	if err := jsp.Save(tokenFilePath, token, jsp.Plain(), nil); err != nil {
+		return fmt.Errorf("failed to write token %q: %v", tokenFilePath, err)
 	}
-	fmt.Fprintf(c.App.Writer, "Logged in (%s)\n", tokenFile)
+	fmt.Fprintf(c.App.Writer, "Logged in (%s)\n", tokenFilePath)
 	return nil
 }
 
 func logoutUserHandler(c *cli.Context) (err error) {
-	tokenFile, err := tokfile(c)
+	tokenFilePath, err := getTokenFilePath(c)
 	if err != nil {
-		if tokenFile == "" {
-			return err
-		}
-		return fmt.Errorf("cannot logout %q: %v", tokenFile, err)
+		return fmt.Errorf("cannot logout: %v", err)
 	}
 	if err := revokeTokenHandler(c); err != nil {
 		return err
 	}
-	if err := os.Remove(tokenFile); err != nil {
-		return fmt.Errorf("failed to logout %q: %v", tokenFile, err)
+	if err := cos.RemoveFile(tokenFilePath); err != nil {
+		return fmt.Errorf("failed to logout, could not remove token file %q: %v", tokenFilePath, err)
 	}
-	fmt.Fprintf(c.App.Writer, "Logged out (removed/revoked %q)\n", tokenFile)
+	fmt.Fprintf(c.App.Writer, "Logged out (removed/revoked %q)\n", tokenFilePath)
 	return nil
 }
 
@@ -510,9 +506,9 @@ func showAuthAllRoles(c *cli.Context) error {
 	// non-verbose is the implicit default when showing all
 	if flagIsSet(c, verboseFlag) {
 		for i, role := range list {
-			rInfo, err := authn.GetRole(authParams, role.ID)
+			rInfo, err := authn.GetRole(authParams, role.Name)
 			if err != nil {
-				color.New(color.FgRed).Fprintf(c.App.Writer, "%s: %v\n", role.ID, err)
+				color.New(color.FgRed).Fprintf(c.App.Writer, "%s: %v\n", role.Name, err)
 			} else {
 				if i > 0 {
 					fmt.Fprintln(c.App.Writer)
@@ -628,8 +624,8 @@ func addOrUpdateRole(c *cli.Context) (*authn.Role, error) {
 		perms |= p
 	}
 	roleACL := &authn.Role{
-		ID:   role,
-		Desc: parseStrFlag(c, descRoleFlag),
+		Name:        role,
+		Description: parseStrFlag(c, descRoleFlag),
 	}
 	if bucket != "" {
 		bck, err := parseBckURI(c, bucket, false)
@@ -655,18 +651,29 @@ func addOrUpdateRole(c *cli.Context) (*authn.Role, error) {
 	return roleACL, nil
 }
 
-func userFromArgsOrStdin(c *cli.Context, omitEmpty bool) *authn.User {
+func userFromArgsOrStdin(c *cli.Context, omitEmpty bool) (*authn.User, error) {
 	var (
 		username = cliAuthnUserName(c)
 		userpass = cliAuthnUserPassword(c, omitEmpty)
-		roles    = c.Args().Tail()
+		args     = c.Args().Tail()
 	)
-	return &authn.User{ID: username, Password: userpass, Roles: roles}
+
+	roles := make([]*authn.Role, 0, len(args))
+	for _, roleName := range args {
+		roleName = strings.TrimSpace(roleName)
+		roleInfo, err := authn.GetRole(authParams, roleName)
+		if err != nil {
+			fmt.Fprintf(c.App.Writer, "Role %q not found\n", roleName)
+			return nil, err
+		}
+		roles = append(roles, roleInfo)
+	}
+	return &authn.User{ID: username, Password: userpass, Roles: roles}, nil
 }
 
 func parseClusterSpecs(c *cli.Context) (cluSpec authn.CluACL, err error) {
 	cluSpec.URLs = make([]string, 0, 1)
-	for idx := 0; idx < c.NArg(); idx++ {
+	for idx := range c.NArg() {
 		arg := c.Args().Get(idx)
 		if strings.HasPrefix(arg, "http:") || strings.HasPrefix(arg, "https:") ||
 			strings.HasPrefix(arg, "HTTP:") || strings.HasPrefix(arg, "HTTPS:") {
@@ -683,21 +690,20 @@ func parseClusterSpecs(c *cli.Context) (cluSpec authn.CluACL, err error) {
 }
 
 func revokeTokenHandler(c *cli.Context) (err error) {
-	tokenFile, err := tokfile(c)
+	tokenFilePath, err := getTokenFilePath(c)
 	if err != nil {
 		return err
 	}
-	b, err := os.ReadFile(tokenFile)
+	b, err := os.ReadFile(tokenFilePath)
 	if err != nil {
-		return fmt.Errorf("failed to read token %q: %v", tokenFile, err)
+		return fmt.Errorf("failed to read token %q: %v", tokenFilePath, err)
 	}
 	msg := &authn.TokenMsg{}
 	if err := jsoniter.Unmarshal(b, msg); err != nil {
-		return fmt.Errorf("invalid token %q format: %v", tokenFile, err)
+		return fmt.Errorf("invalid token %q format: %v", tokenFilePath, err)
 	}
 	return authn.RevokeToken(authParams, msg.Token)
 }
-
 func showAuthConfigHandler(c *cli.Context) (err error) {
 	conf, err := authn.GetConfig(authParams)
 	if err != nil {
@@ -755,17 +761,24 @@ func setAuthConfigHandler(c *cli.Context) (err error) {
 	return authn.SetConfig(authParams, conf)
 }
 
-// compare with: api/authn/loadtoken.go
-func tokfile(c *cli.Context) (string, error) {
-	tokenFile := parseStrFlag(c, tokenFileFlag)
-	if tokenFile == "" {
-		tokenFile = os.Getenv(env.AuthN.TokenFile)
+// getTokenFilePath retrieves the file path for the authentication token.
+// It checks the token file flag, environment variable, and default location in order of precedence.
+// If the file does not exist, it attempts to create the necessary directories.
+func getTokenFilePath(c *cli.Context) (string, error) {
+	tokenFilePath := parseStrFlag(c, tokenFileFlag)
+	if tokenFilePath == "" {
+		tokenFilePath = os.Getenv(env.AuthN.TokenFile)
 	}
-	if tokenFile == "" {
-		tokenFile = filepath.Join(config.ConfigDir, fname.Token)
+	if tokenFilePath == "" {
+		tokenFilePath = filepath.Join(config.ConfigDir, fname.Token)
 	}
-	if tokenFile == "" {
-		return "", errors.New("missing token filename")
+	if err := cos.Stat(tokenFilePath); err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to access token file %q: %v", tokenFilePath, err)
+		}
+		if createErr := cos.CreateDir(filepath.Dir(tokenFilePath)); createErr != nil {
+			return "", fmt.Errorf("failed to create directory for token file %q: %v", tokenFilePath, createErr)
+		}
 	}
-	return tokenFile, cos.Stat(tokenFile)
+	return tokenFilePath, nil
 }

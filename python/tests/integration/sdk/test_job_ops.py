@@ -1,10 +1,12 @@
 #
-# Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
 #
+from datetime import datetime
 import unittest
 
 from tests.integration.sdk.remote_enabled_test import RemoteEnabledTest
-from tests.integration import REMOTE_SET, TEST_TIMEOUT, OBJECT_COUNT
+from tests.integration import REMOTE_SET
+from tests.const import TEST_TIMEOUT, OBJECT_COUNT
 
 
 class TestJobOps(RemoteEnabledTest):  # pylint: disable=unused-variable
@@ -52,6 +54,31 @@ class TestJobOps(RemoteEnabledTest):  # pylint: disable=unused-variable
         for name in object_names:
             self.assertNotIn(name, existing_obj)
 
+    @unittest.skipIf(
+        not REMOTE_SET,
+        "Remote bucket is not set",
+    )
+    def test_job_wait_single_node(self):
+        obj_name, _ = self._create_object_with_content()
 
-if __name__ == "__main__":
-    unittest.main()
+        evict_job_id = self.bucket.objects(obj_names=[obj_name]).evict()
+        self.client.job(evict_job_id).wait(timeout=TEST_TIMEOUT)
+
+        job_id = self.bucket.object(obj_name).blob_download()
+        self.assertNotEqual(job_id, "")
+        self.client.job(job_id=job_id).wait_single_node(timeout=TEST_TIMEOUT)
+
+        objects = self.bucket.list_objects(props="name,cached", prefix=obj_name).entries
+        self._validate_objects_cached(objects, True)
+
+    def test_get_within_timeframe(self):
+        start_time = datetime.now()
+        job_id = self.client.job(job_kind="lru").start()
+        self.client.job(job_id=job_id).wait()
+        end_time = datetime.now()
+        self.assertNotEqual(job_id, "")
+        jobs_list = self.client.job(job_id=job_id).get_within_timeframe(
+            start_time=start_time, end_time=end_time
+        )
+
+        self.assertTrue(len(jobs_list) > 0)

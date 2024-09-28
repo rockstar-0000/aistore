@@ -6,10 +6,8 @@ package ais
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -56,7 +54,7 @@ func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := io.ReadAll(r.Body)
+	b, err := cos.ReadAll(r.Body)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
@@ -83,7 +81,7 @@ func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleETL) {
-		nlog.Infoln(t.String() + ": " + initMsg.String())
+		nlog.Infoln(t.String(), initMsg.String())
 	}
 }
 
@@ -152,7 +150,7 @@ func (t *target) stopETL(w http.ResponseWriter, r *http.Request, etlName string)
 	}
 }
 
-func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, bck *meta.Bck, objName string) {
+func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, lom *core.LOM) {
 	var (
 		comm etl.Communicator
 		err  error
@@ -169,7 +167,7 @@ func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, 
 		t.writeErr(w, r, err)
 		return
 	}
-	if err := comm.InlineTransform(w, r, bck, objName); err != nil {
+	if err := comm.InlineTransform(w, r, lom); err != nil {
 		errV := cmn.NewErrETL(&cmn.ETLErrCtx{ETLName: etlName, PodName: comm.PodName(), SvcName: comm.SvcName()},
 			err.Error())
 		xetl := comm.Xact()
@@ -197,8 +195,7 @@ func (t *target) healthETL(w http.ResponseWriter, r *http.Request, etlName strin
 		}
 		return
 	}
-	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(health)))
-	w.Write([]byte(health))
+	writeXid(w, health)
 }
 
 func (t *target) metricsETL(w http.ResponseWriter, r *http.Request, etlName string) {
@@ -269,7 +266,7 @@ func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 	core.FreeLOM(lom)
 
 	if err != nil {
-		t._erris(w, r, dpq.silent, err, 0)
+		t._erris(w, r, err, 0, dpq.silent)
 	}
 	dpqFree(dpq)
 }
@@ -290,10 +287,10 @@ func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lom := core.AllocLOM(objName)
-	errCode, err := t.objHead(w.Header(), r.URL.Query(), bck, lom)
+	ecode, err := t.objHead(r, w.Header(), r.URL.Query(), bck, lom)
 	core.FreeLOM(lom)
 	if err != nil {
 		// always silent (compare w/ httpobjhead)
-		t.writeErr(w, r, err, errCode, Silent)
+		t.writeErr(w, r, err, ecode, Silent)
 	}
 }

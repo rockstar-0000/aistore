@@ -24,6 +24,8 @@ import (
 	"github.com/urfave/cli"
 )
 
+const listedText = "Listed"
+
 type (
 	lsbFooter struct {
 		pct        int
@@ -32,7 +34,7 @@ type (
 		size       uint64 // apparent
 	}
 
-	entryFilter func(*cmn.LsoEntry) bool
+	entryFilter func(*cmn.LsoEnt) bool
 
 	lstFilter struct {
 		predicates []entryFilter
@@ -89,7 +91,7 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fl
 		if info.IsBckPresent {
 			footer.nbp++
 		}
-		if bck.IsHTTP() {
+		if bck.IsHT() {
 			if bmd == nil {
 				bmd, err = api.GetBMD(apiBP)
 				if err != nil {
@@ -130,36 +132,37 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fl
 // compare with `showBucketSummary`
 func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, args api.BinfoArgs) int {
 	var (
-		footer      lsbFooter
-		hideHeader  = flagIsSet(c, noHeaderFlag)
-		hideFooter  = flagIsSet(c, noFooterFlag)
-		data        = make([]teb.ListBucketsHelper, 0, len(bcks))
-		units, errU = parseUnitsFlag(c, unitsFlag)
-	)
-	if errU != nil {
-		actionWarn(c, errU.Error())
-		units = ""
-	}
-	var (
-		opts       = teb.Opts{AltMap: teb.FuncMapUnits(units)}
+		footer     lsbFooter
+		hideHeader = flagIsSet(c, noHeaderFlag)
+		hideFooter = flagIsSet(c, noFooterFlag)
 		maxwait    = listObjectsWaitTime
-		bckPresent = apc.IsFltPresent(args.FltPresence) // all-buckets part in the `allObjsOrBcksFlag`
-		dontWait   = flagIsSet(c, dontWaitFlag)
-		ctx        = newBsummContext(c, units, qbck, bckPresent, dontWait)
-		prev       = ctx.started
+
+		objCached  = flagIsSet(c, listObjCachedFlag)
+		bckPresent = flagIsSet(c, allObjsOrBcksFlag)
+		prefix     = parseStrFlag(c, listObjPrefixFlag)
 	)
 	debug.Assert(args.Summarize)
+	ctx, err := newBsummCtxMsg(c, qbck, prefix, objCached, bckPresent)
+	if err != nil {
+		actionWarn(c, err.Error()+"\n")
+	}
+
+	// because api.BinfoArgs (left) contains api.BsummArgs (right)
 	args.CallAfter = ctx.args.CallAfter
-	args.Callback = ctx.args.Callback // reusing bsummCtx.progress()
+	args.Callback = ctx.args.Callback
+	args.Prefix = prefix
 
 	// one at a time
+	prev := ctx.started
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(ctx.units, false /*incl. calendar date*/)}
+	data := make([]teb.ListBucketsHelper, 0, len(bcks))
 	for i := range bcks {
 		bck := bcks[i]
 		if !qbck.Contains(&bck) {
 			continue
 		}
 		ctx.qbck = cmn.QueryBcks(bck)
-		xid, props, info, err := api.GetBucketInfo(apiBP, bck, args)
+		xid, props, info, err := api.GetBucketInfo(apiBP, bck, &args)
 		if err != nil {
 			var partial bool
 			if herr, ok := err.(*cmn.ErrHTTP); ok {
@@ -183,7 +186,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 			footer.size += info.TotalSize.OnDisk
 			footer.pct += int(info.UsedPct)
 		}
-		if bck.IsHTTP() {
+		if bck.IsHT() {
 			bck.Name += " (URL: " + props.Extra.HTTP.OrigURLBck + ")"
 		}
 		data = append(data, teb.ListBucketsHelper{XactID: xid, Bck: bck, Props: props, Info: info})
@@ -230,7 +233,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 	if qbck.IsRemoteAIS() {
 		p = "Remote " + p
 	}
-	apparentSize := teb.FmtSize(int64(footer.size), units, 2)
+	apparentSize := teb.FmtSize(int64(footer.size), ctx.units, 2)
 	if footer.pobj+footer.robj != 0 {
 		foot = fmt.Sprintf("Total: [%s bucket%s: %d%s, objects %d(%d), apparent size %s, used capacity %d%%] ========",
 			p, cos.Plural(footer.nb), footer.nb, s, footer.pobj, footer.robj, apparentSize, footer.pct)
@@ -242,7 +245,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 	return footer.nb
 }
 
-func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) error {
+func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpty bool) error {
 	// prefix and filter
 	lstFilter, prefixFromTemplate, err := newLstFilter(c)
 	if err != nil {
@@ -260,7 +263,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	if external, internal := splitPrefixShardBoundary(prefix); internal != "" {
 		origPrefix := prefix
 		prefix = external
-		lstFilter._add(func(obj *cmn.LsoEntry) bool { return strings.HasPrefix(obj.Name, origPrefix) })
+		lstFilter._add(func(obj *cmn.LsoEnt) bool { return strings.HasPrefix(obj.Name, origPrefix) })
 	}
 
 	// lsmsg
@@ -308,10 +311,17 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	if listArch {
 		msg.SetFlag(apc.LsArchDir)
 	}
+	if flagIsSet(c, noRecursFlag) {
+		msg.SetFlag(apc.LsNoRecursion)
+	}
+	if flagIsSet(c, noDirsFlag) {
+		msg.SetFlag(apc.LsNoDirs)
+	}
 
 	var (
 		props    []string
 		propsStr = parseStrFlag(c, objPropsFlag)
+		catOnly  = flagIsSet(c, countAndTimeFlag)
 	)
 	if propsStr != "" {
 		debug.Assert(apc.LsPropsSepa == ",", "',' is documented in 'objPropsFlag' usage and elsewhere")
@@ -334,6 +344,9 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 			msg.AddProps(apc.GetPropsName)
 			msg.AddProps(apc.GetPropsSize)
 			msg.SetFlag(apc.LsNameSize)
+		} else if catOnly {
+			msg.SetFlag(apc.LsNameOnly)
+			msg.Props = apc.GetPropsName
 		} else {
 			msg.AddProps(apc.GetPropsMinimal...)
 		}
@@ -365,17 +378,37 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 	if flagIsSet(c, startAfterFlag) {
 		msg.StartAfter = parseStrFlag(c, startAfterFlag)
 	}
-	pageSize, limit, err := _setPage(c, bck)
+	pageSize, maxPages, limit, err := _setPage(c, bck)
 	if err != nil {
 		return err
 	}
-	msg.PageSize = uint(pageSize)
+	msg.PageSize = pageSize
 
-	// list page by page, print pages one at a time
+	// finally, setup lsargs
+	lsargs := api.ListArgs{Limit: limit}
+	if flagIsSet(c, useInventoryFlag) {
+		lsargs.Header = http.Header{
+			apc.HdrInventory: []string{"true"},
+			apc.HdrInvName:   []string{parseStrFlag(c, invNameFlag)},
+			apc.HdrInvID:     []string{parseStrFlag(c, invIDFlag)},
+		}
+	}
+
+	var (
+		now int64
+	)
+	if catOnly && flagIsSet(c, noFooterFlag) {
+		warn := fmt.Sprintf(errFmtExclusive, qflprn(countAndTimeFlag), qflprn(noFooterFlag))
+		actionWarn(c, warn)
+	}
+	// list (and immediately show) pages, one page at a time
 	if flagIsSet(c, pagedFlag) {
-		pageCounter, maxPages, toShow := 0, parseIntFlag(c, maxPagesFlag), limit
+		pageCounter, toShow := 0, int(limit)
 		for {
-			objList, err := api.ListObjectsPage(apiBP, bck, msg)
+			if catOnly {
+				now = mono.NanoTime()
+			}
+			objList, err := api.ListObjectsPage(apiBP, bck, msg, lsargs)
 			if err != nil {
 				return lsoErr(msg, err)
 			}
@@ -388,7 +421,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 			} else {
 				toPrint = objList.Entries
 			}
-			err = printLso(c, toPrint, lstFilter, propsStr,
+			err = printLso(c, toPrint, lstFilter, propsStr, nil /*_listed*/, now,
 				addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsVerChanged))
 			if err != nil {
 				return err
@@ -402,7 +435,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 				return nil
 			}
 			pageCounter++
-			if maxPages > 0 && pageCounter >= maxPages {
+			if maxPages > 0 && pageCounter >= int(maxPages) {
 				return nil
 			}
 			if limit > 0 {
@@ -414,20 +447,27 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch bool) erro
 		}
 	}
 
-	// list all pages up to a limit, show progress
+	// alternatively (when `--paged` not specified) list all pages up to a limit, show progress
 	var (
 		callAfter = listObjectsWaitTime
-		u         = &_listed{c: c, bck: &bck}
+		_listed   = &_listed{c: c, bck: &bck, limit: int(limit)}
 	)
 	if flagIsSet(c, refreshFlag) {
 		callAfter = parseDurationFlag(c, refreshFlag)
 	}
-	args := api.ListArgs{Callback: u.cb, CallAfter: callAfter, Limit: uint(limit)}
-	objList, err := api.ListObjects(apiBP, bck, msg, args)
+	if catOnly {
+		now = mono.NanoTime()
+	}
+	lsargs.Callback = _listed.cb
+	lsargs.CallAfter = callAfter
+	objList, err := api.ListObjects(apiBP, bck, msg, lsargs)
 	if err != nil {
 		return lsoErr(msg, err)
 	}
-	return printLso(c, objList.Entries, lstFilter, propsStr,
+	if len(objList.Entries) == 0 && !printEmpty {
+		return fmt.Errorf("%s/%s not found", bck.Cname(""), msg.Prefix)
+	}
+	return printLso(c, objList.Entries, lstFilter, propsStr, _listed, now,
 		addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsVerChanged))
 }
 
@@ -441,22 +481,23 @@ func lsoErr(msg *apc.LsoMsg, err error) error {
 	return V(err)
 }
 
-func _setPage(c *cli.Context, bck cmn.Bck) (pageSize, limit int, err error) {
+func _setPage(c *cli.Context, bck cmn.Bck) (pageSize, maxPages, limit int64, err error) {
+	maxPages = int64(parseIntFlag(c, maxPagesFlag))
 	b := meta.CloneBck(&bck)
 	if flagIsSet(c, pageSizeFlag) {
-		pageSize = parseIntFlag(c, pageSizeFlag)
+		pageSize = int64(parseIntFlag(c, pageSizeFlag))
 		if pageSize < 0 {
 			err = fmt.Errorf("invalid %s: page size (%d) cannot be negative", qflprn(pageSizeFlag), pageSize)
 			return
 		}
-		if uint(pageSize) > b.MaxPageSize() {
+		if pageSize > b.MaxPageSize() {
 			if b.Props == nil {
 				if b.Props, err = headBucket(bck, true /* don't add */); err != nil {
 					return
 				}
 			}
 			// still?
-			if uint(pageSize) > b.MaxPageSize() {
+			if pageSize > b.MaxPageSize() {
 				err = fmt.Errorf("invalid %s: page size (%d) cannot exceed the maximum (%d)",
 					qflprn(pageSizeFlag), pageSize, b.MaxPageSize())
 				return
@@ -464,24 +505,27 @@ func _setPage(c *cli.Context, bck cmn.Bck) (pageSize, limit int, err error) {
 		}
 	}
 
-	limit = parseIntFlag(c, objLimitFlag)
+	limit = int64(parseIntFlag(c, objLimitFlag))
 	if limit < 0 {
-		err = fmt.Errorf("invalid %s: max number of listed objects (%d) cannot be negative", qflprn(objLimitFlag), limit)
+		err = fmt.Errorf("invalid %s=%d: max number of objects to list cannot be negative", qflprn(objLimitFlag), limit)
 		return
+	}
+	if limit == 0 && maxPages > 0 {
+		limit = maxPages * b.MaxPageSize()
 	}
 	if limit == 0 {
 		return
 	}
 
 	// when limit "wins"
-	if limit < pageSize || (uint(limit) < b.MaxPageSize() && pageSize == 0) {
+	if limit < pageSize || (limit < b.MaxPageSize() && pageSize == 0) {
 		pageSize = limit
 	}
 	return
 }
 
 // NOTE: in addition to CACHED, may also dynamically add STATUS column
-func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, props string,
+func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, props string, _listed *_listed, now int64,
 	addCachedCol, isRemote, addStatusCol bool) error {
 	var (
 		hideHeader     = flagIsSet(c, noHeaderFlag)
@@ -505,14 +549,34 @@ func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, prop
 		}
 	}
 
+	// validate props for typos
+	for _, prop := range propsList {
+		if _, ok := teb.ObjectPropsMap[prop]; !ok {
+			return fmt.Errorf("unknown object property %q (expecting one of: %v)",
+				prop, cos.StrKVs(teb.ObjectPropsMap).Keys())
+		}
+	}
+
+	// count-and-time only
+	if now > 0 {
+		// unless caption already printed
+		if _listed != nil && _listed.cptn {
+			return nil
+		}
+		elapsed := teb.FormatDuration(mono.Since(now))
+		fmt.Fprintln(c.App.Writer, listedText, cos.FormatBigNum(len(matched)), "names in", elapsed)
+		return nil
+	}
+
+	// otherwise, print names
 	tmpl := teb.LsoTemplate(propsList, hideHeader, addCachedCol, addStatusCol)
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(units)}
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(units, false /*incl. calendar date*/)}
 	if err := teb.Print(matched, tmpl, opts); err != nil {
 		return err
 	}
+
 	if !hideFooter && len(matched) > 10 {
-		listed := fblue("Listed:")
-		fmt.Fprintln(c.App.Writer, listed, cos.FormatBigNum(len(matched)), "names")
+		fmt.Fprintln(c.App.Writer, fblue(listedText), cos.FormatBigNum(len(matched)), "names")
 	}
 	if flagIsSet(c, showUnmatchedFlag) && len(other) > 0 {
 		unmatched := fcyan("\nNames that didn't match: ") + strconv.Itoa(len(other))
@@ -532,14 +596,14 @@ func newLstFilter(c *cli.Context) (flt *lstFilter, prefix string, _ error) {
 	flt = &lstFilter{}
 	if !flagIsSet(c, allObjsOrBcksFlag) {
 		// filter objects that are "not OK" (e.g., misplaced)
-		flt._add(func(obj *cmn.LsoEntry) bool { return obj.IsStatusOK() })
+		flt._add(func(obj *cmn.LsoEnt) bool { return obj.IsStatusOK() })
 	}
 	if regexStr := parseStrFlag(c, regexLsAnyFlag); regexStr != "" {
 		regex, err := regexp.Compile(regexStr)
 		if err != nil {
 			return nil, "", err
 		}
-		flt._add(func(obj *cmn.LsoEntry) bool { return regex.MatchString(obj.Name) })
+		flt._add(func(obj *cmn.LsoEnt) bool { return regex.MatchString(obj.Name) })
 	}
 	if bashTemplate := parseStrFlag(c, templateFlag); bashTemplate != "" {
 		pt, err := cos.NewParsedTemplate(bashTemplate)
@@ -554,7 +618,7 @@ func newLstFilter(c *cli.Context) (flt *lstFilter, prefix string, _ error) {
 			for objName, hasNext := pt.Next(); hasNext; objName, hasNext = pt.Next() {
 				matchingObjectNames[objName] = struct{}{}
 			}
-			flt._add(func(obj *cmn.LsoEntry) bool { _, ok := matchingObjectNames[obj.Name]; return ok })
+			flt._add(func(obj *cmn.LsoEnt) bool { _, ok := matchingObjectNames[obj.Name]; return ok })
 		}
 	}
 	return flt, prefix, nil
@@ -563,7 +627,7 @@ func newLstFilter(c *cli.Context) (flt *lstFilter, prefix string, _ error) {
 func (o *lstFilter) _add(f entryFilter) { o.predicates = append(o.predicates, f) }
 func (o *lstFilter) _len() int          { return len(o.predicates) }
 
-func (o *lstFilter) and(obj *cmn.LsoEntry) bool {
+func (o *lstFilter) and(obj *cmn.LsoEnt) bool {
 	for _, predicate := range o.predicates {
 		if !predicate(obj) {
 			return false
@@ -623,32 +687,45 @@ func splitObjnameShardBoundary(fullName string) (objName, fileName string) {
 /////////////
 
 type _listed struct {
-	c   *cli.Context
-	bck *cmn.Bck
-	l   int
+	c     *cli.Context
+	bck   *cmn.Bck
+	limit int
+	l     int
+	done  bool
+	cptn  bool
 }
 
 func (u *_listed) cb(ctx *api.LsoCounter) {
-	if ctx.Count() < 0 {
+	if ctx.Count() < 0 || u.done {
 		return
 	}
-	if !ctx.IsFinished() {
-		s := "Listed " + cos.FormatBigNum(ctx.Count()) + " objects"
-		if u.l == 0 {
-			u.l = len(s) + 3
-			if u.bck.IsRemote() && !flagIsSet(u.c, listObjCachedFlag) {
-				note := fmt.Sprintf("listing remote objects in %s may take a while (tip: use %s to speed up)\n",
-					u.bck.Cname(""), qflprn(listObjCachedFlag))
-				actionNote(u.c, note)
-			}
-		} else if len(s) > u.l {
-			u.l = len(s) + 2
+	if ctx.IsFinished() || (u.limit > 0 && u.limit <= ctx.Count()) {
+		u.done = true
+		if !flagIsSet(u.c, noFooterFlag) {
+			elapsed := teb.FormatDuration(ctx.Elapsed())
+			fmt.Fprintf(u.c.App.Writer, "\r%s %s names in %s\n", listedText, cos.FormatBigNum(ctx.Count()), elapsed)
+			u.cptn = true
+			briefPause(1)
 		}
-		s += strings.Repeat(" ", u.l-len(s))
-		fmt.Fprintf(u.c.App.Writer, "\r%s", s)
-	} else if !flagIsSet(u.c, noFooterFlag) {
-		elapsed := teb.FormatDuration(ctx.Elapsed())
-		fmt.Fprintf(u.c.App.Writer, "\rListed %s objects in %v\n", cos.FormatBigNum(ctx.Count()), elapsed)
-		briefPause(1)
+		return
 	}
+
+	s := listedText + " " + cos.FormatBigNum(ctx.Count()) + " names"
+	if u.l == 0 {
+		u.l = len(s) + 3
+		if u.bck.IsRemote() {
+			var tip string
+			if flagIsSet(u.c, listObjCachedFlag) {
+				tip = fmt.Sprintf("use %s to show pages immediately - one page at a time", qflprn(pagedFlag))
+			} else {
+				tip = fmt.Sprintf("use %s to speed up and/or %s to show pages", qflprn(listObjCachedFlag), qflprn(pagedFlag))
+			}
+			note := fmt.Sprintf("listing remote objects in %s may take a while\n(Tip: %s)\n", u.bck.Cname(""), tip)
+			actionNote(u.c, note)
+		}
+	} else if len(s) > u.l {
+		u.l = len(s) + 2
+	}
+	s += strings.Repeat(" ", u.l-len(s))
+	fmt.Fprintf(u.c.App.Writer, "\r%s", s)
 }

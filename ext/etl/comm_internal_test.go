@@ -1,12 +1,12 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,8 +21,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/tools/cryptorand"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -68,7 +67,6 @@ var _ = Describe("CommunicatorTest", func() {
 		err = cos.CreateDir(mpath)
 		Expect(err).NotTo(HaveOccurred())
 		fs.TestNew(nil)
-		fs.TestDisableValidation()
 		_, err = fs.Add(mpath, "daeID")
 		Expect(err).NotTo(HaveOccurred())
 
@@ -92,7 +90,7 @@ var _ = Describe("CommunicatorTest", func() {
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		targetServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			err := comm.InlineTransform(w, r, clusterBck, objName)
+			err := comm.InlineTransform(w, r, lom)
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		proxyServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +133,7 @@ var _ = Describe("CommunicatorTest", func() {
 			Expect(err).NotTo(HaveOccurred())
 			defer resp.Body.Close()
 
-			b, err := io.ReadAll(resp.Body)
+			b, err := cos.ReadAll(resp.Body)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(b)).To(Equal(len(transformData)))
 			Expect(b).To(Equal(transformData))

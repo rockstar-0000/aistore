@@ -1,17 +1,19 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -32,6 +34,8 @@ type (
 		// Authn sends these tokens to primary for broadcasting
 		revokedTokens map[string]bool
 		version       int64
+		// signing key secret
+		secret string
 	}
 )
 
@@ -39,39 +43,46 @@ type (
 // authManager //
 /////////////////
 
-func newAuthManager() *authManager {
-	return &authManager{tkList: make(tkList), revokedTokens: make(map[string]bool), version: 1}
+func newAuthManager(config *cmn.Config) *authManager {
+	return &authManager{
+		tkList:        make(tkList),
+		revokedTokens: make(map[string]bool), // TODO: preallocate
+		version:       1,
+		secret:        cos.Right(config.Auth.Secret, os.Getenv(env.AuthN.SecretKey)), // environment override
+	}
 }
 
-// Add tokens to list of invalid ones. After that it cleans up the list
-// from expired tokens
+// Add tokens to the list of invalid ones and clean up the list from expired tokens.
 func (a *authManager) updateRevokedList(newRevoked *tokenList) (allRevoked *tokenList) {
 	a.Lock()
+	defer a.Unlock()
+
 	switch {
-	case newRevoked.Version == 0: // manually revoked
+	case newRevoked.Version == 0: // Manually revoked tokens
 		a.version++
 	case newRevoked.Version > a.version:
 		a.version = newRevoked.Version
 	default:
 		nlog.Errorf("Current token list v%d is greater than received v%d", a.version, newRevoked.Version)
-		a.Unlock()
 		return
 	}
-	// add new
+
+	// Add new revoked tokens and remove them from the valid token list.
 	for _, token := range newRevoked.Tokens {
 		a.revokedTokens[token] = true
 		delete(a.tkList, token)
 	}
+
 	allRevoked = &tokenList{
 		Tokens:  make([]string, 0, len(a.revokedTokens)),
 		Version: a.version,
 	}
-	var (
-		now    = time.Now()
-		secret = cmn.GCO.Get().Auth.Secret
-	)
+
+	// Clean up expired tokens from the revoked list.
+	now := time.Now()
+
 	for token := range a.revokedTokens {
-		tk, err := tok.DecryptToken(token, secret)
+		tk, err := tok.DecryptToken(token, a.secret)
 		debug.AssertNoErr(err)
 		if tk.Expires.Before(now) {
 			delete(a.revokedTokens, token)
@@ -79,7 +90,6 @@ func (a *authManager) updateRevokedList(newRevoked *tokenList) (allRevoked *toke
 			allRevoked.Tokens = append(allRevoked.Tokens, token)
 		}
 	}
-	a.Unlock()
 	if len(allRevoked.Tokens) == 0 {
 		allRevoked = nil
 	}
@@ -123,11 +133,8 @@ func (a *authManager) validateToken(token string) (tk *tok.Token, err error) {
 func (a *authManager) validateAddRm(token string, now time.Time) (*tok.Token, error) {
 	tk, ok := a.tkList[token]
 	if !ok || tk == nil {
-		var (
-			err    error
-			secret = cmn.GCO.Get().Auth.Secret
-		)
-		if tk, err = tok.DecryptToken(token, secret); err != nil {
+		var err error
+		if tk, err = tok.DecryptToken(token, a.secret); err != nil {
 			nlog.Errorln(err)
 			return nil, tok.ErrInvalidToken
 		}
@@ -164,7 +171,7 @@ func (p *proxy) tokenHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		p.validateSecret(w, r)
 	case http.MethodDelete:
-		p.httpTokenDelete(w, r)
+		p.delToken(w, r)
 	default:
 		cmn.WriteErr405(w, r, http.MethodDelete)
 	}
@@ -175,7 +182,7 @@ func (p *proxy) validateSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cksum := cos.NewCksumHash(cos.ChecksumSHA256)
-	cksum.H.Write([]byte(cmn.GCO.Get().Auth.Secret))
+	cksum.H.Write([]byte(p.authn.secret))
 	cksum.Finalize()
 
 	cluConf := &authn.ServerConf{}
@@ -187,7 +194,7 @@ func (p *proxy) validateSecret(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *proxy) httpTokenDelete(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) delToken(w http.ResponseWriter, r *http.Request) {
 	if _, err := p.parseURL(w, r, apc.URLPathTokens.L, 0, false); err != nil {
 		return
 	}
@@ -259,7 +266,7 @@ func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err
 		tk, err = p.validateToken(hdr)
 		if err != nil {
 			// NOTE: making exception to allow 3rd party clients read remote ht://bucket
-			if err == tok.ErrNoToken && bck != nil && bck.IsHTTP() {
+			if err == tok.ErrNoToken && bck != nil && bck.IsHT() {
 				err = nil
 			}
 			return err

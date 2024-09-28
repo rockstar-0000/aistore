@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -100,9 +102,6 @@ func (m *mgr) updateUser(userID string, updateReq *authn.User) error {
 	if len(updateReq.Roles) != 0 {
 		uInfo.Roles = updateReq.Roles
 	}
-	uInfo.ClusterACLs = mergeClusterACLs(uInfo.ClusterACLs, updateReq.ClusterACLs, "")
-	uInfo.BucketACLs = mergeBckACLs(uInfo.BucketACLs, updateReq.BucketACLs, "")
-
 	return m.db.Set(usersCollection, userID, uInfo)
 }
 
@@ -112,18 +111,6 @@ func (m *mgr) lookupUser(userID string) (*authn.User, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// update ACLs with roles's ones
-	for _, role := range uInfo.Roles {
-		rInfo := &authn.Role{}
-		err := m.db.Get(rolesCollection, role, rInfo)
-		if err != nil {
-			continue
-		}
-		uInfo.ClusterACLs = mergeClusterACLs(uInfo.ClusterACLs, rInfo.ClusterACLs, "")
-		uInfo.BucketACLs = mergeBckACLs(uInfo.BucketACLs, rInfo.BucketACLs, "")
-	}
-
 	return uInfo, nil
 }
 
@@ -148,18 +135,18 @@ func (m *mgr) userList() (map[string]*authn.User, error) {
 
 // Registers a new role
 func (m *mgr) addRole(info *authn.Role) error {
-	if info.ID == "" {
+	if info.Name == "" {
 		return errors.New("role name is undefined")
 	}
 	if info.IsAdmin {
 		return fmt.Errorf("only built-in roles can have %q permissions", adminUserID)
 	}
 
-	_, err := m.db.GetString(rolesCollection, info.ID)
+	_, err := m.db.GetString(rolesCollection, info.Name)
 	if err == nil {
-		return fmt.Errorf("role %q already exists", info.ID)
+		return fmt.Errorf("role %q already exists", info.Name)
 	}
-	return m.db.Set(rolesCollection, info.ID, info)
+	return m.db.Set(rolesCollection, info.Name, info)
 }
 
 // Deletes an existing role
@@ -181,11 +168,8 @@ func (m *mgr) updateRole(role string, updateReq *authn.Role) error {
 		return cos.NewErrNotFound(m, "role "+role)
 	}
 
-	if updateReq.Desc != "" {
-		rInfo.Desc = updateReq.Desc
-	}
-	if len(updateReq.Roles) != 0 {
-		rInfo.Roles = updateReq.Roles
+	if updateReq.Description != "" {
+		rInfo.Description = updateReq.Description
 	}
 	rInfo.ClusterACLs = mergeClusterACLs(rInfo.ClusterACLs, updateReq.ClusterACLs, "")
 	rInfo.BucketACLs = mergeBckACLs(rInfo.BucketACLs, updateReq.BucketACLs, "")
@@ -223,18 +207,18 @@ func (m *mgr) roleList() ([]*authn.Role, error) {
 // are not returned to a caller as it is not crucial.
 func (m *mgr) createRolesForCluster(clu *authn.CluACL) {
 	for _, pr := range predefinedRoles {
-		suffix := cos.Either(clu.Alias, clu.ID)
+		suffix := cos.Left(clu.Alias, clu.ID)
 		uid := pr.prefix + "-" + suffix
 		rInfo := &authn.Role{}
 		if err := m.db.Get(rolesCollection, uid, rInfo); err == nil {
 			continue
 		}
-		rInfo.ID = uid
+		rInfo.Name = uid
 		cluName := clu.ID
 		if clu.Alias != "" {
 			cluName += "[" + clu.Alias + "]"
 		}
-		rInfo.Desc = fmt.Sprintf(pr.desc, cluName)
+		rInfo.Description = fmt.Sprintf(pr.desc, cluName)
 		rInfo.ClusterACLs = []*authn.CluACL{
 			{ID: clu.ID, Access: pr.perms},
 		}
@@ -365,67 +349,55 @@ func (m *mgr) delCluster(cluID string) error {
 // already generated and is not expired yet the existing token is returned.
 // Token includes user ID, permissions, and token expiration time.
 // If a new token was generated then it sends the proxy a new valid token list
-func (m *mgr) issueToken(userID, pwd string, msg *authn.LoginMsg) (string, error) {
+func (m *mgr) issueToken(uid, pwd string, msg *authn.LoginMsg) (token string, err error) {
 	var (
-		err     error
-		expires time.Time
-		token   string
 		uInfo   = &authn.User{}
 		cid     string
+		cluACLs []*authn.CluACL
+		bckACLs []*authn.BckACL
 	)
-
-	err = m.db.Get(usersCollection, userID, uInfo)
+	err = m.db.Get(usersCollection, uid, uInfo)
 	if err != nil {
 		nlog.Errorln(err)
 		return "", errInvalidCredentials
 	}
+
+	debug.Assert(uid == uInfo.ID, uid, " vs ", uInfo.ID)
+
 	if !isSamePassword(pwd, uInfo.Password) {
 		return "", errInvalidCredentials
 	}
-	if !uInfo.IsAdmin() {
-		if msg.ClusterID == "" {
-			return "", fmt.Errorf("Couldn't issue token for %q: cluster ID not set", userID)
-		}
-		cid = m.cluLookup(msg.ClusterID, msg.ClusterID)
-		if cid == "" {
-			return "", cos.NewErrNotFound(m, "cluster "+msg.ClusterID)
-		}
-		uInfo.ClusterACLs = mergeClusterACLs(make([]*authn.CluACL, 0, len(uInfo.ClusterACLs)), uInfo.ClusterACLs, cid)
-		uInfo.BucketACLs = mergeBckACLs(make([]*authn.BckACL, 0, len(uInfo.BucketACLs)), uInfo.BucketACLs, cid)
-	}
 
-	// update ACLs with roles's ones
+	// update ACLs with roles' ones
 	for _, role := range uInfo.Roles {
-		rInfo := &authn.Role{}
-		err := m.db.Get(rolesCollection, role, rInfo)
-		if err != nil {
-			continue
-		}
-		uInfo.ClusterACLs = mergeClusterACLs(uInfo.ClusterACLs, rInfo.ClusterACLs, cid)
-		uInfo.BucketACLs = mergeBckACLs(uInfo.BucketACLs, rInfo.BucketACLs, cid)
+		cluACLs = mergeClusterACLs(cluACLs, role.ClusterACLs, cid)
+		bckACLs = mergeBckACLs(bckACLs, role.BucketACLs, cid)
 	}
 
 	// generate token
-	Conf.RLock()
-	defer Conf.RUnlock()
-	issued := time.Now()
-	expDelta := time.Duration(Conf.Server.ExpirePeriod)
+	token, err = m._token(msg, uInfo, cluACLs, bckACLs)
+	return token, err
+}
+
+func (m *mgr) _token(msg *authn.LoginMsg, uInfo *authn.User, cluACLs []*authn.CluACL, bckACLs []*authn.BckACL) (token string, err error) {
+	expDelta := Conf.Expire()
 	if msg.ExpiresIn != nil {
 		expDelta = *msg.ExpiresIn
 	}
 	if expDelta == 0 {
 		expDelta = foreverTokenTime
 	}
-	expires = issued.Add(expDelta)
 
 	// put all useful info into token: who owns the token, when it was issued,
 	// when it expires and credentials to log in AWS, GCP etc.
 	// If a user is a super user, it is enough to pass only isAdmin marker
+	expires := time.Now().Add(expDelta)
+	uid := uInfo.ID
 	if uInfo.IsAdmin() {
-		token, err = tok.IssueAdminJWT(expires, userID, Conf.Server.Secret)
+		token, err = tok.AdminJWT(expires, uid, Conf.Secret())
 	} else {
-		m.fixClusterIDs(uInfo.ClusterACLs)
-		token, err = tok.IssueJWT(expires, userID, uInfo.BucketACLs, uInfo.ClusterACLs, Conf.Server.Secret)
+		m.fixClusterIDs(cluACLs)
+		token, err = tok.JWT(expires, uid, bckACLs, cluACLs, Conf.Secret())
 	}
 	return token, err
 }
@@ -513,21 +485,31 @@ func isSamePassword(password, hashed string) bool {
 func initializeDB(driver kvdb.Driver) error {
 	users, err := driver.List(usersCollection, "")
 	if err != nil || len(users) != 0 {
-		// return on erros or when DB is already initialized
+		// Return on errors or when DB is already initialized
 		return err
 	}
+
+	// Create the admin role
 	role := &authn.Role{
-		ID:      authn.AdminRole,
-		Desc:    "AuthN administrator",
-		IsAdmin: true,
+		Name:        authn.AdminRole,
+		Description: "AuthN administrator",
+		IsAdmin:     true,
 	}
+
 	if err := driver.Set(rolesCollection, authn.AdminRole, role); err != nil {
 		return err
 	}
+
+	// environment override
+	userName := cos.Right(adminUserID, os.Getenv(env.AuthN.AdminUsername))
+	password := cos.Right(adminUserPass, os.Getenv(env.AuthN.AdminPassword))
+
+	// Create the admin user
 	su := &authn.User{
-		ID:       adminUserID,
-		Password: encryptPassword(adminUserPass),
-		Roles:    []string{authn.AdminRole},
+		ID:       userName,
+		Password: encryptPassword(password),
+		Roles:    []*authn.Role{role},
 	}
-	return driver.Set(usersCollection, adminUserID, su)
+
+	return driver.Set(usersCollection, userName, su)
 }

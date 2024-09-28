@@ -7,12 +7,12 @@ package s3
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
@@ -40,11 +40,12 @@ var (
 	mu  sync.RWMutex
 )
 
-func Init() { ups = make(uploads) }
-
 // Start miltipart upload
 func InitUpload(id, bckName, objName string) {
 	mu.Lock()
+	if ups == nil {
+		ups = make(uploads, 8)
+	}
 	ups[id] = &mpt{
 		bckName: bckName,
 		objName: objName,
@@ -133,12 +134,12 @@ func CleanupUpload(id, fqn string, aborted bool) (exists bool) {
 
 	if !aborted {
 		if err := storeMptXattr(fqn, mpt); err != nil {
-			nlog.Warningf("fqn %s, id %s: %v", fqn, id, err)
+			nlog.Warningln("failed to xattr [", fqn, id, err, "]")
 		}
 	}
 	for _, part := range mpt.parts {
-		if err := os.Remove(part.FQN); err != nil && !os.IsNotExist(err) {
-			nlog.Errorln(err)
+		if err := cos.RemoveFile(part.FQN); err != nil {
+			nlog.Errorln("failed to remove part [", fqn, id, err, "]")
 		}
 	}
 	return true
@@ -175,15 +176,15 @@ func ListUploads(bckName, idMarker string, maxUploads int) (result *ListMptUploa
 	return
 }
 
-func ListParts(id string, lom *core.LOM) (parts []*PartInfo, errCode int, err error) {
+func ListParts(id string, lom *core.LOM) (parts []*PartInfo, ecode int, err error) {
 	mu.RLock()
 	mpt, ok := ups[id]
 	if !ok {
-		errCode = http.StatusNotFound
+		ecode = http.StatusNotFound
 		mpt, err = loadMptXattr(lom.FQN)
 		if err != nil || mpt == nil {
 			mu.RUnlock()
-			return nil, errCode, err
+			return nil, ecode, err
 		}
 		mpt.bckName, mpt.objName = lom.Bck().Name, lom.ObjName
 		mpt.ctime = lom.Atime()
@@ -193,5 +194,5 @@ func ListParts(id string, lom *core.LOM) (parts []*PartInfo, errCode int, err er
 		parts = append(parts, &PartInfo{ETag: part.MD5, PartNumber: part.Num, Size: part.Size})
 	}
 	mu.RUnlock()
-	return parts, errCode, err
+	return parts, ecode, err
 }

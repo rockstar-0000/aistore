@@ -56,14 +56,6 @@ type (
 	}
 )
 
-func (r *xactECBase) init(config *cmn.Config, bck *cmn.Bck, mgr *Manager) {
-	r.stats = stats{bck: *bck}
-	r.config = config
-	r.bck = *bck
-	r.dOwner = &dataOwner{slices: make(map[string]*slice, 10)}
-	r.mgr = mgr
-}
-
 /////////////////
 // xactReqBase //
 /////////////////
@@ -108,8 +100,16 @@ func (r *xactReqBase) ecRequestsEnabled() bool {
 // xactECBase //
 ////////////////
 
+func (r *xactECBase) init(config *cmn.Config, bck *cmn.Bck, mgr *Manager) {
+	r.stats = stats{bck: *bck}
+	r.config = config
+	r.bck = *bck
+	r.dOwner = &dataOwner{slices: make(map[string]*slice, 10)}
+	r.mgr = mgr
+}
+
 func newSliceResponse(md *Metadata, attrs *cmn.ObjAttrs, fqn string) (reader cos.ReadOpenCloser, err error) {
-	attrs.Ver = md.ObjVersion
+	attrs.SetVersion(md.ObjVersion)
 	attrs.Cksum = cos.NewCksum(md.CksumType, md.CksumValue)
 
 	stat, err := os.Stat(fqn)
@@ -119,7 +119,7 @@ func newSliceResponse(md *Metadata, attrs *cmn.ObjAttrs, fqn string) (reader cos
 	attrs.Size = stat.Size()
 	reader, err = cos.NewFileHandle(fqn)
 	if err != nil {
-		nlog.Warningf("Failed to read file stats: %s", err)
+		nlog.Warningln("failed to read file stats:", err)
 		return nil, err
 	}
 	return reader, nil
@@ -140,11 +140,11 @@ func newReplicaResponse(attrs *cmn.ObjAttrs, bck *meta.Bck, objName string) (rea
 	if err != nil {
 		return nil, err
 	}
-	if lom.SizeBytes() == 0 {
+	if lom.Lsize() == 0 {
 		return nil, nil
 	}
-	attrs.Size = lom.SizeBytes()
-	attrs.Ver = lom.Version()
+	attrs.Size = lom.Lsize()
+	attrs.CopyVersion(lom.ObjAttrs())
 	attrs.Atime = lom.AtimeUnix()
 	attrs.Cksum = lom.Checksum()
 	return reader, nil
@@ -213,7 +213,7 @@ func (r *xactECBase) sendByDaemonID(daemonIDs []string, o *transport.Obj, reader
 	for _, id := range daemonIDs {
 		si, ok := smap.Tmap[id]
 		if !ok {
-			nlog.Errorf("t[%s] not found", id)
+			nlog.Errorln(meta.Tname(id), "not found in", smap.StringEx())
 			continue
 		}
 		nodes = append(nodes, si)
@@ -324,13 +324,13 @@ func (r *xactECBase) writeRemote(daemonIDs []string, lom *core.LOM, src *dataSou
 	putData := req.NewPack(g.smm)
 	objAttrs := cmn.ObjAttrs{
 		Size:  src.size,
-		Ver:   lom.Version(),
 		Atime: lom.AtimeUnix(),
 	}
+	objAttrs.CopyVersion(lom.ObjAttrs())
 	if src.metadata != nil && src.metadata.SliceID != 0 {
 		// for a slice read everything from slice's metadata
 		if src.metadata.ObjVersion != "" {
-			objAttrs.Ver = src.metadata.ObjVersion
+			objAttrs.SetVersion(src.metadata.ObjVersion)
 		}
 		objAttrs.Cksum = cos.NewCksum(src.metadata.CksumType, src.metadata.CksumValue)
 	} else {
@@ -375,8 +375,8 @@ func _writerReceive(writer *slice, exists bool, objAttrs cmn.ObjAttrs, reader io
 	buf, slab := g.pmm.Alloc()
 	writer.n, err = io.CopyBuffer(writer.writer, reader, buf)
 	writer.cksum = objAttrs.Cksum
-	if writer.version == "" && objAttrs.Ver != "" {
-		writer.version = objAttrs.Ver
+	if v := objAttrs.Version(); writer.version == "" && v != "" {
+		writer.version = v
 	}
 
 	writer.twg.Done()

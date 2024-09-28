@@ -9,7 +9,27 @@ redirect_from:
 
 # `ais show` command
 
-AIS CLI `show` command can universally be used to view summaries and details on a cluster and its nodes, buckets and objects, running and finished jobs - in short, _all_ managed entities (see below). The command is a "hub" for all information-viewing commands that are currently supported.
+AIS CLI `show` command can universally be used to view summaries and details on a cluster and its nodes, buckets and objects, running and finished jobs - in short, _all_ managed entities (see below).
+
+The command is a "hub" for all information-viewing commands that are currently supported:
+
+```console
+$ ais show --help
+
+COMMANDS:
+   auth            show entity in authn
+   object          show object properties
+   bucket          show bucket properties
+   cluster         main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
+   performance     show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
+   storage         show storage usage and utilization, disks and mountpaths
+   rebalance       show rebalance status and stats
+   config          show CLI, cluster, or node configurations (nodes inherit cluster and have local)
+   remote-cluster  show attached AIS clusters
+   job             show running and finished jobs ('--all' for all, or press <TAB-TAB> to select, '--help' for more options)
+   log             for a given node: show its current log (use '--refresh' to update, '--help' for details)
+   tls             show TLS certificate: version, issuer's common name, from/to validity bounds
+```
 
 For easy usage, all `show` commands have been aliased to their respective top-level counterparts:
 
@@ -21,7 +41,7 @@ is equivalent to:
 $ ais <command> show
 ```
 
-> For instance, `ais performance show` is an alias for `ais show performance` - both can be used interchangeably.
+> For instance, `ais show performance` is an alias for `ais performance` - both can be used interchangeably.
 
 > As a general rule, instead of remembering any of the above (as well as any of the below), type (e.g.) `ais perf<TAB-TAB>` and press `Enter`.
 
@@ -35,8 +55,9 @@ As far as `ais show`, the command currently extends as follows:
 
 ```console
 $ ais show <TAB-TAB>
+
 auth             bucket           performance      rebalance        remote-cluster   log
-object           cluster          storage          config           job
+object           cluster          storage          config           job              tls
 ```
 
 In other words, there are currently 11 subcommands that are briefly described in the rest of this text.
@@ -70,7 +91,7 @@ The command's help screen follows below - notice the command-line options (aka f
 ```console
 $ ais show performance --help
 NAME:
-   ais show performance - show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   ais show performance - show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
 
 USAGE:
    ais show performance command [command options] [TARGET_ID]
@@ -79,7 +100,7 @@ COMMANDS:
    counters    show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
                - numbers of list-objects requests;
                - (GET, PUT, etc.) cumulative and average sizes;
-               - associated error counters, if any, and more.
+               - associated error counters, if any.
    throughput  show GET and PUT throughput, associated (cumulative, average) sizes and counters
    latency     show GET, PUT, and APPEND latencies and average sizes
    capacity    show target mountpaths, disks, and used/available capacity
@@ -306,9 +327,9 @@ qVJt8087         g15     rebalance       694             1.02MiB         13:40:5
 - [CLI: `dsort` (distributed shuffle)](/docs/cli/dsort.md)
 - [CLI: `download` from any remote source](/docs/cli/download.md)
 - [built-in `rebalance`](/docs/rebalance.md)
-- [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges)
+- [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
 - [reading, writing, and listing archives](/docs/cli/object.md)
-- [copying buckets](/docs/cli/bucket.md#copy-bucket)
+- [copying buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 ## `ais show cluster`
 
@@ -322,16 +343,16 @@ proxy    target   smap     bmd      config   stats
 ```console
 $ ais show cluster --help
 NAME:
-   ais show cluster - show cluster nodes and utilization
+   ais show cluster - main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
 
 USAGE:
    ais show cluster command [command options] [NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]
 
 COMMANDS:
-   smap    show Smap (cluster map)
-   bmd     show BMD (bucket metadata)
+   smap    show cluster map (Smap)
+   bmd     show bucket metadata (BMD)
    config  show cluster and node configuration
-   stats   (alias for "ais show performance") show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   stats   (alias for "ais show performance") show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
 
 OPTIONS:
    --refresh value   interval for continuous monitoring;

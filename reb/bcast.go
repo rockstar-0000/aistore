@@ -1,6 +1,6 @@
 // Package reb provides global cluster-wide rebalance upon adding/removing storage nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package reb
 
@@ -66,17 +66,18 @@ func bcast(rargs *rebArgs, cb syncCallback) (errCnt int) {
 // pingTarget checks if target is running (type syncCallback)
 // TODO: reuse keepalive
 func (reb *Reb) pingTarget(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
+	const retries = 4
 	var (
 		ver    = rargs.smap.Version
 		sleep  = cmn.Rom.CplaneOperation()
 		logHdr = reb.logHdr(rargs.id, rargs.smap)
 		tname  = tsi.StringEx()
 	)
-	for i := 0; i < 4; i++ {
+	for i := range retries {
 		_, code, err := core.T.Health(tsi, cmn.Rom.MaxKeepalive(), nil)
 		if err == nil {
 			if i > 0 {
-				nlog.Infof("%s: %s is online", logHdr, tname)
+				nlog.Infoln(logHdr+":", tname, "is now reachable")
 			}
 			return true
 		}
@@ -117,7 +118,7 @@ func (reb *Reb) rxReady(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 		curwt += sleep
 	}
 	logHdr, tname := reb.logHdr(rargs.id, rargs.smap), tsi.StringEx()
-	nlog.Errorf("%s: timed out waiting for %s to reach %s state", logHdr, tname, stages[rebStageTraverse])
+	nlog.Errorln(logHdr, "timed out waiting for", tname, "to reach", stages[rebStageTraverse], "stage")
 	return
 }
 

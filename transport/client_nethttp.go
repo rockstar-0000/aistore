@@ -48,7 +48,7 @@ func NewIntraDataClient() (client *http.Client) {
 		ReadBufferSize:  rbuf,
 	}
 	if config.Net.HTTP.UseHTTPS {
-		client = cmn.NewClientTLS(cargs, config.Net.HTTP.ToTLS())
+		client = cmn.NewClientTLS(cargs, config.Net.HTTP.ToTLS(), true /*intra-cluster*/) // streams
 	} else {
 		client = cmn.NewClient(cargs)
 	}
@@ -71,8 +71,8 @@ func (s *streamBase) do(body io.Reader) (err error) {
 
 	response, err = s.client.Do(request)
 	if err != nil {
-		if verbose {
-			nlog.Errorf("%s: Error [%v]", s, err)
+		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+			nlog.Errorln(s.String(), "err:", err)
 		}
 		return
 	}

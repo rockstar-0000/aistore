@@ -7,44 +7,92 @@ redirect_from:
  - /docs/cli/archive.md/
 ---
 
-# When objects are _shards_
+# When objects are called _shards_
 
 In this document:
-* commands to read, write, and list *archives* - objects formatted as `TAR`, `TGZ` (or `TAR.GZ`) , `ZIP`, `TAR.LZ4`.
+* commands to read, write, extract, and list *archives* - objects formatted as `TAR`, `TGZ` (or `TAR.GZ`) , `ZIP`, or `TAR.LZ4`.
 
 For the most recently updated list of supported archival formats, please refer to [this source](https://github.com/NVIDIA/aistore/blob/main/cmn/archive/mime.go).
 
-The corresponding subset of CLI commands starts with `ais archive`, from where you can `<TAB-TAB>` to the actual (reading, writing, listing) operation.
+The corresponding subset of CLI commands starts with `ais archive`, from where you can `<TAB-TAB>` to the actual (reading, writing, etc.) operation.
 
 ```console
 $ ais archive --help
 
 NAME:
-   ais archive - Archive multiple objects from a given bucket; archive local files and directories; list archived content
+   ais archive get - get a shard and extract its content; get an archived file;
+              write the content locally with destination options including: filename, directory, STDOUT ('-'), or '/dev/null' (discard);
+              assorted options further include:
+              - '--prefix' to get multiple shards in one shot (empty prefix for the entire bucket);
+              - '--progress' and '--refresh' to watch progress bar;
+              - '-v' to produce verbose output when getting multiple objects.
+   'ais archive get' examples:
+              - ais://abc/trunk-0123.tar.lz4 /tmp/out - get and extract entire shard to /tmp/out/trunk/*
+              - ais://abc/trunk-0123.tar.lz4 --archpath file45.jpeg /tmp/out - extract one named file
+              - ais://abc/trunk-0123.tar.lz4/file45.jpeg /tmp/out - same as above (and note that '--archpath' is implied)
+              - ais://abc/trunk-0123.tar.lz4/file45 /tmp/out/file456.new - same as above, with destination explicitly (re)named
+   'ais archive get' multi-selection examples:
+              - ais://abc/trunk-0123.tar 111.tar --archregx=jpeg --archmode=suffix - return 111.tar with all *.jpeg files from a given shard
+              - ais://abc/trunk-0123.tar 222.tar --archregx=file45 --archmode=wdskey - return 222.tar with all file45.* files --/--
+              - ais://abc/trunk-0123.tar 333.tar --archregx=subdir/ --archmode=prefix - 333.tar with all subdir/* files --/--
 
 USAGE:
-   ais archive command [command options] [arguments...]
+   ais archive get [command options] BUCKET[/SHARD_NAME] [OUT_FILE|OUT_DIR|-]
 
-COMMANDS:
-   bucket      archive multiple objects from SRC_BUCKET as (.tar, .tgz or .tar.gz, .zip, .tar.lz4)-formatted shard
-   put         archive a file, a directory, or multiple files and/or directories as
-               (.tar, .tgz or .tar.gz, .zip, .tar.lz4)-formatted object - aka "shard".
-               Both APPEND (to an existing shard) and PUT (new version of the shard) variants are supported.
-               Examples:
-               - 'local-filename bucket/shard-00123.tar.lz4 --archpath name-in-archive' - append a file to a given shard and name it as specified;
-               - 'src-dir bucket/shard-99999.zip -put' - one directory; iff the destination .zip doesn't exist create a new one;
-               - '"sys, docs" ais://dst/CCC.tar --dry-run -y -r --archpath ggg/' - dry-run to recursively archive two directories.
-               Tips:
-               - use '--dry-run' option if in doubt;
-               - to archive objects from a local or remote bucket, run 'ais archive bucket', see --help for details.
-   get         get a shard, an archived file, or a range of bytes from the above;
-               - use '--prefix' to get multiple objects in one shot (empty prefix for the entire bucket)
-               - write the content locally with destination options including: filename, directory, STDOUT ('-')
-   ls          list archived content (supported formats: .tar, .tgz or .tar.gz, .zip, .tar.lz4)
-   gen-shards  generate random (.tar, .tgz or .tar.gz, .zip, .tar.lz4)-formatted objects ("shards"), e.g.:
-               - gen-shards 'ais://bucket1/shard-{001..999}.tar' - write 999 random shards (default sizes) to ais://bucket1
-               - gen-shards "gs://bucket2/shard-{01..20..2}.tgz" - 10 random gzipped tarfiles to Cloud bucket
-               (notice quotation marks in both cases)
+OPTIONS:
+   --checksum           validate checksum
+   --yes, -y            assume 'yes' to all questions
+   --latest             check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
+                        from the associated remote bucket:
+                        - provides operation-level control over object versioning (and version synchronization)
+                          without requiring to change bucket configuration
+                        - the latter can be done using 'ais bucket props set BUCKET versioning'
+                        - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
+   --refresh value      time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                        valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress           show progress bar(s) and progress of execution in real time
+   --blob-download      utilize built-in blob-downloader (and the corresponding alternative datapath) to read very large remote objects
+   --chunk-size value   chunk size in IEC or SI units, or "raw" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')
+   --num-workers value  number of concurrent blob-downloading workers (readers); system default when omitted or zero (default: 0)
+   --archpath value     extract the specified file from an object ("shard") formatted as: .tar, .tgz or .tar.gz, .zip, .tar.lz4;
+                        see also: '--archregx'
+   --archmime value     expected format (mime type) of an object ("shard") formatted as: .tar, .tgz or .tar.gz, .zip, .tar.lz4;
+                        especially usable for shards with non-standard extensions
+   --archregx value     string that specifies prefix, suffix, substring, WebDataset key, _or_ a general-purpose regular expression
+                        to select possibly multiple matching archived files from a given shard;
+                        is used in combination with '--archmode' ("matching mode") option
+   --archmode value     enumerated "matching mode" that tells aistore how to handle '--archregx', one of:
+                          * regexp - general purpose regular expression;
+                          * prefix - matching filename starts with;
+                          * suffix - matching filename ends with;
+                          * substr - matching filename contains;
+                          * wdskey - WebDataset key
+                        example:
+                          given a shard containing (subdir/aaa.jpg, subdir/aaa.json, subdir/bbb.jpg, subdir/bbb.json, ...)
+                          and wdskey=subdir/aaa, aistore will match and return (subdir/aaa.jpg, subdir/aaa.json)
+   --extract, -x        extract all files from archive(s)
+   --inventory          list objects using _bucket inventory_ (docs/s3inventory.md); requires s3:// backend; will provide significant performance
+                        boost when used with very large s3 buckets; e.g. usage:
+                          1) 'ais ls s3://abc --inventory'
+                          2) 'ais ls s3://abc --inventory --paged --prefix=subdir/'
+                        (see also: docs/s3inventory.md)
+   --inv-name value     bucket inventory name (optional; system default name is '.inventory')
+   --inv-id value       bucket inventory ID (optional; by default, we use bucket name as the bucket's inventory ID)
+   --prefix value       get objects that start with the specified prefix, e.g.:
+                        '--prefix a/b/c' - get objects from the virtual directory a/b/c and objects from the virtual directory
+                        a/b that have their names (relative to this directory) starting with 'c';
+                        '--prefix ""' - get entire bucket (all objects)
+   --cached             get only in-cluster objects - only those objects from a remote bucket that are present ("cached")
+   --archive            list archived content (see docs/archive.md for details)
+   --limit value        maximum number of object names to display (0 - unlimited; see also '--max-pages')
+                        e.g.: 'ais ls gs://abc --limit 1234 --cached --props size,custom (default: 0)
+   --units value        show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                        si  - SI (metric) format, e.g.: KB, MB, GB
+                        raw - do not convert to (or from) human-readable format
+   --verbose, -v        verbose output
+   --silent             server-side flag, an indication for aistore _not_ to log assorted errors (e.g., HEAD(object) failures)
+   --help, -h           show help
 ```
 
 ## Table of Contents
@@ -53,6 +101,8 @@ COMMANDS:
 - [Archive multiple objects](#archive-multiple-objects)
 - [List archived content](#list-archived-content)
 - [Get archived content](#get-archived-content)
+- [Get archived content: multiple-selection](#get-archived-content-multiple-selection)
+- [Generate shards](#generate-shards)
 
 ## Archive files and directories
 
@@ -249,7 +299,7 @@ This is a yet another archive-**creating** operation that:
 * supported archival formats include `.tar`, `.tar.gz` (or, same, `.tgz`), and `.zip`; more extensions may be added in the future.
 * archiving is carried out asynchronously, in parallel by all AIS targets.
 
-As such, `ais archive bucket` is one of the supported [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges).
+As such, `ais archive bucket` is one of the supported [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets).
 
 **NOTE:**
 
@@ -379,8 +429,7 @@ NAME                                             SIZE
     A.tar/tutorials/etl/compute_md5.md           8.28KiB
     A.tar/tutorials/etl/etl_imagenet_pytorch.md  4.16KiB
     A.tar/tutorials/etl/etl_webdataset.md        3.97KiB
-    A.tar/tutorials/various/hdfs_backend.md      5.39KiB
-Listed: 5 names
+Listed: 4 names
 ````
 
 or, same:
@@ -392,8 +441,7 @@ NAME                                             SIZE
     A.tar/tutorials/etl/compute_md5.md           8.28KiB
     A.tar/tutorials/etl/etl_imagenet_pytorch.md  4.16KiB
     A.tar/tutorials/etl/etl_webdataset.md        3.97KiB
-    A.tar/tutorials/various/hdfs_backend.md      5.39KiB
-Listed: 5 names
+Listed: 4 names
 ```
 
 ## Get archived content
@@ -545,8 +593,7 @@ NAME                                             SIZE
     A.tar/tutorials/etl/compute_md5.md           8.28KiB
     A.tar/tutorials/etl/etl_imagenet_pytorch.md  4.16KiB
     A.tar/tutorials/etl/etl_webdataset.md        3.97KiB
-    A.tar/tutorials/various/hdfs_backend.md      5.39KiB
-Listed: 5 names
+Listed: 4 names
 ```
 
 Now, extract matching files _from_ the bucket to /tmp/out:
@@ -564,6 +611,57 @@ drwxr-x--- 2 root root 4096 May 13 20:05 etl/
 drwxr-x--- 2 root root 4096 May 13 20:05 various/
 ```
 
+## Get archived content: multiple selection
+
+Generally, both single and multi-selection from a given source shard is realized using one of the following 4 (four) options:
+
+```console
+   --archpath value     extract the specified file from an object ("shard") formatted as: .tar, .tgz or .tar.gz, .zip, .tar.lz4;
+                        see also: '--archregx'
+   --archmime value     expected format (mime type) of an object ("shard") formatted as: .tar, .tgz or .tar.gz, .zip, .tar.lz4;
+                        especially usable for shards with non-standard extensions
+   --archregx value     string that specifies prefix, suffix, substring, WebDataset key, _or_ a general-purpose regular expression
+                        to select possibly multiple matching archived files from a given shard;
+                        is used in combination with '--archmode' ("matching mode") option
+   --archmode value     enumerated "matching mode" that tells aistore how to handle '--archregx', one of:
+                          * regexp - general purpose regular expression;
+                          * prefix - matching filename starts with;
+                          * suffix - matching filename ends with;
+                          * substr - matching filename contains;
+                          * wdskey - WebDataset key
+                        example:
+                          given a shard containing (subdir/aaa.jpg, subdir/aaa.json, subdir/bbb.jpg, subdir/bbb.json, ...)
+                          and wdskey=subdir/aaa, aistore will match and return (subdir/aaa.jpg, subdir/aaa.json)
+```
+
+In particular, '--archregx' and '--archmode' pair defines multiple selection that can be further demonstrated on the following examples.
+
+> But first, note that in all multi-selection cases, the result is (currently) invariably formatted as .TAR (that contains the aforementioned selection).
+
+### Example: suffix match
+
+Select all `*.jpeg` files from a given shard and return them all as 111.tar:
+
+```console
+$ ais archive get ais://abc/trunk-0123.tar 111.tar --archregx=jpeg --archmode=suffix
+```
+
+### Example: [WebDataset](https://github.com/webdataset/webdataset) key
+
+Select all files that have a given [WebDataset](https://github.com/webdataset/webdataset) key; return the result as 222.tar:
+
+```console
+$ ais archive get ais://abc/trunk-0123.tar 222.tar --archregx=file45 --archmode=wdskey
+```
+
+### Example: prefix match
+
+Similar to the above except that in this case '--archregx' value specifies virtual subdirectory inside a given named shard:
+
+```console
+$ ais archive get ais://abc/trunk-0123.tar 333.tar --archregx=subdir/ --archmode=prefix
+```
+
 ## Generate shards
 
 `ais archive gen-shards "BUCKET/TEMPLATE.EXT"`
@@ -579,6 +677,7 @@ The `TEMPLATE` must be bash-like brace expansion (see examples) and `.EXT` must 
 | --- | --- | --- | --- |
 | `--fsize` | `string` | Single file size inside the shard, can end with size suffix (k, MB, GiB, ...) | `1024`  (`1KB`)|
 | `--fcount` | `int` | Number of files inside single shard | `5` |
+| `--fext` | `string` |  Comma-separated list of file extensions (default ".test"), e.g.: --fext '.mp3,.json,.cls' | `.test` |
 | `--cleanup` | `bool` | When set, the old bucket will be deleted and created again | `false` |
 | `--conc` | `int` | Limits number of concurrent `PUT` requests and number of concurrent shards created | `10` |
 
@@ -624,5 +723,35 @@ super_shard_004_last.tgz	1.25MiB	1
 super_shard_005_last.tgz	1.25MiB	1
 super_shard_006_last.tgz	1.25MiB	1
 super_shard_007_last.tgz	1.25MiB	1
+...
+```
+
+#### Multi-extension example
+
+
+```console
+$ ais archive gen-shards 'ais://nnn/shard-{01..99}.tar' -fext ".mp3,  .json,  .cls"
+
+$ ais archive ls ais://nnn | head -n 20
+NAME                                             SIZE
+shard-01.tar                                     23.50KiB
+    shard-01.tar/541701ae863f76d0f7e0-0.cls      1.00KiB
+    shard-01.tar/541701ae863f76d0f7e0-0.json     1.00KiB
+    shard-01.tar/541701ae863f76d0f7e0-0.mp3      1.00KiB
+    shard-01.tar/8f8c5fa2934c90138833-1.cls      1.00KiB
+    shard-01.tar/8f8c5fa2934c90138833-1.json     1.00KiB
+    shard-01.tar/8f8c5fa2934c90138833-1.mp3      1.00KiB
+    shard-01.tar/9a42bd12d810d890ea86-3.cls      1.00KiB
+    shard-01.tar/9a42bd12d810d890ea86-3.json     1.00KiB
+    shard-01.tar/9a42bd12d810d890ea86-3.mp3      1.00KiB
+    shard-01.tar/c5bd7c7a34e12ebf3ad3-2.cls      1.00KiB
+    shard-01.tar/c5bd7c7a34e12ebf3ad3-2.json     1.00KiB
+    shard-01.tar/c5bd7c7a34e12ebf3ad3-2.mp3      1.00KiB
+    shard-01.tar/f13522533ecafbad4fe5-4.cls      1.00KiB
+    shard-01.tar/f13522533ecafbad4fe5-4.json     1.00KiB
+    shard-01.tar/f13522533ecafbad4fe5-4.mp3      1.00KiB
+shard-02.tar                                     23.50KiB
+    shard-02.tar/095e6ae644ff4fd1778b-7.cls      1.00KiB
+    shard-02.tar/095e6ae644ff4fd1778b-7.json     1.00KiB
 ...
 ```

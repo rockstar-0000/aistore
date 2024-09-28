@@ -1,7 +1,7 @@
-// Package volume provides the volume abstraction and methods to bootstrap, store with redundancy,
+// Package volume provides volume (a.k.a. pool of disks) abstraction and methods to configure, store,
 // and validate the corresponding metadata. AIS volume is built on top of mountpaths (fs package).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package volume
 
@@ -16,18 +16,20 @@ import (
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/ios"
 )
 
 const vmdCopies = 3
 
 type (
 	fsMpathMD struct {
-		Ext     any      `json:"ext,omitempty"` // reserved for within-metaversion extensions
-		Path    string   `json:"mountpath"`
-		Fs      string   `json:"fs"`
-		FsType  string   `json:"fs_type"`
-		FsID    cos.FsID `json:"fs_id"`
-		Enabled bool     `json:"enabled"`
+		Ext     any       `json:"ext,omitempty"` // reserved for within-metaversion extensions
+		Path    string    `json:"mountpath"`
+		Label   ios.Label `json:"mountpath_label"`
+		Fs      string    `json:"fs"`
+		FsType  string    `json:"fs_type"`
+		FsID    cos.FsID  `json:"fs_id"`
+		Enabled bool      `json:"enabled"`
 	}
 
 	// VMD is AIS target's volume metadata structure
@@ -62,15 +64,20 @@ func _mpathGreaterEq(curr, prev *VMD, mpath string) bool {
 // interface guard
 var _ jsp.Opts = (*VMD)(nil)
 
-func (*VMD) JspOpts() jsp.Options { return jsp.CCSign(cmn.MetaverVMD) }
+func (*VMD) JspOpts() jsp.Options {
+	opts := jsp.CCSign(cmn.MetaverVMD)
+	opts.OldMetaverOk = 1
+	return opts
+}
 
 func (vmd *VMD) addMountpath(mi *fs.Mountpath, enabled bool) {
 	vmd.Mountpaths[mi.Path] = &fsMpathMD{
 		Path:    mi.Path,
-		Enabled: enabled,
+		Label:   mi.Label,
 		Fs:      mi.Fs,
 		FsType:  mi.FsType,
 		FsID:    mi.FsID,
+		Enabled: enabled,
 	}
 }
 

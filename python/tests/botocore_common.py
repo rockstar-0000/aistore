@@ -11,7 +11,7 @@ import boto3
 from moto import mock_s3
 from botocore.exceptions import ClientError
 
-from aistore.sdk.const import UTF_ENCODING, AWS_DEFAULT_REGION
+from aistore.sdk.const import UTF_ENCODING
 from tests import (
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
@@ -70,7 +70,7 @@ class BotocoreBaseTest(unittest.TestCase):
             mock_s3_redirect.redirections_enabled = False
             self.mock_s3.start()
             self.s3 = boto3.client(
-                "s3", region_name=AWS_DEFAULT_REGION
+                "s3", region_name=AWS_REGION
             )  # pylint: disable=invalid-name
         else:
             logging.debug("Using aistore for S3 services")
@@ -208,24 +208,17 @@ class MightRedirect:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc, value, traceback):
+    def __exit__(self, exc_type, exc_value, traceback):
         if self.redirect_errors_expected:
-            try:
-                if exc and value:
-                    raise value
-            except ClientError as ex:
+            if exc_type is not None and isinstance(exc_value, ClientError):
                 # Some operations don't pass through redirect errors directly
                 if self.operation in ["_bucket_response_put"]:
                     return True
-                if int(ex.response["Error"]["Code"]) in [302, 307]:
+                if int(exc_value.response["Error"]["Code"]) in [302, 307]:
                     return True
-            instead = "No error"
-            if value:
-                instead = value
 
             raise Exception(
-                "A ClientError with a redirect code was expected, "
-                + "but didn't happen. Instead: "
-                + instead
+                "A ClientError with a redirect code was expected, but didn't happen. "
+                f"Instead: {exc_value if exc_value else 'No error'}"
             )
         return False

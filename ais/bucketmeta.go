@@ -1,11 +1,10 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"net/textproto"
@@ -134,7 +133,7 @@ func (m *bucketMD) add(bck *meta.Bck, p *cmn.Bprops) bool {
 		m.Version = 1 // on-the-fly (e.g. via PUT remote) w/ brand-new cluster
 	}
 	p.SetProvider(bck.Provider)
-	p.BID = bck.MaskBID(m.Version)
+	p.BID = meta.NewBID(m.Version, bck.IsAIS())
 	p.Created = time.Now().UnixNano()
 	bck.Props = p
 
@@ -273,7 +272,7 @@ func (*bmdOwnerBase) persistBytes(payload msPayload, fpath string) (done bool) {
 	}
 	var (
 		bmd *meta.BMD
-		wto = bytes.NewBuffer(bmdValue)
+		wto = cos.NewBuffer(bmdValue)
 		err = jsp.SaveMeta(fpath, bmd, wto)
 	)
 	done = err == nil
@@ -509,18 +508,6 @@ func defaultBckProps(args bckPropsArgs) (props *cmn.Bprops) {
 		debug.Assert(args.hdr == nil)
 	case args.bck.Backend() != nil:
 		debug.Assertf(args.hdr == nil, "%s, hdr=%+v", args.bck, args.hdr)
-	case args.bck.IsHDFS():
-		props.Versioning.Enabled = false
-		if args.hdr != nil {
-			props = mergeRemoteBckProps(props, args.hdr)
-		}
-		if args.bck.Props == nil {
-			// Since the original bucket does not have any HDFS related info,
-			// validation will fail, so we must skip.
-			return
-		}
-		// Use HDFS props.
-		props.Extra.HDFS = args.bck.Props.Extra.HDFS
 	case args.bck.IsRemote():
 		debug.Assert(args.hdr != nil)
 		props.Versioning.Enabled = false
@@ -540,7 +527,7 @@ func mergeRemoteBckProps(props *cmn.Bprops, header http.Header) *cmn.Bprops {
 		props.Extra.AWS.CloudRegion = header.Get(apc.HdrS3Region)
 		props.Extra.AWS.Endpoint = header.Get(apc.HdrS3Endpoint)
 		props.Extra.AWS.Profile = header.Get(apc.HdrS3Profile)
-	case apc.HTTP:
+	case apc.HT:
 		props.Extra.HTTP.OrigURLBck = header.Get(apc.HdrOrigURLBck)
 	}
 

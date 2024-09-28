@@ -7,10 +7,12 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -43,31 +45,55 @@ func parseURL(w http.ResponseWriter, r *http.Request, itemsAfter int, items []st
 }
 
 // Run public server to manage users and generate tokens
-func (h *hserv) Run() (err error) {
-	portstring := fmt.Sprintf(":%d", Conf.Net.HTTP.Port)
-	nlog.Infof("Listening on *:%s", portstring)
+func (h *hserv) Run() error {
+	var (
+		portStr    string
+		err        error
+		useHTTPS   bool
+		serverCert string
+		serverKey  string
+	)
+
+	// Retrieve and set the port
+	portStr = os.Getenv(env.AuthN.Port)
+	if portStr == "" {
+		portStr = fmt.Sprintf(":%d", Conf.Net.HTTP.Port)
+	} else {
+		portStr = ":" + portStr
+	}
+	nlog.Infof("Listening on %s", portStr)
 
 	h.registerPublicHandlers()
 	h.s = &http.Server{
-		Addr:              portstring,
+		Addr:              portStr,
 		Handler:           h.mux,
 		ReadHeaderTimeout: apc.ReadHeaderTimeout,
 	}
 	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
 		h.s.ReadHeaderTimeout = timeout
 	}
-	if Conf.Net.HTTP.UseHTTPS {
-		if err = h.s.ListenAndServeTLS(Conf.Net.HTTP.Certificate, Conf.Net.HTTP.Key); err == nil {
-			return nil
-		}
-		goto rerr
+
+	// Retrieve and set HTTPS configuration with environment variables taking precedence
+	useHTTPS, err = cos.IsParseEnvBoolOrDefault(env.AuthN.UseHTTPS, Conf.Net.HTTP.UseHTTPS)
+	if err != nil {
+		nlog.Errorf("Failed to parse %s: %v. Defaulting to false", env.AuthN.UseHTTPS, err)
 	}
-	if err = h.s.ListenAndServe(); err == nil {
-		return nil
+	serverCert = cos.GetEnvOrDefault(env.AuthN.ServerCrt, Conf.Net.HTTP.Certificate)
+	serverKey = cos.GetEnvOrDefault(env.AuthN.ServerKey, Conf.Net.HTTP.Key)
+
+	// Start the appropriate server based on the configuration
+	if useHTTPS {
+		nlog.Infof("Starting HTTPS server on port%s", portStr)
+		nlog.Infof("Certificate: %s", serverCert)
+		nlog.Infof("Key: %s", serverKey)
+		err = h.s.ListenAndServeTLS(serverCert, serverKey)
+	} else {
+		nlog.Infof("Starting HTTP server on port%s", portStr)
+		err = h.s.ListenAndServe()
 	}
-rerr:
-	if err != http.ErrServerClosed {
-		nlog.Errorf("Terminated with err: %v", err)
+
+	if err != nil && err != http.ErrServerClosed {
+		nlog.Errorf("Server terminated with error: %v", err)
 		return err
 	}
 	return nil
@@ -249,17 +275,7 @@ func (h *hserv) httpUserGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uInfo.Password = ""
-	clus, err := h.mgr.clus()
-	if err != nil {
-		cmn.WriteErr(w, r, err)
-		return
-	}
-	for _, clu := range uInfo.ClusterACLs {
-		if cInfo, ok := clus[clu.ID]; ok {
-			clu.Alias = cInfo.Alias
-		}
-	}
-	writeJSON(w, uInfo, "user info")
+	writeJSON(w, uInfo, "get user")
 }
 
 // Checks if the request header contains valid admin credentials.
@@ -293,7 +309,6 @@ func validateAdminPerms(w http.ResponseWriter, r *http.Request) error {
 // If h token is already issued and it is not expired yet then the old
 // token is returned
 func (h *hserv) userLogin(w http.ResponseWriter, r *http.Request) {
-	var err error
 	apiItems, err := parseURL(w, r, 1, apc.URLPathUsers.L)
 	if err != nil {
 		return
@@ -303,39 +318,36 @@ func (h *hserv) userLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg.Password == "" {
-		cmn.WriteErrMsg(w, r, "Not authorized", http.StatusUnauthorized)
+		cmn.WriteErrMsg(w, r, "empty password", http.StatusUnauthorized)
 		return
 	}
-	userID := apiItems[0]
-	pass := msg.Password
 
-	tokenString, err := h.mgr.issueToken(userID, pass, msg)
-	if err != nil {
-		nlog.Errorf("Failed to generate token for user %q: %v\n", userID, err)
+	var (
+		token  string
+		userID = apiItems[0]
+	)
+	if token, err = h.mgr.issueToken(userID, msg.Password, msg); err != nil {
+		nlog.Errorf("failed to generate token for user %q: %v\n", userID, err)
 		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
 		return
 	}
 
-	repl := fmt.Sprintf(`{"token": %q}`, tokenString)
-	writeBytes(w, []byte(repl), "auth")
+	repl := fmt.Sprintf(`{"token": %q}`, token)
+	writeBytes(w, cos.UnsafeB(repl), "login")
 }
 
 func writeJSON(w http.ResponseWriter, val any, tag string) {
 	w.Header().Set(cos.HdrContentType, cos.ContentJSON)
-	var err error
-	if err = jsoniter.NewEncoder(w).Encode(val); err == nil {
-		return
+	if err := jsoniter.NewEncoder(w).Encode(val); err != nil {
+		nlog.Errorf("%s: failed to write response: %v", tag, err)
 	}
-	nlog.Errorf("%s: failed to write json, err: %v", tag, err)
 }
 
 func writeBytes(w http.ResponseWriter, jsbytes []byte, tag string) {
 	w.Header().Set(cos.HdrContentType, cos.ContentJSON)
-	var err error
-	if _, err = w.Write(jsbytes); err == nil {
-		return
+	if _, err := w.Write(jsbytes); err != nil {
+		nlog.Errorf("%s: failed to write response: %v", tag, err)
 	}
-	nlog.Errorf("%s: failed to write json, err: %v", tag, err)
 }
 
 func (h *hserv) httpSrvPost(w http.ResponseWriter, r *http.Request) {
@@ -412,7 +424,7 @@ func (h *hserv) httpSrvGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cluList = &authn.RegisteredClusters{
-			M: map[string]*authn.CluACL{clu.ID: clu},
+			Clusters: map[string]*authn.CluACL{clu.ID: clu},
 		}
 	} else {
 		clus, err := h.mgr.clus()
@@ -420,9 +432,9 @@ func (h *hserv) httpSrvGet(w http.ResponseWriter, r *http.Request) {
 			cmn.WriteErr(w, r, err, http.StatusInternalServerError)
 			return
 		}
-		cluList = &authn.RegisteredClusters{M: clus}
+		cluList = &authn.RegisteredClusters{Clusters: clus}
 	}
-	writeJSON(w, cluList, "auth")
+	writeJSON(w, cluList, "get cluster")
 }
 
 func (h *hserv) roleHandler(w http.ResponseWriter, r *http.Request) {
@@ -456,7 +468,7 @@ func (h *hserv) httpRoleGet(w http.ResponseWriter, r *http.Request) {
 			cmn.WriteErr(w, r, err)
 			return
 		}
-		writeJSON(w, roles, "rolelist")
+		writeJSON(w, roles, "list roles")
 		return
 	}
 
@@ -475,7 +487,7 @@ func (h *hserv) httpRoleGet(w http.ResponseWriter, r *http.Request) {
 			clu.Alias = cInfo.Alias
 		}
 	}
-	writeJSON(w, role, "role")
+	writeJSON(w, role, "get role")
 }
 
 func (h *hserv) httpRoleDel(w http.ResponseWriter, r *http.Request) {

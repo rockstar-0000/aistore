@@ -2,6 +2,13 @@
 
 source utils/ais_minikube_setup.sh
 
+function handle_timeout() {
+  local pod_name=$1
+  echo "Timeout waiting for pod $pod_name to be ready. Retrieving logs..."
+  kubectl logs $pod_name
+  exit 1
+}
+
 # Default values and environment variables
 export AIS_FS_PATHS=""
 export TEST_FSPATH_COUNT=4
@@ -41,7 +48,6 @@ export TARGET_CNT=1
 
 export POD_NAME="ais-proxy-0"
 export PORT=$PRIMARY_PORT
-export AIS_IS_PRIMARY=true
 export INSTANCE=0
 
 export AIS_LOG_DIR="/tmp/ais/${INSTANCE}/log"
@@ -51,7 +57,7 @@ export AIS_LOG_DIR="/tmp/ais/${INSTANCE}/log"
 envsubst < kube_templates/aisproxy_deployment.yml | kubectl apply -f -
 
 echo "Waiting for the primary proxy to be ready..."
-kubectl wait --for="condition=ready" --timeout=2m pod ais-proxy-0
+kubectl wait --for="condition=ready" --timeout=2m pod $POD_NAME || handle_timeout $POD_NAME
 
 echo "Starting target deployment..."
 
@@ -70,7 +76,7 @@ export AIS_LOG_DIR="/tmp/ais/${INSTANCE}/log"
 envsubst < kube_templates/aistarget_deployment.yml | kubectl create -f -
 
 echo "Waiting for the targets to be ready..."
-kubectl wait --for="condition=ready" --timeout=2m pods -l type=aistarget
+kubectl wait --for="condition=ready" --timeout=2m pods -l type=aistarget || handle_timeout $POD_NAME
 
 # Display a list of running pods
 echo "List of running pods"

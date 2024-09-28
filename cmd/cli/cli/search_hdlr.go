@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file provides commands that remove various entities from the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -15,6 +15,11 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/urfave/cli"
 )
+
+const searchUsage = "search " + cliName + " commands, e.g.:\n" +
+	indent1 + "\t - 'ais search log' - commands containing 'log' subcommand\n" +
+	indent1 + "\t - 'ais search --regex log' - include all subcommands that contain 'log' substring\n" +
+	indent1 + "\t - 'ais search --regex \"\\blog\"' - slightly narrow the search to those commands that have 'log' on a word boundary, etc."
 
 var (
 	searchCmdFlags = []cli.Flag{
@@ -33,8 +38,8 @@ var (
 		commandCopy:     {"copy", "replicate", "backup"},
 		commandGet:      {"fetch", "read", "download"},
 		commandPrefetch: {"load", "preload", "warmup", "cache", "get"},
-		commandMirror:   {"protect", "replicate", "copy"},
-		commandECEncode: {"protect", "encode", "replicate", "erasure-code"},
+		commandMirror:   {"protect", "replicate", "copy", "n-way", "backup", "redundancy"},
+		commandECEncode: {"protect", "encode", "replicate", "erasure-code", "backup", "redundancy"},
 		commandStart:    {"do", "run", "execute"},
 		commandStop:     {"abort", "terminate"},
 		commandPut:      {"update", "write", "promote", "modify", "upload"},
@@ -47,6 +52,7 @@ var (
 		cmdAuthAdd:      {"register", "create"},
 		cmdStgCleanup:   {"remove", "delete", "evict"},
 		cmdDownload:     {"load", "populate", "copy", "cp"},
+		commandTLS:      {"x509", "X509", "X.509", "certificate", "https"},
 	}
 
 	// app state
@@ -58,11 +64,8 @@ var (
 func initSearch(app *cli.App) {
 	searchCommands = []cli.Command{
 		{
-			Name: commandSearch,
-			Usage: "search " + cliName + " commands, e.g.:\n" +
-				indent1 + "\t - 'ais search log' - commands containing 'log' subcommand\n" +
-				indent1 + "\t - 'ais search --regex log' - include all subcommands that contain 'log' substring\n" +
-				indent1 + "\t - 'ais search --regex \"\\blog\"' - slightly narrow the search to those that have 'log' on a word boundary, etc.",
+			Name:         commandSearch,
+			Usage:        searchUsage,
 			ArgsUsage:    searchArgument,
 			Action:       searchCmdHdlr,
 			Flags:        searchCmdFlags,

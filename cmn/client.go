@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/api/env"
+	"github.com/NVIDIA/aistore/cmn/certloader"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
@@ -92,7 +93,7 @@ func NewTransport(cargs TransportArgs) *http.Transport {
 	return transport
 }
 
-func NewTLS(sargs TLSArgs) (tlsConf *tls.Config, _ error) {
+func NewTLS(sargs TLSArgs, intra bool) (tlsConf *tls.Config, err error) {
 	var pool *x509.CertPool
 	if sargs.ClientCA != "" {
 		cert, err := os.ReadFile(sargs.ClientCA)
@@ -105,19 +106,37 @@ func NewTLS(sargs TLSArgs) (tlsConf *tls.Config, _ error) {
 		}
 	}
 	tlsConf = &tls.Config{RootCAs: pool, InsecureSkipVerify: sargs.SkipVerify}
-	if sargs.Certificate != "" {
-		cert, err := tls.LoadX509KeyPair(sargs.Certificate, sargs.Key)
-		if err != nil {
-			return nil, err
-		}
-		tlsConf.Certificates = []tls.Certificate{cert}
+
+	if sargs.Certificate == "" && sargs.Key == "" {
+		return tlsConf, nil
 	}
-	return tlsConf, nil
+
+	// intra-cluster client
+	if intra {
+		tlsConf.GetClientCertificate, err = certloader.GetClientCert()
+		return tlsConf, err
+	}
+
+	// external client
+	var (
+		cert tls.Certificate
+		hint string
+	)
+	if cert, err = tls.LoadX509KeyPair(sargs.Certificate, sargs.Key); err == nil {
+		tlsConf.Certificates = []tls.Certificate{cert}
+		return tlsConf, nil
+	}
+
+	if os.IsNotExist(err) {
+		hint = "\n(hint: check the two filenames for existence/accessibility)"
+	}
+	return nil, fmt.Errorf("client tls: failed to load public/private key pair: (%q, %q)%s", sargs.Certificate, sargs.Key, hint)
 }
 
+// TODO -- FIXME: this call must get cert file and key to be used for the `clientTLS`
 func NewDefaultClients(timeout time.Duration) (clientH, clientTLS *http.Client) {
 	clientH = NewClient(TransportArgs{Timeout: timeout})
-	clientTLS = NewClientTLS(TransportArgs{Timeout: timeout}, TLSArgs{SkipVerify: true})
+	clientTLS = NewClientTLS(TransportArgs{Timeout: timeout}, TLSArgs{SkipVerify: true}, false /*intra-cluster*/)
 	return
 }
 
@@ -127,24 +146,25 @@ func NewClient(cargs TransportArgs) *http.Client {
 }
 
 func NewIntraClientTLS(cargs TransportArgs, config *Config) *http.Client {
-	return NewClientTLS(cargs, config.Net.HTTP.ToTLS())
+	return NewClientTLS(cargs, config.Net.HTTP.ToTLS(), true /*intra-cluster*/)
 }
 
 // https client (ditto)
-func NewClientTLS(cargs TransportArgs, sargs TLSArgs) *http.Client {
+func NewClientTLS(cargs TransportArgs, sargs TLSArgs, intra bool) *http.Client {
 	transport := NewTransport(cargs)
 
 	// initialize TLS config
-	tlsConfig, err := NewTLS(sargs)
+	tlsConfig, err := NewTLS(sargs, intra)
 	if err != nil {
-		cos.ExitLog(err)
+		cos.ExitLog(err) // FATAL
 	}
 	transport.TLSClientConfig = tlsConfig
 
 	return &http.Client{Transport: transport, Timeout: cargs.Timeout}
 }
 
-// see related: HTTPConf.ToTLS()
+// EnvToTLS usage is limited to aisloader and tools
+// NOTE that embedded intra-cluster clients utilize a similar method: `HTTPConf.ToTLS`
 func EnvToTLS(sargs *TLSArgs) {
 	if s := os.Getenv(env.AIS.Certificate); s != "" {
 		sargs.Certificate = s
@@ -153,6 +173,8 @@ func EnvToTLS(sargs *TLSArgs) {
 		sargs.Key = s
 	}
 	if s := os.Getenv(env.AIS.ClientCA); s != "" {
+		// XXX This should be RootCA for clients
+		// https://pkg.go.dev/crypto/tls
 		sargs.ClientCA = s
 	}
 	if s := os.Getenv(env.AIS.SkipVerifyCrt); s != "" {

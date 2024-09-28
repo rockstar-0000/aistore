@@ -5,6 +5,7 @@
 package apc
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -65,11 +66,8 @@ const (
 	// requesting proxy and, subsequently, to client.
 	LsWantOnlyRemoteProps
 
-	// List bucket entries without recursion (POSIX-wise). Note that the result in this case
-	// will include matching directories.
-	// TODO: works only with AIS bucket and only via S3 (no CLI yet). More exactly:
-	// - update AIS CLI to support non-recursive list-objects operation
-	// - when listing remote bucket, call backend (`Backend()`) to list non-recursively
+	// List objects without recursion (POSIX-wise).
+	// See related feature flag: feat.DontOptimizeVirtualDir
 	LsNoRecursion
 
 	// For remote metadata-capable buckets (ie., bck.HasVersioningMD() == true):
@@ -77,6 +75,13 @@ const (
 	// and if it does:
 	// - check whether remote version differs from its in-cluster copy
 	LsVerChanged
+
+	// Do not return virtual subdirectories.
+	// Background:
+	// Currently,    `list-objects(ais://BUCKET)` never returns virtual subdirectories - while,
+	// for instance, `list-objects(aws://BUCKET)` MAY return the latter.
+	// To prevent this from happening, specify LsNoDirs flag.
+	LsNoDirs
 )
 
 // max page sizes
@@ -140,15 +145,16 @@ var (
 )
 
 type LsoMsg struct {
-	UUID              string `json:"uuid"`               // ID to identify a single multi-page request
-	Props             string `json:"props"`              // comma-delimited, e.g. "checksum,size,custom" (see GetProps* enum)
-	TimeFormat        string `json:"time_format"`        // RFC822 is the default
-	Prefix            string `json:"prefix"`             // return obj names starting with prefix (TODO: e.g. "A.tar/tutorials/")
-	StartAfter        string `json:"start_after"`        // start listing after (AIS buckets only)
-	ContinuationToken string `json:"continuation_token"` // => LsoResult.ContinuationToken => LsoMsg.ContinuationToken
-	SID               string `json:"target"`             // selected target to solely execute backend.list-objects
-	Flags             uint64 `json:"flags,string"`       // enum {LsObjCached, ...} - "LsoMsg flags" above
-	PageSize          uint   `json:"pagesize"`           // max entries returned by list objects call
+	UUID              string      `json:"uuid"`                  // ID to identify a single multi-page request
+	Props             string      `json:"props"`                 // comma-delimited, e.g. "checksum,size,custom" (see GetProps* enum)
+	TimeFormat        string      `json:"time_format,omitempty"` // RFC822 is the default
+	Prefix            string      `json:"prefix"`                // return obj names starting with prefix (TODO: e.g. "A.tar/tutorials/")
+	StartAfter        string      `json:"start_after,omitempty"` // start listing after (AIS buckets only)
+	ContinuationToken string      `json:"continuation_token"`    // => LsoResult.ContinuationToken => LsoMsg.ContinuationToken
+	SID               string      `json:"target"`                // selected target to solely execute backend.list-objects
+	Flags             uint64      `json:"flags,string"`          // enum {LsObjCached, ...} - "LsoMsg flags" above
+	PageSize          int64       `json:"pagesize"`              // max entries returned by list objects call
+	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 }
 
 ////////////

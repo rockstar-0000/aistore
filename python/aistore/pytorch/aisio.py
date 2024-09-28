@@ -15,7 +15,8 @@ from aistore.sdk.ais_source import AISSource
 
 try:
     from aistore.sdk import Client
-    from aistore.pytorch.utils import parse_url, unparse_url
+    from aistore.sdk.utils import parse_url
+    from aistore.pytorch.utils import unparse_url
 
     HAS_AIS = True
 except ImportError:
@@ -41,7 +42,7 @@ class AISFileListerIterDataPipe(IterDataPipe[str]):
     Acceptable prefixes include but not limited to - `ais://bucket-name`, `ais://bucket-name/`
 
     Note:
-    -   This function also supports files from multiple backends (`aws://..`, `gcp://..`, `hdfs://..`, etc)
+    -   This function also supports files from multiple backends (`aws://..`, `gcp://..`, etc.)
     -   Input must be a list and direct URLs are not supported.
     -   length is -1 by default, all calls to len() are invalid as
         not all items are iterated at the start.

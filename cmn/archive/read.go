@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -9,30 +9,69 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/pierrec/lz4/v3"
 )
 
-// usage boils down to a) constructing (`NewReader`) and b) iterating (`Range`) - that's all
+const (
+	_regexp = iota // default (and slow)
+	_prefix
+	_suffix
+	_substr
+	_wdskey
+)
+
+var MatchMode = [...]string{
+	"regexp",
+	"prefix",
+	"suffix",
+	"substr",
+	"wdskey", // WebDataset convention - pathname without extension (https://github.com/webdataset/webdataset#the-webdataset-format)
+}
+
+// to use, construct (`NewReader`) and iterate (`RangeUntil`)
 // (all supported formats)
+// simple/single selection is also supported (`ReadOne`)
 type (
-	ReadCB func(filename string, reader cos.ReadCloseSizer, hdr any) (bool, error)
+	ArchRCB interface {
+		Call(filename string, reader cos.ReadCloseSizer, hdr any) (bool /*stop*/, error)
+	}
 
 	Reader interface {
-		// pass non-empty filename to facilitate a simple/single selection
-		// (generalize as a multi-selection callback? no need yet...)
-		Range(filename string, rcb ReadCB) (cos.ReadCloseSizer, error)
+		// - call rcb (reader's callback) with each matching archived file, where:
+		//   - `regex` is the matching string that gets interpreted according
+		//      to one of the enumerated "matching modes" (see MatchMode);
+		//   - an empty `regex` is just another case of cos.EmptyMatchAll - i.e., matches all archived files
+		// - stop upon EOF, or when rcb returns true (ie., stop) or any error
+		ReadUntil(rcb ArchRCB, regex, mmode string) error
+
+		// simple/single selection of a given archived filename (full path)
+		ReadOne(filename string) (cos.ReadCloseSizer, error)
 
 		// private
 		init(fh io.Reader) error
 	}
 )
 
-// private implementation
+type ErrMatchMode struct{ mmode string }
+
+// private
+type (
+	matcher struct {
+		regex string
+		mmode string
+		// when (and if) compiled
+		re *regexp.Regexp
+	}
+)
+
 type (
 	baseR struct {
 		fh io.Reader
@@ -86,6 +125,45 @@ func NewReader(mime string, fh io.Reader, size ...int64) (ar Reader, err error) 
 
 func (br *baseR) init(fh io.Reader) { br.fh = fh }
 
+// matcher
+
+func (m *matcher) init() (err error) {
+	// making exception for match-all("", "*")
+	if cos.MatchAll(m.regex) {
+		m.mmode = MatchMode[_prefix]
+	}
+	switch m.mmode {
+	case MatchMode[_regexp]:
+		debug.Assert(!cos.MatchAll(m.regex)) // match-all("", "*") must use mmode == prefix
+		m.re, err = regexp.Compile(m.regex)
+	case MatchMode[_prefix], MatchMode[_suffix], MatchMode[_substr], MatchMode[_wdskey]:
+		// do nothing
+	default:
+		err = &ErrMatchMode{m.mmode}
+	}
+	return err
+}
+
+func (m *matcher) do(filename string) bool {
+	if m.regex == "" { // empty regex matches all archived filenames
+		return true
+	}
+	if m.re != nil {
+		return m.re.MatchString(filename)
+	}
+	switch m.mmode {
+	case MatchMode[_prefix]:
+		return strings.HasPrefix(filename, m.regex)
+	case MatchMode[_suffix]:
+		return strings.HasSuffix(filename, m.regex)
+	case MatchMode[_substr]:
+		return strings.Contains(filename, m.regex)
+	default:
+		debug.Assert(m.mmode == MatchMode[_wdskey], m.mmode)
+		return m.regex == cos.WdsKey(filename)
+	}
+}
+
 // tarReader
 
 func (tr *tarReader) init(fh io.Reader) error {
@@ -94,27 +172,41 @@ func (tr *tarReader) init(fh io.Reader) error {
 	return nil
 }
 
-func (tr *tarReader) Range(filename string, rcb ReadCB) (cos.ReadCloseSizer, error) {
-	debug.Assert(rcb != nil || filename != "") // either/or
+func (tr *tarReader) ReadUntil(rcb ArchRCB, regex, mmode string) (err error) {
+	matcher := matcher{regex: regex, mmode: mmode}
+	if err = matcher.init(); err != nil {
+		return err
+	}
 	for {
-		hdr, ern := tr.tr.Next()
-		if ern != nil {
-			if ern == io.EOF {
-				ern = nil
+		hdr, err := tr.tr.Next()
+		if err != nil {
+			if err == io.EOF {
+				err = nil
 			}
-			return nil, ern
+			return err
 		}
-		if filename != "" {
-			if hdr.Name == filename || namesEq(hdr.Name, filename) {
-				return &cslLimited{LimitedReader: io.LimitedReader{R: tr.tr, N: hdr.Size}}, nil
-			}
+		if !matcher.do(hdr.Name) {
 			continue
 		}
-		// otherwise, read them all until stopped
 		csl := &cslLimited{LimitedReader: io.LimitedReader{R: tr.tr, N: hdr.Size}}
-		stop, err := rcb(hdr.Name, csl, hdr)
-		if stop || err != nil {
+		if stop, err := rcb.Call(hdr.Name, csl, hdr); stop || err != nil {
+			return err
+		}
+	}
+}
+
+func (tr *tarReader) ReadOne(filename string) (cos.ReadCloseSizer, error) {
+	debug.Assert(filename != "", "missing archived filename (pathname)")
+	for {
+		hdr, err := tr.tr.Next()
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
 			return nil, err
+		}
+		if hdr.Name == filename || namesEq(hdr.Name, filename) {
+			return &cslLimited{LimitedReader: io.LimitedReader{R: tr.tr, N: hdr.Size}}, nil
 		}
 	}
 }
@@ -131,17 +223,25 @@ func (tgr *tgzReader) init(fh io.Reader) (err error) {
 	return
 }
 
-// NOTE:
-// - when the method returns non-nil reader the responsibility to close the latter goes to the caller (via reader.Close)
-// - otherwise, gzip.Reader is closed upon return
-// currently, non-nil reader is returned iff filename != "" (indicating extraction of a single named file)
-func (tgr *tgzReader) Range(filename string, rcb ReadCB) (cos.ReadCloseSizer, error) {
-	reader, err := tgr.tr.Range(filename, rcb)
+func (tgr *tgzReader) ReadUntil(rcb ArchRCB, regex, mmode string) (err error) {
+	err = tgr.tr.ReadUntil(rcb, regex, mmode)
+	erc := tgr.gzr.Close()
+	if err == nil {
+		err = erc
+	}
+	return err
+}
+
+// here and elsewhere, `filename` indicates extraction of a single named archived file
+func (tgr *tgzReader) ReadOne(filename string) (cos.ReadCloseSizer, error) {
+	reader, err := tgr.tr.ReadOne(filename)
 	if err != nil {
 		tgr.gzr.Close()
 		return reader, err
 	}
 	if reader != nil {
+		// when the method returns non-nil reader it is the responsibility of the caller to close the former
+		// otherwise, gzip.Reader is always closed upon return
 		csc := &cslClose{gzr: tgr.gzr /*to close*/, R: reader /*to read from*/, N: reader.Size()}
 		return csc, err
 	}
@@ -152,42 +252,57 @@ func (tgr *tgzReader) Range(filename string, rcb ReadCB) (cos.ReadCloseSizer, er
 
 func (zr *zipReader) init(fh io.Reader) (err error) {
 	readerAt, ok := fh.(io.ReaderAt)
-	debug.Assert(ok, "expecting io.ReaderAt")
+	debug.Assert(ok, "zipReader: expecting io.ReaderAt")
 	zr.baseR.init(fh)
 	zr.zr, err = zip.NewReader(readerAt, zr.size)
 	return
 }
 
-func (zr *zipReader) Range(filename string, rcb ReadCB) (reader cos.ReadCloseSizer, err error) {
+func (zr *zipReader) ReadUntil(rcb ArchRCB, regex, mmode string) (err error) {
+	matcher := matcher{regex: regex, mmode: mmode}
+	if err = matcher.init(); err != nil {
+		return err
+	}
 	for _, f := range zr.zr.File {
 		finfo := f.FileInfo()
 		if finfo.IsDir() {
 			continue
 		}
-		// select one
-		if filename != "" {
-			if f.FileHeader.Name == filename || namesEq(f.FileHeader.Name, filename) {
-				csf := &cslFile{size: finfo.Size()}
-				csf.file, err = f.Open()
-				reader = csf
-				return
-			}
-			continue
-		}
-
 		debug.Assertf(finfo.Size() == int64(f.FileHeader.UncompressedSize64),
 			"%d vs %d", finfo.Size(), f.FileHeader.UncompressedSize64)
 
+		if !matcher.do(f.FileHeader.Name) {
+			continue
+		}
+
 		csf := &cslFile{size: int64(f.FileHeader.UncompressedSize64)}
 		if csf.file, err = f.Open(); err != nil {
-			return
+			return err
 		}
-		stop, err := rcb(f.FileHeader.Name, csf, &f.FileHeader)
-		if stop || err != nil {
-			return nil, err
+		if stop, err := rcb.Call(f.FileHeader.Name, csf, &f.FileHeader); stop || err != nil {
+			return err
 		}
 	}
 	return
+}
+
+func (zr *zipReader) ReadOne(filename string) (reader cos.ReadCloseSizer, err error) {
+	debug.Assert(filename != "", "missing archived filename (pathname)")
+	for _, f := range zr.zr.File {
+		finfo := f.FileInfo()
+		if finfo.IsDir() {
+			continue
+		}
+		debug.Assertf(finfo.Size() == int64(f.FileHeader.UncompressedSize64),
+			"%d vs %d", finfo.Size(), f.FileHeader.UncompressedSize64)
+
+		if f.FileHeader.Name == filename || namesEq(f.FileHeader.Name, filename) {
+			csf := &cslFile{size: finfo.Size()}
+			csf.file, err = f.Open()
+			return csf, err
+		}
+	}
+	return nil, nil
 }
 
 // lz4Reader
@@ -199,8 +314,12 @@ func (lzr *lz4Reader) init(fh io.Reader) error {
 	return nil
 }
 
-func (lzr *lz4Reader) Range(filename string, rcb ReadCB) (cos.ReadCloseSizer, error) {
-	return lzr.tr.Range(filename, rcb)
+func (lzr *lz4Reader) ReadUntil(rcb ArchRCB, regex, mmode string) error {
+	return lzr.tr.ReadUntil(rcb, regex, mmode)
+}
+
+func (lzr *lz4Reader) ReadOne(filename string) (cos.ReadCloseSizer, error) {
+	return lzr.tr.ReadOne(filename)
 }
 
 //
@@ -246,4 +365,24 @@ func namesEq(n1, n2 string) bool {
 		n2 = n2[1:]
 	}
 	return n1 == n2
+}
+
+//////////////////
+// ErrMatchMode //
+//////////////////
+
+func (e *ErrMatchMode) Error() string {
+	return fmt.Sprintf("invalid matching mode %q, expecting one of: %v", e.mmode, MatchMode)
+}
+
+func ValidateMatchMode(mmode string) (_ string, err error) {
+	if cos.MatchAll(mmode) {
+		return MatchMode[_prefix], nil
+	}
+	for i := range MatchMode {
+		if MatchMode[i] == mmode {
+			return mmode, nil
+		}
+	}
+	return "", &ErrMatchMode{mmode}
 }

@@ -6,7 +6,6 @@ package ais
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,7 +22,7 @@ import (
 )
 
 // [METHOD] /v1/download
-func (p *proxy) downloadHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) dloadHandler(w http.ResponseWriter, r *http.Request) {
 	if !p.ClusterStarted() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -87,7 +86,7 @@ func (p *proxy) httpdlpost(w http.ResponseWriter, r *http.Request) {
 
 	jobID := dload.PrefixJobID + cos.GenUUID() // prefix to visually differentiate vs. xaction IDs
 
-	body, err := io.ReadAll(r.Body)
+	body, err := cos.ReadAllN(r.Body, r.ContentLength)
 	if err != nil {
 		p.writeErrStatusf(w, r, http.StatusInternalServerError, "failed to receive download request: %v", err)
 		return
@@ -108,8 +107,8 @@ func (p *proxy) httpdlpost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	xid := cos.GenUUID()
-	if errCode, err := p.dlstart(r, xid, jobID, body); err != nil {
-		p.writeErrStatusf(w, r, errCode, "Error starting download: %v", err)
+	if ecode, err := p.dlstart(r, xid, jobID, body); err != nil {
+		p.writeErrStatusf(w, r, ecode, "Error starting download: %v", err)
 		return
 	}
 	smap := p.owner.smap.get()
@@ -128,7 +127,8 @@ func (p *proxy) dladm(method, path string, msg *dload.AdminBody) ([]byte, int, e
 	if msg.ID != "" && method == http.MethodGet && msg.OnlyActive {
 		nl := p.notifs.entry(msg.ID)
 		if nl != nil {
-			return p.dlstatus(nl, config)
+			respBytes := p.dlstatus(nl, config)
+			return respBytes, http.StatusOK, nil
 		}
 	}
 	var (
@@ -220,7 +220,7 @@ func (p *proxy) dladm(method, path string, msg *dload.AdminBody) ([]byte, int, e
 	}
 }
 
-func (p *proxy) dlstatus(nl nl.Listener, config *cmn.Config) ([]byte, int, error) {
+func (p *proxy) dlstatus(nl nl.Listener, config *cmn.Config) []byte {
 	// bcast
 	p.notifs.bcastGetStats(nl, config.Periodic.NotifTime.D())
 	stats := nl.NodeStats()
@@ -242,11 +242,10 @@ func (p *proxy) dlstatus(nl nl.Listener, config *cmn.Config) ([]byte, int, error
 		return true
 	})
 
-	respJSON := cos.MustMarshal(resp)
-	return respJSON, http.StatusOK, nil
+	return cos.MustMarshal(resp)
 }
 
-func (p *proxy) dlstart(r *http.Request, xid, jobID string, body []byte) (errCode int, err error) {
+func (p *proxy) dlstart(r *http.Request, xid, jobID string, body []byte) (ecode int, err error) {
 	var (
 		config = cmn.GCO.Get()
 		query  = make(url.Values, 2)
@@ -260,10 +259,10 @@ func (p *proxy) dlstart(r *http.Request, xid, jobID string, body []byte) (errCod
 	results := p.bcastGroup(args)
 	freeBcArgs(args)
 
-	errCode = http.StatusOK
+	ecode = http.StatusOK
 	for _, res := range results {
 		if res.err != nil {
-			errCode, err = res.status, res.err
+			ecode, err = res.status, res.err
 			break
 		}
 	}

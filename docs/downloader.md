@@ -23,8 +23,11 @@ AIS cluster can be easily deployed on any commodity hardware, and AIS **download
 
 ## Features
 
-> By way of background, AIStore supports a number of [3rd party Backend providers](/docs/providers.md) and utilizes the providers' SDKs to access the corresponding backends.
-> For Amazon S3, that would be `aws-sdk-go` SDK, for Azure - `azure-storage-blob-go`, and so on.
+AIStore supports a number of [3rd party Backend providers](/docs/providers.md).
+
+To access remote data (and store it in-cluster), AIStore utilizes the respective provider's SDK.
+
+> For Amazon S3, that would be `aws-sdk-go-v2`, for Azure - `azure-storage-blob-go`, and so on.
 > Each SDK can be **conditionally linked** into AIS executable - the decision (to link or not to link) is made prior to deployment.
 
 This has a certain implication for the Downloader.
@@ -128,6 +131,10 @@ $ curl -Li -H 'Content-Type: application/json' -d '{
   "link": "http://releases.ubuntu.com/18.04.1/ubuntu-18.04.1-desktop-amd64.iso"
 }' -X POST 'http://localhost:8080/v1/download'
 ```
+
+**NOTE:**
+
+> `localhost:8080` (above and elsewhere in this document) can be replaced with any legitimate (http or https) address of any AIS gateway.
 
 ## Multi Download
 

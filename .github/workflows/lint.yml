@@ -1,4 +1,4 @@
-name: lint (on linux)
+name: Lint
 on:
   push:
     branches:
@@ -10,10 +10,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  lint:
     strategy:
       matrix:
-        go-version: ['1.21.x']
+        go-version: ['1.22.x']
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -23,15 +23,21 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: golangci-lint
+      - name: Install `golangci-lint`
         uses: golangci/golangci-lint-action@v3
         with:
-          version: v1.56.1 ### NOTE: see also: Makefile lint-update-ci
-      - name: Lint linux
+          # NOTE: See `lint-update-ci` target in Makefile.
+          version: v1.61.0
+          args: --timeout=30m
+
+      - name: Lint
         run: |
           export GOPATH="$(go env GOPATH)"
           make lint
+          TAGS=statsd make lint
+          TAGS="statsd nethttp ht debug" make lint
+          TAGS="aws gcp azure" make lint
           make fmt-check
           make spell-check

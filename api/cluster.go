@@ -1,6 +1,6 @@
-// Package api provides Go based AIStore API/SDK over HTTP(S)
+// Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -13,8 +13,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/stats"
-	jsoniter "github.com/json-iterator/go"
 )
 
 // to be used by external watchdogs (Kubernetes, etc.)
@@ -158,46 +156,6 @@ func GetClusterSysInfo(bp BaseParams) (info apc.ClusterSysInfo, err error) {
 	return
 }
 
-// How to compute throughputs:
-//
-// - AIS supports several enumerated metric "kinds", including `KindThroughput`
-// (for complete enumeration, see stats/api.go)
-// - By convention, metrics that have `KindThroughput` kind are named with ".bps"
-// ("bytes per second") suffix.
-// - ".bps" metrics reported by api.GetClusterStats and api.GetDaemonStats are,
-// in fact, cumulative byte numbers.
-// - It is the client's responsibility to compute the actual throughputs
-// as only the client knows _when_ exactly the same ".bps" metric was queried
-// the previous time.
-//
-// - See also: `api.GetDaemonStats`, stats/api.go
-func GetClusterStats(bp BaseParams) (res stats.Cluster, err error) {
-	bp.Method = http.MethodGet
-	reqParams := AllocRp()
-	{
-		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathClu.S
-		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatNodeStats}}
-	}
-
-	var rawStats stats.ClusterRaw
-	_, err = reqParams.DoReqAny(&rawStats)
-	FreeRp(reqParams)
-	if err != nil {
-		return
-	}
-
-	res.Proxy = rawStats.Proxy
-	res.Target = make(map[string]*stats.Node)
-	for tid := range rawStats.Target {
-		var ts stats.Node
-		if err := jsoniter.Unmarshal(rawStats.Target[tid], &ts); err == nil {
-			res.Target[tid] = &ts
-		}
-	}
-	return
-}
-
 func GetRemoteAIS(bp BaseParams) (remais meta.RemAisVec, err error) {
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
@@ -207,6 +165,20 @@ func GetRemoteAIS(bp BaseParams) (remais meta.RemAisVec, err error) {
 		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatRemoteAIS}}
 	}
 	_, err = reqParams.DoReqAny(&remais)
+	FreeRp(reqParams)
+	return
+}
+
+// (see also enable/disable backend below)
+func GetConfiguredBackends(bp BaseParams) (out []string, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathClu.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatBackends}}
+	}
+	_, err = reqParams.DoReqAny(&out)
 	FreeRp(reqParams)
 	return
 }
@@ -274,7 +246,7 @@ func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToSet, tr
 		msg = apc.ActMsg{Action: apc.ActSetConfig, Value: configToUpdate}
 	)
 	if transient {
-		q.Set(apc.ActTransient, "true")
+		q = url.Values{apc.ActTransient: []string{"true"}}
 	}
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
@@ -290,9 +262,21 @@ func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToSet, tr
 	return err
 }
 
-// zero out: all metrics _or_ only error counters
-func ResetClusterStats(bp BaseParams, errorsOnly bool) (err error) {
-	return _putCluster(bp, apc.ActMsg{Action: apc.ActResetStats, Value: errorsOnly})
+func setRebalance(bp BaseParams, enabled bool) error {
+	configToSet := &cmn.ConfigToSet{
+		Rebalance: &cmn.RebalanceConfToSet{
+			Enabled: apc.Ptr(enabled),
+		},
+	}
+	return SetClusterConfigUsingMsg(bp, configToSet, false /*transient*/)
+}
+
+func EnableRebalance(bp BaseParams) error {
+	return setRebalance(bp, true)
+}
+
+func DisableRebalance(bp BaseParams) error {
+	return setRebalance(bp, false)
 }
 
 // all nodes: reset configuration to cluster defaults
@@ -361,6 +345,41 @@ func DetachRemoteAIS(bp BaseParams, alias string) error {
 		reqParams.Path = apc.URLPathCluDetach.S
 		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatRemoteAIS}}
 		reqParams.Header = http.Header{apc.HdrRemAisAlias: []string{alias}}
+	}
+	err := reqParams.DoRequest()
+	FreeRp(reqParams)
+	return err
+}
+
+//
+// Backend (enable | disable)
+// see also GetConfiguredBackends above
+//
+
+func EnableBackend(bp BaseParams, provider string) error {
+	np := apc.NormalizeProvider(provider)
+	if !apc.IsCloudProvider(np) {
+		return fmt.Errorf("can only enable cloud backend (have %q)", provider) // TODO: this check can be removed, if need be
+	}
+	path := apc.URLPathCluBendEnable.Join(np)
+	return _backend(bp, path)
+}
+
+func DisableBackend(bp BaseParams, provider string) error {
+	np := apc.NormalizeProvider(provider)
+	if !apc.IsCloudProvider(np) {
+		return fmt.Errorf("can only disable cloud backend (have %q)", provider)
+	}
+	path := apc.URLPathCluBendDisable.Join(np)
+	return _backend(bp, path)
+}
+
+func _backend(bp BaseParams, path string) error {
+	bp.Method = http.MethodPut
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = path
 	}
 	err := reqParams.DoRequest()
 	FreeRp(reqParams)

@@ -7,20 +7,20 @@ redirect_from:
  - /docs/docs.md/
 ---
 
-### Introduction
+## Introduction
 
 - [Brief overview](/README.md)
 - [In-depth overview](/docs/overview.md)
 - [Getting started](/docs/getting_started.md)
 - [CLI: overview, getting started](/docs/cli.md)
 - [CLI: reference guide](https://github.com/NVIDIA/aistore/blob/main/docs/cli.md#cli-reference)
-- [Blogs](https://aiatscale.org/blog)
+- [Blogs](https://aistore.nvidia.com/blog)
 - [Deployment](https://github.com/NVIDIA/aistore/tree/main/deploy)
 
 ## Guides and References
 
 - [Getting Started](/docs/getting_started.md)
-- [Technical Blog](https://aiatscale.org/blog)
+- [Technical Blog](https://aistore.nvidia.com/blog)
 - API and SDK
   - [Go (language) API](https://github.com/NVIDIA/aistore/tree/main/api)
   - [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore), and also:
@@ -49,12 +49,10 @@ redirect_from:
   - [Jobs](/docs/cli/job.md)
 - Security and Access Control
   - [Authentication Server (AuthN)](/docs/authn.md)
-- Tutorials
-  - [Tutorials](/docs/tutorials/README.md)
-  - [Videos](/docs/videos.md)
 - Power tools and extensions
   - [Reading, writing, and listing *archives*](/docs/archive.md)
-  - [Distributed Shuffle](/docs/dsort.md)
+  - [Distributed Shuffle (`dsort`)](/docs/dsort.md)
+  - [Initial Sharding utility (`ishard`)](https://github.com/NVIDIA/aistore/blob/main/cmd/ishard/README.md)
   - [Downloader](/docs/downloader.md)
   - [Extract, Transform, Load](/docs/etl.md)
   - [Tools and utilities](/docs/tools.md)
@@ -85,22 +83,28 @@ redirect_from:
   - [CLI: `ais config`](/docs/cli/config.md)
   - [Feature flags](/docs/feature_flags.md)
 - Observability
-  - [Observability](/docs/metrics.md)
   - [Prometheus](/docs/prometheus.md)
+    - [Reference: all supported metrics](/docs/metrics-reference.md)
+  - [Observability overview: StatsD and Prometheus, logs, and CLI](/docs/metrics.md)
   - [CLI: `ais show performance`](/docs/cli/show.md)
 - For users and developers
   - [Getting started](/docs/getting_started.md)
   - [Docker](/docs/docker_main.md)
   - [Useful scripts](/docs/development.md)
-  - Profiling, race-detecting, and more
+  - Profiling, race-detecting and more
 - Batch jobs
   - [Batch operations](/docs/batch.md)
-  - [eXtended Actions (xactions)](/xact/README.md)
-  - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md)
+  - [eXtended Actions (xactions)](https://github.com/NVIDIA/aistore/blob/main/xact/README.md)
+  - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md), including:
+    - [prefetch remote datasets](/docs/cli/object.md#prefetch-objects)
+    - [copy (list, range, and/or prefix) selected objects or entire (in-cluster or remote) buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+    - [download remote BLOBs](/docs/cli/blob-downloader.md)
+    - [promote NFS or SMB share](https://aistore.nvidia.com/blog/2022/03/17/promote)
 - Assorted Topics
+  - [Virtual directories](/docs/howto_virt_dirs.md)
   - [System files](/docs/sysfiles.md)
-  - [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)
-  - [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
+  - [HTTPS: loading, reloading, and generating certificates; switching cluster between HTTP and HTTPS](/docs/https.md)
+    - [Managing TLS Certificates](/docs/cli/x509.md)
   - [Feature flags](/docs/feature_flags.md)
   - [`aisnode` command line](/docs/command_line.md)
   - [Traffic patterns](/docs/traffic_patterns.md)
@@ -109,4 +113,4 @@ redirect_from:
   - [Downloader](/docs/downloader.md)
   - [On-disk layout](/docs/on_disk_layout.md)
   - [Buckets: definition, operations, properties](https://github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket)
-  - [Out of band updates](/docs/out_of_band.md)
+  - [Out-of-band updates](/docs/out_of_band.md)

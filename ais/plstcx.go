@@ -35,13 +35,14 @@ type (
 		amsg    *apc.ActMsg // orig
 		config  *cmn.Config
 		smap    *smapX
+		hdr     http.Header
 		// work
 		tsi     *meta.Snode
 		xid     string // x-tco
 		cnt     int
 		lsmsg   apc.LsoMsg
 		altmsg  apc.ActMsg
-		tcomsg  cmn.TCObjsMsg
+		tcomsg  cmn.TCOMsg
 		stopped atomic.Bool
 	}
 )
@@ -96,7 +97,7 @@ func (c *lstcx) do() (string, error) {
 		Props:    apc.GetPropsName,
 		PageSize: 0, // i.e., backend.MaxPageSize()
 	}
-	c.lsmsg.SetFlag(apc.LsNameOnly)
+	c.lsmsg.SetFlag(apc.LsNameOnly | apc.LsNoDirs)
 	c.smap = c.p.owner.smap.get()
 	tsi, err := c.smap.HrwTargetTask(c.lsmsg.UUID)
 	if err != nil {
@@ -106,26 +107,34 @@ func (c *lstcx) do() (string, error) {
 	c.lsmsg.SID = tsi.ID()
 
 	// 2. ls 1st page
-	var lst *cmn.LsoResult
-	lst, err = c.p.lsObjsR(c.bckFrom, &c.lsmsg, c.smap, tsi /*designated target*/, c.config, true)
+	var lst *cmn.LsoRes
+	lst, err = c.p.lsObjsR(c.bckFrom, &c.lsmsg, c.hdr, c.smap, tsi /*designated target*/, c.config, true)
 	if err != nil {
 		return "", err
 	}
 	if len(lst.Entries) == 0 {
-		// TODO: return http status to indicate exactly that (#6393)
+		//
+		// TODO: return http.StatusNoContent to indicate exactly that (#6393)
+		//
 		nlog.Infoln(c.amsg.Action, c.bckFrom.Cname(""), " to ", c.bckTo.Cname("")+": lso counts zero - nothing to do")
 		return c.lsmsg.UUID, nil
 	}
 
-	// 3. tcomsg
+	// 3. assign txn UUID here, and use it to communicate with x-tco directly across pages (ref050724)
+	c.tcomsg.TxnUUID = cos.GenUUID()
+
+	// 4. tcomsg
 	c.tcomsg.ToBck = c.bckTo.Clone()
 	lr, cnt := &c.tcomsg.ListRange, len(lst.Entries)
 	lr.ObjNames = make([]string, 0, cnt)
 	for _, e := range lst.Entries {
+		if e.IsDir() { // NOTE: always skip virtual dir (apc.EntryIsDir)
+			continue
+		}
 		lr.ObjNames = append(lr.ObjNames, e.Name)
 	}
 
-	// 4. multi-obj action: transform/copy 1st page
+	// 5. multi-obj action: transform/copy 1st page
 	c.altmsg.Value = &c.tcomsg
 	c.altmsg.Action = apc.ActCopyObjects
 	if c.amsg.Action == apc.ActETLBck {
@@ -139,7 +148,7 @@ func (c *lstcx) do() (string, error) {
 	nlog.Infoln("'ls --all' to execute [" + c.amsg.Action + " -> " + c.altmsg.Action + "]")
 	s := fmt.Sprintf("%s[%s] %s => %s", c.altmsg.Action, c.xid, c.bckFrom, c.bckTo)
 
-	// 5. more pages, if any
+	// 6. more pages, if any
 	if lst.ContinuationToken != "" {
 		// Run
 		nlog.Infoln("run", s, "...")
@@ -169,7 +178,7 @@ func (c *lstcx) pages(s string, cnt int) {
 
 // next page
 func (c *lstcx) _page() (int, error) {
-	lst, err := c.p.lsObjsR(c.bckFrom, &c.lsmsg, c.smap, c.tsi, c.config, true)
+	lst, err := c.p.lsObjsR(c.bckFrom, &c.lsmsg, c.hdr, c.smap, c.tsi, c.config, true)
 	if err != nil {
 		return 0, err
 	}
@@ -183,8 +192,12 @@ func (c *lstcx) _page() (int, error) {
 	clear(lr.ObjNames)
 	lr.ObjNames = lr.ObjNames[:0]
 	for _, e := range lst.Entries {
+		if e.IsDir() { // NOTE: always skip virtual dir (apc.EntryIsDir)
+			continue
+		}
 		lr.ObjNames = append(lr.ObjNames, e.Name)
 	}
+	c.altmsg.Name = c.xid
 	c.altmsg.Value = &c.tcomsg
 	err = c.bcast()
 	return len(lr.ObjNames), err
@@ -192,7 +205,7 @@ func (c *lstcx) _page() (int, error) {
 
 // calls t.httpxpost (TODO: slice of names is the only "delta" - optimize)
 func (c *lstcx) bcast() (err error) {
-	body := cos.MustMarshal(apc.ActMsg{Name: c.xid, Value: &c.tcomsg})
+	body := cos.MustMarshal(c.altmsg)
 	args := allocBcArgs()
 	{
 		args.req = cmn.HreqArgs{Method: http.MethodPost, Path: apc.URLPathXactions.S, Body: body}

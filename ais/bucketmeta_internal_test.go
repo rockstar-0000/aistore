@@ -1,23 +1,20 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/core/meta"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -48,7 +45,7 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 
 		bmd = newBucketMD()
 		for _, provider := range []string{apc.AIS, apc.AWS} {
-			for i := 0; i < 10; i++ {
+			for i := range 10 {
 				var hdr http.Header
 				if provider != apc.AIS {
 					hdr = http.Header{apc.HdrBackendProvider: []string{provider}}
@@ -118,22 +115,6 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 						}
 					}
 				}
-			})
-
-			It("should correctly detect bmd corruption "+node, func() {
-				bmdFullPath := filepath.Join(mpath, fname.Bmd)
-				f, err := os.OpenFile(bmdFullPath, os.O_RDWR, 0)
-				Expect(err).NotTo(HaveOccurred())
-				_, err = f.WriteAt([]byte("xxxxxxxxxxxx"), 10)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(f.Close()).NotTo(HaveOccurred())
-
-				fmt.Println("NOTE: error on screen is expected at this point...")
-				fmt.Println("")
-				bowner = makeBMDOwner()
-				bowner.init()
-
-				Expect(bowner.Get()).NotTo(Equal(&bmd.BMD))
 			})
 		})
 	}

@@ -14,21 +14,22 @@ from aistore.sdk.const import (
     URL_PATH_ETL,
     UTF_ENCODING,
 )
-from aistore.sdk.etl_const import (
+from aistore.sdk.etl.etl_const import (
     CODE_TEMPLATE,
     ETL_COMM_HPUSH,
     ETL_COMM_HPULL,
     ETL_COMM_IO,
 )
 
-from aistore.sdk.etl import Etl, _get_default_runtime
+from aistore.sdk.etl.etl import Etl, _get_default_runtime
 from aistore.sdk.types import ETLDetails
+from tests.const import ETL_NAME
 
 
 class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
     def setUp(self) -> None:
         self.mock_client = Mock()
-        self.etl_name = "etl-name"
+        self.etl_name = ETL_NAME
         self.etl = Etl(self.mock_client, self.etl_name)
 
     def test_init_spec_default_params(self):
@@ -82,7 +83,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
             (3, 11): "python3.11v2",
         }
         for version, runtime in version_to_runtime.items():
-            with patch.object(aistore.sdk.etl.sys, "version_info") as version_info:
+            with patch.object(aistore.sdk.etl.etl.sys, "version_info") as version_info:
                 version_info.major = version[0]
                 version_info.minor = version[1]
                 self.assertEqual(runtime, _get_default_runtime())
@@ -197,3 +198,40 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_DELETE, path=f"etl/{ self.etl_name }"
         )
+
+    def test_valid_names(self):
+        valid_names = [
+            "validname",
+            "valid-name",
+            "name123",
+            "123name",
+            "name-123",
+            "validname123",
+            "a" * 6,  # exactly 6 characters
+            "a" * 32,  # exactly 32 characters
+        ]
+        for name in valid_names:
+            try:
+                Etl.validate_etl_name(name)
+            except ValueError:
+                self.fail(f"Valid name '{name}' raised ValueError unexpectedly!")
+
+    def test_invalid_names(self):
+        invalid_names = [
+            "",
+            "a" * 5,  # 5 characters, too short
+            "a" * 33,  # 33 characters, too long
+            "InvalidName",
+            "invalid_name",
+            "invalid name",
+            "invalid-name-",
+            "-invalid-name",
+            "-invalid-name-",
+            "------------",
+            "invalid$name",
+            "invalid@name",
+        ]
+
+        for name in invalid_names:
+            with self.assertRaises(ValueError):
+                Etl.validate_etl_name(name)

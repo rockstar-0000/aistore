@@ -99,7 +99,7 @@ func (reb *Reb) recvStageNtfn(hdr *transport.ObjHdr, _ io.Reader, errRx error) e
 	)
 	if xreb == nil {
 		if reb.stages.stage.Load() != rebStageInactive {
-			nlog.Errorf("%s: nil rebalancing xaction", reb.logHdr(rebID, rsmap))
+			nlog.Errorln(reb.logHdr(rebID, rsmap), "nil rebalancing xaction")
 		}
 		return nil
 	}
@@ -120,8 +120,8 @@ func (reb *Reb) recvStageNtfn(hdr *transport.ObjHdr, _ io.Reader, errRx error) e
 	}
 	// other's old
 	if rebID > ntfn.rebID {
-		nlog.Warningf("%s: stage notification from %s(%s): %s", reb.logHdr(rebID, rsmap),
-			meta.Tname(ntfn.daemonID), otherStage, reb.warnID(ntfn.rebID, ntfn.daemonID))
+		nlog.Warningln(reb.logHdr(rebID, rsmap), "stage notification from",
+			meta.Tname(ntfn.daemonID), "at stage", otherStage+":", reb.warnID(ntfn.rebID, ntfn.daemonID))
 		return nil
 	}
 
@@ -140,7 +140,7 @@ func (reb *Reb) recvObjRegular(hdr *transport.ObjHdr, smap *meta.Smap, unpacker 
 		return err
 	}
 	if ack.rebID != reb.RebID() {
-		nlog.Warningf("received %s: %s", hdr.Cname(), reb.warnID(ack.rebID, ack.daemonID))
+		nlog.Warningln("received", hdr.Cname(), reb.warnID(ack.rebID, ack.daemonID))
 		return nil
 	}
 	tsid := ack.daemonID // the sender
@@ -209,7 +209,7 @@ func (reb *Reb) recvRegularAck(hdr *transport.ObjHdr, unpacker *cos.ByteUnpack) 
 		return err
 	}
 	if ack.rebID != reb.rebID.Load() {
-		nlog.Warningf("ACK from %s: %s", ack.daemonID, reb.warnID(ack.rebID, ack.daemonID))
+		nlog.Warningln("ACK from", ack.daemonID, reb.warnID(ack.rebID, ack.daemonID))
 		return nil
 	}
 
@@ -262,7 +262,7 @@ func receiveMD(req *stageNtfn, hdr *transport.ObjHdr) error {
 	md.Daemons = req.md.Daemons
 	mdBytes := md.NewPack()
 
-	return ctMeta.Write(bytes.NewReader(mdBytes), -1)
+	return ctMeta.Write(bytes.NewReader(mdBytes), -1, "" /*work fqn*/)
 }
 
 func (reb *Reb) receiveCT(req *stageNtfn, hdr *transport.ObjHdr, reader io.Reader) error {
@@ -294,12 +294,12 @@ func (reb *Reb) receiveCT(req *stageNtfn, hdr *transport.ObjHdr, reader io.Reade
 	// Save received CT to local drives
 	err = reb.saveCTToDisk(req, hdr, reader)
 	if err != nil {
-		if errRm := os.Remove(ct.FQN()); errRm != nil {
-			nlog.Errorf("Failed to remove %s: %v", ct.FQN(), errRm)
+		if errRm := cos.RemoveFile(ct.FQN()); errRm != nil {
+			nlog.Errorln(err, "nested err: failed to remove", ct.FQN(), "[", errRm, "]")
 		}
 		if moveTo != nil {
 			if errMv := os.Rename(workFQN, ct.FQN()); errMv != nil {
-				nlog.Errorf("Error restoring slice: %v", errMv)
+				nlog.Errorln(err, "nested err: failed to rename slice", ct.FQN(), "[", errMv, "]")
 			}
 		}
 		return err
@@ -308,7 +308,7 @@ func (reb *Reb) receiveCT(req *stageNtfn, hdr *transport.ObjHdr, reader io.Reade
 	if moveTo != nil {
 		req.md.SliceID = md.SliceID
 		if err = reb.sendFromDisk(ct, req.md, moveTo, workFQN); err != nil {
-			nlog.Errorf("Failed to move slice to %s: %v", moveTo, err)
+			nlog.Errorln("failed to move slice to", moveTo, "[", err, "]")
 		}
 	}
 	// Broadcast updated MD

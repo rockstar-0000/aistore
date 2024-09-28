@@ -6,14 +6,14 @@ package ais
 
 import (
 	"github.com/NVIDIA/aistore/cmn"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("ListObjectsCache+ListObjectsBuffer", func() {
 	makeEntries := func(xs ...string) (entries cmn.LsoEntries) {
 		for _, x := range xs {
-			entries = append(entries, &cmn.LsoEntry{
+			entries = append(entries, &cmn.LsoEnt{
 				Name: x,
 			})
 		}

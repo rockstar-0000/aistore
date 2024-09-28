@@ -25,6 +25,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/prob"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
@@ -171,7 +172,7 @@ func (reb *Reb) unregRecv() {
 //  4. Global rebalance performs checks such as `stage > rebStageTraverse` or
 //     `stage < rebStageWaitAck`. Since all EC stages are between
 //     `Traverse` and `WaitAck` non-EC rebalance does not "notice" stage changes.
-func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
+func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact, tstats cos.StatsUpdater) {
 	if reb.nxtID.Load() >= id {
 		return
 	}
@@ -185,7 +186,7 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 	reb.mu.Unlock()
 
 	logHdr := reb.logHdr(id, smap, true /*initializing*/)
-	nlog.Infoln(logHdr + ": initializing")
+	nlog.Infoln(logHdr, "initializing")
 
 	bmd := core.T.Bowner().Get()
 	rargs := &rebArgs{id: id, smap: smap, config: cmn.GCO.Get(), ecUsed: bmd.IsECUsed()}
@@ -195,7 +196,7 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 
 	reb.regRecv()
 
-	haveStreams := smap.HasActiveTs(core.T.SID())
+	haveStreams := smap.HasPeersToRebalance(core.T.SID())
 	if bmd.IsEmpty() {
 		haveStreams = false
 	}
@@ -221,7 +222,12 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 
 	// At this point, only one rebalance is running
 
+	if rargs.ecUsed {
+		ec.ECM.OpenStreams(true /*with refc*/)
+	}
 	onGFN()
+
+	tstats.SetFlag(cos.NodeAlerts, cos.Rebalancing)
 
 	errCnt := 0
 	err := reb.run(rargs)
@@ -237,8 +243,14 @@ func (reb *Reb) RunRebalance(smap *meta.Smap, id int64, notif *xact.NotifXact) {
 	}
 
 	reb.fini(rargs, logHdr, err)
+	tstats.ClrFlag(cos.NodeAlerts, cos.Rebalancing)
 
 	offGFN()
+	if rargs.ecUsed {
+		// rebalance can open EC streams; it has has no authority, however, to close them - primary has
+		// that's why all we do here is decrement ref-count back to what it was before this run
+		ec.ECM.CloseStreams(true /*just refc*/)
+	}
 }
 
 // To optimize goroutine creation:
@@ -428,7 +440,7 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 		reb.awaiting.targets = reb.awaiting.targets[:0]
 	}
 	acks := reb.lomAcks()
-	for i := 0; i < len(acks); i++ { // init lom acks
+	for i := range len(acks) { // init lom acks
 		acks[i] = &lomAcks{mu: &sync.Mutex{}, q: make(map[string]*core.LOM, 64)}
 	}
 
@@ -441,7 +453,7 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 		reb.endStreams(err)
 		xctn.Abort(err)
 		reb.mu.Unlock()
-		nlog.Errorf("FATAL: %v, WRITE: %v", fatalErr, writeErr)
+		nlog.Errorln("FATAL:", fatalErr, "WRITE:", writeErr)
 		return false
 	}
 
@@ -450,7 +462,7 @@ func (reb *Reb) initRenew(rargs *rebArgs, notif *xact.NotifXact, logHdr string, 
 	reb.stages.cleanup()
 
 	reb.mu.Unlock()
-	nlog.Infof("%s: running %s", reb.logHdr(rargs.id, rargs.smap), reb.xctn())
+	nlog.Infoln(reb.logHdr(rargs.id, rargs.smap), "- running", reb.xctn())
 	return true
 }
 
@@ -478,10 +490,10 @@ func (reb *Reb) abortStreams() {
 }
 
 func (reb *Reb) endStreams(err error) {
-	if reb.stages.stage.CAS(rebStageFin, rebStageFinStreams) {
-		reb.dm.Close(err)
-		reb.pushes.Close(true)
-	}
+	swapped := reb.stages.stage.CAS(rebStageFin, rebStageFinStreams)
+	debug.Assert(swapped)
+	reb.dm.Close(err)
+	reb.pushes.Close(err == nil)
 }
 
 // when at least one bucket has EC enabled
@@ -548,16 +560,16 @@ func (reb *Reb) runNoEC(rargs *rebArgs) error {
 
 func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 	var (
-		cnt    int
-		logHdr = reb.logHdr(rargs.id, rargs.smap)
-		sleep  = rargs.config.Timeout.CplaneOperation.D()
-		maxwt  = rargs.config.Rebalance.DestRetryTime.D()
-		xreb   = reb.xctn()
-		smap   = rargs.smap
+		cnt   int
+		sleep = rargs.config.Timeout.CplaneOperation.D()
+		maxwt = rargs.config.Rebalance.DestRetryTime.D()
+		xreb  = reb.xctn()
+		smap  = rargs.smap
 	)
 	maxwt += time.Duration(int64(time.Minute) * int64(rargs.smap.CountTargets()/10))
 	maxwt = min(maxwt, rargs.config.Rebalance.DestRetryTime.D()*2)
 	reb.changeStage(rebStageWaitAck)
+	logHdr := reb.logHdr(rargs.id, rargs.smap)
 
 	for {
 		curwt := time.Duration(0)
@@ -574,7 +586,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 						for _, lom := range lomack.q {
 							tsi, err := smap.HrwHash2T(lom.Digest())
 							if err == nil {
-								nlog.Infof("waiting for %s ACK from %s", lom, tsi.StringEx())
+								nlog.Infoln("waiting for", lom.String(), "ACK from", tsi.StringEx())
 								logged = true
 								break
 							}
@@ -583,7 +595,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 				}
 				lomack.mu.Unlock()
 				if err := xreb.AbortErr(); err != nil {
-					nlog.Infof("%s: abort wait-ack (%v)", logHdr, err)
+					nlog.Infoln(logHdr, "abort wait-ack:", err)
 					return
 				}
 			}
@@ -593,7 +605,7 @@ func (reb *Reb) rebWaitAck(rargs *rebArgs) (errCnt int) {
 			}
 			nlog.Warningf("%s: waiting for %d ACKs", logHdr, cnt)
 			if err := xreb.AbortedAfter(sleep); err != nil {
-				nlog.Infof("%s: abort wait-ack (%v)", logHdr, err)
+				nlog.Infoln(logHdr, "abort wait-ack:", err)
 				return
 			}
 
@@ -703,10 +715,8 @@ func (reb *Reb) _aborted(rargs *rebArgs) (yes bool) {
 }
 
 func (reb *Reb) fini(rargs *rebArgs, logHdr string, err error) {
-	var stats core.Stats
-	if cmn.Rom.FastV(4, cos.SmoduleReb) {
-		nlog.Infof("finishing rebalance (reb_args: %s)", reb.logHdr(rargs.id, rargs.smap))
-	}
+	nlog.Infoln(logHdr, "fini")
+
 	// prior to closing the streams
 	if q := reb.quiesce(rargs, rargs.config.Transport.QuiesceTime.D(), reb.nodesQuiescent); q != core.QuiAborted {
 		if errM := fs.RemoveMarker(fname.RebalanceMarker); errM == nil {
@@ -716,7 +726,11 @@ func (reb *Reb) fini(rargs *rebArgs, logHdr string, err error) {
 	}
 	reb.endStreams(err)
 	reb.filterGFN.Reset()
-	xreb := reb.xctn()
+
+	var (
+		stats core.Stats
+		xreb  = reb.xctn()
+	)
 	xreb.ToStats(&stats)
 	if stats.Objs > 0 || stats.OutObjs > 0 || stats.InObjs > 0 {
 		s, e := jsoniter.MarshalIndent(&stats, "", " ")
@@ -731,7 +745,7 @@ func (reb *Reb) fini(rargs *rebArgs, logHdr string, err error) {
 	if !xreb.Finished() {
 		xreb.Finish()
 	}
-	nlog.Infof("%s: done (%s)", logHdr, xreb)
+	nlog.Infoln(logHdr, "done", xreb.String())
 }
 
 //////////////////////////////
@@ -811,8 +825,8 @@ func (rj *rebJogger) _lwalk(lom *core.LOM, fqn string) error {
 		}
 		return cmn.ErrSkip
 	}
-	// skip EC.Enabled bucket - the job for EC rebalance
-	if lom.Bck().Props.EC.Enabled {
+	// skip EC.Enabled bucket - leave the job for EC rebalance
+	if lom.ECEnabled() {
 		return filepath.SkipDir
 	}
 	tsi, err := rj.smap.HrwHash2T(lom.Digest())
@@ -825,9 +839,10 @@ func (rj *rebJogger) _lwalk(lom *core.LOM, fqn string) error {
 
 	// skip objects that were already sent via GFN (due to probabilistic filtering
 	// false-positives, albeit rare, are still possible)
-	uname := cos.UnsafeB(lom.Uname())
-	if rj.m.filterGFN.Lookup(uname) {
-		rj.m.filterGFN.Delete(uname)
+	uname := lom.UnamePtr()
+	bname := cos.UnsafeBptr(uname)
+	if rj.m.filterGFN.Lookup(*bname) {
+		rj.m.filterGFN.Delete(*bname)
 		return cmn.ErrSkip
 	}
 	// prepare to send: rlock, load, new roc

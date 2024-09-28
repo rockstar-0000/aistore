@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -24,8 +24,8 @@ type (
 		workCh   chan *Obj // aka SQ: next object to stream
 		cmplCh   chan cmpl // aka SCQ; note that SQ and SCQ together form a FIFO
 		callback ObjSentCB // to free SGLs, close files, etc.
+		lz4s     *lz4Stream
 		sendoff  sendoff
-		lz4s     lz4Stream
 		streamBase
 	}
 	lz4Stream struct {
@@ -85,6 +85,7 @@ func (s *Stream) terminate(err error, reason string) (actReason string, actErr e
 }
 
 func (s *Stream) initCompression(extra *Extra) {
+	s.lz4s = &lz4Stream{}
 	s.lz4s.s = s
 	s.lz4s.blockMaxSize = int(extra.Config.Transport.LZ4BlockMaxSize)
 	s.lz4s.frameChecksum = extra.Config.Transport.LZ4FrameChecksum
@@ -93,10 +94,9 @@ func (s *Stream) initCompression(extra *Extra) {
 	} else {
 		s.lz4s.sgl = g.mm.NewSGL(cos.KiB*64, cos.KiB*64)
 	}
-	s.lid = fmt.Sprintf("%s[%d[%s]]", s.trname, s.sessID, cos.ToSizeIEC(int64(s.lz4s.blockMaxSize), 0))
 }
 
-func (s *Stream) compressed() bool { return s.lz4s.s == s }
+func (s *Stream) compressed() bool { return s.lz4s != nil }
 func (s *Stream) usePDU() bool     { return s.pdu != nil }
 
 func (s *Stream) resetCompression() {
@@ -171,7 +171,7 @@ func (s *Stream) doRequest() error {
 	s.lz4s.zw.Header.BlockChecksum = false
 	s.lz4s.zw.Header.NoChecksum = !s.lz4s.frameChecksum
 	s.lz4s.zw.Header.BlockMaxSize = s.lz4s.blockMaxSize
-	return s.do(&s.lz4s)
+	return s.do(s.lz4s)
 }
 
 // as io.Reader
@@ -234,8 +234,8 @@ repeat:
 		s.sendoff.ins = inHdr
 		return s.sendHdr(b)
 	case <-s.stopCh.Listen():
-		if verbose {
-			nlog.Infof("%s: stopped (%d/%d)", s, s.numCur, s.stats.Num.Load())
+		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+			nlog.Infoln(s.String(), "stopped [", s.numCur, s.stats.Num.Load(), "]")
 		}
 		err = io.EOF
 		return
@@ -250,21 +250,18 @@ func (s *Stream) sendHdr(b []byte) (n int, err error) {
 	}
 	debug.Assert(s.sendoff.off == int64(len(s.header)))
 	s.stats.Offset.Add(s.sendoff.off)
-	if verbose {
-		num := s.stats.Num.Load()
-		nlog.Infof("%s: hlen=%d (%d/%d)", s, s.sendoff.off, s.numCur, num)
-	}
+
 	obj := &s.sendoff.obj
 	if s.usePDU() && !obj.IsHeaderOnly() {
 		s.sendoff.ins = inPDU
 	} else {
 		s.sendoff.ins = inData
 	}
+	if cmn.Rom.FastV(5, cos.SmoduleTransport) && s.numCur&0x3f == 2 {
+		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, s.stats.Num.Load(), "]")
+	}
 	s.sendoff.off = 0
 	if obj.Hdr.isFin() {
-		if verbose {
-			nlog.Infof("%s: sent last", s)
-		}
 		err = io.EOF
 		s.lastCh.Close()
 	}
@@ -320,13 +317,13 @@ func (s *Stream) eoObj(err error) {
 	s.stats.Size.Add(objSize)
 	s.numCur++
 	s.stats.Num.Inc()
-	if verbose {
-		nlog.Infof("%s: sent %s (%d/%d)", s, obj, s.numCur, s.stats.Num.Load())
+	if cmn.Rom.FastV(5, cos.SmoduleTransport) && s.numCur&0x3f == 3 {
+		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, s.stats.Num.Load(), "]")
 	}
 
 	// target stats
-	g.tstats.Inc(OutObjCount)
-	g.tstats.Add(OutObjSize, objSize)
+	g.tstats.Inc(cos.StreamsOutObjCount)
+	g.tstats.Add(cos.StreamsOutObjSize, objSize)
 exit:
 	if err != nil {
 		nlog.Errorln(err)
@@ -343,7 +340,7 @@ func (s *Stream) dryrun() {
 	var (
 		body = io.NopCloser(s)
 		h    = &hdl{trname: s.trname}
-		it   = iterator{handler: h, body: body, hbuf: make([]byte, dfltMaxHdr)}
+		it   = iterator{handler: h, body: body, hbuf: make([]byte, cmn.DfltTransportHeader)}
 	)
 	for {
 		hlen, flags, err := it.nextProtoHdr(s.String())
@@ -396,8 +393,8 @@ func (s *Stream) closeAndFree() {
 func (s *Stream) idleTick() {
 	if len(s.workCh) == 0 && s.sessST.CAS(active, inactive) {
 		s.workCh <- &Obj{Hdr: ObjHdr{Opcode: opcIdleTick}}
-		if verbose {
-			nlog.Infof("%s: active => inactive", s)
+		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+			nlog.Infoln(s.String(), "active => inactive")
 		}
 	}
 }

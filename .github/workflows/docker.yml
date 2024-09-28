@@ -1,43 +1,43 @@
-name: Docker Images
+name: Container Images
 
 on:
   workflow_dispatch:
     inputs:
-      build_admin_image:
-        description: 'Build admin image (aistorage/admin)'
+      build_util_image:
+        description: 'Build ais-util image (aistorage/ais-util)'
         required: true
         type: boolean
-        default: true
+        default: false
 
       build_aisnode_image:
         description: 'Build aisnode image (aistorage/aisnode)'
         required: true
         type: boolean
-        default: true
+        default: false
 
       build_cluster_minimal_image:
         description: 'Build cluster-minimal image (aistorage/cluster-minimal)'
         required: true
         type: boolean
-        default: true
+        default: false
 
-      build_gitlab_ci_image:
+      build_ci_image:
         description: 'Build GitLab CI image (aistorage/ci)'
         required: true
         type: boolean
-        default: true
+        default: false
 
       build_aisnode_minikube_image:
         description: 'Build aisnode-minikube image (aistorage/aisnode-minikube)'
         required: true
         type: boolean
-        default: true
+        default: false
 
-      build_ais_init_image:
-        description: 'Build ais-init image (aistorage/ais-init)'
+      build_authn_image:
+        description: 'Build AuthN (aistorage/authn)'
         required: true
         type: boolean
-        default: true
+        default: false
 
       image_tag:
         description: 'Tag of all the selected images'
@@ -45,68 +45,64 @@ on:
         default: 'latest'
 
 env:
-  ADMIN_IMAGE: 'aistorage/admin'
+  UTIL_IMAGE: 'aistorage/ais-util'
   AISNODE_IMAGE: 'aistorage/aisnode'
-  AISINIT_IMAGE: 'aistorage/ais-init'
   CLUSTER_MINIMAL_IMAGE: 'aistorage/cluster-minimal'
   CI_IMAGE: 'aistorage/ci'
   AISNODE_MINIKUBE_IMAGE: 'aistorage/aisnode-minikube'
-  # HDFS_CI_IMAGE: 'aistorage/hdfs-ci'
+  AUTHN_IMAGE: 'aistorage/authn'
 
 jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - uses: actions/checkout@v3
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Login to DockerHub
-      uses: docker/login-action@v2
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push `ais-util` image
+        if: ${{ inputs.build_util_image }}
+        run: |
+          pushd $GITHUB_WORKSPACE/deploy/prod/k8s/aisutil_container
+          IMAGE_REPO="${{ env.UTIL_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
+          popd
 
-    - name: aisadmin image
-      if: ${{ inputs.build_admin_image }}
-      run: |
-        pushd $GITHUB_WORKSPACE/deploy/prod/k8s/aisadmin_container
-        IMAGE_REPO="${{ env.ADMIN_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
-        popd
+      - name: Build and push `aisnode` image
+        if: ${{ inputs.build_aisnode_image }}
+        run: |
+          pushd $GITHUB_WORKSPACE/deploy/prod/k8s/aisnode_container
+          IMAGE_REPO="${{ env.AISNODE_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
+          popd
 
-    - name: aisnode image
-      if: ${{ inputs.build_aisnode_image }}
-      run: |
-        pushd $GITHUB_WORKSPACE/deploy/prod/k8s/aisnode_container
-        IMAGE_REPO="${{ env.AISNODE_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
-        popd
+      - name: Build and push `cluster-minimal` image
+        if: ${{ inputs.build_cluster_minimal_image }}
+        run: |
+          pushd $GITHUB_WORKSPACE/deploy/prod/docker/single
+          IMAGE_REPO="${{ env.CLUSTER_MINIMAL_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
+          popd
 
-    - name: ais-init image
-      if: ${{ inputs.build_ais_init_image }}
-      run: |
-        pushd $GITHUB_WORKSPACE/deploy/prod/k8s/init_container
-        IMAGE_REPO="${{ env.AISINIT_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
-        popd
+      - name: Build and push `ci` image
+        if: ${{ inputs.build_gitlab_ci_image }}
+        run: |
+          pushd $GITHUB_WORKSPACE/deploy/ci
+          CI_IMAGE="${{ env.CI_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
+          popd
 
-    - name: cluster-minimal image
-      if: ${{ inputs.build_cluster_minimal_image }}
-      run: |
-        pushd $GITHUB_WORKSPACE/deploy/prod/docker/single
-        IMAGE_REPO="${{ env.CLUSTER_MINIMAL_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
-        popd
+      - name: Build and push `aisnode-minikube` image
+        if: ${{ inputs.build_aisnode_minikube_image }}
+        run: |
+          pushd $GITHUB_WORKSPACE/deploy/dev/k8s
+          IMAGE_REPO="${{ env.AISNODE_MINIKUBE_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e docker-all
+          popd
 
-    - name: ci image
-      if: ${{ inputs.build_gitlab_ci_image }}
-      run: |
-
-        pushd $GITHUB_WORKSPACE/deploy/ci
-        # CI_IMAGE="${{ env.CI_IMAGE }}" HDFS_CI_IMAGE=${{ env.HDFS_CI_IMAGE }} IMAGE_TAG="${{ inputs.image_tag }}" make -e all
-        CI_IMAGE="${{ env.CI_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e all
-        popd
-
-    - name: aisnode-minikube image
-      if: ${{ inputs.build_aisnode_minikube_image }}
-      run: |
-
-        pushd $GITHUB_WORKSPACE/deploy/dev/k8s
-        IMAGE_REPO="${{ env.AISNODE_MINIKUBE_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make -e docker-all
-        popd
+      - name: Build and push `authn` image
+        if: ${{ inputs.build_authn_image }}
+        run: |
+          pushd $GITHUB_WORKSPACE/deploy/prod/k8s/authn_container
+          IMAGE_REPO="${{ env.AUTHN_IMAGE }}" IMAGE_TAG="${{ inputs.image_tag }}" make all
+          popd

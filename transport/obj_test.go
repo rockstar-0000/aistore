@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
@@ -14,12 +14,13 @@ package transport_test
 // go test -v -run=Multi -tags=debug
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,10 +61,13 @@ type dummyStatsTracker struct{}
 // interface guard
 var _ cos.StatsUpdater = (*dummyStatsTracker)(nil)
 
-func (*dummyStatsTracker) Add(string, int64)         {}
-func (*dummyStatsTracker) Inc(string)                {}
-func (*dummyStatsTracker) Get(string) int64          { return 0 }
-func (*dummyStatsTracker) AddMany(...cos.NamedVal64) {}
+func (*dummyStatsTracker) Add(string, int64)                                         {}
+func (*dummyStatsTracker) Inc(string)                                                {}
+func (*dummyStatsTracker) Get(string) int64                                          { return 0 }
+func (*dummyStatsTracker) AddMany(...cos.NamedVal64)                                 {}
+func (*dummyStatsTracker) ClrFlag(string, cos.NodeStateFlags)                        {}
+func (*dummyStatsTracker) SetFlag(string, cos.NodeStateFlags)                        {}
+func (*dummyStatsTracker) SetClrFlag(string, cos.NodeStateFlags, cos.NodeStateFlags) {}
 
 var (
 	objmux   *mux.ServeMux
@@ -87,7 +91,7 @@ func TestMain(t *testing.M) {
 	config.Transport.QuiesceTime = cos.Duration(10 * time.Second)
 	config.Log.Level = "3"
 	cmn.GCO.CommitUpdate(config)
-	sc := transport.Init(&dummyStatsTracker{}, config)
+	sc := transport.Init(&dummyStatsTracker{})
 	go sc.Run()
 
 	objmux = mux.NewServeMux()
@@ -100,7 +104,7 @@ func TestMain(t *testing.M) {
 
 func Example_headers() {
 	f := func(_ http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+		body, err := cos.ReadAll(r.Body)
 		if err != nil {
 			panic(err)
 		}
@@ -120,7 +124,7 @@ func Example_headers() {
 				break
 			}
 
-			fmt.Printf("%+v (%d)\n", hdr, hlen)
+			fmt.Printf("Bck:%s ObjName:%s SID:%s Opaque:%v ObjAttrs:{%s} (%d)\n", hdr.Bck, hdr.ObjName, hdr.SID, hdr.Opaque, hdr.ObjAttrs.String(), hlen)
 			off += hlen + int(hdr.ObjAttrs.Size)
 		}
 	}
@@ -135,8 +139,8 @@ func Example_headers() {
 	stream.Fin()
 
 	// Output:
-	// {Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{Cksum:xxhash[h1] CustomMD:map[] Ver:1 Atime:663346294 Size:231} Opcode:0} (69)
-	// {Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{Cksum:xxhash[h2] CustomMD:map[xx:11 yy:22] Ver:222222222222222222222222 Atime:663346294 Size:213} Opcode:0} (110)
+	// Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{231B, v"1", xxhash[h1], map[]} (69)
+	// Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{213B, v"222222222222222222222222", xxhash[h2], map[xx:11 yy:22]} (110)
 }
 
 func sendText(stream *transport.Stream, txt1, txt2 string) {
@@ -157,10 +161,10 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 			Size:  sgl1.Size(),
 			Atime: 663346294,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h1"),
-			Ver:   "1",
 		},
 		Opaque: nil,
 	}
+	hdr.ObjAttrs.SetVersion("1")
 	wg.Add(1)
 	stream.Send(&transport.Obj{Hdr: hdr, Reader: sgl1, Callback: cb})
 	wg.Wait()
@@ -178,10 +182,10 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 			Size:  sgl2.Size(),
 			Atime: 663346294,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h2"),
-			Ver:   "222222222222222222222222",
 		},
 		Opaque: []byte{'1', '2', '3'},
 	}
+	hdr.ObjAttrs.SetVersion("222222222222222222222222")
 	hdr.ObjAttrs.SetCustomMD(cos.StrKVs{"xx": "11", "yy": "22"})
 	wg.Add(1)
 	stream.Send(&transport.Obj{Hdr: hdr, Reader: sgl2, Callback: cb})
@@ -191,7 +195,7 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 func Example_obj() {
 	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
-		object, err := io.ReadAll(objReader)
+		object, err := cos.ReadAll(objReader)
 		if err != nil {
 			panic(err)
 		}
@@ -242,7 +246,7 @@ func TestMultiStream(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	netstats := make(map[string]transport.RxStats)
 	lock := &sync.Mutex{}
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		wg.Add(1)
 		go streamWriteUntil(t, i, wg, ts, netstats, lock, false /*compress*/, false /*PDU*/)
 	}
@@ -288,7 +292,7 @@ func TestMultipleNetworks(t *testing.T) {
 	totalRecv, recvFunc := makeRecvFunc(t)
 
 	streams := make([]*transport.Stream, 0, 10)
-	for idx := 0; idx < 10; idx++ {
+	for idx := range 10 {
 		ts := httptest.NewServer(objmux)
 		defer ts.Close()
 		trname := "endpoint" + strconv.Itoa(idx)
@@ -343,7 +347,7 @@ func TestSendCallback(t *testing.T) {
 		posted    = make([]*randReader, objectCnt)
 	)
 	random := newRand(mono.NanoTime())
-	for idx := 0; idx < len(posted); idx++ {
+	for idx := range posted {
 		hdr, rr := makeRandReader(random, false)
 		mu.Lock()
 		posted[idx] = rr
@@ -364,25 +368,27 @@ func TestSendCallback(t *testing.T) {
 	}
 }
 
+func _ptrstr(s string) *string { return &s }
+
 func TestObjAttrs(t *testing.T) {
 	testAttrs := []cmn.ObjAttrs{
 		{
 			Size:  1024,
 			Atime: 1024,
 			Cksum: cos.NewCksum("", ""),
-			Ver:   "102.44",
+			Ver:   _ptrstr("102.44"),
 		},
 		{
 			Size:  1024,
 			Atime: math.MaxInt64,
 			Cksum: cos.NewCksum(cos.ChecksumXXHash, "120421"),
-			Ver:   "102.44",
+			Ver:   _ptrstr("102.44"),
 		},
 		{
 			Size:  0,
 			Atime: 0,
 			Cksum: cos.NewCksum(cos.ChecksumNone, "120421"),
-			Ver:   "",
+			Ver:   nil, // NOTE: "" becomes nil via ObjAttrs.SetVersion()
 		},
 	}
 
@@ -475,7 +481,7 @@ func TestCompressedOne(t *testing.T) {
 	slab, _ := memsys.PageMM().GetSlab(memsys.MaxPageSlabSize)
 	random := newRand(mono.NanoTime())
 	buf := slab.Alloc()
-	_, _ = random.Read(buf)
+	_, _ = cryptorand.Read(buf)
 	hdr := genStaticHeader(random)
 	size, prevsize, num, numhdr, numGs := int64(0), int64(0), 0, 0, int64(16)
 	if testing.Short() {
@@ -489,11 +495,11 @@ func TestCompressedOne(t *testing.T) {
 		} else {
 			var reader io.ReadCloser
 			if num%3 == 0 {
-				hdr.ObjAttrs.Size = int64(random.Intn(100) + 1)
+				hdr.ObjAttrs.Size = int64(random.IntN(100) + 1)
 				// fully random to prevent compression
-				reader = io.NopCloser(&io.LimitedReader{R: random, N: hdr.ObjAttrs.Size})
+				reader = io.NopCloser(&io.LimitedReader{R: cryptorand.Reader, N: hdr.ObjAttrs.Size})
 			} else {
-				hdr.ObjAttrs.Size = int64(random.Intn(cos.GiB) + 1)
+				hdr.ObjAttrs.Size = int64(random.IntN(cos.GiB) + 1)
 				reader = &randReader{buf: buf, hdr: hdr, clone: true}
 			}
 			stream.Send(&transport.Obj{Hdr: hdr, Reader: reader})
@@ -530,7 +536,7 @@ func TestDryRun(t *testing.T) {
 	buf, slab := memsys.PageMM().AllocSize(cos.KiB * 128)
 	defer slab.Free(buf)
 	for sgl.Len() < cos.MiB {
-		random.Read(buf)
+		cryptorand.Read(buf)
 		sgl.Write(buf)
 	}
 
@@ -543,7 +549,7 @@ func TestDryRun(t *testing.T) {
 
 	for size < total {
 		hdr.ObjAttrs.Size = cos.KiB * 128
-		for i := int64(0); i < cos.MiB/hdr.ObjAttrs.Size; i++ {
+		for i := range cos.MiB / hdr.ObjAttrs.Size {
 			reader := memsys.NewReader(sgl)
 			reader.Seek(i*hdr.ObjAttrs.Size, io.SeekStart)
 
@@ -593,13 +599,13 @@ func TestCompletionCount(t *testing.T) {
 	stream := transport.NewObjStream(httpclient, url, cos.GenTie(), nil) // provide for sizeable queue at any point
 	random := newRand(mono.NanoTime())
 	rem := int64(0)
-	for idx := 0; idx < 10000; idx++ {
+	for idx := range 10000 {
 		if idx%7 == 0 {
 			hdr := genStaticHeader(random)
 			hdr.ObjAttrs.Size = 0
 			hdr.Opaque = []byte(strconv.FormatInt(104729*int64(idx), 10))
 			stream.Send(&transport.Obj{Hdr: hdr, Callback: callback})
-			rem = random.Int63() % 13
+			rem = random.Int64() % 13
 		} else {
 			hdr, rr := makeRandReader(random, false)
 			stream.Send(&transport.Obj{Hdr: hdr, Reader: rr, Callback: callback})
@@ -686,7 +692,7 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 		if size-prevsize >= cos.GiB*4 {
 			tlog.Logf("%s: %d GiB\n", stream, size/cos.GiB)
 			prevsize = size
-			if random.Int63()%7 == 0 {
+			if random.Int64()%7 == 0 {
 				time.Sleep(time.Second * 2) // simulate occasional timeout
 			}
 		}
@@ -729,7 +735,7 @@ func makeRecvFunc(t *testing.T) (*int64, transport.RecvObj) {
 }
 
 func newRand(seed int64) *rand.Rand {
-	src := rand.NewSource(seed)
+	src := cos.NewRandSource(uint64(seed))
 	random := rand.New(src)
 	return random
 }
@@ -739,17 +745,17 @@ func genStaticHeader(random *rand.Rand) (hdr transport.ObjHdr) {
 		Name:     "a",
 		Provider: apc.AIS,
 	}
-	hdr.ObjName = strconv.FormatInt(random.Int63(), 10)
+	hdr.ObjName = strconv.FormatInt(random.Int64(), 10)
 	hdr.Opaque = []byte("123456789abcdef")
 	hdr.ObjAttrs.Size = cos.GiB
-	hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int63(), 10), "d")
+	hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int64(), 10), "d")
 	hdr.ObjAttrs.SetCustomKey("e", "")
 	hdr.ObjAttrs.SetCksum(cos.ChecksumXXHash, "xxhash")
 	return
 }
 
 func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
-	x := random.Int63()
+	x := random.Int64()
 	hdr.Bck.Name = strconv.FormatInt(x, 10)
 	hdr.Bck.Provider = apc.AIS
 	hdr.ObjName = path.Join(hdr.Bck.Name, strconv.FormatInt(math.MaxInt64-x, 10))
@@ -763,7 +769,7 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 	switch y {
 	case 0:
 		hdr.ObjAttrs.Size = (x & 0xffffff) + 1
-		hdr.ObjAttrs.Ver = s
+		hdr.ObjAttrs.SetVersion(s)
 		hdr.ObjAttrs.SetCksum(cos.ChecksumNone, "")
 	case 1:
 		if usePDU {
@@ -771,18 +777,18 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 		} else {
 			hdr.ObjAttrs.Size = (x & 0xfffff) + 1
 		}
-		hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int63(), 10), s)
+		hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int64(), 10), s)
 		hdr.ObjAttrs.SetCustomKey(s, "")
 		hdr.ObjAttrs.SetCksum(cos.ChecksumMD5, "md5")
 	case 2:
 		hdr.ObjAttrs.Size = (x & 0xffff) + 1
 		hdr.ObjAttrs.SetCksum(cos.ChecksumXXHash, "xxhash")
-		for i := 0; i < int(x&0x1f); i++ {
-			hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int63(), 10), s)
+		for range int(x & 0x1f) {
+			hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int64(), 10), s)
 		}
 	default:
 		hdr.ObjAttrs.Size = 0
-		hdr.ObjAttrs.Ver = s
+		hdr.ObjAttrs.SetVersion(s)
 		hdr.ObjAttrs.SetCustomKey(s, "")
 		hdr.ObjAttrs.SetCksum(cos.ChecksumNone, "")
 	}
@@ -806,13 +812,13 @@ type randReader struct {
 //nolint:gocritic // can do (hdr) hugeParam
 func newRandReader(random *rand.Rand, hdr transport.ObjHdr, slab *memsys.Slab) *randReader {
 	buf := slab.Alloc()
-	_, err := random.Read(buf)
+	_, err := cryptorand.Read(buf)
 	if err != nil {
 		panic("Failed read rand: " + err.Error())
 	}
 	r := &randReader{buf: buf, hdr: hdr, slab: slab, random: random}
 	if hdr.IsUnsized() {
-		r.offEOF = int64(random.Int31()>>1) + 1
+		r.offEOF = int64(random.Int32()>>1) + 1
 	}
 	return r
 }

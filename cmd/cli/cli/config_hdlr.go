@@ -184,12 +184,19 @@ func setCluConfigHandler(c *cli.Context) error {
 		goto show
 	}
 	for k, v := range nvs {
-		if k == feat.FeaturesPropName {
-			featfl, err := parseFeatureFlags(v)
+		if k == feat.PropName {
+			nf, _, err := parseFeatureFlags([]string{v}, 0)
 			if err != nil {
-				return fmt.Errorf("invalid feature flag %q", v)
+				return fmt.Errorf("invalid feature flag %q, err: %v", v, err)
 			}
-			nvs[k] = featfl.Value()
+
+			if cf := config.Features; nf != 0 {
+				if nf.IsSet(feat.S3ReverseProxy) && !cf.IsSet(feat.S3ReverseProxy) {
+					actionWarn(c, "reverse-proxy mode of operation _may_ (and likely will) degrade scalability and performance!\n")
+				}
+			}
+
+			nvs[k] = nf.String() // FormatUint
 		}
 		if k == confLogModules { // (ref 836)
 			if nvs[confLogLevel], err = parseLogModules(v); err != nil {
@@ -201,8 +208,8 @@ func setCluConfigHandler(c *cli.Context) error {
 
 	// assorted named fields that require (cluster | node) restart
 	// for the change to take an effect
-	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired); name != "" {
-		warn := fmt.Sprintf("cluster restart required for the change '%s=%s' to take an effect.", name, nvs[name])
+	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired[:]); name != "" {
+		warn := fmt.Sprintf("cluster restart required for the change '%s=%s' to take effect.", name, nvs[name])
 		actionWarn(c, warn)
 	}
 	if err := api.SetClusterConfig(apiBP, nvs, flagIsSet(c, transientFlag)); err != nil {
@@ -221,7 +228,7 @@ show:
 			fmt.Fprintln(c.App.ErrWriter, redErr(err))
 		}
 	}
-	actionDone(c, "Cluster config updated")
+	actionDone(c, "\nCluster config updated")
 	return nil
 }
 
@@ -232,7 +239,7 @@ func parseLogModules(v string) (string, error) {
 		return "", V(err)
 	}
 	level, _ := config.Log.Level.Parse()
-	if v == "" || v == NilValue {
+	if v == "" || v == apc.NilValue {
 		config.Log.Level.Set(level, []string{""})
 	} else {
 		config.Log.Level.Set(level, splitCsv(v))
@@ -241,9 +248,7 @@ func parseLogModules(v string) (string, error) {
 }
 
 // E.g.:
-// ais config cluster backend.conf='{"aws":{}}'
-// ais config cluster backend.conf '{"gcp":{}, "aws":{}}'
-// ais config cluster checksum.type='{"type":"md5"}'
+// $ ais config cluster checksum.type='{"type":"md5"}'
 func isFmtJSON(nvs cos.StrKVs) (val string, ans bool, err error) {
 	jsonRe := regexp.MustCompile(`^{.*}$`)
 	for _, v := range nvs {
@@ -275,7 +280,7 @@ func setcfg(c *cli.Context, nvs cos.StrKVs) error {
 		case k == "checksum" || strings.HasPrefix(k, "checksum."):
 			jsoniter.Unmarshal([]byte(v), &toUpdate.Cksum)
 		default:
-			return fmt.Errorf("cannot update config using JSON-formatted %q - not implemented yet", k)
+			return fmt.Errorf("cannot update config using JSON-formatted %q - "+NIY, k)
 		}
 		if err := api.SetClusterConfigUsingMsg(apiBP, toUpdate, flagIsSet(c, transientFlag)); err != nil {
 			return V(err)
@@ -350,7 +355,7 @@ func setNodeConfigHandler(c *cli.Context) error {
 
 	// assorted named fields that'll require (cluster | node) restart
 	// for the change to take an effect
-	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired); name != "" {
+	if name := nvs.ContainsAnyMatch(cmn.ConfigRestartRequired[:]); name != "" {
 		warn := fmt.Sprintf("for the change '%s=%s' to take an effect node %q must be restarted.",
 			name, nvs[name], sname)
 		actionWarn(c, warn)
@@ -362,7 +367,7 @@ func setNodeConfigHandler(c *cli.Context) error {
 	}
 	if useMsg {
 		// have api.SetClusterConfigUsingMsg but not "api.SetDaemonConfigUsingMsg"
-		return fmt.Errorf("cannot update node configuration using JSON-formatted %q - not implemented yet", jsonval)
+		return fmt.Errorf("cannot update node configuration using JSON-formatted %q - "+NIY, jsonval)
 	}
 	if err := api.SetDaemonConfig(apiBP, node.ID(), nvs, flagIsSet(c, transientFlag)); err != nil {
 		return V(err)

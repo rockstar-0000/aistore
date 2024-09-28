@@ -66,6 +66,14 @@ func fmtDaemonID(id string, smap *meta.Smap, daeStatus string) (snamePlus string
 	return
 }
 
+func fmtAlerts(flags cos.NodeStateFlags) (s string) {
+	s = flags.String()
+	if flags.IsRed() {
+		return fred(s)
+	}
+	return s
+}
+
 func fmtStatusSID(id string, smap *meta.Smap, daeStatus string) (snamePlus, status string) {
 	si := smap.GetNode(id)
 	snamePlus, status = si.StringEx(), daeStatus
@@ -144,7 +152,7 @@ func fmtTargetsSumm(smap *meta.Smap, numDisks int) string {
 	return fmt.Sprintf("%d%s", cnt, s)
 }
 
-func fmtCapPctMAM(tcdf *fs.TargetCDF, list bool) string {
+func fmtCapPctMAM(tcdf *fs.Tcdf, list bool) string {
 	var (
 		a, b, c string
 		skipMin = " -    " // len(sepa) + len("min%,")
@@ -165,8 +173,26 @@ func fmtCapPctMAM(tcdf *fs.TargetCDF, list bool) string {
 	return fmt.Sprintf("%s%2d%%%s %s%2d%%%s %s%2d%%", a, tcdf.PctMin, sepa, b, tcdf.PctAvg, sepa, c, tcdf.PctMax)
 }
 
+func fmtCDFDisks(cdf *fs.CDF) string {
+	alert, _ := fs.HasAlert(cdf.Disks)
+	if alert == "" {
+		return cdf.FS.String() // fs.Fs + "(" + fs.FsType + ")"
+	}
+	return cdf.FS.Fs + fred(alert)
+}
+
 func fmtSmap(smap *meta.Smap) string {
 	return fmt.Sprintf("version %d, UUID %s, primary %s", smap.Version, smap.UUID, smap.Primary.StringEx())
+}
+
+func fmtCluSoft(version, build string) string {
+	if version == "" {
+		return unknownVal
+	}
+	if build == "" {
+		return version + " (build: " + unknownVal + ")"
+	}
+	return version + " (build: " + build + ")"
 }
 
 func fmtStringList(lst []string) string {
@@ -199,6 +225,17 @@ func toString(lst []string) string {
 	}
 }
 
+// "FormatBckName"
+func fmtBckName(bck cmn.Bck) string {
+	if bck.IsQuery() {
+		if bck.IsEmpty() {
+			return NotSetVal
+		}
+		return fmt.Sprintf("match[%s]:", bck.Cname(""))
+	}
+	return bck.Cname("")
+}
+
 func fmtACL(acl apc.AccessAttrs) string {
 	if acl == 0 {
 		return unknownVal
@@ -206,8 +243,14 @@ func fmtACL(acl apc.AccessAttrs) string {
 	return acl.Describe(true /*incl. all*/)
 }
 
-func fmtNameArch(val string, flags uint16) string {
+func fmtNameDirArch(val string, flags uint16) string {
 	if flags&apc.EntryInArch == 0 {
+		if flags&apc.EntryIsDir != 0 {
+			if !cos.IsLastB(val, '/') {
+				val += "/"
+			}
+			return fgreen(val)
+		}
 		return val
 	}
 	return "    " + val
@@ -229,6 +272,8 @@ func dsortJobInfoStatus(j *dsort.JobInfo) string {
 //
 // core.Snap helpers
 //
+
+const rebalanceForgetTime = 5 * time.Minute
 
 func fmtRebStatus(snap *core.Snap) string {
 	if snap == nil {
@@ -303,20 +348,18 @@ func isUnsetTime(t time.Time) bool {
 	return t.IsZero()
 }
 
-func FmtStartEnd(start, end time.Time) (startS, endS string) {
-	startS, endS = NotSetVal, NotSetVal
-	if start.IsZero() {
+func FmtTime(t time.Time) (s string) {
+	s = NotSetVal
+	if t.IsZero() {
 		return
 	}
-	y1, m1, d1 := start.Date()
-	f := cos.StampSec // hh:mm:ss
-	if !end.IsZero() {
-		y2, m2, d2 := end.Date()
-		if y1 != y2 || m1 != m2 || d1 != d2 {
-			f = time.Stamp // with date
-		}
-		endS = cos.FormatTime(end, f)
+	return cos.FormatTime(t, cos.StampSec)
+}
+
+func FmtDateTime(t time.Time) (s string) {
+	s = NotSetVal
+	if t.IsZero() {
+		return
 	}
-	startS = cos.FormatTime(start, f)
-	return
+	return cos.FormatTime(t, time.Stamp)
 }

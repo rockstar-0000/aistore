@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -58,7 +58,6 @@ func TestMain(m *testing.M) {
 	cos.CreateDir(testMountpath)
 	defer os.RemoveAll(testMountpath)
 	fs.TestNew(nil)
-	fs.TestDisableValidation()
 	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
 	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 
@@ -113,7 +112,7 @@ func BenchmarkObjPut(b *testing.B) {
 			}
 
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				b.StopTimer()
 				r, _ := readers.NewRand(bench.fileSize, cos.ChecksumNone)
 				poi := &putOI{
@@ -124,7 +123,7 @@ func BenchmarkObjPut(b *testing.B) {
 					workFQN: path.Join(testMountpath, "objname.work"),
 					config:  cmn.GCO.Get(),
 				}
-				os.Remove(lom.FQN)
+				lom.RemoveMain()
 				b.StartTimer()
 
 				_, err := poi.putObject()
@@ -133,7 +132,7 @@ func BenchmarkObjPut(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			os.Remove(lom.FQN)
+			lom.RemoveMain()
 		})
 	}
 }
@@ -163,7 +162,7 @@ func BenchmarkObjAppend(b *testing.B) {
 
 			var hdl aoHdl
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				b.StopTimer()
 				r, _ := readers.NewRand(bench.fileSize, cos.ChecksumNone)
 				aoi := &apndOI{
@@ -174,7 +173,7 @@ func BenchmarkObjAppend(b *testing.B) {
 					op:      apc.AppendOp,
 					hdl:     hdl,
 				}
-				os.Remove(lom.FQN)
+				lom.RemoveMain()
 				b.StartTimer()
 
 				newHandle, _, err := aoi.apnd(buf)
@@ -187,7 +186,7 @@ func BenchmarkObjAppend(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			os.Remove(lom.FQN)
+			lom.RemoveMain()
 			os.Remove(hdl.workFQN)
 		})
 	}
@@ -254,7 +253,7 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 			}
 
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				_, err := goi.getObject()
 				if err != nil {
 					b.Fatal(err)
@@ -262,7 +261,7 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 			}
 
 			b.StopTimer()
-			os.Remove(lom.FQN)
+			lom.RemoveMain()
 		})
 	}
 }

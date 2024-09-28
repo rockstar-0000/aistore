@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -62,7 +62,7 @@ func UncacheBck(b *meta.Bck) {
 		go func(cache *sync.Map) {
 			cache.Range(func(hkey, value any) bool {
 				lmd := value.(*lmeta)
-				bck, _ := cmn.ParseUname(lmd.uname)
+				bck, _ := cmn.ParseUname(*lmd.uname)
 				if bck.Equal((*cmn.Bck)(b)) {
 					cache.Delete(hkey)
 				}
@@ -76,7 +76,7 @@ func UncacheBck(b *meta.Bck) {
 
 // NOTE: watch https://github.com/golang/go/pull/61702 for `sync.Map.Clear`, likely Go 22
 func UncacheMountpath(mi *fs.Mountpath) {
-	for idx := 0; idx < cos.MultiSyncMapCount; idx++ {
+	for idx := range cos.MultiSyncMapCount {
 		cache := mi.LomCache(idx)
 		cache.Range(func(hkey any, _ any) bool {
 			cache.Delete(hkey)
@@ -89,17 +89,19 @@ func UncacheMountpath(mi *fs.Mountpath) {
 // lchk //
 //////////
 
-func (lchk *lchk) housekeep() (d time.Duration) {
-	var tag string
-	d, tag = lchk.mp()
+func (lchk *lchk) housekeep(int64) time.Duration {
+	d, tag := lchk.mp()
 	if !lchk.running.CAS(false, true) {
-		if tag != "" {
-			nlog.Infof("running now: memory pressure %q, next sched %v", tag, d)
-		}
-		return
+		nlog.Infoln("running now; memory pressure:", tag, "next HK:", d)
+		return d
 	}
-	go lchk.evictAll(d /*evict older than*/)
-	return
+
+	go func(d time.Duration) {
+		lchk.evictOlder(d)
+		lchk.running.Store(false)
+	}(d)
+
+	return d
 }
 
 const termDuration = time.Duration(-1)
@@ -124,7 +126,7 @@ func (*lchk) mp() (d time.Duration, tag string) {
 	return
 }
 
-func (lchk *lchk) evictAll(d time.Duration) {
+func (lchk *lchk) evictOlder(d time.Duration) {
 	lchk.now = time.Now()
 	lchk.d = d
 
@@ -133,6 +135,7 @@ func (lchk *lchk) evictAll(d time.Duration) {
 	// single-threaded: one cache at a time
 	caches := lomCaches()
 	if lchk.terminating() {
+		nlog.Infoln("terminating -->")
 		for _, cache := range caches {
 			lchk.cache = cache
 			cache.Range(lchk.fterm)
@@ -146,14 +149,12 @@ func (lchk *lchk) evictAll(d time.Duration) {
 	}
 
 	if _, tag := lchk.mp(); tag != "" {
-		nlog.Infof("memory pressure %q, total %d, evicted %d", tag, lchk.totalCnt, lchk.evictedCnt)
+		nlog.Infoln("post-evict memory pressure:", tag, "total:", lchk.totalCnt, "evicted:", lchk.evictedCnt)
 	}
 
 	// stats
 	g.tstats.Add(LcacheEvictedCount, lchk.evictedCnt)
 	g.tstats.Add(LcacheFlushColdCount, lchk.flushColdCnt)
-
-	lchk.running.Store(false)
 }
 
 func (lchk *lchk) fterm(_, value any) bool {
@@ -199,7 +200,7 @@ func (lchk *lchk) frun(hkey, value any) bool {
 }
 
 func (lchk *lchk) flush(md *lmeta, atime time.Time) {
-	lif := LIF{Uname: md.uname, BID: md.bckID}
+	lif := LIF{uname: *md.uname, lid: md.lid}
 	lom, err := lif.LOM()
 	if err == nil {
 		lom.Lock(true)

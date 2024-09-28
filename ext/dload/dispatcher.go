@@ -54,6 +54,8 @@ type (
 		// Certification check is disabled for now and does not depend on cluster settings.
 		clientH   *http.Client
 		clientTLS *http.Client
+
+		once sync.Once // newInfoStore upon the first execution
 	}
 )
 
@@ -68,7 +70,6 @@ func Init(tstats stats.Tracker, db kvdb.Driver, clientConf *cmn.ClientConf) {
 	{
 		g.tstats = tstats
 		g.db = db
-		g.store = newInfoStore(db)
 	}
 	xreg.RegNonBckXact(&factory{})
 }
@@ -95,14 +96,14 @@ func (d *dispatcher) run() (err error) {
 		sema       = cos.NewSemaphore(5 * fs.NumAvail())
 		group, ctx = errgroup.WithContext(context.Background())
 	)
-	availablePaths := fs.GetAvail()
-	for mpath := range availablePaths {
+	avail := fs.GetAvail()
+	for mpath := range avail {
 		d.addJogger(mpath)
 	}
 	// allow other goroutines to run
 	d.startupSema.markStarted()
 
-	nlog.Infoln(d.xdl.Name(), "started, cnt:", len(availablePaths))
+	nlog.Infoln(d.xdl.Name(), "started, cnt:", len(avail))
 mloop:
 	for {
 		select {

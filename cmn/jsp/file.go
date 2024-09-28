@@ -1,14 +1,15 @@
 // Package jsp (JSON persistence) provides utilities to store and load arbitrary
 // JSON-encoded structures with optional checksumming and compression.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package jsp
 
 import (
 	"errors"
-	"io"
+	"fmt"
 	"os"
+	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -30,11 +31,11 @@ const (
 // main methods //
 //////////////////
 
-func SaveMeta(filepath string, meta Opts, wto io.WriterTo) error {
+func SaveMeta(filepath string, meta Opts, wto cos.WriterTo2) error {
 	return Save(filepath, meta, meta.JspOpts(), wto)
 }
 
-func Save(filepath string, v any, opts Options, wto io.WriterTo) (err error) {
+func Save(filepath string, v any, opts Options, wto cos.WriterTo2) (err error) {
 	var (
 		file *os.File
 		tmp  = filepath + ".tmp." + cos.GenTie()
@@ -51,7 +52,7 @@ func Save(filepath string, v any, opts Options, wto io.WriterTo) (err error) {
 		}
 	}()
 	if wto != nil {
-		_, err = wto.WriteTo(file)
+		err = wto.WriteTo2(file)
 	} else {
 		debug.Assert(v != nil)
 		err = Encode(file, v, opts)
@@ -73,13 +74,21 @@ func LoadMeta(filepath string, meta Opts) (*cos.Cksum, error) {
 	return Load(filepath, meta, meta.JspOpts())
 }
 
+func _tag(filepath string, v any) (tag string) {
+	tag = fmt.Sprintf("%T", v)
+	if i := strings.LastIndex(tag, "."); i > 0 {
+		tag = tag[i+1:]
+	}
+	return tag + " at " + filepath
+}
+
 func Load(filepath string, v any, opts Options) (checksum *cos.Cksum, err error) {
 	var file *os.File
 	file, err = os.Open(filepath)
 	if err != nil {
 		return
 	}
-	checksum, err = Decode(file, v, opts, filepath)
+	checksum, err = Decode(file, v, opts, _tag(filepath, v))
 	if err == nil {
 		return
 	}

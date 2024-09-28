@@ -77,6 +77,9 @@ const (
 	ActAttachRemAis = "attach"
 	ActDetachRemAis = "detach"
 
+	ActEnableBackend  = "enable-bend"
+	ActDisableBackend = "disable-bend"
+
 	// Node maintenance & cluster membership (see also ActRmNodeUnsafe below)
 	ActStartMaintenance = "start-maintenance" // put into maintenance state
 	ActStopMaintenance  = "stop-maintenance"  // cancel maintenance state
@@ -100,11 +103,12 @@ const (
 
 // internal use
 const (
-	ActAddRemoteBck   = "add-remote-bck" // add to BMD existing remote bucket, usually on the fly
-	ActRmNodeUnsafe   = "rm-unsafe"      // primary => the node to be removed
-	ActStartGFN       = "start-gfn"      // get-from-neighbor
-	ActStopGFN        = "stop-gfn"       // off
-	ActCleanupMarkers = "cleanup-markers"
+	ActAddRemoteBck   = "add-remote-bck"         // add to BMD existing remote bucket, usually on the fly
+	ActRmNodeUnsafe   = "rm-unsafe"              // primary => the node to be removed
+	ActStartGFN       = "start-gfn"              // get-from-neighbor
+	ActStopGFN        = "stop-gfn"               // off
+	ActCleanupMarkers = "cleanup-markers"        // part of the target joining sequence
+	ActSelfRemove     = "self-initiated-removal" // e.g., when losing last mountpath
 )
 
 const (
@@ -113,6 +117,9 @@ const (
 	ActMountpathEnable  = "enable-mp"
 	ActMountpathDetach  = "detach-mp"
 	ActMountpathDisable = "disable-mp"
+
+	ActMountpathRescan = "rescan-mp"
+	ActMountpathFSHC   = "fshc-mp"
 
 	// Actions on xactions
 	ActXactStop  = Stop
@@ -136,12 +143,17 @@ const (
 	NodeDecommission = "decommission"
 )
 
+const (
+	ActEcOpen  = "open-ec-streams"
+	ActEcClose = "close-ec-streams"
+)
+
 // ActMsg is a JSON-formatted control structures used in a majority of API calls
 type (
 	ActMsg struct {
 		Value  any    `json:"value"`  // action-specific and optional
 		Action string `json:"action"` // ActShutdown, ActRebalance, and many more (see apc/const.go)
-		Name   string `json:"name"`   // action-specific name (e.g., bucket name)
+		Name   string `json:"name"`   // action-specific info of any kind (not necessarily "name")
 	}
 	ActValRmNode struct {
 		DaemonID          string `json:"sid"`

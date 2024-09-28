@@ -37,7 +37,9 @@ var (
 	ErrTokenRevoked  = errors.New("token revoked")
 )
 
-func IssueAdminJWT(expires time.Time, userID, secret string) (string, error) {
+// TODO: cos.Unsafe* and other micro-optimization and refactoring
+
+func AdminJWT(expires time.Time, userID, secret string) (string, error) {
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"expires":  expires,
 		"username": userID,
@@ -46,7 +48,7 @@ func IssueAdminJWT(expires time.Time, userID, secret string) (string, error) {
 	return t.SignedString([]byte(secret))
 }
 
-func IssueJWT(expires time.Time, userID string, bucketACLs []*authn.BckACL, clusterACLs []*authn.CluACL,
+func JWT(expires time.Time, userID string, bucketACLs []*authn.BckACL, clusterACLs []*authn.CluACL,
 	secret string) (string, error) {
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"expires":  expires,
@@ -114,6 +116,9 @@ func (tk *Token) String() string {
 //  4. User's default cluster permissions (ACL for a cluster with empty clusterID)
 //
 // If there are no defined ACL found at any step, any access is denied.
+
+const accessCluster = apc.AceListBuckets | apc.AceCreateBucket | apc.AceDestroyBucket | apc.AceMoveBucket | apc.AceShowCluster | apc.AceAdmin
+
 func (tk *Token) CheckPermissions(clusterID string, bck *cmn.Bck, perms apc.AccessAttrs) error {
 	if tk.IsAdmin {
 		return nil
@@ -121,19 +126,19 @@ func (tk *Token) CheckPermissions(clusterID string, bck *cmn.Bck, perms apc.Acce
 	if perms == 0 {
 		return errors.New("empty permissions requested")
 	}
-	cluPerms := perms & apc.AccessCluster
-	objPerms := perms &^ apc.AccessCluster
+	cluPerms := perms & accessCluster
+	objPerms := perms &^ accessCluster
 	cluACL, cluOk := tk.aclForCluster(clusterID)
 	if cluPerms != 0 {
 		// Cluster-wide permissions requested
 		if !cluOk {
-			return ErrNoPermissions
+			return fmt.Errorf("user `%s` has %v", tk.UserID, ErrNoPermissions)
 		}
 		if clusterID == "" {
 			return errors.New("requested cluster permissions without cluster ID")
 		}
 		if !cluACL.Has(cluPerms) {
-			return fmt.Errorf("%v: [cluster %s, %s, granted(%s)]",
+			return fmt.Errorf("user `%s` has %v: [cluster %s, %s, granted(%s)]", tk.UserID,
 				ErrNoPermissions, clusterID, tk, cluACL.Describe(false /*include all*/))
 		}
 	}
@@ -150,11 +155,11 @@ func (tk *Token) CheckPermissions(clusterID string, bck *cmn.Bck, perms apc.Acce
 		if bckACL.Has(objPerms) {
 			return nil
 		}
-		return fmt.Errorf("%v: [%s, bucket %s, granted(%s)]",
+		return fmt.Errorf("user `%s` has %v: [%s, bucket %s, granted(%s)]", tk.UserID,
 			ErrNoPermissions, tk, bck.String(), bckACL.Describe(false /*include all*/))
 	}
 	if !cluOk || !cluACL.Has(objPerms) {
-		return fmt.Errorf("%v: [%s, granted(%s)]", ErrNoPermissions, tk, cluACL.Describe(false /*include all*/))
+		return fmt.Errorf("user `%s` has %v: [%s, granted(%s)]", tk.UserID, ErrNoPermissions, tk, cluACL.Describe(false /*include all*/))
 	}
 	return nil
 }

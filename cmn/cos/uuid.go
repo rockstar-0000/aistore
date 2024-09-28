@@ -1,30 +1,43 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/NVIDIA/aistore/cmn/atomic"
+	"github.com/OneOfOne/xxhash"
 	"github.com/teris-io/shortid"
 )
-
-const LenShortID = 9 // UUID length, as per https://github.com/teris-io/shortid#id-length
 
 const (
 	// Alphabet for generating UUIDs similar to the shortid.DEFAULT_ABC
 	// NOTE: len(uuidABC) > 0x3f - see GenTie()
 	uuidABC = "-5nZJDft6LuzsjGNpPwY7rQa39vehq4i1cV2FROo8yHSlC0BUEdWbIxMmTgKXAk_"
-
-	lenDaemonID  = 8  // via cryptographic rand
-	lenTooLongID = 32 // suspiciously long
 )
 
 const (
-	OnlyNice = "may only contain letters, numbers, dashes (-), underscores (_), and dots (.)"
-	OnlyPlus = OnlyNice + ", and dots (.)"
+	LenShortID    = 9 // UUID length, as per https://github.com/teris-io/shortid#id-length
+	lenDaemonID   = 8 // min length, via cryptographic rand
+	lenK8sProxyID = 13
+
+	// NOTE: cannot be smaller than any of the valid max lengths - see above
+	tooLongID = 32
+)
+
+// bucket name, remais alias
+const (
+	tooLongName = 64
+)
+
+const (
+	mayOnlyContain = "may only contain letters, numbers, dashes (-), underscores (_)"
+	OnlyNice       = "must be less than 32 characters and " + mayOnlyContain // NOTE tooLongID
+	OnlyPlus       = mayOnlyContain + ", and dots (.)"
 )
 
 var (
@@ -58,9 +71,9 @@ func GenUUID() (uuid string) {
 
 // "best-effort ID" - to independently and locally generate globally unique ID
 // called by xreg.GenBEID
-func GenBEID(val uint64) string {
-	b := make([]byte, LenShortID)
-	for i := 0; i < LenShortID; i++ {
+func GenBEID(val uint64, l int) string {
+	b := make([]byte, l)
+	for i := range l {
 		if idx := int(val & letterIdxMask); idx < LenRunes {
 			b[i] = LetterRunes[idx]
 		} else {
@@ -75,29 +88,37 @@ func IsValidUUID(uuid string) bool {
 	return len(uuid) >= LenShortID && IsAlphaNice(uuid)
 }
 
-func ValidateNiceID(id string, minlen int, tag string) (err error) {
-	if len(id) < minlen {
-		return fmt.Errorf("%s %q is too short", tag, id)
-	}
-	if len(id) >= lenTooLongID {
-		return fmt.Errorf("%s %q is too long", tag, id)
-	}
-	if !IsAlphaNice(id) {
-		err = fmt.Errorf("%s %q is invalid: must start with a letter and can only contain [A-Za-z0-9-_]", tag, id)
-	}
-	return
-}
-
 //
 // Daemon ID
 //
 
-func GenDaemonID() string              { return CryptoRandS(lenDaemonID) }
-func ValidateDaemonID(id string) error { return ValidateNiceID(id, lenDaemonID, "node ID") }
+func GenDaemonID() string { return CryptoRandS(lenDaemonID) }
+
+func ValidateDaemonID(id string) error {
+	if len(id) < lenDaemonID {
+		return fmt.Errorf("node ID %q is too short", id)
+	}
+	if !IsAlphaNice(id) {
+		return fmt.Errorf("node ID %q is invalid: must start with a letter, "+OnlyNice, id)
+	}
+	return nil
+}
+
+func HashK8sProxyID(nodeName string) (pid string) {
+	digest := xxhash.Checksum64S(UnsafeB(nodeName), MLCG32)
+	pid = strconv.FormatUint(digest, 36)
+	if pid[0] >= '0' && pid[0] <= '9' {
+		pid = pid[1:]
+	}
+	if l := lenK8sProxyID - len(pid); l > 0 {
+		return GenBEID(digest, l) + pid
+	}
+	return pid
+}
 
 // (when config.TestingEnv)
 func GenTestingDaemonID(suffix string) string {
-	l := Max(lenDaemonID-len(suffix), 3)
+	l := max(lenDaemonID-len(suffix), 3)
 	return CryptoRandS(l) + suffix
 }
 
@@ -109,12 +130,15 @@ func isAlpha(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
-// letters and numbers w/ '-' and '_' permitted with limitations (below)
-// (see OnlyNice above)
+// letters and numbers w/ '-' and '_' permitted with limitations (see OnlyNice const)
 func IsAlphaNice(s string) bool {
 	l := len(s)
-	for i, c := range s {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+	if l > tooLongID {
+		return false
+	}
+	for i := range l {
+		c := s[i]
+		if isAlpha(c) || (c >= '0' && c <= '9') {
 			continue
 		}
 		if c != '-' && c != '_' {
@@ -128,21 +152,25 @@ func IsAlphaNice(s string) bool {
 }
 
 // alpha-numeric++ including letters, numbers, dashes (-), and underscores (_)
-// period (.) is allowed except for '..'
-// (see OnlyPlus above)
-func IsAlphaPlus(s string) bool {
-	for i, c := range s {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+// period (.) is allowed except for '..' (OnlyPlus const)
+func CheckAlphaPlus(s, tag string) error {
+	l := len(s)
+	if l > tooLongName {
+		return fmt.Errorf("%s is too long: %d > %d(max length)", tag, l, tooLongName)
+	}
+	for i := range l {
+		c := s[i]
+		if isAlpha(c) || (c >= '0' && c <= '9') || c == '-' || c == '_' {
 			continue
 		}
 		if c != '.' {
-			return false
+			return errors.New(tag + " is invalid: " + OnlyPlus)
 		}
-		if i < len(s)-1 && s[i+1] == '.' {
-			return false
+		if i < l-1 && s[i+1] == '.' {
+			return errors.New(tag + " is invalid: " + OnlyPlus)
 		}
 	}
-	return true
+	return nil
 }
 
 // 3-letter tie breaker (fast)

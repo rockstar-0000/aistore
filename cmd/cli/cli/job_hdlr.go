@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
@@ -25,16 +26,32 @@ import (
 	"github.com/urfave/cli"
 )
 
-const (
-	prefetchUsage = "prefetch one remote bucket, multiple remote buckets, or\n" +
-		indent1 + "selected objects in a given remote bucket or buckets, e.g.:\n" +
-		indent1 + "\t- 'prefetch gs://abc'\t- prefetch entire bucket (all gs://abc objects that are _not_ present in the cluster);\n" +
-		indent1 + "\t- 'prefetch gs:'\t- prefetch all visible/accessible GCP buckets;\n" +
-		indent1 + "\t- 'prefetch gs://abc --template images/'\t- prefetch all objects from the virtual subdirectory \"images\";\n" +
-		indent1 + "\t- 'prefetch gs://abc/images/'\t- same as above;\n" +
-		indent1 + "\t- 'prefetch gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- prefetch the matching range (prefix + brace expansion);\n" +
-		indent1 + "\t- 'prefetch \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)"
-)
+const prefetchUsage = "prefetch one remote bucket, multiple remote buckets, or\n" +
+	indent1 + "selected objects in a given remote bucket or buckets, e.g.:\n" +
+	indent1 + "\t- 'prefetch gs://abc'\t- prefetch entire bucket (all gs://abc objects that are _not_ in-cluster);\n" +
+	indent1 + "\t- 'prefetch gs://abc --num-workers 32'\t- same as above with 32 concurrent (prefetching) workers;\n" +
+	indent1 + "\t- 'prefetch gs:'\t- prefetch all visible/accessible GCP buckets;\n" +
+	indent1 + "\t- 'prefetch gs: --num-workers=48'\t- same as above employing 48 workers;\n" +
+	indent1 + "\t- 'prefetch gs://abc --template images/'\t- prefetch all objects from the virtual subdirectory \"images\";\n" +
+	indent1 + "\t- 'prefetch gs://abc/images/'\t- same as above;\n" +
+	indent1 + "\t- 'prefetch gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- prefetch the matching range (prefix + brace expansion);\n" +
+	indent1 + "\t- 'prefetch \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)"
+
+const blobDownloadUsage = "run a job to download large object(s) from remote storage to aistore cluster, e.g.:\n" +
+	indent1 + "\t- 'blob-download s3://ab/largefile --chunk-size=2mb --progress'\t- download one blob at a given chunk size\n" +
+	indent1 + "\t- 'blob-download s3://ab --list \"f1, f2\" --num-workers=4 --progress'\t- run 4 concurrent readers to download 2 (listed) blobs\n" +
+	indent1 + "When _not_ using '--progress' option, run 'ais show job' to monitor."
+
+const resilverUsage = "resilver user data on a given target (or all targets in the cluster); entails:\n" +
+	indent1 + "\t- fix data redundancy with respect to bucket configuration;\n" +
+	indent1 + "\t- remove migrated objects and old/obsolete workfiles."
+
+const stopUsage = "terminate a single batch job or multiple jobs, e.g.:\n" +
+	indent1 + "\t- 'stop tco-cysbohAGL'\t- terminate a given job identified by its unique ID;\n" +
+	indent1 + "\t- 'stop copy-listrange'\t- terminate all multi-object copies;\n" +
+	indent1 + "\t- 'stop copy-objects'\t- same as above (using display name);\n" +
+	indent1 + "\t- 'stop --all'\t- terminate all running jobs\n" +
+	indent1 + tabHelpOpt + "."
 
 // top-level job command
 var (
@@ -84,13 +101,14 @@ var (
 			verbObjPrefixFlag, // to disambiguate bucket/prefix vs bucket/objName
 			latestVerFlag,
 			blobThresholdFlag,
+			numListRangeWorkersFlag,
 		),
 		cmdBlobDownload: {
 			refreshFlag,
 			progressFlag,
 			listFlag,
 			chunkSizeFlag,
-			numWorkersFlag,
+			numBlobWorkersFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
 			latestVerFlag,
@@ -104,9 +122,8 @@ var (
 	}
 
 	jobStartResilver = cli.Command{
-		Name: commandResilver,
-		Usage: "resilver user data on a given target (or all targets in the cluster): fix data redundancy\n" +
-			indent4 + "\twith respect to bucket configuration, remove migrated objects and old/obsolete workfiles",
+		Name:         commandResilver,
+		Usage:        resilverUsage,
 		ArgsUsage:    optionalTargetIDArgument,
 		Flags:        startCommonFlags,
 		Action:       startResilverHandler,
@@ -122,11 +139,8 @@ var (
 		BashComplete: bucketCompletions(bcmplop{multiple: true}),
 	}
 	blobDownloadCmd = cli.Command{
-		Name: cmdBlobDownload,
-		Usage: "run a job to download large object(s) from remote storage to aistore cluster, e.g.:\n" +
-			indent1 + "\t- 'blob-download s3://ab/largefile --chunk-size=2mb --progress'\t- download one blob at a given chunk size\n" +
-			indent1 + "\t- 'blob-download s3://ab --list \"f1, f2\" --num-workers=4 --progress'\t- use 4 concurrent readers to download each of the 2 blobs\n" +
-			indent1 + "When _not_ using '--progress' option, run 'ais show job' to monitor.",
+		Name:         cmdBlobDownload,
+		Usage:        blobDownloadUsage,
 		ArgsUsage:    objectArgument,
 		Flags:        startSpecialFlags[cmdBlobDownload],
 		Action:       blobDownloadHandler,
@@ -184,13 +198,8 @@ var (
 		yesFlag,
 	}
 	jobStopSub = cli.Command{
-		Name: commandStop,
-		Usage: "terminate a single batch job or multiple jobs, e.g.:\n" +
-			indent1 + "\t- 'stop tco-cysbohAGL'\t- terminate a given job identified by its unique ID;\n" +
-			indent1 + "\t- 'stop copy-listrange'\t- terminate all multi-object copies;\n" +
-			indent1 + "\t- 'stop copy-objects'\t- same as above (using display name);\n" +
-			indent1 + "\t- 'stop --all'\t- terminate all running jobs\n" +
-			indent1 + strToSentence(tabHelpOpt),
+		Name:         commandStop,
+		Usage:        stopUsage,
 		ArgsUsage:    jobAnyArg,
 		Flags:        stopCmdsFlags,
 		Action:       stopJobHandler,
@@ -463,11 +472,11 @@ func startDownloadHandler(c *cli.Context) error {
 	} else if source.backend.bck.IsEmpty() {
 		dlType = dload.TypeSingle
 	} else {
-		cfg, err := getRandTargetConfig(c)
+		backends, err := api.GetConfiguredBackends(apiBP)
 		if err != nil {
 			return err
 		}
-		if _, ok := cfg.Backend.Providers[source.backend.bck.Provider]; ok { // backend is configured
+		if cos.StringInSlice(source.backend.bck.Provider, backends) {
 			dlType = dload.TypeBackend
 
 			p, err := api.HeadBucket(apiBP, basePayload.Bck, false /* don't add */)
@@ -738,7 +747,7 @@ func stopJobHandler(c *cli.Context) error {
 			actionWarn(c, warn)
 		default:
 			if regex != "" {
-				warn := fmt.Sprintf("ignoring flag %s - not implemented yet", qflprn(regexJobsFlag))
+				warn := fmt.Sprintf("ignoring flag %s - "+NIY, qflprn(regexJobsFlag))
 				actionWarn(c, warn)
 			}
 		}
@@ -796,37 +805,30 @@ func stopJobHandler(c *cli.Context) error {
 	// query
 	msg := formatXactMsg(xactID, xname, bck)
 	xargs := xact.ArgsMsg{ID: xactID, Kind: xactKind}
-	_, snap, err := getXactSnap(&xargs)
+	xs, cms, err := queryXactions(&xargs, true /*summarize*/)
 	if err != nil {
 		return fmt.Errorf("cannot stop %s: %v", msg, err)
 	}
-	if snap == nil {
+	if len(xs) == 0 {
 		actionWarn(c, msg+" not found, nothing to do")
 		return nil
 	}
 
 	// reformat
-	if xactID == "" {
-		xactID = snap.ID
-		debug.Assert(xactKind == snap.Kind)
-		msg = formatXactMsg(xactID, xname, snap.Bck)
-	} else {
-		debug.Assert(xactID == snap.ID)
-		msg = formatXactMsg(xactID, xname, snap.Bck)
-	}
+	msg = formatXactMsg(xid, xname, bck)
 
-	// abort?
-	var s = "already finished"
-	if snap.IsAborted() {
-		s = "aborted"
+	// nothing to do?
+	if cms.aborted {
+		fmt.Fprintf(c.App.Writer, "%s is aborted, nothing to do\n", msg)
+		return nil
 	}
-	if snap.IsAborted() || snap.Finished() {
-		fmt.Fprintf(c.App.Writer, "%s is %s, nothing to do\n", msg, s)
+	if !cms.running {
+		fmt.Fprintf(c.App.Writer, "%s already finished, nothing to do\n", msg)
 		return nil
 	}
 
-	// abort
-	args := xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: snap.Bck}
+	// call to abort
+	args := xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: bck}
 	if err := api.AbortXaction(apiBP, &args); err != nil {
 		return V(err)
 	}
@@ -1014,7 +1016,7 @@ func waitJob(c *cli.Context, name, xid string, bck cmn.Bck) error {
 
 	// find out the kind if not provided
 	if xargs.Kind == "" {
-		_, snap, err := getXactSnap(&xargs)
+		_, snap, err := getAnyXactSnap(&xargs)
 		if err != nil {
 			return err
 		}

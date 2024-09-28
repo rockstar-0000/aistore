@@ -1,13 +1,14 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,18 +22,18 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/tools/cryptorand"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/trand"
 )
 
 type (
 	DirTreeDesc struct {
-		InitDir string // Directory where the tree is created (can be empty).
-		Dirs    int    // Number of (initially empty) directories at each depth (we recurse into single directory at each depth).
-		Files   int    // Number of files at each depth.
-		Depth   int    // Depth of tree/nesting.
-		Empty   bool   // Determines if there is a file somewhere in the directories.
+		InitDir  string // Directory where the tree is created (can be empty).
+		Dirs     int    // Number of (initially empty) directories at each depth (we recurse into single directory at each depth).
+		Files    int    // Number of files at each depth.
+		FileSize int64  // Size of each file.
+		Depth    int    // Depth of tree/nesting.
+		Empty    bool   // Determines if there is a file somewhere in the directories.
 	}
 
 	ContentTypeDesc struct {
@@ -55,8 +56,8 @@ type (
 )
 
 func RandomObjDir(dirLen, maxDepth int) (dir string) {
-	depth := rand.Intn(maxDepth)
-	for i := 0; i < depth; i++ {
+	depth := rand.IntN(maxDepth)
+	for range depth {
 		dir = filepath.Join(dir, trand.String(dirLen))
 	}
 	return
@@ -70,6 +71,17 @@ func SetXattrCksum(fqn string, bck cmn.Bck, cksum *cos.Cksum) error {
 	_ = lom.LoadMetaFromFS()
 	lom.SetCksum(cksum)
 	return lom.Persist()
+}
+
+func ModifyLOM(t *testing.T, fqn string, bck cmn.Bck, modify func(*testing.T, *core.LOM)) {
+	lom := &core.LOM{}
+	// NOTE: this is an intentional hack to go ahead and corrupt the checksum
+	//       - init and/or load errors are ignored on purpose
+	_ = lom.InitFQN(fqn, &bck)
+	_ = lom.LoadMetaFromFS()
+	modify(t, lom)
+	err := lom.Persist()
+	tassert.CheckFatal(t, err)
 }
 
 func CheckPathExists(t *testing.T, path string, dir bool) {
@@ -106,8 +118,12 @@ func PrepareDirTree(tb testing.TB, desc DirTreeDesc) (string, []string) {
 		for i := 1; i <= desc.Files; i++ {
 			f, err := os.CreateTemp(nestedDirectoryName, "")
 			tassert.CheckFatal(tb, err)
+			if desc.FileSize > 0 {
+				io.Copy(f, io.LimitReader(cryptorand.Reader, desc.FileSize))
+			}
 			fileNames = append(fileNames, f.Name())
-			f.Close()
+			err = f.Close()
+			tassert.CheckFatal(tb, err)
 		}
 		sort.Strings(names)
 		if desc.Dirs > 0 {
@@ -119,8 +135,12 @@ func PrepareDirTree(tb testing.TB, desc DirTreeDesc) (string, []string) {
 	if !desc.Empty {
 		f, err := os.CreateTemp(nestedDirectoryName, "")
 		tassert.CheckFatal(tb, err)
+		if desc.FileSize > 0 {
+			io.Copy(f, io.LimitReader(cryptorand.Reader, desc.FileSize))
+		}
 		fileNames = append(fileNames, f.Name())
-		f.Close()
+		err = f.Close()
+		tassert.CheckFatal(tb, err)
 	}
 	return topDirName, fileNames
 }
@@ -145,7 +165,6 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 
 	mios := mock.NewIOS()
 	fs.TestNew(mios)
-	fs.TestDisableValidation()
 
 	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
@@ -154,7 +173,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 
 	dir := t.TempDir()
 
-	for i := 0; i < desc.MountpathsCnt; i++ {
+	for range desc.MountpathsCnt {
 		mpath, err := os.MkdirTemp(dir, "")
 		tassert.CheckFatal(t, err)
 		mp, err := fs.Add(mpath, "daeID")
@@ -174,7 +193,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 	}
 
 	for _, ct := range desc.CTs {
-		for i := 0; i < ct.ContentCnt; i++ {
+		for range ct.ContentCnt {
 			fqn, _, err := core.HrwFQN(&bck, ct.Type, trand.String(15))
 			tassert.CheckFatal(t, err)
 
@@ -187,9 +206,10 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 			f.Close()
 			tassert.CheckFatal(t, err)
 
-			parsedFQN, err := fs.ParseFQN(fqn)
+			var parsed fs.ParsedFQN
+			err = parsed.Init(fqn)
 			tassert.CheckFatal(t, err)
-			mpathCnts[parsedFQN.Mountpath.Path]++
+			mpathCnts[parsed.Mountpath.Path]++
 
 			switch ct.Type {
 			case fs.ObjectType:
@@ -243,15 +263,13 @@ func AddMpath(t *testing.T, path string) {
 	tassert.Errorf(t, err == nil, "Failed adding mountpath %q, err: %v", path, err)
 }
 
-func AssertMountpathCount(t *testing.T, availableCount, disabledCount int) {
-	availableMountpaths, disabledMountpaths := fs.Get()
-	if len(availableMountpaths) != availableCount ||
-		len(disabledMountpaths) != disabledCount {
-		t.Errorf(
-			"wrong mountpaths: %d/%d, %d/%d",
-			len(availableMountpaths), availableCount,
-			len(disabledMountpaths), disabledCount,
-		)
+func AssertMountpathCount(t *testing.T, na, nd int) {
+	var (
+		avail, disabled = fs.Get()
+		la, ld          = len(avail), len(disabled)
+	)
+	if la != na || ld != nd {
+		t.Errorf("wrong mountpath count: avail (have %d, expect %d), disabled (have %d, expect %d)", la, na, ld, nd)
 	}
 }
 

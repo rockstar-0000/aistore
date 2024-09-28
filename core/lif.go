@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -13,8 +13,8 @@ import (
 // LOM In Flight (LIF)
 type (
 	LIF struct {
-		Uname  string
-		BID    uint64
+		uname  string
+		lid    lomBID
 		digest uint64
 	}
 	lifUnlocker interface {
@@ -28,31 +28,41 @@ var _ lifUnlocker = (*LIF)(nil)
 
 // constructor
 func (lom *LOM) LIF() (lif LIF) {
-	debug.Assert(lom.md.uname != "")
-	debug.Assert(lom.Bprops() != nil && lom.Bprops().BID != 0)
+	debug.Assert(lom.md.uname != nil)
+	bprops := lom.Bprops()
+	debug.Assert(bprops != nil && bprops.BID != 0)
+	lid := lom.md.lid
+	if lid == 0 {
+		lid = lomBID(bprops.BID)
+	}
+	debug.Assert(lid.bid() == bprops.BID, lid.bid(), " vs ", bprops.BID)
 	return LIF{
-		Uname:  lom.md.uname,
-		BID:    lom.Bprops().BID,
+		uname:  *lom.md.uname,
+		lid:    lid,
 		digest: lom.digest,
 	}
 }
 
 // LIF => LOF with a check for bucket existence
 func (lif *LIF) LOM() (lom *LOM, err error) {
-	b, objName := cmn.ParseUname(lif.Uname)
+	b, objName := cmn.ParseUname(lif.uname)
 	lom = AllocLOM(objName)
 	if err = lom.InitBck(&b); err != nil {
 		FreeLOM(lom)
-		return
+		return nil, err
 	}
-	if bprops := lom.Bprops(); bprops == nil {
-		err = cmn.NewErrObjDefunct(lom.String(), 0, lif.BID)
+	bprops := lom.Bprops()
+	if bprops == nil {
+		err = cmn.NewErrObjDefunct(lom.String(), 0, lif.lid.bid())
 		FreeLOM(lom)
-	} else if bprops.BID != lif.BID {
-		err = cmn.NewErrObjDefunct(lom.String(), bprops.BID, lif.BID)
-		FreeLOM(lom)
+		return nil, err
 	}
-	return
+	if lif.lid.bid() != bprops.BID {
+		err = cmn.NewErrObjDefunct(lom.String(), bprops.BID, lif.lid.bid())
+		FreeLOM(lom)
+		return nil, err
+	}
+	return lom, nil
 }
 
 // deferred unlocking
@@ -62,5 +72,5 @@ func (lif *LIF) getLocker() *nlc { return &g.locker[lif.CacheIdx()] }
 
 func (lif *LIF) Unlock(exclusive bool) {
 	nlc := lif.getLocker()
-	nlc.Unlock(lif.Uname, exclusive)
+	nlc.Unlock(lif.uname, exclusive)
 }

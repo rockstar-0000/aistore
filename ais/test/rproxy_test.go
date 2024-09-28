@@ -84,6 +84,7 @@ func extractSpeed(out []byte) int64 {
 }
 
 func TestRProxyGCS(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true}) // NOTE: ht:// is now conditionally linked, requires 'ht' build tag
 	var (
 		resURL     = genObjURL(false, true)
 		proxyURL   = tools.GetPrimaryURL()
@@ -98,7 +99,7 @@ func TestRProxyGCS(t *testing.T) {
 	}
 
 	initMountpaths(t, proxyURL)
-	bck := cmn.Bck{Provider: apc.HTTP}
+	bck := cmn.Bck{Provider: apc.HT}
 	queryBck := cmn.QueryBcks(bck)
 	bckList, err := api.ListBuckets(baseParams, queryBck, apc.FltExists)
 	tassert.CheckFatal(t, err)
@@ -193,6 +194,7 @@ retry:
 }
 
 func TestRProxyInvalidURL(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true}) // NOTE: ht:// is now conditionally linked, requires 'ht' build tag
 	var (
 		proxyURL   = tools.GetPrimaryURL()
 		baseParams = tools.BaseAPIParams(proxyURL)
@@ -203,13 +205,12 @@ func TestRProxyInvalidURL(t *testing.T) {
 		statusCode int
 		doAndCheck bool
 	}{
-		// case 1
 		{url: "http://storage.googleapis.com/kubernetes-release/release", statusCode: http.StatusNotFound, doAndCheck: true},
-		{url: "http://invalid.invaliddomain.com/test/webpage.txt", statusCode: http.StatusBadRequest, doAndCheck: true}, // Invalid domain
-		// case 2
+		{url: "http://invalid.invaliddomain.com/test/webpage.txt", statusCode: http.StatusNotFound, doAndCheck: true}, // sometimes, http.StatusBadRequest
 		{url: "http://archive.ics.uci.edu/ml/datasets/Abalone", doAndCheck: false},
 	}
 	for _, test := range tests {
+		tlog.Logln(t.Name() + test.url + " " + strings.Repeat("=", 16))
 		hbo, err := cmn.NewHTTPObjPath(test.url)
 		tassert.CheckError(t, err)
 		api.DestroyBucket(baseParams, hbo.Bck)

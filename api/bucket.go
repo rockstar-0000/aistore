@@ -1,6 +1,6 @@
-// Package api provides Go based AIStore API/SDK over HTTP(S)
+// Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -12,7 +12,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -92,7 +91,9 @@ func hdr2msg(bck cmn.Bck, status int, err error) error {
 	if !ok {
 		return err
 	}
-	debug.Assert(herr.Status == status)
+	if status == 0 && herr.Status != 0 { // (connection refused)
+		return err
+	}
 
 	quoted := "\"" + bck.Cname("") + "\""
 	if !bck.IsQuery() && status == http.StatusNotFound {

@@ -24,7 +24,7 @@ const (
 )
 
 func IsHTTPS(url string) bool { return strings.HasPrefix(url, "https://") }
-func IsHTTP(url string) bool  { return strings.HasPrefix(url, "http://") }
+func IsHT(url string) bool    { return strings.HasPrefix(url, "http://") }
 
 func ParseURL(s string) (u *url.URL, valid bool) {
 	if s == "" {
@@ -84,7 +84,7 @@ func JoinWords(w string, words ...string) (path string) {
 
 // JoinPath joins two path elements that may (or may not) be prefixed/suffixed with a slash.
 func JoinPath(url, path string) string {
-	suffix := url[len(url)-1] == '/'
+	suffix := IsLastB(url, '/')
 	prefix := path[0] == '/'
 	if suffix && prefix {
 		return url + path[1:]

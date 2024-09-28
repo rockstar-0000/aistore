@@ -39,13 +39,15 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 type (
-	azureProvider struct {
-		u     string
-		creds *azblob.SharedKeyCredential
+	azbp struct {
 		t     core.TargetPut
+		creds *azblob.SharedKeyCredential
+		u     string
+		base
 	}
 )
 
@@ -61,27 +63,20 @@ const (
 	azProtoEnvVar = "AIS_AZURE_PROTO"
 )
 
-// used to parse azure errors
 const (
-	azErrDesc = "Description"
-	azErrCode = "Code: "
-
 	azErrPrefix = "azure-error["
 )
 
+// parse azure errors
 var (
 	azCleanErrRegex = regexp.MustCompile(`[^a-zA-Z0-9 ]+`)
 )
 
 // interface guard
-var _ core.BackendProvider = (*azureProvider)(nil)
+var _ core.Backend = (*azbp)(nil)
 
 func azProto() string {
-	proto := os.Getenv(azProtoEnvVar)
-	if proto == "" {
-		proto = azDefaultProto
-	}
-	return proto
+	return cos.Right(azDefaultProto, os.Getenv(azProtoEnvVar))
 }
 
 func azAccName() string { return os.Getenv(azAccNameEnvVar) }
@@ -103,7 +98,7 @@ func asEndpoint() string {
 	}
 }
 
-func NewAzure(t core.TargetPut) (core.BackendProvider, error) {
+func NewAzure(t core.TargetPut, tstats stats.Tracker) (core.Backend, error) {
 	blurl := asEndpoint()
 
 	// NOTE: NewSharedKeyCredential requires account name and its primary or secondary key
@@ -111,12 +106,14 @@ func NewAzure(t core.TargetPut) (core.BackendProvider, error) {
 	if err != nil {
 		return nil, cmn.NewErrFailedTo(nil, azErrPrefix+": init]", "credentials", err)
 	}
-
-	return &azureProvider{
+	bp := &azbp{
 		t:     t,
 		creds: creds,
 		u:     blurl,
-	}, nil
+		base:  base{provider: apc.Azure},
+	}
+	bp.base.init(t.Snode(), tstats)
+	return bp, nil
 }
 
 // (compare w/ cmn/backend)
@@ -132,6 +129,12 @@ func azEncodeChecksum(v []byte) string {
 //
 // format and parse errors
 //
+
+const (
+	azErrDesc = "Description"
+	azErrResp = "RESPONSE"
+	azErrCode = "Code: " // and CODE:
+)
 
 func azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (int, error) {
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
@@ -184,39 +187,36 @@ func azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (int, 
 	for _, line := range lines {
 		if strings.HasPrefix(line, azErrDesc) {
 			description = azCleanErrRegex.ReplaceAllString(line[len(azErrDesc):], "")
-		} else if i := strings.Index(line, azErrCode); i > 0 {
+		} else if strings.HasPrefix(line, azErrResp) {
+			i := max(0, strings.Index(line, ": "))
+			// alternatively, take "^RESPONSE ...: <...>" for description
+			description = azCleanErrRegex.ReplaceAllString(line[i:], "")
+		}
+		if i := strings.Index(line, azErrCode); i > 0 {
+			code = azCleanErrRegex.ReplaceAllString(line[i+len(azErrCode):], "")
+		} else if i := strings.Index(line, strings.ToUpper(azErrCode)); i > 0 {
 			code = azCleanErrRegex.ReplaceAllString(line[i+len(azErrCode):], "")
 		}
 	}
 	if code != "" && description != "" {
-		return status, errors.New(azErrPrefix + code + ": " + description + "]")
+		return status, errors.New(azErrPrefix + code + ": " + strings.TrimSpace(description) + "]")
 	}
 	debug.Assert(false, azureError) // expecting to parse
 	return status, azureError
 }
 
-// as core.BackendProvider --------------------------------------------------------------
-
-func (*azureProvider) Provider() string { return apc.Azure }
-
-//
-// CREATE BUCKET
-//
-
-func (*azureProvider) CreateBucket(_ *meta.Bck) (int, error) {
-	return http.StatusNotImplemented, cmn.NewErrNotImpl("create", "azure:// bucket")
-}
+// as core.Backend --------------------------------------------------------------
 
 //
 // HEAD BUCKET
 //
 
-func (ap *azureProvider) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, int, error) {
+func (azbp *azbp) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, int, error) {
 	var (
 		cloudBck = bck.RemoteBck()
-		cntURL   = ap.u + "/" + cloudBck.Name
+		cntURL   = azbp.u + "/" + cloudBck.Name
 	)
-	client, err := container.NewClientWithSharedKeyCredential(cntURL, ap.creds, nil)
+	client, err := container.NewClientWithSharedKeyCredential(cntURL, azbp.creds, nil)
 	if err != nil {
 		status, err := azureErrorToAISError(err, cloudBck, "")
 		return nil, status, err
@@ -243,15 +243,19 @@ func (ap *azureProvider) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.Str
 // LIST OBJECTS
 //
 
-func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoResult) (int, error) {
+// TODO: support non-recursive (apc.LsNoRecursion) operation, as in:
+// $ az storage blob list -c abc --prefix sub/ --delimiter /
+// TODO: research "hierarchical namespaces"
+// See also: aws.go, gcp.go
+func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, error) {
 	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
 	var (
 		cloudBck = bck.RemoteBck()
-		cntURL   = ap.u + "/" + cloudBck.Name
+		cntURL   = azbp.u + "/" + cloudBck.Name
 		num      = int32(msg.PageSize)
 		opts     = container.ListBlobsFlatOptions{Prefix: apc.Ptr(msg.Prefix), MaxResults: &num}
 	)
-	client, err := container.NewClientWithSharedKeyCredential(cntURL, ap.creds, nil)
+	client, err := container.NewClientWithSharedKeyCredential(cntURL, azbp.creds, nil)
 	if err != nil {
 		return azureErrorToAISError(err, cloudBck, "")
 	}
@@ -268,29 +272,30 @@ func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.Ls
 		return azureErrorToAISError(err, cloudBck, "")
 	}
 
-	l := len(resp.Segment.BlobItems)
-	for i := len(lst.Entries); i < l; i++ {
-		lst.Entries = append(lst.Entries, &cmn.LsoEntry{}) // add missing empty
+	var (
+		custom     cos.StrKVs
+		wantCustom = msg.WantProp(apc.GetPropsCustom)
+	)
+	if wantCustom {
+		custom = make(cos.StrKVs, 4) // reuse
 	}
-	for idx := range resp.Segment.BlobItems {
-		var (
-			custom = cos.StrKVs{}
-			blob   = resp.Segment.BlobItems[idx]
-			entry  = lst.Entries[idx]
-		)
-		entry.Name = *blob.Name
-		entry.Size = *blob.Properties.ContentLength
+	lst.Entries = lst.Entries[:0]
+	for _, blob := range resp.Segment.BlobItems {
+		en := cmn.LsoEnt{Name: *blob.Name, Size: *blob.Properties.ContentLength}
+
+		// not expecting directories
+		debug.Assert(en.Name != "" && !cos.IsLastB(en.Name, '/'), en.Name)
+
 		if msg.IsFlagSet(apc.LsNameOnly) || msg.IsFlagSet(apc.LsNameSize) {
+			lst.Entries = append(lst.Entries, &en)
 			continue
 		}
 
-		entry.Checksum = azEncodeChecksum(blob.Properties.ContentMD5)
-
+		en.Checksum = azEncodeChecksum(blob.Properties.ContentMD5)
 		etag := azEncodeEtag(*blob.Properties.ETag)
-		entry.Version = etag // (TODO a the top)
-
-		// custom
-		if msg.WantProp(apc.GetPropsCustom) {
+		en.Version = etag // (TODO a the top)
+		if wantCustom {
+			clear(custom)
 			custom[cmn.ETag] = etag
 			if !blob.Properties.LastModified.IsZero() {
 				custom[cmn.LastModified] = fmtTime(*blob.Properties.LastModified)
@@ -301,10 +306,10 @@ func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.Ls
 			if blob.VersionID != nil {
 				custom[cmn.VersionObjMD] = *blob.VersionID
 			}
-			entry.Custom = cmn.CustomMD2S(custom)
+			en.Custom = cmn.CustomMD2S(custom)
 		}
+		lst.Entries = append(lst.Entries, &en)
 	}
-	lst.Entries = lst.Entries[:l]
 
 	if resp.NextMarker != nil {
 		lst.ContinuationToken = *resp.NextMarker
@@ -319,8 +324,8 @@ func (ap *azureProvider) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.Ls
 // LIST BUCKETS
 //
 
-func (ap *azureProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, _ int, _ error) {
-	serviceClient, err := service.NewClientWithSharedKeyCredential(ap.u, ap.creds, nil)
+func (azbp *azbp) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, _ int, _ error) {
+	serviceClient, err := service.NewClientWithSharedKeyCredential(azbp.u, azbp.creds, nil)
 	if err != nil {
 		status, err := azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
 		return nil, status, err
@@ -349,12 +354,12 @@ func (ap *azureProvider) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, _ int, _ err
 // HEAD OBJECT
 //
 
-func (ap *azureProvider) HeadObj(ctx context.Context, lom *core.LOM) (*cmn.ObjAttrs, int, error) {
+func (azbp *azbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (*cmn.ObjAttrs, int, error) {
 	var (
 		cloudBck = lom.Bucket().RemoteBck()
-		blURL    = ap.u + "/" + cloudBck.Name + "/" + lom.ObjName
+		blURL    = azbp.u + "/" + cloudBck.Name + "/" + lom.ObjName
 	)
-	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, ap.creds, nil)
+	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, azbp.creds, nil)
 	if err != nil {
 		status, err := azureErrorToAISError(err, cloudBck, lom.ObjName)
 		return nil, status, err
@@ -375,7 +380,7 @@ func (ap *azureProvider) HeadObj(ctx context.Context, lom *core.LOM) (*cmn.ObjAt
 	etag := azEncodeEtag(*resp.ETag)
 	oa.SetCustomKey(cmn.ETag, etag)
 
-	oa.Ver = etag // TODO #200224
+	oa.SetVersion(etag) // TODO #200224
 
 	if md5 := azEncodeChecksum(resp.ContentMD5); md5 != "" {
 		oa.SetCustomKey(cmn.MD5ObjMD, md5)
@@ -398,13 +403,13 @@ func (ap *azureProvider) HeadObj(ctx context.Context, lom *core.LOM) (*cmn.ObjAt
 // GET OBJECT
 //
 
-func (ap *azureProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT) (int, error) {
-	res := ap.GetObjReader(ctx, lom, 0, 0)
+func (azbp *azbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (int, error) {
+	res := azbp.GetObjReader(ctx, lom, 0, 0)
 	if res.Err != nil {
 		return res.ErrCode, res.Err
 	}
 	params := allocPutParams(res, owt)
-	err := ap.t.PutObject(lom, params)
+	err := azbp.t.PutObject(lom, params)
 	core.FreePutParams(params)
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infoln("[get_object]", lom.String(), err)
@@ -412,12 +417,12 @@ func (ap *azureProvider) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT)
 	return 0, err
 }
 
-func (ap *azureProvider) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
+func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
 	var (
 		cloudBck = lom.Bucket().RemoteBck()
-		blURL    = ap.u + "/" + cloudBck.Name + "/" + lom.ObjName
+		blURL    = azbp.u + "/" + cloudBck.Name + "/" + lom.ObjName
 	)
-	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, ap.creds, nil)
+	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, azbp.creds, nil)
 	if err != nil {
 		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
 		return
@@ -468,17 +473,17 @@ func (ap *azureProvider) GetObjReader(ctx context.Context, lom *core.LOM, offset
 // PUT OBJECT
 //
 
-func (ap *azureProvider) PutObj(r io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (int, error) {
+func (azbp *azbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, error) {
 	defer cos.Close(r)
 
-	client, err := azblob.NewClientWithSharedKeyCredential(ap.u, ap.creds, nil)
+	client, err := azblob.NewClientWithSharedKeyCredential(azbp.u, azbp.creds, nil)
 	if err != nil {
 		return azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
 	}
 	cloudBck := lom.Bck().RemoteBck()
 
 	opts := azblob.UploadStreamOptions{}
-	if size := lom.SizeBytes(true); size > cos.MiB {
+	if size := lom.Lsize(true); size > cos.MiB {
 		opts.Concurrency = int(min((size+cos.MiB-1)/cos.MiB, 8))
 	}
 
@@ -505,8 +510,8 @@ func (ap *azureProvider) PutObj(r io.ReadCloser, lom *core.LOM, _ *core.ExtraArg
 // DELETE OBJECT
 //
 
-func (ap *azureProvider) DeleteObj(lom *core.LOM) (int, error) {
-	client, err := azblob.NewClientWithSharedKeyCredential(ap.u, ap.creds, nil)
+func (azbp *azbp) DeleteObj(lom *core.LOM) (int, error) {
+	client, err := azblob.NewClientWithSharedKeyCredential(azbp.u, azbp.creds, nil)
 	if err != nil {
 		return azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
 	}

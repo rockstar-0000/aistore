@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -39,8 +39,13 @@ func init() {
 // gco //
 /////////
 
-func (gco *gco) Get() *Config       { return gco.c.Load() }
-func (gco *gco) Put(config *Config) { gco.c.Store(config) }
+func (gco *gco) Get() *Config { return gco.c.Load() }
+
+func (gco *gco) Put(config *Config) {
+	gco.c.Store(config)
+	// update assorted read-mostly knobs
+	Rom.Set(&config.ClusterConfig)
+}
 
 func (gco *gco) GetOverride() *ConfigToSet       { return gco.oc.Load() }
 func (gco *gco) PutOverride(config *ConfigToSet) { gco.oc.Store(config) }

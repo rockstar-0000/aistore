@@ -15,8 +15,8 @@ import (
 var (
 	// ObjectPropsMap matches ObjEntry field
 	ObjectPropsMap = map[string]string{
-		apc.GetPropsName:     "{{FormatNameArch $obj.Name $obj.Flags}}",
-		apc.GetPropsSize:     "{{FormatBytesSig $obj.Size 2}}",
+		apc.GetPropsName:     "{{FormatNameDirArch $obj.Name $obj.Flags}}",
+		apc.GetPropsSize:     "{{FormatBytesSig2 $obj.Size 2 $obj.Flags}}",
 		apc.GetPropsChecksum: "{{$obj.Checksum}}",
 		apc.GetPropsAtime:    "{{$obj.Atime}}",
 		apc.GetPropsVersion:  "{{$obj.Version}}",
@@ -80,7 +80,7 @@ func LsoTemplate(propsList []string, hideHeader, addCachedCol, addStatusCol bool
 // formatting
 //
 
-func fmtLsObjStatus(e *cmn.LsoEntry) string {
+func fmtLsObjStatus(e *cmn.LsoEnt) string {
 	switch e.Status() {
 	case apc.LocOK:
 		if !e.IsPresent() {
@@ -108,6 +108,9 @@ func fmtLsObjStatus(e *cmn.LsoEntry) string {
 	}
 }
 
-func fmtLsObjIsCached(e *cmn.LsoEntry) string {
+func fmtLsObjIsCached(e *cmn.LsoEnt) string {
+	if e.IsDir() {
+		return ""
+	}
 	return FmtBool(e.IsPresent())
 }

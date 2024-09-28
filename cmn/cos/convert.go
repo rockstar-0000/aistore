@@ -7,7 +7,6 @@ package cos
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
@@ -36,11 +35,10 @@ func ParseBool(s string) (bool, error) {
 		return true, nil
 	}
 	// add. options
-	s = strings.ToLower(s)
 	switch s {
-	case "y", "yes", "on":
+	case "y", "yes", "on", "true":
 		return true, nil
-	case "n", "no", "off":
+	case "n", "no", "off", "false":
 		return false, nil
 	}
 	// gen. case

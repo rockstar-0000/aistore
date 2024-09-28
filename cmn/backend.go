@@ -19,6 +19,15 @@ type backendFuncs struct {
 	EncodeCksum   func(v any) (cksumValue string, isSet bool)
 }
 
+// from https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html
+// "The ETag may or may not be an MD5 digest of the object data. Whether or
+// not it is depends on how the object was created and how it is encrypted..."
+const AwsMultipartDelim = "-"
+
+func IsS3MultipartEtag(etag string) bool {
+	return strings.Contains(etag, AwsMultipartDelim)
+}
+
 func awsIsVersionSet(version *string) bool {
 	return version != nil && *version != "" && *version != "null"
 }
@@ -31,7 +40,6 @@ var BackendHelpers = struct {
 	Amazon backendFuncs
 	Azure  backendFuncs
 	Google backendFuncs
-	HDFS   backendFuncs
 	HTTP   backendFuncs
 }{
 	Amazon: backendFuncs{
@@ -94,17 +102,6 @@ var BackendHelpers = struct {
 				// See: https://cloud.google.com/storage/docs/xml-api/reference-headers#xgooghash.
 				b := []byte{byte(x >> 24), byte(x >> 16), byte(x >> 8), byte(x)}
 				return base64.StdEncoding.EncodeToString(b), true
-			default:
-				debug.FailTypeCast(v)
-				return "", false
-			}
-		},
-	},
-	HDFS: backendFuncs{
-		EncodeCksum: func(v any) (cksumValue string, isSet bool) {
-			switch x := v.(type) {
-			case []byte:
-				return hex.EncodeToString(x), true
 			default:
 				debug.FailTypeCast(v)
 				return "", false

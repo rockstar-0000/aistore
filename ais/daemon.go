@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -8,17 +8,20 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/space"
@@ -33,9 +36,9 @@ type (
 	daemonCtx struct {
 		cli       cliFlags
 		rg        *rungroup
-		version   string      // major.minor.build (see cmd/aisnode)
-		buildTime string      // YYYY-MM-DD HH:MM:SS-TZ
-		stopping  atomic.Bool // true when exiting
+		version   string // major.minor.build (see cmd/aisnode)
+		buildTime string // YYYY-MM-DD HH:MM:SS-TZ
+		EP        string // env "AIS_PRIMARY_EP"
 		resilver  struct {
 			reason   string // Reason why resilver needs to be run.
 			required bool   // Determines if the resilver needs to be started.
@@ -55,9 +58,6 @@ type (
 		target    struct {
 			// do not try to auto-join cluster upon startup - stand by and wait for admin request
 			standby bool
-			// allow: disk sharing by multiple mountpaths and mountpaths with no disks whatsoever
-			// (usage: testing, minikube env, etc.)
-			allowSharedDisksAndNoDisks bool
 			// force starting up with a lost or missing mountpath
 			startWithLostMountpath bool
 			// use loopback devices
@@ -89,22 +89,25 @@ func initFlags(flset *flag.FlagSet) {
 		"config filename: local file that stores daemon's local configuration")
 	flset.StringVar(&daemon.cli.confCustom, "config_custom", "",
 		"\"key1=value1,key2=value2\" formatted string to override selected entries in config")
-	flset.BoolVar(&daemon.cli.transient, "transient", false,
-		"false: store customized (via '-config_custom') configuration\ntrue: keep '-config_custom' settings in memory only (non-persistent)")
+	flset.BoolVar(&daemon.cli.transient, "transient", false, "false: store customized (via '-config_custom') configuration\n"+
+		"true: keep '-config_custom' settings in memory only (non-persistent)")
 	flset.BoolVar(&daemon.cli.usage, "h", false, "show usage and exit")
 
 	// target-only
-	flset.BoolVar(&daemon.cli.target.standby, "standby", false, "when starting up, do not try to auto-join cluster - stand by and wait for admin request (target-only)")
-	flset.BoolVar(&daemon.cli.target.allowSharedDisksAndNoDisks, "allow_shared_no_disks", false, "disk sharing by multiple mountpaths and mountpaths with no disks whatsoever (target-only)")
-	flset.BoolVar(&daemon.cli.target.useLoopbackDevs, "loopback", false, "use loopback devices (local playground, target-only)")
-	flset.BoolVar(&daemon.cli.target.startWithLostMountpath, "start_with_lost_mountpath", false, "force starting up with a lost or missing mountpath (target-only)")
+	flset.BoolVar(&daemon.cli.target.standby, "standby", false,
+		"when starting up, do not try to auto-join cluster - stand by and wait for admin request (target-only)")
+	flset.BoolVar(&cmn.AllowSharedDisksAndNoDisks, "allow_shared_no_disks", false,
+		"NOTE: deprecated, will be removed in future releases")
+	flset.BoolVar(&daemon.cli.target.useLoopbackDevs, "loopback", false,
+		"use loopback devices (local playground, target-only)")
+	flset.BoolVar(&daemon.cli.target.startWithLostMountpath, "start_with_lost_mountpath", false,
+		"force starting up with a lost or missing mountpath (target-only)")
 
 	// primary-only:
-	flset.IntVar(&daemon.cli.primary.ntargets, "ntargets", 0, "number of storage targets expected to be joining at startup (optional, primary-only)")
+	flset.IntVar(&daemon.cli.primary.ntargets, "ntargets", 0,
+		"number of storage targets expected to be joining at startup (optional, primary-only)")
 	flset.BoolVar(&daemon.cli.primary.skipStartup, "skip_startup", false,
 		"whether primary, when starting up, should skip waiting for target joins (used only in tests)")
-
-	nlog.InitFlags(flset)
 }
 
 func initDaemon(version, buildTime string) cos.Runner {
@@ -185,24 +188,47 @@ func initDaemon(version, buildTime string) cos.Runner {
 	}
 
 	daemon.version, daemon.buildTime = version, buildTime
-	loghdr := fmt.Sprintf("Version %s, build time %s, debug %t", version, buildTime, debug.ON())
-	cpus := sys.NumCPU()
-	if containerized := sys.Containerized(); containerized {
-		loghdr += fmt.Sprintf(", CPUs(%d, runtime=%d), containerized", cpus, runtime.NumCPU())
-	} else {
-		loghdr += fmt.Sprintf(", CPUs(%d, runtime=%d)", cpus, runtime.NumCPU())
-	}
-	nlog.Infoln(loghdr) // redundant (see below), prior to start/init
-	sys.SetMaxProcs()
+	loghdr := _loghdr()
+	sys.GoEnvMaxprocs()
 
 	daemon.rg = &rungroup{rs: make(map[string]cos.Runner, 6)}
-	hk.Init(&daemon.stopping)
-	daemon.rg.add(hk.DefaultHK)
+	hk.Init()
+	daemon.rg.add(hk.HK)
 
 	// K8s
 	k8s.Init()
 
+	// declared xactions, as per xact/api.go
 	xreg.Init()
+
+	// primary 'host[:port]' endpoint or URL from the environment
+	if daemon.EP = os.Getenv(env.AIS.PrimaryEP); daemon.EP != "" {
+		scheme := "http"
+		if config.Net.HTTP.UseHTTPS {
+			scheme = "https"
+		}
+		if strings.Contains(daemon.EP, "://") {
+			u, err := url.Parse(daemon.EP)
+			if err != nil {
+				cos.ExitLogf("invalid environment %s=%s: %v", env.AIS.PrimaryEP, daemon.EP, err)
+			}
+			if u.Path != "" && u.Path != "/" {
+				cos.ExitLogf("invalid environment %s=%s (not expecting path %q)",
+					env.AIS.PrimaryEP, daemon.EP, u.Path)
+			}
+			// reassemble and compare
+			ustr := scheme + "://" + u.Hostname()
+			if port := u.Port(); port != "" {
+				ustr += ":" + port
+			}
+			if ustr != daemon.EP {
+				nlog.Warningln("environment-set primary URL mismatch:", daemon.EP, "vs", ustr)
+				daemon.EP = ustr
+			}
+		} else {
+			daemon.EP = scheme + "://" + daemon.EP
+		}
+	}
 
 	// fork (proxy | target)
 	co := newConfigOwner(config)
@@ -210,7 +236,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 		xs.Xreg(true /* x-ele only */)
 		p := newProxy(co)
 		p.init(config)
-		title := "Node " + p.si.Name() + ", " + loghdr + "\n"
+		title := _loghdr2(p.si, loghdr)
 		nlog.Infoln(title)
 
 		// aux plumbing
@@ -225,14 +251,52 @@ func initDaemon(version, buildTime string) cos.Runner {
 
 	t := newTarget(co)
 	t.init(config)
-	title := "Node " + t.si.Name() + ", " + loghdr + "\n"
+	title := _loghdr2(t.si, loghdr)
 	nlog.Infoln(title)
 
 	// aux plumbing
 	nlog.SetTitle(title)
 	cmn.InitErrs(t.si.Name(), fs.CleanPathErr)
 
+	cmn.InitObjProps2Hdr()
+
 	return t
+}
+
+func _loghdr2(si *meta.Snode, loghdr string) string {
+	var sb strings.Builder
+	sb.WriteString("Node ")
+	sb.WriteString(si.Name())
+	sb.WriteString(", ")
+	sb.WriteString(loghdr)
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+func _loghdr() (loghdr string) {
+	var sb strings.Builder
+	sb.WriteString("Version ")
+	sb.WriteString(daemon.version)
+	if debug.ON() {
+		sb.WriteString(", DEBUG build ")
+	} else {
+		sb.WriteString(", build ")
+	}
+	sb.WriteString(daemon.buildTime)
+
+	cpus := sys.NumCPU()
+	sb.WriteString(", CPUs(")
+	sb.WriteString(strconv.Itoa(cpus))
+	sb.WriteString(", runtime=")
+	sb.WriteString(strconv.Itoa(runtime.NumCPU()))
+	sb.WriteByte(')')
+
+	if sys.Containerized() {
+		sb.WriteString(", containerized")
+	}
+	loghdr = sb.String()
+	nlog.Infoln(loghdr) // redundant (see below), prior to start/init
+	return loghdr
 }
 
 func newProxy(co *configOwner) *proxy {
@@ -259,16 +323,17 @@ func Run(version, buildTime string) int {
 		return 0
 	}
 	if e, ok := err.(*cos.ErrSignal); ok {
-		nlog.Infof("Terminated OK via %v", e)
+		nlog.Infoln("Terminated OK via", e)
 		return e.ExitCode()
 	}
 	if errors.Is(err, cmn.ErrStartupTimeout) {
-		// NOTE: stats and keepalive runners wait for the ClusterStarted() - i.e., for the primary
-		//       to reach the corresponding stage. There must be an external "restarter" (e.g. K8s)
-		//       to restart the daemon if the primary gets killed or panics prior (to reaching that state)
+		// NOTE:
+		// stats and keepalive runners wait for the ClusterStarted() - i.e., for the primary
+		// to reach the corresponding stage. There must be an external "restarter" (e.g. K8s)
+		// to restart the daemon if the primary gets killed or panics prior (to reaching that state)
 		nlog.Errorln("Timed-out while starting up")
 	}
-	nlog.Errorf("Terminated with err: %v", err)
+	nlog.Errorln("Terminated with err:", err)
 	return 1
 }
 
@@ -294,14 +359,13 @@ func (g *rungroup) run(r cos.Runner) {
 
 func (g *rungroup) runAll(mainRunner cos.Runner) error {
 	g.errCh = make(chan runRet, len(g.rs))
-	daemon.stopping.Store(false)
 
 	// run all, housekeeper first
-	go g.run(hk.DefaultHK)
+	go g.run(hk.HK)
 	runtime.Gosched()
 	hk.WaitStarted()
 	for _, r := range g.rs {
-		if r.Name() == hk.DefaultHK.Name() {
+		if r.Name() == hk.HK.Name() {
 			continue
 		}
 		go g.run(r)
@@ -309,7 +373,7 @@ func (g *rungroup) runAll(mainRunner cos.Runner) error {
 
 	// Stop all runners, target (or proxy) first.
 	ret := <-g.errCh
-	daemon.stopping.Store(true)
+	nlog.SetStopping()
 	if ret.name != mainRunner.Name() {
 		mainRunner.Stop(ret.err)
 	}
@@ -319,7 +383,7 @@ func (g *rungroup) runAll(mainRunner cos.Runner) error {
 		}
 	}
 	// Wait for all terminations.
-	for i := 0; i < len(g.rs)-1; i++ {
+	for range len(g.rs) - 1 {
 		<-g.errCh
 	}
 	return ret.err

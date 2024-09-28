@@ -1,11 +1,12 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,7 +31,6 @@ import (
 	"github.com/NVIDIA/aistore/ext/etl/runtime"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/tools"
-	"github.com/NVIDIA/aistore/tools/cryptorand"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tetl"
@@ -100,7 +100,7 @@ func tfRecordsEqual(examples1, examples2 []*core.TFExample) (bool, error) {
 		return examples2[i].GetFeature("__key__").String() < examples2[j].GetFeature("__key__").String()
 	})
 
-	for i := 0; i < len(examples1); i++ {
+	for i := range examples1 {
 		if !reflect.DeepEqual(examples1[i].ProtoReflect(), examples2[i].ProtoReflect()) {
 			return false, nil
 		}

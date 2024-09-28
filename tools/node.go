@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
@@ -138,7 +138,7 @@ func RandomProxyURL(ts ...*testing.T) (url string) {
 
 func getRandomProxyURL(smap *meta.Smap) string {
 	proxies := smap.Pmap.ActiveNodes()
-	return proxies[rand.Intn(len(proxies))].URL(cmn.NetPublic)
+	return proxies[rand.IntN(len(proxies))].URL(cmn.NetPublic)
 }
 
 // Return the first proxy from smap that is IC member. The primary
@@ -180,6 +180,13 @@ func WaitForClusterStateActual(proxyURL, reason string, origVersion int64, proxy
 			origVersion, smap.Version, targetCnt, smap.CountTargets(), proxyCnt, smap.CountProxies())
 		origVersion = smap.Version
 	}
+}
+
+func _minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // WaitForClusterState waits until a cluster reaches specified state, meaning:
@@ -248,7 +255,7 @@ func WaitForClusterState(proxyURL, reason string, origVer int64, pcnt, tcnt int,
 			}
 		}
 		if smap.Version != lastVer && lastVer != 0 {
-			deadline = cos.MinTime(time.Now().Add(maxWait), opDeadline)
+			deadline = _minTime(time.Now().Add(maxWait), opDeadline)
 		}
 		// if the primary's map changed to the state we want, wait for the map get populated
 		if ok {
@@ -416,32 +423,31 @@ func RestoreNode(cmd RestoreCmd, asPrimary bool, tag string) error {
 	}
 
 	tlog.Logf("Restoring %s: %s %+v\n", tag, cmd.Cmd, cmd.Args)
-	pid, err := startNode(cmd.Cmd, cmd.Args, asPrimary)
+	pid, err := startNode(&cmd, asPrimary)
 	if err == nil && pid <= 0 {
 		err = fmt.Errorf("RestoreNode: invalid process ID %d", pid)
 	}
 	return err
 }
 
-func startNode(cmd string, args []string, asPrimary bool) (int, error) {
-	ncmd := exec.Command(cmd, args...)
-	// When using Ctrl-C on test, children (restored daemons) should not be
-	// killed as well.
-	// (see: https://groups.google.com/forum/#!topic/golang-nuts/shST-SDqIp4)
+// When using Ctrl-C on test, children (restored daemons) should not be killed as well.
+// (see: https://groups.google.com/forum/#!topic/golang-nuts/shST-SDqIp4)
+func startNode(cmd *RestoreCmd, asPrimary bool) (int, error) {
+	ncmd := exec.Command(cmd.Cmd, cmd.Args...) //nolint:gosec // used only in tests
 	ncmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
 	if asPrimary {
 		// Sets the environment variable to start as primary
 		environ := os.Environ()
-		environ = append(environ, env.AIS.IsPrimary+"=true")
+		environ = append(environ, env.AIS.PrimaryEP+"="+cmd.Node.PubNet.URL)
 		ncmd.Env = environ
 	}
 	if err := ncmd.Start(); err != nil {
 		return 0, err
 	}
 	pid := ncmd.Process.Pid
-	err := ncmd.Process.Release() // TODO -- FIXME: needed?
+	err := ncmd.Process.Release()
 	return pid, err
 }
 
@@ -467,15 +473,18 @@ func DeployNode(t *testing.T, node *meta.Snode, conf *cmn.Config, localConf *cmn
 	err = jsp.SaveMeta(configFile, &conf.ClusterConfig, nil)
 	tassert.CheckFatal(t, err)
 
-	args := []string{
-		"-role=" + node.Type(),
-		"-daemon_id=" + node.ID(),
-		"-config=" + configFile,
-		"-local_config=" + localConfFile,
+	var cmd = RestoreCmd{
+		Args: []string{
+			"-role=" + node.Type(),
+			"-daemon_id=" + node.ID(),
+			"-config=" + configFile,
+			"-local_config=" + localConfFile,
+		},
+		Node: node,
+		Cmd:  getAISNodeCmd(t),
 	}
 
-	cmd := getAISNodeCmd(t)
-	pid, err := startNode(cmd, args, false)
+	pid, err := startNode(&cmd, false)
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, pid > 0, "invalid process ID %d", pid)
 	return pid
@@ -802,10 +811,10 @@ func waitSmapSync(bp api.BaseParams, timeout time.Time, smap *meta.Smap, ver int
 			if newSmap.Version > ver+1 {
 				// reset
 				if ver <= 0 {
-					gctx.Log("Received %s from %s\n", newSmap, sname)
+					gctx.Log("Received %s from %s\n", newSmap.StringEx(), sname)
 				} else {
 					gctx.Log("Received newer %s from %s, updated wait-for condition (%d => %d)\n",
-						newSmap, sname, ver, newSmap.Version)
+						newSmap.StringEx(), sname, ver, newSmap.Version)
 				}
 				ver = newSmap.Version - 1
 				ignore = orig.Clone()

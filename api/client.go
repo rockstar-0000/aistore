@@ -1,6 +1,6 @@
-// Package api provides Go based AIStore API/SDK over HTTP(S)
+// Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -70,7 +70,7 @@ type (
 )
 
 func newErrCreateHTTPRequest(err error) error {
-	return fmt.Errorf("failed to create HTTP request: %w", err)
+	return fmt.Errorf("failed to create http request: %w", err)
 }
 
 // HTTPStatus returns HTTP status or (-1) for non-HTTP error.
@@ -209,12 +209,21 @@ func (reqParams *ReqParams) do() (resp *http.Response, err error) {
 		IsClient:  true,
 	})
 	resp = rr.resp
-	if err != nil && resp != nil {
+	if err == nil {
+		return resp, nil
+	}
+	if resp != nil {
 		herr := cmn.NewErrHTTP(req, err, resp.StatusCode)
 		herr.Method, herr.URLPath = reqParams.BaseParams.Method, reqParams.Path
-		err = herr
+		return nil, herr
 	}
-	return
+	if uerr, ok := err.(*url.Error); ok {
+		err = uerr.Unwrap()
+		herr := cmn.NewErrHTTP(req, err, 0)
+		herr.Method, herr.URLPath = reqParams.BaseParams.Method, reqParams.Path
+		return nil, herr
+	}
+	return nil, err
 }
 
 // Check, Drain, Close
@@ -270,7 +279,7 @@ func (reqParams *ReqParams) readStr(resp *http.Response, out *string) error {
 	if err := reqParams.checkResp(resp); err != nil {
 		return err
 	}
-	b, err := io.ReadAll(resp.Body)
+	b, err := cos.ReadAllN(resp.Body, resp.ContentLength)
 	if err != nil {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
@@ -330,7 +339,7 @@ func (reqParams *ReqParams) checkResp(resp *http.Response) error {
 		return nil
 	}
 	if reqParams.BaseParams.Method == http.MethodHead {
-		// HEAD request does not return body
+		// "A response to a HEAD method should not have a body."
 		if msg := resp.Header.Get(apc.HdrError); msg != "" {
 			return &cmn.ErrHTTP{
 				TypeCode: cmn.TypeCodeHTTPErr(msg),
@@ -342,7 +351,7 @@ func (reqParams *ReqParams) checkResp(resp *http.Response) error {
 		}
 	}
 
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := cos.ReadAllN(resp.Body, resp.ContentLength)
 	if len(b) == 0 {
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			msg := fmt.Sprintf("[%s]: starting up, please try again later...", http.StatusText(http.StatusServiceUnavailable))

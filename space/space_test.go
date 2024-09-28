@@ -1,6 +1,6 @@
 // Package space_test is a unit test for the package.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package space_test
 
@@ -23,7 +23,7 @@ import (
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact/xreg"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -68,11 +68,11 @@ var _ = Describe("space evict/cleanup tests", func() {
 			initConfig()
 			createAndAddMountpath(basePath)
 			core.T = newTargetLRUMock()
-			availablePaths := fs.GetAvail()
+			avail := fs.GetAvail()
 			bck := cmn.Bck{Name: bucketName, Provider: apc.AIS, Ns: cmn.NsGlobal}
 			bckAnother = cmn.Bck{Name: bucketNameAnother, Provider: apc.AIS, Ns: cmn.NsGlobal}
-			filesPath = availablePaths[basePath].MakePathCT(&bck, fs.ObjectType)
-			fpAnother = availablePaths[basePath].MakePathCT(&bckAnother, fs.ObjectType)
+			filesPath = avail[basePath].MakePathCT(&bck, fs.ObjectType)
+			fpAnother = avail[basePath].MakePathCT(&bckAnother, fs.ObjectType)
 			cos.CreateDir(filesPath)
 			cos.CreateDir(fpAnother)
 		})
@@ -261,8 +261,8 @@ var _ = Describe("space evict/cleanup tests", func() {
 			})
 			It("should remove all deleted items", func() {
 				var (
-					availablePaths = fs.GetAvail()
-					mi             = availablePaths[basePath]
+					avail = fs.GetAvail()
+					mi    = avail[basePath]
 				)
 
 				saveRandomFiles(filesPath, 10)
@@ -408,7 +408,7 @@ func saveRandomFilesWithMetadata(filesPath string, files []fileMetadata) {
 // Saves random bytes to a file with random name.
 // timestamps and names are not increasing in the same manner
 func saveRandomFiles(filesPath string, filesNumber int) {
-	for i := 0; i < filesNumber; i++ {
+	for i := range filesNumber {
 		saveRandomFile(path.Join(filesPath, getRandomFileName(i)), fileSize)
 	}
 }

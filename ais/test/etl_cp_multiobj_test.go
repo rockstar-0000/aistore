@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -84,7 +84,7 @@ func TestETLMultiObj(t *testing.T) {
 		}
 
 		tlog.Logf("PUT %d objects (size %d) => %s/test/a-*\n", objCnt, objSize, m.bck)
-		for i := 0; i < objCnt; i++ {
+		for i := range objCnt {
 			r, _ := readers.NewRand(objSize, cksumType)
 			_, err := api.PutObject(&api.PutArgs{
 				BaseParams: baseParams,
@@ -146,7 +146,7 @@ func testETLMultiObj(t *testing.T, etlName string, bckFrom, bckTo cmn.Bck, fileR
 		objList        = pt.ToSlice()
 		objCnt         = len(objList)
 		requestTimeout = 30 * time.Second
-		tcomsg         = cmn.TCObjsMsg{ToBck: bckTo}
+		tcomsg         = cmn.TCOMsg{ToBck: bckTo}
 	)
 	tcomsg.Transform.Name = etlName
 	tcomsg.Transform.Timeout = cos.Duration(requestTimeout)

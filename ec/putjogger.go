@@ -79,25 +79,24 @@ func (ctx *encodeCtx) freeReplica() {
 // putJogger //
 ///////////////
 
-func (*putJogger) newCtx(lom *core.LOM, meta *Metadata) (ctx *encodeCtx, err error) {
-	ctx = allocCtx()
-	ctx.lom = lom
-	ctx.dataSlices = lom.Bprops().EC.DataSlices
-	ctx.paritySlices = lom.Bprops().EC.ParitySlices
-	ctx.meta = meta
+func (c *putJogger) run(wg *sync.WaitGroup) {
+	nlog.Infoln("start [", c.parent.bck.Cname(""), c.mpath, "]")
 
-	totalCnt := ctx.paritySlices + ctx.dataSlices
-	ctx.sliceSize = SliceSize(ctx.lom.SizeBytes(), ctx.dataSlices)
-	ctx.slices = make([]*slice, totalCnt)
-	ctx.padSize = ctx.sliceSize*int64(ctx.dataSlices) - ctx.lom.SizeBytes()
-
-	ctx.fh, err = cos.NewFileHandle(lom.FQN)
-	return ctx, err
-}
-
-func (*putJogger) freeCtx(ctx *encodeCtx) {
-	*ctx = emptyCtx
-	encCtxPool.Put(ctx)
+	defer wg.Done()
+	c.buffer, c.slab = g.pmm.Alloc()
+	for {
+		select {
+		case req := <-c.putCh:
+			c.processRequest(req)
+			freeReq(req)
+		case req := <-c.xactCh:
+			c.processRequest(req)
+			freeReq(req)
+		case <-c.stopCh.Listen():
+			c.freeResources()
+			return
+		}
+	}
 }
 
 func (c *putJogger) freeResources() {
@@ -126,39 +125,20 @@ func (c *putJogger) processRequest(req *request) {
 			return
 		}
 		ecConf := lom.Bprops().EC
-		memRequired := lom.SizeBytes() * int64(ecConf.DataSlices+ecConf.ParitySlices) / int64(ecConf.ParitySlices)
+		memRequired := lom.Lsize() * int64(ecConf.DataSlices+ecConf.ParitySlices) / int64(ecConf.ParitySlices)
 		c.toDisk = useDisk(memRequired, c.parent.config)
 	}
 
 	c.parent.stats.updateWaitTime(time.Since(req.tm))
 	req.tm = time.Now()
 	if err = c.ec(req, lom); err != nil {
-		err = cmn.NewErrFailedTo(core.T, req.Action, lom, err)
+		err = cmn.NewErrFailedTo(core.T, req.Action, lom.Cname(), err)
 		c.parent.AddErr(err, 0)
 	}
 }
 
-func (c *putJogger) run(wg *sync.WaitGroup) {
-	nlog.Infof("Started EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
-	defer wg.Done()
-	c.buffer, c.slab = g.pmm.Alloc()
-	for {
-		select {
-		case req := <-c.putCh:
-			c.processRequest(req)
-			freeReq(req)
-		case req := <-c.xactCh:
-			c.processRequest(req)
-			freeReq(req)
-		case <-c.stopCh.Listen():
-			c.freeResources()
-			return
-		}
-	}
-}
-
 func (c *putJogger) stop() {
-	nlog.Infof("Stopping EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
+	nlog.Infoln("stop [", c.parent.bck.Cname(""), c.mpath, "]")
 	c.stopCh.Close()
 }
 
@@ -235,7 +215,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 	meta := &Metadata{
 		MDVersion:   MDVersionLast,
 		Generation:  generation,
-		Size:        lom.SizeBytes(),
+		Size:        lom.Lsize(),
 		Data:        ecConf.DataSlices,
 		Parity:      ecConf.ParitySlices,
 		IsCopy:      req.IsCopy,
@@ -252,7 +232,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 	if err != nil {
 		return err
 	}
-	targets, err := smap.HrwTargetList(ctx.lom.Uname(), reqTargets)
+	targets, err := smap.HrwTargetList(ctx.lom.UnamePtr(), reqTargets)
 	if err != nil {
 		return err
 	}
@@ -275,7 +255,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 		return err
 	}
 	metaBuf := bytes.NewReader(meta.NewPack())
-	if err := ctMeta.Write(metaBuf, -1); err != nil {
+	if err := ctMeta.Write(metaBuf, -1, "" /*work fqn*/); err != nil {
 		return err
 	}
 	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
@@ -285,6 +265,28 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 		return fmt.Errorf("%s metafile saved while bucket %s was being destroyed", ctMeta.ObjectName(), ctMeta.Bucket())
 	}
 	return nil
+}
+
+func (*putJogger) newCtx(lom *core.LOM, meta *Metadata) (ctx *encodeCtx, err error) {
+	ctx = allocCtx()
+	ctx.lom = lom
+	ctx.dataSlices = lom.Bprops().EC.DataSlices
+	ctx.paritySlices = lom.Bprops().EC.ParitySlices
+	ctx.meta = meta
+
+	totalCnt := ctx.paritySlices + ctx.dataSlices
+	ctx.sliceSize = SliceSize(ctx.lom.Lsize(), ctx.dataSlices)
+	ctx.slices = make([]*slice, totalCnt)
+	ctx.padSize = ctx.sliceSize*int64(ctx.dataSlices) - ctx.lom.Lsize()
+	debug.Assert(ctx.padSize >= 0)
+
+	ctx.fh, err = cos.NewFileHandle(lom.FQN)
+	return ctx, err
+}
+
+func (*putJogger) freeCtx(ctx *encodeCtx) {
+	*ctx = emptyCtx
+	encCtxPool.Put(ctx)
 }
 
 func (c *putJogger) ctSendCallback(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
@@ -333,7 +335,7 @@ func (c *putJogger) createCopies(ctx *encodeCtx) error {
 	// broadcast the replica to the targets
 	src := &dataSource{
 		reader:   ctx.fh,
-		size:     ctx.lom.SizeBytes(),
+		size:     ctx.lom.Lsize(),
 		metadata: ctx.meta,
 		reqType:  reqPut,
 	}
@@ -360,7 +362,7 @@ func generateSlicesToMemory(ctx *encodeCtx) error {
 		initSize     = min(ctx.sliceSize, cos.MiB)
 		sliceWriters = make([]io.Writer, ctx.paritySlices)
 	)
-	for i := 0; i < ctx.paritySlices; i++ {
+	for i := range ctx.paritySlices {
 		writer := g.pmm.NewSGL(initSize)
 		ctx.slices[i+ctx.dataSlices] = &slice{obj: writer}
 		if cksumType == cos.ChecksumNone {
@@ -377,8 +379,8 @@ func generateSlicesToMemory(ctx *encodeCtx) error {
 func initializeSlices(ctx *encodeCtx) (err error) {
 	// readers are slices of original object(no memory allocated)
 	cksmReaders := make([]io.Reader, ctx.dataSlices)
-	sizeLeft := ctx.lom.SizeBytes()
-	for i := 0; i < ctx.dataSlices; i++ {
+	sizeLeft := ctx.lom.Lsize()
+	for i := range ctx.dataSlices {
 		var (
 			reader     cos.ReadOpenCloser
 			cksmReader cos.ReadOpenCloser
@@ -413,7 +415,7 @@ func finalizeSlices(ctx *encodeCtx, writers []io.Writer) error {
 
 	// Calculate parity slices and their checksums
 	readers := make([]io.Reader, ctx.dataSlices)
-	for i := 0; i < ctx.dataSlices; i++ {
+	for i := range ctx.dataSlices {
 		readers[i] = ctx.slices[i].reader
 	}
 	if err := stream.Encode(readers, writers); err != nil {
@@ -446,9 +448,9 @@ func generateSlicesToDisk(ctx *encodeCtx) error {
 	}()
 
 	cksumType := ctx.lom.CksumType()
-	for i := 0; i < ctx.paritySlices; i++ {
+	for i := range ctx.paritySlices {
 		workFQN := fs.CSM.Gen(ctx.lom, fs.WorkfileType, fmt.Sprintf("ec-write-%d", i))
-		writer, err := ctx.lom.CreateFile(workFQN)
+		writer, err := ctx.lom.CreateSlice(workFQN)
 		if err != nil {
 			return err
 		}
@@ -495,7 +497,7 @@ func (c *putJogger) sendSlice(ctx *encodeCtx, data *slice, node *meta.Snode, idx
 			data.release()
 		}
 		if err != nil {
-			nlog.Errorln("Failed to send", hdr.Cname()+": ", err)
+			nlog.Errorln("failed to send", hdr.Cname(), "[", err, "]")
 		}
 	}
 

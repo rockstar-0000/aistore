@@ -6,7 +6,6 @@
 package nlog
 
 import (
-	"flag"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/mono"
@@ -18,12 +17,8 @@ const (
 	ActRotate
 )
 
+var LogToStderr bool
 var MaxSize int64 = 4 * 1024 * 1024 // usually, config.log.max_size
-
-func InitFlags(flset *flag.FlagSet) {
-	flset.BoolVar(&toStderr, "logtostderr", false, "log to standard error instead of files")
-	flset.BoolVar(&alsoToStderr, "alsologtostderr", false, "log to standard error as well as files")
-}
 
 func InfoDepth(depth int, args ...any)    { log(sevInfo, depth, "", args...) }
 func Infoln(args ...any)                  { log(sevInfo, 0, "", args...) }
@@ -34,9 +29,22 @@ func ErrorDepth(depth int, args ...any)   { log(sevErr, depth, "", args...) }
 func Errorln(args ...any)                 { log(sevErr, 0, "", args...) }
 func Errorf(format string, args ...any)   { log(sevErr, 0, format, args...) }
 
-func SetLogDirRole(dir, role string) { logDir, aisrole = dir, role }
-func SetTitle(s string)              { title = s }
+func SetPre(dir, role string) {
+	logDir, aisrole = dir, role
+}
 
+func SetPost(logToStderr bool, maxSize int64) {
+	LogToStderr = logToStderr
+	MaxSize = maxSize
+	if MaxSize > 1024*1024*1024 {
+		Warningf("log.max_size %d exceeds 1GB, setting log.max_size=4MB", MaxSize)
+		MaxSize = 4 * 1024 * 1024
+	}
+}
+
+func SetTitle(s string) { title = s }
+
+// see also: `logtypes` in stats/common
 func InfoLogName() string { return sname() + ".INFO" }
 func ErrLogName() string  { return sname() + ".ERROR" }
 
@@ -73,8 +81,7 @@ func Flush(action int) {
 	}
 }
 
-func Since() time.Duration {
-	now := mono.NanoTime()
+func Since(now int64) time.Duration {
 	a, b := nlogs[sevInfo].since(now), nlogs[sevErr].since(now)
 	if a > b {
 		return a
@@ -85,3 +92,6 @@ func Since() time.Duration {
 func OOB() bool {
 	return nlogs[sevInfo].oob.Load() || nlogs[sevErr].oob.Load()
 }
+
+func Stopping() bool { return stopping.Load() }
+func SetStopping()   { stopping.Store(true) }

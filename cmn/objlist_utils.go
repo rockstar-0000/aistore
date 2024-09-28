@@ -6,29 +6,38 @@
 package cmn
 
 import (
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
-var nilEntry LsoEntry
+var nilEntry LsoEnt
 
 ////////////////
 // LsoEntries //
 ////////////////
 
-func (entries LsoEntries) cmp(i, j int) bool { return entries[i].less(entries[j]) }
+func (entries LsoEntries) cmp(i, j int) bool {
+	eni, enj := entries[i], entries[j]
+	return eni.less(enj)
+}
 
-func appSorted(entries LsoEntries, ne *LsoEntry) LsoEntries {
-	for i := range entries {
-		if ne.Name > entries[i].Name {
+func appSorted(entries LsoEntries, ne *LsoEnt) LsoEntries {
+	for i, eni := range entries {
+		if eni.IsDir() != ne.IsDir() {
+			if eni.IsDir() {
+				continue
+			}
+		} else if ne.Name > eni.Name {
 			continue
 		}
 		// dedup
-		if ne.Name == entries[i].Name {
-			if ne.Status() < entries[i].Status() {
+		if ne.Name == eni.Name {
+			if ne.Status() < eni.Status() {
 				entries[i] = ne
 			}
 			return entries
@@ -49,36 +58,46 @@ func appSorted(entries LsoEntries, ne *LsoEntry) LsoEntries {
 	return entries
 }
 
-//////////////
-// LsoEntry //
-//////////////
+////////////
+// LsoEnt //
+////////////
 
 // The terms "cached" and "present" are interchangeable:
 // "object is cached" and "is present" is actually the same thing
-func (be *LsoEntry) IsPresent() bool { return be.Flags&apc.EntryIsCached != 0 }
-func (be *LsoEntry) SetPresent()     { be.Flags |= apc.EntryIsCached }
+func (be *LsoEnt) IsPresent() bool { return be.Flags&apc.EntryIsCached != 0 }
+func (be *LsoEnt) SetPresent()     { be.Flags |= apc.EntryIsCached }
 
 // see also: "latest-ver", QparamLatestVer, et al.
-func (be *LsoEntry) SetVerChanged()     { be.Flags |= apc.EntryVerChanged }
-func (be *LsoEntry) IsVerChanged() bool { return be.Flags&apc.EntryVerChanged != 0 }
-func (be *LsoEntry) SetVerRemoved()     { be.Flags |= apc.EntryVerRemoved }
-func (be *LsoEntry) IsVerRemoved() bool { return be.Flags&apc.EntryVerRemoved != 0 }
+func (be *LsoEnt) SetVerChanged()     { be.Flags |= apc.EntryVerChanged }
+func (be *LsoEnt) IsVerChanged() bool { return be.Flags&apc.EntryVerChanged != 0 }
+func (be *LsoEnt) SetVerRemoved()     { be.Flags |= apc.EntryVerRemoved }
+func (be *LsoEnt) IsVerRemoved() bool { return be.Flags&apc.EntryVerRemoved != 0 }
 
-func (be *LsoEntry) IsStatusOK() bool   { return be.Status() == 0 }
-func (be *LsoEntry) Status() uint16     { return be.Flags & apc.EntryStatusMask }
-func (be *LsoEntry) IsInsideArch() bool { return be.Flags&apc.EntryInArch != 0 }
-func (be *LsoEntry) IsListedArch() bool { return be.Flags&apc.EntryIsArchive != 0 }
-func (be *LsoEntry) String() string     { return "{" + be.Name + "}" }
+func (be *LsoEnt) IsStatusOK() bool   { return be.Status() == 0 }
+func (be *LsoEnt) Status() uint16     { return be.Flags & apc.EntryStatusMask }
+func (be *LsoEnt) IsDir() bool        { return be.Flags&apc.EntryIsDir != 0 }
+func (be *LsoEnt) IsInsideArch() bool { return be.Flags&apc.EntryInArch != 0 }
+func (be *LsoEnt) IsListedArch() bool { return be.Flags&apc.EntryIsArchive != 0 }
+func (be *LsoEnt) String() string     { return "{" + be.Name + "}" }
 
-func (be *LsoEntry) less(oe *LsoEntry) bool {
+func (be *LsoEnt) less(oe *LsoEnt) bool {
+	if be.IsDir() {
+		if oe.IsDir() {
+			return be.Name < oe.Name
+		}
+		return true
+	}
+	if oe.IsDir() {
+		return false
+	}
 	if be.Name == oe.Name {
 		return be.Status() < oe.Status()
 	}
 	return be.Name < oe.Name
 }
 
-func (be *LsoEntry) CopyWithProps(propsSet cos.StrSet) (ne *LsoEntry) {
-	ne = &LsoEntry{Name: be.Name}
+func (be *LsoEnt) CopyWithProps(propsSet cos.StrSet) (ne *LsoEnt) {
+	ne = &LsoEnt{Name: be.Name}
 	if propsSet.Contains(apc.GetPropsSize) {
 		ne.Size = be.Size
 	}
@@ -109,13 +128,16 @@ func (be *LsoEntry) CopyWithProps(propsSet cos.StrSet) (ne *LsoEntry) {
 
 func SortLso(entries LsoEntries) { sort.Slice(entries, entries.cmp) }
 
-func DedupLso(entries LsoEntries, maxSize int) []*LsoEntry {
+func DedupLso(entries LsoEntries, maxSize int, noDirs bool) []*LsoEnt {
 	var j int
-	for _, obj := range entries {
-		if j > 0 && entries[j-1].Name == obj.Name {
+	for _, en := range entries {
+		if j > 0 && entries[j-1].Name == en.Name {
 			continue
 		}
-		entries[j] = obj
+
+		debug.Assert(!(noDirs && en.IsDir())) // expecting backends for filter out accordingly
+
+		entries[j] = en
 		j++
 
 		if maxSize > 0 && j == maxSize {
@@ -129,38 +151,43 @@ func DedupLso(entries LsoEntries, maxSize int) []*LsoEntry {
 // MergeLso merges list-objects results received from targets. For the same
 // object name (ie., the same object) the corresponding properties are merged.
 // If maxSize is greater than 0, the resulting list is sorted and truncated.
-func MergeLso(lists []*LsoResult, maxSize int) *LsoResult {
+func MergeLso(lists []*LsoRes, lsmsg *apc.LsoMsg, maxSize int) *LsoRes {
+	noDirs := lsmsg.IsFlagSet(apc.LsNoDirs)
 	if len(lists) == 0 {
-		return &LsoResult{}
+		return &LsoRes{}
 	}
 	resList := lists[0]
 	token := resList.ContinuationToken
 	if len(lists) == 1 {
 		SortLso(resList.Entries)
-		resList.Entries = DedupLso(resList.Entries, maxSize)
+		resList.Entries = DedupLso(resList.Entries, maxSize, noDirs)
 		resList.ContinuationToken = token
 		return resList
 	}
 
-	tmp := make(map[string]*LsoEntry, len(resList.Entries)*len(lists))
+	tmp := make(map[string]*LsoEnt, len(resList.Entries)*len(lists))
 	for _, l := range lists {
 		resList.Flags |= l.Flags
 		if token < l.ContinuationToken {
 			token = l.ContinuationToken
 		}
-		for _, e := range l.Entries {
-			entry, exists := tmp[e.Name]
+		for _, en := range l.Entries {
+			// expecting backends for filter out
+			debug.Assert(!(noDirs && en.IsDir()))
+
+			// add new
+			entry, exists := tmp[en.Name]
 			if !exists {
-				tmp[e.Name] = e
+				tmp[en.Name] = en
 				continue
 			}
-			// merge the props
-			if !entry.IsPresent() && e.IsPresent() {
-				e.Version = cos.Either(e.Version, entry.Version)
-				tmp[e.Name] = e
+			// merge existing w/ new props
+			if !entry.IsPresent() && en.IsPresent() {
+				en.Version = cos.Left(en.Version, entry.Version)
+				tmp[en.Name] = en
 			} else {
-				entry.Location = cos.Either(entry.Location, e.Location)
-				entry.Version = cos.Either(entry.Version, e.Version)
+				entry.Location = cos.Left(entry.Location, en.Location)
+				entry.Version = cos.Left(entry.Version, en.Version)
 			}
 		}
 	}
@@ -202,4 +229,27 @@ func DirHasOrIsPrefix(dirPath, prefix string) bool {
 
 func ObjHasPrefix(objName, prefix string) bool {
 	return prefix == "" || strings.HasPrefix(objName, prefix)
+}
+
+// no recursion (LsNoRecursion) helper function:
+// - check the level of nesting
+// - possibly, return virtual directory (to be included in LsoRes) and/or filepath.SkipDir
+func HandleNoRecurs(prefix, relPath string) (*LsoEnt, error) {
+	debug.Assert(relPath != "")
+	if prefix == "" || prefix == cos.PathSeparator {
+		return &LsoEnt{Name: relPath, Flags: apc.EntryIsDir}, filepath.SkipDir
+	}
+
+	prefix = cos.TrimLastB(prefix, '/')
+	suffix := strings.TrimPrefix(relPath, prefix)
+	if suffix == relPath {
+		// wrong subtree (unlikely, given higher-level traversal logic)
+		return nil, filepath.SkipDir
+	}
+
+	if strings.Contains(suffix, cos.PathSeparator) {
+		// nesting-wise, we are deeper than allowed by the prefix
+		return nil, filepath.SkipDir
+	}
+	return &LsoEnt{Name: relPath, Flags: apc.EntryIsDir}, nil
 }

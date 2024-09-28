@@ -1,13 +1,13 @@
 // Package hrw provides a way to benchmark different HRW variants.
 // See /bench/hrw/README.md for more info.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package hrw
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -36,9 +36,9 @@ func randFileName(src *rand.Rand, nameLen int) string {
 
 	b := make([]byte, nameLen)
 	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := nameLen-1, src.Int63(), letterIdxMax; i >= 0; {
+	for i, cache, remain := nameLen-1, src.Int64(), letterIdxMax; i >= 0; {
 		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
+			cache, remain = src.Int64(), letterIdxMax
 		}
 		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
 			b[i] = letterBytes[idx]
@@ -60,19 +60,19 @@ func similarFileName(bucketName string, objNum int) string {
 // Duplicated on purpose to avoid dependency on any AIStore code.
 func randNodeID(randGen *rand.Rand) string {
 	randIP := ""
-	for i := 0; i < 3; i++ {
-		randIP += strconv.Itoa(randGen.Intn(255)) + "."
+	for range 3 {
+		randIP += strconv.Itoa(randGen.IntN(255)) + "."
 	}
-	randIP += strconv.Itoa(randGen.Intn(255))
+	randIP += strconv.Itoa(randGen.IntN(255))
 	cksum := xxhash.Checksum32S(cos.UnsafeB(randIP), xxHashSeed)
 	nodeID := strconv.Itoa(int(cksum & 0xfffff))
-	randPort := strconv.Itoa(randGen.Intn(65535))
+	randPort := strconv.Itoa(randGen.IntN(65535))
 	return nodeID + "_" + randPort
 }
 
 func randNodeIDs(numNodes int, randGen *rand.Rand) []node {
 	nodes := make([]node, numNodes)
-	for i := 0; i < numNodes; i++ {
+	for i := range numNodes {
 		id := randNodeID(randGen)
 		xhash := xxhash.NewS64(xxHashSeed)
 		xhash.WriteString(id)
@@ -88,7 +88,7 @@ func randNodeIDs(numNodes int, randGen *rand.Rand) []node {
 
 func get3DSlice(numRoutines, numFuncs, numNodes int) [][][]int {
 	perRoutine := make([][][]int, numRoutines)
-	for w := 0; w < numRoutines; w++ {
+	for w := range numRoutines {
 		perFunc := make([][]int, numFuncs)
 		for p := range perFunc {
 			perFunc[p] = make([]int, numNodes)

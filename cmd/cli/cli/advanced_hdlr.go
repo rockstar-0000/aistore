@@ -30,14 +30,14 @@ var (
 			},
 			{
 				Name:         cmdRmSmap,
-				Usage:        "immediately remove node from cluster map (advanced usage - potential data loss!)",
+				Usage:        "immediately remove node from cluster map (beware: potential data loss!)",
 				ArgsUsage:    nodeIDArgument,
 				Action:       removeNodeFromSmap,
 				BashComplete: suggestAllNodes,
 			},
 			{
 				Name:   cmdRandNode,
-				Usage:  "print random node ID (by default, random target)",
+				Usage:  "print random node ID (by default, ID of a randomly selected target)",
 				Action: randNode,
 				BashComplete: func(c *cli.Context) {
 					if c.NArg() == 0 {
@@ -53,10 +53,24 @@ var (
 			},
 			{
 				Name:         cmdRotateLogs,
-				Usage:        "rotate logs",
+				Usage:        "rotate aistore logs",
 				ArgsUsage:    optionalNodeIDArgument,
 				Action:       rotateLogs,
 				BashComplete: suggestAllNodes,
+			},
+			{
+				Name:         cmdBackendEnable,
+				Usage:        "(re)enable cloud backend (see also: 'ais config cluster backend')",
+				ArgsUsage:    cloudProviderArg,
+				Action:       backendEnableHandler,
+				BashComplete: suggestCloudProvider,
+			},
+			{
+				Name:         cmdBackendDisable,
+				Usage:        "disable cloud backend (see also: 'ais config cluster backend')",
+				ArgsUsage:    cloudProviderArg,
+				Action:       backendDisableHandler,
+				BashComplete: suggestCloudProvider,
 			},
 		},
 	}
@@ -90,7 +104,7 @@ func removeNodeFromSmap(c *cli.Context) error {
 	if node.IsProxy() {
 		smap, err := getClusterMap(c)
 		if err != nil {
-			return err // cannot happen
+			return err // (unlikely)
 		}
 		if smap.IsPrimary(node) {
 			return fmt.Errorf("%s is primary (cannot remove the primary node)", sname)
@@ -130,11 +144,11 @@ func randMountpath(c *cli.Context) error {
 	if tsi.IsProxy() {
 		return fmt.Errorf("%s is a 'proxy' (expecting 'target')", sname)
 	}
-	daeStatus, err := api.GetStatsAndStatus(apiBP, tsi)
+	daeStatus, err := _status(tsi)
 	if err != nil {
 		return V(err)
 	}
-	cdf := daeStatus.Node.TargetCDF
+	cdf := daeStatus.Node.Tcdf
 	for mpath := range cdf.Mountpaths {
 		fmt.Fprintln(c.App.Writer, mpath)
 		break
@@ -160,5 +174,29 @@ func rotateLogs(c *cli.Context) error {
 		return V(err)
 	}
 	actionDone(c, "cluster: rotated all logs")
+	return nil
+}
+
+func backendEnableHandler(c *cli.Context) error {
+	if c.NArg() == 0 {
+		return incorrectUsageMsg(c, c.Command.ArgsUsage)
+	}
+	cloudProvider := c.Args().Get(0)
+	if err := api.EnableBackend(apiBP, cloudProvider); err != nil {
+		return err
+	}
+	actionDone(c, "cluster: enabled "+cloudProvider+" backend")
+	return nil
+}
+
+func backendDisableHandler(c *cli.Context) error {
+	if c.NArg() == 0 {
+		return incorrectUsageMsg(c, c.Command.ArgsUsage)
+	}
+	cloudProvider := c.Args().Get(0)
+	if err := api.DisableBackend(apiBP, cloudProvider); err != nil {
+		return err
+	}
+	actionDone(c, "cluster: disabled "+cloudProvider+" backend")
 	return nil
 }

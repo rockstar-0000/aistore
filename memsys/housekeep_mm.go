@@ -1,7 +1,7 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
@@ -44,7 +45,7 @@ func (r *MMSA) FreeSpec(spec FreeSpec) {
 				x := s.cleanup()
 				if x > 0 {
 					freed += x
-					if verbose {
+					if cmn.Rom.FastV(5, cos.SmoduleMemsys) {
 						nlog.Infof("%s: idle for %v - cleanup", s.tag, idle)
 					}
 				}
@@ -71,9 +72,9 @@ func (r *MMSA) GetStats() (stats *Stats) {
 // private
 //
 
-func (r *MMSA) hkcb() time.Duration {
+func (r *MMSA) hkcb(now int64) time.Duration {
 	// 1. refresh and clone stats
-	r.refreshStats()
+	r.refreshStats(now)
 
 	// 2. update swapping state and compute mem-pressure ranking
 	err := r.mem.Get()
@@ -140,9 +141,8 @@ func (r *MMSA) hkIval(pressure int) time.Duration {
 }
 
 // refresh and clone internal hits/idle stats
-func (r *MMSA) refreshStats() {
-	now := mono.NanoTime()
-	for i := 0; i < r.numSlabs; i++ {
+func (r *MMSA) refreshStats(now int64) {
+	for i := range r.numSlabs {
 		hits, prev := r.slabStats.hits[i].Load(), r.slabStats.prev[i]
 		hinc := hits - prev
 		if hinc == 0 {
@@ -192,7 +192,7 @@ func (r *MMSA) freeIdle() (total int64) {
 			continue
 		}
 		total += freed
-		if verbose && freed > 0 {
+		if freed > 0 && cmn.Rom.FastV(5, cos.SmoduleMemsys) {
 			nlog.Infof("%s idle for %v: freed %s", s.tag, idle, cos.ToSizeIEC(freed, 1))
 		}
 	}

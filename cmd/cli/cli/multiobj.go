@@ -28,6 +28,10 @@ type lrCtx struct {
 	bck                cmn.Bck
 }
 
+func _warnProgress(c *cli.Context) {
+	actionWarn(c, "cannot show progress bar with an empty list/range type option - "+NIY)
+}
+
 // x-TCO: multi-object transform or copy
 func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName string) error {
 	var (
@@ -53,12 +57,12 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		lrMsg.Template = tmplObjs
 	}
 	if showProgress && numObjs == 0 {
-		actionWarn(c, "cannot show progress bar with an empty list/range type option - not implemented yet")
+		_warnProgress(c)
 		showProgress = false
 	}
 
 	// 2. TCO message
-	msg := cmn.TCObjsMsg{ToBck: bckTo}
+	msg := cmn.TCOMsg{ToBck: bckTo}
 	{
 		msg.ListRange = lrMsg
 		msg.DryRun = flagIsSet(c, copyDryRunFlag)
@@ -68,6 +72,9 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		msg.LatestVer = flagIsSet(c, latestVerFlag)
 		msg.Sync = flagIsSet(c, syncFlag)
 		msg.ContinueOnError = flagIsSet(c, continueOnErrorFlag)
+		if flagIsSet(c, numListRangeWorkersFlag) {
+			msg.NumWorkers = parseIntFlag(c, numListRangeWorkersFlag)
+		}
 	}
 	// 3. start copying/transforming
 	var (
@@ -115,7 +122,7 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 	// or wait
 	var timeout time.Duration
 
-	fmt.Fprintf(c.App.Writer, tcbtcoCptn(text, bckFrom, bckTo)+" ...")
+	fmt.Fprint(c.App.Writer, tcbtcoCptn(text, bckFrom, bckTo)+" ...")
 
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
@@ -355,7 +362,9 @@ func (lr *lrCtx) do(c *cli.Context) (err error) {
 		_, xname = xact.GetKindName(kind)
 		text = fmt.Sprintf("%s: %s %s from %s", xact.Cname(xname, xid), s, action, lr.bck.Cname(""))
 	} else {
-		num = pt.Count()
+		if lr.tmplObjs != "" && !emptyTemplate && len(pt.Ranges) != 0 {
+			num = pt.Count()
+		}
 		_, xname = xact.GetKindName(kind)
 		if emptyTemplate {
 			text = fmt.Sprintf("%s: %s entire bucket %s", xact.Cname(xname, xid), action, lr.bck.Cname(""))
@@ -366,6 +375,10 @@ func (lr *lrCtx) do(c *cli.Context) (err error) {
 
 	// 5. progress
 	showProgress := flagIsSet(c, progressFlag)
+	if showProgress && num == 0 {
+		_warnProgress(c)
+		showProgress = false
+	}
 	if showProgress {
 		var cpr = cprCtx{
 			xname:  xname,
@@ -434,11 +447,14 @@ func (lr *lrCtx) _do(c *cli.Context, fileList []string) (xid, kind, action strin
 			msg.ObjNames = fileList
 			msg.Template = lr.tmplObjs
 			msg.LatestVer = flagIsSet(c, latestVerFlag)
-		}
-		if flagIsSet(c, blobThresholdFlag) {
-			msg.BlobThreshold, err = parseSizeFlag(c, blobThresholdFlag)
-			if err != nil {
-				return
+			if flagIsSet(c, blobThresholdFlag) {
+				msg.BlobThreshold, err = parseSizeFlag(c, blobThresholdFlag)
+				if err != nil {
+					return
+				}
+			}
+			if flagIsSet(c, numListRangeWorkersFlag) {
+				msg.NumWorkers = parseIntFlag(c, numListRangeWorkersFlag)
 			}
 		}
 		xid, err = api.Prefetch(apiBP, lr.bck, msg)
@@ -452,7 +468,7 @@ func (lr *lrCtx) _do(c *cli.Context, fileList []string) (xid, kind, action strin
 		kind = apc.ActEvictObjects
 		action = "evict"
 	default:
-		debug.Assert(false, verb)
+		debug.Assert(false, "invalid subcommand: ", verb)
 	}
 	return xid, kind, action, err
 }

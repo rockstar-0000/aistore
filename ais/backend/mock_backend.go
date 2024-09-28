@@ -1,6 +1,6 @@
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -15,55 +15,59 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 const mock = "mock-backend"
 
-type mockBP struct {
+type mockbp struct {
 	t core.TargetPut
+	base
 }
 
 // interface guard
-var _ core.BackendProvider = (*mockBP)(nil)
+var _ core.Backend = (*mockbp)(nil)
 
-func NewDummyBackend(t core.TargetPut) (core.BackendProvider, error) { return &mockBP{t: t}, nil }
-
-func (*mockBP) Provider() string           { return mock }
-func (*mockBP) MaxPageSize(*meta.Bck) uint { return math.MaxUint32 }
-
-func (*mockBP) CreateBucket(*meta.Bck) (int, error) {
-	return http.StatusBadRequest, cmn.NewErrUnsupp("create", mock+" bucket")
+func NewDummyBackend(t core.TargetPut, _ stats.Tracker) (core.Backend, error) {
+	return &mockbp{
+		t:    t,
+		base: base{provider: mock},
+	}, nil
 }
 
-func (*mockBP) HeadBucket(_ ctx, bck *meta.Bck) (cos.StrKVs, int, error) {
+func (*mockbp) MaxPageSize(*meta.Bck) uint { return math.MaxUint32 }
+
+func (*mockbp) HeadBucket(_ context.Context, bck *meta.Bck) (cos.StrKVs, int, error) {
 	return cos.StrKVs{}, http.StatusNotFound, cmn.NewErrRemoteBckOffline(bck.Bucket())
 }
 
-func (*mockBP) ListObjects(bck *meta.Bck, _ *apc.LsoMsg, _ *cmn.LsoResult) (int, error) {
+func (*mockbp) ListObjects(bck *meta.Bck, _ *apc.LsoMsg, _ *cmn.LsoRes) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckOffline(bck.Bucket())
 }
 
 // cannot fail - return empty list
-func (*mockBP) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, errCode int, err error) {
+func (*mockbp) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, ecode int, err error) {
 	return
 }
 
-func (*mockBP) HeadObj(_ ctx, lom *core.LOM) (*cmn.ObjAttrs, int, error) {
+func (*mockbp) HeadObj(_ context.Context, lom *core.LOM, _ *http.Request) (*cmn.ObjAttrs, int, error) {
 	return &cmn.ObjAttrs{}, http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*mockBP) GetObj(_ ctx, lom *core.LOM, _ cmn.OWT) (int, error) {
+func (*mockbp) GetObj(_ context.Context, lom *core.LOM, _ cmn.OWT, _ *http.Request) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*mockBP) GetObjReader(context.Context, *core.LOM, int64, int64) (res core.GetReaderResult) {
+func (*mockbp) GetObjReader(_ context.Context, lom *core.LOM, _, _ int64) (res core.GetReaderResult) {
+	res.Err = cmn.NewErrRemoteBckOffline(lom.Bucket())
+	res.ErrCode = http.StatusNotFound
 	return
 }
 
-func (*mockBP) PutObj(_ io.ReadCloser, lom *core.LOM, _ *core.ExtraArgsPut) (int, error) {
+func (*mockbp) PutObj(_ io.ReadCloser, lom *core.LOM, _ *http.Request) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }
 
-func (*mockBP) DeleteObj(lom *core.LOM) (int, error) {
+func (*mockbp) DeleteObj(lom *core.LOM) (int, error) {
 	return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(lom.Bucket())
 }

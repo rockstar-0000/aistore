@@ -6,6 +6,7 @@ package dsort
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -117,7 +117,7 @@ func (m *Manager) start() (err error) {
 
 		shardSize := int64(float64(m.Pars.OutputShardSize) / ratio)
 		nlog.Infof("%s: [dsort] %s started phase 3: ratio=%f, shard size (%d, %d)",
-			core.T, m.ManagerUUID, shardSize, m.Pars.OutputShardSize)
+			core.T, m.ManagerUUID, ratio, shardSize, m.Pars.OutputShardSize)
 		if err := m.phase3(shardSize); err != nil {
 			nlog.Errorf("%s: [dsort] %s phase3 err: %v", core.T, m.ManagerUUID, err)
 			return err
@@ -366,7 +366,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 			return err
 		}
 
-		if lom.SizeBytes() <= 0 {
+		if lom.Lsize() <= 0 {
 			goto exit
 		}
 
@@ -378,7 +378,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 		o := transport.AllocSend()
 		o.Hdr = transport.ObjHdr{
 			ObjName:  shardName,
-			ObjAttrs: cmn.ObjAttrs{Size: lom.SizeBytes(), Cksum: lom.Checksum()},
+			ObjAttrs: cmn.ObjAttrs{Size: lom.Lsize(), Cksum: lom.Checksum()},
 		}
 		o.Hdr.Bck.Copy(lom.Bucket())
 
@@ -467,7 +467,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 			)
 			group.Go(func() error {
 				var (
-					buf, slab = g.mm.AllocSize(serializationBufSize)
+					buf, slab = g.mem.AllocSize(serializationBufSize)
 					msgpw     = msgp.NewWriterBuf(w, buf)
 				)
 				defer slab.Free(buf)
@@ -605,21 +605,14 @@ func (m *Manager) generateShardsWithTemplate(maxSize int64) ([]*shard.Shard, err
 	return shards, nil
 }
 
-func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard, error) {
-	var (
-		shards         = make([]*shard.Shard, 0)
-		externalKeyMap = make(map[string]string)
-		shardsBuilder  = make(map[string][]*shard.Shard)
-	)
-	if maxSize <= 0 {
-		return nil, fmt.Errorf(fmtErrInvalidMaxSize, maxSize)
-	}
-	parsedURL, err := url.Parse(m.Pars.OrderFileURL)
+func (m *Manager) parseEKMFile() (shard.ExternalKeyMap, error) {
+	ekm := shard.NewExternalKeyMap(64)
+	parsedURL, err := url.Parse(m.Pars.EKMFileURL)
 	if err != nil {
-		return nil, fmt.Errorf(fmtErrOrderURL, m.Pars.OrderFileURL, err)
+		return nil, fmt.Errorf(fmtErrOrderURL, m.Pars.EKMFileURL, err)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, m.Pars.OrderFileURL, http.NoBody)
+	req, err := http.NewRequest(http.MethodGet, m.Pars.EKMFileURL, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -635,8 +628,8 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard,
 	defer cos.Close(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf(
-			"unexpected status code (%d) when requesting order file from %q",
-			resp.StatusCode, m.Pars.OrderFileURL,
+			"unexpected status code (%d) when requesting ekm file from %q",
+			resp.StatusCode, m.Pars.EKMFileURL,
 		)
 	}
 
@@ -644,63 +637,115 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard,
 	//  need to save file to the disk and operate on the file directly rather
 	//  than keeping everything in memory.
 
-	switch filepath.Ext(parsedURL.Path) {
-	case ".json":
-		var ekm map[string][]string
-		if err := jsoniter.NewDecoder(resp.Body).Decode(&ekm); err != nil {
-			return nil, err
-		}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 
-		for shardNameFmt, recordKeys := range ekm {
+	// Attempt to parse as JSON
+	var content map[string][]string
+	jsonErr := jsoniter.Unmarshal(bodyBytes, &content)
+	if jsonErr != nil && filepath.Ext(parsedURL.Path) == ".json" {
+		return nil, errors.New("EKM file parsing as JSON fails, but the file extension is .json which is not allowed")
+	}
+
+	if jsonErr == nil {
+		// Add keys to the EKM
+		for shardNameFmt, recordKeys := range content {
 			for _, recordKey := range recordKeys {
-				externalKeyMap[recordKey] = shardNameFmt
-			}
-		}
-	default:
-		lineReader := bufio.NewReader(resp.Body)
-		for idx := 0; ; idx++ {
-			l, _, err := lineReader.ReadLine()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			line := strings.TrimSpace(string(l))
-			if line == "" {
-				continue
-			}
-
-			parts := strings.Split(line, m.Pars.OrderFileSep)
-			if len(parts) != 2 {
-				msg := fmt.Sprintf("malformed line (%d) in external key map: %s", idx, line)
-				if err := m.react(m.Pars.EKMMalformedLine, msg); err != nil {
+				if err := ekm.Add(recordKey, shardNameFmt); err != nil {
 					return nil, err
 				}
 			}
-
-			recordKey, shardNameFmt := parts[0], parts[1]
-			externalKeyMap[recordKey] = shardNameFmt
 		}
+		return ekm, nil
+	}
+
+	// Parse as normal EKM file
+	lineReader := bufio.NewReader(bytes.NewReader(bodyBytes))
+	for idx := 0; ; idx++ {
+		l, _, err := lineReader.ReadLine()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		line := strings.TrimSpace(string(l))
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, m.Pars.EKMFileSep)
+		if len(parts) != 2 {
+			msg := fmt.Sprintf("malformed line (%d) in external key map: %s", idx, line)
+			if err := m.react(m.Pars.EKMMalformedLine, msg); err != nil {
+				return nil, err
+			}
+		}
+
+		recordKey, shardNameFmt := parts[0], parts[1]
+		if err := ekm.Add(recordKey, shardNameFmt); err != nil {
+			return nil, err
+		}
+	}
+
+	return ekm, nil
+}
+
+func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard, error) {
+	var (
+		shards         = make([]*shard.Shard, 0)
+		shardTemplates = make(map[string]*cos.ParsedTemplate, 8)
+		shardsBuilder  = make(map[string][]*shard.Shard, 8)
+	)
+	if maxSize <= 0 {
+		return nil, fmt.Errorf(fmtErrInvalidMaxSize, maxSize)
+	}
+
+	ekm, err := m.parseEKMFile()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, shardNameFmt := range ekm.All() {
+		tmpl, err := cos.NewParsedTemplate(shardNameFmt)
+		if err != nil {
+			return nil, err
+		}
+		if len(tmpl.Ranges) == 0 {
+			return nil, fmt.Errorf("invalid output template %q: no ranges (prefix-only output is not supported)", shardNameFmt)
+		}
+		shardTemplates[shardNameFmt] = &tmpl
+		shardTemplates[shardNameFmt].InitIter()
 	}
 
 	for _, r := range m.recm.Records.All() {
 		key := fmt.Sprintf("%v", r.Key)
-		shardNameFmt, ok := externalKeyMap[key]
-		if !ok {
-			msg := fmt.Sprintf("record %q doesn't belong in external key map", key)
+		shardNameFmt, err := ekm.Lookup(key)
+		if err != nil {
+			msg := fmt.Sprintf("error on lookup record %q in external key map: %s", key, err)
 			if err := m.react(m.Pars.EKMMissingKey, msg); err != nil {
 				return nil, err
 			}
 		}
 
-		shards := shardsBuilder[shardNameFmt]
 		recordSize := r.TotalSize() + m.shardRW.MetadataSize()*int64(len(r.Objects))
-		shardCount := len(shards)
-		if shardCount == 0 || shards[shardCount-1].Size > maxSize {
+
+		// retrieve all shards created using the current template format
+		shards := shardsBuilder[shardNameFmt]
+		// if no shards exist for this template, or the last shard exceeds the max size, create a new shard
+		if len(shards) == 0 || shards[len(shards)-1].Size > maxSize {
+			shardName, hasNext := shardTemplates[shardNameFmt].Next()
+			if !hasNext {
+				return nil, fmt.Errorf(
+					"number of shards to be created using %s template exceeds expected number of shards (%d)",
+					shardTemplates[shardNameFmt].Prefix, shardTemplates[shardNameFmt].Count(),
+				)
+			}
 			shard := &shard.Shard{
-				Name:    fmt.Sprintf(shardNameFmt, shardCount),
+				Name:    shardName,
 				Size:    recordSize,
 				Records: shard.NewRecords(1),
 			}
@@ -708,7 +753,7 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard,
 			shardsBuilder[shardNameFmt] = append(shardsBuilder[shardNameFmt], shard)
 		} else {
 			// Append records
-			lastShard := shards[shardCount-1]
+			lastShard := shards[len(shards)-1]
 			lastShard.Size += recordSize
 			lastShard.Records.Insert(r)
 		}
@@ -750,7 +795,7 @@ func (m *Manager) phase3(maxSize int64) error {
 			sendOrder[d.ID()] = make(map[string]*shard.Shard, 100)
 		}
 	}
-	if m.Pars.OrderFileURL != "" {
+	if m.Pars.EKMFileURL != "" {
 		shards, err = m.generateShardsWithOrderingFile(maxSize)
 	} else {
 		shards, err = m.generateShardsWithTemplate(maxSize)
@@ -816,7 +861,7 @@ func (m *Manager) _dist(si *meta.Snode, s []*shard.Shard, order map[string]*shar
 	)
 	group.Go(func() error {
 		var (
-			buf, slab = g.mm.AllocSize(serializationBufSize)
+			buf, slab = g.mem.AllocSize(serializationBufSize)
 			msgpw     = msgp.NewWriterBuf(w, buf)
 			md        = &CreationPhaseMetadata{Shards: s, SendOrder: order}
 		)
@@ -859,7 +904,7 @@ func (m *Manager) _do(reqArgs *cmn.HreqArgs, tsi *meta.Snode, act string) error 
 	}
 	if resp.StatusCode != http.StatusOK {
 		var b []byte
-		b, err = io.ReadAll(resp.Body)
+		b, err = cos.ReadAll(resp.Body)
 		if err == nil {
 			err = fmt.Errorf("%s: %s failed to %s: %s", core.T, m.ManagerUUID, act, strings.TrimSuffix(string(b), "\n"))
 		} else {
@@ -955,20 +1000,20 @@ func (es *extractShard) _do(lom *core.LOM) error {
 	}
 
 	lom.Lock(false)
-	fh, err := os.Open(lom.FQN)
+	fh, err := lom.Open()
 	if err != nil {
 		phaseInfo.adjuster.releaseSema(lom.Mountpath())
 		lom.Unlock(false)
 		return errors.Errorf("unable to open %s: %v", lom.Cname(), err)
 	}
 
-	expectedExtractedSize := uint64(float64(lom.SizeBytes()) / m.compressionRatio())
+	expectedExtractedSize := uint64(float64(lom.Lsize()) / m.compressionRatio())
 	toDisk := m.dsorter.preShardExtraction(expectedExtractedSize)
 
 	extractedSize, extractedCount, err := shardRW.Extract(lom, fh, m.recm, toDisk)
 	cos.Close(fh)
 
-	m.addSizes(lom.SizeBytes(), extractedSize) // update compression rate
+	m.addSizes(lom.Lsize(), extractedSize) // update compression rate
 
 	phaseInfo.adjuster.releaseSema(lom.Mountpath())
 	lom.Unlock(false)

@@ -1,6 +1,6 @@
 // Package integration contains AIS integration tests.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package apitests_test
 
@@ -19,8 +19,8 @@ import (
 )
 
 type testConfig struct {
-	objectCnt uint
-	pageSize  uint
+	objectCnt int
+	pageSize  int
 	useCache  bool
 }
 
@@ -31,20 +31,20 @@ func (tc testConfig) name() string {
 	)
 }
 
-func createAndFillBucket(b *testing.B, objCnt uint, u string) cmn.Bck {
+func createAndFillBucket(b *testing.B, objCnt int, u string) cmn.Bck {
 	const workerCount = 10
 	var (
 		bck        = cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
 		baseParams = tools.BaseAPIParams(u)
 
 		wg              = &sync.WaitGroup{}
-		objCntPerWorker = int(objCnt) / workerCount
+		objCntPerWorker = objCnt / workerCount
 	)
 
 	tools.CreateBucket(b, baseParams.URL, bck, nil, true /*cleanup*/)
 
 	// Iterations of PUT
-	for wid := uint(0); wid < workerCount; wid++ {
+	for range workerCount {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -81,15 +81,15 @@ func BenchmarkListObject(b *testing.B) {
 			)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				msg := &apc.LsoMsg{PageSize: test.pageSize}
+			for range b.N {
+				msg := &apc.LsoMsg{PageSize: int64(test.pageSize)}
 				if test.useCache {
 					msg.SetFlag(apc.UseListObjsCache)
 				}
 				objs, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
 				tassert.CheckFatal(b, err)
 				tassert.Errorf(
-					b, len(objs.Entries) == int(test.objectCnt),
+					b, len(objs.Entries) == test.objectCnt,
 					"expected %d objects got %d", test.objectCnt, len(objs.Entries),
 				)
 			}

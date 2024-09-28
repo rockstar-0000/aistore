@@ -22,7 +22,6 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
@@ -119,12 +118,12 @@ func (*clnFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, er
 
 func RunCleanup(ini *IniCln) fs.CapStatus {
 	var (
-		xcln           = ini.Xaction
-		config         = cmn.GCO.Get()
-		availablePaths = fs.GetAvail()
-		num            = len(availablePaths)
-		joggers        = make(map[string]*clnJ, num)
-		parent         = &clnP{joggers: joggers, ini: *ini}
+		xcln    = ini.Xaction
+		config  = cmn.GCO.Get()
+		avail   = fs.GetAvail()
+		num     = len(avail)
+		joggers = make(map[string]*clnJ, num)
+		parent  = &clnP{joggers: joggers, ini: *ini}
 	)
 	defer func() {
 		if ini.WG != nil {
@@ -136,7 +135,7 @@ func RunCleanup(ini *IniCln) fs.CapStatus {
 		xcln.Finish()
 		return fs.CapStatus{}
 	}
-	for mpath, mi := range availablePaths {
+	for mpath, mi := range avail {
 		joggers[mpath] = &clnJ{
 			oldWork: make([]string, 0, 64),
 			stopCh:  make(chan struct{}, 1),
@@ -379,7 +378,7 @@ func (j *clnJ) visitCT(parsedFQN *fs.ParsedFQN, fqn string) {
 			j.oldWork = append(j.oldWork, fqn)
 			return
 		}
-		if err := ct.LoadFromFS(); err != nil {
+		if err := ct.LoadSliceFromFS(); err != nil {
 			return
 		}
 		// Saving a CT is not atomic: first it saves CT, then its metafile
@@ -424,28 +423,28 @@ func (j *clnJ) visitObj(fqn string, lom *core.LOM) {
 	}
 	// handle load err
 	if errLoad := lom.Load(false /*cache it*/, false /*locked*/); errLoad != nil {
-		_, atime, err := ios.FinfoAtime(lom.FQN)
+		_, atimefs, _, err := lom.Fstat(true /*get-atime*/)
 		if err != nil {
 			if !os.IsNotExist(err) {
 				err = os.NewSyscallError("stat", err)
 				j.ini.Xaction.AddErr(err)
-				core.T.FSHC(err, lom.FQN)
+				core.T.FSHC(err, lom.Mountpath(), lom.FQN)
 			}
 			return
 		}
 		// too early to remove anything
-		if atime+int64(j.config.LRU.DontEvictTime) < j.now {
+		if atimefs+int64(j.config.LRU.DontEvictTime) < j.now {
 			return
 		}
 		if cmn.IsErrLmetaCorrupted(err) {
-			if err := cos.RemoveFile(lom.FQN); err != nil {
+			if err := lom.RemoveMain(); err != nil {
 				nlog.Errorf("%s: failed to rm MD-corrupted %s: %v (nested: %v)", j, lom, errLoad, err)
 				j.ini.Xaction.AddErr(err)
 			} else {
 				nlog.Errorf("%s: removed MD-corrupted %s: %v", j, lom, errLoad)
 			}
 		} else if cmn.IsErrLmetaNotFound(err) {
-			if err := cos.RemoveFile(lom.FQN); err != nil {
+			if err := lom.RemoveMain(); err != nil {
 				nlog.Errorf("%s: failed to rm no-MD %s: %v (nested: %v)", j, lom, errLoad, err)
 				j.ini.Xaction.AddErr(err)
 			} else {
@@ -470,7 +469,7 @@ func (j *clnJ) visitObj(fqn string, lom *core.LOM) {
 	if lom.IsCopy() {
 		return
 	}
-	if lom.Bprops().EC.Enabled {
+	if lom.ECEnabled() {
 		metaFQN := fs.CSM.Gen(lom, fs.ECMetaType, "")
 		if cos.Stat(metaFQN) != nil {
 			j.misplaced.ec = append(j.misplaced.ec, core.NewCTFromLOM(lom, fs.ObjectType))
@@ -505,18 +504,18 @@ func (j *clnJ) rmExtraCopies(lom *core.LOM) {
 }
 
 func (j *clnJ) walk(fqn string, de fs.DirEntry) error {
+	var parsed fs.ParsedFQN
 	if de.IsDir() {
 		return nil
 	}
 	if err := j.yieldTerm(); err != nil {
 		return err
 	}
-	parsedFQN, _, err := core.ResolveFQN(fqn)
-	if err != nil {
+	if _, err := core.ResolveFQN(fqn, &parsed); err != nil {
 		return nil
 	}
-	if parsedFQN.ContentType != fs.ObjectType {
-		j.visitCT(&parsedFQN, fqn)
+	if parsed.ContentType != fs.ObjectType {
+		j.visitCT(&parsed, fqn)
 	} else {
 		lom := core.AllocLOM("")
 		j.visitObj(fqn, lom)
@@ -571,9 +570,9 @@ func (j *clnJ) rmLeftovers() (size int64, err error) {
 			core.FreeLOM(lom)
 			if removed {
 				fevicted++
-				bevicted += mlom.SizeBytes(true /*not loaded*/)
+				bevicted += mlom.Lsize(true /*not loaded*/)
 				if cmn.Rom.FastV(4, cos.SmoduleSpace) {
-					nlog.Infof("%s: rm misplaced %q, size=%d", j, mlom, mlom.SizeBytes(true /*not loaded*/))
+					nlog.Infof("%s: rm misplaced %q, size=%d", j, mlom, mlom.Lsize(true /*not loaded*/))
 				}
 				if err = j.yieldTerm(); err != nil {
 					return
@@ -591,7 +590,7 @@ func (j *clnJ) rmLeftovers() (size int64, err error) {
 		}
 		if os.Remove(ct.FQN()) == nil {
 			fevicted++
-			bevicted += ct.SizeBytes()
+			bevicted += ct.Lsize()
 			if err = j.yieldTerm(); err != nil {
 				return
 			}

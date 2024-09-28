@@ -1,6 +1,6 @@
 // Package mock provides a variety of mock implementations used for testing.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package mock
 
@@ -32,7 +32,8 @@ func NewBaseBownerMock(bcks ...*meta.Bck) *BownerMock {
 
 	owner := &BownerMock{BMD: meta.BMD{Version: 1, Providers: providers}}
 	for _, bck := range bcks {
-		bck.Props.BID = bck.MaskBID(owner.BMD.Version)
+		isAis := bck.IsAIS()
+		bck.Props.BID = meta.NewBID(owner.BMD.Version, isAis)
 		owner.Add(bck)
 	}
 	return owner

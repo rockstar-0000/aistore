@@ -57,15 +57,15 @@ func log(sev severity, depth int, format string, args ...any) {
 	case !flag.Parsed():
 		os.Stderr.WriteString("Error: logging before flag.Parse: ")
 		fallthrough
-	case toStderr:
+	case LogToStderr:
 		fb := alloc()
 		sprintf(sev, depth, format, fb, args...)
 		fb.flush(os.Stderr)
 		free(fb)
-	case alsoToStderr || sev >= sevWarn:
+	case sev >= sevWarn:
 		fb := alloc()
 		sprintf(sev, depth, format, fb, args...)
-		if alsoToStderr || sev >= sevErr {
+		if sev >= sevErr {
 			fb.flush(os.Stderr)
 		}
 		if sev >= sevWarn {
@@ -186,7 +186,11 @@ func (nlog *nlog) flush() {
 func (nlog *nlog) do(pw *fixed) {
 	// write
 	if nlog.erred.Load() {
-		os.Stderr.Write(pw.buf[:pw.woff])
+		if Stopping() {
+			_whileStopping(pw.buf[:pw.woff])
+		} else {
+			os.Stderr.Write(pw.buf[:pw.woff])
+		}
 	} else {
 		n, err := pw.flush(nlog.file)
 		if err != nil {
@@ -271,8 +275,8 @@ func formatHdr(s severity, depth int, fb *fixed) {
 	}
 	fb.writeByte(char[s])
 	fb.writeByte(' ')
-	now := time.Now()
-	fb.writeString(now.Format("15:04:05.000000"))
+
+	fb.writeStamp()
 
 	fb.writeByte(' ')
 	if _, redact := redactFnames[fn]; redact {
@@ -292,6 +296,14 @@ func sprintf(sev severity, depth int, format string, fb *fixed, args ...any) {
 		fmt.Fprintf(fb, format, args...)
 		fb.eol()
 	}
+}
+
+const wstag = "[while stopping:] "
+
+func _whileStopping(p []byte) {
+	os.Stderr.WriteString(wstag)
+	os.Stderr.Write(p)
+	os.Stderr.WriteString("\n")
 }
 
 // mem pool of additional buffers

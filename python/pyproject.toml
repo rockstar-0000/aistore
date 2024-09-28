@@ -11,6 +11,7 @@ include = ["aistore"]
 [tool.pytest.ini_options]
 markers = [
     "etl: marks tests as using etl and therefore requiring k8s cluster",
+    "authn: marks tests as using AuthN and therefore requiring AIStore cluster to be deployed with AuthN",
 ]
 
 [tool.hatch.version]
@@ -43,7 +44,8 @@ dependencies = [
     "cloudpickle==2.2.0",
     "humanize>=4.6.0",
     "braceexpand>=0.1.7",
-    "msgspec>=0.15.1"
+    "msgspec>=0.15.1",
+    "webdataset==0.2.86"
 ]
 
 keywords = [

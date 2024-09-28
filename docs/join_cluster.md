@@ -18,21 +18,29 @@ Also, see related:
 * [CLI: `ais cluster` command](/docs/cli/cluster.md)
 * [Scripted integration tests](https://github.com/NVIDIA/aistore/tree/main/ais/test/scripts)
 
-## Joining a Cluster: _discovery_ URL, and more
+## Joining a Cluster: _discovery_ URL
 
-First, some basic facts. AIStore clusters can be deployed with an arbitrary number of AIStore proxies. Each proxy/gateway implements RESTful API and provides full access to objects stored in the cluster. Each proxy collaborates with all other proxies to perform majority-voted HA failovers (section [Highly Available Control Plane](ha.md).
+First, some basic facts. AIStore clusters can be deployed with an arbitrary number of AIStore proxies (a.k.a. gateways).
 
-There are some subtle differences between proxies, though. Two of them can be designated via [AIStore configuration](/deploy/dev/local/aisnode_config.sh)) as an *original* and a *discovery*. The *original* (located at the configurable `original_url`) is expected to point to the primary at the cluster initial deployment time.
+Each proxy/gateway implements RESTful APIs (both native and S3 compatible) and provides full access to user data stored in the cluster.
 
-Later on, when and if an HA event triggers automated failover, the role of the primary will be automatically assumed by a different proxy/gateway, with the corresponding cluster map (Smap) update getting synchronized across all running nodes.
+Each proxy collaborates with other proxies in the cluster to perform majority-voted HA failovers (section [Highly Available Control Plane](ha.md).
 
-A new node, however, could potentially experience a problem when trying to join an already deployed and running cluster - simply because its configuration may still be referring to the old primary. The `discovery_url` (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh)) is precisely intended to address this scenario.
+All _electable_ proxies are functionally equivalent. The one that is elected as _primary_ is, among other things, responsible to _join_ nodes to the running cluster.
 
-Here's how a new node joins a running AIStore cluster:
+To facilitate node-joining in presence of disruptive events, such as:
 
-- first, there's the primary proxy/gateway referenced by the current cluster map (Smap) and/or - during the cluster deployment time - by the configured `primary_url` (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh))
+* network failures, and/or
+* partial or complete loss of local copies of aistore metadata (e.g., cluster maps)
 
-- if joining via the `primary_url` fails, then the new node goes ahead and tries the alternatives:
-  - `discovery_url`
-  - `original_url`
-- but only if those are defined and different from the previously tried.
+- to still be able to reconnect and restore operation, we also provide so called *original* and *discovery* URLs in the cluster configuration.
+
+The latter is versioned, replicated, protected and distributed - solely by the elected primary.
+
+> **March 2024 UPDATE**: starting v3.23, the *original* URL does _not_ track the "original" primary. Instead, the current (or currently elected) primary takes full responsibility for updating both URLs with the single and singular purpose: optimizing time to join or rejoin cluster.
+
+For instance:
+
+When and if an HA event triggers automated failover, the role of the primary will be automatically assumed by a different proxy/gateway, with the corresponding cluster map (Smap) update getting synchronized across all running nodes.
+
+A new node, however, could potentially experience a problem when trying to join an already deployed and running cluster - simply because its configuration may still be referring to the old primary. The *original* and *discovery* URLs (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh)) are precisely intended to address this scenario.
