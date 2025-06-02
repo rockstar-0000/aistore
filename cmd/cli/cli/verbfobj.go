@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles object operations.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
 	"github.com/vbauerster/mpb/v4/decor"
@@ -31,15 +33,15 @@ import (
 
 type (
 	uparams struct {
-		wop       wop
-		bck       cmn.Bck
-		fobjs     []fobj
-		workerCnt int
-		refresh   time.Duration
-		cksum     *cos.Cksum
-		cptn      string
-		totalSize int64
-		dryRun    bool
+		wop        wop
+		bck        cmn.Bck
+		fobjs      []fobj
+		numWorkers int
+		refresh    time.Duration
+		cksum      *cos.Cksum
+		cptn       string
+		totalSize  int64
+		dryRun     bool
 	}
 	uctx struct {
 		wg            cos.WG
@@ -76,7 +78,14 @@ func verbFobjs(c *cli.Context, wop wop, fobjs []fobj, bck cmn.Bck, ndir int, rec
 		return errU
 	}
 	if totalSize == 0 {
-		return fmt.Errorf("total size of all files is zero (%s, %v)", wop.verb(), fobjs)
+		err := fmt.Errorf("%s: total size of all files is zero", wop.verb())
+		if !flagIsSet(c, yesFlag) {
+			if !confirm(c, err.Error()+" - proceed anyway?") {
+				return err
+			}
+		} else {
+			actionWarn(c, err.Error())
+		}
 	}
 
 	if err := teb.Print(extSizes, tmpl, opts); err != nil {
@@ -94,26 +103,28 @@ func verbFobjs(c *cli.Context, wop wop, fobjs []fobj, bck cmn.Bck, ndir int, rec
 
 	// confirm
 	if flagIsSet(c, dryRunFlag) {
-		actionCptn(c, dryRunHeader()+" ", cptn)
+		actionCptn(c, dryRunHeader(), cptn)
 	} else if !flagIsSet(c, yesFlag) {
-		if ok := confirm(c, cptn+"?"); !ok {
+		if !confirm(c, cptn+"?") {
 			fmt.Fprintln(c.App.Writer, "Operation canceled")
 			return nil
 		}
 	}
 	refresh := calcPutRefresh(c)
-	numWorkers := parseIntFlag(c, concurrencyFlag)
-	debug.Assert(numWorkers > 0)
+	numWorkers, err := parseNumWorkersFlag(c, numPutWorkersFlag)
+	if err != nil {
+		return err
+	}
 	uparams := &uparams{
-		wop:       wop,
-		bck:       bck,
-		fobjs:     fobjs,
-		workerCnt: numWorkers,
-		refresh:   refresh,
-		cksum:     cksum,
-		cptn:      cptn,
-		totalSize: totalSize,
-		dryRun:    flagIsSet(c, dryRunFlag),
+		wop:        wop,
+		bck:        bck,
+		fobjs:      fobjs,
+		numWorkers: numWorkers,
+		refresh:    refresh,
+		cksum:      cksum,
+		cptn:       cptn,
+		totalSize:  totalSize,
+		dryRun:     flagIsSet(c, dryRunFlag),
 	}
 	return uparams.do(c)
 }
@@ -144,7 +155,7 @@ func (p *uparams) do(c *cli.Context) error {
 	u := &uctx{
 		verbose:      flagIsSet(c, verboseFlag),
 		showProgress: flagIsSet(c, progressFlag),
-		wg:           cos.NewLimitedWaitGroup(p.workerCnt, 0),
+		wg:           cos.NewLimitedWaitGroup(p.numWorkers, 0),
 		lastReport:   time.Now(),
 		reportEvery:  p.refresh,
 	}
@@ -167,9 +178,7 @@ func (p *uparams) do(c *cli.Context) error {
 		u.barSize = totalBars[1]
 	}
 
-	if flagIsSet(c, putRetriesFlag) {
-		_ = parseRetriesFlag(c, putRetriesFlag, true)
-	}
+	_ = parseRetriesFlag(c, putRetriesFlag, true) // to warn once, if need be
 
 	u.errCh = make(chan string, len(p.fobjs))
 	for _, fobj := range p.fobjs {
@@ -223,6 +232,12 @@ func (p *uparams) _putOne(c *cli.Context, fobj fobj, reader cos.ReadOpenCloser, 
 	if isTout {
 		putArgs.BaseParams.Client.Timeout = longClientTimeout
 	}
+
+	// encode special symbols
+	if flagIsSet(c, encodeObjnameFlag) {
+		putArgs.ObjName = url.PathEscape(putArgs.ObjName)
+	}
+
 	_, err = api.PutObject(&putArgs)
 	return
 }
@@ -296,10 +311,10 @@ func (u *uctx) init(c *cli.Context, fobj fobj) (fh *cos.FileHandle, bar *mpb.Bar
 			fmt.Fprint(c.App.Writer, str)
 		}
 		u.errCount.Inc()
-		return
+		return nil, nil, err
 	}
 	if !u.showProgress || !u.verbose {
-		return
+		return fh, nil, nil
 	}
 
 	// setup "verbose" bar
@@ -318,20 +333,19 @@ func (u *uctx) init(c *cli.Context, fobj fobj) (fh *cos.FileHandle, bar *mpb.Bar
 		options = append(options, mpb.AppendDecorators(decor.Percentage(decor.WCSyncWidth)))
 	}
 	bar = u.progress.AddBar(fobj.size, options...)
-	return
+	return fh, bar, nil
 }
 
 func (u *uctx) do(c *cli.Context, p *uparams, fobj fobj, fh *cos.FileHandle, updateBar func(int, error)) {
 	var (
 		err         error
 		skipVC      = flagIsSet(c, skipVerCksumFlag)
-		countReader = cos.NewCallbackReadOpenCloser(fh, updateBar /*progress callback*/)
+		countReader = newRocCb(fh, updateBar /*progress callback*/, 0)
 		iters       = 1
 		isTout      bool
 	)
-	if flagIsSet(c, putRetriesFlag) {
-		iters += parseRetriesFlag(c, putRetriesFlag, false /*warn*/)
-	}
+	iters += parseRetriesFlag(c, putRetriesFlag, false /*warn*/)
+
 	switch p.wop.verb() {
 	case "PUT":
 		for i := range iters {
@@ -346,13 +360,14 @@ func (u *uctx) do(c *cli.Context, p *uparams, fobj fobj, fh *cos.FileHandle, upd
 			if i < iters-1 {
 				s := fmt.Sprintf("[#%d] %s: %v - retrying...", i+1, fobj.path, e)
 				fmt.Fprintln(c.App.ErrWriter, s)
-				time.Sleep(time.Second)
-				ffh, errO := fh.Open()
+				briefPause(1)
+
+				ffh, errO := fh.OpenDup()
 				if errO != nil {
 					fmt.Fprintf(c.App.ErrWriter, "failed to reopen %s: %v\n", fobj.path, errO)
 					break
 				}
-				countReader = cos.NewCallbackReadOpenCloser(ffh, updateBar /*progress callback*/)
+				countReader = newRocCb(ffh, updateBar /*progress callback*/, 0)
 				isTout = isTimeout(e)
 			}
 		}
@@ -429,8 +444,9 @@ func putRegular(c *cli.Context, bck cmn.Bck, objName, path string, finfo os.File
 		// setup progress bar
 		args := barArgs{barType: sizeArg, barText: objName, total: finfo.Size()}
 		progress, bars = simpleBar(args)
+
 		cb := func(n int, _ error) { bars[0].IncrBy(n) }
-		reader = cos.NewCallbackReadOpenCloser(fh, cb)
+		reader = newRocCb(fh, cb, 0)
 	}
 
 	putArgs := api.PutArgs{
@@ -441,10 +457,13 @@ func putRegular(c *cli.Context, bck cmn.Bck, objName, path string, finfo os.File
 		Cksum:      cksum,
 		SkipVC:     flagIsSet(c, skipVerCksumFlag),
 	}
-	iters := 1
-	if flagIsSet(c, putRetriesFlag) {
-		iters += parseRetriesFlag(c, putRetriesFlag, true /*warn*/)
+	// encode special symbols
+	if flagIsSet(c, encodeObjnameFlag) {
+		putArgs.ObjName = url.PathEscape(putArgs.ObjName)
 	}
+	iters := 1
+	iters += parseRetriesFlag(c, putRetriesFlag, true /*warn*/)
+
 	for i := range iters {
 		_, err = api.PutObject(&putArgs)
 		if err == nil {
@@ -453,11 +472,17 @@ func putRegular(c *cli.Context, bck cmn.Bck, objName, path string, finfo os.File
 			}
 			break
 		}
+
+		if e, ok := err.(*cmn.ErrCreateHreq); ok {
+			return e
+		}
+
 		e := stripErr(err)
 		if i < iters-1 {
 			s := fmt.Sprintf("[#%d] %s: %v - retrying...", i+1, path, e)
 			fmt.Fprintln(c.App.ErrWriter, s)
-			time.Sleep(time.Second)
+			briefPause(1)
+
 			putArgs.Reader, err = fh.Open()
 			if isTimeout(e) {
 				putArgs.BaseParams.Client.Timeout = longClientTimeout
@@ -501,10 +526,13 @@ func putAppendChunks(c *cli.Context, bck cmn.Bck, objName string, r io.Reader, c
 		if n == 0 {
 			break
 		}
-		reader = cos.NewByteHandle(b.Bytes())
+
+		fh := cos.NewByteReader(b.Bytes())
+		reader = fh
 		if flagIsSet(c, progressFlag) {
 			actualChunkOffset := atomic.NewInt64(0)
-			reader = cos.NewCallbackReadOpenCloser(reader, func(n int, _ error) {
+
+			readCb := func(n int, _ error) {
 				if n == 0 {
 					return
 				}
@@ -517,7 +545,9 @@ func putAppendChunks(c *cli.Context, bck cmn.Bck, objName string, r io.Reader, c
 					return
 				}
 				pi.printProgress(int64(n))
-			})
+			}
+
+			reader = newRocCb(fh, readCb, 0)
 		}
 		if i == 0 {
 			// overwrite, if exists
@@ -528,6 +558,10 @@ func putAppendChunks(c *cli.Context, bck cmn.Bck, objName string, r io.Reader, c
 				ObjName:    objName,
 				Reader:     reader,
 				Size:       uint64(n),
+			}
+			// encode special symbols
+			if flagIsSet(c, encodeObjnameFlag) {
+				putArgs.ObjName = url.PathEscape(putArgs.ObjName)
 			}
 			_, err = api.PutObject(&putArgs)
 		} else {
@@ -576,7 +610,7 @@ func initPutObjCksumFlags() (flags []cli.Flag) {
 		}
 		flags = append(flags, cli.StringFlag{
 			Name:  cksum,
-			Usage: fmt.Sprintf("compute client-side %s checksum\n"+putObjCksumText, cksum),
+			Usage: fmt.Sprintf("Compute client-side %s checksum\n"+putObjCksumText, cksum),
 		})
 	}
 	return

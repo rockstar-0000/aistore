@@ -1,16 +1,13 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -33,7 +30,7 @@ import (
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact"
-	"github.com/OneOfOne/xxhash"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -1007,7 +1004,7 @@ func setPrimaryTo(t *testing.T, proxyURL string, smap *meta.Smap, directURL, toI
 
 	baseParams := tools.BaseAPIParams(directURL)
 	tlog.Logf("Setting primary from %s to %s\n", smap.Primary.ID(), toID)
-	err := api.SetPrimaryProxy(baseParams, toID, false /*force*/)
+	err := api.SetPrimary(baseParams, toID, "" /*toURL*/, false /*force*/)
 	tassert.CheckFatal(t, err)
 
 	newSmap, err = tools.WaitForNewSmap(proxyURL, smap.Version)
@@ -1019,13 +1016,11 @@ func setPrimaryTo(t *testing.T, proxyURL string, smap *meta.Smap, directURL, toI
 	return
 }
 
-func chooseNextProxy(smap *meta.Smap) (proxyid, proxyURL string, err error) {
-	pid, err := hrwProxyTest(smap, smap.Primary.ID())
-	pi := smap.Pmap[pid]
+func chooseNextProxy(smap *meta.Smap) (string, string, error) {
+	pi, err := smap.HrwProxy(smap.Primary.ID())
 	if err != nil {
-		return
+		return "", "", err
 	}
-
 	return pi.ID(), pi.URL(cmn.NetPublic), nil
 }
 
@@ -1065,47 +1060,6 @@ func primarySetToRand(t *testing.T) *meta.Smap {
 	psi, err := smap.GetRandProxy(true /*exclude primary*/)
 	tassert.CheckFatal(t, err)
 	return setPrimaryTo(t, proxyURL, smap, "", psi.ID())
-}
-
-// This is duplicated in the tests because the `idDigest` of `daemonInfo` is not
-// exported. As a result of this, ais.HrwProxy will not return the correct
-// proxy since the `idDigest` will be initialized to 0. To avoid this, we
-// compute the checksum directly in this method.
-func hrwProxyTest(smap *meta.Smap, idToSkip string) (pi string, err error) {
-	if smap.CountActivePs() == 0 {
-		err = errors.New("AIStore cluster map is empty: no proxies")
-		return
-	}
-	var (
-		maxH    uint64
-		skipped int
-	)
-	for id, snode := range smap.Pmap {
-		if id == idToSkip {
-			skipped++
-			continue
-		}
-		if smap.NonElectable(snode) {
-			skipped++
-			continue
-		}
-
-		if smap.InMaintOrDecomm(snode) {
-			skipped++
-			continue
-		}
-
-		cs := xxhash.Checksum64S(cos.UnsafeB(snode.ID()), cos.MLCG32)
-		if cs > maxH {
-			maxH = cs
-			pi = id
-		}
-	}
-	if pi == "" {
-		err = fmt.Errorf("cannot HRW-select proxy: current count=%d, skipped=%d",
-			smap.CountActivePs(), skipped)
-	}
-	return
 }
 
 func networkFailureTarget(t *testing.T) {
@@ -1243,17 +1197,9 @@ func networkFailurePrimary(t *testing.T) {
 	}
 
 	// Forcefully set new primary for the original one
+
 	baseParams := tools.BaseAPIParams(oldPrimaryURL)
-	baseParams.Method = http.MethodPut
-	reqParams := &api.ReqParams{
-		BaseParams: baseParams,
-		Path:       apc.URLPathDaeProxy.Join(newPrimaryID),
-		Query: url.Values{
-			apc.QparamForce:            {"true"},
-			apc.QparamPrimaryCandidate: {newPrimaryURL},
-		},
-	}
-	err = reqParams.DoRequest()
+	err = api.SetPrimary(baseParams, newPrimaryID, newPrimaryURL /*toURL*/, true /*force*/)
 	tassert.CheckFatal(t, err)
 
 	smap, err = tools.WaitForClusterState(
@@ -1296,7 +1242,7 @@ func primaryAndNextCrash(t *testing.T) {
 	// Cluster map is re-read to have a clone of original smap that the test
 	// can modify in any way it needs. Because original smap got must be preserved
 	smapNext := tools.GetClusterMap(t, proxyURL)
-	// get next next primary
+	// get next primary
 	firstPrimary := smapNext.Pmap[firstPrimaryID]
 	delete(smapNext.Pmap, firstPrimaryID)
 	finalPrimaryID, finalPrimaryURL, err := chooseNextProxy(smapNext)
@@ -1726,7 +1672,7 @@ func runMockTarget(t *testing.T, proxyURL string, mocktgt targetMocker, stopch c
 	if err != nil {
 		tlog.Logf("Error: failed to unsafely remove t[%s]: %v\n", tools.MockDaemonID, err)
 	}
-	s.Shutdown(context.Background())
+	s.Shutdown(t.Context())
 }
 
 func registerMockTarget(proxyURL string, smap *meta.Smap) error {

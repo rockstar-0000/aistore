@@ -1,12 +1,13 @@
 // Package tetl provides helpers for ETL.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tetl
 
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -24,19 +25,24 @@ import (
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/xact"
+
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
 const (
-	commTypeAnnotation    = "communication_type"
-	waitTimeoutAnnotation = "wait_timeout"
-
-	Tar2TF        = "tar2tf"
-	Echo          = "transformer-echo"
-	EchoGolang    = "echo-go"
-	MD5           = "transformer-md5"
-	Tar2tfFilters = "tar2tf-filters"
-	tar2tfFilter  = `
+	EchoETLSpec         = "echo-etl-spec"
+	HashWithArgsETLSpec = "hash-with-args-etl-spec"
+	MD5ETLSpec          = "md5-etl-spec"
+	NonExistImage       = "non-exist-image"
+	InvalidYaml         = "invalid-yaml"
+	Tar2TF              = "tar2tf"
+	Echo                = "transformer-echo"
+	EchoGolang          = "echo-go"
+	MD5                 = "transformer-md5"
+	HashWithArgs        = "hash-with-args"
+	Tar2tfFilters       = "tar2tf-filters"
+	tar2tfFilter        = `
 {
   "conversions": [
     { "type": "Decode", "ext_name": "png"},
@@ -50,16 +56,98 @@ const (
 `
 )
 
+// ETL specs
+const (
+	echoETLSpec = `
+name: echo-etl-spec
+runtime:
+  image: aistorage/transformer_echo:latest
+  command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
+`
+	hashWithArgsETLSpec = `
+name: hash-with-args-etl-spec
+runtime:
+  image: aistorage/transformer_hash_with_args:latest
+  command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
+  env:
+    - name: SEED_DEFAULT
+    - value: "0"
+`
+	md5ETLSpec = `
+name: md5-etl-spec
+runtime:
+  image: aistorage/transformer_md5:latest
+  command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
+`
+)
+
+// invalid pod specs
+const (
+	nonExistImageSpec = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: non-exist-image
+  annotations:
+    communication_type: ${COMMUNICATION_TYPE:-"\"hpull://\""}
+    wait_timeout: 5m
+spec:
+  containers:
+    - name: server
+      image: aistorage/non-exist-image:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - name: default
+          containerPort: 80
+      command: ['/code/server.py', '--listen', '0.0.0.0', '--port', '80']
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: default
+`
+	invalidYamlSpec = `
+apiVersion: v1
+kind: Pod
+metadata
+  name: invalid-syntax
+spec:
+  containers:
+    - name: server
+      image: aistorage/runtime_python:latest
+      ports
+        - name: default
+          containerPort: 80
+`
+)
+
 var (
 	links = map[string]string{
-		MD5:           "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/md5/pod.yaml",
-		Tar2TF:        "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/tar2tf/pod.yaml",
-		Tar2tfFilters: "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/tar2tf/pod.yaml",
-		Echo:          "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/echo/pod.yaml",
-		EchoGolang:    "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/go_echo/pod.yaml",
+		MD5:           "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/md5/pod.yaml",
+		HashWithArgs:  "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/hash_with_args/pod.yaml",
+		Tar2TF:        "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/tar2tf/pod.yaml",
+		Tar2tfFilters: "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/tar2tf/pod.yaml",
+		Echo:          "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/echo/pod.yaml",
+		EchoGolang:    "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/go_echo/pod.yaml",
+	}
+
+	testSpecs = map[string]string{
+		NonExistImage:       nonExistImageSpec,
+		InvalidYaml:         invalidYamlSpec,
+		EchoETLSpec:         echoETLSpec,
+		HashWithArgsETLSpec: hashWithArgsETLSpec,
+		MD5ETLSpec:          md5ETLSpec,
 	}
 
 	client = &http.Client{}
+)
+
+var (
+	EchoTransform  = func(r io.Reader) io.Reader { return r }
+	NumpyTransform = func(_ io.Reader) io.Reader { return bytes.NewReader([]byte("\x00\x00\x01\x00\x02\x00\x03\x00")) }
+	MD5Transform   = func(r io.Reader) io.Reader {
+		data, _ := io.ReadAll(r)
+		return bytes.NewReader([]byte(cos.ChecksumB2S(data, cos.ChecksumMD5)))
+	}
 )
 
 func validateETLName(name string) error {
@@ -70,18 +158,24 @@ func validateETLName(name string) error {
 }
 
 func GetTransformYaml(etlName string) ([]byte, error) {
+	if spec, ok := testSpecs[etlName]; ok {
+		return []byte(spec), nil
+	}
 	if err := validateETLName(etlName); err != nil {
 		return nil, err
 	}
 
-	var resp *http.Response
+	var (
+		resp   *http.Response
+		action = "get transform yaml for ETL[" + etlName + "]"
+	)
 	// with retry in case github in unavailable for a moment
-	err := cmn.NetworkCallWithRetry(&cmn.RetryArgs{
-		Call: func() (code int, err error) {
+	_, err := cmn.NetworkCallWithRetry(&cmn.RetryArgs{
+		Call: func() (_ int, err error) {
 			resp, err = client.Get(links[etlName]) //nolint:bodyclose // see defer close below
-			return
+			return 0, err
 		},
-		Action:   "get transform yaml for ETL[" + etlName + "]",
+		Action:   action,
 		SoftErr:  3,
 		HardErr:  1,
 		IsClient: true,
@@ -252,31 +346,51 @@ func ReportXactionStatus(bp api.BaseParams, xid string, stopCh *cos.StopCh, inte
 	}()
 }
 
-func InitSpec(t *testing.T, bp api.BaseParams, etlName, comm string) (xid string) {
-	tlog.Logf("InitSpec ETL[%s], communicator %s\n", etlName, comm)
-
-	msg := &etl.InitSpecMsg{}
-	msg.IDX = etlName
-	msg.CommTypeX = comm
+func InitSpec(t *testing.T, bp api.BaseParams, etlName, commType, argType string) (xid string) {
+	tlog.Logf("InitSpec ETL[%s], communicator %s\n", etlName, commType)
 	spec, err := GetTransformYaml(etlName)
 	tassert.CheckFatal(t, err)
-	msg.Spec = spec
+
+	var (
+		etlSpec  etl.ETLSpecMsg
+		initSpec etl.InitSpecMsg
+		msg      etl.InitMsg
+	)
+	if err := yaml.Unmarshal(spec, &etlSpec); err == nil && etlSpec.Validate() == nil {
+		etlSpec.EtlName = etlName
+		etlSpec.CommTypeX = commType
+		etlSpec.ArgTypeX = argType
+		etlSpec.InitTimeout = cos.Duration(time.Minute * 2) // manually increase timeout in testing environment
+		msg = &etlSpec
+	} else {
+		initSpec.EtlName = etlName
+		initSpec.CommTypeX = commType
+		initSpec.ArgTypeX = argType
+		initSpec.InitTimeout = cos.Duration(time.Minute * 2) // manually increase timeout in testing environment
+		initSpec.Spec = spec
+		msg = &initSpec
+	}
+
 	tassert.Fatalf(t, msg.Name() == etlName, "%q vs %q", msg.Name(), etlName) // assert
 
 	xid, err = api.ETLInit(bp, msg)
+	if herr, ok := err.(*cmn.ErrHTTP); ok && herr.TypeCode == "ErrUnsupp" && msg.CommType() == etl.WebSocket {
+		t.Skipf("skipping, WebSocket only work with direct put supported transformers")
+	}
 	tassert.CheckFatal(t, err)
 	tassert.Errorf(t, cos.IsValidUUID(xid), "expected valid xaction ID, got %q", xid)
-
-	tlog.Logf("ETL %q: running x-etl-spec[%s]\n", etlName, xid)
-
 	// reread `InitMsg` and compare with the specified
 	etlMsg, err := api.ETLGetInitMsg(bp, etlName)
 	tassert.CheckFatal(t, err)
 
-	initSpec := etlMsg.(*etl.InitSpecMsg)
-	tassert.Errorf(t, initSpec.Name() == etlName, "expected etlName %s != %s", etlName, initSpec.Name())
-	tassert.Errorf(t, initSpec.CommType() == comm, "expected communicator type %s != %s", comm, initSpec.CommType())
-	tassert.Errorf(t, bytes.Equal(spec, initSpec.Spec), "pod specs differ")
+	tlog.Logf("ETL %q: running x-etl-spec[%s]\n", etlName, xid)
+
+	tassert.Errorf(t, etlMsg.Name() == etlName, "expected etlName %s, got %s", etlName, etlMsg.Name())
+	tassert.Errorf(t, etlMsg.CommType() == commType, "expected communicator type %s, got %s", commType, etlMsg.CommType())
+
+	if initSpec, ok := etlMsg.(*etl.InitSpecMsg); ok {
+		tassert.Errorf(t, bytes.Equal(spec, initSpec.Spec), "pod specs differ, expected %s, got %s", string(spec), string(initSpec.Spec))
+	}
 
 	return
 }
@@ -315,25 +429,35 @@ func ETLBucketWithCleanup(t *testing.T, bp api.BaseParams, bckFrom, bckTo cmn.Bc
 	return xid
 }
 
-func ETLShouldBeRunning(t *testing.T, params api.BaseParams, etlName string) {
+func ETLBucketWithCmp(t *testing.T, bp api.BaseParams, bckFrom, bckTo cmn.Bck, msg *apc.TCBMsg, cmp func(r1, r2 io.Reader) bool) {
+	xid := ETLBucketWithCleanup(t, bp, bckFrom, bckTo, msg)
+	err := WaitForFinished(bp, xid, apc.ActETLBck, 3*time.Minute)
+	tassert.CheckFatal(t, err)
+
+	tlog.Logf("ETL[%s]: comparing buckets, %s vs %s\n", msg.Transform.Name, bckFrom.Cname(""), bckTo.Cname(""))
+
+	objeList, err := api.ListObjects(bp, bckFrom, &apc.LsoMsg{}, api.ListArgs{})
+	tassert.CheckFatal(t, err)
+	for _, en := range objeList.Entries {
+		r1, _, err := api.GetObjectReader(bp, bckFrom, en.Name, &api.GetArgs{})
+		tassert.CheckFatal(t, err)
+		r2, _, err := api.GetObjectReader(bp, bckTo, en.Name, &api.GetArgs{})
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, cmp(r1, r2), "object content mismatch: %s vs %s", bckFrom.Cname(en.Name), bckTo.Cname(en.Name))
+		tassert.CheckFatal(t, r1.Close())
+		tassert.CheckFatal(t, r2.Close())
+	}
+}
+
+func ETLCheckStage(t *testing.T, params api.BaseParams, etlName string, stage etl.Stage) {
 	etls, err := api.ETLList(params)
 	tassert.CheckFatal(t, err)
-	for _, etl := range etls {
-		if etlName == etl.Name {
+	for _, inst := range etls {
+		if etlName == inst.Name && inst.Stage == stage.String() {
 			return
 		}
 	}
-	t.Fatalf("etl[%s] is not running (%v)", etlName, etls)
-}
-
-func ETLShouldNotBeRunning(t *testing.T, params api.BaseParams, etlName string) {
-	etls, err := api.ETLList(params)
-	tassert.CheckFatal(t, err)
-	for _, etl := range etls {
-		if etlName == etl.Name {
-			t.Fatalf("expected etl[%s] to be stopped (%v)", etlName, etls)
-		}
-	}
+	t.Fatalf("etl[%s] doesn't exist or isn't in status %s (%v)", etlName, stage.String(), etls)
 }
 
 func CheckNoRunningETLContainers(t *testing.T, params api.BaseParams) {
@@ -342,44 +466,67 @@ func CheckNoRunningETLContainers(t *testing.T, params api.BaseParams) {
 	tassert.Fatalf(t, len(etls) == 0, "Expected no ETL running, got %+v", etls)
 }
 
-func SpecToInitMsg(spec []byte /*yaml*/) (msg *etl.InitSpecMsg, err error) {
+func SpecToInitMsg(spec []byte /*yaml*/) (*etl.InitSpecMsg, error) {
 	errCtx := &cmn.ETLErrCtx{}
-	msg = &etl.InitSpecMsg{Spec: spec}
-	pod, err := etl.ParsePodSpec(errCtx, msg.Spec)
+	msg := &etl.InitSpecMsg{Spec: spec}
+	pod, err := msg.ParsePodSpec()
 	if err != nil {
-		return msg, err
+		return msg, cmn.NewErrETLf(errCtx, "failed to parse pod spec: %v\n%q", err, string(msg.Spec))
 	}
 	errCtx.ETLName = pod.GetName()
-	msg.IDX = pod.GetName()
+	msg.EtlName = pod.GetName()
 
-	if err := k8s.ValidateEtlName(msg.IDX); err != nil {
+	if err := k8s.ValidateEtlName(msg.EtlName); err != nil {
 		return msg, err
 	}
 	// Check annotations.
 	msg.CommTypeX = podTransformCommType(pod)
-	if msg.Timeout, err = podTransformTimeout(errCtx, pod); err != nil {
+	if msg.InitTimeout, err = podTransformTimeout(errCtx, pod); err != nil {
 		return msg, err
 	}
 
-	return msg, msg.Validate()
+	err = msg.Validate()
+	return msg, err
 }
 
 func podTransformCommType(pod *corev1.Pod) string {
-	if pod.Annotations == nil || pod.Annotations[commTypeAnnotation] == "" {
+	if pod.Annotations == nil || pod.Annotations[etl.CommTypeAnnotation] == "" {
 		// By default assume `Hpush`.
 		return etl.Hpush
 	}
-	return pod.Annotations[commTypeAnnotation]
+	return pod.Annotations[etl.CommTypeAnnotation]
 }
 
 func podTransformTimeout(errCtx *cmn.ETLErrCtx, pod *corev1.Pod) (cos.Duration, error) {
-	if pod.Annotations == nil || pod.Annotations[waitTimeoutAnnotation] == "" {
+	if pod.Annotations == nil || pod.Annotations[etl.WaitTimeoutAnnotation] == "" {
 		return 0, nil
 	}
 
-	v, err := time.ParseDuration(pod.Annotations[waitTimeoutAnnotation])
+	v, err := time.ParseDuration(pod.Annotations[etl.WaitTimeoutAnnotation])
 	if err != nil {
 		return cos.Duration(v), cmn.NewErrETL(errCtx, err.Error()).WithPodName(pod.Name)
 	}
 	return cos.Duration(v), nil
+}
+
+func ListObjectsWithRetry(bp api.BaseParams, bckTo cmn.Bck, expectedCount int, opts tools.WaitRetryOpts) (err error) {
+	var (
+		retries       = opts.MaxRetries
+		retryInterval = opts.Interval
+		i             int
+	)
+retry:
+	list, err := api.ListObjects(bp, bckTo, nil, api.ListArgs{})
+	if err == nil && len(list.Entries) == expectedCount {
+		return nil
+	}
+	if !cmn.IsStatusServiceUnavailable(err) && !cos.IsRetriableConnErr(err) {
+		return
+	}
+	time.Sleep(retryInterval)
+	i++
+	if i > retries {
+		return fmt.Errorf("api.ListObjects max retries (%d) exceeded, expected %d objects, got %d", retries, expectedCount, len(list.Entries))
+	}
+	goto retry
 }

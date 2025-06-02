@@ -1,144 +1,166 @@
 """
 Test class for AIStore PyTorch Plugin
-Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 """
 
+import os
 import unittest
+import multiprocessing
 from pathlib import Path
-import torchdata.datapipes.iter as torch_pipes
-from aistore.sdk import Client, Bucket
-from aistore.sdk.errors import AISError, ErrBckNotFound
+from torch.utils.data import DataLoader
+
+from tests.integration import CLUSTER_ENDPOINT
+from tests.integration.sdk import DEFAULT_TEST_CLIENT
+from tests.utils import (
+    create_and_put_object,
+    random_string,
+    cleanup_local,
+    create_archive,
+)
+
 from aistore.sdk.dataset.data_shard import DataShard
 from aistore.pytorch import (
-    AISFileLister,
-    AISFileLoader,
     AISMapDataset,
     AISIterDataset,
     AISMultiShardStream,
     AISShardReader,
 )
-from tests.integration import CLUSTER_ENDPOINT
-from tests.utils import (
-    create_and_put_object,
-    random_string,
-    destroy_bucket,
-    cleanup_local,
-    create_archive,
-)
 
 
-# pylint: disable=unused-variable
 class TestPytorchPlugin(unittest.TestCase):
-    """
-    Integration tests for the Pytorch plugin
-    """
+    """Integration tests for the PyTorch plugin"""
 
     def setUp(self) -> None:
-        self.bck_name = random_string()
-        self.client = Client(CLUSTER_ENDPOINT)
-        self.bck = self.client.bucket(self.bck_name)
+        self.client = DEFAULT_TEST_CLIENT
+        self.bck = self.client.bucket(random_string())
         self.bck.create()
         self.local_test_files = (
             Path().absolute().joinpath("pytorch-plugin-test-" + random_string(8))
         )
 
     def tearDown(self) -> None:
-        """
-        Cleanup after each test, destroy the bucket if it exists
-        """
-        destroy_bucket(self.client, self.bck_name)
+        self.bck.delete(missing_ok=True)
         cleanup_local(str(self.local_test_files))
 
-    def test_filelister_with_prefix_variations(self):
-        num_objs = 10
+    # ----------------------
+    # Shared helper methods
+    # ----------------------
 
-        # create 10 objects in the /temp dir
-        for i in range(num_objs):
-            create_and_put_object(
-                self.client, bck_name=self.bck_name, obj_name=f"temp/obj{ i }"
+    def create_test_objects(self, count: int) -> dict:
+        content_dict = {}
+        for i in range(count):
+            obj_name = f"temp/obj{i}"
+            _, content = create_and_put_object(
+                self.client, bck=self.bck.as_model(), obj_name=obj_name
             )
+            content_dict[obj_name] = content
+        return content_dict
 
-        # create 10 objects in the / dir
-        for i in range(num_objs):
-            obj_name = f"obj{ i }"
-            create_and_put_object(
-                self.client, bck_name=self.bck_name, obj_name=obj_name
-            )
+    def verify_dataset_output(self, received: dict, expected: dict):
+        self.assertEqual(len(received), len(expected))
+        for k, v in received.items():
+            self.assertEqual(v, expected[k])
 
-        prefixes = [
-            ["ais://" + self.bck_name],
-            ["ais://" + self.bck_name + "/"],
-            ["ais://" + self.bck_name + "/temp/", "ais://" + self.bck_name + "/obj"],
-        ]
-        for prefix in prefixes:
-            urls = AISFileLister(url=CLUSTER_ENDPOINT, source_datapipe=prefix)
-            ais_loader = AISFileLoader(url=CLUSTER_ENDPOINT, source_datapipe=urls)
-            with self.assertRaises(TypeError):
-                len(urls)
-            self.assertEqual(len(list(urls)), 20)
-            self.assertEqual(sum(1 for _ in ais_loader), 20)
+    def get_pid_list(self):
+        return multiprocessing.Manager().list()
 
-    def test_incorrect_inputs(self):
-        prefixes = ["ais://asdasd"]
-
-        # AISFileLister: Bucket not found
-        try:
-            list(AISFileLister(url=CLUSTER_ENDPOINT, source_datapipe=prefixes))
-        except ErrBckNotFound as err:
-            self.assertEqual(err.status_code, 404)
-
-        # AISFileLoader: incorrect inputs
-        url_list = [[""], ["ais:"], ["ais://"], ["s3:///unkown-bucket"]]
-
-        for url in url_list:
-            with self.assertRaises(AISError):
-                s3_loader_dp = AISFileLoader(url=CLUSTER_ENDPOINT, source_datapipe=url)
-                for _ in s3_loader_dp:
-                    pass
-
-    def test_torch_library(self):
-        # Tests the torch library imports of aistore
-        torch_pipes.AISFileLister(
-            url=CLUSTER_ENDPOINT, source_datapipe=["ais://" + self.bck_name]
-        )
-        torch_pipes.AISFileLoader(
-            url=CLUSTER_ENDPOINT, source_datapipe=["ais://" + self.bck_name]
-        )
+    # ----------------------
+    # Core dataset tests
+    # ----------------------
 
     def test_ais_dataset(self):
-        num_objs = 10
-        content_dict = {}
-        for i in range(num_objs):
-            content = create_and_put_object(
-                self.client, bck_name=self.bck_name, obj_name=f"temp/obj{ i }"
-            )
-            content_dict[i] = content
+        content_dict = self.create_test_objects(10)
+        dataset = AISMapDataset(ais_source_list=[self.bck])
 
-        ais_dataset = AISMapDataset(ais_source_list=[self.bck])
-        self.assertEqual(len(ais_dataset), num_objs)
-        for i in range(num_objs):
-            obj_name, content = ais_dataset[i]
-            self.assertEqual(obj_name, f"temp/obj{ i }")
-            self.assertEqual(content, content_dict[i])
+        self.assertEqual(len(dataset), len(content_dict))
+        for obj_name in content_dict:
+            name, content = dataset[list(content_dict).index(obj_name)]
+            self.assertEqual(name, obj_name)
+            self.assertEqual(content, content_dict[obj_name])
 
     def test_ais_iter_dataset(self):
-        num_objs = 10
-        content_dict = {}
-        for i in range(num_objs):
-            content = create_and_put_object(
-                self.client, bck_name=self.bck_name, obj_name=f"temp/obj{ i }"
-            )
-            content_dict[i] = content
+        content_dict = self.create_test_objects(10)
+        dataset = AISIterDataset(ais_source_list=self.bck)
 
-        ais_iter_dataset = AISIterDataset(ais_source_list=self.bck)
-        self.assertEqual(len(ais_iter_dataset), num_objs)
-        for i, (obj_name, content) in enumerate(ais_iter_dataset):
-            self.assertEqual(obj_name, f"temp/obj{ i }")
-            self.assertEqual(content, content_dict[i])
+        self.assertEqual(len(dataset), len(content_dict))
+        for i, (name, content) in enumerate(dataset):
+            self.assertEqual(name, f"temp/obj{i}")
+            self.assertEqual(content, content_dict[name])
+
+    # ----------------------
+    # Dataloader tests
+    # ----------------------
+
+    def test_ais_iter_dataloader(self):
+        content_dict = self.create_test_objects(10)
+        dataset = AISIterDataset(ais_source_list=self.bck)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+
+        received = {}
+        for obj_name, content in dataloader:
+            received[obj_name[0]] = content[0]
+
+        self.verify_dataset_output(received, content_dict)
+
+    def test_ais_map_dataloader(self):
+        content_dict = self.create_test_objects(10)
+        dataset = AISMapDataset(ais_source_list=self.bck)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+
+        received = {}
+        for obj_name, content in dataloader:
+            received[obj_name[0]] = content[0]
+
+        self.verify_dataset_output(received, content_dict)
+
+    def test_ais_iter_dataloader_multiprocessing(self):
+        content_dict = self.create_test_objects(10)
+        pid_list = self.get_pid_list()
+
+        class TestableDataset(AISIterDataset):
+            def __iter__(self):
+                pid_list.append(os.getpid())
+                return super().__iter__()
+
+        dataset = TestableDataset(ais_source_list=self.bck)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+
+        received = {}
+        for obj_name, content in dataloader:
+            received[obj_name[0]] = content[0]
+
+        self.verify_dataset_output(received, content_dict)
+        self.assertGreater(
+            len(set(pid_list)), 1, f"Expected multiple worker PIDs: {pid_list}"
+        )
+
+    def test_ais_map_dataloader_multiprocessing(self):
+        content_dict = self.create_test_objects(10)
+        pid_list = self.get_pid_list()
+
+        class TestableDataset(AISMapDataset):
+            def __getitem__(self, index):
+                pid_list.append(os.getpid())
+                return super().__getitem__(index)
+
+        dataset = TestableDataset(ais_source_list=self.bck)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+
+        received = {}
+        for obj_name, content in dataloader:
+            received[obj_name[0]] = content[0]
+
+        self.verify_dataset_output(received, content_dict)
+        self.assertGreater(
+            len(set(pid_list)), 1, f"Expected multiprocessing, got PIDs: {pid_list}"
+        )
+
+    # ----------------------
+    # Sharded dataset tests
+    # ----------------------
 
     def test_multishard_stream(self):
         self.local_test_files.mkdir()
-        bucket = self.client.bucket(self.bck_name)
         # Create two shards and store them in the bucket
         shard1_content_dict = {
             "file1.txt": b"Content of file one",
@@ -148,8 +170,8 @@ class TestPytorchPlugin(unittest.TestCase):
         shard1_archive_name = "test_multishard_shard1.tar"
         shard1_archive_path = self.local_test_files.joinpath(shard1_archive_name)
         create_archive(shard1_archive_path, shard1_content_dict)
-        shard1_obj = bucket.object(obj_name=shard1_archive_name)
-        shard1_obj.put_file(shard1_archive_path)
+        shard1_obj = self.bck.object(obj_name=shard1_archive_name)
+        shard1_obj.get_writer().put_file(shard1_archive_path)
 
         shard2_content_dict = {
             "file1.cls": b"1",
@@ -159,17 +181,17 @@ class TestPytorchPlugin(unittest.TestCase):
         shard2_archive_name = "test_multishard_shard2.tar"
         shard2_archive_path = self.local_test_files.joinpath(shard2_archive_name)
         create_archive(shard2_archive_path, shard2_content_dict)
-        shard2_obj = bucket.object(obj_name=shard2_archive_name)
-        shard2_obj.put_file(shard2_archive_path)
+        shard2_obj = self.bck.object(obj_name=shard2_archive_name)
+        shard2_obj.get_writer().put_file(shard2_archive_path)
 
         shard1 = DataShard(
             client_url=CLUSTER_ENDPOINT,
-            bucket_name=self.bck_name,
+            bucket_name=self.bck.name,
             prefix="test_multishard_shard1.tar",
         )
         shard2 = DataShard(
             client_url=CLUSTER_ENDPOINT,
-            bucket_name=self.bck_name,
+            bucket_name=self.bck.name,
             prefix="test_multishard_shard2.tar",
         )
         dataset = AISMultiShardStream(data_sources=[shard1, shard2])
@@ -181,12 +203,15 @@ class TestPytorchPlugin(unittest.TestCase):
             self.assertEqual(content, combined_content[i])
 
     def test_shard_reader(self):
-
         self.local_test_files.mkdir()
 
-        bucket: Bucket = self.client.bucket(self.bck_name)
+        def prepare_shard(content_dict, name):
+            path = self.local_test_files.joinpath(name)
+            create_archive(path, content_dict)
+            obj = self.bck.object(obj_name=name)
+            obj.get_writer().put_file(path)
 
-        shard_one_dict = {
+        shard1_data = {
             "sample_1.cls": b"Class content of sample one",
             "sample_1.jpg": b"Jpg content of sample one",
             "sample_1.png": b"Png content of sample one",
@@ -194,13 +219,8 @@ class TestPytorchPlugin(unittest.TestCase):
             "sample_2.jpg": b"Jpg content of sample two",
             "sample_2.png": b"Png content of sample two",
         }
-        shard_one_archive_name = "shard_1.tar"
-        shard_one_archive_path = self.local_test_files.joinpath(shard_one_archive_name)
-        create_archive(shard_one_archive_path, shard_one_dict)
-        shard_one_obj = bucket.object(obj_name=shard_one_archive_name)
-        shard_one_obj.put_file(shard_one_archive_path)
 
-        shard_two_dict = {
+        shard2_data = {
             "sample_3.cls": b"Class content of sample three",
             "sample_3.jpg": b"Jpg content of sample three",
             "sample_3.png": b"Png content of sample three",
@@ -208,55 +228,46 @@ class TestPytorchPlugin(unittest.TestCase):
             "sample_4.jpg": b"Jpg content of sample four",
             "sample_4.png": b"Png content of sample four",
         }
-        shard_two_archive_name = "shard_2.tar"
-        shard_two_archive_path = self.local_test_files.joinpath(shard_two_archive_name)
-        create_archive(shard_two_archive_path, shard_two_dict)
-        shard_two_obj = bucket.object(obj_name=shard_two_archive_name)
-        shard_two_obj.put_file(shard_two_archive_path)
 
-        # Expected output from the reader
-        expected_sample_dicts = [
+        prepare_shard(shard1_data, "shard1.tar")
+        prepare_shard(shard2_data, "shard2.tar")
+
+        expected = [
             {
-                "cls": b"Class content of sample one",
-                "jpg": b"Jpg content of sample one",
-                "png": b"Png content of sample one",
+                "cls": shard1_data["sample_1.cls"],
+                "jpg": shard1_data["sample_1.jpg"],
+                "png": shard1_data["sample_1.png"],
             },
             {
-                "cls": b"Class content of sample two",
-                "jpg": b"Jpg content of sample two",
-                "png": b"Png content of sample two",
+                "cls": shard1_data["sample_2.cls"],
+                "jpg": shard1_data["sample_2.jpg"],
+                "png": shard1_data["sample_2.png"],
             },
             {
-                "cls": b"Class content of sample three",
-                "jpg": b"Jpg content of sample three",
-                "png": b"Png content of sample three",
+                "cls": shard2_data["sample_3.cls"],
+                "jpg": shard2_data["sample_3.jpg"],
+                "png": shard2_data["sample_3.png"],
             },
             {
-                "cls": b"Class content of sample four",
-                "jpg": b"Jpg content of sample four",
-                "png": b"Png content of sample four",
+                "cls": shard2_data["sample_4.cls"],
+                "jpg": shard2_data["sample_4.jpg"],
+                "png": shard2_data["sample_4.png"],
             },
         ]
 
-        sample_basenames = ["sample_1", "sample_2", "sample_3", "sample_4"]
+        sample_names = ["sample_1", "sample_2", "sample_3", "sample_4"]
 
-        # Test shard_reader with prefixes
-
-        url_shard_reader = AISShardReader(
-            bucket_list=[bucket],
-            prefix_map={bucket: "shard_1.tar"},
+        shard_reader = AISShardReader(
+            bucket_list=[self.bck], prefix_map={self.bck: "shard1.tar"}
         )
+        for i, (basename, sample) in enumerate(shard_reader):
+            self.assertEqual(basename, sample_names[i])
+            self.assertEqual(sample, expected[i])
 
-        for i, (basename, content_dict) in enumerate(url_shard_reader):
-            self.assertEqual(basename, sample_basenames[i])
-            self.assertEqual(content_dict, expected_sample_dicts[i])
-
-        # Test shard_reader with bucket_params
-        bck_shard_reader = AISShardReader(bucket_list=[bucket])
-
-        for i, (basename, content_dict) in enumerate(bck_shard_reader):
-            self.assertEqual(basename, sample_basenames[i])
-            self.assertEqual(content_dict, expected_sample_dicts[i])
+        shard_reader = AISShardReader(bucket_list=[self.bck])
+        for i, (basename, sample) in enumerate(shard_reader):
+            self.assertEqual(basename, sample_names[i])
+            self.assertEqual(sample, expected[i])
 
 
 if __name__ == "__main__":

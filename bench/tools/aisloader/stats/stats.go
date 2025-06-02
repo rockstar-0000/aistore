@@ -1,6 +1,6 @@
 // Package stats provides various structs for collecting stats
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
@@ -81,7 +81,7 @@ func (s *HTTPReq) AvgLatency() int64 {
 
 // Throughput returns throughput of requests (bytes/per second).
 func (s *HTTPReq) Throughput(start, end time.Time) int64 {
-	if start == end {
+	if start == end { //nolint:staticcheck // "Two times can be equal even if they are in different locations."
 		return 0
 	}
 	return int64(float64(s.bytes) / end.Sub(start).Seconds())

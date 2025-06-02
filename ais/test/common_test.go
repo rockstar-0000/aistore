@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -31,6 +31,7 @@ import (
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -68,6 +69,7 @@ type ioContext struct {
 	originalProxyCount  int
 	num                 int
 	numGetsEachFile     int
+	nameLen             int
 	getErrIsFatal       bool
 	silent              bool
 	fixedSize           bool
@@ -147,21 +149,17 @@ func (m *ioContext) init(cleanup bool) {
 		if m.deleteRemoteBckObjs {
 			m.del(-1 /*delete all*/, 0 /* lsmsg.Flags */)
 		} else {
-			tools.EvictRemoteBucket(m.t, m.proxyURL, m.bck) // evict from AIStore
+			tools.EvictRemoteBucket(m.t, m.proxyURL, m.bck, true /*keepMD*/)
 		}
 	}
-
 	if cleanup {
-		// cleanup m.bck upon exit from the test
-		m.t.Cleanup(m._cleanup)
-	}
-}
-
-func (m *ioContext) _cleanup() {
-	m.del()
-	if m.bck.IsRemote() {
-		// Ensure all local objects are removed.
-		tools.EvictRemoteBucket(m.t, m.proxyURL, m.bck)
+		// cleanup upon exit from this (m.t) test
+		m.t.Cleanup(func() {
+			m.del()
+			if m.bck.IsRemote() {
+				tools.EvictRemoteBucket(m.t, m.proxyURL, m.bck, true /*keepMD*/)
+			}
+		})
 	}
 }
 
@@ -182,7 +180,7 @@ func (m *ioContext) checkObjectDistribution(t *testing.T) {
 		requiredCount     = int64(rebalanceObjectDistributionTestCoef * (float64(m.num) / float64(m.originalTargetCount)))
 		targetObjectCount = make(map[string]int64)
 	)
-	tlog.Logf("Checking if each target has a required number of object in bucket %s...\n", m.bck)
+	tlog.Logf("Checking if each target has a required number of object in bucket %s...\n", m.bck.String())
 	baseParams := tools.BaseAPIParams(m.proxyURL)
 	lst, err := api.ListObjects(baseParams, m.bck, &apc.LsoMsg{Props: apc.GetPropsLocation}, api.ListArgs{})
 	tassert.CheckFatal(t, err)
@@ -193,7 +191,7 @@ func (m *ioContext) checkObjectDistribution(t *testing.T) {
 	}
 	if len(targetObjectCount) != m.originalTargetCount {
 		t.Fatalf("Rebalance error, %d/%d targets received no objects from bucket %s\n",
-			m.originalTargetCount-len(targetObjectCount), m.originalTargetCount, m.bck)
+			m.originalTargetCount-len(targetObjectCount), m.originalTargetCount, m.bck.String())
 	}
 	for targetURL, objCount := range targetObjectCount {
 		if objCount < requiredCount {
@@ -225,13 +223,14 @@ func (m *ioContext) puts(ignoreErrs ...bool) {
 		if k = m.prefix; k != "" {
 			k = "/" + k + "*"
 		}
-		tlog.Logf("PUT %d objects%s => %s%s\n", m.num, s, m.bck, k)
+		tlog.Logf("PUT %d objects%s => %s%s\n", m.num, s, m.bck.String(), k)
 	}
 	m.objNames, m.numPutErrs, err = tools.PutRandObjs(tools.PutObjectsArgs{
 		ProxyURL:  m.proxyURL,
 		Bck:       m.bck,
 		ObjPath:   m.prefix,
 		ObjCnt:    m.num,
+		ObjNameLn: m.nameLen,
 		ObjSize:   m.fileSize,
 		FixedSize: m.fixedSize,
 		CksumType: p.Cksum.Type,
@@ -269,16 +268,16 @@ func (m *ioContext) remoteRefill() {
 		msg        = &apc.LsoMsg{Prefix: m.prefix, Props: apc.GetPropsName}
 	)
 
-	objList, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
+	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
 	tassert.CheckFatal(m.t, err)
 
 	m.objNames = m.objNames[:0]
-	for _, obj := range objList.Entries {
+	for _, obj := range lst.Entries {
 		m.objNames = append(m.objNames, obj.Name)
 	}
 
-	leftToFill := m.num - len(objList.Entries)
-	tassert.Errorf(m.t, leftToFill > 0, "leftToFill %d", leftToFill)
+	leftToFill := m.num - len(lst.Entries)
+	tassert.Fatalf(m.t, leftToFill > 0, "leftToFill %d", leftToFill)
 
 	m._remoteFill(leftToFill, false /*evict*/, false /*override*/)
 }
@@ -290,7 +289,7 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 		wg         = cos.NewLimitedWaitGroup(20, 0)
 	)
 	if !m.silent {
-		tlog.Logf("remote PUT %d objects (size %s) => %s\n", objCnt, cos.ToSizeIEC(int64(m.fileSize), 0), m.bck)
+		tlog.Logf("remote PUT %d objects (size %s) => %s\n", objCnt, cos.ToSizeIEC(int64(m.fileSize), 0), m.bck.String())
 	}
 	p, err := api.HeadBucket(baseParams, m.bck, false /* don't add */)
 	tassert.CheckFatal(m.t, err)
@@ -300,13 +299,15 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 		tassert.CheckFatal(m.t, err)
 
 		var objName string
-		if override {
+		switch {
+		case override:
 			objName = m.objNames[i]
-		} else if m.ordered {
+		case m.ordered:
 			objName = fmt.Sprintf("%s%d", m.prefix, i)
-		} else {
+		default:
 			objName = fmt.Sprintf("%s%s-%d", m.prefix, trand.String(8), i)
 		}
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -318,7 +319,7 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 	}
 	wg.Wait()
 	tassert.SelectErr(m.t, errCh, "put", true)
-	tlog.Logf("remote bucket %s: %d cached objects\n", m.bck, m.num)
+	tlog.Logf("remote bucket %s: %d cached objects\n", m.bck.String(), m.num)
 
 	if evict {
 		m.evict()
@@ -331,13 +332,13 @@ func (m *ioContext) evict() {
 		msg        = &apc.LsoMsg{Prefix: m.prefix, Props: apc.GetPropsName}
 	)
 
-	objList, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
+	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
 	tassert.CheckFatal(m.t, err)
-	if len(objList.Entries) != m.num {
-		m.t.Fatalf("list_objects err: %d != %d", len(objList.Entries), m.num)
+	if len(lst.Entries) != m.num {
+		m.t.Fatalf("list_objects err: %d != %d", len(lst.Entries), m.num)
 	}
 
-	tlog.Logf("evicting remote bucket %s...\n", m.bck)
+	tlog.Logf("evicting remote bucket %s...\n", m.bck.String())
 	err = api.EvictRemoteBucket(baseParams, m.bck, false)
 	tassert.CheckFatal(m.t, err)
 }
@@ -348,13 +349,13 @@ func (m *ioContext) remotePrefetch(prefetchCnt int) {
 		msg        = &apc.LsoMsg{Prefix: m.prefix, Props: apc.GetPropsName}
 	)
 
-	objList, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
+	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
 	tassert.CheckFatal(m.t, err)
 
 	tlog.Logf("remote PREFETCH %d objects...\n", prefetchCnt)
 
 	wg := &sync.WaitGroup{}
-	for idx, obj := range objList.Entries {
+	for idx, obj := range lst.Entries {
 		if idx >= prefetchCnt {
 			break
 		}
@@ -421,7 +422,7 @@ func (m *ioContext) del(opts ...int) {
 	if toRemoveCnt < 0 && m.prefix != "" {
 		lsmsg.Prefix = "" // all means all
 	}
-	objList, err := api.ListObjects(baseParams, m.bck, lsmsg, api.ListArgs{})
+	lst, err := api.ListObjects(baseParams, m.bck, lsmsg, api.ListArgs{})
 	if err != nil {
 		if errors.As(err, &herr) && herr.Status == http.StatusNotFound {
 			return
@@ -435,7 +436,7 @@ func (m *ioContext) del(opts ...int) {
 	tassert.CheckFatal(m.t, err)
 
 	// delete
-	toRemove := objList.Entries
+	toRemove := lst.Entries
 	if toRemoveCnt >= 0 {
 		toRemove = toRemove[:toRemoveCnt]
 	}
@@ -546,9 +547,9 @@ func (m *ioContext) gets(getArgs *api.GetArgs, withValidation bool) {
 	)
 	if !m.silent {
 		if m.numGetsEachFile == 1 {
-			tlog.Logf("GET %d objects from %s\n", m.num, m.bck)
+			tlog.Logf("GET %d objects from %s\n", m.num, m.bck.String())
 		} else {
-			tlog.Logf("GET %d objects %d times from %s\n", m.num, m.numGetsEachFile, m.bck)
+			tlog.Logf("GET %d objects %d times from %s\n", m.num, m.numGetsEachFile, m.bck.String())
 		}
 	}
 	wg := cos.NewLimitedWaitGroup(20, 0)
@@ -599,7 +600,7 @@ func (m *ioContext) ensureNumCopies(baseParams api.BaseParams, expectedCopies in
 	tassert.CheckFatal(m.t, err)
 
 	// List Bucket - primarily for the copies
-	msg := &apc.LsoMsg{Flags: apc.LsObjCached, Prefix: m.prefix}
+	msg := &apc.LsoMsg{Flags: apc.LsCached, Prefix: m.prefix}
 	msg.AddProps(apc.GetPropsCopies, apc.GetPropsAtime, apc.GetPropsStatus)
 	objectList, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
 	tassert.CheckFatal(m.t, err)
@@ -838,7 +839,7 @@ func runProviderTests(t *testing.T, f func(*testing.T, *meta.Bck)) {
 			} else {
 				test.skipArgs.Bck = test.backendBck
 				if !test.backendBck.IsCloud() {
-					t.Skipf("backend bucket must be a Cloud bucket (have %q)", test.backendBck)
+					t.Skipf("backend bucket must be a Cloud bucket (have %q)", test.backendBck.String())
 				}
 			}
 			tools.CheckSkip(t, &test.skipArgs)

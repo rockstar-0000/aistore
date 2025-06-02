@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -56,8 +56,10 @@ const (
 	Finished = "finished"
 	Progress = "progress"
 
-	// dsort, dloader, query
-	Metrics     = "metrics"
+	// Prometheus metrics
+	Metrics = "metrics"
+
+	// dsort, downloader
 	Records     = "records"
 	Shards      = "shards"
 	FinishedAck = "finished_ack"
@@ -88,8 +90,8 @@ const (
 )
 
 type URLPath struct {
-	L []string
 	S string
+	L []string
 }
 
 func urlpath(words ...string) URLPath {
@@ -128,6 +130,7 @@ var (
 	URLPathDaeProxy     = urlpath(Version, Daemon, Proxy)
 	URLPathDaeSetConf   = urlpath(Version, Daemon, ActSetConfig)
 	URLPathDaeAdminJoin = urlpath(Version, Daemon, AdminJoin)
+	URLPathDaeForceJoin = urlpath(Version, Daemon, ActPrimaryForce)
 
 	URLPathDaeBendDisable = urlpath(Version, Daemon, ActDisableBackend)
 	URLPathDaeBendEnable  = urlpath(Version, Daemon, ActEnableBackend)

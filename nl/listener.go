@@ -1,6 +1,6 @@
-// Package notifications provides interfaces for AIStore notifications
+// Package nl provides interfaces for AIStore notifications
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package nl
 
@@ -16,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/core/meta"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -64,12 +65,18 @@ type (
 	Callback func(n Listener)
 
 	NodeStats struct {
-		sync.RWMutex
 		stats map[string]any // daeID => Stats (e.g. cmn.SnapExt)
+		sync.RWMutex
 	}
 
 	ListenerBase struct {
-		mu     sync.RWMutex
+		// construction
+		Srcs        meta.NodeMap     // all notifiers
+		ActiveSrcs  meta.NodeMap     // running notifiers
+		F           Callback         `json:"-"` // optional listening-side callback
+		Stats       *NodeStats       // [daeID => Stats (e.g. cmn.SnapExt)]
+		lastUpdated map[string]int64 // [daeID => last update time(nanoseconds)]
+
 		Common struct {
 			UUID  string
 			Kind  string // async operation kind (see api/apc/actmsg.go)
@@ -77,19 +84,15 @@ type (
 			Owned string // "": not owned | equalIC: IC | otherwise, pid + IC
 			Bck   []*cmn.Bck
 		}
-		// construction
-		Srcs        meta.NodeMap     // all notifiers
-		ActiveSrcs  meta.NodeMap     // running notifiers
-		F           Callback         `json:"-"` // optional listening-side callback
-		Stats       *NodeStats       // [daeID => Stats (e.g. cmn.SnapExt)]
-		lastUpdated map[string]int64 // [daeID => last update time(nanoseconds)]
-		progress    time.Duration    // time interval to monitor the progress
-		addedTime   atomic.Int64     // Time when `nl` is added
+
+		Errs      cos.Errs      // reported error and count
+		progress  time.Duration // time interval to monitor the progress
+		addedTime atomic.Int64  // Time when `nl` is added
 
 		// runtime
 		EndTimeX atomic.Int64 // timestamp when finished
-		AbortedX atomic.Bool  // sets if the xaction is Aborted
-		Errs     cos.Errs     // reported error and count
+		mu       sync.RWMutex
+		AbortedX atomic.Bool // sets if the xaction is Aborted
 	}
 
 	Status struct {
@@ -175,8 +178,6 @@ func (nlb *ListenerBase) Err() error {
 }
 
 func (nlb *ListenerBase) SetStats(daeID string, stats any) {
-	debug.AssertRWMutexLocked(&nlb.mu)
-
 	_, ok := nlb.Srcs[daeID]
 	debug.Assert(ok)
 	nlb.Stats.Store(daeID, stats)
@@ -216,8 +217,11 @@ func (nlb *ListenerBase) Status() *Status {
 	return &Status{Kind: nlb.Kind(), UUID: nlb.UUID(), EndTimeX: nlb.EndTimeX.Load(), AbortedX: nlb.Aborted()}
 }
 
-func (nlb *ListenerBase) _name() *strings.Builder {
+func (nlb *ListenerBase) _name(l int) *strings.Builder {
 	var sb strings.Builder
+	l += 3 + len(nlb.Kind()) + 1 + len(nlb.UUID()) + 1
+	sb.Grow(l)
+
 	sb.WriteString("nl-")
 	sb.WriteString(nlb.Kind())
 	sb.WriteByte('[')
@@ -227,14 +231,14 @@ func (nlb *ListenerBase) _name() *strings.Builder {
 }
 
 func (nlb *ListenerBase) Name() string {
-	sb := nlb._name()
+	sb := nlb._name(0)
 	return sb.String()
 }
 
 func (nlb *ListenerBase) String() string {
 	var (
 		tm, res  string
-		sb       = nlb._name()
+		sb       = nlb._name(128)
 		finCount = nlb.FinCount()
 	)
 	if nlb.Cause() != "" {
@@ -267,7 +271,6 @@ func (nlb *ListenerBase) String() string {
 		sb.WriteByte('/')
 		sb.WriteString(strconv.Itoa(len(nlb.Srcs)))
 		sb.WriteByte(')')
-		return sb.String()
 	}
 	return sb.String()
 }

@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -8,17 +8,16 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmd/cli/config"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/memsys"
+
 	"github.com/fatih/color"
 	"github.com/urfave/cli"
 )
@@ -34,38 +33,6 @@ const (
    * download ` + cmn.GitHubHome + `/tree/main/cmd/cli/autocomplete
    * run 'cmd/cli/autocomplete/install.sh'
    To install CLI directly from GitHub: ` + cmn.GitHubHome + `/blob/main/scripts/install_from_binaries.sh`
-
-	// custom cli.AppHelpTemplate
-	// "You can render custom help text by setting this variable." (from github.com/urfave/cli)
-	appHelpTemplate = `NAME:
-   {{.Name}}{{if .Usage}} - {{.Usage}}{{end}}
-
-USAGE:
-   {{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}} {{if .VisibleFlags}}[global options]{{end}}{{if .Commands}} command [command options]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}}{{if .Version}}{{if not .HideVersion}}
-
-VERSION:
-   {{.Version}}{{end}}{{end}}{{if .Description}}
-
-TAB completions (Bash and Zsh):
-   {{.Description}}{{end}}{{if len .Authors}}
-
-AUTHOR{{with $length := len .Authors}}{{if ne 1 $length}}S{{end}}{{end}}:
-   {{range $index, $author := .Authors}}{{if $index}}
-   {{end}}{{$author}}{{end}}{{end}}{{if .VisibleCommands}}
-
-COMMANDS:{{range .VisibleCategories}}{{if .Name}}
-
-   {{.Name}}:{{range .VisibleCommands}}
-     {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{else}}{{range .VisibleCommands}}
-   {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{end}}{{end}}{{end}}{{if .VisibleFlags}}
-
-GLOBAL OPTIONS:
-   {{range $index, $option := .VisibleFlags}}{{if $index}}
-   {{end}}{{$option}}{{end}}{{end}}{{if .Copyright}}
-
-COPYRIGHT:
-   {{.Copyright}}{{end}}
-`
 )
 
 const (
@@ -104,63 +71,7 @@ var (
 	fred, fcyan, fblue, fgreen func(a ...any) string
 )
 
-// `ais help [COMMAND]`
-var helpCommand = cli.Command{
-	Name:      "help",
-	Usage:     "show a list of commands; show help for a given command",
-	ArgsUsage: "[COMMAND]",
-	Action:    helpCmdHandler,
-	BashComplete: func(c *cli.Context) {
-		for _, cmd := range c.App.Commands {
-			fmt.Println(cmd.Name)
-		}
-	},
-}
-
-func paginate(_ io.Writer, templ string, data interface{}) {
-	gmm, err := memsys.NewMMSA("cli-out-buffer", true)
-	if err != nil {
-		exitln("memsys:", err)
-	}
-	sgl := gmm.NewSGL(0)
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		exitln("os.pipe:", err)
-	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(sgl, r); err != nil {
-			exitln("write sgl:", err)
-		}
-		r.Close()
-	}()
-
-	cli.HelpPrinterCustom(w, templ, data, nil)
-	w.Close()
-	wg.Wait()
-
-	cmd := exec.Command("more")
-	cmd.Stdin = sgl
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		exitln("cmd more:", err)
-	}
-}
-
 func cliConfVerbose() bool { return cfg.Verbose } // more warnings, errors with backtraces and details
-
-func helpCmdHandler(c *cli.Context) error {
-	args := c.Args()
-	if args.Present() {
-		return cli.ShowCommandHelp(c, args.First())
-	}
-	return cli.ShowAppHelp(c)
-}
 
 // main method
 func Run(version, buildtime string, args []string) error {
@@ -274,17 +185,37 @@ func (a *acli) init(version string, emptyCmdline bool) {
 	app.Version = version
 	app.EnableBashCompletion = true
 	app.HideHelp = true
+
+	cli.HelpFlag = &cli.BoolFlag{
+		Name:  "help, h",
+		Usage: "Show help",
+	}
 	app.Flags = []cli.Flag{cli.HelpFlag}
+
 	app.CommandNotFound = commandNotFoundHandler
 	app.OnUsageError = onUsageErrorHandler
 	app.Metadata = map[string]any{metadata: a.longRun}
 	app.Writer = a.outWriter
 	app.ErrWriter = a.errWriter
 	app.Description = cliDescr
+
+	// paginate help via `more`
 	if !cfg.NoMore {
-		cli.HelpPrinter = paginate
+		cli.HelpPrinter = helpMorePrinter
 	}
-	cli.AppHelpTemplate = appHelpTemplate
+
+	// custom templates and help coloring
+	if !cfg.NoColor {
+		cli.AppHelpTemplate = appColoredHelpTemplate
+		cli.CommandHelpTemplate = commandColoredHelpTemplate
+		cli.SubcommandHelpTemplate = subcommandColoredHelpTemplate
+	} else {
+		cli.AppHelpTemplate = appHelpTemplate
+		cli.CommandHelpTemplate = commandHelpTemplate
+		cli.SubcommandHelpTemplate = subcommandHelpTemplate
+		funcColorMap = nil
+	}
+
 	a.setupCommands(emptyCmdline)
 }
 
@@ -323,8 +254,14 @@ func (a *acli) setupCommands(emptyCmdline bool) {
 	}
 
 	app.Commands = append(app.Commands, a.initAliases()...)
+
 	setupCommandHelp(app.Commands)
 	a.enableSearch()
+
+	// finally, alphabetically
+	sort.Slice(app.Commands, func(i, j int) bool {
+		return app.Commands[i].Name < app.Commands[j].Name
+	})
 }
 
 func (a *acli) enableSearch() {

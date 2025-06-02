@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -22,6 +22,7 @@ type SkipTestArgs struct {
 	MinTargets            int
 	MinProxies            int
 	MinMountpaths         int
+	MaxTargets            int
 	RequiresRemoteCluster bool
 	RequiresAuth          bool
 	RequiresTLS           bool
@@ -62,17 +63,19 @@ func CheckSkip(tb testing.TB, args *SkipTestArgs) {
 		tassert.Fatalf(tb, !args.Bck.IsEmpty(), "bucket is missing in the args")
 		proxyURL := GetPrimaryURL()
 		if !isRemoteAndPresentBucket(tb, proxyURL, args.Bck) {
-			tb.Skipf("%s requires a remote in-cluster bucket (have %s)", tb.Name(), args.Bck)
+			tb.Skipf("%s requires a remote in-cluster bucket (have %s)", tb.Name(), args.Bck.String())
 		}
 	}
 	if args.CloudBck || args.RequiredCloudProvider != "" {
 		tassert.Fatalf(tb, !args.Bck.IsEmpty(), "bucket is missing in the args")
 		cname := args.Bck.Cname("")
-		if !args.Bck.IsCloud() {
+
+		switch {
+		case !args.Bck.IsCloud():
 			tb.Skipf("%s requires cloud bucket (have %s)", tb.Name(), cname)
-		} else if args.RequiredCloudProvider != "" && args.RequiredCloudProvider != args.Bck.Provider {
+		case args.RequiredCloudProvider != "" && args.RequiredCloudProvider != args.Bck.Provider:
 			tb.Skipf("%s requires cloud bucket with %s provider (have %s)", tb.Name(), args.RequiredCloudProvider, cname)
-		} else {
+		default:
 			proxyURL := GetPrimaryURL()
 			exists, err := BucketExists(tb, proxyURL, args.Bck)
 			tassert.CheckFatal(tb, err)
@@ -104,7 +107,7 @@ func CheckSkip(tb testing.TB, args *SkipTestArgs) {
 		}
 	}
 
-	if args.MinTargets > 0 || args.MinMountpaths > 0 || args.MinProxies > 0 {
+	if args.MinTargets > 0 || args.MinMountpaths > 0 || args.MinProxies > 0 || args.MaxTargets > 0 {
 		smap = GetClusterMap(tb, GetPrimaryURL())
 	}
 
@@ -130,6 +133,13 @@ func CheckSkip(tb testing.TB, args *SkipTestArgs) {
 		tassert.CheckFatal(tb, err)
 		if l := len(mpList.Available); l < args.MinMountpaths {
 			tb.Skipf("%s requires at least %d mountpaths (have %d)", tb.Name(), args.MinMountpaths, l)
+		}
+	}
+
+	if args.MaxTargets > 0 {
+		if smap.CountTargets() > args.MaxTargets {
+			tb.Skipf("%s requires at most %d targets (have %d)",
+				tb.Name(), args.MaxTargets, smap.CountTargets())
 		}
 	}
 }

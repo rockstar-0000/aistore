@@ -10,7 +10,7 @@ from aistore.sdk.errors import InvalidObjectRangeIndex
 from aistore.sdk.multiobj.object_collection import ObjectCollection
 
 
-# pylint: disable=unused-variable,too-few-public-methods
+# pylint: disable=too-few-public-methods
 class ObjectRange(ObjectCollection):
     """
     Class representing a range of object names
@@ -25,7 +25,7 @@ class ObjectRange(ObjectCollection):
         suffix (str, optional): Suffix at the end of all object names
     """
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def __init__(
         self,
         prefix: str,

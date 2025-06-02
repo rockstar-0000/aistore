@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -28,65 +28,70 @@ import (
 const (
 	opPut = iota
 	opGet
+	opUpdateExisting // {GET followed by PUT(same name, same size)} combo
 	opConfig
 )
 
 type (
 	workOrder struct {
-		op        int
-		proxyURL  string
-		bck       cmn.Bck
-		objName   string // In the format of 'virtual dir' + "/" + objName
-		size      int64
 		err       error
-		start     time.Time
-		end       time.Time
-		latencies httpLatencies
-		cksumType string
 		sgl       *memsys.SGL
+		bck       cmn.Bck
+		proxyURL  string
+		objName   string // virtual-dir + "/" + objName
+		cksumType string
+		latencies httpLatencies
+		op        int
+		size      int64
+		start     int64
+		end       int64
+		startPut  int64 // PUT in `opUpdateExisting`
 	}
 )
 
 func postNewWorkOrder() (err error) {
-	var wo *workOrder
-	switch {
-	case runParams.getConfig:
-		wo = newGetConfigWorkOrder()
-	case runParams.putPct == 100:
-		wo, err = newPutWorkOrder()
-	case runParams.putPct == 0:
-		wo, err = newGetWorkOrder()
+	if runParams.getConfig {
+		workCh <- newGetConfigWorkOrder()
+		return nil
+	}
+
+	var (
+		pct = runParams.putPct
+		put bool
+	)
+	switch pct {
+	case 0:
+	case 25:
+		put = mono.NanoTime()&0x3 == 0x3
+	case 50:
+		put = mono.NanoTime()&1 == 1
+	case 75:
+		put = mono.NanoTime()&0x3 > 0
+	case 100:
+		put = true
 	default:
-		var put bool
-		if runParams.putPct == 50 {
-			put = mono.NanoTime()&1 == 1
-		} else {
-			put = runParams.putPct > rnd.IntN(99)
+		put = pct > rnd.IntN(100)
+	}
+
+	var wo *workOrder
+	if put {
+		wo, err = newPutWorkOrder()
+	} else {
+		var op = opGet
+		if pct = runParams.updateExistingPct; pct > 0 {
+			if pct > rnd.IntN(100) {
+				op = opUpdateExisting
+			}
 		}
-		if put {
-			wo, err = newPutWorkOrder()
-		} else {
-			wo, err = newGetWorkOrder()
-		}
+		wo, err = newGetWorkOrder(op)
 	}
 	if err == nil {
 		workCh <- wo
 	}
-	return
-}
-
-func validateWorkOrder(wo *workOrder, delta time.Duration) error {
-	if wo.op == opGet || wo.op == opPut {
-		if delta == 0 {
-			return fmt.Errorf("%s has the same start time as end time", wo)
-		}
-	}
-	return nil
+	return err
 }
 
 func completeWorkOrder(wo *workOrder, terminating bool) {
-	delta := timeDelta(wo.end, wo.start)
-
 	if wo.err == nil && traceHTTPSig.Load() {
 		var lat *stats.MetricLatsAgg
 		switch wo.op {
@@ -110,32 +115,49 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 		}
 	}
 
-	if err := validateWorkOrder(wo, delta); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "[ERROR] %s", err.Error())
-		return
-	}
+	delta := time.Duration(wo.end - wo.start)
 
 	switch wo.op {
+	case opUpdateExisting:
+		delta = time.Duration(wo.startPut - wo.start)
+		fallthrough
 	case opGet:
+		if delta <= 0 {
+			fmt.Fprintf(os.Stderr, "[ERROR] %s has the same start time as end time", wo)
+			return
+		}
 		getPending--
 		intervalStats.statsd.Get.AddPending(getPending)
-		if wo.err == nil {
-			intervalStats.get.Add(wo.size, delta)
-			intervalStats.statsd.Get.Add(wo.size, delta)
-		} else {
-			fmt.Println("GET failed: ", wo.err)
+		if wo.err != nil {
+			fmt.Println("GET failed:", wo.err) // TODO: not necessarily when opGetPutNewVer
 			intervalStats.statsd.Get.AddErr()
 			intervalStats.get.AddErr()
+			return
 		}
+		intervalStats.get.Add(wo.size, delta)
+		intervalStats.statsd.Get.Add(wo.size, delta)
+		if wo.op == opGet {
+			return
+		}
+
+		delta = time.Duration(wo.end - wo.startPut)
+		putPending++
+		fallthrough
 	case opPut:
+		if delta <= 0 {
+			fmt.Fprintf(os.Stderr, "[ERROR] %s has the same start time as end time", wo)
+			return
+		}
 		putPending--
 		intervalStats.statsd.Put.AddPending(putPending)
 		if wo.err == nil {
-			bucketObjsNames.AddObjName(wo.objName)
+			if wo.op != opUpdateExisting {
+				bucketObjsNames.AddObjName(wo.objName)
+			}
 			intervalStats.put.Add(wo.size, delta)
 			intervalStats.statsd.Put.Add(wo.size, delta)
 		} else {
-			fmt.Println("PUT failed: ", wo.err)
+			fmt.Println("PUT failed:", wo.err)
 			intervalStats.put.AddErr()
 			intervalStats.statsd.Put.AddErr()
 		}
@@ -143,8 +165,7 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 			return
 		}
 
-		now, l := time.Now(), len(wo2Free)
-		debug.Assert(!wo.end.IsZero())
+		now, l := mono.NanoTime(), len(wo2Free)
 		// free previously executed PUT SGLs
 		for i := 0; i < l; i++ {
 			if terminating {
@@ -153,7 +174,7 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 			w := wo2Free[i]
 			// delaying freeing sgl for `wo2FreeDelay`
 			// (background at https://github.com/golang/go/issues/30597)
-			if now.Sub(w.end) < wo2FreeDelay {
+			if time.Duration(now-w.end) < wo2FreeDelay {
 				break
 			}
 			if w.sgl != nil && !w.sgl.IsNil() {
@@ -171,11 +192,11 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 			intervalStats.getConfig.Add(1, delta)
 			intervalStats.statsd.Config.Add(delta, wo.latencies.Proxy, wo.latencies.ProxyConn)
 		} else {
-			fmt.Println("GET config failed: ", wo.err)
+			fmt.Println("get-config failed:", wo.err)
 			intervalStats.getConfig.AddErr()
 		}
 	default:
-		debug.Assert(false) // Should never be here
+		debug.Assert(false, wo.op)
 	}
 }
 
@@ -265,7 +286,7 @@ func worker(wos <-chan *workOrder, results chan<- *workOrder, wg *sync.WaitGroup
 			return
 		}
 
-		wo.start = time.Now()
+		wo.start = mono.NanoTime()
 
 		switch wo.op {
 		case opPut:
@@ -273,13 +294,21 @@ func worker(wos <-chan *workOrder, results chan<- *workOrder, wg *sync.WaitGroup
 		case opGet:
 			doGet(wo)
 			numGets.Inc()
+		case opUpdateExisting:
+			// TODO: fix latency stats
+			doGet(wo)
+			if wo.err == nil {
+				numGets.Inc()
+				wo.startPut = mono.NanoTime()
+				doPut(wo)
+			}
 		case opConfig:
 			doGetConfig(wo)
 		default:
-			// Should not come here
+			debug.Assert(false, wo.op)
 		}
 
-		wo.end = time.Now()
+		wo.end = mono.NanoTime()
 		results <- wo
 	}
 }
@@ -343,7 +372,7 @@ func _genObjName() (string, error) {
 	return path.Join(comps[0:idx]...), nil
 }
 
-func newGetWorkOrder() (*workOrder, error) {
+func newGetWorkOrder(op int) (*workOrder, error) {
 	if bucketObjsNames.Len() == 0 {
 		return nil, errors.New("no objects in bucket")
 	}
@@ -352,7 +381,7 @@ func newGetWorkOrder() (*workOrder, error) {
 	return &workOrder{
 		proxyURL: runParams.proxyURL,
 		bck:      runParams.bck,
-		op:       opGet,
+		op:       op,
 		objName:  bucketObjsNames.ObjName(),
 	}, nil
 }
@@ -367,10 +396,12 @@ func newGetConfigWorkOrder() *workOrder {
 func (wo *workOrder) String() string {
 	var errstr, opName string
 	switch wo.op {
-	case opGet:
-		opName = http.MethodGet
 	case opPut:
 		opName = http.MethodPut
+	case opGet:
+		opName = http.MethodGet
+	case opUpdateExisting:
+		opName = "GET-PUT(new-version)"
 	case opConfig:
 		opName = "CONFIG"
 	}
@@ -379,6 +410,6 @@ func (wo *workOrder) String() string {
 		errstr = ", error: " + wo.err.Error()
 	}
 
-	return fmt.Sprintf("WO: %s/%s, start:%s end:%s, size: %d, type: %s%s",
-		wo.bck, wo.objName, wo.start.Format(time.StampMilli), wo.end.Format(time.StampMilli), wo.size, opName, errstr)
+	return fmt.Sprintf("WO: %s/%s, duration %s, size: %d, type: %s%s",
+		wo.bck.String(), wo.objName, time.Duration(wo.end-wo.start), wo.size, opName, errstr)
 }

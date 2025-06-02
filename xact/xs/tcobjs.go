@@ -1,14 +1,14 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
 	"fmt"
 	"io"
-	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,44 +20,64 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
+
+// The flow: `BeginMsg`, `ContMsg`, and `doMsg`.
+// Single xaction to execute multiple list-range-prefix API calls for a given pair of (source, destination) buckets.
 
 const PrefixTcoID = "tco-"
 
 type (
 	tcoFactory struct {
-		args *xreg.TCObjsArgs
+		args *xreg.TCOArgs
 		streamingF
 	}
-	XactTCObjs struct {
-		pending struct {
+	XactTCO struct {
+		transform etl.Session // stateful etl Session
+		copier
+		sntl   sentinel
+		args   *xreg.TCOArgs
+		workCh chan *cmn.TCOMsg
+		pend   struct {
 			m   map[string]*tcowi
-			mtx sync.RWMutex
+			mtx sync.Mutex
 		}
-		args     *xreg.TCObjsArgs
-		workCh   chan *cmn.TCOMsg
-		chanFull atomic.Int64
 		streamingX
-		owt cmn.OWT
+		chanFull cos.ChanFull
+		nworkers atomic.Int64 // total across all pending (currently, always zero)
+		owt      cmn.OWT
 	}
 	tcowi struct {
-		r   *XactTCObjs
-		msg *cmn.TCOMsg
-		// finishing
-		refc atomic.Int32
+		r    *XactTCO
+		msg  *cmn.TCOMsg
+		pend struct {
+			n atomic.Int64
+		}
+	}
+)
+
+type (
+	// remove objects not present at the source (when synchronizing bckFrom => bckTo)
+	syncwi struct {
+		rp *prune
 	}
 )
 
 // interface guard
 var (
-	_ core.Xact      = (*XactTCObjs)(nil)
+	_ core.Xact      = (*XactTCO)(nil)
+	_ lrxact         = (*XactTCO)(nil)
 	_ xreg.Renewable = (*tcoFactory)(nil)
 	_ lrwi           = (*tcowi)(nil)
+	_ lrwi           = (*syncwi)(nil)
 )
 
 ////////////////
@@ -66,7 +86,7 @@ var (
 
 func (p *tcoFactory) New(args xreg.Args, bckFrom *meta.Bck) xreg.Renewable {
 	np := &tcoFactory{streamingF: streamingF{RenewBase: xreg.RenewBase{Args: args, Bck: bckFrom}, kind: p.kind}}
-	np.args = args.Custom.(*xreg.TCObjsArgs)
+	np.args = args.Custom.(*xreg.TCOArgs)
 	return np
 }
 
@@ -81,159 +101,255 @@ func (p *tcoFactory) Start() error {
 	p.Args.UUID = PrefixTcoID + uuid
 
 	// new x-tco
-	workCh := make(chan *cmn.TCOMsg, maxNumInParallel)
-	r := &XactTCObjs{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}, args: p.args, workCh: workCh}
-	r.pending.m = make(map[string]*tcowi, maxNumInParallel)
+	var (
+		config = cmn.GCO.Get()
+		burst  = max(minTcoWorkChSize, config.TCO.Burst)
+		r      = &XactTCO{
+			streamingX: streamingX{p: &p.streamingF, config: config},
+			args:       p.args,
+			workCh:     make(chan *cmn.TCOMsg, burst),
+		}
+	)
+	r.pend.m = make(map[string]*tcowi, burst)
 	r.owt = cmn.OwtCopy
+
 	if p.kind == apc.ActETLObjects {
 		r.owt = cmn.OwtTransform
+		r.copier.getROC, r.transform, err = etl.GetOfflineTransform(p.args.Msg.Transform.Name, r)
+		if err != nil {
+			return err
+		}
 	}
+
 	p.xctn = r
-	r.DemandBase.Init(p.UUID(), p.Kind(), p.Bck, xact.IdleDefault)
+	r.DemandBase.Init(p.UUID(), p.Kind(), "" /*ctlmsg via SetCtlMsg later*/, p.Bck, xact.IdleDefault)
 
-	var sizePDU int32
-	if p.kind == apc.ActETLObjects {
-		// unlike apc.ActCopyObjects (where we know the size)
-		// apc.ActETLObjects (transform) generates arbitrary sizes where we use PDU-based transport
-		sizePDU = memsys.DefaultBufSize
-	}
-
-	if err := p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, r.owt, sizePDU); err != nil {
+	smap := core.T.Sowner().Get()
+	if err := core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
 		return err
 	}
+	nat := smap.CountActiveTs()
+	r.rate.init(p.args.BckFrom, p.args.BckTo, nat)
 
-	if r.p.dm != nil {
-		p.dm.SetXact(r)
-		p.dm.Open()
+	// TODO: add ETL capability to provide Size(transformed-result)
+	var sizePDU int32
+	if p.kind == apc.ActETLObjects {
+		sizePDU = memsys.DefaultBufSize // `transport` to generate PDU-based traffic
 	}
+
+	// TODO: sentinels require DM; no-DM still requires sentinels
+	if useDM := !r.args.DisableDM; useDM && nat > 1 {
+		dmxtra := bundle.Extra{
+			RecvAck:     nil, // no ACKs
+			Config:      r.config,
+			Compression: r.config.TCO.Compression,
+			Multiplier:  r.config.TCO.SbundleMult,
+			SizePDU:     sizePDU,
+		}
+		if err := p.newDM(p.Args.UUID /*trname*/, r.recv, smap, dmxtra, r.owt); err != nil {
+			return err
+		}
+	}
+
+	r.copier.r = r
+
+	// limited use (compare w/ tcb sntl.init)
+	r.sntl.r = r
+	r.sntl.nat = nat
+
+	// (rgetstats)
+	if bck := r.args.BckFrom; bck.IsRemote() {
+		r.bp = core.T.Backend(bck)
+		r.vlabs = map[string]string{
+			stats.VlabBucket: bck.Cname(""),
+			stats.VlabXkind:  r.Kind(),
+		}
+	}
+
 	xact.GoRunW(r)
 	return nil
 }
 
-////////////////
-// XactTCObjs //
-////////////////
+/////////////
+// XactTCO //
+/////////////
 
-func (r *XactTCObjs) Name() string {
+func (r *XactTCO) Name() string {
 	return fmt.Sprintf("%s => %s", r.streamingX.Name(), r.args.BckTo)
 }
 
-func (r *XactTCObjs) String() string {
+func (r *XactTCO) String() string {
 	return r.streamingX.String() + " => " + r.args.BckTo.String()
 }
 
-func (r *XactTCObjs) FromTo() (*meta.Bck, *meta.Bck) { return r.args.BckFrom, r.args.BckTo }
+func (r *XactTCO) FromTo() (*meta.Bck, *meta.Bck) { return r.args.BckFrom, r.args.BckTo }
 
-func (r *XactTCObjs) Snap() (snap *core.Snap) {
+func (r *XactTCO) Snap() (snap *core.Snap) {
 	snap = &core.Snap{}
 	r.ToSnap(snap)
+
+	snap.Pack(0, int(r.nworkers.Load()), r.chanFull.Load())
 
 	snap.IdleX = r.IsIdle()
 	f, t := r.FromTo()
 	snap.SrcBck, snap.DstBck = f.Clone(), t.Clone()
-	return
+	return snap
 }
 
-func (r *XactTCObjs) Begin(msg *cmn.TCOMsg) {
+func (r *XactTCO) BeginMsg(msg *cmn.TCOMsg) {
 	wi := &tcowi{r: r, msg: msg}
-	r.pending.mtx.Lock()
-	r.pending.m[msg.TxnUUID] = wi
+	r.pend.mtx.Lock()
+
+	r.pend.m[msg.TxnUUID] = wi
 	r.wiCnt.Inc()
-	r.pending.mtx.Unlock()
+
+	r.pend.mtx.Unlock()
 }
 
-func (r *XactTCObjs) Run(wg *sync.WaitGroup) {
-	var err error
+func (r *XactTCO) ContMsg(msg *cmn.TCOMsg) {
+	r.IncPending()
+
+	l, c := len(r.workCh), cap(r.workCh)
+	r.chanFull.Check(l, c)
+
+	r.workCh <- msg
+}
+
+func (r *XactTCO) doMsg(msg *cmn.TCOMsg) (stop bool) {
+	debug.Assert(cos.IsValidUUID(msg.TxnUUID), msg.TxnUUID) // (ref050724: in re: ais/plstcx)
+
+	r.pend.mtx.Lock()
+	wi, ok := r.pend.m[msg.TxnUUID]
+	r.pend.mtx.Unlock()
+	if !ok {
+		if r.ErrCnt() > 0 {
+			return true // stop
+		}
+		nlog.Errorf("%s: expecting errors in %s, missing txn %q", core.T.String(), r.String(), msg.TxnUUID) // (unlikely)
+		return false
+	}
+
+	// this target must be active (ref: ignoreMaintenance)
+	smap := core.T.Sowner().Get()
+	if err := core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
+		r.Abort(err)
+		return true // stop
+	}
+	if err := r.sntl.checkSmap(smap, nil); err != nil {
+		r.Abort(err)
+		return true // stop
+	}
+	wi.pend.n.Store(int64(r.sntl.nat - 1)) // must dec down to zero
+
+	var (
+		lrit    = &lrit{}
+		lsflags uint64
+	)
+	if msg.TCBMsg.NonRecurs {
+		lsflags = apc.LsNoRecursion
+	}
+	if err := lrit.init(r, &msg.ListRange, r.Bck(), lsflags, msg.NumWorkers, r.config.TCO.Burst); err != nil {
+		r.AddErr(err)
+		return !msg.ContinueOnError // stop?
+	}
+	if lrit.lrp == lrpPrefix {
+		// ambiguity: two possible `prefix` values, with ListRange.Template default
+		debug.Assert(msg.TCBMsg.Prefix == "" || lrit.prefix == "" || msg.TCBMsg.Prefix == lrit.prefix,
+			msg.TCBMsg.Prefix, " vs ", lrit.prefix)
+		lrit.prefix = cos.Left(lrit.prefix, msg.TCBMsg.Prefix)
+	}
+
+	nworkers := int64(len(lrit.nwp.workers))
+	r.nworkers.Add(nworkers)
+
+	// run
+	var wg *sync.WaitGroup
+	{
+		var sb strings.Builder
+		sb.Grow(160)
+		msg.CopyBckMsg.Str(&sb, r.args.BckFrom.Cname(msg.Prefix), r.args.BckTo.Cname(msg.Prepend))
+		sb.WriteByte(' ')
+		msg.ListRange.Str(&sb, lrit.lrp == lrpPrefix)
+		r.Base.SetCtlMsg(sb.String())
+	}
+	// run
+	if msg.Sync && lrit.lrp != lrpList {
+		// TODO -- FIXME: revisit stopCh and related
+		wg = &sync.WaitGroup{}
+		wg.Add(1)
+		go func(pt *cos.ParsedTemplate, wg *sync.WaitGroup) {
+			r.prune(lrit, smap, pt, lsflags)
+			wg.Done()
+		}(lrit.pt.Clone(), wg)
+	}
+	err := lrit.run(wi, smap, true /*prealloc buf*/)
+
+	lrit.wait()
+
+	r.nworkers.Sub(nworkers)
+	r.chanFull.Add(lrit.nwp.chanFull.Load()) // NOTE: (adding apples to oranges)
+
+	// wait sync
+	if wg != nil {
+		wg.Wait()
+	}
+	if r.IsAborted() {
+		return true // stop
+	}
+	if err != nil {
+		r.AddErr(err)
+	}
+	return false
+}
+
+func (r *XactTCO) Run(wg *sync.WaitGroup) {
 	nlog.Infoln(r.Name())
 	wg.Done()
+outer:
 	for {
 		select {
 		case msg := <-r.workCh:
-			var (
-				smap = core.T.Sowner().Get()
-				lrit = &lrit{}
-			)
-			debug.Assert(cos.IsValidUUID(msg.TxnUUID), msg.TxnUUID) // (ref050724: in re: ais/plstcx)
-			r.pending.mtx.Lock()
-			wi, ok := r.pending.m[msg.TxnUUID]
-			r.pending.mtx.Unlock()
-			if !ok {
-				if r.ErrCnt() > 0 {
-					goto fin
-				}
-				nlog.Errorf("%s: expecting errors in %s, missing txn %q", core.T.String(), r.String(), msg.TxnUUID) // (unlikely)
-				continue
-			}
-
-			// this target must be active (ref: ignoreMaintenance)
-			if err = core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
-				nlog.Errorln(err)
-				goto fin
-			}
-			nat := smap.CountActiveTs()
-			wi.refc.Store(int32(nat - 1))
-
-			// run
-			var wg *sync.WaitGroup
-			if err = lrit.init(r, &msg.ListRange, r.Bck(), lrpWorkersDflt); err == nil {
-				if msg.Sync && lrit.lrp != lrpList {
-					wg = &sync.WaitGroup{}
-					wg.Add(1)
-					go func(pt *cos.ParsedTemplate) {
-						r.prune(lrit, smap, pt)
-						wg.Done()
-					}(lrit.pt.Clone())
-				}
-				err = lrit.run(wi, smap)
-			}
-			if wg != nil {
-				wg.Wait()
-			}
-			lrit.wait()
-
-			if r.IsAborted() || err != nil {
-				goto fin
-			}
-			r.sendTerm(wi.msg.TxnUUID, nil, nil)
+			stop := r.doMsg(msg)
 			r.DecPending()
+			if stop {
+				break outer
+			}
+			if r.p.dm != nil {
+				r.sntl.bcast(msg.TxnUUID, r.p.dm, nil) // (compare w/ r.ID below)
+			}
 		case <-r.IdleTimer():
-			goto fin
+			break outer
 		case <-r.ChanAbort():
-			goto fin
+			break outer
 		}
 	}
-fin:
-	r.fin(true /*unreg Rx*/)
+	if r.p.dm != nil {
+		if err := r.AbortErr(); err != nil {
+			if _, ok := err.(*recvAbortErr); !ok {
+				r.sntl.bcast(r.ID(), r.p.dm, err)
+			}
+		}
+	}
+
+	r.fin(true /*unreg Rx*/) // TODO: compare w/ tcb quiescing
 	if r.ErrCnt() > 0 {
 		// (see "expecting errors" and cleanup)
-		r.pending.mtx.Lock()
-		clear(r.pending.m)
-		r.pending.mtx.Unlock()
+		r.pend.mtx.Lock()
+		clear(r.pend.m)
+		r.pend.mtx.Unlock()
 	}
-}
 
-// more work
-func (r *XactTCObjs) Do(msg *cmn.TCOMsg) {
-	r.IncPending()
-	r.workCh <- msg
-
-	if l, c := len(r.workCh), cap(r.workCh); l > c/2 {
-		runtime.Gosched() // poor man's throttle
-		if l == c {
-			cnt := r.chanFull.Inc()
-			if (cnt >= 10 && cnt <= 20) || (cnt > 0 && cmn.Rom.FastV(5, cos.SmoduleXs)) {
-				nlog.Errorln(cos.ErrWorkChanFull, r.Name(), "cnt", cnt)
-			}
-		}
+	if a := r.chanFull.Load(); a > 0 {
+		nlog.Warningln(r.Name(), "work channel full (final)", a)
 	}
 }
 
 //
-// Rx
+// receive
 //
 
 // NOTE: strict(est) error handling: abort on any of the errors below
-func (r *XactTCObjs) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
+func (r *XactTCO) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	if err != nil && !cos.IsEOF(err) {
 		goto ex
 	}
@@ -249,20 +365,31 @@ ex:
 	return err
 }
 
-func (r *XactTCObjs) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
-	if hdr.Opcode == opcodeDone {
-		r.pending.mtx.Lock()
-		wi, ok := r.pending.m[cos.UnsafeS(hdr.Opaque)] // txnUUID
-		if !ok {
-			r.pending.mtx.Unlock()
-			_, err := r.JoinErr()
-			return err
+func (r *XactTCO) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
+	if hdr.Opcode != 0 {
+		switch hdr.Opcode {
+		case opDone:
+			uuid := cos.UnsafeS(hdr.Opaque) // txnUUID
+			r.pend.mtx.Lock()
+			wi, ok := r.pend.m[uuid]
+			if !ok {
+				r.pend.mtx.Unlock()
+				_, err := r.JoinErr()
+				return err
+			}
+			n := wi.pend.n.Dec()
+			if n == 0 {
+				r.wiCnt.Dec()
+			}
+			r.pend.mtx.Unlock()
+		case opAbort:
+			uuid := cos.UnsafeS(hdr.Opaque)
+			debug.Assert(uuid == r.ID(), uuid, " vs ", r.ID())
+
+			r.sntl.rxAbort(hdr)
+		default:
+			return abortOpcode(r, hdr.Opcode)
 		}
-		refc := wi.refc.Dec()
-		if refc == 0 {
-			r.wiCnt.Dec()
-		}
-		r.pending.mtx.Unlock()
 		return nil
 	}
 
@@ -273,7 +400,7 @@ func (r *XactTCObjs) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 	return err
 }
 
-func (r *XactTCObjs) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LOM) (err error) {
+func (r *XactTCO) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LOM) (err error) {
 	if err = lom.InitBck(&hdr.Bck); err != nil {
 		return
 	}
@@ -307,39 +434,20 @@ func (r *XactTCObjs) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.
 // tcowi //
 ///////////
 
-func (wi *tcowi) do(lom *core.LOM, lrit *lrit) {
-	var (
-		objNameTo = wi.msg.ToName(lom.ObjName)
-		buf, slab = core.T.PageMM().Alloc()
-	)
+// under ETL, the returned sizes of transformed objects are unknown (`cos.ContentLengthUnknown`)
+// until after the transformation; here we are disregarding the size anyway as the stats
+// are done elsewhere
 
-	// under ETL, the returned sizes of transformed objects are unknown (`cos.ContentLengthUnknown`)
-	// until after the transformation; here we are disregarding the size anyway as the stats
-	// are done elsewhere
+func (wi *tcowi) do(lom *core.LOM, lrit *lrit, buf []byte) {
+	r := wi.r
+	a := r.copier.prepare(lom, r.args.BckTo, &r.args.Msg.TCBMsg, r.config, buf, r.owt)
 
-	coiParams := core.AllocCOI()
-	{
-		coiParams.DP = wi.r.args.DP
-		coiParams.Xact = wi.r
-		coiParams.Config = wi.r.config
-		coiParams.BckTo = wi.r.args.BckTo
-		coiParams.ObjnameTo = objNameTo
-		coiParams.Buf = buf
-		coiParams.OWT = wi.r.owt
-		coiParams.DryRun = wi.msg.DryRun
-		coiParams.LatestVer = wi.msg.LatestVer
-		coiParams.Sync = wi.msg.Sync
-	}
-	_, err := core.T.CopyObject(lom, wi.r.p.dm, coiParams)
-	core.FreeCOI(coiParams)
-	slab.Free(buf)
+	// multiple messages per x-tco (compare w/ x-tcb)
+	a.LatestVer, a.Sync = wi.msg.LatestVer, wi.msg.Sync
 
-	if err != nil {
-		if !cos.IsNotExist(err, 0) || lrit.lrp == lrpList {
-			wi.r.AddErr(err, 5, cos.SmoduleXs)
-		}
-	} else if cmn.Rom.FastV(5, cos.SmoduleXs) {
-		nlog.Infoln(wi.r.Name()+":", lom.Cname(), "=>", wi.r.args.BckTo.Cname(objNameTo))
+	err := r.copier.do(a, lom, r.p.dm)
+	if cos.IsNotExist(err, 0) && lrit.lrp == lrpList {
+		r.AddErr(err, 5, cos.SmoduleXs)
 	}
 }
 
@@ -348,15 +456,8 @@ func (wi *tcowi) do(lom *core.LOM, lrit *lrit) {
 // TODO: probabilistic filtering
 //
 
-type syncwi struct {
-	rp *prune
-}
-
-// interface guard
-var _ lrwi = (*syncwi)(nil)
-
-func (r *XactTCObjs) prune(pruneit *lrit, smap *meta.Smap, pt *cos.ParsedTemplate) {
-	rp := prune{parent: r, smap: smap}
+func (r *XactTCO) prune(pruneit *lrit, smap *meta.Smap, pt *cos.ParsedTemplate, lsflags uint64) {
+	rp := prune{r: r, smap: smap, lsflags: lsflags}
 	rp.bckFrom, rp.bckTo = r.FromTo()
 
 	// tcb use case
@@ -372,14 +473,14 @@ func (r *XactTCObjs) prune(pruneit *lrit, smap *meta.Smap, pt *cos.ParsedTemplat
 	var syncit lrit
 	debug.Assert(pruneit.lrp == lrpRange)
 
-	err := syncit.init(pruneit.parent, pruneit.msg, rp.bckTo, lrpWorkersDflt)
+	err := syncit.init(pruneit.parent, pruneit.msg, rp.bckTo, lsflags, nwpDflt, r.config.TCO.Burst)
 	debug.AssertNoErr(err)
 	syncit.pt = pt
 	syncwi := &syncwi{&rp} // reusing only prune.do (and not init/run/wait)
-	syncit.run(syncwi, smap)
+	syncit.run(syncwi, smap, false /*prealloc buf*/)
 	syncit.wait()
 }
 
-func (syncwi *syncwi) do(lom *core.LOM, _ *lrit) {
+func (syncwi *syncwi) do(lom *core.LOM, _ *lrit, _ []byte) {
 	syncwi.rp.do(lom, nil)
 }

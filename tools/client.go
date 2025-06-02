@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -26,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact"
+
 	"golang.org/x/sync/errgroup"
 )
 
@@ -64,6 +65,7 @@ type PutObjectsArgs struct {
 	CksumType string
 	ObjSize   uint64
 	ObjCnt    int
+	ObjNameLn int
 	WorkerCnt int
 	FixedSize bool
 	Ordered   bool // true - object names make sequence, false - names are random
@@ -75,7 +77,7 @@ func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh 
 		defer wg.Done()
 	}
 	if !silent {
-		fmt.Printf("DEL: %s\n", object)
+		tlog.Logf("DEL: %s\n", object)
 	}
 	bp := BaseAPIParams(proxyURL)
 	err := api.DeleteObject(bp, bck, object)
@@ -107,7 +109,7 @@ func Put(proxyURL string, bck cmn.Bck, objName string, reader readers.Reader, er
 		return
 	}
 	if errCh == nil {
-		fmt.Printf("Failed to PUT %s: %v (nil error channel)\n", bck.Cname(objName), err)
+		tlog.Logf("Failed to PUT %s: %v (nil error channel)\n", bck.Cname(objName), err)
 	} else {
 		errCh <- err
 	}
@@ -130,7 +132,7 @@ func ListObjectNames(proxyURL string, bck cmn.Bck, prefix string, objectCountLim
 		msg = &apc.LsoMsg{Prefix: prefix}
 	)
 	if cached {
-		msg.Flags = apc.LsObjCached
+		msg.Flags = apc.LsCached
 	}
 	data, err := api.ListObjects(bp, bck, msg, api.ListArgs{Limit: objectCountLimit})
 	if err != nil {
@@ -149,7 +151,7 @@ func GetPrimaryURL() string {
 	if err == nil {
 		return primary.URL(cmn.NetPublic)
 	}
-	fmt.Printf("Warning: GetPrimaryProxy [%v] - retrying once...\n", err)
+	tlog.Logf("Warning: GetPrimaryProxy [%v] - retrying once...\n", err)
 	if currSmap == nil {
 		time.Sleep(time.Second)
 		primary, err = GetPrimaryProxy(proxyURLReadOnly)
@@ -162,7 +164,7 @@ func GetPrimaryURL() string {
 		}
 	}
 	if err != nil {
-		fmt.Printf("Warning: GetPrimaryProxy [%v] - returning global %q\n", err, proxyURLReadOnly)
+		tlog.Logf("Warning: GetPrimaryProxy [%v] - returning global %q\n", err, proxyURLReadOnly)
 		return proxyURLReadOnly
 	}
 	return primary.URL(cmn.NetPublic)
@@ -213,11 +215,11 @@ func DestroyBucket(tb testing.TB, proxyURL string, bck cmn.Bck) {
 	}
 }
 
-func EvictRemoteBucket(tb testing.TB, proxyURL string, bck cmn.Bck) {
+func EvictRemoteBucket(tb testing.TB, proxyURL string, bck cmn.Bck, keepMD bool) {
 	if backend := bck.Backend(); backend != nil {
 		bck.Copy(backend)
 	}
-	err := api.EvictRemoteBucket(BaseAPIParams(proxyURL), bck, false)
+	err := api.EvictRemoteBucket(BaseAPIParams(proxyURL), bck, keepMD)
 	tassert.CheckFatal(tb, err)
 }
 
@@ -228,14 +230,15 @@ func CleanupRemoteBucket(t *testing.T, proxyURL string, bck cmn.Bck, prefix stri
 
 	toDelete, err := ListObjectNames(proxyURL, bck, prefix, 0, false /*cached*/)
 	tassert.CheckFatal(t, err)
-	defer EvictRemoteBucket(t, proxyURL, bck)
+	defer EvictRemoteBucket(t, proxyURL, bck, false /*keepMD*/)
 
 	if len(toDelete) == 0 {
 		return
 	}
 
 	bp := BaseAPIParams(proxyURL)
-	xid, err := api.DeleteMultiObj(bp, bck, toDelete, "" /*template*/)
+	msg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: toDelete}}
+	xid, err := api.DeleteMultiObj(bp, bck, msg)
 	tassert.CheckFatal(t, err)
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: BucketCleanupTimeout}
 	_, err = api.WaitForXactionIC(bp, &args)
@@ -334,7 +337,8 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 		if args.Ordered {
 			objNames = append(objNames, path.Join(args.ObjPath, strconv.Itoa(i)))
 		} else {
-			objNames = append(objNames, path.Join(args.ObjPath, trand.String(16)))
+			nameLen := cos.NonZero(args.ObjNameLn, 16)
+			objNames = append(objNames, path.Join(args.ObjPath, trand.String(nameLen)))
 		}
 	}
 	chunkSize := (len(objNames) + workerCnt - 1) / workerCnt
@@ -419,7 +423,7 @@ func GetObjectAtime(t *testing.T, bp api.BaseParams, bck cmn.Bck, object, timeFo
 		}
 	}
 
-	tassert.Fatalf(t, false, "Cannot find %s in bucket %s", object, bck)
+	tassert.Fatalf(t, false, "Cannot find %s in bucket %s", object, bck.String())
 	return time.Time{}, ""
 }
 
@@ -468,11 +472,12 @@ func BaseAPIParams(urls ...string) api.BaseParams {
 	return api.BaseParams{Client: gctx.Client, URL: u, Token: LoggedUserToken, UA: "tools/test"}
 }
 
-func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList []string) {
+func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, lst []string) {
 	bp := BaseAPIParams(proxyURL)
-	xid, err := api.EvictMultiObj(bp, bck, objList, "" /*template*/)
+	msg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: lst}}
+	xid, err := api.EvictMultiObj(bp, bck, msg)
 	if err != nil {
-		t.Errorf("Evict bucket %s failed, err = %v", bck, err)
+		t.Errorf("Evict bucket %s failed: %v", bck.String(), err)
 	}
 
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: EvictPrefetchTimeout}

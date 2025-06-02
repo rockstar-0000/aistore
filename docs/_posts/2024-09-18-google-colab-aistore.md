@@ -6,7 +6,7 @@ author: Abhishek Gaikwad
 categories: aistore google-colab data-loading
 ---
 
-Working with data stored in cloud services like GCP, AWS, and Azure in [Google Colab](https://colab.research.google.com/) can be challenging. The entire process—from installing libraries and configuring the backend to pulling data and dealing with performance and usability issues—is often frustrating. We often end up downloading the same data repeatedly instead of caching it locally.
+Working with data stored in cloud services like GCP, AWS, Azure, and OCI in [Google Colab](https://colab.research.google.com/) can be challenging. The entire process—from installing libraries and configuring the backend to pulling data and dealing with performance and usability issues—is often frustrating. We often end up downloading the same data repeatedly instead of caching it locally.
 
 In this blog, we'll show you how to use AIStore on Google Colab for quick experiments and easy data loading. AIStore stores your data on Colab's local disk space, so after the initial download from the cloud, your data is cached locally on the instance. This means subsequent data access is much faster, as it loads directly from the local disk instead of the cloud. With Google Colab's free tier offering around **60 GB** of disk space, you can cache a significant amount of data without any additional cost.
 
@@ -17,7 +17,7 @@ The process is simple. Just click the button below to load the notebook and foll
 <a href="https://colab.research.google.com/github/NVIDIA/aistore/blob/main/python/examples/google_colab/aistore_deployment.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
 **Important Notes:**
-- This example installs [Go v1.22.3](https://go.dev/doc/install), which is the supported Go version and toolchain at the time of writing.
+- This example installs [Go v1.23.1](https://go.dev/doc/install), which is the supported Go version and toolchain at the time of writing.
 - AIStore runs in the background during the experiments. However, if you interrupt any cell, it sends a `SIGINT` (termination signal) to all background processes, including AIStore. If this happens, simply rerun the appropriate cell to restart AIStore and continue your work.
 
 ## Stats for Nerds

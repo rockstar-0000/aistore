@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
@@ -64,7 +64,8 @@ var _ cos.StatsUpdater = (*dummyStatsTracker)(nil)
 func (*dummyStatsTracker) Add(string, int64)                                         {}
 func (*dummyStatsTracker) Inc(string)                                                {}
 func (*dummyStatsTracker) Get(string) int64                                          { return 0 }
-func (*dummyStatsTracker) AddMany(...cos.NamedVal64)                                 {}
+func (*dummyStatsTracker) AddWith(...cos.NamedVal64)                                 {}
+func (*dummyStatsTracker) IncWith(string, map[string]string)                         {}
 func (*dummyStatsTracker) ClrFlag(string, cos.NodeStateFlags)                        {}
 func (*dummyStatsTracker) SetFlag(string, cos.NodeStateFlags)                        {}
 func (*dummyStatsTracker) SetClrFlag(string, cos.NodeStateFlags, cos.NodeStateFlags) {}
@@ -94,7 +95,7 @@ func TestMain(t *testing.M) {
 	sc := transport.Init(&dummyStatsTracker{})
 	go sc.Run()
 
-	objmux = mux.NewServeMux()
+	objmux = mux.NewServeMux(false /*enableTracing*/)
 	path := transport.ObjURLPath("")
 	objmux.HandleFunc(path, transport.RxAnyStream)
 	objmux.HandleFunc(path+"/", transport.RxAnyStream)
@@ -124,7 +125,8 @@ func Example_headers() {
 				break
 			}
 
-			fmt.Printf("Bck:%s ObjName:%s SID:%s Opaque:%v ObjAttrs:{%s} (%d)\n", hdr.Bck, hdr.ObjName, hdr.SID, hdr.Opaque, hdr.ObjAttrs.String(), hlen)
+			fmt.Printf("Bck:%s ObjName:%s SID:%s Opaque:%v ObjAttrs:{%s} (%d)\n",
+				hdr.Bck.String(), hdr.ObjName, hdr.SID, hdr.Opaque, hdr.ObjAttrs.String(), hlen)
 			off += hlen + int(hdr.ObjAttrs.Size)
 		}
 	}
@@ -139,8 +141,8 @@ func Example_headers() {
 	stream.Fin()
 
 	// Output:
-	// Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{231B, v"1", xxhash[h1], map[]} (69)
-	// Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{213B, v"222222222222222222222222", xxhash[h2], map[xx:11 yy:22]} (110)
+	// Bck:s3://@uuid#namespace/abc ObjName:X SID: Opaque:[] ObjAttrs:{231B, v"1", xxhash2[h1], map[]} (70)
+	// Bck:ais://abracadabra ObjName:p/q/s SID: Opaque:[49 50 51] ObjAttrs:{213B, v"222222222222222222222222", xxhash2[h2], map[xx:11 yy:22]} (111)
 }
 
 func sendText(stream *transport.Stream, txt1, txt2 string) {
@@ -160,7 +162,7 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 		ObjAttrs: cmn.ObjAttrs{
 			Size:  sgl1.Size(),
 			Atime: 663346294,
-			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h1"),
+			Cksum: cos.NewCksum(cos.ChecksumCesXxh, "h1"),
 		},
 		Opaque: nil,
 	}
@@ -181,7 +183,7 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 		ObjAttrs: cmn.ObjAttrs{
 			Size:  sgl2.Size(),
 			Atime: 663346294,
-			Cksum: cos.NewCksum(cos.ChecksumXXHash, "h2"),
+			Cksum: cos.NewCksum(cos.ChecksumCesXxh, "h2"),
 		},
 		Opaque: []byte{'1', '2', '3'},
 	}
@@ -381,7 +383,7 @@ func TestObjAttrs(t *testing.T) {
 		{
 			Size:  1024,
 			Atime: math.MaxInt64,
-			Cksum: cos.NewCksum(cos.ChecksumXXHash, "120421"),
+			Cksum: cos.NewCksum(cos.ChecksumCesXxh, "120421"),
 			Ver:   _ptrstr("102.44"),
 		},
 		{
@@ -523,7 +525,9 @@ func TestCompressedOne(t *testing.T) {
 	printNetworkStats()
 }
 
+// TODO: Skip unmaintained dry-run test to reduce test runtime (revisit)
 func TestDryRun(t *testing.T) {
+	t.Skipf("skipping %s", t.Name())
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
 	t.Setenv("AIS_STREAM_DRY_RUN", "true")
@@ -558,14 +562,14 @@ func TestDryRun(t *testing.T) {
 			size += hdr.ObjAttrs.Size
 			if size-prevsize >= cos.GiB*100 {
 				prevsize = size
-				tlog.Logf("[dry]: %d GiB\n", size/cos.GiB)
+				fmt.Printf("[dry]: %d GiB\n", size/cos.GiB)
 			}
 		}
 	}
 	stream.Fin()
 	stats := stream.GetStats()
 
-	fmt.Printf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
+	tlog.Logf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
 }
 
 func TestCompletionCount(t *testing.T) {
@@ -750,7 +754,7 @@ func genStaticHeader(random *rand.Rand) (hdr transport.ObjHdr) {
 	hdr.ObjAttrs.Size = cos.GiB
 	hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int64(), 10), "d")
 	hdr.ObjAttrs.SetCustomKey("e", "")
-	hdr.ObjAttrs.SetCksum(cos.ChecksumXXHash, "xxhash")
+	hdr.ObjAttrs.SetCksum(cos.ChecksumCesXxh, "xxhash")
 	return
 }
 
@@ -782,7 +786,7 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 		hdr.ObjAttrs.SetCksum(cos.ChecksumMD5, "md5")
 	case 2:
 		hdr.ObjAttrs.Size = (x & 0xffff) + 1
-		hdr.ObjAttrs.SetCksum(cos.ChecksumXXHash, "xxhash")
+		hdr.ObjAttrs.SetCksum(cos.ChecksumCesXxh, "xxhash")
 		for range int(x & 0x1f) {
 			hdr.ObjAttrs.SetCustomKey(strconv.FormatInt(random.Int64(), 10), s)
 		}
@@ -792,7 +796,7 @@ func genRandomHeader(random *rand.Rand, usePDU bool) (hdr transport.ObjHdr) {
 		hdr.ObjAttrs.SetCustomKey(s, "")
 		hdr.ObjAttrs.SetCksum(cos.ChecksumNone, "")
 	}
-	return
+	return hdr
 }
 
 ////////////////

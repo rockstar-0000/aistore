@@ -1,12 +1,3 @@
----
-layout: post
-title: PROVIDERS
-permalink: /docs/providers
-redirect_from:
- - /providers.md/
- - /docs/providers.md/
----
-
 ## Introduction
 
 Terminology first:
@@ -21,6 +12,7 @@ AIStore natively integrates with multiple backend providers:
 | `aws` | `aws://`, `s3://` | [Amazon Cloud Storage](#cloud-object-storage) |
 | `azure` | `azure://`, `az://` | [Azure Cloud Storage](#cloud-object-storage)|
 | `gcp` | `gcp://`, `gs://` | [Google Cloud Storage](#cloud-object-storage) |
+| `oci` | `oc://`, `oci://` | [Oracle Cloud Storage](#cloud-object-storage)[^1] |
 | `ht` | `ht://` | [HTTP(S) based dataset](#https-based-dataset) |
 
 **Native integration**, in turn, implies:
@@ -45,8 +37,8 @@ The full taxonomy of the supported backends is shown below (and note that AIS su
 
 Further:
 
-* For additional information on working with buckets, please refer to [bucket readme](bucket.md).
-* For API reference, see [the RESTful API reference and examples](http_api.md).
+* For types of supported buckets (AIS, Cloud, remote AIS, etc.), bucket management and properties, storage services and more usage examples, see [in-depth overview](/docs/bucket.md)
+* For API reference, see [APIs](/docs/overview.md#aistore-api).
 * For AIS command-line management, see [CLI](cli.md).
 
 ## Remote AIS cluster
@@ -147,6 +139,7 @@ Cloud-based object storage include:
 * `aws` - [Amazon S3](https://aws.amazon.com/s3)
 * `azure` - [Microsoft Azure Blob Storage](https://azure.microsoft.com/en-us/services/storage/blobs)
 * `gcp` - [Google Cloud Storage](https://cloud.google.com)
+* `oci` - [Oracle Cloud Storage](https://www.oracle.com/cloud/storage/)[^1]
 
 In each case, we use the vendor's own SDK/API to provide transparent access to Cloud storage with the additional capability of *persistently caching* all read data in the AIStore's [remote buckets](bucket.md).
 
@@ -155,7 +148,86 @@ In each case, we use the vendor's own SDK/API to provide transparent access to C
 
 > Notwithstanding, *remote buckets* will often serve as a fast cache or a fast tier in front of a given 3rd party Cloud storage.
 
-> Note as well that AIS provides [5 (five) easy ways to populate its *remote buckets*](overview.md) - including, but not limited to conventional on-demand caching (aka *cold GET*).
+> Note as well that AIS provides [multiple easy ways to populate its *remote buckets*](overview.md#existing-datasets) - including, but not limited to conventional on-demand self-populating dubbed [cold GET](/docs/overview.md#existing-datasets).
+
+## Example: accessing Cloud storage via remote AIS
+
+There are, essentially, two different capabilities:
+
+* attach _other_ AIS clusters
+* redirect AIS bucket to read, write, and otherwise operate on a different bucket
+
+Here's a quick and commented example where we access (e.g.) `s3://data` indirectly, via another bucket called `ais://nnn`.
+
+Notice that the cluster that contains `ais://nnn` does no necessarily has to have AWS credentials to access `s3://data`.
+
+### Step 1: show remote cluster
+
+```console
+$ ais show remote-cluster
+
+UUID        URL                     Alias   Primary  Smap    Targets  Uptime
+A9A78a_cSc  http://aistore:51080    remais           v2145   4        64d23h
+```
+
+### Step 2: list s3://data directly via remote cluster
+
+```console
+$ AIS_ENDPOINT=http://aistore:51080 ais ls s3://data
+
+NAME             SIZE
+aaa/bbb/ccc      16.26KiB
+aaa/bbb/eee      16.26KiB
+aaa/ddd          16.26KiB
+aaabbb           16.26KiB
+aaaccc           16.26KiB
+bbb/111          16.26KiB
+ttt/hhh          16.26KiB
+ttt/qqq          16.26KiB
+```
+
+### Step 3: redirect "local" `ais://nnn` to Cloud-based `s3://data` via remote AIS cluster
+
+```console
+$ ais bucket props set ais://nnn <TAB-TAB>
+
+backend_bck.name               checksum.validate_cold_get     lru.enabled                    ec.bundle_multiplier           features
+backend_bck.provider           checksum.validate_warm_get     mirror.copies                  ec.data_slices                 write_policy.data
+versioning.enabled             checksum.validate_obj_move     mirror.burst_buffer            ec.parity_slices               write_policy.md
+versioning.validate_warm_get   checksum.enable_read_range     mirror.enabled                 ec.enabled
+versioning.synchronize         lru.dont_evict_time            ec.objsize_limit               ec.disk_only
+checksum.type                  lru.capacity_upd_time          ec.compression                 access
+
+$ ais bucket props set ais://nnn backend_bck=s3://@A9A78a_cSc/data
+
+"backend_bck.name" set to: "data" (was: "")
+"backend_bck.provider" set to: "aws" (was: "")
+
+Bucket props successfully updated.
+```
+
+Note that attached clusters have (human-readable) aliases that often may be easier to use, e.g.:
+
+```console
+$ ais bucket props set ais://nnn backend_bck=s3://@remais/data
+```
+
+In other words, actual cluster UUID (`A9A78a_cSc` above) and its alias (`remais`) can be used interchangibly.
+
+### Step 4: finally, list `s3//data` via "local" `ais://nnn`
+
+```console
+$ ais ls ais://nnn
+
+aaa/bbb/ccc      16.26KiB
+aaa/bbb/eee      16.26KiB
+aaa/ddd          16.26KiB
+aaabbb           16.26KiB
+aaaccc           16.26KiB
+bbb/111          16.26KiB
+ttt/hhh          16.26KiB
+ttt/qqq          16.26KiB
+```
 
 ## HTTP(S) based dataset
 
@@ -170,3 +242,5 @@ would all be stored in a single AIS bucket that would have a protocol prefix `ht
 
 WARNING: Currently HTTP(S) based datasets can only be used with clients which support an option of overriding the proxy for certain hosts (for e.g. `curl ... --noproxy=$(curl -s G/v1/cluster?what=target_ips)`).
 If used otherwise, we get stuck in a redirect loop, as the request to target gets redirected via proxy.
+
+[^1]: **Note:** OCI support is currently experimental and may have limited functionality or stability.

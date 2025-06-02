@@ -1,12 +1,3 @@
----
-layout: post
-title: CONFIG
-permalink: /docs/cli/config
-redirect_from:
- - /cli/config.md/
- - /docs/cli/config.md/
----
-
 Primarily, there are two main configuration-managing commands, each having multiple subcommands and sub-subcommands:
 
 1. `ais config`		- show and update configuration
@@ -22,7 +13,7 @@ NAME:
    ais config - configure AIS cluster and individual nodes (in the cluster); configure CLI (tool)
 
 USAGE:
-   ais config command [command options] [arguments...]
+   ais config command [arguments...] [command options]
 
 COMMANDS:
    show     show CLI, cluster, or node configurations (nodes inherit cluster and have local)
@@ -196,7 +187,7 @@ NAME:
    ais show config - show CLI, cluster, or node configurations (nodes inherit cluster and have local)
 
 USAGE:
-   ais show config [command options] cli | cluster [CONFIG SECTION OR PREFIX] |
+   ais show config cli | cluster [CONFIG SECTION OR PREFIX] | [command options]
       NODE_ID [ cluster | local | all [CONFIG SECTION OR PREFIX ] ]
 
 OPTIONS:

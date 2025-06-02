@@ -1,8 +1,9 @@
 
 SHELL := /bin/bash
 PYTHON = python3
+GO = go
 PYTEST = $(PYTHON) -m pytest
-PIP = pip3
+PIP ?= pip3
 SDK_DOCFILE := ../docs/python_sdk.md
 TORCH_DOCFILE := ../docs/pytorch.md
 PYAISLOADER_TEST_TYPE ?= short
@@ -39,6 +40,10 @@ botocore_deps:
 s3_test_deps:
 	$(PIP) install --upgrade -r tests/s3compat/requirements --quiet
 
+.PHONY: python_unit_tests_scenario_gen
+python_unit_tests_scenario_gen:
+	@ $(GO) run tests/unit/sdk/hrw/scenario_gen.go
+
 .PHONY: python_tests
 python_tests: common_deps dev_deps botocore_deps python_sdk_tests python_etl_tests python_botocore_tests
 
@@ -48,11 +53,18 @@ python_sdk_tests: common_deps python_sdk_unit_tests python_sdk_integration_tests
 
 .PHONY: python_sdk_integration_tests
 python_sdk_integration_tests: common_deps
-	$(PYTEST) -v tests/integration/sdk -m "not etl and not authn"
+	$(PYTEST) -v -n auto tests/integration/sdk -m "not etl and not authn and not extended and not nonparallel" --durations=20
+	# Run tests that are specifically not able to run alongside certain others
+	$(PYTEST) -v tests/integration/sdk -m "nonparallel" --durations=0
 
 .PHONY: python_sdk_unit_tests
 python_sdk_unit_tests: common_deps
-	$(PYTEST) -v tests/unit/sdk
+	$(PYTEST) -v -n auto tests/unit/sdk
+
+# Run tests with `extended` marker with `AIS_STRESS_TEST` to control increased object count, size, etc.
+.PHONY: python_sdk_extended_tests
+python_sdk_extended_tests: common_deps
+	AIS_STRESS_TEST=true $(PYTEST) -v tests/integration/sdk -m "extended" --durations=0
 
 .PHONY: python_etl_tests
 python_etl_tests: common_deps
@@ -107,8 +119,9 @@ generate-sdk-docs:
 	@ source doc_prefixes.sh &&  echo "$$SDK_PREFIX" > $(SDK_DOCFILE)
 	@ pydoc-markdown -I ./aistore/sdk \
 	-m authn.authn_client -m authn.cluster_manager -m authn.role_manager -m authn.token_manager -m authn.user_manager -m authn.access_attr \
-	-m bucket -m client -m cluster -m etl -m job -m multiobj.object_group -m multiobj.object_names -m multiobj.object_range -m multiobj.object_template \
-	-m obj.object -m obj.object_reader -m obj.object_file -m obj.object_props -m obj.object_attributes \
+	-m bucket -m client -m cluster -m etl -m job -m retry_config \
+	-m multiobj.object_group -m multiobj.object_names -m multiobj.object_range -m multiobj.object_template \
+	-m obj.object -m obj.object_reader -m obj.obj_file.object_file -m obj.object_props -m obj.object_attributes \
 	'{ renderer: { type: markdown, descriptive_class_title: "Class: ", render_toc: true, render_toc_title: "", render_module_header: false, classdef_with_decorators: true } }' >> $(SDK_DOCFILE)	
 	@ sed -i -e 's/####/###/g' $(SDK_DOCFILE)
 
@@ -119,7 +132,7 @@ generate-pytorch-docs:
 	@ [[ $$(pipx --help) ]] || $(PIP) install pipx; $(PYTHON) -m pipx ensurepath --force
 	@ [[ $$(pydoc-markdown --help) ]] || pipx install --force pydoc-markdown[novella]
 	@ source doc_prefixes.sh && echo "$$TORCH_PREFIX" > $(TORCH_DOCFILE)
-	@ pydoc-markdown -I ./aistore/pytorch -m base_map_dataset -m base_iter_dataset -m map_dataset -m iter_dataset -m shard_reader -m worker_request_client -m multishard_dataset -m aisio '{ renderer: { type: markdown, descriptive_class_title: "Class: ", render_toc: true, render_toc_title: "", render_module_header: false, classdef_with_decorators: true } }' >> $(TORCH_DOCFILE)
+	@ pydoc-markdown -I ./aistore/pytorch -m base_map_dataset -m base_iter_dataset -m map_dataset -m iter_dataset -m shard_reader -m multishard_dataset '{ renderer: { type: markdown, descriptive_class_title: "Class: ", render_toc: true, render_toc_title: "", render_module_header: false, classdef_with_decorators: true } }' >> $(TORCH_DOCFILE)
 	@ sed -i -e 's/####/###/g' $(TORCH_DOCFILE)
 
 

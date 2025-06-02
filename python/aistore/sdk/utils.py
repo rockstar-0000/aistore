@@ -1,36 +1,37 @@
 #
-# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 import logging
+import re
 from pathlib import Path
-from typing import Callable, Iterator, Tuple, Type, TypeVar
-from urllib.parse import urlparse
+from typing import Iterator, Optional, Tuple, Type, TypeVar, Union
+from urllib.parse import urlparse, urlunparse
 
 import braceexpand
 import humanize
+import requests
+import xxhash
 
 from msgspec import msgpack
-import pydantic.tools
-import requests
-from pydantic import BaseModel, parse_raw_as
-from requests import Response
+from pydantic.v1 import BaseModel, parse_raw_as
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
 from aistore.sdk.const import (
-    UTF_ENCODING,
     HEADER_CONTENT_TYPE,
     MSGPACK_CONTENT_TYPE,
     DEFAULT_LOG_FORMAT,
-)
-from aistore.sdk.errors import (
-    AISError,
-    ErrBckNotFound,
-    ErrRemoteBckNotFound,
-    ErrBckAlreadyExists,
-    ErrETLAlreadyExists,
+    XX_HASH_SEED,
 )
 
 T = TypeVar("T")
+MASK = 0xFFFFFFFFFFFFFFFF  # 64-bit mask
+# fmt: off
+GOLDEN_RATIO = 0x9e3779b97f4a7c15
+CONST1 = 0xbf58476d1ce4e5b9
+CONST2 = 0x94d049bb133111eb
+# fmt: on
+ROTATION_BITS = 7
 
 
 class HttpError(BaseModel):
@@ -38,65 +39,13 @@ class HttpError(BaseModel):
     Represents an error returned by the API.
     """
 
-    status: int
+    status_code: int
     message: str = ""
     method: str = ""
     url_path: str = ""
     remote_addr: str = ""
     caller: str = ""
     node: str = ""
-
-
-def raise_ais_error(text: str) -> None:
-    """
-    Raise an AIS error based on the response text.
-
-    Args:
-        text (str): The raw text of the API response containing error details.
-
-    Raises:
-        AISError: If the error doesn't match any specific conditions.
-        ErrBckNotFound: If the error message indicates a missing bucket.
-        ErrRemoteBckNotFound: If the error message indicates a missing remote bucket.
-        ErrBckAlreadyExists: If the error message indicates a bucket already exists.
-        ErrETLAlreadyExists: If the error message indicates an ETL already exists
-    """
-    err = pydantic.tools.parse_raw_as(HttpError, text)
-    if 400 <= err.status < 500:
-        if "does not exist" in err.message:
-            if "cloud bucket" in err.message or "remote bucket" in err.message:
-                raise ErrRemoteBckNotFound(err.status, err.message)
-            if "bucket" in err.message:
-                raise ErrBckNotFound(err.status, err.message)
-        elif "already exists" in err.message:
-            if "bucket" in err.message:
-                raise ErrBckAlreadyExists(err.status, err.message)
-            if "etl" in err.message:
-                raise ErrETLAlreadyExists(err.status, err.message)
-
-    raise AISError(err.status, err.message)
-
-
-# pylint: disable=unused-variable
-def handle_errors(
-    resp: requests.Response, raise_error_fn: Callable[[str], None] = raise_ais_error
-) -> None:
-    """
-    Error handling for requests made to the AIS Client
-
-    Args:
-        resp: requests.Response = Response received from the request
-        raise_error_fn: Function that processes error text and raises appropriate exceptions.
-    """
-    error_text = resp.text
-    if isinstance(resp.text, bytes):
-        try:
-            error_text = error_text.decode(UTF_ENCODING)
-        except UnicodeDecodeError:
-            error_text = error_text.decode("iso-8859-1")
-    if error_text != "":
-        raise_error_fn(error_text)
-    resp.raise_for_status()
 
 
 def probing_frequency(dur: int) -> float:
@@ -114,7 +63,7 @@ def probing_frequency(dur: int) -> float:
     return max(freq, 0.1)
 
 
-def read_file_bytes(filepath: str):
+def read_file_bytes(filepath: str) -> bytes:
     """
     Given a filepath, read the content as bytes
     Args:
@@ -126,37 +75,40 @@ def read_file_bytes(filepath: str):
         return reader.read()
 
 
-def _check_path_exists(path: str) -> None:
-    if not Path(path).exists():
+def _check_path_exists(path: Path) -> None:
+    if not path.exists():
         raise ValueError(f"Path: {path} does not exist")
 
 
-def validate_file(path: str) -> None:
+def validate_file(path: str or Path) -> None:
     """
     Validate that a file exists and is a file
     Args:
-        path: Path to validate
+        path (str or Path): Path to validate
     Raises:
         ValueError: If path does not exist or is not a file
     """
+    if isinstance(path, str):
+        path = Path(path)
     _check_path_exists(path)
-    path_obj = Path(path)
-    if not path_obj.exists():
+    if not path.exists():
         raise ValueError(f"Path: {path} does not exist")
-    if not path_obj.is_file():
+    if not path.is_file():
         raise ValueError(f"Path: {path} is a directory, not a file")
 
 
-def validate_directory(path: str) -> None:
+def validate_directory(path: str or Path) -> None:
     """
     Validate that a directory exists and is a directory
     Args:
-        path: Path to validate
+        path (str or Path): Path to validate
     Raises:
         ValueError: If path does not exist or is not a directory
     """
+    if isinstance(path, str):
+        path = Path(path)
     _check_path_exists(path)
-    if not Path(path).is_dir():
+    if not path.is_dir():
         raise ValueError(f"Path: {path} is a file, not a directory")
 
 
@@ -192,7 +144,7 @@ def expand_braces(template: str) -> Iterator[str]:
 
 def decode_response(
     res_model: Type[T],
-    resp: Response,
+    resp: requests.Response,
 ) -> T:
     """
     Parse response content from the cluster into a Python class,
@@ -223,13 +175,36 @@ def parse_url(url: str) -> Tuple[str, str, str]:
     return parsed_url.scheme, parsed_url.netloc, path
 
 
+def extract_and_parse_url(msg: str) -> Optional[Tuple[str, str, bool]]:
+    """
+    Extract provider, bucket, and object from raw string.
+
+    Args:
+        msg (str): Any string that may contain an AIS FQN.
+
+    Returns:
+        Optional[Tuple[str, str, bool]]: (prov, bck, obj) if a FQN is found, otherwise None.
+    """
+    pattern = r"([a-z0-9]+)://([A-Za-z0-9@._-]+)(/.*)?"
+    match = re.search(pattern, msg)
+
+    if not match:
+        return None
+
+    prov = match.group(1)
+    bck = match.group(2)
+    obj = match.group(3)  # Not None if `/` after bucket
+
+    return prov, bck, obj
+
+
 def get_logger(name: str, log_format: str = DEFAULT_LOG_FORMAT):
     """
     Create or retrieve a logger with the specified configuration.
 
     Args:
         name (str): The name of the logger.
-        format (str, optional): Logging format.
+        log_format (str, optional): Logging format.
 
     Returns:
         logging.Logger: Configured logger instance.
@@ -237,8 +212,114 @@ def get_logger(name: str, log_format: str = DEFAULT_LOG_FORMAT):
     logger = logging.getLogger(name)
     if not logger.hasHandlers():
         handler = logging.StreamHandler()
-        formatter = logging.Formatter(log_format)
-        handler.setFormatter(formatter)
+        handler.setFormatter(logging.Formatter(log_format))
         logger.addHandler(handler)
     logger.propagate = False
     return logger
+
+
+# Translated from:
+# http://xoshiro.di.unimi.it/xoshiro256starstar.c
+# Scrambled Linear Pseudorandom Number Generators
+# David Blackman, Sebastiano Vigna
+# https://arxiv.org/abs/1805.01407
+# http://www.pcg-random.org/posts/a-quick-look-at-xoshiro256.html
+def xoshiro256_hash(seed: int) -> int:
+    """
+    Xoshiro256-inspired hash function with 64-bit overflow behavior.
+    """
+    z = (seed + GOLDEN_RATIO) & MASK
+    z = (z ^ (z >> 30)) * CONST1 & MASK
+    z = (z ^ (z >> 27)) * CONST2 & MASK
+    z = (z ^ (z >> 31)) + GOLDEN_RATIO & MASK
+    z = (z ^ (z >> 30)) * CONST1 & MASK
+    z = (z ^ (z >> 27)) * CONST2 & MASK
+    z = (z ^ (z >> 31)) * 5 & MASK
+    rotated = ((z << ROTATION_BITS) | (z >> (64 - ROTATION_BITS))) & MASK
+    return (rotated * 9) & MASK
+
+
+def get_digest(name: str) -> int:
+    """
+    Get the xxhash digest of a given string.
+    """
+    return xxhash.xxh64(seed=XX_HASH_SEED, input=name.encode("utf-8")).intdigest()
+
+
+def convert_to_seconds(time_val: Union[str, int]) -> int:
+    """
+    Converts a time value (e.g., '5s', '10m', '2h', '3d', or 10) to seconds.
+    If no unit is provided (e.g., '10' or 10), seconds are assumed.
+
+    Args:
+        time_val (Union[str, int]): The time value to convert.
+
+    Returns:
+        int: The equivalent time in seconds.
+
+    Raises:
+        ValueError: If the format or unit is invalid.
+    """
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+    if isinstance(time_val, int):
+        return time_val
+
+    if not isinstance(time_val, str) or not time_val.strip():
+        raise ValueError("Time value must be a non-empty string or integer.")
+
+    time_val = time_val.strip()
+
+    if time_val.isdigit():
+        return int(time_val)
+
+    num, unit = time_val[:-1], time_val[-1]
+
+    if unit not in multipliers:
+        raise ValueError(f"Unsupported time unit: '{unit}'. Use 's', 'm', 'h', or 'd'.")
+
+    if not num.isdigit():
+        raise ValueError(f"Invalid numeric value in time: '{num}'.")
+
+    return int(num) * multipliers[unit]
+
+
+def compose_etl_direct_put_url(direct_put_url: str, host_target: str) -> str:
+    """
+    Composes the final direct PUT URL by merging the AIS target base URL (`host_target`)
+    with the destination node address and object path from `direct_put_url`.
+
+    Args:
+        direct_put_url (str): The destination node's direct PUT URL, including path and query.
+        host_target (str): The base AIS target URL used as the scheme and path base.
+
+    Returns:
+        str: A complete direct PUT URL targeting the appropriate AIS node.
+    """
+    parsed_target = urlparse(direct_put_url)
+    parsed_host = urlparse(host_target)
+    return urlunparse(
+        parsed_host._replace(
+            netloc=parsed_target.netloc,
+            path=parsed_host.path + parsed_target.path,
+            query=parsed_target.query,  # pass xid on direct put for statistics
+        )
+    )
+
+
+def is_read_timeout(exc: requests.ConnectionError) -> bool:
+    """
+    Check if a given ConnectionError was caused by an underlying ReadTimeoutError
+    Args:
+        exc: Any requests.ConnectionError.
+
+    Returns: If ReadTimeoutError cause the exception.
+
+    """
+    if len(exc.args) < 1:
+        return False
+    inner_exc = exc.args[0]
+    # Expect it to be wrapped in urllib's retry
+    if not isinstance(inner_exc, MaxRetryError):
+        return False
+    return isinstance(inner_exc.reason, ReadTimeoutError)

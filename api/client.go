@@ -1,6 +1,6 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -17,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/tinylib/msgp/msgp"
 )
@@ -68,10 +69,6 @@ type (
 		n          int64  // number bytes read from `resp.Body`
 	}
 )
-
-func newErrCreateHTTPRequest(err error) error {
-	return fmt.Errorf("failed to create http request: %w", err)
-}
 
 // HTTPStatus returns HTTP status or (-1) for non-HTTP error.
 func HTTPStatus(err error) int {
@@ -200,7 +197,7 @@ func (reqParams *ReqParams) do() (resp *http.Response, err error) {
 	SetAuxHeaders(req, &reqParams.BaseParams)
 
 	rr := reqResp{client: reqParams.BaseParams.Client, req: req}
-	err = cmn.NetworkCallWithRetry(&cmn.RetryArgs{
+	_, err = cmn.NetworkCallWithRetry(&cmn.RetryArgs{
 		Call:      rr.call,
 		Verbosity: cmn.RetryLogOff,
 		SoftErr:   httpMaxRetries,
@@ -389,7 +386,7 @@ func (rr *reqResp) call() (status int, err error) {
 	if rr.resp != nil {
 		status = rr.resp.StatusCode
 	}
-	return
+	return status, err
 }
 
 //

@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -46,7 +47,7 @@ import (
 //
 //         (shared-replicated-object, associated action-message),
 //
-// where `associated action-message` (aisMsg) provides receivers with the operation
+// where `associated action-message` (actMsgExt) provides receivers with the operation
 // ("action") and other relevant context.
 //
 // Further, the metasyncer:
@@ -109,6 +110,7 @@ type (
 	revs interface {
 		tag() string         // enum { revsSmapTag, ... }
 		version() int64      // the version
+		uuid() string        // UUID
 		marshal() (b []byte) // marshals the revs
 		jit(p *proxy) revs   // current (just-in-time) instance
 		sgl() *memsys.SGL    // jsp-encoded SGL
@@ -116,7 +118,7 @@ type (
 	}
 	revsPair struct {
 		revs revs
-		msg  *aisMsg
+		msg  *actMsgExt
 	}
 	revsReq struct {
 		wg        *sync.WaitGroup
@@ -137,6 +139,7 @@ type (
 		stopCh       chan struct{}     // stop channel
 		workCh       chan revsReq      // work channel
 		retryTimer   *time.Timer       // timer to sync pending
+		chanFull     cos.ChanFull      // as implied
 		timerStopped bool              // true if retryTimer has been stopped, false otherwise
 	}
 	// metasync Rx structured error
@@ -212,9 +215,8 @@ func (y *metasyncer) Run() error {
 				y.retryTimer.Reset(config.Periodic.RetrySyncTime.D())
 				y.timerStopped = false
 
-				if l, c := len(y.workCh), cap(y.workCh); l > c/2 {
-					nlog.Errorln("Warning:", y.p.String(), "[hp]:", cos.ErrWorkChanFull, "len", l, "cap", c,
-						"failed", failedCnt)
+				if l, c := len(y.workCh), cap(y.workCh); y.chanFull.Check(l, c) {
+					nlog.Errorln("[hp full]:", y.chanFull.Load(), "failed", failedCnt)
 				}
 			} else {
 				y.timerStopped = true
@@ -287,7 +289,7 @@ drain:
 		}
 	}
 	y.workCh <- revsReq{}
-	nlog.Infof("%s: becoming non-primary", y.p)
+	nlog.Infoln(y.p.String(), "becoming non-primary")
 }
 
 // main method; see top of the file; returns number of "sync" failures
@@ -312,7 +314,7 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 			msg, tag = pair.msg, pair.revs.tag()
 			revs     = pair.revs
 		)
-		if reqT == reqNotify {
+		if reqT == reqNotify || msg.Action == apc.ActPrimaryForce {
 			revsBody = revs.marshal()
 		} else {
 			revs = y.jit(pair)
@@ -445,7 +447,7 @@ func (y *metasyncer) jit(pair revsPair) revs {
 	return revs
 }
 
-// keeping track of per-daemon versioning - TODO: extend to take care of aisMsg where pairs may be empty
+// keeping track of per-daemon versioning - TODO: extend to take care of actMsgExt where pairs may be empty
 func (y *metasyncer) syncDone(si *meta.Snode, pairs []revsPair) {
 	ndr, ok := y.nodesRevs[si.ID()]
 	smap := y.p.owner.smap.get()
@@ -465,7 +467,7 @@ func (y *metasyncer) syncDone(si *meta.Snode, pairs []revsPair) {
 	}
 }
 
-func (y *metasyncer) handleRefused(method, urlPath string, body io.Reader, refused meta.NodeMap, pairs []revsPair, smap *smapX) (ok bool) {
+func (y *metasyncer) handleRefused(method, urlPath string, body io.ReadCloser, refused meta.NodeMap, pairs []revsPair, smap *smapX) (ok bool) {
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{Method: method, Path: urlPath, BodyR: body}
 	args.network = cmn.NetIntraControl
@@ -506,7 +508,7 @@ func (y *metasyncer) _pending() (pending meta.NodeMap, smap *smapX) {
 	smap = y.p.owner.smap.get()
 	if !smap.isPrimary(y.p.si) {
 		y.becomeNonPrimary()
-		return
+		return nil, smap
 	}
 	for _, serverMap := range []meta.NodeMap{smap.Tmap, smap.Pmap} {
 		for _, si := range serverMap {
@@ -523,8 +525,9 @@ func (y *metasyncer) _pending() (pending meta.NodeMap, smap *smapX) {
 					if !ok || v < revs.version() {
 						inSync = false
 						break
-					} else if v > revs.version() {
-						// skip older versions (TODO: don't skip sending associated aisMsg)
+					}
+					if v > revs.version() {
+						// skip older versions (TODO: don't skip sending associated actMsgExt)
 						nlog.Errorf("v: %d; revs.version: %d", v, revs.version())
 					}
 				}
@@ -538,7 +541,7 @@ func (y *metasyncer) _pending() (pending meta.NodeMap, smap *smapX) {
 			pending.Add(si)
 		}
 	}
-	return
+	return pending, smap
 }
 
 // gets invoked when retryTimer fires; returns updated number of still pending
@@ -716,9 +719,10 @@ func (payload msPayload) marshal(mm *memsys.MMSA) (sgl *memsys.SGL) {
 	return sgl
 }
 
-func (payload msPayload) unmarshal(reader io.ReadCloser, tag string) (err error) {
-	_, err = jsp.Decode(reader, &payload, msjspOpts, tag)
-	return
+func (payload msPayload) unmarshal(reader io.ReadCloser, tag string) error {
+	_, err := jsp.Decode(reader, &payload, msjspOpts, tag)
+	cos.Close(reader)
+	return err
 }
 
 //////////////

@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -71,22 +71,22 @@ func (mi *Mountpath) RemoveDeleted(who string) (rerr error) {
 // 1. Synchronously gets temporary directory name
 // 2. Synchronously renames old folder to temporary directory
 func (mi *Mountpath) MoveToDeleted(dir string) (err error) {
-	var base, tmpBase, tmpDst string
-	err = cos.Stat(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = nil
+	if errN := cos.Stat(dir); errN != nil {
+		if os.IsNotExist(errN) {
+			errN = nil
 		}
-		return
+		return errN
 	}
 
 	var (
-		cs          = Cap()
-		errCap, oos = cs.Err(), cs.IsOOS()
+		base, tmpBase, tmpDst string
+		cs                    = Cap()
+		errCap, oos           = cs.Err(), cs.IsOOS()
 	)
 	if errCap != nil {
 		goto rm // not moving - removing
 	}
+
 	base = filepath.Base(dir)
 	tmpBase = mi.TempDir(base)
 	err = cos.CreateDir(tmpBase)
@@ -99,7 +99,7 @@ func (mi *Mountpath) MoveToDeleted(dir string) (err error) {
 
 	tmpDst = filepath.Join(tmpBase, strconv.FormatInt(mono.NanoTime(), 10))
 	if err = os.Rename(dir, tmpDst); err == nil {
-		return // ok
+		return nil // ok
 	}
 
 	if cos.IsErrOOS(err) {
@@ -117,7 +117,7 @@ rm:
 	return err
 }
 
-func (mi *Mountpath) ClearMDs(inclBMD bool) (rerr error) {
+func (mi *Mountpath) clearMDs(inclBMD bool) (rerr error) {
 	for _, mdfd := range mdFilesDirs {
 		if !inclBMD && mdfd == fname.Bmd {
 			continue
@@ -128,7 +128,7 @@ func (mi *Mountpath) ClearMDs(inclBMD bool) (rerr error) {
 			rerr = err
 		}
 	}
-	return
+	return rerr
 }
 
 //
@@ -161,7 +161,7 @@ func demd(allmpi []MPI) (rerr error) {
 	for _, mpi := range allmpi {
 		for _, mi := range mpi {
 			// NOTE: BMD goes with data (ie., no data - no BMD)
-			if err := mi.ClearMDs(false /*include BMD*/); err != nil {
+			if err := mi.clearMDs(false /*include BMD*/); err != nil {
 				rerr = err
 			}
 			// node ID (SID)
@@ -171,7 +171,7 @@ func demd(allmpi []MPI) (rerr error) {
 			}
 		}
 	}
-	return
+	return rerr
 }
 
 // the entire content including user data, MDs, and daemon ID
@@ -192,7 +192,7 @@ func deworld(allmpi []MPI) (rerr error) {
 			}
 		}
 	}
-	return
+	return rerr
 }
 
 // retrying ENOTEMPTY - "directory not empty" race vs. new writes
@@ -211,5 +211,5 @@ func RemoveAll(dir string) (err error) {
 			time.Sleep(desleep)
 		}
 	}
-	return
+	return err
 }

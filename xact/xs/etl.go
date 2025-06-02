@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -13,6 +13,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
@@ -22,7 +23,10 @@ type (
 		xreg.RenewBase
 		xctn *xactETL
 	}
+	// represents `apc.ActETLInline` kind of xaction (`apc.ActETLBck`/`apc.ActETLObject` kinds are managed by tcb/tcobjs)
+	// responsible for triggering global abort on error to ensure all related ETL resources are cleaned up across all targets.
 	xactETL struct {
+		msg etl.InitMsg
 		xact.Base
 	}
 )
@@ -39,7 +43,7 @@ func (*etlFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 
 func (p *etlFactory) Start() error {
 	debug.Assert(cos.IsValidUUID(p.Args.UUID), p.Args.UUID)
-	p.xctn = newETL(p.Args.UUID, p.Kind())
+	p.xctn = newETL(p)
 	return nil
 }
 
@@ -52,10 +56,12 @@ func (*etlFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 
 // (tests only)
 
-func newETL(id, kind string) (xctn *xactETL) {
-	xctn = &xactETL{}
-	xctn.InitBase(id, kind, nil)
-	return
+func newETL(p *etlFactory) *xactETL {
+	msg, ok := p.Args.Custom.(etl.InitMsg)
+	debug.Assert(ok)
+	xctn := &xactETL{msg: msg}
+	xctn.InitBase(p.Args.UUID, p.Kind(), msg.String(), nil)
+	return xctn
 }
 
 func (*xactETL) Run(*sync.WaitGroup) { debug.Assert(false) }

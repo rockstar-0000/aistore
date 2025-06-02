@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -18,18 +18,24 @@ const (
 
 // LsoMsg flags
 const (
-	// Applies to objects from the buckets with remote backends (e.g., to optimize-out listing remotes)
-	// See related Flt* enum
-	LsObjCached = 1 << iota
+	// only list in-cluster objects, i.e., those from the respective remote bucket that are present (\"cached\")
+	// see also: flt* enum and `LsNotCached` below
+	LsCached = 1 << iota
 
-	LsMissing // include missing main obj (with copy existing)
+	// include missing main obj (with copy existing)
+	LsMissing
 
-	LsDeleted // include obj-s marked for deletion (TODO: not implemented yet)
+	// include obj-s marked for deletion (TODO: not implemented yet)
+	LsDeleted
 
-	LsArchDir // expand archives as directories
+	// expand archives as directories
+	LsArchDir
 
-	LsNameOnly // return only object names and, spearately, statuses
-	LsNameSize // same as above and size (minor speedup)
+	// return only object names and, separately, statuses
+	LsNameOnly
+
+	// same as above and size (minor speedup)
+	LsNameSize
 
 	// Background: ============================================================
 	// as far as AIS is concerned, adding a (confirmed to exist)
@@ -50,37 +56,35 @@ const (
 	// * `QparamDontHeadRemote` (this package)
 	LsDontHeadRemote
 
-	// To list remote buckets without adding them to aistore
+	// list remote buckets without adding them to aistore
 	// See also:
 	// * cmd/cli/cli/const.go for `dontAddRemoteFlag`
 	// * `QparamDontAddRemote` (this package)
 	LsDontAddRemote
 
-	// cache list-objects results and use this cache to speed-up
-	UseListObjsCache
+	// strict opposite of the `LsCached`
+	LsNotCached
 
-	// For remote buckets - list only remote props (aka `wantOnlyRemote`). When false,
+	// for remote buckets - list only remote props (aka `wantOnlyRemote`). When false,
 	// the default that's being used is: `WantOnlyRemoteProps` - see below.
 	// When true, the request gets executed in a pass-through fashion whereby a single ais target
 	// simply forwards it to the associated remote backend and delivers the results as is to the
 	// requesting proxy and, subsequently, to client.
 	LsWantOnlyRemoteProps
 
-	// List objects without recursion (POSIX-wise).
-	// See related feature flag: feat.DontOptimizeVirtualDir
+	// list objects without recursion (POSIX-wise).
+	// see related feature flag: feat.DontOptimizeVirtualDir
 	LsNoRecursion
 
-	// For remote metadata-capable buckets (ie., bck.HasVersioningMD() == true):
-	// - check whether remote version exists,
-	// and if it does:
-	// - check whether remote version differs from its in-cluster copy
-	LsVerChanged
+	// bidirectional (remote <-> in-cluster) diff requires remote metadata-capable (`HasVersioningMD`) buckets;
+	// it entails:
+	// - checking whether remote version exists,
+	//   and if it does,
+	// - checking whether it differs from its in-cluster copy.
+	// see related `cmn.LsoEnt` flags: `EntryVerChanged` and `EntryVerRemoved`, respectively.
+	LsDiff
 
-	// Do not return virtual subdirectories.
-	// Background:
-	// Currently,    `list-objects(ais://BUCKET)` never returns virtual subdirectories - while,
-	// for instance, `list-objects(aws://BUCKET)` MAY return the latter.
-	// To prevent this from happening, specify LsNoDirs flag.
+	// do not return virtual subdirectories - do not include them as `cmn.LsoEnt` entries
 	LsNoDirs
 )
 
@@ -91,32 +95,35 @@ const (
 	MaxPageSizeAWS   = 1000
 	MaxPageSizeGCP   = 1000
 	MaxPageSizeAzure = 5000
+	MaxPageSizeOCI   = 1000
 )
 
 const (
-	// Status
+	// location _status_
 	LocOK = iota
 	LocMisplacedNode
 	LocMisplacedMountpath
 	LocIsCopy
-	LocIsCopyMissingObj
+	LocIsCopyMissingObj // missing "main replica"
 
 	// LsoEntry Flags
-	EntryIsCached   = 1 << (EntryStatusBits + 1)
-	EntryInArch     = 1 << (EntryStatusBits + 2)
-	EntryIsDir      = 1 << (EntryStatusBits + 3)
-	EntryIsArchive  = 1 << (EntryStatusBits + 4)
-	EntryVerChanged = 1 << (EntryStatusBits + 5) // see also: QparamLatestVer, et al.
-	EntryVerRemoved = 1 << (EntryStatusBits + 6) // ditto
+	EntryIsCached   = 1 << (statusBits + 1)
+	EntryInArch     = 1 << (statusBits + 2)
+	EntryIsDir      = 1 << (statusBits + 3)
+	EntryIsArchive  = 1 << (statusBits + 4)
+	EntryVerChanged = 1 << (statusBits + 5) // see also: QparamLatestVer, et al.
+	EntryVerRemoved = 1 << (statusBits + 6) // ditto
+	// added v3.26
+	EntryHeadFail = 1 << (statusBits + 7)
 )
 
-// ObjEntry.Flags field
+// cmn/objlist_utils
 const (
-	EntryStatusBits = 5                          // N bits
-	EntryStatusMask = (1 << EntryStatusBits) - 1 // mask for N low bits
+	statusBits    = 5
+	LsoStatusMask = (1 << statusBits) - 1
 )
 
-// LsoMsg and HEAD(object) enum (NOTE: compare with `cmn.ObjectProps`)
+// LsoMsg and HEAD(object) enum
 const (
 	GetPropsName     = "name"
 	GetPropsSize     = "size"
@@ -145,6 +152,7 @@ var (
 )
 
 type LsoMsg struct {
+	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 	UUID              string      `json:"uuid"`                  // ID to identify a single multi-page request
 	Props             string      `json:"props"`                 // comma-delimited, e.g. "checksum,size,custom" (see GetProps* enum)
 	TimeFormat        string      `json:"time_format,omitempty"` // RFC822 is the default
@@ -152,9 +160,8 @@ type LsoMsg struct {
 	StartAfter        string      `json:"start_after,omitempty"` // start listing after (AIS buckets only)
 	ContinuationToken string      `json:"continuation_token"`    // => LsoResult.ContinuationToken => LsoMsg.ContinuationToken
 	SID               string      `json:"target"`                // selected target to solely execute backend.list-objects
-	Flags             uint64      `json:"flags,string"`          // enum {LsObjCached, ...} - "LsoMsg flags" above
+	Flags             uint64      `json:"flags,string"`          // enum {LsCached, ...} - "LsoMsg flags" above
 	PageSize          int64       `json:"pagesize"`              // max entries returned by list objects call
-	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 }
 
 ////////////
@@ -209,7 +216,46 @@ func (lsmsg *LsoMsg) PropsSet() (s cos.StrSet) {
 	return s
 }
 
-// LsoMsg flags enum: LsObjCached, ...
+func (lsmsg *LsoMsg) Str(cname string) string {
+	var sb strings.Builder
+	sb.Grow(80)
+
+	sb.WriteString(cname)
+	if lsmsg.Props != "" {
+		sb.WriteString(", props:")
+		sb.WriteString(lsmsg.Props)
+	}
+	if lsmsg.Flags == 0 {
+		return sb.String()
+	}
+
+	sb.WriteString(", flags:")
+	if lsmsg.IsFlagSet(LsCached) {
+		sb.WriteString("cached,")
+	}
+	if lsmsg.IsFlagSet(LsMissing) {
+		sb.WriteString("missing,")
+	}
+	if lsmsg.IsFlagSet(LsArchDir) {
+		sb.WriteString("arch,")
+	}
+	if lsmsg.IsFlagSet(LsBckPresent) {
+		sb.WriteString("bck-present,")
+	}
+	if lsmsg.IsFlagSet(LsDontAddRemote) {
+		sb.WriteString("skip-lookup,")
+	}
+	if lsmsg.IsFlagSet(LsNoRecursion) {
+		sb.WriteString("no-recurs,")
+	}
+	if lsmsg.IsFlagSet(LsDiff) {
+		sb.WriteString("diff,")
+	}
+	s := sb.String()
+	return s[:len(s)-1]
+}
+
+// LsoMsg flags enum: LsCached, ...
 func (lsmsg *LsoMsg) SetFlag(flag uint64)         { lsmsg.Flags |= flag }
 func (lsmsg *LsoMsg) ClearFlag(flag uint64)       { lsmsg.Flags &= ^flag }
 func (lsmsg *LsoMsg) IsFlagSet(flags uint64) bool { return lsmsg.Flags&flags == flags }

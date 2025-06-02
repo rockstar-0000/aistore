@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -46,22 +46,22 @@ func newDownloadDB(driver kvdb.Driver) *downloaderDB {
 	}
 }
 
-func (db *downloaderDB) errors(id string) (errors []TaskErrInfo, err error) {
+func (db *downloaderDB) errors(id string) (errs []TaskErrInfo, _ error) {
 	key := path.Join(downloaderErrors, id)
-	if err := db.driver.Get(downloaderCollection, key, &errors); err != nil {
+	if code, err := db.driver.Get(downloaderCollection, key, &errs); err != nil {
 		if !cos.IsErrNotFound(err) {
-			nlog.Errorln(err)
+			nlog.Errorln(err, code)
 			return nil, err
 		}
 		// nothing in DB - return an empty list
 		return db.errCache[id], nil
 	}
 
-	errors = append(errors, db.errCache[id]...)
-	return
+	errs = append(errs, db.errCache[id]...)
+	return errs, nil
 }
 
-func (db *downloaderDB) getErrors(id string) (errors []TaskErrInfo, err error) {
+func (db *downloaderDB) getErrors(id string) ([]TaskErrInfo, error) {
 	db.mtx.RLock()
 	defer db.mtx.RUnlock()
 	return db.errors(id)
@@ -85,8 +85,8 @@ func (db *downloaderDB) persistError(id, objName, errMsg string) {
 	errMsgs = append(errMsgs, errInfo)
 
 	key := path.Join(downloaderErrors, id)
-	if err := db.driver.Set(downloaderCollection, key, errMsgs); err != nil {
-		nlog.Errorln(err)
+	if code, err := db.driver.Set(downloaderCollection, key, errMsgs); err != nil {
+		nlog.Errorln(err, code)
 		return
 	}
 
@@ -95,9 +95,9 @@ func (db *downloaderDB) persistError(id, objName, errMsg string) {
 
 func (db *downloaderDB) tasks(id string) (tasks []TaskDlInfo, err error) {
 	key := path.Join(downloaderTasks, id)
-	if err := db.driver.Get(downloaderCollection, key, &tasks); err != nil {
+	if code, err := db.driver.Get(downloaderCollection, key, &tasks); err != nil {
 		if !cos.IsErrNotFound(err) {
-			nlog.Errorln(err)
+			nlog.Errorln(err, code)
 			return nil, err
 		}
 		// nothing in DB - return an empty list
@@ -125,7 +125,7 @@ func (db *downloaderDB) persistTaskInfo(singleTask *singleTask) error {
 	persistedTasks = append(persistedTasks, singleTask.ToTaskDlInfo())
 
 	key := path.Join(downloaderTasks, id)
-	if err := db.driver.Set(downloaderCollection, key, persistedTasks); err != nil {
+	if _, err := db.driver.Set(downloaderCollection, key, persistedTasks); err != nil {
 		return err
 	}
 	// clear cache
@@ -152,8 +152,8 @@ func (db *downloaderDB) flush(id string) error {
 		}
 
 		key := path.Join(downloaderErrors, id)
-		if err := db.driver.Set(downloaderCollection, key, errMsgs); err != nil {
-			nlog.Errorln(err)
+		if code, err := db.driver.Set(downloaderCollection, key, errMsgs); err != nil {
+			nlog.Errorln(err, code)
 			return err
 		}
 
@@ -167,8 +167,8 @@ func (db *downloaderDB) flush(id string) error {
 		}
 
 		key := path.Join(downloaderTasks, id)
-		if err := db.driver.Set(downloaderCollection, key, persistedTasks); err != nil {
-			nlog.Errorln(err)
+		if code, err := db.driver.Set(downloaderCollection, key, persistedTasks); err != nil {
+			nlog.Errorln(err, code)
 			return err
 		}
 

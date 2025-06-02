@@ -5,7 +5,7 @@ import sys
 import re
 
 import base64
-from typing import Callable, List
+from typing import Callable, List, Union
 
 import cloudpickle
 
@@ -22,12 +22,21 @@ from aistore.sdk.etl.etl_const import (
     DEFAULT_ETL_RUNTIME,
     DEFAULT_ETL_COMM,
     DEFAULT_ETL_TIMEOUT,
+    DEFAULT_ETL_OBJ_TIMEOUT,
     ETL_COMM_SPEC,
     ETL_COMM_CODE,
     CODE_TEMPLATE,
 )
 
-from aistore.sdk.types import ETLDetails, InitCodeETLArgs, InitSpecETLArgs
+from aistore.sdk.types import (
+    ETLDetails,
+    InitCodeETLArgs,
+    InitSpecETLArgs,
+    ETLSpecMsg,
+    EnvVar,
+    ETLRuntimeSpec,
+)
+from aistore.sdk.utils import convert_to_seconds
 
 
 def _get_default_runtime():
@@ -64,11 +73,13 @@ class Etl:
         """Name of the ETL"""
         return self._name
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def init_spec(
         self,
         template: str,
         communication_type: str = DEFAULT_ETL_COMM,
-        timeout: str = DEFAULT_ETL_TIMEOUT,
+        init_timeout: str = DEFAULT_ETL_TIMEOUT,
+        obj_timeout: str = DEFAULT_ETL_OBJ_TIMEOUT,
         arg_type: str = "",
     ) -> str:
         """
@@ -77,9 +88,10 @@ class Etl:
         Args:
             template (str): Kubernetes pod spec template
                 Existing templates can be found at `sdk.etl_templates`
-                For more information visit: https://github.com/NVIDIA/ais-etl/tree/master/transformers
-            communication_type (str): Communication type of the ETL (options: hpull, hrev, hpush)
-            timeout (str): Timeout of the ETL job (e.g. 5m for 5 minutes)
+                For more information visit: https://github.com/NVIDIA/ais-etl/tree/main/transformers
+            communication_type (str): Communication type of the ETL (options: hpull, hpush)
+            init_timeout (str): [optional, default="5m"] Timeout of the ETL job (e.g. 5m for 5 minutes)
+            obj_timeout (str): [optional, default="45s"] Timeout of transforming a single object
         Returns:
             Job ID string associated with this ETL
         """
@@ -92,15 +104,21 @@ class Etl:
 
         value = InitSpecETLArgs(
             spec=spec_encoded,
-            etl_name=self._name,
-            communication_type=communication_type,
-            timeout=timeout,
+            name=self._name,
+            comm_type=communication_type,
+            init_timeout=init_timeout,
+            obj_timeout=obj_timeout,
             arg_type=arg_type,
         ).as_dict()
 
-        return self._client.request(HTTP_METHOD_PUT, path=URL_PATH_ETL, json=value).text
+        return self._client.request(
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=convert_to_seconds(init_timeout),
+            json=value,
+        ).text
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def init_code(
         self,
         transform: Callable,
@@ -108,7 +126,8 @@ class Etl:
         preimported_modules: List[str] = None,
         runtime: str = _get_default_runtime(),
         communication_type: str = DEFAULT_ETL_COMM,
-        timeout: str = DEFAULT_ETL_TIMEOUT,
+        init_timeout: str = DEFAULT_ETL_TIMEOUT,
+        obj_timeout: str = DEFAULT_ETL_OBJ_TIMEOUT,
         chunk_size: int = None,
         arg_type: str = "",
     ) -> str:
@@ -121,11 +140,12 @@ class Etl:
             preimported_modules (list[str]): Modules to import before running the transform function. This can
              be necessary in cases where the modules used both attempt to import each other circularly
             runtime (str): [optional, default= V2 implementation of the current python version if supported, else
-                python3.8v2] Runtime environment of the ETL [choose from: python3.8v2, python3.10v2, python3.11v2]
-                (see ext/etl/runtime/all.go)
-            communication_type (str): [optional, default="hpush"] Communication type of the ETL (options: hpull, hrev,
+                python3.13v2] Runtime environment of the ETL [choose from: python3.9v2, python3.10v2, python3.11v2,
+                python3.12v2, python3.13v2] (see ext/etl/runtime/all.go)
+            communication_type (str): [optional, default="hpush"] Communication type of the ETL (options: hpull,
                 hpush, io)
-            timeout (str): [optional, default="5m"] Timeout of the ETL job (e.g. 5m for 5 minutes)
+            init_timeout (str): [optional, default="5m"] Timeout of the ETL job (e.g. 5m for 5 minutes)
+            obj_timeout (str): [optional, default="45s"] Timeout of transforming a single object
             chunk_size (int): Chunk size in bytes if transform function in streaming data.
                 (whole object is read by default)
             arg_type (optional, str): The type of argument the runtime will provide the transform function.
@@ -142,10 +162,11 @@ class Etl:
         }
 
         value = InitCodeETLArgs(
-            etl_name=self._name,
+            name=self._name,
             runtime=runtime,
-            communication_type=communication_type,
-            timeout=timeout,
+            comm_type=communication_type,
+            init_timeout=init_timeout,
+            obj_timeout=obj_timeout,
             dependencies=self._encode_dependencies(dependencies),
             functions=functions,
             code=self._encode_transform(
@@ -158,8 +179,70 @@ class Etl:
         return self._client.request(
             HTTP_METHOD_PUT,
             path=URL_PATH_ETL,
+            timeout=convert_to_seconds(init_timeout),
             json=value,
         ).text
+
+    def init(
+        self,
+        image: str,
+        command: Union[List[str], str],
+        comm_type: str = DEFAULT_ETL_COMM,
+        init_timeout: str = DEFAULT_ETL_TIMEOUT,
+        obj_timeout: str = DEFAULT_ETL_OBJ_TIMEOUT,
+        arg_type: str = "",
+        direct_put: bool = False,
+        **kwargs,
+    ):
+        """
+        Initializes ETL based on the provided image and command.
+        Args:
+            name (str): Name of the ETL
+            image (str): Docker image to use for the ETL
+            command (Union[List[str], str]): Command to run in the container
+            comm_type (str): Communication type of the ETL (options: hpull, hpush, ws)
+            init_timeout (str): [optional, default="5m"] Timeout of the ETL job (e.g. 5m for 5 minutes)
+            obj_timeout (str): [optional, default="45s"] Timeout of transforming a single object
+            arg_type (str): The type of argument the runtime will provide the transform function.
+                The default value of "" will provide the raw bytes read from the object.
+            direct_put (bool): Whether to support direct put optimization in bck-to-bck operations.
+            kwargs (dict): Additional keyword arguments to pass to the ETL, will be passed as
+                environment variables to the container
+        Returns:
+            Job ID string associated with this ETL
+        """
+
+        # Validate communication type
+        _validate_comm_type(comm_type, ETL_COMM_SPEC)
+
+        # normalize command
+        if isinstance(command, str):
+            command = command.split()
+
+        # build EnvVar list
+        env_vars = [EnvVar(name=k, value=v) for k, v in kwargs.items()]
+        # assemble spec
+        spec_msg = ETLSpecMsg(
+            name=self._name,
+            comm_type=comm_type,
+            init_timeout=init_timeout,
+            obj_timeout=obj_timeout,
+            arg_type=arg_type,
+            direct_put=direct_put,
+            runtime=ETLRuntimeSpec(
+                image=image,
+                command=command,
+                env=env_vars,
+            ),
+        )
+
+        resp = self._client.request(
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=convert_to_seconds(init_timeout),
+            json=spec_msg.as_dict(),
+        )
+        return resp.text
 
     def view(self) -> ETLDetails:
         """
@@ -180,7 +263,9 @@ class Etl:
         Note: Deleted ETLs cannot be started.
         """
         self._client.request(
-            HTTP_METHOD_POST, path=f"{URL_PATH_ETL}/{self._name}/start"
+            HTTP_METHOD_POST,
+            path=f"{URL_PATH_ETL}/{self._name}/start",
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
         )
 
     def stop(self):
@@ -188,7 +273,11 @@ class Etl:
         Stops ETL. Stops (but does not delete) all the pods created by Kubernetes for this ETL and
         terminates any transforms.
         """
-        self._client.request(HTTP_METHOD_POST, path=f"{URL_PATH_ETL}/{self._name}/stop")
+        self._client.request(
+            HTTP_METHOD_POST,
+            path=f"{URL_PATH_ETL}/{self._name}/stop",
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
+        )
 
     def delete(self):
         """
@@ -197,7 +286,11 @@ class Etl:
 
         Note: Running ETLs cannot be deleted.
         """
-        self._client.request(HTTP_METHOD_DELETE, path=f"{URL_PATH_ETL}/{self._name}")
+        self._client.request(
+            HTTP_METHOD_DELETE,
+            path=f"{URL_PATH_ETL}/{self._name}",
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
+        )
 
     @staticmethod
     def _encode_transform(
@@ -218,7 +311,7 @@ class Etl:
     def _encode_dependencies(dependencies: List[str]):
         if dependencies is None:
             dependencies = []
-        dependencies.append("cloudpickle==2.2.0")
+        dependencies.append("cloudpickle>=3.0.0")
         deps = "\n".join(dependencies).encode(UTF_ENCODING)
         return base64.b64encode(deps).decode(UTF_ENCODING)
 

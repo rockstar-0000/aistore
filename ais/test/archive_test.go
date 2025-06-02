@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -191,7 +191,7 @@ func TestGetFromArch(t *testing.T) {
 	})
 }
 
-// archive multple obj-s with an option to append if exists
+// archive multiple obj-s with an option to append if exists
 func TestArchMultiObj(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	runProviderTests(t, func(t *testing.T, bck *meta.Bck) {
@@ -325,7 +325,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 
 						xids, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 						tassert.CheckFatal(t, err)
-						tlog.Logf("[%s] %2d: arch list %d objects %s => %s\n", xids, i, len(list), m.bck, bckTo)
+						tlog.Logf("[%s] %2d: arch list %d objects %s => %s\n", xids, i, len(list), m.bck.String(), bckTo.String())
 					}(archName, list, i)
 				}
 			} else {
@@ -343,7 +343,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 						xids, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 						tassert.CheckFatal(t, err)
 						tlog.Logf("[%s] %2d: arch range %s %s => %s\n",
-							xids, i, msg.ListRange.Template, m.bck, bckTo)
+							xids, i, msg.ListRange.Template, m.bck.String(), bckTo.String())
 					}(archName, start, i)
 				}
 			}
@@ -359,31 +359,31 @@ func testArch(t *testing.T, bck *meta.Bck) {
 			for ii := range 2 {
 				api.WaitForXactionIdle(baseParams, &flt)
 
-				tlog.Logf("List %s\n", bckTo)
+				tlog.Logf("List %s\n", bckTo.String())
 				msg := &apc.LsoMsg{Prefix: "test_"}
 				msg.AddProps(apc.GetPropsName, apc.GetPropsSize)
-				objList, err := api.ListObjects(baseParams, bckTo, msg, api.ListArgs{})
+				lst, err := api.ListObjects(baseParams, bckTo, msg, api.ListArgs{})
 				tassert.CheckFatal(t, err)
-				for _, en := range objList.Entries {
+				for _, en := range lst.Entries {
 					tlog.Logf("%s: %dB\n", en.Name, en.Size)
 				}
-				num := len(objList.Entries)
+				num := len(lst.Entries)
 				if num < numArchs && ii == 0 {
 					tlog.Logf("Warning: expected %d, have %d - retrying...\n", numArchs, num)
 					time.Sleep(7 * time.Second) // TODO: ditto
 					continue
 				}
 				tassert.Errorf(t, num == numArchs || test.abrt, "expected %d, have %d", numArchs, num)
-				lstToAppend = objList
+				lstToAppend = lst
 				break
 			}
 
 			msg := &apc.LsoMsg{Prefix: "test_"}
 			msg.AddProps(apc.GetPropsName, apc.GetPropsSize)
 			msg.SetFlag(apc.LsArchDir)
-			objList, err := api.ListObjects(baseParams, bckTo, msg, api.ListArgs{})
+			lst, err := api.ListObjects(baseParams, bckTo, msg, api.ListArgs{})
 			tassert.CheckFatal(t, err)
-			num := len(objList.Entries)
+			num := len(lst.Entries)
 			expectedNum := numArchs + numArchs*numInArch
 
 			tassert.Errorf(t, num == expectedNum || test.abrt, "expected %d, have %d", expectedNum, num)
@@ -405,7 +405,7 @@ func testArch(t *testing.T, bck *meta.Bck) {
 						xids, err := api.ArchiveMultiObj(baseParams, m.bck, &msg)
 						tassert.CheckFatal(t, err)
 						tlog.Logf("[%s] APPEND %s/%s => %s/%s\n",
-							xids, m.bck, msg.ListRange.Template, bckTo, archName)
+							xids, m.bck.String(), msg.ListRange.Template, bckTo.String(), archName)
 					}(e.Name, start)
 				}
 
@@ -418,8 +418,8 @@ func testArch(t *testing.T, bck *meta.Bck) {
 				objName string
 				mime    = "application/x-" + test.ext[1:]
 			)
-			for _, en := range objList.Entries {
-				if !en.IsInsideArch() {
+			for _, en := range lst.Entries {
+				if !en.IsAnyFlagSet(apc.EntryInArch) {
 					objName = en.Name
 					continue
 				}
@@ -518,6 +518,12 @@ func TestAppendToArch(t *testing.T) {
 				numAdd = 3
 			}
 
+			// speed up serialized tests
+			if !test.multi {
+				numArchs /= 2
+				numAdd /= 2
+			}
+
 			for i := range numArchs {
 				archName := fmt.Sprintf(objPattern, i, test.ext)
 				list := make([]string, 0, numInArch)
@@ -541,9 +547,9 @@ func TestAppendToArch(t *testing.T) {
 
 			lsmsg := &apc.LsoMsg{Prefix: "test_lst"}
 			lsmsg.AddProps(apc.GetPropsName, apc.GetPropsSize)
-			objList, err := api.ListObjects(baseParams, bckTo, lsmsg, api.ListArgs{})
+			lst, err := api.ListObjects(baseParams, bckTo, lsmsg, api.ListArgs{})
 			tassert.CheckFatal(t, err)
-			num := len(objList.Entries)
+			num := len(lst.Entries)
 			tassert.Errorf(t, num == numArchs, "expected %d, have %d", numArchs, num)
 
 			sparcePrint := max(numArchs/10, 1)
@@ -551,7 +557,7 @@ func TestAppendToArch(t *testing.T) {
 				archName := fmt.Sprintf(objPattern, i, test.ext)
 				if test.multi {
 					if i%sparcePrint == 0 {
-						tlog.Logf("APPEND multi-obj %s => %s/%s\n", bckFrom, bckTo, archName)
+						tlog.Logf("APPEND multi-obj %s => %s/%s\n", bckFrom.String(), bckTo.String(), archName)
 					}
 					list := make([]string, 0, numAdd)
 					for range numAdd {
@@ -584,7 +590,7 @@ func TestAppendToArch(t *testing.T) {
 							Flags:    apc.ArchAppend, // existence required
 						}
 						if i%sparcePrint == 0 && j == 0 {
-							tlog.Logf("APPEND local rand => %s/%s/%s\n", bckTo, archName, archpath)
+							tlog.Logf("APPEND local rand => %s/%s/%s\n", bckTo.String(), archName, archpath)
 						}
 						err = api.PutApndArch(&appendArchArgs)
 						tassert.CheckError(t, err)
@@ -598,9 +604,9 @@ func TestAppendToArch(t *testing.T) {
 			}
 
 			lsmsg.SetFlag(apc.LsArchDir)
-			objList, err = api.ListObjects(baseParams, bckTo, lsmsg, api.ListArgs{})
+			lst, err = api.ListObjects(baseParams, bckTo, lsmsg, api.ListArgs{})
 			tassert.CheckError(t, err)
-			num = len(objList.Entries)
+			num = len(lst.Entries)
 			expectedNum := numArchs + numArchs*(numInArch+numAdd)
 
 			if num < expectedNum && test.multi && expectedNum-num < 10 {

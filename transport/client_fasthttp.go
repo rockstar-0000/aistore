@@ -3,7 +3,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -12,12 +12,11 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/nlog"
+
 	"github.com/valyala/fasthttp"
 )
 
@@ -31,25 +30,19 @@ func whichClient() string { return "fasthttp" }
 
 // overriding fasthttp default `const DefaultDialTimeout = 3 * time.Second`
 func dialTimeout(addr string) (net.Conn, error) {
-	return fasthttp.DialTimeout(addr, 10*time.Second)
+	return fasthttp.DialTimeout(addr, cmn.DfltDialupTimeout)
 }
 
 // intra-cluster networking: fasthttp client
 func NewIntraDataClient() Client {
 	config := cmn.GCO.Get()
+	httcfg := &config.Net.HTTP
 
-	// compare with ais/httpcommon.go
-	wbuf, rbuf := config.Net.HTTP.WriteBufferSize, config.Net.HTTP.ReadBufferSize
-	if wbuf == 0 {
-		wbuf = cmn.DefaultWriteBufferSize // fasthttp uses 4KB
-	}
-	if rbuf == 0 {
-		rbuf = cmn.DefaultReadBufferSize // ditto
-	}
+	// (compare with cmn/client.go)
 	cl := &fasthttp.Client{
 		Dial:            dialTimeout,
-		ReadBufferSize:  rbuf,
-		WriteBufferSize: wbuf,
+		ReadBufferSize:  cos.NonZero(httcfg.ReadBufferSize, int(cmn.DefaultReadBufferSize)),   // 4K
+		WriteBufferSize: cos.NonZero(httcfg.WriteBufferSize, int(cmn.DefaultWriteBufferSize)), // ditto
 	}
 	if config.Net.HTTP.UseHTTPS {
 		tlsConfig, err := cmn.NewTLS(config.Net.HTTP.ToTLS(), true /*intra-cluster*/) // streams
@@ -61,31 +54,50 @@ func NewIntraDataClient() Client {
 	return cl
 }
 
-func (s *streamBase) do(body io.Reader) (err error) {
-	// init request & response
-	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+func (s *streamBase) doPlain(body io.Reader) (err error) {
+	var (
+		req  = fasthttp.AcquireRequest()
+		resp = fasthttp.AcquireResponse()
+	)
+	err = s._do(body, req, resp)
+	fasthttp.ReleaseRequest(req)
+	fasthttp.ReleaseResponse(resp)
+	return err
+}
+
+func (s *streamBase) doCmpr(body io.Reader) (err error) {
+	var (
+		req  = fasthttp.AcquireRequest()
+		resp = fasthttp.AcquireResponse()
+	)
+	req.Header.Set(apc.HdrCompress, apc.LZ4Compression)
+
+	err = s._do(body, req, resp)
+
+	fasthttp.ReleaseRequest(req)
+	fasthttp.ReleaseResponse(resp)
+	s.streamer.resetCompression()
+	return err
+}
+
+func (s *streamBase) _do(body io.Reader, req *fasthttp.Request, resp *fasthttp.Response) (err error) {
 	req.Header.SetMethod(http.MethodPut)
 	req.SetRequestURI(s.dstURL)
 	req.SetBodyStream(body, -1)
-	if s.streamer.compressed() {
-		req.Header.Set(apc.HdrCompress, apc.LZ4Compression)
-	}
 	req.Header.Set(apc.HdrSessID, strconv.FormatInt(s.sessID, 10))
 	req.Header.Set(cos.HdrUserAgent, ua)
+
 	// do
 	err = s.client.Do(req, resp)
 	if err != nil {
-		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
-			nlog.Errorln(s.String(), "err:", err)
-		}
+		s.yelp(err)
 		return err
 	}
-	// handle response & cleanup
-	resp.BodyWriteTo(io.Discard)
-	fasthttp.ReleaseRequest(req)
-	fasthttp.ReleaseResponse(resp)
-	if s.streamer.compressed() {
-		s.streamer.resetCompression()
+
+	// drain response & cleanup
+	err = resp.BodyWriteTo(io.Discard)
+	if err != nil {
+		s.yelp(err)
 	}
 	return nil
 }

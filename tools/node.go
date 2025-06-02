@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -299,7 +299,7 @@ func pidFromURL(smap *meta.Smap, proxyURL string) string {
 }
 
 func WaitForNewSmap(proxyURL string, prevVersion int64) (newSmap *meta.Smap, err error) {
-	return WaitForClusterState(proxyURL, "new smap version", prevVersion, 0, 0)
+	return WaitForClusterState(proxyURL, "new Smap version", prevVersion, 0, 0)
 }
 
 func WaitForResilvering(t *testing.T, bp api.BaseParams, target *meta.Snode) {
@@ -414,7 +414,7 @@ func ShutdownNode(_ *testing.T, bp api.BaseParams, node *meta.Snode) (pid int, c
 
 func RestoreNode(cmd RestoreCmd, asPrimary bool, tag string) error {
 	if docker.IsRunning() {
-		tlog.Logf("Restarting %s container %s\n", tag, cmd)
+		tlog.Logf("Restarting %s container [%s %s]\n", tag, cmd.Node.ID(), cmd.Cmd)
 		return docker.Restart(cmd.Node.ID())
 	}
 
@@ -440,7 +440,7 @@ func startNode(cmd *RestoreCmd, asPrimary bool) (int, error) {
 	if asPrimary {
 		// Sets the environment variable to start as primary
 		environ := os.Environ()
-		environ = append(environ, env.AIS.PrimaryEP+"="+cmd.Node.PubNet.URL)
+		environ = append(environ, env.AisPrimaryEP+"="+cmd.Node.PubNet.URL)
 		ncmd.Env = environ
 	}
 	if err := ncmd.Start(); err != nil {
@@ -568,11 +568,10 @@ func getProcess(port string) (pid int, cmd string, args []string, err error) {
 }
 
 func WaitForPID(pid int) error {
-	const retryInterval = time.Second
-
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return nil // already (TODO: confirm)
+		tlog.Logf("Warning: PID %d already terminated: %v\n", pid, err)
+		return nil
 	}
 
 	var (
@@ -580,27 +579,26 @@ func WaitForPID(pid int) error {
 		ctx    = context.Background()
 		done   = make(chan error)
 	)
-	tlog.Logf("Waiting for PID=%d to terminate\n", pid)
+	tlog.Logf("Waiting for PID %d to terminate\n", pid)
 
-	deadline := time.Minute / 2
-	ctx, cancel = context.WithTimeout(ctx, deadline)
+	const (
+		timeout = 4 * time.Second
+	)
+	ctx, cancel = context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	go func() {
-		_, erw := process.Wait() // NOTE: w/ no timeout
+		_, erw := process.Wait() // wait with no timeout
 		done <- erw
 	}()
-	time.Sleep(10 * time.Millisecond)
+
 	for {
 		select {
 		case <-done:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			break
 		}
-		time.Sleep(retryInterval)
 	}
 }
 
@@ -749,7 +747,7 @@ func _joinCluster(proxyURL string, node *meta.Snode, timeout time.Duration) (reb
 	if err != nil {
 		return "", err
 	}
-	if rebID, _, err = api.JoinCluster(bp, node); err != nil {
+	if rebID, _, err = api.JoinCluster(bp, node, 0 /*node flags*/); err != nil {
 		return
 	}
 
@@ -805,15 +803,15 @@ func waitSmapSync(bp api.BaseParams, timeout time.Time, smap *meta.Smap, ver int
 		if err == nil && newSmap.Version > ver {
 			ignore.Add(sid)
 			if newSmap.Version > smap.Version {
-				gctx.Log("Updating %s to %s from %s\n", smap, newSmap.StringEx(), sname)
+				tlog.Logf("Updating %s to %s from %s\n", smap, newSmap.StringEx(), sname)
 				cos.CopyStruct(smap, newSmap)
 			}
 			if newSmap.Version > ver+1 {
 				// reset
 				if ver <= 0 {
-					gctx.Log("Received %s from %s\n", newSmap.StringEx(), sname)
+					tlog.Logf("Received %s from %s\n", newSmap.StringEx(), sname)
 				} else {
-					gctx.Log("Received newer %s from %s, updated wait-for condition (%d => %d)\n",
+					tlog.Logf("Received newer %s from %s, updated wait-for condition (%d => %d)\n",
 						newSmap.StringEx(), sname, ver, newSmap.Version)
 				}
 				ver = newSmap.Version - 1
@@ -827,10 +825,10 @@ func waitSmapSync(bp api.BaseParams, timeout time.Time, smap *meta.Smap, ver int
 		}
 		if newSmap != nil {
 			if snode := newSmap.GetNode(sid); snode != nil {
-				gctx.Log("Waiting for %s(%s) to sync Smap > v%d\n", snode.StringEx(), newSmap, ver)
+				tlog.Logf("Waiting for %s(%s) to sync Smap > v%d\n", snode.StringEx(), newSmap, ver)
 			} else {
-				gctx.Log("Waiting for %s(%s) to sync Smap > v%d\n", sname, newSmap, ver)
-				gctx.Log("(Warning: %s hasn't joined yet - not present)\n", sname)
+				tlog.Logf("Waiting for %s(%s) to sync Smap > v%d\n", sname, newSmap, ver)
+				tlog.Logf("(Warning: %s hasn't joined yet - not present)\n", sname)
 			}
 		}
 		prevSid = sid

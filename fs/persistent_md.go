@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -74,25 +74,32 @@ func PersistMarker(marker string) (fatalErr, writeErr error) {
 	return fatalErr, writeErr
 }
 
-func RemoveMarker(marker string) (err error) {
+func RemoveMarker(marker string, stup cos.StatsUpdater) (err error) {
 	var (
 		avail   = GetAvail()
 		relname = filepath.Join(fname.MarkersDir, marker)
 	)
 	for _, mi := range avail {
 		if er1 := cos.RemoveFile(filepath.Join(mi.Path, relname)); er1 != nil {
-			nlog.Errorf("Failed to remove %q marker from %q: %v", relname, mi.Path, er1)
 			err = er1
 		}
 	}
-	return
+	switch marker {
+	case fname.RebalanceMarker:
+		stup.ClrFlag(cos.NodeAlerts, cos.RebalanceInterrupted|cos.Rebalancing)
+	case fname.ResilverMarker:
+		stup.ClrFlag(cos.NodeAlerts, cos.ResilverInterrupted|cos.Resilvering)
+	case fname.NodeRestartedPrev:
+		stup.ClrFlag(cos.NodeAlerts, cos.NodeRestarted)
+	}
+	return err
 }
 
 // PersistOnMpaths persists `what` on mountpaths under "mountpath.Path/path" filename.
 // It does it on maximum `atMost` mountPaths. If `atMost == 0`, it does it on every mountpath.
 // If `backupPath != ""`, it removes files from `backupPath` and moves files from `path` to `backupPath`.
 // Returns how many times it has successfully stored a file.
-func PersistOnMpaths(fname, backupName string, meta jsp.Opts, atMost int, b []byte, sgl *memsys.SGL) (cnt, availCnt int) {
+func PersistOnMpaths(fn, backupName string, meta jsp.Opts, atMost int, b []byte, sgl *memsys.SGL) (cnt, availCnt int) {
 	var (
 		wto   cos.WriterTo2
 		bcnt  int
@@ -105,9 +112,9 @@ func PersistOnMpaths(fname, backupName string, meta jsp.Opts, atMost int, b []by
 	}
 	for _, mi := range avail {
 		if backupName != "" {
-			bcnt = mi.backupAtmost(fname, backupName, bcnt, atMost)
+			bcnt = mi.backupAtmost(fn, backupName, bcnt, atMost)
 		}
-		fpath := filepath.Join(mi.Path, fname)
+		fpath := filepath.Join(mi.Path, fn)
 		os.Remove(fpath)
 		if cnt >= atMost {
 			continue
@@ -118,23 +125,22 @@ func PersistOnMpaths(fname, backupName string, meta jsp.Opts, atMost int, b []by
 			wto = sgl // not reopening - see sgl.WriteTo()
 		}
 		if err := jsp.SaveMeta(fpath, meta, wto); err != nil {
-			nlog.Errorf("Failed to persist %q on %q, err: %v", fname, mi, err)
+			nlog.Errorf("Failed to persist %q on %q, err: %v", fn, mi, err)
 		} else {
 			cnt++
 		}
 	}
 	debug.Func(func() {
 		expected := min(atMost, availCnt)
-		debug.Assertf(cnt == expected, "expected %q to be persisted on %d mountpaths got %d instead",
-			fname, expected, cnt)
+		debug.Assertf(cnt == expected, "expected %q to be persisted on %d mountpaths got %d instead", fn, expected, cnt)
 	})
-	return
+	return cnt, availCnt
 }
 
-func CountPersisted(fname string) (cnt int) {
+func CountPersisted(fn string) (cnt int) {
 	avail := GetAvail()
 	for mpath := range avail {
-		fpath := filepath.Join(mpath, fname)
+		fpath := filepath.Join(mpath, fn)
 		if err := cos.Stat(fpath); err == nil {
 			cnt++
 		}

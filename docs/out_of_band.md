@@ -1,11 +1,41 @@
----
-layout: post
-title: Out-of-band updates
-permalink: /docs/out_of_band
-redirect_from:
- - /out_of_band.md/
- - /docs/out_of_band.md/
----
+**Table of Contents**
+- [Example](#example)
+- [Out-of-band updates](#out-of-band-updates)
+- [Lesser scope](#lesser-scope)
+- [Out-of-band writes, deletes and more](#out-of-band-writes-deletes-and-more)
+- [When reading in-cluster data causes deletion](#when-reading-in-cluster-data-causes-deletion)
+- [GET latest version](#get-latest-version)
+- [References](#references)
+
+There are multiple ways to fully synchronize in-cluster content with remote backend. Let's first take a look at the following `ais cp` and `ais prefetch` examples:
+
+## Example
+
+```console
+$ ais cp s3://BUCKET s3://BUCKET --prefix PREFIX --num-workers 64 --sync
+```
+
+Notice the `--sync` option.
+
+Alternatively, to fully synchronize in-cluster content (and since "prefetch" typically does not imply any deletions) we can also use `ais evict` followed by `ais prefetch`:
+
+```console
+## run "evict" and wait for the job to finish; optionally use `--wait` option
+##
+$ ais evict BUCKET[/PREFIX] --keep-md
+
+## optionally, `ais ls` to show that nothing is "cached"
+##
+$ ais ls BUCKET[/PREFIX] --cached
+
+## no need to use `--latest` option (redundant and slowing-down).
+##
+$ ais prefetch BUCKET[/PREFIX] --num-workers 64 --blob-threshold 1GiB
+```
+
+> Notice the `--keep-md` option above.
+
+> TIP: always a good idea to check `--help` for the most recent updates.
 
 ## Out-of-band updates
 
@@ -46,7 +76,7 @@ Here's the an excerpt from `GET` help (and note `--latest` below):
 $ ais get --help
 
 USAGE:
-   ais get [command options] BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-]
+   ais get BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-] [command options]
 
 OPTIONS:
    --offset value    object read offset; must be used together with '--length'; default formatting: IEC (use '--units' to override)
@@ -97,12 +127,12 @@ No assumption is being made on whether any of the above is present (except, of c
 The rules are simple:
 
 * compare _existing_ items of the same kind (`size` vs `size`, `MD5` and `MD5`, etc.);
-* fail immediately - that is, require cold GET - if any pair of comparable items differ;
+* fail immediately - that is, require [cold GET](/docs/overview.md#existing-datasets) - if any pair of comparable items differ;
 * count all matches except `size` (in other words, same size does _not_ contribute to decision in favor of skipping cold GET);
 * exclude double counting (which is mostly relevant for `ETag` vs `MD5`);
 * require **two or more matches**.
 
-When there are no matches, we go ahead with cold GET.
+When there are no matches, we go ahead with [cold GET](/docs/overview.md#existing-datasets).
 
 A single match - e.g. only the `version` (if exists), or only `ETag`, etc. - is currently resolved positively iff the source backend is the same as well.
 

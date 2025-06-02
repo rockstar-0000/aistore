@@ -3,7 +3,7 @@
 #
 
 ARG INSTALLER_IMAGE=debian:bookworm
-ARG BUILDER_IMAGE=golang:1.22
+ARG BUILDER_IMAGE=golang:1.24
 ARG BASE_IMAGE=gcr.io/distroless/base-debian12
 
 
@@ -21,11 +21,12 @@ COPY . .
 
 ARG mode
 ARG providers
+ARG tags
 ARG TARGETOS
 ARG TARGETARCH
 
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    MODE=${mode} AIS_BACKEND_PROVIDERS=${providers:-"aws gcp"} \
+    MODE=${mode} AIS_BACKEND_PROVIDERS=${providers:-"aws gcp"} TAGS=${tags:-""} \
     make node
 
 

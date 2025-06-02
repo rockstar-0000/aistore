@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -69,20 +69,17 @@ func (addr *localIPv4Info) warn() {
 //
 
 // returns a list of local unicast (IPv4, MTU)
-func getLocalIPv4s(config *cmn.Config) (addrlist []*localIPv4Info, err error) {
-	addrlist = make([]*localIPv4Info, 0, 4)
-
-	addrs, e := net.InterfaceAddrs()
-	if e != nil {
-		err = fmt.Errorf("failed to get host unicast IPs: %w", e)
-		return
+func getLocalIPv4s(config *cmn.Config) ([]*localIPv4Info, error) {
+	addrs, ea := net.InterfaceAddrs()
+	if ea != nil {
+		return nil, fmt.Errorf("failed to get host unicast IPs: %w", ea)
 	}
-	iflist, e := net.Interfaces()
-	if e != nil {
-		err = fmt.Errorf("failed to get network interfaces: %w", e)
-		return
+	iflist, ei := net.Interfaces()
+	if ei != nil {
+		return nil, fmt.Errorf("failed to get network interfaces: %w", ei)
 	}
 
+	addrlist := make([]*localIPv4Info, 0, 4)
 	for _, addr := range addrs {
 		curr := &localIPv4Info{}
 		if ipnet, ok := addr.(*net.IPNet); ok {
@@ -126,12 +123,12 @@ func getLocalIPv4s(config *cmn.Config) (addrlist []*localIPv4Info, err error) {
 		}
 	}
 	if len(addrlist) == 0 {
-		return addrlist, errors.New("the host does not have any IPv4 addresses")
+		return nil, errors.New("the host does not have any IPv4 addresses")
 	}
 	return addrlist, nil
 }
 
-// HACK, to accommodate non-K8s docker deployments and non-containerized
+// HACK to accommodate non-K8s (docker and non-containerized) deployments
 func excludeLoopbackIP() bool {
 	if _, present := os.LookupEnv("AIS_LOCAL_PLAYGROUND"); present {
 		return false
@@ -141,19 +138,26 @@ func excludeLoopbackIP() bool {
 
 // given configured list of hostnames, return the first one matching local unicast IPv4
 func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
-	sb := &strings.Builder{}
+	var (
+		sb strings.Builder
+		n  = len(locIPs)
+		l  = 2 + 31*n
+	)
+	sb.Grow(l)
 	sb.WriteByte('[')
 	for i, lip := range locIPs {
 		sb.WriteString(lip.ipv4)
 		sb.WriteString("(MTU=")
 		sb.WriteString(strconv.Itoa(lip.mtu))
 		sb.WriteByte(')')
-		if i < len(locIPs)-1 {
+		if i < n-1 {
 			sb.WriteByte(' ')
 		}
 	}
 	sb.WriteByte(']')
-	nlog.Infoln("local IPv4:", sb.String())
+
+	sips := sb.String()
+	nlog.Infoln("local IPv4:", sips)
 	nlog.Infoln("configured:", hostnames)
 
 	for i, host := range hostnames {
@@ -178,7 +182,7 @@ func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
 		}
 	}
 
-	err := fmt.Errorf("failed to select hostname from: (%s, %v)", sb.String(), hostnames)
+	err := fmt.Errorf("failed to select hostname from: (%s, %v)", sips, hostnames)
 	nlog.Errorln(err)
 	return "", err
 }
@@ -201,17 +205,17 @@ func _localIP(addrList []*localIPv4Info) (ip net.IP, _ error) {
 
 	// NOTE:
 	// - try using environment to eliminate ambiguity
-	// - env.AIS.PubIPv4CIDR ("AIS_PUBLIC_IP_CIDR") takes precedence
+	// - env.AisPubIPv4CIDR ("AIS_PUBLIC_IP_CIDR") takes precedence
 	var (
 		selected     = -1
 		parsed       net.IP
-		network, err = _parseCIDR(env.AIS.LocalRedirectCIDR, env.AIS.PubIPv4CIDR)
+		network, err = _parseCIDR(env.AisLocalRedirectCIDR, env.AisPubIPv4CIDR)
 	)
 	if err != nil {
 		return nil, err
 	}
 	if network == nil {
-		goto warn
+		goto warn // ------>
 	}
 	for j := range l {
 		if ip = net.ParseIP(addrList[j].ipv4); ip == nil {
@@ -234,11 +238,29 @@ func _localIP(addrList []*localIPv4Info) (ip net.IP, _ error) {
 	return parsed, nil
 
 warn:
+	// TODO:
+	// to reduce ambiguity
+	// parse `config.Proxy.PrimaryURL` for network that must further _contain_ IP to select
+	// from multiple `addrList` entries
+
+	tag := "the first"
+	selected = 0
 	if ip = net.ParseIP(addrList[0].ipv4); ip == nil {
 		return nil, fmt.Errorf(fmtErrParseIP, addrList[0].ipv4)
 	}
-	nlog.Warningln("given multiple choice, selecting the first", addrList[0].String())
-	addrList[0].warn()
+	// local playground and multiple choice with no IPs configured: insist on selecting loopback
+	if !ip.IsLoopback() && cmn.Rom.TestingEnv() && l > 1 {
+		for j := 1; j < l; j++ {
+			if ip1 := net.ParseIP(addrList[j].ipv4); ip1 != nil && ip1.IsLoopback() {
+				selected, ip = j, ip1
+				tag = "loopback"
+				break
+			}
+		}
+	}
+	nlog.Warningln("given multiple choice, selecting", tag, addrList[selected].String())
+	addrList[selected].warn()
+
 	return ip, nil
 }
 
@@ -404,7 +426,7 @@ func cleanupConfigDir(name string, keepInitialConfig bool) {
 		cos.RemoveFile(daemon.cli.localConfigPath)
 	}
 	config := cmn.GCO.Get()
-	filepath.Walk(config.ConfigDir, func(path string, finfo os.FileInfo, _ error) error {
+	filepath.WalkDir(config.ConfigDir, func(path string, finfo os.DirEntry, _ error) error {
 		if strings.HasPrefix(finfo.Name(), ".ais.") {
 			if err := cos.RemoveFile(path); err != nil {
 				nlog.Errorf("%s: failed to cleanup %q, err: %v", name, path, err)

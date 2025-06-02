@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -10,9 +10,13 @@ const (
 
 	QparamProps = "props" // e.g. "checksum, size"|"atime, size"|"cached"|"bucket, size"| ...
 
-	QparamUUID    = "uuid"     // xaction
-	QparamJobID   = "jobid"    // job
-	QparamETLName = "etl_name" // etl
+	QparamUUID  = "uuid"  // xaction
+	QparamJobID = "jobid" // job
+
+	// etl
+	QparamETLName          = "etl_name"
+	QparamETLTransformArgs = "etl_args"
+	QparamETLSecret        = "etl_secret" // secret generated during ETL init to validate directly target access from trusted ETL
 
 	QparamRegex      = "regex"       // dsort: list regex
 	QparamOnlyActive = "only_active" // dsort: list only active
@@ -52,7 +56,7 @@ const (
 	// NOTE: non-empty value indicates api.GetBucketInfo; "true" value further requires "with remote obj-s"
 	QparamBinfoWithOrWithoutRemote = "bsumm_remote"
 
-	// "presence" in a given cluster shall not be be confused with "existence" (possibly, remote).
+	// "presence" in a given cluster shall not be confused with "existence" (possibly, remote).
 	// See also:
 	// - Flt* enum below
 	// - ListObjsMsg flags, docs/providers.md (for terminology)
@@ -89,7 +93,7 @@ const (
 	QparamArchregx = "archregx"
 
 	// "archmode", on the other hand, tells aistore whether to interpret "archregx" (above) as a
-	// a general-purpose regular expression or, alternatively, use it for a simple and fast string comparison;
+	// general-purpose regular expression or (alternativelyr) use it for simple and fast string comparison;
 	// the latter is further formalized as `MatchMode` enum in the cmn/archive package,
 	// with enumerated values including: "regexp", "prefix", "suffix", "substr", "wdskey".
 	//
@@ -135,11 +139,14 @@ const (
 
 	// (see api.AttachMountpath vs. LocalConfig.FSP)
 	QparamMpathLabel = "mountpath_label"
+
+	// Request to restore an object
+	QparamECObject = "object"
 )
 
 // QparamFltPresence enum.
 //
-// Descibes both buckets and objects with respect to their existence/presence (or non-existence/non-presence)
+// Describes both buckets and objects with respect to their existence/presence (or non-existence/non-presence)
 // in AIS cluster.
 //
 // "FltPresent*" refers to availability ("presence") in the cluster. For details, see the values and comments below.
@@ -171,17 +178,18 @@ const (
 
 // health
 const (
-	QparamHealthReadiness = "readiness" // to be used by external watchdogs (e.g. K8s)
-	QparamAskPrimary      = "apr"       // true: the caller is directing health request to primary
-	QparamPrimaryReadyReb = "prr"       // true: check whether primary is ready to start rebalancing cluster
+	QparamHealthReadiness = "readiness" // used by external watchdogs (K8s)
+	QparamHealthReady     = QparamHealthReadiness + "=true"
+
+	QparamAskPrimary      = "apr" // true: the caller is directing health request to primary
+	QparamPrimaryReadyReb = "prr" // true: check whether primary is ready to start rebalancing cluster
 )
 
 // Internal query params.
 const (
 	QparamProxyID          = "pid" // ID of the redirecting proxy.
-	QparamPrimaryCandidate = "can" // ID of the candidate for the primary proxy.
-	QparamPrepare          = "prp" // true: request belongs to the "prepare" phase of the primary proxy election
-	QparamNonElectable     = "nel" // true: proxy is non-electable for the primary role
+	QparamPrimaryCandidate = "can" // candidate for the primary proxy (voting ID, force URL)
+	QparamPrepare          = "prp" // 2-phase commit where 'true' corresponds to 'begin'; usage: (primary election; set-primary)
 	QparamUnixTime         = "utm" // Unix time since 01/01/70 UTC (nanoseconds)
 	QparamIsGFNRequest     = "gfn" // true if the request is a Get-From-Neighbor
 	QparamRebStatus        = "rbs" // true: get detailed rebalancing status
@@ -223,10 +231,8 @@ const (
 	WhatBackends = "backends"
 
 	// stats and status
-	WhatNodeStatsV322          = "stats"       // [ backward compatibility ]
-	WhatNodeStatsAndStatusV322 = "status"      // [ ditto ]
-	WhatNodeStats              = "node_stats"  // redundant
-	WhatNodeStatsAndStatus     = "node_status" // current
+	WhatNodeStats          = "node_stats"  // redundant
+	WhatNodeStatsAndStatus = "node_status" // current
 
 	WhatDiskRWUtilCap = "disk" // read/write stats, disk utilization, capacity
 

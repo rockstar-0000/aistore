@@ -1,12 +1,3 @@
----
-layout: post
-title: PERFORMANCE
-permalink: /docs/performance
-redirect_from:
- - /performance.md/
- - /docs/performance.md/
----
-
 AIStore is all about performance. It's all about performance and reliability, to be precise. An assortment of tips and recommendations that you find in this text will go a long way to ensure that AIS _does_ deliver.
 
 But first, one important consideration:
@@ -48,7 +39,7 @@ The question, then, is how to get the maximum out of the underlying hardware? Ho
 
 Specifically, `sysctl` selected system variables, such as `net.core.wmem_max`, `net.core.rmem_max`, `vm.swappiness`, and more - here's the approximate list:
 
-* [https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/host-config/vars/host_config_sysctl.yml](sysctl)
+* [sysctl](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/host-config/vars/host_config_sysctl.yml)
 
 The document is part of a separate [repository](https://github.com/NVIDIA/ais-k8s) that serves the (specific) purposes of deploying AIS on **bare-metal Kubernetes**. The repo includes a number of [playbooks](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/README.md) to assist in a full deployment of AIStore.
 
@@ -283,7 +274,7 @@ There's a price, though, and the scenarios where you could make an educated choi
 
 In particular, let's say that we are massively writing a new content into a bucket.
 
-> Type of the bucket doesn't matter - it may be an `ais://` bucket, or `s3://`, or any other supported [backend](/docs/bucket.md#backend-provider) including HDFS and HTTP.
+> Type of the bucket doesn't matter - it may be an `ais://` bucket, or `s3://`, or any other supported [backend](/docs/overview.md#backend-provider).
 
 What matters is that we do *know* that we'll be overwriting few objects, percentage-wise. Then it would stand to reason that AIS, on its end, should probably refrain from trying to load the destination object's metadata. Skip loading existing object's metadata in order to compare checksums (and thus maybe avoid writing altogether if the checksums match) and/or update the object's version, etc.
 

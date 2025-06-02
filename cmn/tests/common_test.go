@@ -1,6 +1,6 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tests_test
 
@@ -12,6 +12,7 @@ import (
 	"reflect"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -190,10 +191,10 @@ var _ = Describe("Common file", func() {
 		})
 
 		It("should copy a object and compute its checksum", func() {
-			expectedCksum, err := cos.SaveReader(srcFilename, rand.Reader, make([]byte, 1000), cos.ChecksumXXHash, 1000)
+			expectedCksum, err := cos.SaveReader(srcFilename, rand.Reader, make([]byte, 1000), cos.ChecksumCesXxh, 1000)
 			Expect(err).NotTo(HaveOccurred())
 
-			_, cksum, err := cos.CopyFile(srcFilename, dstFilename, make([]byte, 1000), cos.ChecksumXXHash)
+			_, cksum, err := cos.CopyFile(srcFilename, dstFilename, make([]byte, 1000), cos.ChecksumCesXxh)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cksum).To(Equal(expectedCksum))
 

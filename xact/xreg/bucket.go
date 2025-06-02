@@ -1,6 +1,6 @@
 // Package xreg provides registry and (renew, find) functions for AIS eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xreg
 
@@ -13,42 +13,6 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
-)
-
-type (
-	TCBArgs struct {
-		DP      core.DP
-		BckFrom *meta.Bck
-		BckTo   *meta.Bck
-		Msg     *apc.TCBMsg
-		Phase   string
-	}
-	TCObjsArgs struct {
-		BckFrom *meta.Bck
-		BckTo   *meta.Bck
-		DP      core.DP
-	}
-	DsortArgs struct {
-		BckFrom *meta.Bck
-		BckTo   *meta.Bck
-	}
-	ECEncodeArgs struct {
-		Phase string
-	}
-	BckRenameArgs struct {
-		BckFrom *meta.Bck
-		BckTo   *meta.Bck
-		RebID   string
-		Phase   string
-	}
-	MNCArgs struct {
-		Tag    string
-		Copies int
-	}
-	LsoArgs struct {
-		Msg *apc.LsoMsg
-		Hdr http.Header
-	}
 )
 
 //////////////
@@ -69,8 +33,9 @@ func RenewBucketXact(kind string, bck *meta.Bck, args Args, buckets ...*meta.Bck
 	return dreg.renew(e, bck, buckets...)
 }
 
-func RenewECEncode(bck *meta.Bck, uuid, phase string) RenewRes {
-	return RenewBucketXact(apc.ActECEncode, bck, Args{Custom: &ECEncodeArgs{Phase: phase}, UUID: uuid})
+func RenewECEncode(bck *meta.Bck, uuid, phase string, checkAndRecover bool) RenewRes {
+	args := Args{Custom: &ECEncodeArgs{Phase: phase, Recover: checkAndRecover}, UUID: uuid}
+	return RenewBucketXact(apc.ActECEncode, bck, args)
 }
 
 func RenewMakeNCopies(uuid, tag string) {

@@ -38,6 +38,10 @@ var ioErrs = [...]error{
 func IsIOError(err error) bool {
 	debug.Assert(err != nil)
 
+	if IsErrMv(err) {
+		return false
+	}
+
 	// via os.NewSyscallError(), with a prior check !os.IsNotExist()
 	if e, ok := err.(*os.SyscallError); ok {
 		nlog.Infoln("by syscall-error", e)
@@ -54,5 +58,5 @@ func IsIOError(err error) bool {
 }
 
 func IsErrXattrNotFound(err error) bool {
-	return os.IsNotExist(err) || err == syscall.ENODATA
+	return os.IsNotExist(err) || errors.Is(err, syscall.ENODATA)
 }

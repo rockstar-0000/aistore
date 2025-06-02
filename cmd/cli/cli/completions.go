@@ -1,7 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
-// This file handles bash completions for the CLI.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -21,15 +20,14 @@ import (
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 )
 
-//////////////////////
-// Cluster / Daemon //
-//////////////////////
+// This source handles Bash and zsh completions for the CLI.
 
-// Log level doubles as level per se and (s)modules, the latter enumerated
 const (
+	// Log level doubles as level per se and (s)modules, the latter enumerated
 	confLogLevel   = "log.level"
 	confLogModules = "log.modules"
 )
@@ -44,8 +42,8 @@ var (
 		// access
 		cmn.PropBucketAccessAttrs: apc.SupportedPermissions(),
 		// feature flags
-		"cluster.features": append(feat.Cluster[:], apc.NilValue),
-		"bucket.features":  append(feat.Bucket[:], apc.NilValue),
+		clusterFeatures: append(feat.Cluster[:], apc.NilValue),
+		bucketFeatures:  append(feat.Bucket[:], apc.NilValue),
 		// rest
 		"write_policy.data":                   apc.SupportedWritePolicy[:],
 		"write_policy.md":                     apc.SupportedWritePolicy[:],
@@ -94,9 +92,9 @@ func lastIsFeature(c *cli.Context, bucketScope bool) bool {
 		return true
 	}
 	if bucketScope {
-		return _lastv(c, propCmpls["bucket.features"])
+		return _lastv(c, propCmpls[bucketFeatures])
 	}
-	return _lastv(c, propCmpls["cluster.features"])
+	return _lastv(c, propCmpls[clusterFeatures])
 }
 
 // Returns true if the last arg is any of the enumerated constants
@@ -123,9 +121,9 @@ func accessCompletions(c *cli.Context)  { remaining(c, propCmpls[cmn.PropBucketA
 
 func featureCompletions(c *cli.Context, bucketScope bool) {
 	if bucketScope {
-		remaining(c, propCmpls["bucket.features"])
+		remaining(c, propCmpls[bucketFeatures])
 	} else {
-		remaining(c, propCmpls["cluster.features"])
+		remaining(c, propCmpls[clusterFeatures])
 	}
 }
 
@@ -423,11 +421,22 @@ func (opts *bcmplop) buckets(c *cli.Context) {
 	printNotUsedBuckets(c, buckets, opts.separator, opts.multiple)
 }
 
+func suggestProvider(*cli.Context) {
+	fmt.Println(fcyan(scopeAll))
+	for p := range apc.Providers {
+		fmt.Println(p)
+	}
+}
+
 func (opts *bcmplop) remoteBuckets(c *cli.Context) {
 	var (
 		buckets []cmn.Bck
 	)
-	for _, provider := range []string{apc.AWS, apc.GCP, apc.Azure} {
+	for provider := range apc.Providers {
+		if !apc.IsCloudProvider(provider) {
+			// Filter out non-cloud providers
+			continue
+		}
 		qbck := cmn.QueryBcks{Provider: provider}
 		bcks, err := api.ListBuckets(apiBP, qbck, apc.FltPresent) // NOTE: `present` only
 		if err != nil {

@@ -1,8 +1,8 @@
 //go:build gcp
 
-// Package backend contains implementation of various backend providers.
+// Package backend contains core/backend interface implementations for supported backend providers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -15,7 +15,6 @@ import (
 	"os"
 	"strings"
 
-	"cloud.google.com/go/storage"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -24,6 +23,9 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tracing"
+
+	"cloud.google.com/go/storage"
 	jsoniter "github.com/json-iterator/go"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
@@ -55,14 +57,11 @@ var (
 	//     The default scope is ScopeFullControl."
 	gcpClient *storage.Client
 
-	// context placeholder
-	gctx context.Context
-
 	// interface guard
 	_ core.Backend = (*gsbp)(nil)
 )
 
-func NewGCP(t core.TargetPut, tstats stats.Tracker) (_ core.Backend, err error) {
+func NewGCP(t core.TargetPut, tstats stats.Tracker, startingUp bool) (_ core.Backend, err error) {
 	var (
 		projectID     string
 		credProjectID = readCredFile()
@@ -88,13 +87,15 @@ func NewGCP(t core.TargetPut, tstats stats.Tracker) (_ core.Backend, err error) 
 		projectID: projectID,
 		base:      base{provider: apc.GCP},
 	}
-	bp.base.init(t.Snode(), tstats)
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
 
-	gctx = context.Background()
-	gcpClient, err = bp.createClient(gctx)
+	gcpClient, err = bp.createClient(context.Background())
 
 	return bp, err
 }
+
+// TODO: use config.Net.HTTP.IdleConnTimeout and friends
 
 func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 	opts := []option.ClientOption{option.WithScopes(storage.ScopeFullControl)}
@@ -111,7 +112,7 @@ func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 		}
 		return nil, cmn.NewErrFailedTo(nil, "gcp-backend: create", "http transport", err)
 	}
-	opts = append(opts, option.WithHTTPClient(&http.Client{Transport: transport}))
+	opts = append(opts, option.WithHTTPClient(tracing.NewTraceableClient(&http.Client{Transport: transport})))
 	// create HTTP client
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
@@ -151,13 +152,16 @@ func (*gsbp) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.StrKVs
 // LIST OBJECTS
 //
 
-func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode int, err error) {
+func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, error) {
 	var (
 		query    *storage.Query
 		h        = cmn.BackendHelpers.Google
 		cloudBck = bck.RemoteBck()
 	)
 	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
+
+	// in re: `apc.LsNoDirs` and `apc.LsNoRecursion`, see:
+	// https://github.com/NVIDIA/aistore/blob/main/docs/howto_virt_dirs.md
 
 	if prefix := msg.Prefix; prefix != "" {
 		query = &storage.Query{Prefix: prefix}
@@ -169,7 +173,7 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	}
 
 	var (
-		it    = gcpClient.Bucket(cloudBck.Name).Objects(gctx, query)
+		it    = gcpClient.Bucket(cloudBck.Name).Objects(context.Background(), query)
 		pager = iterator.NewPager(it, int(msg.PageSize), msg.ContinuationToken)
 		objs  = make([]*storage.ObjectAttrs, 0, msg.PageSize)
 	)
@@ -178,19 +182,14 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 			nlog.Infof("list_objects %s: %v", cloudBck.Name, errPage)
 		}
-		ecode, err = gcpErrorToAISError(errPage, cloudBck)
-		return
+		return gcpErrorToAISError(errPage, cloudBck)
 	}
 
 	lst.ContinuationToken = nextPageToken
 
 	var (
-		custom     cos.StrKVs
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
 	)
-	if wantCustom {
-		custom = make(cos.StrKVs, 3) // reuse
-	}
 	lst.Entries = lst.Entries[:0]
 	for _, attrs := range objs {
 		en := cmn.LsoEnt{Name: attrs.Name, Size: attrs.Size}
@@ -200,7 +199,7 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 			debug.Assert(attrs.Name == "", attrs.Prefix, " vs ", attrs.Name)
 			debug.Assert(query != nil && query.Delimiter != "")
 
-			if msg.IsFlagSet(apc.LsNoDirs) {
+			if msg.IsFlagSet(apc.LsNoDirs) { // do not return virtual subdirectories
 				continue
 			}
 			en.Name = attrs.Prefix
@@ -212,12 +211,10 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 			if v, ok := h.EncodeVersion(attrs.Generation); ok {
 				en.Version = v
 			}
-			// custom
 			if wantCustom {
-				custom[cmn.ETag], _ = h.EncodeCksum(attrs.Etag)
-				custom[cmn.LastModified] = fmtTime(attrs.Updated)
-				custom[cos.HdrContentType] = attrs.ContentType
-				en.Custom = cmn.CustomMD2S(custom)
+				etag, _ := h.EncodeETag(attrs.Etag)
+				en.Custom = cmn.CustomProps2S(cmn.ETag, etag, cmn.LsoLastModified, fmtLsoTime(attrs.Updated),
+					cos.HdrContentType, attrs.ContentType)
 			}
 		}
 		lst.Entries = append(lst.Entries, &en)
@@ -226,61 +223,57 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 		nlog.Infof("[list_objects] count %d", len(lst.Entries))
 	}
-	return
+
+	return 0, nil
 }
 
 //
 // LIST BUCKETS
 //
 
-func (gsbp *gsbp) ListBuckets(_ cmn.QueryBcks) (bcks cmn.Bcks, ecode int, err error) {
+func (gsbp *gsbp) ListBuckets(_ cmn.QueryBcks) (cmn.Bcks, int, error) {
 	if gsbp.projectID == "" {
 		// NOTE: empty `projectID` results in obscure: "googleapi: Error 400: Invalid argument"
 		return nil, http.StatusBadRequest,
 			errors.New("empty project ID: cannot list GCP buckets with no authentication")
 	}
-	bcks = make(cmn.Bcks, 0, 16)
-	it := gcpClient.Buckets(gctx, gsbp.projectID)
+	var (
+		bcks = make(cmn.Bcks, 0, 16)
+		it   = gcpClient.Buckets(context.Background(), gsbp.projectID)
+	)
 	for {
-		var battrs *storage.BucketAttrs
-
-		battrs, err = it.Next()
-		if err == iterator.Done {
-			err = nil
-			break
-		}
+		battrs, err := it.Next()
 		if err != nil {
-			ecode, err = gcpErrorToAISError(err, &cmn.Bck{Provider: apc.GCP})
-			return
+			if err == iterator.Done {
+				return bcks, 0, nil
+			}
+			ecode, errV := gcpErrorToAISError(err, &cmn.Bck{Provider: apc.GCP})
+			return bcks, ecode, errV
 		}
-		bcks = append(bcks, cmn.Bck{
-			Name:     battrs.Name,
-			Provider: apc.GCP,
-		})
+
+		bcks = append(bcks, cmn.Bck{Name: battrs.Name, Provider: apc.GCP})
 		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
-			nlog.Infof("[bucket_names] %s: created %v, versioning %t",
-				battrs.Name, battrs.Created, battrs.VersioningEnabled)
+			nlog.Infof("[bucket_names] %s: created %v, versioning %t", battrs.Name, battrs.Created, battrs.VersioningEnabled)
 		}
 	}
-	return
 }
 
 //
 // HEAD OBJECT
 //
 
-func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
+func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (*cmn.ObjAttrs, int, error) {
 	var (
-		attrs    *storage.ObjectAttrs
 		h        = cmn.BackendHelpers.Google
 		cloudBck = lom.Bck().RemoteBck()
 	)
-	attrs, err = gcpClient.Bucket(cloudBck.Name).Object(lom.ObjName).Attrs(ctx)
+	attrs, err := gcpClient.Bucket(cloudBck.Name).Object(lom.ObjName).Attrs(ctx)
 	if err != nil {
-		ecode, err = handleObjectError(ctx, gcpClient, err, cloudBck)
-		return
+		ecode, errV := handleObjectError(ctx, gcpClient, err, cloudBck)
+		return nil, ecode, errV
 	}
-	oa = &cmn.ObjAttrs{}
+
+	oa := &cmn.ObjAttrs{}
 	oa.CustomMD = make(cos.StrKVs, 6)
 	oa.SetCustomKey(cmn.SourceObjMD, apc.GCP)
 	oa.Size = attrs.Size
@@ -294,7 +287,7 @@ func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *c
 	if v, ok := h.EncodeCksum(attrs.CRC32C); ok {
 		oa.SetCustomKey(cmn.CRC32CObjMD, v)
 	}
-	if v, ok := h.EncodeCksum(attrs.Etag); ok {
+	if v, ok := h.EncodeETag(attrs.Etag); ok {
 		oa.SetCustomKey(cmn.ETag, v)
 	}
 
@@ -304,20 +297,23 @@ func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *c
 		}
 	}
 
-	oa.SetCustomKey(cmn.LastModified, fmtTime(attrs.Updated))
+	oa.SetCustomKey(cos.HdrLastModified, fmtHdrTime(attrs.Updated))
+
 	// unlike other custom attrs, "Content-Type" is not getting stored w/ LOM
 	// - only shown via list-objects and HEAD when not present
 	oa.SetCustomKey(cos.HdrContentType, attrs.ContentType)
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infof("[head_object] %s", cloudBck.Cname(lom.ObjName))
 	}
-	return
+
+	return oa, 0, nil
 }
 
 //
 // GET OBJECT
 //
 
+//nolint:dupl // GCP vs Azure: similar code, different BPs
 func (gsbp *gsbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (int, error) {
 	res := gsbp.GetObjReader(ctx, lom, 0, 0)
 	if res.Err != nil {
@@ -388,63 +384,67 @@ func setCustomGs(lom *core.LOM, attrs *storage.ObjectAttrs) (expCksum *cos.Cksum
 			expCksum = cos.NewCksum(cos.ChecksumCRC32C, v)
 		}
 	}
-	if v, ok := h.EncodeCksum(attrs.Etag); ok {
+	if v, ok := h.EncodeETag(attrs.Etag); ok {
 		lom.SetCustomKey(cmn.ETag, v)
 	}
-	lom.SetCustomKey(cmn.LastModified, fmtTime(attrs.Updated))
-	return
+
+	lom.SetCustomKey(cmn.LsoLastModified, fmtLsoTime(attrs.Updated))
+	lom.SetCustomKey(cos.HdrLastModified, fmtHdrTime(attrs.Updated))
+
+	return expCksum
 }
 
 //
 // PUT OBJECT
 //
 
-func (gsbp *gsbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (ecode int, err error) {
+func (gsbp *gsbp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, error) {
 	var (
-		attrs    *storage.ObjectAttrs
-		written  int64
-		cloudBck = lom.Bck().RemoteBck()
-		md       = make(cos.StrKVs, 2)
-		gcpObj   = gcpClient.Bucket(cloudBck.Name).Object(lom.ObjName)
-		wc       = gcpObj.NewWriter(gctx)
+		cloudBck            = lom.Bck().RemoteBck()
+		cksumType, cksumVal = lom.Checksum().Get()
+		gcpObj              = gcpClient.Bucket(cloudBck.Name).Object(lom.ObjName)
+		wc                  = gcpObj.NewWriter(ctx)
 	)
-	md[gcpChecksumType], md[gcpChecksumVal] = lom.Checksum().Get()
+	wc.Metadata = map[string]string{
+		gcpChecksumType: cksumType,
+		gcpChecksumVal:  cksumVal,
+	}
 
-	wc.Metadata = md
 	buf, slab := gsbp.t.PageMM().Alloc()
-	written, err = io.CopyBuffer(wc, r, buf)
+	written, err := io.CopyBuffer(wc, r, buf)
 	slab.Free(buf)
 	cos.Close(r)
+
 	if err != nil {
-		return
+		return 0, err
 	}
-	if err = wc.Close(); err != nil {
-		ecode, err = gcpErrorToAISError(err, cloudBck)
-		return
+	if err := wc.Close(); err != nil {
+		return gcpErrorToAISError(err, cloudBck)
 	}
-	attrs, err = gcpObj.Attrs(gctx)
-	if err != nil {
-		ecode, err = handleObjectError(gctx, gcpClient, err, cloudBck)
-		return
+
+	attrs, errV := gcpObj.Attrs(ctx)
+	if errV != nil {
+		return handleObjectError(ctx, gcpClient, errV, cloudBck)
 	}
+
 	_ = setCustomGs(lom, attrs)
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infof("[put_object] %s, size %d", lom, written)
 	}
-	return
+	return 0, nil
 }
 
 //
 // DELETE OBJECT
 //
 
-func (*gsbp) DeleteObj(lom *core.LOM) (ecode int, err error) {
+func (*gsbp) DeleteObj(ctx context.Context, lom *core.LOM) (ecode int, err error) {
 	var (
 		cloudBck = lom.Bck().RemoteBck()
 		o        = gcpClient.Bucket(cloudBck.Name).Object(lom.ObjName)
 	)
-	if err = o.Delete(gctx); err != nil {
-		ecode, err = handleObjectError(gctx, gcpClient, err, cloudBck)
+	if err = o.Delete(ctx); err != nil {
+		ecode, err = handleObjectError(ctx, gcpClient, err, cloudBck)
 		return
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
@@ -487,17 +487,20 @@ func gcpErrorToAISError(gcpError error, bck *cmn.Bck) (int, error) {
 		return http.StatusNotFound, err
 	}
 	apiErr, ok := gcpError.(*googleapi.Error)
-	if !ok {
+	switch {
+	case !ok:
 		return http.StatusInternalServerError, err
-	}
-	if apiErr.Code == http.StatusForbidden && strings.Contains(apiErr.Error(), "may not exist") {
+	case apiErr.Code == http.StatusForbidden && strings.Contains(apiErr.Error(), "may not exist"):
 		// HACK: "not found or misspelled" vs  "service not paid for" (the latter less likely)
 		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 			nlog.Infoln(err)
 		}
 		return http.StatusNotFound, err
+	case apiErr.Code == http.StatusTooManyRequests || apiErr.Code == http.StatusServiceUnavailable:
+		return apiErr.Code, cmn.NewErrTooManyRequests(err, apiErr.Code)
+	default:
+		return apiErr.Code, err
 	}
-	return apiErr.Code, err
 }
 
 // (compare w/ _awsErr)

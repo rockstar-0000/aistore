@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/tools/tassert"
+
 	"github.com/urfave/cli"
 )
 
@@ -183,7 +184,7 @@ func TestParseSourceValidURIs(t *testing.T) {
 	}
 
 	for _, test := range parseSourceTests {
-		source, err := parseSource(test.input)
+		source, err := parseDlSource(test.input)
 		if err != nil {
 			t.Errorf("unexpected error while parsing source URI %s: %v", test.input, err)
 		}
@@ -210,13 +211,13 @@ func TestParseDestValidURIs(t *testing.T) {
 	}
 
 	for _, test := range parseDestTests {
-		bucket, pathSuffix, err := parseDest(&cli.Context{}, test.url)
+		bucket, pathSuffix, err := parseBckObjAux(&cli.Context{}, test.url)
 		if err != nil {
 			t.Errorf("unexpected error while parsing dest URI %s: %v", test.url, err)
 		}
 
 		if bucket != test.bucket {
-			t.Errorf("parseSource(%s) expected bucket: %s, got: %s", test.url, test.bucket, bucket)
+			t.Errorf("parseSource(%s) expected bucket: %s, got: %s", test.url, test.bucket.String(), bucket.String())
 		}
 		if pathSuffix != test.objName {
 			t.Errorf("parseSource(%s) expected bucket: %s, got: %s", test.url, test.objName, pathSuffix)
@@ -234,7 +235,7 @@ func TestParseDestInvalidURIs(t *testing.T) {
 	}
 
 	for _, test := range parseDestTests {
-		_, _, err := parseDest(&cli.Context{}, test)
+		_, _, err := parseBckObjAux(&cli.Context{}, test)
 		if err == nil {
 			t.Errorf("expected error while parsing dest URI %s", test)
 		}
@@ -294,25 +295,29 @@ func TestMakePairsErrors(t *testing.T) {
 
 func TestParseQueryBckURI(t *testing.T) {
 	positiveTests := []struct {
-		uri string
-		bck cmn.QueryBcks
+		uri  string
+		bck  cmn.QueryBcks
+		pref string
 	}{
-		{uri: "", bck: cmn.QueryBcks{}},
-		{uri: "ais://", bck: cmn.QueryBcks{Provider: apc.AIS}},
-		{uri: "ais://#ns", bck: cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{Name: "ns"}}},
-		{uri: "ais://@uuid", bck: cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{UUID: "uuid"}}},
-		{uri: "ais://@uuid#ns", bck: cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{Name: "ns", UUID: "uuid"}}},
-		{uri: "ais://bucket", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket"}},
-		{uri: "ais://#ns/bucket", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket", Ns: cmn.Ns{Name: "ns"}}},
-		{uri: "ais://@uuid#ns/bucket", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket", Ns: cmn.Ns{Name: "ns", UUID: "uuid"}}},
-		{uri: "http://web.url/dataset", bck: cmn.QueryBcks{Provider: apc.HT, Name: "ZWUyYWFiOGEzYjEwMTJkNw"}},
-		{uri: "https://web.url/dataset", bck: cmn.QueryBcks{Provider: apc.HT, Name: "ZWUyYWFiOGEzYjEwMTJkNw"}},
+		{uri: "", bck: cmn.QueryBcks{}, pref: ""},
+		{uri: "ais://", bck: cmn.QueryBcks{Provider: apc.AIS}, pref: ""},
+		{uri: "ais://#ns", bck: cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{Name: "ns"}}, pref: ""},
+		{uri: "ais://@uuid", bck: cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{UUID: "uuid"}}, pref: ""},
+		{uri: "ais://@uuid#ns", bck: cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.Ns{Name: "ns", UUID: "uuid"}}, pref: ""},
+		{uri: "ais://bucket", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket"}, pref: ""},
+		{uri: "ais://#ns/bucket", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket", Ns: cmn.Ns{Name: "ns"}}, pref: ""},
+		{uri: "ais://@uuid#ns/bucket", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket", Ns: cmn.Ns{Name: "ns", UUID: "uuid"}}, pref: ""},
+		{uri: "http://web.url/dataset", bck: cmn.QueryBcks{Provider: apc.HT, Name: "ZWUyYWFiOGEzYjEwMTJkNw"}, pref: ""},
+		{uri: "https://web.url/dataset", bck: cmn.QueryBcks{Provider: apc.HT, Name: "ZWUyYWFiOGEzYjEwMTJkNw"}, pref: ""},
+		{uri: "ais://bucket/objname", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket"}, pref: "objname"},
+		{uri: "ais://bucket/aaa/bbb/objname", bck: cmn.QueryBcks{Provider: apc.AIS, Name: "bucket"}, pref: "aaa/bbb/objname"},
 	}
 	for _, test := range positiveTests {
-		bck, err := parseQueryBckURI(&cli.Context{}, test.uri)
+		bck, pref, err := parseQueryBckURI(test.uri)
 		tassert.Errorf(t, err == nil, "failed on %s with err: %v", test.uri, err)
 		b := cmn.Bck(bck)
 		tassert.Errorf(t, test.bck.Equal(&b), "failed on %s buckets are not equal (expected: %q, got: %q)", test.uri, test.bck, bck)
+		tassert.Errorf(t, test.pref == pref, "parsed %s to invalid embedded prefix %q (expected %q)", test.uri, pref, test.pref)
 	}
 
 	negativeTests := []struct {
@@ -323,13 +328,13 @@ func TestParseQueryBckURI(t *testing.T) {
 		{uri: "://"},
 		{uri: "aiss://"},
 		{uri: "aiss://bucket"},
-		{uri: "ais://bucket/objname"},
 		{uri: "ais:///objectname"},
+		{uri: "ais:///aaa/bbb/objectname"},
 		{uri: "ftp://unsupported"},
 	}
 	for _, test := range negativeTests {
-		bck, err := parseQueryBckURI(&cli.Context{}, test.uri)
-		tassert.Errorf(t, err != nil, "expected error on %s (bck: %q)", test.uri, bck)
+		bck, pref, err := parseQueryBckURI(test.uri)
+		tassert.Errorf(t, err != nil, "expected error parsing %q, got: (bck %q, pref %q)", test.uri, bck, pref)
 	}
 }
 
@@ -347,7 +352,8 @@ func TestParseBckURI(t *testing.T) {
 	for _, test := range positiveTests {
 		bck, err := parseBckURI(&cli.Context{}, test.uri, true /*require provider*/)
 		tassert.Errorf(t, err == nil, "failed on %s with err: %v", test.uri, err)
-		tassert.Errorf(t, test.bck.Equal(&bck), "failed on %s buckets are not equal (expected: %q, got: %q)", test.uri, test.bck, bck)
+		tassert.Errorf(t, test.bck.Equal(&bck), "failed on %s buckets are not equal (expected: %q, got: %q)",
+			test.uri, test.bck.String(), bck.String())
 	}
 
 	negativeTests := []struct {
@@ -369,7 +375,7 @@ func TestParseBckURI(t *testing.T) {
 	}
 	for _, test := range negativeTests {
 		bck, err := parseBckURI(&cli.Context{}, test.uri, true /*require provider*/)
-		tassert.Errorf(t, err != nil, "expected error on %s (bck: %q)", test.uri, bck)
+		tassert.Errorf(t, err != nil, "expected error on %s (bck: %q)", test.uri, bck.String())
 	}
 }
 
@@ -423,7 +429,8 @@ func TestParseBckObjectURI(t *testing.T) {
 	for _, test := range positiveTests {
 		bck, objName, err := parseBckObjURI(&cli.Context{}, test.uri, test.optObjName)
 		tassert.Errorf(t, err == nil, "failed on %s with err: %v", test.uri, err)
-		tassert.Errorf(t, test.bck.Equal(&bck), "failed on %s buckets are not equal (expected: %q, got: %q)", test.uri, test.bck, bck)
+		tassert.Errorf(t, test.bck.Equal(&bck), "failed on %s buckets are not equal (expected: %q, got: %q)",
+			test.uri, test.bck.String(), bck.String())
 		tassert.Errorf(t, test.objName == objName, "failed on %s object names are not equal (expected: %q, got: %q)", test.uri, test.objName, objName)
 	}
 
@@ -454,6 +461,6 @@ func TestParseBckObjectURI(t *testing.T) {
 	}
 	for _, test := range negativeTests {
 		bck, objName, err := parseBckObjURI(&cli.Context{}, test.uri, test.optObjName)
-		tassert.Errorf(t, err != nil, "expected error on %s (bck: %q, obj_name: %q)", test.uri, bck, objName)
+		tassert.Errorf(t, err != nil, "expected error on %s (bck: %q, obj_name: %q)", test.uri, bck.String(), objName)
 	}
 }

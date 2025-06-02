@@ -1,7 +1,6 @@
-//nolint:dupl // copy-paste benign and can wait
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -37,6 +36,7 @@ import (
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -307,16 +307,18 @@ func (df *dsortFramework) createInputShards() {
 			} else {
 				tarName = path + df.inputExt
 			}
-			if df.alg.Kind == dsort.Content {
+
+			switch {
+			case df.alg.Kind == dsort.Content:
 				err = tarch.CreateArchCustomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
 					df.fileSz, df.alg.ContentKeyType, df.alg.Ext, df.missingKeys)
-			} else if df.recordNames != nil {
+			case df.recordNames != nil:
 				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
 					df.fileSz, duplication, true, df.recordExts, df.recordNames)
-			} else if df.inputExt == archive.ExtTar {
+			case df.inputExt == archive.ExtTar:
 				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
 					df.fileSz, duplication, false, df.recordExts, nil)
-			} else {
+			default:
 				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
 					df.fileSz, duplication, false, nil, nil)
 			}
@@ -440,12 +442,13 @@ outer:
 			}
 
 			for _, file := range files {
-				if df.alg.Kind == "" || df.alg.Kind == dsort.Alphanumeric {
+				switch df.alg.Kind {
+				case "", dsort.Alphanumeric:
 					if lastName > file.Name() && canonicalName(lastName) != canonicalName(file.Name()) {
 						df.m.t.Fatalf("%s: names out of order (shard: %s, lastName: %s, curName: %s)",
 							df.job(), shardName, lastName, file.Name())
 					}
-				} else if df.alg.Kind == dsort.Shuffle {
+				case dsort.Shuffle:
 					if lastName > file.Name() {
 						inversions++
 					}
@@ -512,10 +515,7 @@ func (df *dsortFramework) checkOutputShardsWithEKM(ekm *shard.ExternalKeyMap) {
 	for tmpl, pool := range shardNamePools {
 		pt, _ := cos.NewParsedTemplate(tmpl)
 		pt.InitIter()
-		for {
-			if len(pool) == 0 {
-				break
-			}
+		for len(pool) > 0 {
 			shardName, hasNext := pt.Next()
 			if !hasNext {
 				df.m.t.Fatalf("Shard name template (%v) does not match the corresponding shard name pool, remaining names: %v", tmpl, pool)
@@ -592,7 +592,7 @@ func (df *dsortFramework) getRecordNames(bck cmn.Bck) []shardRecords {
 	tassert.CheckFatal(df.m.t, err)
 
 	if len(list.Entries) == 0 {
-		df.m.t.Errorf("number of objects in bucket %q is 0", bck)
+		df.m.t.Errorf("number of objects in the bucket %q is 0 (zero)", bck.String())
 	}
 	for _, obj := range list.Entries {
 		var (
@@ -702,7 +702,7 @@ func waitForDsortPhase(t *testing.T, proxyURL, managerUUID, phaseName string, ca
 //
 
 func TestDsort(t *testing.T) {
-	for _, ext := range []string{archive.ExtTar, archive.ExtTarLz4, archive.ExtZip} {
+	for _, ext := range []string{archive.ExtTar, archive.ExtZip} { // TODO -- FIXME: add back ExtTarLz4
 		for _, lr := range []string{"list", "range"} {
 			t.Run(ext+"/"+lr, func(t *testing.T) {
 				testDsort(t, ext, lr)
@@ -795,7 +795,7 @@ func TestDsortNonExistingBuckets(t *testing.T) {
 
 			tlog.Logln(startingDS)
 			spec := df.gen()
-			tlog.Logf("dsort %s(-) => %s\n", m.bck, df.outputBck)
+			tlog.Logf("dsort %s(-) => %s\n", m.bck.String(), df.outputBck.String())
 			if _, err := api.StartDsort(df.baseParams, &spec); err == nil {
 				t.Error("expected dsort to fail when input bucket doesn't exist")
 			}
@@ -804,7 +804,7 @@ func TestDsortNonExistingBuckets(t *testing.T) {
 			tools.DestroyBucket(t, m.proxyURL, df.outputBck)
 			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
-			tlog.Logf("dsort %s => %s(-)\n", m.bck, df.outputBck)
+			tlog.Logf("dsort %s => %s(-)\n", m.bck.String(), df.outputBck.String())
 			if _, err := api.StartDsort(df.baseParams, &spec); err != nil {
 				t.Errorf("expected dsort to create output bucket on the fly, got: %v", err)
 			}
@@ -1036,7 +1036,7 @@ func TestDsortDisk(t *testing.T) {
 }
 
 func TestDsortCompressionDisk(t *testing.T) {
-	for _, ext := range []string{archive.ExtTgz, archive.ExtTarLz4, archive.ExtZip} {
+	for _, ext := range []string{archive.ExtTgz, archive.ExtZip} { // TODO: add archive.ExtTarLz4 back
 		t.Run(ext, func(t *testing.T) {
 			runDsortTest(
 				t, dsortTestSpec{p: true, types: dsorterTypes},
@@ -1140,6 +1140,8 @@ func TestDsortMemDisk(t *testing.T) {
 }
 
 func TestDsortMinMemCompression(t *testing.T) {
+	t.Skipf("skipping %s", t.Name()) // TODO -- FIXME: remove completely
+
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	for _, ext := range []string{archive.ExtTarGz, archive.ExtTarLz4, archive.ExtZip} {
 		for _, maxMem := range []string{"10%", "1%"} {

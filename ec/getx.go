@@ -1,10 +1,11 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
-* Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,9 +67,10 @@ func (*getFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 
 func (p *getFactory) Start() error {
 	xec := ECM.NewGetXact(p.Bck.Bucket())
-	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
+	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), "" /*ctlmsg*/, p.Bck, 0 /*use default*/)
 	p.xctn = xec
-	go xec.Run(nil)
+
+	xact.GoRunW(xec)
 	return nil
 }
 func (*getFactory) Kind() string     { return apc.ActECGet }
@@ -84,26 +86,19 @@ func (p *getFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 /////////////
 
 func newGetXact(bck *cmn.Bck, mgr *Manager) *XactGet {
-	var (
-		avail, disabled = fs.Get()
-		totalPaths      = len(avail) + len(disabled)
-		config          = cmn.GCO.Get()
-		xctn            = &XactGet{
-			getJoggers: make(map[string]*getJogger, totalPaths),
-		}
-	)
-	xctn.xactECBase.init(config, bck, mgr)
+	xctn := &XactGet{}
+	xctn.xactECBase.init(cmn.GCO.Get(), bck, mgr)
 	xctn.xactReqBase.init()
 
-	// create all runners but do not start them until Run is called
-	for mpath := range avail {
-		getJog := xctn.newGetJogger(mpath)
-		xctn.getJoggers[mpath] = getJog
+	// construct joggers
+	avail, disabled := fs.Get()
+	xctn.getJoggers = make(map[string]*getJogger, len(avail)+len(disabled))
+	for _, mpi := range []fs.MPI{avail, disabled} {
+		for mpath := range mpi {
+			xctn.getJoggers[mpath] = xctn.newGetJogger(mpath)
+		}
 	}
-	for mpath := range disabled {
-		getJog := xctn.newGetJogger(mpath)
-		xctn.getJoggers[mpath] = getJog
-	}
+
 	return xctn
 }
 
@@ -120,24 +115,27 @@ func (r *XactGet) dispatchResp(iReq intraReq, hdr *transport.ObjHdr, bck *meta.B
 	// the transfer is complete
 	case respPut:
 		if cmn.Rom.FastV(4, cos.SmoduleEC) {
-			nlog.Infof("Response from %s, %s", hdr.SID, uname)
+			nlog.Infoln("response from", hdr.SID, bck.Cname(objName))
 		}
 		r.dOwner.mtx.Lock()
 		writer, ok := r.dOwner.slices[uname]
 		r.dOwner.mtx.Unlock()
 
 		if !ok {
-			err := fmt.Errorf("%s: no slice writer for %s (uname %s)", core.T, bck.Cname(objName), uname)
+			err := fmt.Errorf("%s: no slice writer for %s", core.T, bck.Cname(objName))
 			r.AddErr(err, 0)
 			return
 		}
 		if err := _writerReceive(writer, iReq.exists, objAttrs, reader); err != nil {
-			err = fmt.Errorf("%s: failed to read %s replica: %w (uname %s)", core.T, bck.Cname(objName), err, uname)
-			r.AddErr(err, 0)
+			errN := fmt.Errorf("%s: failed to read %s replica: %w", core.T, bck.Cname(objName), err)
+			r.AddErr(errN, 0)
+			if err == io.ErrUnexpectedEOF || errors.Is(err, io.ErrUnexpectedEOF) {
+				r.Abort(errN)
+			}
 		}
 	default:
-		debug.Assert(false, "opcode", hdr.Opcode)
-		nlog.Errorf("Invalid request: %d", hdr.Opcode)
+		debug.Assert(false, invalOpcode, " ", hdr.Opcode)
+		nlog.Errorln(r.Name(), invalOpcode, hdr.Opcode)
 	}
 }
 
@@ -155,13 +153,13 @@ func (r *XactGet) newGetJogger(mpath string) *getJogger {
 		parent: r,
 		mpath:  mpath,
 		client: client,
-		workCh: make(chan *request, requestBufSizeFS),
+		workCh: make(chan *request, max(getxBurstSize, r.config.EC.Burst)),
 	}
 	j.stopCh.Init()
 	return j
 }
 
-func (r *XactGet) dispatchRequest(req *request, lom *core.LOM) error {
+func (r *XactGet) dispatchReq(req *request, lom *core.LOM) error {
 	if !r.ecRequestsEnabled() {
 		if req.ErrCh != nil {
 			req.ErrCh <- ErrorECDisabled
@@ -174,14 +172,17 @@ func (r *XactGet) dispatchRequest(req *request, lom *core.LOM) error {
 
 	jogger, ok := r.getJoggers[lom.Mountpath().Path]
 	if !ok {
-		debug.Assert(false, "invalid "+lom.Mountpath().String())
+		err := errLossMpath(r, lom)
+		r.Abort(err)
+		return err
 	}
+
 	r.stats.updateQueue(len(jogger.workCh))
 	jogger.workCh <- req
 	return nil
 }
 
-func (r *XactGet) Run(*sync.WaitGroup) {
+func (r *XactGet) Run(gowg *sync.WaitGroup) {
 	nlog.Infoln(r.Name())
 	for _, jog := range r.getJoggers {
 		go jog.run()
@@ -191,6 +192,7 @@ func (r *XactGet) Run(*sync.WaitGroup) {
 	defer ticker.Stop()
 
 	ECM.incActive(r)
+	gowg.Done()
 
 	// as of now all requests are equal. Some may get throttling later
 	for {
@@ -248,15 +250,19 @@ func (r *XactGet) stop() {
 // a nil value from channel but ecrunner keeps working - it reuploads all missing
 // slices or copies
 func (r *XactGet) decode(req *request, lom *core.LOM) {
-	debug.Assert(req.Action == ActRestore, "invalid action for restore: "+req.Action)
 	r.stats.updateDecode()
 	req.putTime = time.Now()
-	req.tm = time.Now()
+	req.tm = req.putTime
 
-	if err := r.dispatchRequest(req, lom); err != nil {
-		nlog.Errorf("failed to restore %s: %v", lom, err)
-		freeReq(req)
+	err := r.dispatchReq(req, lom)
+	if err == nil {
+		return
 	}
+	if req.Callback != nil {
+		req.Callback(lom, err)
+	}
+	nlog.Errorln("failed to restore", lom.Cname(), "err:", err)
+	freeReq(req)
 }
 
 // ClearRequests disables receiving new EC requests, they will be terminated with error
@@ -296,7 +302,10 @@ func (r *XactGet) addMpath(mpath string) {
 func (r *XactGet) removeMpath(mpath string) {
 	getJog, ok := r.getJoggers[mpath]
 	if !ok {
-		debug.Assert(false, "invalid mountpath: "+mpath)
+		err := fmt.Errorf("%s: invalid or lost mountpath %q", r, mpath)
+		debug.Assert(false, err)
+		r.Abort(err)
+		return
 	}
 	getJog.stop()
 	delete(r.getJoggers, mpath)

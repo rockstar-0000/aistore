@@ -1,8 +1,7 @@
 import unittest
-from datetime import datetime, timedelta
-from typing import Dict, List
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch, call
-
+from aistore.sdk import Bucket
 from aistore.sdk.const import (
     QPARAM_WHAT,
     QPARAM_FORCE,
@@ -15,7 +14,13 @@ from aistore.sdk.const import (
 )
 from aistore.sdk.errors import Timeout, JobInfoNotFound
 from aistore.sdk.request_client import RequestClient
-from aistore.sdk.types import JobStatus, JobArgs, BucketModel, ActionMsg, JobSnapshot
+from aistore.sdk.types import (
+    JobStatus,
+    JobArgs,
+    ActionMsg,
+    JobSnap,
+    AggregatedJobSnap,
+)
 from aistore.sdk.utils import probing_frequency
 from aistore.sdk.job import Job
 
@@ -97,7 +102,7 @@ class TestJob(unittest.TestCase):
 
         self.assertRaises(Timeout, self.job.wait)
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def wait_exec_assert(
         self,
         job,
@@ -122,13 +127,20 @@ class TestJob(unittest.TestCase):
 
     @patch("aistore.sdk.job.time.sleep")
     def test_wait_for_idle(self, mock_sleep):
-        snap_other_job_idle = JobSnapshot(id="other_id", is_idle=True)
-        snap_job_running = JobSnapshot(id=self.job_id, is_idle=False)
-        snap_job_idle = JobSnapshot(id=self.job_id, is_idle=True)
+        snap_other_job_idle = JobSnap(id="other_id", is_idle=True)
+        snap_job_running = JobSnap(id=self.job_id, is_idle=False)
+        snap_job_idle = JobSnap(id=self.job_id, is_idle=True)
         self.mock_client.request_deserialize.side_effect = [
-            {"d1": [snap_other_job_idle, snap_job_running], "d2": [snap_job_running]},
-            {"d1": [snap_job_running], "d2": [snap_job_idle]},
-            {"d1": [snap_job_idle], "d2": [snap_job_idle]},
+            AggregatedJobSnap.parse_obj(
+                {
+                    "d1": [snap_other_job_idle, snap_job_running],
+                    "d2": [snap_job_running],
+                }
+            ),
+            AggregatedJobSnap.parse_obj(
+                {"d1": [snap_job_running], "d2": [snap_job_idle]}
+            ),
+            AggregatedJobSnap.parse_obj({"d1": [snap_job_idle], "d2": [snap_job_idle]}),
         ]
         timeout = 20
         frequency = probing_frequency(timeout)
@@ -139,7 +151,7 @@ class TestJob(unittest.TestCase):
             path=URL_PATH_CLUSTER,
             json=expected_request_val,
             params=expected_request_params,
-            res_model=Dict[str, List[JobSnapshot]],
+            res_model=AggregatedJobSnap,
         )
 
         expected_client_requests = [expected_call for _ in range(2)]
@@ -155,17 +167,21 @@ class TestJob(unittest.TestCase):
     @patch("aistore.sdk.job.time.sleep")
     # pylint: disable=unused-argument
     def test_wait_for_idle_timeout(self, mock_sleep):
-        res = {
-            "d1": [JobSnapshot(id=self.job_id, is_idle=True)],
-            "d2": [JobSnapshot(id=self.job_id, is_idle=False)],
-        }
+        res = AggregatedJobSnap.parse_obj(
+            {
+                "d1": [JobSnap(id=self.job_id, is_idle=True)],
+                "d2": [JobSnap(id=self.job_id, is_idle=False)],
+            }
+        )
         self.mock_client.request_deserialize.return_value = res
         self.assertRaises(Timeout, self.job.wait_for_idle)
 
     @patch("aistore.sdk.job.time.sleep")
     # pylint: disable=unused-argument
     def test_wait_for_idle_no_snapshots(self, mock_sleep):
-        self.mock_client.request_deserialize.return_value = {}
+        self.mock_client.request_deserialize.return_value = AggregatedJobSnap.parse_obj(
+            {}
+        )
         with self.assertRaises(Timeout) as exc:
             self.job.wait_for_idle()
         self.assertEqual(
@@ -176,10 +192,12 @@ class TestJob(unittest.TestCase):
     @patch("aistore.sdk.job.time.sleep")
     # pylint: disable=unused-argument
     def test_wait_for_idle_no_job_in_snapshots(self, mock_sleep):
-        res = {
-            "d1": [JobSnapshot(id="1"), JobSnapshot(id="2")],
-            "d2": [JobSnapshot(id="2")],
-        }
+        res = AggregatedJobSnap.parse_obj(
+            {
+                "d1": [JobSnap(id="1"), JobSnap(id="2")],
+                "d2": [JobSnap(id="2")],
+            }
+        )
         self.mock_client.request_deserialize.return_value = res
         with self.assertRaises(Timeout) as exc:
             self.job.wait_for_idle()
@@ -190,9 +208,12 @@ class TestJob(unittest.TestCase):
 
     def test_job_start_single_bucket(self):
         daemon_id = "daemon id"
-        bucket = BucketModel(client=Mock(RequestClient), name="single bucket")
+        bucket = Bucket(
+            client=Mock(RequestClient),
+            name="single bucket",
+        )
         expected_json = JobArgs(
-            kind=self.job_kind, daemon_id=daemon_id, bucket=bucket
+            kind=self.job_kind, daemon_id=daemon_id, bucket=bucket.as_model()
         ).as_dict()
         self.job_start_exec_assert(
             self.job,
@@ -206,11 +227,19 @@ class TestJob(unittest.TestCase):
     def test_job_start_bucket_list(self):
         daemon_id = "daemon id"
         buckets = [
-            BucketModel(client=Mock(RequestClient), name="first bucket"),
-            BucketModel(client=Mock(RequestClient), name="second bucket"),
+            Bucket(
+                client=Mock(RequestClient),
+                name="first bucket",
+            ),
+            Bucket(
+                client=Mock(RequestClient),
+                name="second bucket",
+            ),
         ]
         expected_json = JobArgs(
-            kind=self.job_kind, daemon_id=daemon_id, buckets=buckets
+            kind=self.job_kind,
+            daemon_id=daemon_id,
+            buckets=[bucket.as_model() for bucket in buckets],
         ).as_dict()
         self.job_start_exec_assert(
             self.job,
@@ -242,16 +271,18 @@ class TestJob(unittest.TestCase):
 
     @patch("aistore.sdk.job.time.sleep", Mock())
     def test_wait_single_node_finishes_successfully(self):
-        finished_snapshot = {
-            "key": [
-                JobSnapshot(
-                    id=self.job_id,
-                    is_idle=True,
-                    end_time="2024-01-01T00:00:00Z",
-                    aborted=False,
-                )
-            ]
-        }
+        finished_snapshot = AggregatedJobSnap.parse_obj(
+            {
+                "key": [
+                    JobSnap(
+                        id=self.job_id,
+                        is_idle=True,
+                        end_time="2024-01-01T00:00:00Z",
+                        aborted=False,
+                    )
+                ]
+            }
+        )
         self.mock_client.request_deserialize.return_value = finished_snapshot
 
         self.job.wait_single_node()
@@ -261,16 +292,18 @@ class TestJob(unittest.TestCase):
 
     @patch("aistore.sdk.job.time.sleep", Mock())
     def test_wait_single_node_is_aborted(self):
-        aborted_snapshot = {
-            "key": [
-                JobSnapshot(
-                    id=self.job_id,
-                    is_idle=True,
-                    end_time="2024-01-01T00:00:00Z",
-                    aborted=True,
-                )
-            ]
-        }
+        aborted_snapshot = AggregatedJobSnap.parse_obj(
+            {
+                "key": [
+                    JobSnap(
+                        id=self.job_id,
+                        is_idle=True,
+                        end_time="2024-01-01T00:00:00Z",
+                        aborted=True,
+                    )
+                ]
+            }
+        )
         self.mock_client.request_deserialize.return_value = aborted_snapshot
 
         self.job.wait_single_node()
@@ -278,16 +311,18 @@ class TestJob(unittest.TestCase):
 
     @patch("aistore.sdk.job.time.sleep", Mock())
     def test_wait_single_node_timeout(self):
-        ongoing_snapshots = {
-            "key": [
-                JobSnapshot(
-                    id=self.job_id,
-                    is_idle=False,
-                    end_time="0001-01-01T00:00:00Z",
-                    aborted=False,
-                )
-            ]
-        }
+        ongoing_snapshots = AggregatedJobSnap.parse_obj(
+            {
+                "key": [
+                    JobSnap(
+                        id=self.job_id,
+                        is_idle=False,
+                        end_time="0001-01-01T00:00:00Z",
+                        aborted=False,
+                    )
+                ]
+            }
+        )
         self.mock_client.request_deserialize.return_value = ongoing_snapshots
 
         with self.assertRaises(Timeout):
@@ -296,21 +331,22 @@ class TestJob(unittest.TestCase):
         self.mock_client.request_deserialize.assert_called()
 
     def test_get_within_timeframe_found_jobs(self):
-        start_time = datetime.now() - timedelta(days=1)
-        end_time = datetime.now()
+        start_time = datetime.now(timezone.utc) - timedelta(days=1)
+        end_time = datetime.now(timezone.utc)
 
         mock_snapshots = [
-            JobSnapshot(
+            JobSnap(
                 id="1234",
                 kind="test job",
-                start_time=(start_time.isoformat() + "Z"),
-                end_time=(end_time.isoformat() + "Z"),
+                start_time=(start_time.isoformat()),
+                end_time=(end_time.isoformat()),
                 aborted=False,
                 is_idle=True,
             )
         ]
-
-        self.mock_client.request_deserialize.return_value = {"key": mock_snapshots}
+        self.mock_client.request_deserialize.return_value = AggregatedJobSnap.parse_obj(
+            {"key": mock_snapshots}
+        )
 
         found_jobs = self.job.get_within_timeframe(start_time, end_time)
 
@@ -321,9 +357,68 @@ class TestJob(unittest.TestCase):
             self.assertEqual(found_job.end_time, expected_snapshot.end_time)
 
     def test_get_within_timeframe_no_jobs_found(self):
-        start_time = datetime.now() - timedelta(days=1)
-        end_time = datetime.now()
-        self.mock_client.request_deserialize.return_value = {}
-
+        start_time = datetime.now(timezone.utc) - timedelta(days=1)
+        end_time = datetime.now(timezone.utc)
+        self.mock_client.request_deserialize.return_value = AggregatedJobSnap()
         with self.assertRaises(JobInfoNotFound):
             self.job.get_within_timeframe(start_time, end_time)
+
+    def test_get_details(self):
+        mock_snapshot = JobSnap(
+            id="1234",
+            kind="test job",
+            start_time="2024-01-01T00:00:00Z",
+            end_time="2024-01-02T00:00:00Z",
+            aborted=False,
+            is_idle=True,
+        )
+        self.mock_client.request_deserialize.return_value = AggregatedJobSnap.parse_obj(
+            {"target1": [mock_snapshot], "target2": [mock_snapshot]}
+        )
+
+        details = self.job.get_details()
+
+        self.assertEqual(len(details.__root__.keys()), 2)
+        for target, snapshots in details.__root__.items():
+            self.assertIn(target, ["target1", "target2"])
+            for snapshot in snapshots:
+                self.assertEqual(snapshot.id, mock_snapshot.id)
+                self.assertEqual(snapshot.kind, mock_snapshot.kind)
+                self.assertEqual(snapshot.start_time, mock_snapshot.start_time)
+                self.assertEqual(snapshot.end_time, mock_snapshot.end_time)
+                self.assertEqual(snapshot.aborted, mock_snapshot.aborted)
+                self.assertEqual(snapshot.is_idle, mock_snapshot.is_idle)
+
+    def test_get_total_time_completed(self):
+        snapshot1 = JobSnap(
+            start_time="2025-03-10T00:00:00.000000000Z",
+            end_time="2025-03-11T00:00:00.000000000Z",
+        )
+        snapshot2 = JobSnap(
+            start_time="2025-03-10T00:00:00.000000000Z",
+            end_time="2025-03-12T00:00:00.000000000Z",
+        )
+        self.mock_client.request_deserialize.return_value = AggregatedJobSnap.parse_obj(
+            {"target1": [snapshot1], "target2": [snapshot2]}
+        )
+
+        total_time = self.job.get_total_time()
+
+        self.assertEqual(total_time, timedelta(days=2))
+
+    def test_get_total_time_running(self):
+        snapshot1 = JobSnap(
+            start_time="2025-03-10T00:00:00.000000000Z",
+            end_time="2025-03-11T00:00:00.000000000Z",
+        )
+        snapshot2 = JobSnap(
+            start_time="2025-03-10T00:00:00.000000000Z",
+            # end_time is not set, job is still running
+        )
+        self.mock_client.request_deserialize.return_value = AggregatedJobSnap.parse_obj(
+            {"target1": [snapshot1], "target2": [snapshot2]}
+        )
+
+        total_time = self.job.get_total_time()
+
+        self.assertEqual(total_time, None)

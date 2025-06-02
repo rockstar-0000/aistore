@@ -21,8 +21,8 @@ CLI_VERSION := $(shell ais version 2>/dev/null)
 MAKEFLAGS += --no-print-directory
 
 # Uncomment to cross-compile aisnode and cli, respectively:
-# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.22
-# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.22
+# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.24
+# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.24
 
 # Build version, flags, and tags
 VERSION = $(shell git rev-parse --short HEAD)
@@ -73,14 +73,12 @@ ifeq ($(MODE),debug)
 	GCFLAGS = -gcflags="all=-N -l"
 	LDFLAGS = -ldflags "-X 'main.build=$(VERSION)' -X 'main.buildtime=$(BUILD)'"
 	BUILD_TAGS += debug
+	GOFLAGS =
 else
 	# Production mode
 	GCFLAGS =
 	LDFLAGS = -ldflags "-w -s -X 'main.build=$(VERSION)' -X 'main.buildtime=$(BUILD)'"
-endif
-
-ifdef AIS_DEBUG
-	BUILD_TAGS += debug
+	GOFLAGS = -trimpath
 endif
 
 # mono:  utilize go:linkname for monotonic time source
@@ -103,10 +101,10 @@ ifdef WRD
 	@echo "Deploying with race detector, writing reports to $(subst log_path=,,$(GORACE)).<pid>"
 endif
 ifdef CROSS_COMPILE
-	@$(CROSS_COMPILE) go build -o ./aisnode $(BUILD_FLAGS) -tags="$(BUILD_TAGS)" $(GCFLAGS) $(LDFLAGS) $(BUILD_SRC)
+	@$(CROSS_COMPILE) go build -o ./aisnode $(BUILD_FLAGS) -tags="$(BUILD_TAGS)" $(GCFLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_SRC)
 	@mv ./aisnode $(BUILD_DEST)/.
 else
-	@$(WRD) go build -o $(BUILD_DEST)/aisnode $(BUILD_FLAGS) -tags="$(BUILD_TAGS)" $(GCFLAGS) $(LDFLAGS) $(BUILD_SRC)
+	@$(WRD) go build -o $(BUILD_DEST)/aisnode $(BUILD_FLAGS) -tags="$(BUILD_TAGS)" $(GCFLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_SRC)
 endif
 	@echo "done."
 
@@ -114,9 +112,9 @@ cli: ## Build CLI binary. NOTE: 1) a separate go.mod, 2) static linkage with cgo
 	@echo "Building ais (CLI) [build tags:$(BUILD_TAGS)]"
 ifdef CROSS_COMPILE_CLI
 	cd $(BUILD_DIR)/cli && \
-	$(CROSS_COMPILE_CLI) go build -o ./ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(LDFLAGS) *.go && mv ./ais $(BUILD_DEST)/.
+	$(CROSS_COMPILE_CLI) go build -o ./ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(GOFLAGS) $(LDFLAGS) *.go && mv ./ais $(BUILD_DEST)/.
 else
-	@cd $(BUILD_DIR)/cli && $(CGO_DISABLE) go build -o $(BUILD_DEST)/ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(LDFLAGS) *.go
+	@cd $(BUILD_DIR)/cli && $(CGO_DISABLE) go build -o $(BUILD_DEST)/ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(GOFLAGS) $(LDFLAGS) *.go
 endif
 	@echo "*** To enable autocompletions in your current shell, run:"
 ifeq ($(AISTORE_PATH),$(PWD))
@@ -129,17 +127,23 @@ cli-autocompletions: ## Add CLI autocompletions
 	@echo "Adding CLI autocomplete..."
 	@./$(BUILD_DIR)/cli/autocomplete/install.sh
 
+ishard: ## Build ishard CLI binary
+	@echo "Building ishard..."
+	@cd $(BUILD_DIR)/ishard && go build -o $(BUILD_DEST)/ishard *.go
+	@echo "done."
+
 authn: build-authn         ## Build AuthN
 aisloader: build-aisloader ## Build aisloader
 xmeta: build-xmeta         ## Build xmeta
+aisinit: build-aisinit     ## Build aisinit
 
 build-%:
 	@echo -n "Building $*... "
 ifdef CROSS_COMPILE
-	@$(CROSS_COMPILE) go build -o ./$* $(BUILD_FLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
+	@$(CROSS_COMPILE) go build -o ./$* $(BUILD_FLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
 	@mv ./$* $(BUILD_DEST)/.
 else
-	@go build -o $(BUILD_DEST)/$* $(BUILD_FLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
+	@go build -o $(BUILD_DEST)/$* $(BUILD_FLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
 endif
 	@echo "done."
 
@@ -185,6 +189,7 @@ clean: ## Remove all AIS related files and binaries
 
 mod-all: mod-clean mod-tidy
 	@echo "CLI ..." && cd cmd/cli && $(MAKE) mod-tidy
+	@echo "ishard ..." && cd cmd/ishard && $(MAKE) mod-tidy
 
 # cleanup go-mod cache
 mod-clean:
@@ -223,6 +228,9 @@ test-short: test-envcheck ## Run short tests
 	@RE="$(RE)" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-short
 	@cd $(BUILD_DIR)/cli && go test -v -tags=debug ./...
 
+test-tracing-unit:
+	@cd tracing && go test -v -tags=oteltracing ./...
+
 test-assorted: test-envcheck # Run specific tests
 	@RE="ETLBucket|ETLConnectionError|ETLInitCode" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
 
@@ -257,15 +265,16 @@ lint-update:
 ## See also: .github/workflows/lint.yml
 lint-update-ci:
 	@rm -f $(GOPATH)/bin/golangci-lint
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.61.0
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v2.1.2
 
 lint:
 	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" lint
 	@$(MAKE) -C $(BUILD_DIR)/cli lint
+	@$(MAKE) -C $(BUILD_DIR)/ishard lint
 
 install-python-deps:
-	@pip3 install -r ./python/aistore/common_requirements
+	@cd python && make common_deps botocore_deps
 
 fmt-check: install-python-deps ## Check code formatting
 	@pip3 install --upgrade black[jupyter] -q
@@ -313,7 +322,7 @@ help:
 	@printf "  $(cyan)%s$(term-reset)\n    %s\n\n" \
 		"make deploy" "Deploy cluster locally" \
 		"make kill clean" "Stop locally deployed cluster and cleanup all cluster-related data and bucket metadata (but not cluster map)" \
-		"make kill deploy <<< $$'7\n2\n4\ny\ny\n'"  "Shutdown and then (non-interactively) generate local configs and deploy a cluster consisting of 7 targets (4 mountpaths each) and 2 proxies; build 'aisnode' executable with GCP and AWS backends" \
+		"make kill deploy <<< $$'7\n2\n4\ny\ny\n'"  "Shutdown and then (non-interactively) generate local configs and deploy a cluster consisting of 7 targets (4 mountpaths each) and 2 proxies; build 'aisnode' executable with AWS and GCP backends" \
 		"TAGS=\"aws gcp\" make kill deploy <<< $$'7\n2\n'"  "Same as above (see docs/getting_started.md for many more examples)" \
 		"GORACE='log_path=/tmp/race' make deploy" "Deploy cluster with race detector, write reports to /tmp/race.<PID>" \
 		"MODE=debug make deploy" "Deploy cluster with 'aisnode' (AIS target and proxy) executable built with debug symbols and debug asserts enabled" \

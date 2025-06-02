@@ -8,34 +8,35 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
 jobs:
   test:
+    strategy:
+      matrix:
+        python-version: ['3.9','3.10','3.11','3.12','3.13']
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup-minikube
-        uses: medyagh/setup-minikube@latest
-        with:
-          driver: docker
-          container-runtime: docker
-          cpus: max
-          memory: max
+      - name: Create KinD K8s Cluster
+        uses: helm/kind-action@v1
 
-      - name: Run AIStore in Minikube
+      - name: Run AIStore in KinD
         run: |
-          cd $GITHUB_WORKSPACE/deploy/dev/k8s/
-          ./minimal.sh
+          cd $GITHUB_WORKSPACE/deploy/dev/k8s/kustomize
+          make github-ci
 
-      - name: Setup Python '3.11'
-        uses: actions/setup-python@v4
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Python ETL Tests
         run: |
           cd $GITHUB_WORKSPACE/python/
-          export AIS_ENDPOINT="http://$(minikube ip):8080"
+          source $GITHUB_WORKSPACE/deploy/dev/k8s/kustomize/utils/export_endpoint.sh
           make python_etl_tests
 

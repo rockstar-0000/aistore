@@ -1,6 +1,6 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -20,9 +21,9 @@ type (
 
 	// ETL metadata
 	MD struct {
-		Version int64
-		ETLs    ETLs
 		Ext     any
+		ETLs    ETLs
+		Version int64
 	}
 
 	jsonETL struct {
@@ -30,9 +31,9 @@ type (
 		Msg  jsoniter.RawMessage `json:"msg"`
 	}
 	jsonMD struct {
-		Version int64              `json:"version"`
-		ETLs    map[string]jsonETL `json:"etls"`
 		Ext     any                `json:"ext,omitempty"` // within meta-version extensions
+		ETLs    map[string]jsonETL `json:"etls"`
+		Version int64              `json:"version"`
 	}
 )
 
@@ -50,13 +51,18 @@ var (
 // MD //
 ////////
 
-func (e *MD) Init(l int)         { e.ETLs = make(ETLs, l) }
-func (e *MD) Add(msg InitMsg)    { e.ETLs[msg.Name()] = msg }
+func (e *MD) Init(l int) { e.ETLs = make(ETLs, l) }
+func (e *MD) Add(msg InitMsg) {
+	if msg == nil {
+		return
+	}
+	e.ETLs[msg.Name()] = msg
+}
 func (*MD) JspOpts() jsp.Options { return etlMDJspOpts }
 
 func (e *MD) Get(id string) (msg InitMsg, present bool) {
 	if e == nil {
-		return
+		return nil, false
 	}
 	msg, present = e.ETLs[id]
 	return
@@ -98,10 +104,12 @@ func (e *MD) UnmarshalJSON(data []byte) (err error) {
 	e.ETLs = make(ETLs, len(jsonMD.ETLs))
 	for k, v := range jsonMD.ETLs {
 		switch v.Type {
-		case Code:
+		case CodeType:
 			e.ETLs[k] = &InitCodeMsg{}
-		case Spec:
+		case SpecType:
 			e.ETLs[k] = &InitSpecMsg{}
+		case ETLSpecType:
+			e.ETLs[k] = &ETLSpecMsg{}
 		default:
 			err = fmt.Errorf("invalid InitMsg type %q", v.Type)
 			debug.AssertNoErr(err)

@@ -10,17 +10,18 @@ jobs:
   build:
     strategy:
       matrix:
-        go-version: ['1.22.x']
-        os: [ubuntu-latest, macos-latest]
+        go-version: ['1.24.x']
+        os: [ubuntu-latest]
+        # TODO: provide support for MacOS (revisit !7808)
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: ${{ matrix.go-version }}
-
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
 
       - name: Build AIStore on ${{ matrix.os }}
         run: |
@@ -35,7 +36,7 @@ jobs:
           AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="debug" make node
           # 5) cloud backends, debug, statsd
           # (build with StatsD, and note that Prometheus is the default when `statsd` tag is not defined)
-          TAGS="aws azure gcp statsd debug" make node
+          TAGS="aws azure gcp statsd debug oteltracing" make node
           # 6) statsd, debug, nethttp (note that fasthttp is used by default)
           TAGS="nethttp statsd debug" make node
           # 7) w/ mem profile (see cmd/aisnodeprofile)

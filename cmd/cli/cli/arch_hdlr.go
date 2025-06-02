@@ -1,11 +1,12 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles CLI commands that pertain to AIS objects.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
+	"archive/tar"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
@@ -24,20 +25,21 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/memsys"
+
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
 	"github.com/vbauerster/mpb/v4/decor"
 	"golang.org/x/sync/errgroup"
 )
 
-const archBucketUsage = "archive selected or matching objects from " + bucketObjectSrcArgument + " as\n" +
-	indent1 + archExts + "-formatted object (a.k.a. shard),\n" +
-	indent1 + "e.g.:\n" +
-	indent1 + "\t- 'archive bucket ais://src ais://dst/a.tar.lz4 --template \"shard-{001..997}\"'\n" +
-	indent1 + "\t- 'archive bucket \"ais://src/shard-{001..997}\" ais://dst/a.tar.lz4'\t- same as above (notice double quotes)\n" +
-	indent1 + "\t- 'archive bucket \"ais://src/shard-{998..999}\" ais://dst/a.tar.lz4 --append-or-put'\t- append (ie., archive) 2 more objects"
+const archBucketUsage = "Archive selected or matching objects from " + bucketObjectSrcArgument + " as\n" +
+	indent1 + archExts + "-formatted object (a.k.a. \"shard\"):\n" +
+	indent1 + "\t- 'ais archive bucket ais://src gs://dst/a.tar.lz4 --template \"trunk-{001..997}\"'\t- archive (prefix+range) matching objects from ais://src;\n" +
+	indent1 + "\t- 'ais archive bucket \"ais://src/trunk-{001..997}\" gs://dst/a.tar.lz4'\t- same as above (notice double quotes);\n" +
+	indent1 + "\t- 'ais archive bucket \"ais://src/trunk-{998..999}\" gs://dst/a.tar.lz4 --append-or-put'\t- add two more objects to an existing shard;\n" +
+	indent1 + "\t- 'ais archive bucket s3://src/trunk-00 ais://dst/b.tar'\t- archive \"trunk-00\" prefixed objects from an s3 bucket as a given TAR destination"
 
-const archPutUsage = "archive a file, a directory, or multiple files and/or directories as\n" +
+const archPutUsage = "Archive a file, a directory, or multiple files and/or directories as\n" +
 	indent1 + "\t" + archExts + "-formatted object - aka \"shard\".\n" +
 	indent1 + "\tBoth APPEND (to an existing shard) and PUT (a new version of the shard) are supported.\n" +
 	indent1 + "\tExamples:\n" +
@@ -52,7 +54,7 @@ const archPutUsage = "archive a file, a directory, or multiple files and/or dire
 	indent1 + "\t- to archive objects from a ais:// or remote bucket, run 'ais archive bucket' (see --help for details)."
 
 // (compare with  objGetUsage)
-const archGetUsage = "get a shard and extract its content; get an archived file;\n" +
+const archGetUsage = "Get a shard and extract its content; get an archived file;\n" +
 	indent4 + "\twrite the content locally with destination options including: filename, directory, STDOUT ('-'), or '/dev/null' (discard);\n" +
 	indent4 + "\tassorted options further include:\n" +
 	indent4 + "\t- '--prefix' to get multiple shards in one shot (empty prefix for the entire bucket);\n" +
@@ -68,7 +70,7 @@ const archGetUsage = "get a shard and extract its content; get an archived file;
 	indent4 + "\t- ais://abc/trunk-0123.tar 222.tar --archregx=file45 --archmode=wdskey - return 222.tar with all file45.* files --/--\n" +
 	indent4 + "\t- ais://abc/trunk-0123.tar 333.tar --archregx=subdir/ --archmode=prefix - 333.tar with all subdir/* files --/--"
 
-const genShardsUsage = "generate random " + archExts + "-formatted objects (\"shards\"), e.g.:\n" +
+const genShardsUsage = "Generate random " + archExts + "-formatted objects (\"shards\"), e.g.:\n" +
 	indent4 + "\t- gen-shards 'ais://bucket1/shard-{001..999}.tar' - write 999 random shards (default sizes) to ais://bucket1\n" +
 	indent4 + "\t- gen-shards \"gs://bucket2/shard-{01..20..2}.tgz\" - 10 random gzipped tarfiles to Cloud bucket\n" +
 	indent4 + "\t(notice quotation marks in both cases)"
@@ -84,6 +86,7 @@ var (
 			listFlag,
 			templateFlag,
 			verbObjPrefixFlag,
+			nonRecursFlag,
 			inclSrcBucketNameFlag,
 			waitFlag,
 		},
@@ -92,31 +95,32 @@ var (
 			archAppendOrPutFlag,
 			archAppendOnlyFlag,
 			archpathFlag,
-			concurrencyFlag,
+			numPutWorkersFlag,
 			dryRunFlag,
 			recursFlag,
+			continueOnErrorFlag,
 			verboseFlag,
 			yesFlag,
 			unitsFlag,
-			inclSrcDirNameFlag,
+			archSrcDirNameFlag,
 			skipVerCksumFlag,
-			continueOnErrorFlag, // TODO: revisit
 		),
 		cmdGenShards: {
 			cleanupFlag,
-			concurrencyFlag,
+			numGenShardWorkersFlag,
 			fsizeFlag,
 			fcountFlag,
 			fextsFlag,
+			tformFlag,
 		},
 	}
 
-	// archive bucket
+	// archive bucket (multiple objects => shard)
 	archBucketCmd = cli.Command{
 		Name:         commandBucket,
 		Usage:        archBucketUsage,
 		ArgsUsage:    bucketObjectSrcArgument + " " + dstShardArgument,
-		Flags:        archCmdsFlags[commandBucket],
+		Flags:        sortFlags(archCmdsFlags[commandBucket]),
 		Action:       archMultiObjHandler,
 		BashComplete: putPromApndCompletions,
 	}
@@ -126,7 +130,7 @@ var (
 		Name:         commandPut,
 		Usage:        archPutUsage,
 		ArgsUsage:    putApndArchArgument,
-		Flags:        archCmdsFlags[commandPut],
+		Flags:        sortFlags(archCmdsFlags[commandPut]),
 		Action:       putApndArchHandler,
 		BashComplete: putPromApndCompletions,
 	}
@@ -136,17 +140,17 @@ var (
 		Name:         objectCmdGet.Name,
 		Usage:        archGetUsage,
 		ArgsUsage:    getShardArgument,
-		Flags:        rmFlags(objectCmdGet.Flags, headObjPresentFlag, lengthFlag, offsetFlag),
+		Flags:        sortFlags(rmFlags(objectCmdGet.Flags, headObjPresentFlag, lengthFlag, offsetFlag)),
 		Action:       getArchHandler,
 		BashComplete: objectCmdGet.BashComplete,
 	}
 
-	// archive ls
+	// archive ls (NOTE: listArchFlag is implied)
 	archLsCmd = cli.Command{
 		Name:         cmdList,
-		Usage:        "list archived content (supported formats: " + archFormats + ")",
+		Usage:        "List archived content (supported formats: " + archFormats + ")",
 		ArgsUsage:    optionalShardArgument,
-		Flags:        rmFlags(bucketCmdsFlags[commandList], listArchFlag), // is implied
+		Flags:        sortFlags(rmFlags(lsCmdFlags, listArchFlag)),
 		Action:       listArchHandler,
 		BashComplete: bucketCompletions(bcmplop{}),
 	}
@@ -156,14 +160,14 @@ var (
 		Name:      cmdGenShards,
 		Usage:     genShardsUsage,
 		ArgsUsage: `"BUCKET/TEMPLATE.EXT"`,
-		Flags:     archCmdsFlags[cmdGenShards],
+		Flags:     sortFlags(archCmdsFlags[cmdGenShards]),
 		Action:    genShardsHandler,
 	}
 
 	// main `ais archive`
 	archCmd = cli.Command{
 		Name:   commandArch,
-		Usage:  "archive multiple objects from a given bucket; archive local files and directories; list archived content",
+		Usage:  "Archive multiple objects from a given bucket; archive local files and directories; list archived content",
 		Action: archUsageHandler,
 		Subcommands: []cli.Command{
 			archBucketCmd,
@@ -176,6 +180,10 @@ var (
 )
 
 func archUsageHandler(c *cli.Context) error {
+	if c.NArg() == 0 {
+		cli.ShowCommandHelp(c, c.Command.Name)
+		return nil
+	}
 	{
 		// parse for put/append
 		a := archput{}
@@ -208,23 +216,21 @@ func archUsageHandler(c *cli.Context) error {
 }
 
 func archMultiObjHandler(c *cli.Context) error {
-	// is it an attempt to PUT => archive?
-	{
-		a := archput{}
-		if err := a.parse(c); err == nil {
-			// Yes, it is
-			msg := fmt.Sprintf("expecting %s\n(hint: use 'ais archive put' command, %s for details)",
-				c.Command.ArgsUsage, qflprn(cli.HelpFlag))
-			return errors.New(msg)
-		}
-	}
-
 	// parse
 	var a archbck
 	a.apndIfExist = flagIsSet(c, archAppendOrPutFlag)
 	if err := a.parse(c); err != nil {
+		// is it an attempt to PUT files => archive?
+		{
+			b := archput{}
+			if errV := b.parse(c); errV == nil {
+				msg := fmt.Sprintf("%v\n(hint: check 'ais archive put --help' vs 'ais archive bucket --help')", err)
+				return errors.New(msg)
+			}
+		}
 		return err
 	}
+
 	// control msg
 	msg := cmn.ArchiveBckMsg{ToBck: a.dst.bck}
 	{
@@ -233,15 +239,13 @@ func archMultiObjHandler(c *cli.Context) error {
 		msg.ContinueOnError = flagIsSet(c, continueOnErrorFlag)
 		msg.AppendIfExists = a.apndIfExist
 		msg.ListRange = a.rsrc.lr
+		msg.NonRecurs = flagIsSet(c, nonRecursFlag)
 	}
+
 	// dry-run
 	if flagIsSet(c, dryRunFlag) {
 		dryRunCptn(c)
-		what := msg.ListRange.Template
-		if msg.ListRange.IsList() {
-			what = strings.Join(msg.ListRange.ObjNames, ", ")
-		}
-		fmt.Fprintf(c.App.Writer, "archive %s/{%s} as %q\n", a.rsrc.bck, what, a.dest())
+		_archDone(c, &msg, &a)
 		return nil
 	}
 	if !flagIsSet(c, dontHeadSrcDstBucketsFlag) {
@@ -275,11 +279,19 @@ func archMultiObjHandler(c *cli.Context) error {
 		total += sleep
 	}
 ex:
-	actionDone(c, "Archived "+a.dest())
+	_archDone(c, &msg, &a)
 	return nil
 }
 
-func putApndArchHandler(c *cli.Context) (err error) {
+func _archDone(c *cli.Context, msg *cmn.ArchiveBckMsg, a *archbck) {
+	what := msg.ListRange.Template
+	if msg.ListRange.IsList() {
+		what = strings.Join(msg.ListRange.ObjNames, ", ")
+	}
+	fmt.Fprintf(c.App.Writer, "Archived %s/%s => %s\n", a.rsrc.bck.String(), what, a.dest())
+}
+
+func putApndArchHandler(c *cli.Context) error {
 	{
 		src, dst := c.Args().Get(0), c.Args().Get(1)
 		if _, _, err := parseBckObjURI(c, src, true); err == nil {
@@ -290,8 +302,8 @@ func putApndArchHandler(c *cli.Context) (err error) {
 		}
 	}
 	a := archput{}
-	if err = a.parse(c); err != nil {
-		return
+	if err := a.parse(c); err != nil {
+		return err
 	}
 	if flagIsSet(c, dryRunFlag) {
 		dryRunCptn(c)
@@ -301,15 +313,15 @@ func putApndArchHandler(c *cli.Context) (err error) {
 		if a.archpath == "" {
 			a.archpath = filepath.Base(a.src.abspath)
 		}
-		if err = a2aRegular(c, &a); err != nil {
-			return
+		if err := a2aRegular(c, &a); err != nil {
+			return err
 		}
 		msg := fmt.Sprintf("%s %s to %s", a.verb(), a.src.arg, a.dst.bck.Cname(a.dst.oname))
 		if a.archpath != a.src.arg {
 			msg += " as \"" + a.archpath + "\""
 		}
 		actionDone(c, msg+"\n")
-		return
+		return nil
 	}
 
 	//
@@ -329,7 +341,7 @@ func putApndArchHandler(c *cli.Context) (err error) {
 			fmt.Fprintf(c.App.ErrWriter, "Assuming %s - proceeding to execute...\n\n", qflprn(archAppendOrPutFlag))
 		} else {
 			if ok := confirm(c, fmt.Sprintf("Proceed to execute 'archive put %s'?", flprn(archAppendOrPutFlag))); !ok {
-				return
+				return nil
 			}
 		}
 		a.appendOrPut = true
@@ -340,13 +352,13 @@ func putApndArchHandler(c *cli.Context) (err error) {
 		if !flagIsSet(c, yesFlag) {
 			warn := fmt.Sprintf("no trailing filepath separator in: '%s=%s'", qflprn(archpathFlag), a.archpath)
 			actionWarn(c, warn)
-			if ok := confirm(c, "Proceed anyway?"); !ok {
-				return
+			if !confirm(c, "Proceed anyway?") {
+				return nil
 			}
 		}
 	}
 
-	incl := flagIsSet(c, inclSrcDirNameFlag)
+	incl := flagIsSet(c, archSrcDirNameFlag)
 	switch {
 	case len(a.src.fdnames) > 0:
 		// a) csv of files and/or directories (names) from the first arg, e.g. "f1[,f2...]" dst-bucket[/prefix]
@@ -369,7 +381,7 @@ func putApndArchHandler(c *cli.Context) (err error) {
 			debug.Assert(srcpath == "", srcpath)
 			srcpath = a.pt.Prefix
 		}
-		fobjs, err := lsFobj(c, srcpath, "" /*trim pref*/, a.archpath /*append pref*/, &ndir, a.src.recurs, incl)
+		fobjs, err := lsFobj(c, srcpath, "" /*trim pref*/, a.archpath /*append pref*/, &ndir, a.src.recurs, incl, false /*globbed*/)
 		if err != nil {
 			return err
 		}
@@ -403,8 +415,9 @@ func a2aRegular(c *cli.Context, a *archput) error {
 			args = barArgs{barType: sizeArg, barText: a.dst.oname, total: fi.Size()}
 		)
 		progress, bars = simpleBar(args)
+
 		cb := func(n int, _ error) { bars[0].IncrBy(n) }
-		reader = cos.NewCallbackReadOpenCloser(fh, cb)
+		reader = newRocCb(fh, cb, 0)
 	}
 	putArgs := api.PutArgs{
 		BaseParams: apiBP,
@@ -499,12 +512,24 @@ func genShardsHandler(c *cli.Context) error {
 		}
 	}
 
-	mm, err := memsys.NewMMSA("cli-gen-shards", true /*silent*/)
-	if err != nil {
-		debug.AssertNoErr(err) // unlikely
-		return err
+	format := tar.FormatUnknown
+	if flagIsSet(c, tformFlag) {
+		formatAsString := parseStrFlag(c, tformFlag)
+		switch formatAsString {
+		case "Unknown":
+			// Leave fmtat at default
+		case "USTAR":
+			format = tar.FormatUSTAR
+		case "PAX":
+			format = tar.FormatPAX
+		case "GNU":
+			format = tar.FormatGNU
+		default:
+			return fmt.Errorf("%s value, if specified, must be one of \"%s\", \"USTAR\", \"PAX\", or \"GNU\"", tformFlag.Name, dfltTform)
+		}
 	}
 
+	mm := memsys.NewMMSA("cli-gen-shards", true /*silent*/)
 	ext := mime
 	template := strings.TrimSuffix(objname, ext)
 	pt, err := cos.ParseBashTemplate(template)
@@ -519,7 +544,7 @@ func genShardsHandler(c *cli.Context) error {
 	var (
 		shardNum      int
 		progress      = mpb.New(mpb.WithWidth(barWidth))
-		concLimit     = parseIntFlag(c, concurrencyFlag)
+		concLimit     = parseIntFlag(c, numGenShardWorkersFlag)
 		concSemaphore = make(chan struct{}, concLimit)
 		group, ctx    = errgroup.WithContext(context.Background())
 		text          = "Shards created: "
@@ -553,7 +578,7 @@ loop:
 				sgl := mm.NewSGL(fileSize * int64(fileCnt))
 				defer sgl.Free()
 
-				if err := genOne(sgl, ext, i*fileCnt, (i+1)*fileCnt, fileCnt, int(fileSize), fileExts); err != nil {
+				if err := genOne(sgl, ext, i*fileCnt, (i+1)*fileCnt, fileCnt, int(fileSize), fileExts, format); err != nil {
 					return err
 				}
 				putArgs := api.PutArgs{
@@ -577,12 +602,12 @@ loop:
 	return nil
 }
 
-func genOne(w io.Writer, shardExt string, start, end, fileCnt, fileSize int, fileExts []string) (err error) {
+func genOne(w io.Writer, shardExt string, start, end, fileCnt, fileSize int, fileExts []string, format tar.Format) (err error) {
 	var (
 		prefix = make([]byte, 10)
 		width  = len(strconv.Itoa(fileCnt))
 		oah    = cos.SimpleOAH{Size: int64(fileSize), Atime: time.Now().UnixNano()}
-		opts   = archive.Opts{CB: archive.SetTarHeader, Serialize: false}
+		opts   = archive.Opts{CB: archive.SetTarHeader, TarFormat: format, Serialize: false}
 		writer = archive.NewWriter(shardExt, w, nil /*cksum*/, &opts)
 	)
 	for idx := start; idx < end && err == nil; idx++ {

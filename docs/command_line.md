@@ -1,12 +1,3 @@
----
-layout: post
-title: COMMAND LINE
-permalink: /docs/command-line
-redirect_from:
- - /command_line.md/
- - /docs/command_line.md/
----
-
 ### Command-Line arguments
 
 There is a single AIS node (`aisnode`) binary that functions either as AIS proxy (gateway) or AIS target, depending on the `-role` option - examples follow below:
@@ -22,8 +13,6 @@ $ aisnode -config=/etc/ais/config.json -local_config=/etc/ais/local_config.json 
 The common executable, typically called `aisnode`, supports the following command-line arguments:
 
 ```console
-  -allow_shared_no_disks
-        NOTE: deprecated, will be removed in future releases
   -config string
         config filename: local file that stores the global cluster configuration
   -config_custom string

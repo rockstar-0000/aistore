@@ -1,20 +1,22 @@
 #
-# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
-from __future__ import annotations  # pylint: disable=unused-variable
+from __future__ import annotations
 
 import json
 import logging
 import os
 from pathlib import Path
 import time
-from typing import Dict, List, NewType, Iterable
+from typing import Dict, List, NewType, Iterable, Union, Optional
 import requests
+from requests import structures
 
 from aistore.sdk.ais_source import AISSource
 from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
 from aistore.sdk.obj.object_iterator import ObjectIterator
+from aistore.sdk.etl import ETLConfig
 from aistore.sdk.const import (
     ACT_COPY_BCK,
     ACT_CREATE_BCK,
@@ -33,7 +35,6 @@ from aistore.sdk.const import (
     HTTP_METHOD_HEAD,
     HTTP_METHOD_POST,
     MSGPACK_CONTENT_TYPE,
-    PROVIDER_AIS,
     QPARAM_BCK_TO,
     QPARAM_BSUMM_REMOTE,
     QPARAM_FLT_PRESENCE,
@@ -48,6 +49,7 @@ from aistore.sdk.const import (
     DEFAULT_JOB_POLL_TIME,
 )
 from aistore.sdk.enums import FLTPresence
+from aistore.sdk.provider import Provider
 from aistore.sdk.dataset.dataset_config import DatasetConfig
 
 from aistore.sdk.errors import (
@@ -58,7 +60,7 @@ from aistore.sdk.errors import (
 )
 from aistore.sdk.multiobj import ObjectGroup, ObjectRange
 from aistore.sdk.request_client import RequestClient
-from aistore.sdk.obj.object import Object
+from aistore.sdk.obj.object import Object, BucketDetails
 from aistore.sdk.types import (
     ActionMsg,
     BucketEntry,
@@ -75,10 +77,10 @@ from aistore.sdk.list_object_flag import ListObjectFlag
 from aistore.sdk.utils import validate_directory, get_file_size
 from aistore.sdk.obj.object_props import ObjectProps
 
-Header = NewType("Header", requests.structures.CaseInsensitiveDict)
+Header = NewType("Header", structures.CaseInsensitiveDict)
 
 
-# pylint: disable=unused-variable,too-many-public-methods,too-many-lines
+# pylint: disable=too-many-public-methods,too-many-lines
 class Bucket(AISSource):
     """
     A class representing a bucket that contains user data.
@@ -86,7 +88,7 @@ class Bucket(AISSource):
     Args:
         client (RequestClient): Client for interfacing with AIS cluster
         name (str): name of bucket
-        provider (str, optional): Provider of bucket (one of "ais", "aws", "gcp", ...), defaults to "ais"
+        provider (str or Provider, optional): Provider of bucket (one of "ais", "aws", "gcp", ...), defaults to "ais"
         namespace (Namespace, optional): Namespace of bucket, defaults to None
     """
 
@@ -94,25 +96,25 @@ class Bucket(AISSource):
         self,
         name: str,
         client: RequestClient = None,
-        provider: str = PROVIDER_AIS,
+        provider: Union[Provider, str] = Provider.AIS,
         namespace: Namespace = None,
     ):
         self._client = client
         self._name = name
-        self._provider = provider
+        self._provider = Provider.parse(provider)
         self._namespace = namespace
-        self._qparam = {QPARAM_PROVIDER: provider}
+        self._qparam = {QPARAM_PROVIDER: self.provider.value}
         if self.namespace:
             self._qparam[QPARAM_NAMESPACE] = namespace.get_path()
 
     @property
     def client(self) -> RequestClient:
-        """The client bound to this bucket."""
+        """The client used by this bucket."""
         return self._client
 
     @client.setter
-    def client(self, client) -> RequestClient:
-        """Update the client bound to this bucket."""
+    def client(self, client):
+        """Update the client used by this bucket."""
         self._client = client
 
     @property
@@ -121,7 +123,7 @@ class Bucket(AISSource):
         return self._qparam
 
     @property
-    def provider(self) -> str:
+    def provider(self) -> Provider:
         """The provider for this bucket."""
         return self._provider
 
@@ -135,20 +137,23 @@ class Bucket(AISSource):
         """The namespace for this bucket."""
         return self._namespace
 
-    def list_urls(self, prefix: str = "", etl_name: str = None) -> Iterable[str]:
+    def list_urls(
+        self, prefix: str = "", etl: Optional[ETLConfig] = None
+    ) -> Iterable[str]:
         """
-        Implementation of the abstract method from AISSource that provides an iterator
-        of full URLs to every object in this bucket matching the specified prefix
+        Generates full URLs for all objects in the bucket that match the specified prefix.
 
         Args:
-            prefix (str, optional): Limit objects selected by a given string prefix
-            etl_name (str, optional): ETL to include in URLs
+            prefix (str, optional): A string prefix to filter objects. Only objects with names starting
+                with this prefix will be included. Defaults to an empty string (no filtering).
+            etl (Optional[ETLConfig], optional): An optional ETL configuration. If provided, the URLs
+                will include ETL processing parameters. Defaults to None.
 
         Returns:
-            Iterator of full URLs of all objects matching the prefix
+            Iterable[str]: An iterator yielding full URLs of all objects matching the prefix.
         """
         for entry in self.list_objects_iter(prefix=prefix, props="name"):
-            yield self.object(entry.name).get_url(etl_name=etl_name)
+            yield self.object(entry.name).get_url(etl=etl)
 
     def list_all_objects_iter(
         self, prefix: str = "", props: str = "name,size"
@@ -293,7 +298,7 @@ class Bucket(AISSource):
             params=self.qparam,
         ).headers
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def summary(
         self,
         uuid: str = "",
@@ -467,16 +472,18 @@ class Bucket(AISSource):
 
         return bucket_props, result
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def copy(
         self,
         to_bck: Bucket,
         prefix_filter: str = "",
         prepend: str = "",
+        ext: Optional[Dict[str, str]] = None,
         dry_run: bool = False,
         force: bool = False,
         latest: bool = False,
         sync: bool = False,
+        num_workers: Optional[int] = 0,
     ) -> str:
         """
         Returns job ID that can be used later to check the status of the asynchronous operation.
@@ -485,11 +492,16 @@ class Bucket(AISSource):
             to_bck (Bucket): Destination bucket
             prefix_filter (str, optional): Only copy objects with names starting with this prefix
             prepend (str, optional): Value to prepend to the name of copied objects
+            ext (Dict[str, str], optional): Dict mapping each extension to the extension that will replace it
+                (e.g. {"jpg": "txt"})
             dry_run (bool, optional): Determines if the copy should actually
                 happen or not
             force (bool, optional): Override existing destination bucket
             latest (bool, optional): GET the latest object version from the associated remote bucket
             sync (bool, optional): synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source
+            num_workers (int, optional): Number of concurrent workers for the copy job per target
+                - 0 (default): number of mountpaths
+                - -1: single thread, serial execution
 
         Returns:
             Job ID (as str) that can be used to check the status of the operation
@@ -502,21 +514,26 @@ class Bucket(AISSource):
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ReadTimeout: Timed out receiving response from AIStore
         """
-        value = CopyBckMsg(
-            prefix=prefix_filter,
-            prepend=prepend,
-            dry_run=dry_run,
-            force=force,
-            latest=latest,
-            sync=sync,
+        value = TCBckMsg(
+            ext=ext,
+            num_workers=num_workers,
+            copy_msg=CopyBckMsg(
+                prefix=prefix_filter,
+                prepend=prepend,
+                force=force,
+                dry_run=dry_run,
+                latest=latest,
+                sync=sync,
+            ),
         ).as_dict()
+
         params = self.qparam.copy()
         params[QPARAM_BCK_TO] = to_bck.get_path()
         return self.make_request(
             HTTP_METHOD_POST, ACT_COPY_BCK, value=value, params=params
         ).text
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def list_objects(
         self,
         prefix: str = "",
@@ -693,7 +710,7 @@ class Bucket(AISSource):
             uuid = resp.uuid
         return obj_list
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def transform(
         self,
         etl_name: str,
@@ -701,11 +718,12 @@ class Bucket(AISSource):
         timeout: str = DEFAULT_ETL_TIMEOUT,
         prefix_filter: str = "",
         prepend: str = "",
-        ext: Dict[str, str] = None,
+        ext: Optional[Dict[str, str]] = None,
         force: bool = False,
         dry_run: bool = False,
         latest: bool = False,
         sync: bool = False,
+        num_workers: Optional[int] = 0,
     ) -> str:
         """
         Visits all selected objects in the source bucket and for each object, puts the transformed
@@ -717,18 +735,22 @@ class Bucket(AISSource):
             timeout (str, optional): Timeout of the ETL job (e.g. 5m for 5 minutes)
             prefix_filter (str, optional): Only transform objects with names starting with this prefix
             prepend (str, optional): Value to prepend to the name of resulting transformed objects
-            ext (Dict[str, str], optional): dict of new extension followed by extension to be replaced
-                (i.e. {"jpg": "txt"})
+            ext (Dict[str, str], optional): Dict mapping each extension to the extension that will replace it
+                (e.g. {"jpg": "txt"})
             dry_run (bool, optional): determines if the copy should actually happen or not
             force (bool, optional): override existing destination bucket
             latest (bool, optional): GET the latest object version from the associated remote bucket
             sync (bool, optional): synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source
+            num_workers (int, optional): Number of concurrent workers for the transformation job per target
+                - 0 (default): number of mountpaths
+                - -1: single thread, serial execution
 
         Returns:
             Job ID (as str) that can be used to check the status of the operation
         """
         value = TCBckMsg(
             ext=ext,
+            num_workers=num_workers,
             transform_msg=TransformBckMsg(etl_name=etl_name, timeout=timeout),
             copy_msg=CopyBckMsg(
                 prefix=prefix_filter,
@@ -795,7 +817,7 @@ class Bucket(AISSource):
                 continue
             obj_name = self._get_uploaded_obj_name(file, path, basename, prepend)
             if not dry_run:
-                self.object(obj_name).put_file(str(file))
+                self.object(obj_name).get_writer().put_file(str(file))
             logger.info(
                 "%s File '%s' uploaded as object '%s' with size %s",
                 dry_run_prefix,
@@ -819,19 +841,29 @@ class Bucket(AISSource):
             return prepend + obj_name
         return obj_name
 
-    def object(self, obj_name: str, props: ObjectProps = None) -> Object:
+    def object(
+        self,
+        obj_name: str,
+        props: ObjectProps = None,
+    ) -> Object:
         """
         Factory constructor for an object in this bucket.
         Does not make any HTTP request, only instantiates an object in a bucket owned by the client.
 
         Args:
             obj_name (str): Name of object
-            size (int, optional): Size of object in bytes
+            props (ObjectProps, optional): Properties of the object, as updated by head(), optionally pre-initialized.
 
         Returns:
             The object created.
         """
-        return Object(bucket=self, name=obj_name, props=props)
+        details = BucketDetails(self.name, self.provider, self.qparam, self.get_path())
+        return Object(
+            client=self.client,
+            bck_details=details,
+            name=obj_name,
+            props=props,
+        )
 
     def objects(
         self,
@@ -894,14 +926,14 @@ class Bucket(AISSource):
         """
         Verify the bucket provider is AIS
         """
-        if self.provider is not PROVIDER_AIS:
+        if self.provider.is_remote():
             raise InvalidBckProvider(self.provider)
 
     def verify_cloud_bucket(self):
         """
         Verify the bucket provider is a cloud provider
         """
-        if self.provider is PROVIDER_AIS:
+        if not self.provider.is_remote():
             raise InvalidBckProvider(self.provider)
 
     def get_path(self) -> str:
@@ -909,7 +941,7 @@ class Bucket(AISSource):
         Get the path representation of this bucket
         """
         namespace_path = self.namespace.get_path() if self.namespace else "@#"
-        return f"{ self.provider }/{ namespace_path }/{ self.name }/"
+        return f"{ self.provider.value }/{ namespace_path }/{ self.name }/"
 
     def as_model(self) -> BucketModel:
         """
@@ -919,7 +951,7 @@ class Bucket(AISSource):
             BucketModel representation
         """
         return BucketModel(
-            name=self.name, namespace=self.namespace, provider=self.provider
+            name=self.name, namespace=self.namespace, provider=self.provider.value
         )
 
     def write_dataset(
@@ -938,12 +970,12 @@ class Bucket(AISSource):
             **kwargs (optional): Optional keyword arguments to pass to the ShardWriter
         """
 
-        # Add the upload shard logic to the original post processing function
+        # Add the upload shard logic to the original post-processing function
         original_post = kwargs.get("post", lambda path: None)
 
         def combined_post_processing(shard_path):
             original_post(shard_path)
-            self.object(shard_path).put_file(shard_path)
+            self.object(shard_path).get_writer().put_file(shard_path)
             os.unlink(shard_path)
 
         kwargs["post"] = combined_post_processing

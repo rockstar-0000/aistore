@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -50,8 +50,8 @@ func (lom *LOM) PreInit(fqn string) error {
 	return nil
 }
 
-func (lom *LOM) PostInit() (err error) {
-	if err = lom.bck.InitFast(T.Bowner()); err != nil {
+func (lom *LOM) PostInit() error {
+	if err := lom.bck.InitFast(T.Bowner()); err != nil {
 		return err
 	}
 	uname := lom.bck.MakeUname(lom.ObjName)
@@ -59,12 +59,12 @@ func (lom *LOM) PostInit() (err error) {
 	return nil
 }
 
-func (lom *LOM) InitFQN(fqn string, expbck *cmn.Bck) (err error) {
-	if err = lom.PreInit(fqn); err != nil {
+func (lom *LOM) InitFQN(fqn string, expbck *cmn.Bck) error {
+	if err := lom.PreInit(fqn); err != nil {
 		return err
 	}
 	if expbck != nil && !lom.Bucket().Equal(expbck) {
-		err = fmt.Errorf("lom-init mismatch for %q: %s vs %s", fqn, lom.Bucket(), expbck)
+		err := fmt.Errorf("lom-init mismatch for %q: %s vs %s", fqn, lom.Bucket(), expbck)
 		debug.AssertNoErr(err)
 		return err
 	}
@@ -100,7 +100,11 @@ func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
 }
 
 func (lom *LOM) String() string {
-	sb := &strings.Builder{}
+	var (
+		sb strings.Builder
+		l  = 2 + len(lom.bck.Name) + 1 + len(lom.ObjName) + 4
+	)
+	sb.Grow(l)
 	sb.WriteString("o[")
 	sb.WriteString(lom.bck.Name)
 	sb.WriteByte('/')

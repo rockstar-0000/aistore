@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools"
@@ -89,10 +90,10 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 	return
 }
 
-func propsReadObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList map[string]string) {
+func propsReadObjects(t *testing.T, proxyURL string, bck cmn.Bck, lst map[string]string) {
 	versChanged, bytesChanged := propsStats(t, proxyURL)
 	baseParams := tools.BaseAPIParams(proxyURL)
-	for objName := range objList {
+	for objName := range lst {
 		_, err := api.GetObject(baseParams, bck, objName, nil)
 		if err != nil {
 			t.Errorf("Failed to GET %s: %v", bck.Cname(objName), err)
@@ -104,7 +105,7 @@ func propsReadObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList map[st
 		tlog.Logf("Versions changed: %d (%s)\n", versChangedFinal-versChanged, cos.ToSizeIEC(bytesChangedFinal-bytesChanged, 1))
 	}
 	if versChanged != versChangedFinal || bytesChanged != bytesChangedFinal {
-		t.Fatalf("All objects must be retreived from the cache but cold get happened: %d times (%d bytes)",
+		t.Fatalf("All objects must be retrieved from the cache but cold get happened: %d times (%d bytes)",
 			versChangedFinal-versChanged, bytesChangedFinal-bytesChanged)
 	}
 }
@@ -129,7 +130,8 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 	}
 
 	baseParams := tools.BaseAPIParams(proxyURL)
-	xid, err := api.EvictMultiObj(baseParams, bck, toEvictList, "" /*template*/)
+	evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: toEvictList}}
+	xid, err := api.EvictMultiObj(baseParams, bck, evdMsg)
 	if err != nil {
 		t.Errorf("Failed to evict objects: %v\n", err)
 	}
@@ -151,7 +153,7 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 		if !ok {
 			continue
 		}
-		tlog.Logf("%s [%d] - cached: [%v], atime [%v]\n", bck.Cname(m.Name), m.Flags, m.IsPresent(), m.Atime)
+		tlog.Logf("%s: fl [%d], cached [%t], atime [%v], version [%s]\n", bck.Cname(m.Name), m.Flags, m.IsPresent(), m.Atime, m.Version)
 
 		// e.g. misplaced replica
 		if !m.IsStatusOK() {
@@ -185,7 +187,7 @@ func propsRecacheObjects(t *testing.T, proxyURL string, bck cmn.Bck, objs map[st
 
 	tlog.Logf("Listing objects...\n")
 	reslist := testListObjects(t, proxyURL, bck, msg)
-	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck)
+	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck.String())
 
 	var (
 		version string
@@ -256,7 +258,7 @@ func propsRebalance(t *testing.T, proxyURL string, bck cmn.Bck, objects map[stri
 
 	tlog.Logf("Listing objects...\n")
 	reslist := testListObjects(t, proxyURL, bck, msg)
-	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck)
+	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck.String())
 
 	var (
 		version  string
@@ -347,6 +349,24 @@ func propsVersionAllProviders(t *testing.T, versioning bool) {
 			}
 		}()
 
+		if b := bck.RemoteBck(); b != nil && b.Provider == apc.AWS {
+			// needed for the test
+			// reminder:
+			// "when versioning info is requested, use ListObjectVersions API (beware: extremely slow, versioned S3 buckets only)"
+			var (
+				of = bck.Props.Features
+				nf = feat.S3ListObjectVersions
+			)
+			props := &cmn.BpropsToSet{Features: &nf}
+			_, err := api.SetBucketProps(baseParams, bck.Clone(), props)
+			tassert.CheckFatal(t, err)
+			defer func() {
+				props := &cmn.BpropsToSet{Features: &of}
+				_, err := api.SetBucketProps(baseParams, bck.Clone(), props)
+				tassert.CheckFatal(t, err)
+			}()
+		}
+
 		propsVersion(t, bck.Clone(), bck.Props.Versioning.Enabled, bck.Props.Cksum.Type)
 	})
 }
@@ -374,7 +394,7 @@ func propsVersion(t *testing.T, bck cmn.Bck, versionEnabled bool, cksumType stri
 	msg.AddProps(apc.GetPropsVersion, apc.GetPropsAtime, apc.GetPropsStatus)
 	reslist := testListObjects(t, proxyURL, bck, msg)
 	if reslist == nil {
-		t.Fatalf("Unexpected error: no objects in the bucket %s", bck)
+		t.Fatalf("Unexpected error: no objects in the bucket %s", bck.String())
 		return
 	}
 
@@ -502,7 +522,7 @@ func TestObjProps(t *testing.T) {
 				}
 				tassert.Errorf(
 					t, err != nil,
-					"Cloud bucket %s is %s - expecting set-props to fail", m.bck, s)
+					"Cloud bucket %s is %s - expecting set-props to fail", m.bck.String(), s)
 			} else {
 				tassert.CheckFatal(t, err)
 			}
@@ -606,16 +626,17 @@ func TestObjProps(t *testing.T) {
 }
 
 func testListObjects(t *testing.T, proxyURL string, bck cmn.Bck, msg *apc.LsoMsg) *cmn.LsoRes {
-	if msg == nil {
-		tlog.Logf("LIST %s []\n", bck)
-	} else if msg.Prefix == "" && msg.PageSize == 0 && msg.ContinuationToken == "" {
-		tlog.Logf("LIST %s [cached: %t]\n", bck, msg.IsFlagSet(apc.LsObjCached))
-	} else {
+	switch {
+	case msg == nil:
+		tlog.Logf("LIST %s []\n", bck.String())
+	case msg.Prefix == "" && msg.PageSize == 0 && msg.ContinuationToken == "":
+		tlog.Logf("LIST %s [cached: %t]\n", bck.String(), msg.IsFlagSet(apc.LsCached))
+	default:
 		tlog.Logf("LIST %s [prefix: %q, page_size: %d, cached: %t, token: %q]\n",
-			bck, msg.Prefix, msg.PageSize, msg.IsFlagSet(apc.LsObjCached), msg.ContinuationToken)
+			bck.String(), msg.Prefix, msg.PageSize, msg.IsFlagSet(apc.LsCached), msg.ContinuationToken)
 	}
 	baseParams := tools.BaseAPIParams(proxyURL)
 	resList, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
-	tassert.Fatalf(t, err == nil, "%s: list-objects failed: %v", bck, err)
+	tassert.Fatalf(t, err == nil, "%s: list-objects failed: %v", bck.String(), err)
 	return resList
 }

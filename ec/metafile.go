@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -13,7 +13,8 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/OneOfOne/xxhash"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 const MDVersionLast = 1 // current version of metadata
@@ -138,7 +139,7 @@ func (md *Metadata) Unpack(unpacker *cos.ByteUnpack) (err error) {
 		return
 	}
 	b := unpacker.Bytes()
-	calcCksum := xxhash.Checksum64S(b[:len(b)-cos.SizeofI64], cos.MLCG32)
+	calcCksum := onexxh.Checksum64S(b[:len(b)-cos.SizeofI64], cos.MLCG32)
 	if cksum != calcCksum {
 		err = cos.NewErrMetaCksum(cksum, calcCksum, "EC metadata")
 	}
@@ -148,43 +149,43 @@ func (md *Metadata) Unpack(unpacker *cos.ByteUnpack) (err error) {
 func (md *Metadata) unpackLastVersion(unpacker *cos.ByteUnpack) (err error) {
 	var i16 uint16
 	if md.Generation, err = unpacker.ReadInt64(); err != nil {
-		return
+		return err
 	}
 	if md.Size, err = unpacker.ReadInt64(); err != nil {
-		return
+		return err
 	}
 	if i16, err = unpacker.ReadUint16(); err != nil {
-		return
+		return err
 	}
 	md.Data = int(i16)
 	if i16, err = unpacker.ReadUint16(); err != nil {
-		return
+		return err
 	}
 	md.Parity = int(i16)
 	if i16, err = unpacker.ReadUint16(); err != nil {
-		return
+		return err
 	}
 	md.SliceID = int(i16)
 	if md.IsCopy, err = unpacker.ReadBool(); err != nil {
-		return
+		return err
 	}
 	if md.FullReplica, err = unpacker.ReadString(); err != nil {
-		return
+		return err
 	}
 	if md.ObjCksum, err = unpacker.ReadString(); err != nil {
-		return
+		return err
 	}
 	if md.ObjVersion, err = unpacker.ReadString(); err != nil {
-		return
+		return err
 	}
 	if md.CksumType, err = unpacker.ReadString(); err != nil {
-		return
+		return err
 	}
 	if md.CksumValue, err = unpacker.ReadString(); err != nil {
-		return
+		return err
 	}
 	md.Daemons, err = unpacker.ReadMapStrUint16()
-	return
+	return err
 }
 
 func (md *Metadata) Pack(packer *cos.BytePack) {
@@ -201,7 +202,7 @@ func (md *Metadata) Pack(packer *cos.BytePack) {
 	packer.WriteString(md.CksumType)
 	packer.WriteString(md.CksumValue)
 	packer.WriteMapStrUint16(md.Daemons)
-	h := xxhash.Checksum64S(packer.Bytes(), cos.MLCG32)
+	h := onexxh.Checksum64S(packer.Bytes(), cos.MLCG32)
 	packer.WriteUint64(h)
 }
 

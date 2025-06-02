@@ -1,12 +1,11 @@
 // Package mpather provides per-mountpath concepts.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mpather
 
 import (
 	"fmt"
-	"runtime"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -14,14 +13,20 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+
 	"golang.org/x/sync/errgroup"
 )
 
+//
+// one-worker (with a worker.do method) per mountpath
+// currently, used only by mirror/x-put
+//
+
 type (
 	WorkerGroupOpts struct {
-		Callback  func(lom *core.LOM, buf []byte)
-		Slab      *memsys.Slab
-		QueueSize int
+		Callback   func(lom *core.LOM, buf []byte)
+		Slab       *memsys.Slab
+		WorkChSize int
 	}
 
 	// WorkerGroup starts one worker per mountpath; each worker receives (*core.LOM) tasks
@@ -31,55 +36,63 @@ type (
 		workers map[string]*worker
 	}
 	worker struct {
-		opts   *WorkerGroupOpts
-		mi     *fs.Mountpath
-		workCh chan core.LIF
-		stopCh cos.StopCh
+		opts     *WorkerGroupOpts
+		mi       *fs.Mountpath
+		workCh   chan core.LIF
+		chanFull cos.ChanFull
+		stopCh   cos.StopCh
 	}
 )
 
-func NewWorkerGroup(opts *WorkerGroupOpts) *WorkerGroup {
+func NewWorkerGroup(opts *WorkerGroupOpts) (*WorkerGroup, error) {
 	var (
-		mpaths  = fs.GetAvail()
-		workers = make(map[string]*worker, len(mpaths))
+		avail   = fs.GetAvail()
+		l       = len(avail)
+		workers = make(map[string]*worker, l)
 	)
-	debug.Assert(opts.QueueSize > 0) // expect buffered channels
-	for _, mi := range mpaths {
+	if l == 0 {
+		return nil, cmn.ErrNoMountpaths
+	}
+	for _, mi := range avail {
 		workers[mi.Path] = newWorker(opts, mi)
 	}
-	return &WorkerGroup{
-		wg:      &errgroup.Group{},
-		workers: workers,
+	wkg := &WorkerGroup{wg: &errgroup.Group{}, workers: workers}
+	return wkg, nil
+}
+
+func (wkg *WorkerGroup) Run() {
+	for _, worker := range wkg.workers {
+		wkg.wg.Go(worker.do)
 	}
 }
 
-func (wg *WorkerGroup) Run() {
-	for _, worker := range wg.workers {
-		wg.wg.Go(worker.work)
+func (wkg *WorkerGroup) ChanFullTotal() (n int64) {
+	for _, worker := range wkg.workers {
+		n += worker.chanFull.Load()
 	}
+	return n
 }
 
-func (wg *WorkerGroup) PostLIF(lom *core.LOM) (chanFull bool, err error) {
+func (wkg *WorkerGroup) PostLIF(lom *core.LOM) error {
 	mi := lom.Mountpath()
-	worker, ok := wg.workers[mi.Path]
+	worker, ok := wkg.workers[mi.Path]
 	if !ok {
-		return false, fmt.Errorf("post-lif: %s not found", mi)
+		return fmt.Errorf("post-lif: %s not found", mi)
 	}
+	l, c := len(worker.workCh), cap(worker.workCh)
+	worker.chanFull.Check(l, c)
 	worker.workCh <- lom.LIF()
-	if l, c := len(worker.workCh), cap(worker.workCh); l > c/2 {
-		runtime.Gosched() // poor man's throttle
-		chanFull = l == c
-	}
-	return
+
+	return nil
 }
 
 // Stop aborts all the workers. It should be called after we are sure no more
 // new tasks will be dispatched.
-func (wg *WorkerGroup) Stop() (n int) {
-	for _, worker := range wg.workers {
+func (wkg *WorkerGroup) Stop() (n int) {
+	for _, worker := range wkg.workers {
 		n += worker.abort()
 	}
-	_ = wg.wg.Wait()
+	_ = wkg.wg.Wait()
 	return
 }
 
@@ -87,13 +100,13 @@ func newWorker(opts *WorkerGroupOpts, mi *fs.Mountpath) (w *worker) {
 	w = &worker{
 		opts:   opts,
 		mi:     mi,
-		workCh: make(chan core.LIF, opts.QueueSize),
+		workCh: make(chan core.LIF, opts.WorkChSize),
 	}
 	w.stopCh.Init()
 	return
 }
 
-func (w *worker) work() error {
+func (w *worker) do() error {
 	var buf []byte
 	if w.opts.Slab != nil {
 		buf = w.opts.Slab.Alloc()

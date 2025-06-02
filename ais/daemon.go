@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -26,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/sys"
+	"github.com/NVIDIA/aistore/tracing"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
 )
@@ -34,7 +35,6 @@ const usecli = " -role=<proxy|target> -config=</dir/config.json> -local_config=<
 
 type (
 	daemonCtx struct {
-		cli       cliFlags
 		rg        *rungroup
 		version   string // major.minor.build (see cmd/aisnode)
 		buildTime string // YYYY-MM-DD HH:MM:SS-TZ
@@ -43,6 +43,7 @@ type (
 			reason   string // Reason why resilver needs to be run.
 			required bool   // Determines if the resilver needs to be started.
 		}
+		cli cliFlags
 	}
 	cliFlags struct {
 		localConfigPath  string // path to local config
@@ -66,8 +67,8 @@ type (
 		usage bool // show usage and exit
 	}
 	runRet struct {
-		name string
 		err  error
+		name string
 	}
 	rungroup struct {
 		rs    map[string]cos.Runner
@@ -96,8 +97,6 @@ func initFlags(flset *flag.FlagSet) {
 	// target-only
 	flset.BoolVar(&daemon.cli.target.standby, "standby", false,
 		"when starting up, do not try to auto-join cluster - stand by and wait for admin request (target-only)")
-	flset.BoolVar(&cmn.AllowSharedDisksAndNoDisks, "allow_shared_no_disks", false,
-		"NOTE: deprecated, will be removed in future releases")
 	flset.BoolVar(&daemon.cli.target.useLoopbackDevs, "loopback", false,
 		"use loopback devices (local playground, target-only)")
 	flset.BoolVar(&daemon.cli.target.startWithLostMountpath, "start_with_lost_mountpath", false,
@@ -115,7 +114,6 @@ func initDaemon(version, buildTime string) cos.Runner {
 	var (
 		flset  *flag.FlagSet
 		config *cmn.Config
-		err    error
 	)
 	// flags
 	flset = flag.NewFlagSet(os.Args[0], flag.ExitOnError) // discard flags of imported packages
@@ -149,8 +147,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 
 	// config
 	config = &cmn.Config{}
-	err = cmn.LoadConfig(daemon.cli.globalConfigPath, daemon.cli.localConfigPath, daemon.cli.role, config)
-	if err != nil {
+	if err := cmn.LoadConfig(daemon.cli.globalConfigPath, daemon.cli.localConfigPath, daemon.cli.role, config); err != nil {
 		cos.ExitLog(err)
 	}
 	cmn.GCO.Put(config)
@@ -181,7 +178,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 
 		overrideConfig := cmn.GCO.MergeOverride(toUpdate)
 		if !daemon.cli.transient {
-			if err = cmn.SaveOverrideConfig(config.ConfigDir, overrideConfig); err != nil {
+			if err := cmn.SaveOverrideConfig(config.ConfigDir, overrideConfig); err != nil {
 				cos.ExitLogf("failed to save 'override' config: %v", err)
 			}
 		}
@@ -192,7 +189,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 	sys.GoEnvMaxprocs()
 
 	daemon.rg = &rungroup{rs: make(map[string]cos.Runner, 6)}
-	hk.Init()
+	hk.Init(true /*run*/)
 	daemon.rg.add(hk.HK)
 
 	// K8s
@@ -202,7 +199,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 	xreg.Init()
 
 	// primary 'host[:port]' endpoint or URL from the environment
-	if daemon.EP = os.Getenv(env.AIS.PrimaryEP); daemon.EP != "" {
+	if daemon.EP = os.Getenv(env.AisPrimaryEP); daemon.EP != "" {
 		scheme := "http"
 		if config.Net.HTTP.UseHTTPS {
 			scheme = "https"
@@ -210,11 +207,11 @@ func initDaemon(version, buildTime string) cos.Runner {
 		if strings.Contains(daemon.EP, "://") {
 			u, err := url.Parse(daemon.EP)
 			if err != nil {
-				cos.ExitLogf("invalid environment %s=%s: %v", env.AIS.PrimaryEP, daemon.EP, err)
+				cos.ExitLogf("invalid environment %s=%s: %v", env.AisPrimaryEP, daemon.EP, err)
 			}
 			if u.Path != "" && u.Path != "/" {
 				cos.ExitLogf("invalid environment %s=%s (not expecting path %q)",
-					env.AIS.PrimaryEP, daemon.EP, u.Path)
+					env.AisPrimaryEP, daemon.EP, u.Path)
 			}
 			// reassemble and compare
 			ustr := scheme + "://" + u.Hostname()
@@ -233,7 +230,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 	// fork (proxy | target)
 	co := newConfigOwner(config)
 	if daemon.cli.role == apc.Proxy {
-		xs.Xreg(true /* x-ele only */)
+		xs.Preg()
 		p := newProxy(co)
 		p.init(config)
 		title := _loghdr2(p.si, loghdr)
@@ -241,22 +238,30 @@ func initDaemon(version, buildTime string) cos.Runner {
 
 		// aux plumbing
 		nlog.SetTitle(title)
-		cmn.InitErrs(p.si.Name(), nil)
+		cmn.Init(p.si.Name(), nil)
+
+		// init distributed tracing
+		tracing.Init(&config.Tracing, p.si, nil, version)
+
 		return p
 	}
 
-	// reg xaction factories
-	xs.Xreg(false /* x-ele only */)
-	space.Xreg()
-
 	t := newTarget(co)
 	t.init(config)
+
+	// reg xaction factories
+	xs.Treg(t)
+	space.Xreg()
+
 	title := _loghdr2(t.si, loghdr)
 	nlog.Infoln(title)
 
 	// aux plumbing
 	nlog.SetTitle(title)
-	cmn.InitErrs(t.si.Name(), fs.CleanPathErr)
+	cmn.Init(t.si.Name(), fs.CleanPathErr)
+
+	// init distributed tracing
+	tracing.Init(&config.Tracing, t.si, nil, version)
 
 	cmn.InitObjProps2Hdr()
 
@@ -264,7 +269,11 @@ func initDaemon(version, buildTime string) cos.Runner {
 }
 
 func _loghdr2(si *meta.Snode, loghdr string) string {
-	var sb strings.Builder
+	var (
+		sb strings.Builder
+		l  = 5 + len(si.Name()) + 2 + len(loghdr) + 2
+	)
+	sb.Grow(l)
 	sb.WriteString("Node ")
 	sb.WriteString(si.Name())
 	sb.WriteString(", ")
@@ -274,7 +283,11 @@ func _loghdr2(si *meta.Snode, loghdr string) string {
 }
 
 func _loghdr() (loghdr string) {
-	var sb strings.Builder
+	var (
+		sb strings.Builder
+		l  = 128
+	)
+	sb.Grow(l)
 	sb.WriteString("Version ")
 	sb.WriteString(daemon.version)
 	if debug.ON() {
@@ -306,7 +319,7 @@ func newProxy(co *configOwner) *proxy {
 }
 
 func newTarget(co *configOwner) *target {
-	t := &target{backend: make(backends, 8)}
+	t := &target{}
 	t.owner.bmd = newBMDOwnerTgt()
 	t.owner.etl = newEtlMDOwnerTgt()
 	t.owner.config = co
@@ -317,6 +330,9 @@ func newTarget(co *configOwner) *target {
 func Run(version, buildTime string) int {
 	rmain := initDaemon(version, buildTime)
 	err := daemon.rg.runAll(rmain)
+
+	// stop traceprovider, if running.
+	tracing.Shutdown()
 
 	if err == nil {
 		nlog.Infoln("Terminated OK")
@@ -354,7 +370,7 @@ func (g *rungroup) run(r cos.Runner) {
 	if err != nil {
 		nlog.Warningf("runner [%s] exited with err [%v]", r.Name(), err)
 	}
-	g.errCh <- runRet{r.Name(), err}
+	g.errCh <- runRet{err, r.Name()}
 }
 
 func (g *rungroup) runAll(mainRunner cos.Runner) error {

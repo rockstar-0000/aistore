@@ -1,7 +1,7 @@
 // Package ios is a collection of interfaces to the local storage subsystem;
 // the package includes OS-dependent implementations for those interfaces.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ios
 
@@ -30,10 +30,10 @@ type (
 	IOS interface {
 		GetAllMpathUtils() *MpathUtil
 		GetMpathUtil(mpath string) int64
-		AddMpath(mpath, fs string, label Label, config *cmn.Config, blockDevs BlockDevices) (FsDisks, error)
-		RescanDisks(mpath, fs string, disks []string) RescanDisksResult
+		AddMpath(mpath, fsname string, label cos.MountpathLabel, config *cmn.Config, blockDevs BlockDevs) (FsDisks, error)
+		RescanDisks(mpath, fsname string, disks []string) RescanDisksResult
 		RemoveMpath(mpath string, testingEnv bool)
-		DiskStats(m AllDiskStats)
+		DiskStats(m cos.AllDiskStats)
 	}
 
 	MpathUtil sync.Map
@@ -104,7 +104,7 @@ func (x *MpathUtil) Set(mpath string, util int64) {
 // ios //
 /////////
 
-func New(num int) (IOS, BlockDevices) {
+func New(num int) (IOS, BlockDevs) {
 	ios := &ios{
 		mpath2disks: make(map[string]FsDisks, num),
 		disk2mpath:  make(cos.StrKVs, num),
@@ -151,13 +151,13 @@ func (ios *ios) _put(cache *cache) { ios.cache.Store(cache) }
 // add mountpath
 //
 
-func (ios *ios) AddMpath(mpath, fs string, label Label, config *cmn.Config, blockDevs BlockDevices) (fsdisks FsDisks, err error) {
+func (ios *ios) AddMpath(mpath, fsname string, label cos.MountpathLabel, config *cmn.Config, blockDevs BlockDevs) (fsdisks FsDisks, err error) {
 	var (
 		warn       string
 		testingEnv = config.TestingEnv()
 		fspaths    = config.LocalConfig.FSP.Paths
 	)
-	fsdisks, err = fs2disks(mpath, fs, label, blockDevs, len(fspaths), testingEnv)
+	fsdisks, err = fs2disks(mpath, fsname, label, blockDevs, len(fspaths), testingEnv)
 	if err != nil || len(fsdisks) == 0 {
 		return fsdisks, err
 	}
@@ -178,20 +178,20 @@ func (ios *ios) AddMpath(mpath, fs string, label Label, config *cmn.Config, bloc
 	return fsdisks, err
 }
 
-func (ios *ios) _add(mpath string, label Label, fsdisks FsDisks, fspaths cos.StrKVs, testingEnv bool) (warn string, _ error) {
+func (ios *ios) _add(mpath string, label cos.MountpathLabel, fsdisks FsDisks, fspaths cos.StrKVs, testingEnv bool) (warn string, _ error) {
 	if dd, ok := ios.mpath2disks[mpath]; ok {
 		return "", fmt.Errorf("duplicate mountpath %s (disks %s, %s)", mpath, dd._str(), fsdisks._str())
 	}
 
 	ios.mpath2disks[mpath] = fsdisks
 	for disk := range fsdisks {
-		if mp, ok := ios.disk2mpath[disk]; ok && !testingEnv && !cmn.AllowSharedDisksAndNoDisks {
+		if mp, ok := ios.disk2mpath[disk]; ok && !testingEnv {
 			if label.IsNil() {
 				return "", fmt.Errorf("disk %s is shared between mountpaths %s and %s", disk, mpath, mp)
 			}
-			var otherLabel Label
+			var otherLabel cos.MountpathLabel
 			if o, ok := fspaths[mp]; ok {
-				otherLabel = Label(o)
+				otherLabel = cos.MountpathLabel(o)
 			}
 			warn = fmt.Sprintf("Warning: disk %s is shared between %s%s and %s%s",
 				disk, mpath, label.ToLog(), mp, otherLabel.ToLog())
@@ -243,11 +243,11 @@ func (ios *ios) _add(mpath string, label Label, fsdisks FsDisks, fspaths cos.Str
 // - resolve (mpath, filesystem) => disks
 // - revalidate disk(s)
 // - note: part of the alerting mechanism, via filesystem health checker (FSHC)
-func (ios *ios) RescanDisks(mpath, fs string, disks []string) (out RescanDisksResult) {
+func (ios *ios) RescanDisks(mpath, fsname string, disks []string) (out RescanDisksResult) {
 	debug.Assert(len(disks) > 0)
 
 	var err error
-	out.FsDisks, err = fs2disks(mpath, fs, Label(""), nil, len(disks), false /*no-disks is ok*/)
+	out.FsDisks, err = fs2disks(mpath, fsname, cos.MountpathLabel(""), nil, len(disks), false /*no-disks is ok*/)
 	if err != nil {
 		out.Fatal = err
 		return out
@@ -255,12 +255,12 @@ func (ios *ios) RescanDisks(mpath, fs string, disks []string) (out RescanDisksRe
 	fsdisks := out.FsDisks
 	for _, d := range disks {
 		if _, ok := fsdisks[d]; !ok {
-			out.Lost = append(out.Lost, cmn.NewErrMpathLostDisk(mpath, fs, d, disks, fsdisks.ToSlice()))
+			out.Lost = append(out.Lost, cmn.NewErrMpathLostDisk(mpath, fsname, d, disks, fsdisks.ToSlice()))
 		}
 	}
 	for d := range fsdisks {
 		if !cos.StringInSlice(d, disks) {
-			out.Attached = append(out.Attached, cmn.NewErrMpathNewDisk(mpath, fs, disks, fsdisks.ToSlice()))
+			out.Attached = append(out.Attached, cmn.NewErrMpathNewDisk(mpath, fsname, disks, fsdisks.ToSlice()))
 
 			// TODO -- FIXME: under lock: update ios.mpath2disks and related state; log
 			ios._update(mpath, fsdisks, disks)
@@ -346,10 +346,10 @@ func (ios *ios) GetMpathUtil(mpath string) int64 {
 	return ios.GetAllMpathUtils().Get(mpath)
 }
 
-func (ios *ios) DiskStats(m AllDiskStats) {
+func (ios *ios) DiskStats(m cos.AllDiskStats) {
 	cache := ios.refresh()
 	for disk := range cache.ioms {
-		m[disk] = DiskStats{
+		m[disk] = cos.DiskStats{
 			RBps: cache.rbps[disk],
 			Ravg: cache.ravg[disk],
 			WBps: cache.wbps[disk],
@@ -416,8 +416,8 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 		statsCache     = ios._get()
 		nowTs          = mono.NanoTime()
 		elapsed        = nowTs - statsCache.timestamp
-		elapsedSeconds = cos.DivRound(elapsed, int64(time.Second))
-		elapsedMillis  = cos.DivRound(elapsed, int64(time.Millisecond))
+		elapsedSeconds = cos.DivRoundI64(elapsed, int64(time.Second))
+		elapsedMillis  = cos.DivRoundI64(elapsed, int64(time.Millisecond))
 	)
 
 	ncache.timestamp = nowTs
@@ -465,7 +465,7 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 			if ioMs >= elapsedMillis {
 				ncache.util[disk] = 100
 			} else {
-				ncache.util[disk] = cos.DivRound(ioMs*100, elapsedMillis)
+				ncache.util[disk] = cos.DivRoundI64(ioMs*100, elapsedMillis)
 			}
 		} else {
 			ncache.util[disk] = statsCache.util[disk]
@@ -474,24 +474,27 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 			ncache.mpathUtil[mpath] += ncache.util[disk]
 		}
 		if elapsedSeconds > 0 {
-			ncache.rbps[disk] = cos.DivRound(readBytes, elapsedSeconds)
-			ncache.wbps[disk] = cos.DivRound(writeBytes, elapsedSeconds)
+			ncache.rbps[disk] = cos.DivRoundI64(readBytes, elapsedSeconds)
+			ncache.wbps[disk] = cos.DivRoundI64(writeBytes, elapsedSeconds)
 		} else {
 			ncache.rbps[disk] = statsCache.rbps[disk]
 			ncache.wbps[disk] = statsCache.wbps[disk]
 		}
-		if reads > 0 {
-			ncache.ravg[disk] = cos.DivRound(readBytes, reads)
-		} else if elapsedSeconds == 0 {
+		// averages
+		switch {
+		case reads > 0:
+			ncache.ravg[disk] = cos.DivRoundI64(readBytes, reads)
+		case elapsedSeconds == 0:
 			ncache.ravg[disk] = statsCache.ravg[disk]
-		} else {
+		default:
 			ncache.ravg[disk] = 0
 		}
-		if writes > 0 {
-			ncache.wavg[disk] = cos.DivRound(writeBytes, writes)
-		} else if elapsedSeconds == 0 {
+		switch {
+		case writes > 0:
+			ncache.wavg[disk] = cos.DivRoundI64(writeBytes, writes)
+		case elapsedSeconds == 0:
 			ncache.wavg[disk] = statsCache.wavg[disk]
-		} else {
+		default:
 			ncache.wavg[disk] = 0
 		}
 	}
@@ -509,7 +512,7 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 			ncache.mpathUtilRO.Set(mpath, u)
 			maxUtil = max(maxUtil, u)
 		}
-		return
+		return ncache, maxUtil, missingInfo
 	}
 
 	for mpath, disks := range ios.mpath2disks {
@@ -518,12 +521,12 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 			debug.Assert(ncache.mpathUtil[mpath] == 0)
 			continue
 		}
-		u := cos.DivRound(ncache.mpathUtil[mpath], num)
+		u := cos.DivRoundI64(ncache.mpathUtil[mpath], num)
 		ncache.mpathUtil[mpath] = u
 		ncache.mpathUtilRO.Set(mpath, u)
 		maxUtil = max(maxUtil, u)
 	}
-	return
+	return ncache, maxUtil, missingInfo
 }
 
 /////////////

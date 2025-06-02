@@ -91,6 +91,7 @@ or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://gith
     * [etl](#client.Client.etl)
     * [dsort](#client.Client.dsort)
     * [fetch\_object\_by\_url](#client.Client.fetch_object_by_url)
+    * [get\_object\_from\_url](#client.Client.get_object_from_url)
 * [cluster](#cluster)
   * [Cluster](#cluster.Cluster)
     * [client](#cluster.Cluster.client)
@@ -114,6 +115,13 @@ or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://gith
     * [wait\_single\_node](#job.Job.wait_single_node)
     * [start](#job.Job.start)
     * [get\_within\_timeframe](#job.Job.get_within_timeframe)
+    * [get\_details](#job.Job.get_details)
+    * [get\_total\_time](#job.Job.get_total_time)
+* [retry\_config](#retry_config)
+  * [ColdGetConf](#retry_config.ColdGetConf)
+    * [default](#retry_config.ColdGetConf.default)
+  * [RetryConfig](#retry_config.RetryConfig)
+    * [default](#retry_config.RetryConfig.default)
 * [multiobj.object\_group](#multiobj.object_group)
   * [ObjectGroup](#multiobj.object_group.ObjectGroup)
     * [client](#multiobj.object_group.ObjectGroup.client)
@@ -135,16 +143,22 @@ or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://gith
 * [multiobj.object\_template](#multiobj.object_template)
   * [ObjectTemplate](#multiobj.object_template.ObjectTemplate)
 * [obj.object](#obj.object)
+  * [BucketDetails](#obj.object.BucketDetails)
   * [Object](#obj.object.Object)
-    * [bucket](#obj.object.Object.bucket)
+    * [bucket\_name](#obj.object.Object.bucket_name)
+    * [bucket\_provider](#obj.object.Object.bucket_provider)
+    * [query\_params](#obj.object.Object.query_params)
     * [name](#obj.object.Object.name)
     * [props](#obj.object.Object.props)
+    * [props\_cached](#obj.object.Object.props_cached)
     * [head](#obj.object.Object.head)
+    * [get\_reader](#obj.object.Object.get_reader)
     * [get](#obj.object.Object.get)
     * [get\_semantic\_url](#obj.object.Object.get_semantic_url)
     * [get\_url](#obj.object.Object.get_url)
     * [put\_content](#obj.object.Object.put_content)
     * [put\_file](#obj.object.Object.put_file)
+    * [get\_writer](#obj.object.Object.get_writer)
     * [promote](#obj.object.Object.promote)
     * [delete](#obj.object.Object.delete)
     * [blob\_download](#obj.object.Object.blob_download)
@@ -157,20 +171,17 @@ or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://gith
     * [read\_all](#obj.object_reader.ObjectReader.read_all)
     * [raw](#obj.object_reader.ObjectReader.raw)
     * [as\_file](#obj.object_reader.ObjectReader.as_file)
-    * [iter\_from\_position](#obj.object_reader.ObjectReader.iter_from_position)
     * [\_\_iter\_\_](#obj.object_reader.ObjectReader.__iter__)
-* [obj.object\_file](#obj.object_file)
-  * [SimpleBuffer](#obj.object_file.SimpleBuffer)
-    * [\_\_len\_\_](#obj.object_file.SimpleBuffer.__len__)
-    * [read](#obj.object_file.SimpleBuffer.read)
-    * [fill](#obj.object_file.SimpleBuffer.fill)
-    * [empty](#obj.object_file.SimpleBuffer.empty)
-  * [ObjectFile](#obj.object_file.ObjectFile)
-    * [close](#obj.object_file.ObjectFile.close)
-    * [tell](#obj.object_file.ObjectFile.tell)
-    * [readable](#obj.object_file.ObjectFile.readable)
-    * [seekable](#obj.object_file.ObjectFile.seekable)
-    * [read](#obj.object_file.ObjectFile.read)
+* [obj.obj\_file.object\_file](#obj.obj_file.object_file)
+  * [ObjectFileReader](#obj.obj_file.object_file.ObjectFileReader)
+    * [content\_iterator](#obj.obj_file.object_file.ObjectFileReader.content_iterator)
+    * [readable](#obj.obj_file.object_file.ObjectFileReader.readable)
+    * [read](#obj.obj_file.object_file.ObjectFileReader.read)
+    * [close](#obj.obj_file.object_file.ObjectFileReader.close)
+  * [ObjectFileWriter](#obj.obj_file.object_file.ObjectFileWriter)
+    * [write](#obj.obj_file.object_file.ObjectFileWriter.write)
+    * [flush](#obj.obj_file.object_file.ObjectFileWriter.flush)
+    * [close](#obj.obj_file.object_file.ObjectFileWriter.close)
 * [obj.object\_props](#obj.object_props)
   * [ObjectProps](#obj.object_props.ObjectProps)
     * [bucket\_name](#obj.object_props.ObjectProps.bucket_name)
@@ -188,6 +199,7 @@ or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://gith
     * [access\_time](#obj.object_attributes.ObjectAttributes.access_time)
     * [obj\_version](#obj.object_attributes.ObjectAttributes.obj_version)
     * [custom\_metadata](#obj.object_attributes.ObjectAttributes.custom_metadata)
+    * [present](#obj.object_attributes.ObjectAttributes.present)
 
 <a id="authn.authn_client.AuthNClient"></a>
 
@@ -860,7 +872,7 @@ A class representing a bucket that contains user data.
 
 - `client` _RequestClient_ - Client for interfacing with AIS cluster
 - `name` _str_ - name of bucket
-- `provider` _str, optional_ - Provider of bucket (one of "ais", "aws", "gcp", ...), defaults to "ais"
+- `provider` _str or Provider, optional_ - Provider of bucket (one of "ais", "aws", "gcp", ...), defaults to "ais"
 - `namespace` _Namespace, optional_ - Namespace of bucket, defaults to None
 
 <a id="bucket.Bucket.client"></a>
@@ -872,7 +884,7 @@ A class representing a bucket that contains user data.
 def client() -> RequestClient
 ```
 
-The client bound to this bucket.
+The client used by this bucket.
 
 <a id="bucket.Bucket.client"></a>
 
@@ -880,10 +892,10 @@ The client bound to this bucket.
 
 ```python
 @client.setter
-def client(client) -> RequestClient
+def client(client)
 ```
 
-Update the client bound to this bucket.
+Update the client used by this bucket.
 
 <a id="bucket.Bucket.qparam"></a>
 
@@ -902,7 +914,7 @@ Default query parameters to use with API calls from this bucket.
 
 ```python
 @property
-def provider() -> str
+def provider() -> Provider
 ```
 
 The provider for this bucket.
@@ -934,21 +946,23 @@ The namespace for this bucket.
 ### list\_urls
 
 ```python
-def list_urls(prefix: str = "", etl_name: str = None) -> Iterable[str]
+def list_urls(prefix: str = "",
+              etl: Optional[ETLConfig] = None) -> Iterable[str]
 ```
 
-Implementation of the abstract method from AISSource that provides an iterator
-of full URLs to every object in this bucket matching the specified prefix
+Generates full URLs for all objects in the bucket that match the specified prefix.
 
 **Arguments**:
 
-- `prefix` _str, optional_ - Limit objects selected by a given string prefix
-- `etl_name` _str, optional_ - ETL to include in URLs
+- `prefix` _str, optional_ - A string prefix to filter objects. Only objects with names starting
+  with this prefix will be included. Defaults to an empty string (no filtering).
+- `etl` _Optional[ETLConfig], optional_ - An optional ETL configuration. If provided, the URLs
+  will include ETL processing parameters. Defaults to None.
   
 
 **Returns**:
 
-  Iterator of full URLs of all objects matching the prefix
+- `Iterable[str]` - An iterator yielding full URLs of all objects matching the prefix.
 
 <a id="bucket.Bucket.list_all_objects_iter"></a>
 
@@ -1188,10 +1202,12 @@ Returns bucket summary and information/properties.
 def copy(to_bck: Bucket,
          prefix_filter: str = "",
          prepend: str = "",
+         ext: Optional[Dict[str, str]] = None,
          dry_run: bool = False,
          force: bool = False,
          latest: bool = False,
-         sync: bool = False) -> str
+         sync: bool = False,
+         num_workers: Optional[int] = 0) -> str
 ```
 
 Returns job ID that can be used later to check the status of the asynchronous operation.
@@ -1201,11 +1217,16 @@ Returns job ID that can be used later to check the status of the asynchronous op
 - `to_bck` _Bucket_ - Destination bucket
 - `prefix_filter` _str, optional_ - Only copy objects with names starting with this prefix
 - `prepend` _str, optional_ - Value to prepend to the name of copied objects
+- `ext` _Dict[str, str], optional_ - Dict mapping each extension to the extension that will replace it
+  (e.g. {"jpg": "txt"})
 - `dry_run` _bool, optional_ - Determines if the copy should actually
   happen or not
 - `force` _bool, optional_ - Override existing destination bucket
 - `latest` _bool, optional_ - GET the latest object version from the associated remote bucket
 - `sync` _bool, optional_ - synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source
+- `num_workers` _int, optional_ - Number of concurrent workers for the copy job per target
+  - 0 (default): number of mountpaths
+  - -1: single thread, serial execution
   
 
 **Returns**:
@@ -1370,11 +1391,12 @@ def transform(etl_name: str,
               timeout: str = DEFAULT_ETL_TIMEOUT,
               prefix_filter: str = "",
               prepend: str = "",
-              ext: Dict[str, str] = None,
+              ext: Optional[Dict[str, str]] = None,
               force: bool = False,
               dry_run: bool = False,
               latest: bool = False,
-              sync: bool = False) -> str
+              sync: bool = False,
+              num_workers: Optional[int] = 0) -> str
 ```
 
 Visits all selected objects in the source bucket and for each object, puts the transformed
@@ -1387,12 +1409,15 @@ result to the destination bucket
 - `timeout` _str, optional_ - Timeout of the ETL job (e.g. 5m for 5 minutes)
 - `prefix_filter` _str, optional_ - Only transform objects with names starting with this prefix
 - `prepend` _str, optional_ - Value to prepend to the name of resulting transformed objects
-- `ext` _Dict[str, str], optional_ - dict of new extension followed by extension to be replaced
-  (i.e. {"jpg": "txt"})
+- `ext` _Dict[str, str], optional_ - Dict mapping each extension to the extension that will replace it
+  (e.g. {"jpg": "txt"})
 - `dry_run` _bool, optional_ - determines if the copy should actually happen or not
 - `force` _bool, optional_ - override existing destination bucket
 - `latest` _bool, optional_ - GET the latest object version from the associated remote bucket
 - `sync` _bool, optional_ - synchronize destination bucket with its remote (e.g., Cloud or remote AIS) source
+- `num_workers` _int, optional_ - Number of concurrent workers for the transformation job per target
+  - 0 (default): number of mountpaths
+  - -1: single thread, serial execution
   
 
 **Returns**:
@@ -1456,7 +1481,7 @@ Does not make any HTTP request, only instantiates an object in a bucket owned by
 **Arguments**:
 
 - `obj_name` _str_ - Name of object
-- `size` _int, optional_ - Size of object in bytes
+- `props` _ObjectProps, optional_ - Properties of the object, as updated by head(), optionally pre-initialized.
   
 
 **Returns**:
@@ -1570,20 +1595,28 @@ Write a dataset to a bucket in AIS in webdataset format using wds.ShardWriter. L
 class Client()
 ```
 
-AIStore client for managing buckets, objects, ETL jobs
+AIStore client for managing buckets, objects, and ETL jobs.
 
 **Arguments**:
 
-- `endpoint` _str_ - AIStore endpoint
+- `endpoint` _str_ - AIStore endpoint.
 - `skip_verify` _bool, optional_ - If True, skip SSL certificate verification. Defaults to False.
-- `ca_cert` _str, optional_ - Path to a CA certificate file for SSL verification. If not provided, the
-  'AIS_CLIENT_CA' environment variable will be used. Defaults to None.
-- `timeout` _Union[float, Tuple[float, float], None], optional_ - Request timeout in seconds; a single float
-  for both connect/read timeouts (e.g., 5.0), a tuple for separate connect/read timeouts (e.g., (3.0, 10.0)),
-  or None to disable timeout.
-- `retry` _urllib3.Retry, optional_ - Retry configuration object from the urllib3 library.
+- `ca_cert` _str, optional_ - Path to a CA certificate file for SSL verification. If not provided,
+  the 'AIS_CLIENT_CA' environment variable will be used. Defaults to None.
+- `client_cert` _Union[str, Tuple[str, str], None], optional_ - Path to a client certificate PEM file
+  or a tuple (cert, key) for mTLS. If not provided, 'AIS_CRT' and 'AIS_CRT_KEY' environment
+  variables will be used. Defaults to None.
+- `timeout` _Union[float, Tuple[float, float], None], optional_ - Timeout for HTTP requests.
+  - Single float (e.g., `5.0`): Applies to both connection and read timeouts.
+  - Tuple (e.g., `(3.0, 20.0)`): First value is the connection timeout, second is the read timeout.
+  - `None`: Disables timeouts (not recommended). Defaults to `(3, 20)`.
+- `retry_config` _RetryConfig, optional_ - Defines retry behavior for HTTP and network failures.
+  If not provided, the default retry configuration (`RetryConfig.default()`) is used.
+- `retry` _urllib3.Retry, optional_ - [Deprecated] Retry configuration from urllib3. Use `retry_config` instead.
 - `token` _str, optional_ - Authorization token. If not provided, the 'AIS_AUTHN_TOKEN' environment variable
   will be used. Defaults to None.
+- `max_pool_size` _int, optional_ - Maximum number of connections per host in the connection pool.
+  Defaults to 10.
 
 <a id="client.Client.bucket"></a>
 
@@ -1591,7 +1624,7 @@ AIStore client for managing buckets, objects, ETL jobs
 
 ```python
 def bucket(bck_name: str,
-           provider: str = PROVIDER_AIS,
+           provider: Union[Provider, str] = Provider.AIS,
            namespace: Namespace = None)
 ```
 
@@ -1601,7 +1634,8 @@ Does not make any HTTP request, only instantiates a bucket object.
 **Arguments**:
 
 - `bck_name` _str_ - Name of bucket
-- `provider` _str_ - Provider of bucket, one of "ais", "aws", "gcp", ... (optional, defaults to ais)
+- `provider` _str or Provider_ - Provider of bucket, one of "ais", "aws", "gcp", ...
+  (optional, defaults to ais)
 - `namespace` _Namespace_ - Namespace of bucket (optional, defaults to None)
   
 
@@ -1695,7 +1729,11 @@ Does not make any HTTP request, only instantiates a dSort object.
 def fetch_object_by_url(url: str) -> Object
 ```
 
-Retrieve an object based on its URL.
+Deprecated: Use `get_object_from_url` instead.
+
+Creates an Object instance from a URL.
+
+This method does not make any HTTP requests.
 
 **Arguments**:
 
@@ -1704,7 +1742,33 @@ Retrieve an object based on its URL.
 
 **Returns**:
 
-- `Object` - The object retrieved from the specified URL
+- `Object` - The object constructed from the specified URL
+
+<a id="client.Client.get_object_from_url"></a>
+
+### get\_object\_from\_url
+
+```python
+def get_object_from_url(url: str) -> Object
+```
+
+Creates an Object instance from a URL.
+
+This method does not make any HTTP requests.
+
+**Arguments**:
+
+- `url` _str_ - Full URL of the object (e.g., "ais://bucket1/file.txt")
+  
+
+**Returns**:
+
+- `Object` - The object constructed from the specified URL
+  
+
+**Raises**:
+
+- `InvalidURLException` - If the URL is invalid.
 
 <a id="cluster.Cluster"></a>
 
@@ -1764,14 +1828,14 @@ Returns: URL of primary proxy
 ### list\_buckets
 
 ```python
-def list_buckets(provider: str = PROVIDER_AIS)
+def list_buckets(provider: Union[str, Provider] = Provider.AIS)
 ```
 
 Returns list of buckets in AIStore cluster.
 
 **Arguments**:
 
-- `provider` _str, optional_ - Name of bucket provider, one of "ais", "aws", "gcp", "az" or "ht".
+- `provider` _str or Provider, optional_ - Provider of bucket (one of "ais", "aws", "gcp", ...).
   Defaults to "ais". Empty provider returns buckets of all providers.
   
 
@@ -1862,26 +1926,16 @@ Checks if cluster is ready or still setting up.
 ### get\_performance
 
 ```python
-def get_performance(get_throughput: bool = True,
-                    get_latency: bool = True,
-                    get_counters: bool = True) -> ClusterPerformance
+def get_performance() -> Dict
 ```
 
-Retrieves and calculates the performance metrics for each target node in the AIStore cluster.
-It compiles throughput, latency, and various operational counters from each target node,
-providing a comprehensive view of the cluster's overall performance
-
-**Arguments**:
-
-- `get_throughput` _bool, optional_ - get cluster throughput
-- `get_latency` _bool, optional_ - get cluster latency
-- `get_counters` _bool, optional_ - get cluster counters
-  
+Retrieves the raw performance and status data from each target node in the AIStore cluster.
 
 **Returns**:
 
-- `ClusterPerformance` - An object encapsulating the detailed performance metrics of the cluster,
-  including throughput, latency, and counters for each node
+- `Dict` - A dictionary where each key is the ID of a target node and each value is the
+  raw AIS performance/status JSON returned by that node (for more information,
+  see https://aistore.nvidia.com/docs/monitoring-metrics#target-metrics).
   
 
 **Raises**:
@@ -2090,26 +2144,128 @@ Start a job and return its ID.
 ### get\_within\_timeframe
 
 ```python
-def get_within_timeframe(start_time: datetime.datetime,
-                         end_time: datetime.datetime) -> List[JobSnapshot]
+def get_within_timeframe(start_time: datetime,
+                         end_time: Optional[datetime] = None) -> List[JobSnap]
 ```
 
-Checks for jobs that started and finished within a specified timeframe.
+Retrieves jobs that started after a specified start_time and optionally ended before a specified end_time.
 
 **Arguments**:
 
-- `start_time` _datetime.datetime_ - The start of the timeframe for monitoring jobs.
-- `end_time` _datetime.datetime_ - The end of the timeframe for monitoring jobs.
+- `start_time` _datetime_ - The start of the timeframe for monitoring jobs.
+- `end_time` _datetime, optional_ - The end of the timeframe for monitoring jobs.
   
 
 **Returns**:
 
-- `List[JobSnapshot]` - A list of jobs that have finished within the specified timeframe.
+- `List[JobSnapshot]` - A list of jobs that meet the specified timeframe criteria.
   
 
 **Raises**:
 
-- `JobInfoNotFound` - Raised when information on a job's status could not be found.
+- `JobInfoNotFound` - Raised when no relevant job info is found.
+
+<a id="job.Job.get_details"></a>
+
+### get\_details
+
+```python
+def get_details() -> AggregatedJobSnap
+```
+
+Retrieve detailed job snapshot information across all targets.
+
+**Returns**:
+
+- `AggregatedJobSnapshots` - A snapshot containing detailed metrics for the job.
+
+<a id="job.Job.get_total_time"></a>
+
+### get\_total\_time
+
+```python
+def get_total_time() -> Optional[timedelta]
+```
+
+Calculates the total job duration as the difference between the earliest start time
+and the latest end time among all job snapshots. If any snapshot is missing an end_time,
+returns None to indicate the job is incomplete.
+
+**Returns**:
+
+- `Optional[timedelta]` - The total duration of the job, or None if incomplete.
+
+Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+<a id="retry_config.ColdGetConf"></a>
+
+## Class: ColdGetConf
+
+```python
+@dataclass
+class ColdGetConf()
+```
+
+Configuration class for retrying HEAD requests to objects that are not present in cluster when attempting a cold
+GET.
+
+**Attributes:**
+est_bandwidth_bps (int): Estimated bandwidth in bytes per second from the AIS cluster to backend buckets.
+Used to determine retry intervals for fetching remote objects.
+Raising this will decrease the initial time we expect object fetch to take.
+Defaults to 1 Gbps.
+max_cold_wait (int): Maximum total number of seconds to wait for an object to be present before re-raising a
+ReadTimeoutError to be handled by the top-level RetryConfig.
+Defaults to 3 minutes.
+
+<a id="retry_config.ColdGetConf.default"></a>
+
+### default
+
+```python
+@staticmethod
+def default() -> "ColdGetConf"
+```
+
+Returns the default cold get config options.
+
+<a id="retry_config.RetryConfig"></a>
+
+## Class: RetryConfig
+
+```python
+@dataclass
+class RetryConfig()
+```
+
+Configuration class for managing both HTTP and network retries in AIStore.
+
+AIStore implements two types of retries to ensure reliability and fault tolerance:
+
+1. **HTTP Retry (urllib3.Retry)** - Handles HTTP errors based on status codes (e.g., 429, 500, 502, 503, 504).
+2. **Network Retry (tenacity)** - Recovers from connection failures, timeouts, and unreachable targets.
+
+**Why two types of retries?**
+- AIStore uses **redirects** for GET/PUT operations.
+- If a target node is down, we must retry the request via the proxy instead of the same failing target.
+- `network_retry` ensures that the request is reattempted at the **proxy level**, preventing unnecessary failures.
+
+**Attributes:**
+http_retry (urllib3.Retry): Defines retry behavior for transient HTTP errors.
+network_retry (tenacity.Retrying): Configured `tenacity.Retrying` instance managing retries for network-related
+issues, such as connection failures, timeouts, or unreachable targets.
+cold_get_conf (ColdGetConf): Configuration for retrying COLD GET requests, see ColdGetConf class.
+
+<a id="retry_config.RetryConfig.default"></a>
+
+### default
+
+```python
+@staticmethod
+def default() -> "RetryConfig"
+```
+
+Returns the default retry configuration for AIStore.
 
 <a id="multiobj.object_group.ObjectGroup"></a>
 
@@ -2156,7 +2312,8 @@ Update the client bound to the bucket used by the ObjectGroup.
 ### list\_urls
 
 ```python
-def list_urls(prefix: str = "", etl_name: str = None) -> Iterable[str]
+def list_urls(prefix: str = "",
+              etl: Optional[ETLConfig] = None) -> Iterable[str]
 ```
 
 Implementation of the abstract method from AISSource that provides an iterator
@@ -2165,7 +2322,8 @@ of full URLs to every object in this bucket matching the specified prefix
 **Arguments**:
 
 - `prefix` _str, optional_ - Limit objects selected by a given string prefix
-- `etl_name` _str, optional_ - ETL to include in URLs
+- `etl` _Optional[ETLConfig], optional_ - An optional ETL configuration. If provided, the URLs
+  will include ETL processing parameters. Defaults to None.
   
 
 **Returns**:
@@ -2338,6 +2496,7 @@ def transform(to_bck: "Bucket",
               etl_name: str,
               timeout: str = DEFAULT_ETL_TIMEOUT,
               prepend: str = "",
+              ext: Dict[str, str] = None,
               continue_on_error: bool = False,
               dry_run: bool = False,
               force: bool = False,
@@ -2354,6 +2513,8 @@ Performs ETL operation on a list or range of objects in a bucket, placing the re
 - `etl_name` _str_ - Name of existing ETL to apply
 - `timeout` _str_ - Timeout of the ETL job (e.g. 5m for 5 minutes)
 - `prepend` _str, optional_ - Value to prepend to the name of resulting transformed objects
+- `ext` _Dict[str, str], optional_ - Dict mapping each extension to the extension that will replace it
+  (i.e. {"jpg": "txt"})
 - `continue_on_error` _bool, optional_ - Whether to continue if there is an error transforming a single object
 - `dry_run` _bool, optional_ - Skip performing the transform and just log the intended actions
 - `force` _bool, optional_ - Force this job to run over others in case it conflicts
@@ -2490,6 +2651,17 @@ A collection of object names specified by a template in the bash brace expansion
 
 - `template` _str_ - A string template that defines the names of objects to include in the collection
 
+<a id="obj.object.BucketDetails"></a>
+
+## Class: BucketDetails
+
+```python
+@dataclass
+class BucketDetails()
+```
+
+Metadata about a bucket, used by objects within that bucket.
+
 <a id="obj.object.Object"></a>
 
 ## Class: Object
@@ -2498,25 +2670,47 @@ A collection of object names specified by a template in the bash brace expansion
 class Object()
 ```
 
-A class representing an object of a bucket bound to a client.
+Provides methods for interacting with an object in AIS.
 
 **Arguments**:
 
-- `bucket` _Bucket_ - Bucket to which this object belongs
-- `name` _str_ - name of object
-- `size` _int, optional_ - size of object in bytes
-- `props` _ObjectProps, optional_ - Properties of object
+- `client` _RequestClient_ - Client used for all http requests.
+- `bck_details` _BucketDetails_ - Metadata about the bucket to which this object belongs.
+- `name` _str_ - Name of the object.
+- `props` _ObjectProps, optional_ - Properties of the object, as updated by head(), optionally pre-initialized.
 
-<a id="obj.object.Object.bucket"></a>
+<a id="obj.object.Object.bucket_name"></a>
 
-### bucket
+### bucket\_name
 
 ```python
 @property
-def bucket()
+def bucket_name() -> str
 ```
 
-Bucket containing this object.
+Name of the bucket where this object resides.
+
+<a id="obj.object.Object.bucket_provider"></a>
+
+### bucket\_provider
+
+```python
+@property
+def bucket_provider() -> Provider
+```
+
+Provider of the bucket where this object resides (e.g. ais, s3, gcp).
+
+<a id="obj.object.Object.query_params"></a>
+
+### query\_params
+
+```python
+@property
+def query_params() -> Dict[str, str]
+```
+
+Query params used as a base for constructing all requests for this object.
 
 <a id="obj.object.Object.name"></a>
 
@@ -2538,14 +2732,41 @@ Name of this object.
 def props() -> ObjectProps
 ```
 
-Properties of this object.
+Get the latest properties of the object.
+
+This will make a HEAD request to the AIStore cluster to fetch up-to-date object headers
+and refresh the internal `_props` cache. Use this when you want to ensure you're accessing
+the most recent metadata for the object.
+
+**Returns**:
+
+- `ObjectProps` - The latest object properties from the server.
+
+<a id="obj.object.Object.props_cached"></a>
+
+### props\_cached
+
+```python
+@property
+def props_cached() -> Optional[ObjectProps]
+```
+
+Get the cached object properties (without making a network call).
+
+This is useful when:
+- You want to avoid a network request.
+- You're sure the cached `_props` was already set via a previous call to `head()` or during object construction.
+
+**Returns**:
+
+  ObjectProps or None: Cached object properties, or None if not set.
 
 <a id="obj.object.Object.head"></a>
 
 ### head
 
 ```python
-def head() -> Header
+def head() -> CaseInsensitiveDict
 ```
 
 Requests object properties and returns headers. Updates props.
@@ -2563,6 +2784,53 @@ Requests object properties and returns headers. Updates props.
 - `requests.ReadTimeout` - Timed out waiting response from AIStore
 - `requests.exceptions.HTTPError(404)` - The object does not exist
 
+<a id="obj.object.Object.get_reader"></a>
+
+### get\_reader
+
+```python
+def get_reader(archive_config: Optional[ArchiveConfig] = None,
+               blob_download_config: Optional[BlobDownloadConfig] = None,
+               chunk_size: int = DEFAULT_CHUNK_SIZE,
+               etl: Optional[ETLConfig] = None,
+               writer: Optional[BufferedWriter] = None,
+               latest: bool = False,
+               byte_range: Optional[str] = None,
+               direct: bool = False) -> ObjectReader
+```
+
+Creates and returns an ObjectReader with access to object contents
+and optionally writes to a provided writer.
+
+**Arguments**:
+
+- `archive_config` _Optional[ArchiveConfig]_ - Settings for archive extraction.
+- `blob_download_config` _Optional[BlobDownloadConfig]_ - Settings for using blob download.
+- `chunk_size` _int, optional_ - Chunk size to use while reading from stream.
+- `etl` _Optional[ETLConfig]_ - Settings for ETL-specific operations (name, args).
+- `writer` _Optional[BufferedWriter]_ - User-provided writer for writing content output.
+  The user is responsible for closing the writer.
+- `latest` _bool, optional_ - GET the latest object version from the associated remote bucket.
+- `byte_range` _Optional[str]_ - Byte range in RFC 7233 format for single-range requests
+  (e.g., "bytes=0-499", "bytes=500-", "bytes=-500").
+- `See` - https://www.rfc-editor.org/rfc/rfc7233#section-2.1.
+- `direct` _bool, optional_ - If True, the object content is read directly from the target node,
+  bypassing the proxy.
+  
+
+**Returns**:
+
+- `ObjectReader` - An iterator for streaming object content.
+  
+
+**Raises**:
+
+- `ValueError` - If Byte Range is used with Blob Download.
+- `requests.RequestException` - If an error occurs during the request.
+- `requests.ConnectionError` - If there is a connection error.
+- `requests.ConnectionTimeout` - If the connection times out.
+- `requests.ReadTimeout` - If the read operation times out.
+
 <a id="obj.object.Object.get"></a>
 
 ### get
@@ -2571,39 +2839,43 @@ Requests object properties and returns headers. Updates props.
 def get(archive_config: ArchiveConfig = None,
         blob_download_config: BlobDownloadConfig = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
-        etl_name: str = None,
+        etl: ETLConfig = None,
         writer: BufferedWriter = None,
         latest: bool = False,
         byte_range: str = None) -> ObjectReader
 ```
 
+Deprecated: Use 'get_reader' instead.
+
 Creates and returns an ObjectReader with access to object contents and optionally writes to a provided writer.
 
 **Arguments**:
 
-- `archive_config` _ArchiveConfig, optional_ - Settings for archive extraction
-- `blob_download_config` _BlobDownloadConfig, optional_ - Settings for using blob download
-- `chunk_size` _int, optional_ - chunk_size to use while reading from stream
-- `etl_name` _str, optional_ - Transforms an object based on ETL with etl_name
-- `writer` _BufferedWriter, optional_ - User-provided writer for writing content output
-  User is responsible for closing the writer
-- `latest` _bool, optional_ - GET the latest object version from the associated remote bucket
-- `byte_range` _str, optional_ - Specify a specific data segment of the object for transfer, including
-  both the start and end of the range (e.g. "bytes=0-499" to request the first 500 bytes)
+- `archive_config` _ArchiveConfig, optional_ - Settings for archive extraction.
+- `blob_download_config` _BlobDownloadConfig, optional_ - Settings for using blob download.
+- `chunk_size` _int, optional_ - Chunk size to use while reading from stream.
+- `etl` _ETLConfig, optional_ - Settings for ETL-specific operations (name, meta).
+- `writer` _BufferedWriter, optional_ - User-provided writer for writing content output.
+  The user is responsible for closing the writer.
+- `latest` _bool, optional_ - GET the latest object version from the associated remote bucket.
+- `byte_range` _str, optional_ - Byte range in RFC 7233 format for single-range requests
+  (e.g., "bytes=0-499", "bytes=500-", "bytes=-500").
+- `See` - https://www.rfc-editor.org/rfc/rfc7233#section-2.1.
   
 
 **Returns**:
 
-  An ObjectReader which can be iterated over to stream chunks of object content or used to read all content
-  directly.
+- `ObjectReader` - An ObjectReader that can be iterated over to stream chunks of object content
+  or used to read all content directly.
   
 
 **Raises**:
 
-- `requests.RequestException` - "There was an ambiguous exception that occurred while handling..."
-- `requests.ConnectionError` - Connection error
-- `requests.ConnectionTimeout` - Timed out connecting to AIStore
-- `requests.ReadTimeout` - Timed out waiting response from AIStore
+- `ValueError` - If Byte Range is used with Blob Download.
+- `requests.RequestException` - If an error occurs during the request.
+- `requests.ConnectionError` - If there is a connection error.
+- `requests.ConnectionTimeout` - If the connection times out.
+- `requests.ReadTimeout` - If the read operation times out.
 
 <a id="obj.object.Object.get_semantic_url"></a>
 
@@ -2624,7 +2896,7 @@ Get the semantic URL to the object
 ### get\_url
 
 ```python
-def get_url(archpath: str = "", etl_name: str = None) -> str
+def get_url(archpath: str = "", etl: ETLConfig = None) -> str
 ```
 
 Get the full url to the object including base url and any query parameters
@@ -2633,7 +2905,7 @@ Get the full url to the object including base url and any query parameters
 
 - `archpath` _str, optional_ - If the object is an archive, use `archpath` to extract a single file
   from the archive
-- `etl_name` _str, optional_ - Transforms an object based on ETL with etl_name
+- `etl` _ETLConfig, optional_ - Settings for ETL-specific operations (name, meta).
   
 
 **Returns**:
@@ -2647,6 +2919,8 @@ Get the full url to the object including base url and any query parameters
 ```python
 def put_content(content: bytes) -> Response
 ```
+
+Deprecated: Use 'ObjectWriter.put_content' instead.
 
 Puts bytes as an object to a bucket in AIS storage.
 
@@ -2667,14 +2941,16 @@ Puts bytes as an object to a bucket in AIS storage.
 ### put\_file
 
 ```python
-def put_file(path: str = None) -> Response
+def put_file(path: str or Path) -> Response
 ```
+
+Deprecated: Use 'ObjectWriter.put_file' instead.
 
 Puts a local file as an object to a bucket in AIS storage.
 
 **Arguments**:
 
-- `path` _str_ - Path to local file
+- `path` _str or Path_ - Path to local file
   
 
 **Raises**:
@@ -2684,6 +2960,20 @@ Puts a local file as an object to a bucket in AIS storage.
 - `requests.ConnectionTimeout` - Timed out connecting to AIStore
 - `requests.ReadTimeout` - Timed out waiting response from AIStore
 - `ValueError` - The path provided is not a valid file
+
+<a id="obj.object.Object.get_writer"></a>
+
+### get\_writer
+
+```python
+def get_writer() -> ObjectWriter
+```
+
+Create an ObjectWriter to write to object contents and attributes.
+
+**Returns**:
+
+  An ObjectWriter which can be used to write to an object's contents and attributes.
 
 <a id="obj.object.Object.promote"></a>
 
@@ -2792,6 +3082,8 @@ def append_content(content: bytes,
                    flush: bool = False) -> str
 ```
 
+Deprecated: Use 'ObjectWriter.append_content' instead.
+
 Append bytes as an object to a bucket in AIS storage.
 
 **Arguments**:
@@ -2822,6 +3114,8 @@ Append bytes as an object to a bucket in AIS storage.
 def set_custom_props(custom_metadata: Dict[str, str],
                      replace_existing: bool = False) -> Response
 ```
+
+Deprecated: Use 'ObjectWriter.set_custom_props' instead.
 
 Set custom properties for the object.
 
@@ -2910,50 +3204,31 @@ Return the raw byte stream of object content.
 ### as\_file
 
 ```python
-def as_file(max_resume: Optional[int] = 5) -> ObjectFile
+def as_file(buffer_size: Optional[int] = None,
+            max_resume: Optional[int] = 5) -> BufferedIOBase
 ```
 
-Create an `ObjectFile` for reading object data in chunks. `ObjectFile` supports
-resuming and retrying from the last known position in the case the object stream
-is prematurely closed due to an unexpected error.
+Create a read-only, non-seekable `ObjectFileReader` instance for streaming object data in chunks.
+This file-like object primarily implements the `read()` method to retrieve data sequentially,
+with automatic retry/resumption in case of unexpected stream interruptions (e.g. `ChunkedEncodingError`,
+`ConnectionError`) or timeouts (e.g. `ReadTimeout`).
 
 **Arguments**:
 
-- `max_resume` _int, optional_ - Maximum number of resume attempts in case of streaming failure. Defaults to 5.
+- `buffer_size` _int, optional_ - Currently unused; retained for backward compatibility and future
+  enhancements.
+- `max_resume` _int, optional_ - Total number of retry attempts allowed to resume the stream in case of
+  interruptions. Defaults to 5.
   
 
 **Returns**:
 
-- `ObjectFile` - A file-like object that can be used to read the object content.
+- `BufferedIOBase` - A read-only, non-seekable file-like object for streaming object content.
   
 
 **Raises**:
 
-- `requests.RequestException` - An ambiguous exception occurred while handling the request.
-- `requests.ConnectionError` - A connection error occurred.
-- `requests.ConnectionTimeout` - The connection to AIStore timed out.
-- `requests.ReadTimeout` - Waiting for a response from AIStore timed out.
-- `requests.exceptions.HTTPError(404)` - The object does not exist.
-
-<a id="obj.object_reader.ObjectReader.iter_from_position"></a>
-
-### iter\_from\_position
-
-```python
-def iter_from_position(start_position: int = 0) -> Iterator[bytes]
-```
-
-Make a request to get a stream from the provided object starting at a specific byte position
-and yield chunks of the stream content.
-
-**Arguments**:
-
-- `start_position` _int, optional_ - The byte position to start reading from. Defaults to 0.
-  
-
-**Returns**:
-
-- `Iterator[bytes]` - An iterator over each chunk of bytes in the object starting from the specific position.
+- `ValueError` - If `max_resume` is invalid (must be a non-negative integer).
 
 <a id="obj.object_reader.ObjectReader.__iter__"></a>
 
@@ -2969,194 +3244,162 @@ Make a request to get a stream from the provided object and yield chunks of the 
 
 - `Iterator[bytes]` - An iterator over each chunk of bytes in the object.
 
-<a id="obj.object_file.SimpleBuffer"></a>
+<a id="obj.obj_file.object_file.ObjectFileReader"></a>
 
-## Class: SimpleBuffer
-
-```python
-class SimpleBuffer()
-```
-
-A buffer for efficiently handling streamed data with position tracking.
-
-It stores incoming chunks of data in a bytearray and tracks the current read position.
-Once data is read, it is discarded from the buffer to free memory, ensuring efficient
-usage.
-
-<a id="obj.object_file.SimpleBuffer.__len__"></a>
-
-### \_\_len\_\_
+## Class: ObjectFileReader
 
 ```python
-def __len__()
+class ObjectFileReader(BufferedIOBase)
 ```
 
-Return the number of unread bytes in the buffer.
+A sequential read-only file-like object extending `BufferedIOBase` for reading object data, with support for both
+reading a fixed size of data and reading until the end of file (EOF).
 
-**Returns**:
+When a read is requested, any remaining data from a previously fetched chunk is returned first. If the remaining
+data is insufficient to satisfy the request, the `read()` method fetches additional chunks from the provided
+`content_iterator` as needed, until the requested size is fulfilled or the end of the stream is reached.
 
-- `int` - The number of unread bytes remaining in the buffer.
-
-<a id="obj.object_file.SimpleBuffer.read"></a>
-
-### read
-
-```python
-def read(size: int = -1) -> bytes
-```
-
-Read bytes from the buffer and advance the read position.
-
-**Arguments**:
-
-- `size` _int, optional_ - Number of bytes to read from the buffer. If -1, reads all
-  remaining bytes.
-  
-
-**Returns**:
-
-- `bytes` - The data read from the buffer.
-
-<a id="obj.object_file.SimpleBuffer.fill"></a>
-
-### fill
-
-```python
-def fill(source: Iterator[bytes], size: int = -1)
-```
-
-Fill the buffer with data from the source, up to the specified size.
-
-**Arguments**:
-
-- `source` _Iterator[bytes]_ - The data source (chunks).
-- `size` _int, optional_ - The target size to fill the buffer up to. Default is -1 for unlimited.
-
-**Returns**:
-
-- `int` - Number of bytes in the buffer.
-
-<a id="obj.object_file.SimpleBuffer.empty"></a>
-
-### empty
-
-```python
-def empty()
-```
-
-Empty the buffer.
-
-<a id="obj.object_file.ObjectFile"></a>
-
-## Class: ObjectFile
-
-```python
-class ObjectFile(BufferedIOBase)
-```
-
-A file-like object for reading object data, with support for both reading a fixed size of data
-and reading until the end of the stream (EOF). It provides the ability to resume and continue
-reading from the last known position in the event of a ChunkedEncodingError.
-
-Data is fetched in chunks via the object reader iterator and temporarily stored in an internal
-buffer. The buffer is filled either to the required size or until EOF is reached. If a
-`ChunkedEncodingError` occurs during this process, ObjectFile catches and automatically attempts
-to resume the buffer filling process from the last known chunk position. The number of resume
-attempts is tracked across the entire object file, and if the total number of attempts exceeds
-the configurable `max_resume`, a `ChunkedEncodingError` is raised.
-
-Once the buffer is adequately filled, the `read()` method reads and returns the requested amount
-of data from the buffer.
+In case of unexpected stream interruptions (e.g. `ChunkedEncodingError`, `ConnectionError`) or timeouts (e.g.
+`ReadTimeout`), the `read()` method automatically retries and resumes fetching data from the last successfully
+retrieved chunk. The `max_resume` parameter controls how many retry attempts are made before an error is raised.
 
 **Arguments**:
 
 - `content_iterator` _ContentIterator_ - An iterator that can fetch object data from AIS in chunks.
-- `max_resume` _int_ - Maximum number of retry attempts in case of a streaming failure.
+- `max_resume` _int_ - Maximum number of resumes allowed for an ObjectFileReader instance.
 
-<a id="obj.object_file.ObjectFile.close"></a>
+<a id="obj.obj_file.object_file.ObjectFileReader.content_iterator"></a>
 
-### close
-
-```python
-def close() -> None
-```
-
-Close the file and release resources.
-
-**Raises**:
-
-- `ValueError` - I/O operation on closed file.
-
-<a id="obj.object_file.ObjectFile.tell"></a>
-
-### tell
+### content\_iterator
 
 ```python
-def tell() -> int
+@property
+def content_iterator() -> ContentIterator
 ```
 
-Return the current file position.
+Return the content iterator.
 
-**Returns**:
-
-  The current file position.
-  
-
-**Raises**:
-
-- `ValueError` - I/O operation on closed file.
-
-<a id="obj.object_file.ObjectFile.readable"></a>
+<a id="obj.obj_file.object_file.ObjectFileReader.readable"></a>
 
 ### readable
 
 ```python
+@override
 def readable() -> bool
 ```
 
 Return whether the file is readable.
 
-**Returns**:
-
-  True if the file is readable, False otherwise.
-  
-
-**Raises**:
-
-- `ValueError` - I/O operation on closed file.
-
-<a id="obj.object_file.ObjectFile.seekable"></a>
-
-### seekable
-
-```python
-def seekable() -> bool
-```
-
-Return whether the file supports seeking.
-
-**Returns**:
-
-  False since the file does not support seeking.
-
-<a id="obj.object_file.ObjectFile.read"></a>
+<a id="obj.obj_file.object_file.ObjectFileReader.read"></a>
 
 ### read
 
 ```python
-def read(size=-1)
+@override
+def read(size: Optional[int] = -1) -> bytes
 ```
 
-Read bytes from the object, handling retries in case of stream errors.
+Read up to 'size' bytes from the object. If size is -1, read until the end of the stream.
 
 **Arguments**:
 
-- `size` _int, optional_ - Number of bytes to read. If -1, reads until the end of the stream.
+- `size` _int, optional_ - The number of bytes to read. If -1, reads until EOF.
   
 
 **Returns**:
 
-- `bytes` - The data read from the object.
+- `bytes` - The read data as a bytes object.
+  
+
+**Raises**:
+
+- `ObjectFileReaderStreamError` - If a connection cannot be made.
+- `ObjectFileReaderMaxResumeError` - If the stream is interrupted more than the allowed maximum.
+- `ValueError` - I/O operation on a closed file.
+- `Exception` - Any other errors while streaming and reading.
+
+<a id="obj.obj_file.object_file.ObjectFileReader.close"></a>
+
+### close
+
+```python
+@override
+def close() -> None
+```
+
+Close the file.
+
+<a id="obj.obj_file.object_file.ObjectFileWriter"></a>
+
+## Class: ObjectFileWriter
+
+```python
+class ObjectFileWriter(BufferedWriter)
+```
+
+A file-like writer object for AIStore, extending `BufferedWriter`.
+
+**Arguments**:
+
+- `obj_writer` _ObjectWriter_ - The ObjectWriter instance for handling write operations.
+- `mode` _str_ - Specifies the mode in which the file is opened.
+  - `'w'`: Write mode. Opens the object for writing, truncating any existing content.
+  Writing starts from the beginning of the object.
+  - `'a'`: Append mode. Opens the object for appending. Existing content is preserved,
+  and writing starts from the end of the object.
+
+<a id="obj.obj_file.object_file.ObjectFileWriter.write"></a>
+
+### write
+
+```python
+@override
+def write(buffer: bytes) -> int
+```
+
+Write data to the object.
+
+**Arguments**:
+
+- `data` _bytes_ - The data to write.
+  
+
+**Returns**:
+
+- `int` - Number of bytes written.
+  
+
+**Raises**:
+
+- `ValueError` - I/O operation on a closed file.
+
+<a id="obj.obj_file.object_file.ObjectFileWriter.flush"></a>
+
+### flush
+
+```python
+@override
+def flush() -> None
+```
+
+Flush the writer, ensuring the object is finalized.
+
+This does not close the writer but makes the current state accessible.
+
+**Raises**:
+
+- `ValueError` - I/O operation on a closed file.
+
+<a id="obj.obj_file.object_file.ObjectFileWriter.close"></a>
+
+### close
+
+```python
+@override
+def close() -> None
+```
+
+Close the writer and finalize the object.
 
 <a id="obj.object_props.ObjectProps"></a>
 
@@ -3329,4 +3572,15 @@ def custom_metadata() -> Dict[str, str]
 ```
 
 Dictionary of custom metadata.
+
+<a id="obj.object_attributes.ObjectAttributes.present"></a>
+
+### present
+
+```python
+@property
+def present() -> bool
+```
+
+Whether the object is present/cached.
 

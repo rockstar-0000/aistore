@@ -1,19 +1,30 @@
 // Package k8s: initialization, client, and misc. helpers
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package k8s
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 
 	"github.com/NVIDIA/aistore/api/env"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+
 	v1 "k8s.io/api/core/v1"
 )
+
+type PodStatus struct {
+	State    string // "Waiting" | "Running" | "Terminated"
+	CtrName  string // main container name
+	Reason   string
+	Message  string
+	ExitCode int32
+}
 
 const (
 	defaultPodNameEnv   = "HOSTNAME"
@@ -43,9 +54,8 @@ func Init() {
 	}
 
 	var (
-		pod      *v1.Pod
-		nodeName = os.Getenv(env.AIS.K8sNode)
-		podName  = os.Getenv(env.AIS.K8sPod)
+		pod     *v1.Pod
+		podName = os.Getenv(env.AisK8sPod)
 	)
 	if podName != "" {
 		debug.Func(func() {
@@ -55,38 +65,33 @@ func Init() {
 	} else {
 		podName = os.Getenv(defaultPodNameEnv)
 	}
-	nlog.Infof("Checking pod: %q, node: %q", podName, nodeName)
+	nlog.Infof("Checking pod: %q", podName)
 
-	// node name specified - proceed directly to check
-	if nodeName != "" {
-		goto checkNode
-	}
 	if podName == "" {
-		nlog.Infoln("environment (above) not set =>", nonK8s)
+		nlog.Infof("Env %q is not set => %s", env.AisK8sPod, nonK8s)
 		return
 	}
 
-	// check POD
+	// Check Pod.
 	pod, err = client.Pod(podName)
 	if err != nil {
-		nlog.Errorf("Failed to get pod %q: %v", podName, err)
+		cos.ExitLogf("Failed to get Pod %q, err: %v", podName, err)
 		return
 	}
-	nodeName = pod.Spec.NodeName
-	nlog.Infoln("pod.Spec: Node", nodeName, "Hostname", pod.Spec.Hostname, "HostNetwork", pod.Spec.HostNetwork)
+
+	// Check if pod is already scheduled or fall back to env var
+	switch {
+	case pod.Spec.NodeName != "":
+		NodeName = pod.Spec.NodeName
+	case os.Getenv(env.AisK8sNode) != "":
+		NodeName = os.Getenv(env.AisK8sNode)
+	default:
+		cos.ExitLogf("Failed to get K8s node name. %q is not set", env.AisK8sNode)
+		return
+	}
+
+	nlog.Infoln("Pod info:", "name", podName, ",namespace", pod.Namespace, ",node", NodeName, ",hostname", pod.Spec.Hostname, ",host_network", pod.Spec.HostNetwork)
 	_ppvols(pod.Spec.Volumes)
-
-checkNode: // always check Node
-	node, err := client.Node(nodeName)
-	if err != nil {
-		nlog.Errorf("Failed to get Node %q: %v", nodeName, err)
-		return
-	}
-
-	NodeName = node.Name
-	if node.Namespace != "" {
-		nlog.Infoln("Node", NodeName, "Namespace", node.Namespace)
-	}
 }
 
 func _ppvols(volumes []v1.Volume) {
@@ -114,4 +119,8 @@ func _short(err error) string {
 	default:
 		return msg[:sizeLimit] + " ..."
 	}
+}
+
+func (ps *PodStatus) String() string {
+	return fmt.Sprintf("container: %s, state: %s, reason: %s, message: %s, exitCode: %d", ps.CtrName, ps.State, ps.Reason, ps.Message, ps.ExitCode)
 }

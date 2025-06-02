@@ -1,11 +1,12 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
 import (
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 )
@@ -30,15 +31,17 @@ type (
 		ClusterStarted() bool
 		NodeStarted() bool
 
+		StatsUpdater() cos.StatsUpdater
+
 		// Memory allocators
 		PageMM() *memsys.MMSA
 		ByteMM() *memsys.MMSA
 	}
 )
 
-func InMaintOrDecomm(smap *meta.Smap, tsi *meta.Snode, xact Xact) (err error) {
-	if smap.InMaintOrDecomm(tsi) {
-		err = cmn.NewErrXactTgtInMaint(xact.String(), tsi.StringEx())
+func InMaintOrDecomm(smap *meta.Smap, tsi *meta.Snode, xact Xact) error {
+	if smap.InMaintOrDecomm(tsi.ID()) {
+		return cmn.NewErrXactTgtInMaint(xact.String(), tsi.StringEx())
 	}
-	return err
+	return nil
 }

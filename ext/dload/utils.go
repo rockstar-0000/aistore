@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -193,6 +194,9 @@ func attrsFromLink(link string, resp *http.Response, oah cos.OAH) (size int64) {
 		if v, ok := h.EncodeVersion(resp.Header.Get(cos.S3VersionHeader)); ok {
 			oah.SetCustomKey(cmn.VersionObjMD, v)
 		}
+		if v, ok := h.EncodeETag(resp.Header.Get(cos.HdrETag)); ok {
+			oah.SetCustomKey(cmn.ETag, v)
+		}
 		if v, ok := h.EncodeCksum(resp.Header.Get(cos.S3CksumHeader)); ok {
 			oah.SetCustomKey(cmn.MD5ObjMD, v)
 		}
@@ -205,6 +209,7 @@ func attrsFromLink(link string, resp *http.Response, oah cos.OAH) (size int64) {
 		if v, ok := h.EncodeCksum(resp.Header.Get(cos.AzCksumHeader)); ok {
 			oah.SetCustomKey(cmn.MD5ObjMD, v)
 		}
+		// [TODO] Add case, if necessary, for OCI here
 	default:
 		oah.SetCustomKey(cmn.SourceObjMD, cmn.WebObjMD)
 	}

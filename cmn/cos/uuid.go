@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -10,7 +10,8 @@ import (
 	"strconv"
 
 	"github.com/NVIDIA/aistore/cmn/atomic"
-	"github.com/OneOfOne/xxhash"
+
+	onexxh "github.com/OneOfOne/xxhash"
 	"github.com/teris-io/shortid"
 )
 
@@ -57,12 +58,11 @@ func InitShortID(seed uint64) {
 func GenUUID() (uuid string) {
 	var h, t string
 	uuid = sid.MustGenerate()
-	if !isAlpha(uuid[0]) {
+	if c := uuid[0]; c == 'g' || !isAlpha(c) { // see also: `xact.RebID2S`
 		tie := int(rtie.Add(1))
 		h = string(rune('A' + tie%26))
 	}
-	c := uuid[len(uuid)-1]
-	if c == '-' || c == '_' {
+	if c := uuid[len(uuid)-1]; c == '-' || c == '_' {
 		tie := int(rtie.Add(1))
 		t = string(rune('a' + tie%26))
 	}
@@ -105,7 +105,7 @@ func ValidateDaemonID(id string) error {
 }
 
 func HashK8sProxyID(nodeName string) (pid string) {
-	digest := xxhash.Checksum64S(UnsafeB(nodeName), MLCG32)
+	digest := onexxh.Checksum64S(UnsafeB(nodeName), MLCG32)
 	pid = strconv.FormatUint(digest, 36)
 	if pid[0] >= '0' && pid[0] <= '9' {
 		pid = pid[1:]
@@ -151,7 +151,7 @@ func IsAlphaNice(s string) bool {
 	return true
 }
 
-// alpha-numeric++ including letters, numbers, dashes (-), and underscores (_)
+// alphanumeric++ including letters, numbers, dashes (-), and underscores (_)
 // period (.) is allowed except for '..' (OnlyPlus const)
 func CheckAlphaPlus(s, tag string) error {
 	l := len(s)

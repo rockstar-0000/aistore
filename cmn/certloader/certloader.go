@@ -96,7 +96,7 @@ func Load() (err error) {
 
 func Props() (out cos.StrKVs) {
 	flags := cos.NodeStateFlags(gcl.tstats.Get(cos.NodeAlerts))
-	if flags.IsSet(cos.CertificateInvalid) || flags.IsSet(cos.CertificateExpired) {
+	if flags.IsAnySet(cos.CertificateInvalid | cos.CertificateExpired) {
 		out = make(cos.StrKVs, 1)
 		flags &= (cos.CertificateInvalid | cos.CertificateExpired)
 		out["error"] = flags.String()
@@ -138,7 +138,7 @@ func (cl *certLoader) hk(int64) time.Duration {
 
 func (cl *certLoader) hktime() (d time.Duration) {
 	flags := cos.NodeStateFlags(cl.tstats.Get(cos.NodeAlerts))
-	if flags.IsSet(cos.CertificateExpired) || flags.IsSet(cos.CertificateInvalid) {
+	if flags.IsAnySet(cos.CertificateExpired | cos.CertificateInvalid) {
 		return dfltTimeInvalid
 	}
 
@@ -221,7 +221,7 @@ func (cl *certLoader) do(compare bool) (err error) {
 	if compare {
 		xcert := cl.xcert.Load()
 		debug.Assert(xcert != nil, "expecting X.509 loaded at startup: ", cl.certFile, ", ", cl.keyFile)
-		if finfo.ModTime() == xcert.modTime && finfo.Size() == xcert.size {
+		if mtime := finfo.ModTime(); mtime.Equal(xcert.modTime) && finfo.Size() == xcert.size {
 			return nil
 		}
 	}
@@ -252,13 +252,18 @@ func (cl *certLoader) do(compare bool) (err error) {
 ///////////
 
 func (x *xcert) String() string {
-	var sb strings.Builder
+	var (
+		sb        strings.Builder
+		notBefore = x.notBefore.String()
+		notAfter  = x.notAfter.String()
+		l         = len(x.parent.certFile) + 1 + len(notBefore) + 1 + len(notAfter) + 1
+	)
+	sb.Grow(l)
 	sb.WriteString(x.parent.certFile)
-
 	sb.WriteByte('[')
-	sb.WriteString(x.notBefore.String())
+	sb.WriteString(notBefore)
 	sb.WriteByte(',')
-	sb.WriteString(x.notAfter.String())
+	sb.WriteString(notAfter)
 	sb.WriteByte(']')
 
 	return sb.String()
@@ -280,12 +285,13 @@ func (x *xcert) ini(finfo os.FileInfo) (rem time.Duration, err error) {
 		x.notAfter = x.Certificate.Leaf.NotAfter
 	}
 	now := time.Now()
-	if now.After(x.notAfter) {
+	switch {
+	case now.After(x.notAfter):
 		msg := fmt.Sprintf(fmtErrExpired, name, x.parent.certFile, x.notAfter)
 		err = &errExpired{msg}
-	} else if now.Before(x.notBefore) {
+	case now.Before(x.notBefore):
 		err = fmt.Errorf("%s: %s not valid yet: (%v, %v)", name, x.parent.certFile, x.notBefore, x.notAfter)
-	} else {
+	default:
 		rem = x.notAfter.Sub(now)
 	}
 	return rem, err

@@ -1,7 +1,7 @@
 // Package tok provides AuthN token (structure and methods)
 // for validation by AIS gateways
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tok
 
@@ -16,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/api/authn"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	"github.com/golang-jwt/jwt/v4"
 )
 

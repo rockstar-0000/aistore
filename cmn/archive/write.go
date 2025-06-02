@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -19,7 +19,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/pierrec/lz4/v3"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 type (
@@ -46,26 +47,26 @@ type (
 	baseW struct {
 		wmul io.Writer
 		lck  sync.Locker // serialize: (multi-object => single shard)
-		buf  []byte
 		cb   HeaderCallback
 		slab *memsys.Slab
+		buf  []byte
 	}
 	tarWriter struct {
+		tw *tar.Writer
 		baseW
 		format tar.Format
-		tw     *tar.Writer
 	}
 	tgzWriter struct {
-		tw  tarWriter
 		gzw *gzip.Writer
+		tw  tarWriter
 	}
 	zipWriter struct {
-		baseW
 		zw *zip.Writer
+		baseW
 	}
 	lz4Writer struct {
-		tw  tarWriter
 		lzw *lz4.Writer
+		tw  tarWriter
 	}
 )
 
@@ -237,15 +238,21 @@ func (zw *zipWriter) Copy(src io.Reader, size ...int64) error {
 // lz4Writer
 
 func (lzw *lz4Writer) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
+	var (
+		blockSize = lz4.Block256Kb
+	)
 	lzw.tw.baseW.init(w, cksum, opts)
 	lzw.lzw = lz4.NewWriter(lzw.tw.wmul)
 
-	lzw.lzw.Header.BlockChecksum = false
-	lzw.lzw.Header.NoChecksum = !cmn.Rom.Features().IsSet(feat.LZ4FrameChecksum)
-	lzw.lzw.Header.BlockMaxSize = 256 * cos.KiB
 	if cmn.Rom.Features().IsSet(feat.LZ4Block1MB) {
-		lzw.lzw.Header.BlockMaxSize = cos.MiB
+		blockSize = lz4.Block1Mb
 	}
+	err := lzw.lzw.Apply(
+		lz4.BlockSizeOption(blockSize),
+		lz4.ChecksumOption(cmn.Rom.Features().IsSet(feat.LZ4FrameChecksum)),
+		lz4.BlockChecksumOption(false),
+	)
+	debug.AssertNoErr(err)
 
 	lzw.tw.tw = tar.NewWriter(lzw.lzw)
 }

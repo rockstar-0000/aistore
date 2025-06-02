@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains util functions and types.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 )
 
@@ -51,7 +52,7 @@ func toMonitorMsg(c *cli.Context, xjid, suffix string) (out string) {
 func toShowMsg(c *cli.Context, xjid, prompt string, verbose bool) string {
 	// use command search
 	cmds := findCmdMultiKeyAlt(commandShow, c.Command.Name)
-	if len(cmds) == 0 {
+	if len(cmds) == 0 || xjid != "" {
 		// generic
 		cmds = findCmdMultiKeyAlt(commandShow, commandJob)
 	}
@@ -173,7 +174,7 @@ func flattenXactStats(snap *core.Snap, units string) nvpairList {
 		nvpair{Name: ".start", Value: fmtTime(snap.StartTime)},
 		nvpair{Name: ".end", Value: fmtTime(snap.EndTime)},
 		nvpair{Name: ".aborted", Value: strconv.FormatBool(snap.AbortedX)},
-		nvpair{Name: ".state", Value: teb.FmtXactStatus(snap)},
+		nvpair{Name: ".state", Value: teb.FmtXactRunFinAbrt(snap)},
 	)
 	if snap.Stats.Objs != 0 || snap.Stats.Bytes != 0 {
 		printtedVal := teb.FmtSize(snap.Stats.Bytes, units, 2)
@@ -348,11 +349,40 @@ func extractXactIDsForKind(xs xact.MultiSnap, xactKind string) (xactIDs []string
 		xactIDs = append(xactIDs, xid)
 	}
 	if len(xactIDs) <= 1 {
-		return
+		return xactIDs
 	}
 	sort.Slice(xactIDs, func(i, j int) bool {
 		xi, xj := xactIDs[i], xactIDs[j]
 		return timedIDs[xi].Before(timedIDs[xj])
 	})
-	return
+	return xactIDs
+}
+
+// [backward compatibility] added xargs.Flags in 44f77dfe56376e
+func xstart(c *cli.Context, xargs *xact.ArgsMsg, extra string) (xid string, err error) {
+	if xid, err = api.StartXaction(apiBP, xargs, extra); err == nil {
+		return xid, nil
+	}
+	if !strings.Contains(err.Error(), "marshal") {
+		return "", V(err)
+	}
+	debug.Assert(xargs.Flags != 0) // ditto
+	if smap, e1 := getClusterMap(c); e1 == nil {
+		if ds, e2 := api.GetStatsAndStatus(apiBP, smap.Primary); e2 == nil {
+			err = fmt.Errorf("CLI version %s is not compatible with (an older) AIS v%s", c.App.Version, ds.Version)
+		}
+	}
+	return "", err
+}
+
+func xstop(xargs *xact.ArgsMsg) (err error) {
+	if xargs.Flags != 0 {
+		err = errors.New("invalid 'ais stop' command - expecting zero flags")
+		debug.AssertNoErr(err)
+		return err
+	}
+	if err = api.AbortXaction(apiBP, xargs); err != nil {
+		return V(err)
+	}
+	return nil
 }

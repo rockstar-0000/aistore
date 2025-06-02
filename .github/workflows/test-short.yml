@@ -10,19 +10,19 @@ jobs:
   test:
     strategy:
       matrix:
-        go-version: ['1.22.x']
+        go-version: ['1.24.x']
         # os: [ubuntu-latest, macos-latest]
         # TODO: provide support for MacOS (!1169)
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: ${{ matrix.go-version }}
-
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
 
       - name: Run and test AIStore
         run: |

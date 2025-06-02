@@ -3,13 +3,13 @@
 // Package stats provides methods and functionality to register, track, log,
 // and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
 import (
-	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	ratomic "sync/atomic"
@@ -22,7 +22,6 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats/statsd"
-	jsoniter "github.com/json-iterator/go"
 )
 
 type (
@@ -55,35 +54,18 @@ var (
 )
 
 // empty stab (Prometheus only)
-func initDfltlabel(*meta.Snode) {}
+func initProm(*meta.Snode) {}
 
 ///////////////
 // coreStats //
 ///////////////
 
-// interface guard
-var (
-	_ json.Marshaler   = (*coreStats)(nil)
-	_ json.Unmarshaler = (*coreStats)(nil)
-)
-
-func (s *coreStats) init(size int) {
-	s.Tracker = make(map[string]*statsValue, size)
-
-	s.sgl = memsys.PageMM().NewSGL(memsys.DefaultBufSize)
-}
-
 // NOTE: nil StatsD client means that we provide metrics to Prometheus (see below)
 func (s *coreStats) statsdDisabled() bool { return s.statsdC == nil }
 
-// empty stabs
-func (*coreStats) promLock()   {}
-func (*coreStats) promUnlock() {}
-
-// init StatsD (not Prometheus)
-func (s *coreStats) initStatsdOrProm(snode *meta.Snode, _ *runner) {
+func (s *coreStats) initStarted(snode *meta.Snode) {
 	var (
-		port  = 8125  // StatsD default port, see https://github.com/etsy/stats
+		port  = 8125  // StatsD default port, see https://github.com/etsy/statsd
 		probe = false // test-probe StatsD server at init time
 	)
 	if portStr := os.Getenv("AIS_STATSD_PORT"); portStr != "" {
@@ -111,42 +93,32 @@ func (s *coreStats) initStatsdOrProm(snode *meta.Snode, _ *runner) {
 	s.statsdC = statsD
 }
 
-func (s *coreStats) updateUptime(d time.Duration) {
-	v := s.Tracker[Uptime]
-	ratomic.StoreInt64(&v.Value, d.Nanoseconds())
-}
+// compare w/ prometheus
+func (s *coreStats) addWith(nv cos.NamedVal64) { s.add(nv.Name, nv.Value) }
 
-func (s *coreStats) MarshalJSON() ([]byte, error) { return jsoniter.Marshal(s.Tracker) }
-func (s *coreStats) UnmarshalJSON(b []byte) error { return jsoniter.Unmarshal(b, &s.Tracker) }
+func (s *coreStats) inc(name string)           { s.add(name, 1) }    // (for the sake of Prometheus optimization)
+func (s *coreStats) incWith(nv cos.NamedVal64) { s.add(nv.Name, 1) } // ditto
 
-func (s *coreStats) get(name string) (val int64) {
-	v := s.Tracker[name]
-	val = ratomic.LoadInt64(&v.Value)
-	return
-}
-
-func (s *coreStats) update(nv cos.NamedVal64) {
-	v, ok := s.Tracker[nv.Name]
-	debug.Assertf(ok, "invalid metric name %q", nv.Name)
+func (s *coreStats) add(name string, val int64) {
+	v, ok := s.Tracker[name]
+	debug.Assertf(ok, "invalid metric name %q", name)
 	switch v.kind {
 	case KindLatency:
 		ratomic.AddInt64(&v.numSamples, 1)
 		fallthrough
 	case KindThroughput:
-		ratomic.AddInt64(&v.Value, nv.Value)
-		ratomic.AddInt64(&v.cumulative, nv.Value)
+		ratomic.AddInt64(&v.Value, val)
+		ratomic.AddInt64(&v.cumulative, val)
 	case KindCounter, KindSize, KindTotal:
-		ratomic.AddInt64(&v.Value, nv.Value)
-		// - non-empty suffix forces an immediate Tx with no aggregation (see below);
-		// - suffix is an arbitrary string that can be defined at runtime;
-		// - e.g. usage: per-mountpath error counters.
-		if !s.statsdDisabled() && nv.NameSuffix != "" {
-			s.statsdC.Send(v.label.comm+"."+nv.NameSuffix,
-				1, metric{Type: statsd.Counter, Name: "count", Value: nv.Value})
-		}
+		ratomic.AddInt64(&v.Value, val)
 	default:
 		debug.Assert(false, v.kind)
 	}
+}
+
+func (s *coreStats) updateUptime(d time.Duration) {
+	v := s.Tracker[Uptime]
+	ratomic.StoreInt64(&v.Value, d.Nanoseconds())
 }
 
 // usage: log and StatsD Tx
@@ -167,7 +139,7 @@ func (s *coreStats) copyT(out copyTracker, diskLowUtil ...int64) bool {
 			out[name] = copyValue{lat}
 
 			// NOTE: if not zero, report StatsD latency (milliseconds) over the last "periodic.stats_time" interval
-			millis := cos.DivRound(lat, int64(time.Millisecond))
+			millis := cos.DivRoundI64(lat, int64(time.Millisecond))
 			if !s.statsdDisabled() && millis > 0 {
 				s.statsdC.AppMetric(metric{Type: statsd.Timer, Name: v.label.stpr, Value: float64(millis)}, s.sgl)
 			}
@@ -181,15 +153,13 @@ func (s *coreStats) copyT(out copyTracker, diskLowUtil ...int64) bool {
 			}
 			out[name] = copyValue{throughput}
 			if !s.statsdDisabled() && throughput > 0 {
-				fv := roundMBs(throughput)
-				s.statsdC.AppMetric(metric{Type: statsd.Gauge, Name: v.label.stpr, Value: fv}, s.sgl)
+				s.statsdC.AppMetric(metric{Type: statsd.Gauge, Name: v.label.stpr, Value: throughput}, s.sgl)
 			}
 		case KindComputedThroughput:
 			if throughput := ratomic.SwapInt64(&v.Value, 0); throughput > 0 {
 				out[name] = copyValue{throughput}
 				if !s.statsdDisabled() {
-					fv := roundMBs(throughput)
-					s.statsdC.AppMetric(metric{Type: statsd.Gauge, Name: v.label.stpr, Value: fv}, s.sgl)
+					s.statsdC.AppMetric(metric{Type: statsd.Gauge, Name: v.label.stpr, Value: throughput}, s.sgl)
 				}
 			}
 		case KindCounter, KindSize, KindTotal:
@@ -323,7 +293,7 @@ func (r *runner) reg(snode *meta.Snode, name, kind string, _ *Extra) {
 	case KindThroughput, KindComputedThroughput:
 		debug.Assert(strings.HasSuffix(name, ".bps"), name)
 		v.label.comm = strings.TrimSuffix(name, ".bps")
-		v.label.stpr = f("mbps")
+		v.label.stpr = f("bps")
 	default:
 		debug.Assert(kind == KindGauge || kind == KindSpecial)
 		v.label.comm = name
@@ -337,11 +307,7 @@ func (r *runner) reg(snode *meta.Snode, name, kind string, _ *Extra) {
 	r.core.Tracker[name] = v
 }
 
-func (*runner) IsPrometheus() bool { return false }
+// empty stub (prometheus only)
+func (*runner) PromHandler() http.Handler { return nil }
 
-func (r *runner) Stop(err error) {
-	nlog.Infof("Stopping %s, err: %v", r.Name(), err)
-	r.stopCh <- struct{}{}
-	r.core.statsdC.Close()
-	close(r.stopCh)
-}
+func (r *runner) closeStatsD() { r.core.statsdC.Close() }

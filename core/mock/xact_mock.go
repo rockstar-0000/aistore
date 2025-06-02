@@ -1,6 +1,6 @@
 // Package mock provides a variety of mock implementations used for testing.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mock
 
@@ -30,7 +30,7 @@ func (*XactMock) Run(*sync.WaitGroup) {
 
 func NewXact(kind string) *XactMock {
 	xctn := &XactMock{}
-	xctn.InitBase(cos.GenUUID(), kind, nil)
+	xctn.InitBase(cos.GenUUID(), kind, "", nil)
 	return xctn
 }
 

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 import unittest
@@ -9,9 +9,8 @@ from urllib3 import Retry
 
 from aistore.sdk.authn import AuthNClient
 from aistore.sdk.authn.types import TokenMsg, LoginMsg
-from aistore.sdk.authn.utils import raise_authn_error
 
-from tests.utils import test_cases
+from tests.utils import cases
 
 
 # pylint: disable=unused-variable, duplicate-code
@@ -22,17 +21,18 @@ class TestAuthNClient(unittest.TestCase):
 
     @patch("aistore.sdk.authn.authn_client.SessionManager")
     @patch("aistore.sdk.authn.authn_client.RequestClient")
-    def test_init_defaults(self, mock_request_client, mock_sm):
+    @patch("aistore.sdk.authn.authn_client.AuthNResponseHandler")
+    def test_init_defaults(self, mock_rh, mock_request_client, mock_sm):
         AuthNClient(self.endpoint)
         mock_request_client.assert_called_with(
             endpoint=self.endpoint,
             session_manager=mock_sm.return_value,
             timeout=None,
             token=None,
-            error_handler=raise_authn_error,
+            response_handler=mock_rh.return_value,
         )
 
-    @test_cases(
+    @cases(
         (True, None, None, None, "dummy.token"),
         (False, "ca_cert_location", None, None, None),
         (False, None, 30.0, Retry(total=20), None),
@@ -40,7 +40,8 @@ class TestAuthNClient(unittest.TestCase):
     )
     @patch("aistore.sdk.authn.authn_client.SessionManager")
     @patch("aistore.sdk.authn.authn_client.RequestClient")
-    def test_init(self, test_case, mock_request_client, mock_sm):
+    @patch("aistore.sdk.authn.authn_client.AuthNResponseHandler")
+    def test_init(self, test_case, mock_rh, mock_request_client, mock_sm):
         skip_verify, ca_cert, timeout, retry, token = test_case
         # print all vars
         print(
@@ -64,7 +65,7 @@ class TestAuthNClient(unittest.TestCase):
             session_manager=mock_sm.return_value,
             timeout=timeout,
             token=token,
-            error_handler=raise_authn_error,
+            response_handler=mock_rh.return_value,
         )
 
     @patch("aistore.sdk.request_client.RequestClient.request_deserialize")

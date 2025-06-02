@@ -1,7 +1,7 @@
 // Package nlog - aistore logger, provides buffering, timestamping, writing, and
 // flushing/syncing/rotating
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package nlog
 
@@ -23,6 +23,7 @@ var MaxSize int64 = 4 * 1024 * 1024 // usually, config.log.max_size
 func InfoDepth(depth int, args ...any)    { log(sevInfo, depth, "", args...) }
 func Infoln(args ...any)                  { log(sevInfo, 0, "", args...) }
 func Infof(format string, args ...any)    { log(sevInfo, 0, format, args...) }
+func WarningDepth(depth int, args ...any) { log(sevWarn, depth, "", args...) }
 func Warningln(args ...any)               { log(sevWarn, 0, "", args...) }
 func Warningf(format string, args ...any) { log(sevWarn, 0, format, args...) }
 func ErrorDepth(depth int, args ...any)   { log(sevErr, depth, "", args...) }

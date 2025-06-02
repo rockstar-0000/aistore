@@ -38,7 +38,7 @@ run_cmd() {
 # 3. when adding/deleting backends, update the 3 (three) functions that follow below:
 
 set_env_backends() {
-  known_backends=( aws gcp azure ht )
+  known_backends=( aws gcp azure oci ht )
   if [[ ! -z $TAGS ]]; then
     ## environment var TAGS may contain any/all build tags, including backends
     for b in "${known_backends[@]}"; do
@@ -63,8 +63,9 @@ set_env_backends() {
         aws)   ;;
         azure) ;;
         gcp)   ;;
+        oci)   ;;
         ht)    ;;
-	*) echo "fatal: unknown backend '$b' in 'AIS_BACKEND_PROVIDERS=${AIS_BACKEND_PROVIDERS}'"; exit 1;;
+        *)     echo "fatal: unknown backend '$b' in 'AIS_BACKEND_PROVIDERS=${AIS_BACKEND_PROVIDERS}'"; exit 1;;
       esac
     done
     ## consume (and discard) all reads
@@ -107,6 +108,15 @@ _set_env_backends() {
   if  [[ "${cld_azure}" == "y" ]] ; then
     AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} azure"
   fi
+  echo "OCI: (y/n) ?"
+  read -r cld_oci
+  if [[ "$cld_oci" == "" ]] ; then
+    return
+  fi
+  is_boolean "${cld_oci}"
+  if  [[ "${cld_oci}" == "y" ]] ; then
+    AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} oci"
+  fi
 }
 
 make_backend_conf() {
@@ -116,6 +126,7 @@ make_backend_conf() {
       aws)   backend_conf+=('"aws":   {}') ;;
       azure) backend_conf+=('"azure": {}') ;;
       gcp)   backend_conf+=('"gcp":   {}') ;;
+      oci)   backend_conf+=('"oci":   {}') ;;
       ht)    backend_conf+=('"ht":    {}') ;;
     esac
   done
@@ -196,4 +207,74 @@ rm_loopbacks() {
       sudo losetup -d "${mpath}"
     done
   fi
+}
+
+set_env_tracing_or_skip() {
+  echo "$AIS_TRACING_ENDPOINT"
+  if [[ -n "${AIS_TRACING_ENDPOINT}" ]]; then
+    TAGS="${TAGS} oteltracing"
+    return
+  fi
+
+  echo "Enable distributed tracings (y/n)?"
+  read -r enable_tracing
+
+  ## check presence
+  if [[ "$enable_tracing" == "" || "$enable_tracing" == "n" ]] ; then
+    return
+  fi
+
+  is_boolean "${enable_tracing}"
+
+  ## check presence
+  if [[ "$enable_tracing" == "y" ]] ; then
+    TAGS="${TAGS} oteltracing"
+  else
+    return
+  fi
+
+  echo "Exporter endpoint (default:'localhost:4317' jaeger)"
+  read -r exporter_endpoint
+  if [[ -z "${AIS_TRACING_ENDPOINT}" ]]; then
+    AIS_TRACING_ENDPOINT=${exporter_endpoint:-"localhost:4317"}
+  fi
+
+  echo "Exporter auth-header (default:'')"
+  read -r exporter_auth_header
+  if [[ -z "${AIS_TRACING_AUTH_TOKEN_HEADER}" ]]; then
+    AIS_TRACING_AUTH_TOKEN_HEADER=${exporter_auth_header}
+  fi
+
+  echo "Exporter auth-token-file (default:'')"
+  read -r exporter_auth_token_file
+  if [[ -z "${AIS_TRACING_AUTH_TOKEN_FILE}" ]]; then
+    AIS_TRACING_AUTH_TOKEN_FILE={exporter_auth_token_file}
+  fi
+}
+
+
+make_tracing_conf() {
+  tracing_auth_conf=""
+  if [[ -n "${AIS_TRACING_AUTH_TOKEN_HEADER}" && -n "${AIS_TRACING_AUTH_TOKEN_FILE}" ]]; then
+    tracing_auth_conf=',
+      "exporter_auth": {
+        "token_header": "'"${AIS_TRACING_AUTH_TOKEN_HEADER}"'",
+        "token_file": "'"${AIS_TRACING_AUTH_TOKEN_FILE}"'"
+      }'
+  fi
+
+  tracing_conf=""
+  if [[ -n "${AIS_TRACING_ENDPOINT}" ]]; then
+    tracing_conf='
+      "tracing": {
+        "enabled": true,
+        "exporter_endpoint": "'${AIS_TRACING_ENDPOINT}'",
+        "skip_verify": true,
+        "service_name_prefix": "'${AIS_TRACING_SERVICE_PREFIX:-aistore}'",
+        "sampler_probability": "'${AIS_TRACING_SAMPLING_PROBABILITY:-1.0}'"'${tracing_auth_conf}'
+      },
+    '
+  fi
+
+  echo "${tracing_conf}"
 }

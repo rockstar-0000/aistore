@@ -1,6 +1,6 @@
 // Package dloader_test is a unit test
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload_test
 
@@ -56,7 +56,7 @@ func TestCompareObject(t *testing.T) {
 	// initialize http clients
 	clientConf.Timeout = 5 * cos.Duration(time.Second)
 	clientConf.TimeoutLong = 15 * cos.Duration(time.Second)
-	dload.Init(nil, nil, &clientConf)
+	dload.Init(nil, &clientConf)
 
 	// Modify local object to contain invalid (meta)data.
 	customMD := cos.StrKVs{

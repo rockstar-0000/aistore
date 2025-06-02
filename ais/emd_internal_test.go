@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/ext/etl"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -22,7 +23,7 @@ func TestEtlMDDeepCopy(t *testing.T) {
 	etlMD := newEtlMD()
 	etlMD.Add(&etl.InitCodeMsg{
 		InitMsgBase: etl.InitMsgBase{
-			IDX:       "init-code",
+			EtlName:   "init-code",
 			CommTypeX: etl.Hpush,
 		},
 		Code: []byte("print('hello')"),
@@ -52,7 +53,7 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 		// Set path for proxy (it uses ConfigDir)
 		config := cmn.GCO.BeginUpdate()
 		config.ConfigDir = mpath
-		config.Cksum.Type = cos.ChecksumXXHash
+		config.Cksum.Type = cos.ChecksumOneXxh
 		config.Space = cmn.SpaceConf{
 			LowWM: 75, HighWM: 90, OOS: 95,
 		}
@@ -63,13 +64,13 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 		cfg = cmn.GCO.Get()
 
 		etlMD = newEtlMD()
-		for _, initType := range []string{etl.Code, etl.Spec} {
+		for _, initType := range []string{etl.CodeType, etl.SpecType} {
 			for i := range 5 {
 				var msg etl.InitMsg
-				if initType == etl.Code {
+				if initType == etl.CodeType {
 					msg = &etl.InitCodeMsg{
 						InitMsgBase: etl.InitMsgBase{
-							IDX:       fmt.Sprintf("init-code-%d", i),
+							EtlName:   fmt.Sprintf("init-code-%d", i),
 							CommTypeX: etl.Hpush,
 						},
 						Code: []byte(fmt.Sprintf("print('hello-%d')", i)),
@@ -77,7 +78,7 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 				} else {
 					msg = &etl.InitSpecMsg{
 						InitMsgBase: etl.InitMsgBase{
-							IDX:       fmt.Sprintf("init-spec-%d", i),
+							EtlName:   fmt.Sprintf("init-spec-%d", i),
 							CommTypeX: etl.Hpush,
 						},
 						Spec: []byte(fmt.Sprintf("test spec - %d", i)),
@@ -127,7 +128,7 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 							clone := etlMD.clone()
 							msg := &etl.InitCodeMsg{
 								InitMsgBase: etl.InitMsgBase{
-									IDX:       "init-code-" + cos.GenTie(),
+									EtlName:   "init-code-" + cos.GenTie(),
 									CommTypeX: etl.Hpush,
 								},
 								Code: []byte("print('hello')"),

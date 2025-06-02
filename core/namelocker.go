@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -8,9 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/OneOfOne/xxhash"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 const nlpTryDefault = time.Second // nlp.TryLock default duration
@@ -23,17 +25,14 @@ const nlpTryDefault = time.Second // nlp.TryLock default duration
 // The lock can be exclusive (write) or shared (read).
 
 type (
-	nameLocker []nlc
+	nameLocker [cos.MultiHashMapCount]nlc
 	nlc        struct {
 		m  map[string]*lockInfo
 		mu sync.Mutex
 	}
 	lockInfo struct {
-		wcond     *sync.Cond // to synchronize "waiting room" upgrade logic
-		rc        int32      // read-lock refcount
-		waiting   int32      // waiting room count
-		exclusive bool       // write-lock
-		upgraded  bool       // indication for the waiters that upgrade's done
+		rc        int32 // read-lock refcount
+		exclusive bool  // write-lock
 	}
 )
 
@@ -66,36 +65,10 @@ const (
 ////////////////
 
 func newNameLocker() (nl nameLocker) {
-	nl = make(nameLocker, cos.MultiSyncMapCount)
 	for idx := range nl {
 		nl[idx].init()
 	}
 	return
-}
-
-//////////////
-// lockInfo //
-//////////////
-
-func (li *lockInfo) notify() {
-	if li.wcond == nil || li.waiting == 0 {
-		return
-	}
-	debug.Assert(li.rc >= li.waiting)
-	if li.upgraded {
-		// has been upgraded - wake up all waiters
-		li.wcond.Broadcast()
-	} else {
-		// wake up only the owner
-		li.wcond.Signal()
-	}
-}
-
-func (li *lockInfo) decWaiting() {
-	li.waiting--
-	if li.waiting == 0 {
-		li.wcond = nil
-	}
 }
 
 /////////
@@ -106,15 +79,21 @@ func (nlc *nlc) init() {
 	nlc.m = make(map[string]*lockInfo, initCapacity)
 }
 
-func (nlc *nlc) IsLocked(uname string) (rc int, exclusive bool) {
+// returns {apc.LockNone, ...} enum
+func (nlc *nlc) IsLocked(uname string) int {
 	nlc.mu.Lock()
 	defer nlc.mu.Unlock()
 
 	lockInfo, found := nlc.m[uname]
-	if !found {
-		return
+	switch {
+	case !found:
+		return apc.LockNone
+	case lockInfo.exclusive:
+		return apc.LockWrite
+	case lockInfo.rc > 0:
+		return apc.LockRead
 	}
-	return int(lockInfo.rc), lockInfo.exclusive
+	return apc.LockNone
 }
 
 func (nlc *nlc) TryLock(uname string, exclusive bool) (locked bool) {
@@ -142,10 +121,6 @@ func (nlc *nlc) try(uname string, exclusive bool) bool {
 	if li.exclusive {
 		return false
 	}
-	// can't rlock if there's someone trying to upgrade
-	if li.waiting > 0 {
-		return false
-	}
 	li.rc++
 	return true
 }
@@ -167,55 +142,28 @@ func (nlc *nlc) Lock(uname string, exclusive bool) {
 	}
 }
 
-// upgrade rlock -> wlock
-// e.g. usage: simultaneous cold GET
-// returns true if exclusively locked by _another_ thread
-func (nlc *nlc) UpgradeLock(uname string) bool {
+// lone reader: upgrade rlock -> wlock
+// otherwise:   fail
+func (nlc *nlc) UpgradeLock(uname string) (wlocked bool) {
 	nlc.mu.Lock()
 	li, found := nlc.m[uname]
-	debug.Assert(found && !li.exclusive && li.rc > 0)
+	debug.Assert(found && !li.exclusive && li.rc > 0,
+		"found ", found, " li.exclusive ", li.exclusive, " li.rc ", li.rc)
 	if li.rc == 1 {
 		li.rc = 0
 		li.exclusive = true
-		nlc.mu.Unlock()
-		return false
+		wlocked = true
 	}
-
-	//
-	// TODO -- FIXME: consider removing this part, simplifying `wcond` out, returning EBUSY instead..
-	//
-
-	if li.wcond == nil {
-		li.wcond = sync.NewCond(&nlc.mu)
-	}
-	li.waiting++
-	// Wait here until all readers get in line
-	for li.rc != li.waiting {
-		li.wcond.Wait()
-
-		// Has been upgraded by smbd. else
-		if li.upgraded {
-			li.decWaiting()
-			nlc.mu.Unlock()
-			return true
-		}
-	}
-	// Upgrading
-	li.upgraded = true
-	li.rc--
-	li.decWaiting()
-	li.exclusive = true
 	nlc.mu.Unlock()
-	return false
+	return wlocked
 }
 
 func (nlc *nlc) DowngradeLock(uname string) {
 	nlc.mu.Lock()
 	li, found := nlc.m[uname]
-	debug.Assert(found && li.exclusive)
+	debug.Assert(found && li.exclusive, "found ", found, " li.exclusive ", li.exclusive, " li.rc ", li.rc)
 	li.rc++
 	li.exclusive = false
-	li.notify()
 	nlc.mu.Unlock()
 }
 
@@ -223,22 +171,18 @@ func (nlc *nlc) Unlock(uname string, exclusive bool) {
 	nlc.mu.Lock()
 	li, found := nlc.m[uname]
 	debug.Assert(found)
+
 	if exclusive {
 		debug.Assert(li.exclusive)
-		if li.waiting > 0 {
-			li.exclusive = false
-			li.notify()
-		} else {
-			delete(nlc.m, uname)
-		}
+		delete(nlc.m, uname)
 		nlc.mu.Unlock()
 		return
 	}
+
 	li.rc--
 	if li.rc == 0 {
 		delete(nlc.m, uname)
 	}
-	li.notify()
 	nlc.mu.Unlock()
 }
 
@@ -253,8 +197,8 @@ var _ NLP = (*nlp)(nil)
 func NewNLP(name []byte) NLP {
 	var (
 		nlp  = &nlp{uname: cos.UnsafeS(name)}
-		hash = xxhash.Checksum64S(name, cos.MLCG32)
-		idx  = int(hash & cos.MultiSyncMapMask)
+		hash = onexxh.Checksum64S(name, cos.MLCG32)
+		idx  = int(hash & cos.MultiHashMapMask)
 	)
 	nlp.nlc = &bckLocker[idx] // NOTE: bckLocker
 	return nlp

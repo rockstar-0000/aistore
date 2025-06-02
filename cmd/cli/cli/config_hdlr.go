@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 )
@@ -76,23 +77,23 @@ var (
 			makeAlias(showCmdConfig, "", true, commandShow), // alias for `ais show`
 			{
 				Name:         cmdCluster,
-				Usage:        "configure AIS cluster",
+				Usage:        "Configure AIS cluster",
 				ArgsUsage:    keyValuePairsArgument,
-				Flags:        configCmdsFlags[cmdCluster],
+				Flags:        sortFlags(configCmdsFlags[cmdCluster]),
 				Action:       setCluConfigHandler,
 				BashComplete: setCluConfigCompletions,
 			},
 			{
 				Name:         cmdNode,
-				Usage:        "configure AIS node",
+				Usage:        "Configure AIS node",
 				ArgsUsage:    nodeConfigArgument,
-				Flags:        configCmdsFlags[cmdNode],
+				Flags:        sortFlags(configCmdsFlags[cmdNode]),
 				Action:       setNodeConfigHandler,
 				BashComplete: setNodeConfigCompletions,
 			},
 			{
 				Name:         cmdReset,
-				Usage:        "reset (cluster | node | CLI) configuration to system defaults",
+				Usage:        "Reset (cluster | node | CLI) configuration to system defaults",
 				ArgsUsage:    optionalNodeIDArgument,
 				Action:       resetConfigHandler,
 				BashComplete: showConfigCompletions, // `cli  cluster  p[...]   t[...]`
@@ -106,33 +107,34 @@ var (
 	// cli
 	clicfgCmd = cli.Command{
 		Name:   cmdCLI,
-		Usage:  "display and change AIS CLI configuration",
+		Usage:  "Display and change AIS CLI configuration",
 		Action: showCfgCLI,
-		Flags:  clicfgCmdFlags[cmdCLIShow],
+		Flags:  sortFlags(clicfgCmdFlags[cmdCLIShow]),
 		Subcommands: []cli.Command{
 			{
 				Name:   cmdCLIShow,
-				Usage:  "display CLI configuration",
-				Flags:  clicfgCmdFlags[cmdCLIShow],
+				Usage:  "Display CLI configuration",
+				Flags:  sortFlags(clicfgCmdFlags[cmdCLIShow]),
 				Action: showCfgCLI,
 			},
 			{
 				Name:         cmdCLISet,
-				Usage:        "change CLI configuration",
+				Usage:        "Update CLI configuration",
 				ArgsUsage:    keyValuePairsArgument,
-				Flags:        clicfgCmdFlags[cmdCLISet],
+				Flags:        sortFlags(clicfgCmdFlags[cmdCLISet]),
 				Action:       setCfgCLI,
 				BashComplete: cliPropCompletions,
 			},
 			{
 				Name:   cmdCLIReset,
-				Usage:  "reset CLI configurations to system defaults",
+				Usage:  "Reset CLI configurations to system defaults",
 				Action: resetCfgCLI,
 			},
 		},
 	}
 )
 
+// TODO: prune config.ClusterConfig - hide deprecated "non_electable"
 func setCluConfigHandler(c *cli.Context) error {
 	var (
 		nvs      cos.StrKVs
@@ -289,6 +291,7 @@ func setcfg(c *cli.Context, nvs cos.StrKVs) error {
 	return nil
 }
 
+//nolint:staticcheck // `localNodeCfgErr` with punctuation for usability
 func setNodeConfigHandler(c *cli.Context) error {
 	var (
 		config   cmn.Config

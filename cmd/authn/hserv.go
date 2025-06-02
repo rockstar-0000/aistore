@@ -1,10 +1,11 @@
 // Package authn is authentication server for AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -44,6 +46,11 @@ func parseURL(w http.ResponseWriter, r *http.Request, itemsAfter int, items []st
 	return items, err
 }
 
+func (h *hserv) failAction(w http.ResponseWriter, r *http.Request, action, what string, err error, code int) {
+	err = cmn.NewErrFailedTo(h.mgr, action, what, err, code)
+	cmn.WriteErr(w, r, err, code)
+}
+
 // Run public server to manage users and generate tokens
 func (h *hserv) Run() error {
 	var (
@@ -55,7 +62,7 @@ func (h *hserv) Run() error {
 	)
 
 	// Retrieve and set the port
-	portStr = os.Getenv(env.AuthN.Port)
+	portStr = os.Getenv(env.AisAuthPort)
 	if portStr == "" {
 		portStr = fmt.Sprintf(":%d", Conf.Net.HTTP.Port)
 	} else {
@@ -74,12 +81,12 @@ func (h *hserv) Run() error {
 	}
 
 	// Retrieve and set HTTPS configuration with environment variables taking precedence
-	useHTTPS, err = cos.IsParseEnvBoolOrDefault(env.AuthN.UseHTTPS, Conf.Net.HTTP.UseHTTPS)
+	useHTTPS, err = cos.IsParseEnvBoolOrDefault(env.AisAuthUseHTTPS, Conf.Net.HTTP.UseHTTPS)
 	if err != nil {
-		nlog.Errorf("Failed to parse %s: %v. Defaulting to false", env.AuthN.UseHTTPS, err)
+		nlog.Errorf("Failed to parse %s: %v. Defaulting to false", env.AisAuthUseHTTPS, err)
 	}
-	serverCert = cos.GetEnvOrDefault(env.AuthN.ServerCrt, Conf.Net.HTTP.Certificate)
-	serverKey = cos.GetEnvOrDefault(env.AuthN.ServerKey, Conf.Net.HTTP.Key)
+	serverCert = cos.GetEnvOrDefault(env.AisAuthServerCrt, Conf.Net.HTTP.Certificate)
+	serverKey = cos.GetEnvOrDefault(env.AisAuthServerKey, Conf.Net.HTTP.Key)
 
 	// Start the appropriate server based on the configuration
 	if useHTTPS {
@@ -182,9 +189,9 @@ func (h *hserv) httpUserDel(w http.ResponseWriter, r *http.Request) {
 	if err = validateAdminPerms(w, r); err != nil {
 		return
 	}
-	if err := h.mgr.delUser(apiItems[0]); err != nil {
-		nlog.Errorf("Failed to delete user: %v\n", err)
-		cmn.WriteErrMsg(w, r, "Failed to delete user: "+err.Error())
+	userID := apiItems[0]
+	if code, err := h.mgr.delUser(userID); err != nil {
+		h.failAction(w, r, "delete user", userID, err, code)
 	}
 }
 
@@ -206,9 +213,6 @@ func (h *hserv) httpUserPut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err = validateAdminPerms(w, r); err != nil {
-		return
-	}
 	var (
 		userID    = apiItems[0]
 		updateReq = &authn.User{}
@@ -218,12 +222,14 @@ func (h *hserv) httpUserPut(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErrMsg(w, r, "Invalid request")
 		return
 	}
+	if err = validateUpdatePerms(w, r, userID, updateReq); err != nil {
+		return
+	}
 	if Conf.Verbose() {
 		nlog.Infof("PUT user %q", userID)
 	}
-	if err := h.mgr.updateUser(userID, updateReq); err != nil {
-		cmn.WriteErr(w, r, err)
-		return
+	if code, err := h.mgr.updateUser(userID, updateReq); err != nil {
+		h.failAction(w, r, "update user", userID, err, code)
 	}
 }
 
@@ -236,8 +242,8 @@ func (h *hserv) userAdd(w http.ResponseWriter, r *http.Request) {
 	if err := cmn.ReadJSON(w, r, info); err != nil {
 		return
 	}
-	if err := h.mgr.addUser(info); err != nil {
-		cmn.WriteErrMsg(w, r, fmt.Sprintf("Failed to add user: %v", err), http.StatusInternalServerError)
+	if code, err := h.mgr.addUser(info); err != nil {
+		h.failAction(w, r, "add user", info.ID, err, code)
 		return
 	}
 	if Conf.Verbose() {
@@ -255,11 +261,13 @@ func (h *hserv) httpUserGet(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErrMsg(w, r, "invalid request")
 		return
 	}
-
-	var users map[string]*authn.User
+	var (
+		users map[string]*authn.User
+		code  int
+	)
 	if len(items) == 0 {
-		if users, err = h.mgr.userList(); err != nil {
-			cmn.WriteErr(w, r, err)
+		if users, code, err = h.mgr.userList(); err != nil {
+			cmn.WriteErr(w, r, err, code)
 			return
 		}
 		for _, uInfo := range users {
@@ -268,32 +276,36 @@ func (h *hserv) httpUserGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, users, "list users")
 		return
 	}
-
-	uInfo, err := h.mgr.lookupUser(items[0])
+	uInfo, code, err := h.mgr.lookupUser(items[0])
 	if err != nil {
-		cmn.WriteErr(w, r, err)
+		cmn.WriteErr(w, r, err, code)
 		return
 	}
 	uInfo.Password = ""
 	writeJSON(w, uInfo, "get user")
 }
 
+func getToken(r *http.Request) (*tok.Token, error) {
+	tokenStr, err := tok.ExtractToken(r.Header)
+	if err != nil {
+		return nil, err
+	}
+	secret := Conf.Secret()
+	tk, err := tok.DecryptToken(tokenStr, secret)
+	if err != nil {
+		return nil, err
+	}
+	if tk.Expires.Before(time.Now()) {
+		return nil, fmt.Errorf("not authorized (token expired): %s", tk)
+	}
+	return tk, nil
+}
+
 // Checks if the request header contains valid admin credentials.
 // (admin is created at deployment time and cannot be modified via API)
 func validateAdminPerms(w http.ResponseWriter, r *http.Request) error {
-	token, err := tok.ExtractToken(r.Header)
+	tk, err := getToken(r)
 	if err != nil {
-		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
-		return err
-	}
-	secret := Conf.Secret()
-	tk, err := tok.DecryptToken(token, secret)
-	if err != nil {
-		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
-		return err
-	}
-	if tk.Expires.Before(time.Now()) {
-		err := fmt.Errorf("not authorized: %s", tk)
 		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
 		return err
 	}
@@ -303,6 +315,23 @@ func validateAdminPerms(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	return nil
+}
+
+func validateUpdatePerms(w http.ResponseWriter, r *http.Request, userID string, updateReq *authn.User) error {
+	tk, err := getToken(r)
+	if err != nil {
+		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
+		return err
+	}
+	if tk.IsAdmin {
+		return nil
+	}
+	if tk.UserID == userID && len(updateReq.Roles) == 0 {
+		return nil
+	}
+	err = fmt.Errorf("not authorized: (%s)", tk)
+	cmn.WriteErr(w, r, err, http.StatusUnauthorized)
+	return err
 }
 
 // Generate h token for h user if provided credentials are valid.
@@ -324,11 +353,11 @@ func (h *hserv) userLogin(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		token  string
+		code   int
 		userID = apiItems[0]
 	)
-	if token, err = h.mgr.issueToken(userID, msg.Password, msg); err != nil {
-		nlog.Errorf("failed to generate token for user %q: %v\n", userID, err)
-		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
+	if token, code, err = h.mgr.issueToken(userID, msg.Password, msg); err != nil {
+		h.failAction(w, r, "generate token for", userID, err, code)
 		return
 	}
 
@@ -361,8 +390,8 @@ func (h *hserv) httpSrvPost(w http.ResponseWriter, r *http.Request) {
 	if err := cmn.ReadJSON(w, r, cluConf); err != nil {
 		return
 	}
-	if err := h.mgr.addCluster(cluConf); err != nil {
-		cmn.WriteErr(w, r, err, http.StatusInternalServerError)
+	if code, err := h.mgr.addCluster(cluConf); err != nil {
+		h.failAction(w, r, "add cluster", cluConf.ID, err, code)
 	}
 }
 
@@ -379,8 +408,8 @@ func (h *hserv) httpSrvPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cluID := apiItems[0]
-	if err := h.mgr.updateCluster(cluID, cluConf); err != nil {
-		cmn.WriteErr(w, r, err, http.StatusInternalServerError)
+	if code, err := h.mgr.updateCluster(cluID, cluConf); err != nil {
+		h.failAction(w, r, "update cluster", cluID, err, code)
 	}
 }
 
@@ -392,17 +421,14 @@ func (h *hserv) httpSrvDelete(w http.ResponseWriter, r *http.Request) {
 	if err = validateAdminPerms(w, r); err != nil {
 		return
 	}
-
+	cluID := apiItems[0]
 	if len(apiItems) == 0 {
-		cmn.WriteErrMsg(w, r, "cluster name or ID is not defined", http.StatusInternalServerError)
+		err = errors.New("cluster name or ID not defined")
+		h.failAction(w, r, "delete cluster", cluID, err, http.StatusBadRequest)
 		return
 	}
-	if err := h.mgr.delCluster(apiItems[0]); err != nil {
-		if cos.IsErrNotFound(err) {
-			cmn.WriteErr(w, r, err, http.StatusNotFound)
-		} else {
-			cmn.WriteErr(w, r, err, http.StatusInternalServerError)
-		}
+	if code, err := h.mgr.delCluster(cluID); err != nil {
+		h.failAction(w, r, "delete cluster", cluID, err, code)
 	}
 }
 
@@ -414,22 +440,18 @@ func (h *hserv) httpSrvGet(w http.ResponseWriter, r *http.Request) {
 	var cluList *authn.RegisteredClusters
 	if len(apiItems) != 0 {
 		cid := apiItems[0]
-		clu, err := h.mgr.getCluster(cid)
+		clu, code, err := h.mgr.getCluster(cid)
 		if err != nil {
-			if cos.IsErrNotFound(err) {
-				cmn.WriteErr(w, r, err, http.StatusNotFound)
-			} else {
-				cmn.WriteErr(w, r, err, http.StatusInternalServerError)
-			}
+			cmn.WriteErr(w, r, err, code)
 			return
 		}
 		cluList = &authn.RegisteredClusters{
 			Clusters: map[string]*authn.CluACL{clu.ID: clu},
 		}
 	} else {
-		clus, err := h.mgr.clus()
+		clus, code, err := h.mgr.clus()
 		if err != nil {
-			cmn.WriteErr(w, r, err, http.StatusInternalServerError)
+			cmn.WriteErr(w, r, err, code)
 			return
 		}
 		cluList = &authn.RegisteredClusters{Clusters: clus}
@@ -463,23 +485,23 @@ func (h *hserv) httpRoleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(apiItems) == 0 {
-		roles, err := h.mgr.roleList()
+		roles, code, err := h.mgr.roleList()
 		if err != nil {
-			cmn.WriteErr(w, r, err)
+			cmn.WriteErr(w, r, err, code)
 			return
 		}
 		writeJSON(w, roles, "list roles")
 		return
 	}
 
-	role, err := h.mgr.lookupRole(apiItems[0])
+	role, code, err := h.mgr.lookupRole(apiItems[0])
 	if err != nil {
-		cmn.WriteErr(w, r, err)
+		cmn.WriteErr(w, r, err, code)
 		return
 	}
-	clus, err := h.mgr.clus()
+	clus, code, err := h.mgr.clus()
 	if err != nil {
-		cmn.WriteErr(w, r, err)
+		cmn.WriteErr(w, r, err, code)
 		return
 	}
 	for _, clu := range role.ClusterACLs {
@@ -500,8 +522,8 @@ func (h *hserv) httpRoleDel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roleID := apiItems[0]
-	if err = h.mgr.delRole(roleID); err != nil {
-		cmn.WriteErr(w, r, err)
+	if code, err := h.mgr.delRole(roleID); err != nil {
+		h.failAction(w, r, "delete role", roleID, err, code)
 	}
 }
 
@@ -517,8 +539,8 @@ func (h *hserv) httpRolePost(w http.ResponseWriter, r *http.Request) {
 	if err := cmn.ReadJSON(w, r, info); err != nil {
 		return
 	}
-	if err := h.mgr.addRole(info); err != nil {
-		cmn.WriteErrMsg(w, r, fmt.Sprintf("Failed to add role: %v", err), http.StatusInternalServerError)
+	if code, err := h.mgr.addRole(info); err != nil {
+		h.failAction(w, r, "add role", info.Name, err, code)
 	}
 }
 
@@ -541,11 +563,7 @@ func (h *hserv) httpRolePut(w http.ResponseWriter, r *http.Request) {
 	if Conf.Verbose() {
 		nlog.Infof("PUT role %q\n", role)
 	}
-	if err := h.mgr.updateRole(role, updateReq); err != nil {
-		if cos.IsErrNotFound(err) {
-			cmn.WriteErr(w, r, err, http.StatusNotFound)
-		} else {
-			cmn.WriteErr(w, r, err)
-		}
+	if code, err := h.mgr.updateRole(role, updateReq); err != nil {
+		h.failAction(w, r, "update role", role, err, code)
 	}
 }

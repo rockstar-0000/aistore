@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
-* Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -66,9 +66,10 @@ func (*putFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 
 func (p *putFactory) Start() error {
 	xec := ECM.NewPutXact(p.Bck.Bucket())
-	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
+	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), "" /*ctlmsg*/, p.Bck, 0 /*use default*/)
 	p.xctn = xec
-	go xec.Run(nil)
+
+	xact.GoRunW(xec)
 	return nil
 }
 
@@ -85,25 +86,17 @@ func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 /////////////
 
 func newPutXact(bck *cmn.Bck, mgr *Manager) *XactPut {
-	var (
-		avail, disabled = fs.Get()
-		totalPaths      = len(avail) + len(disabled)
-		config          = cmn.GCO.Get()
-		xctn            = &XactPut{
-			putJoggers: make(map[string]*putJogger, totalPaths),
-		}
-	)
-	xctn.xactECBase.init(config, bck, mgr)
+	xctn := &XactPut{}
+	xctn.xactECBase.init(cmn.GCO.Get(), bck, mgr)
 	xctn.xactReqBase.init()
 
-	// create all runners but do not start them until Run is called
-	for mpath := range avail {
-		putJog := xctn.newPutJogger(mpath)
-		xctn.putJoggers[mpath] = putJog
-	}
-	for mpath := range disabled {
-		putJog := xctn.newPutJogger(mpath)
-		xctn.putJoggers[mpath] = putJog
+	// construct all joggers
+	avail, disabled := fs.Get()
+	xctn.putJoggers = make(map[string]*putJogger, len(avail)+len(disabled))
+	for _, mpi := range []fs.MPI{avail, disabled} {
+		for mpath := range mpi {
+			xctn.putJoggers[mpath] = xctn.newPutJogger(mpath)
+		}
 	}
 	return xctn
 }
@@ -112,8 +105,8 @@ func (r *XactPut) newPutJogger(mpath string) *putJogger {
 	j := &putJogger{
 		parent: r,
 		mpath:  mpath,
-		putCh:  make(chan *request, requestBufSizeFS),
-		xactCh: make(chan *request, requestBufSizeEncode),
+		putCh:  make(chan *request, max(putxBurstSize, r.config.EC.Burst)),
+		xactCh: make(chan *request, max(encodeBurstSize, r.config.EC.Burst)),
 	}
 	j.stopCh.Init()
 	return j
@@ -131,12 +124,15 @@ func (r *XactPut) dispatchRequest(req *request, lom *core.LOM) error {
 	case ActDelete:
 		r.stats.updateDelete()
 	default:
-		return fmt.Errorf("invalid request's action %s for putxaction", req.Action)
+		return fmt.Errorf("%s: invalid action %q", r, req.Action)
 	}
 
 	jogger, ok := r.putJoggers[lom.Mountpath().Path]
 	if !ok {
-		debug.Assert(false, "invalid "+lom.Mountpath().String())
+		err := errLossMpath(r, lom)
+		debug.Assert(false, err)
+		r.Abort(err)
+		return err
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("ECPUT (bg queue = %d): dispatching object %s....", len(jogger.putCh), lom)
@@ -150,7 +146,7 @@ func (r *XactPut) dispatchRequest(req *request, lom *core.LOM) error {
 	return nil
 }
 
-func (r *XactPut) Run(*sync.WaitGroup) {
+func (r *XactPut) Run(gowg *sync.WaitGroup) {
 	nlog.Infoln(r.Name())
 
 	var wg sync.WaitGroup
@@ -160,6 +156,7 @@ func (r *XactPut) Run(*sync.WaitGroup) {
 	}
 
 	ECM.incActive(r)
+	gowg.Done()
 
 	ticker := time.NewTicker(r.config.Periodic.StatsTime.D())
 	r.mainLoop(ticker)
@@ -169,7 +166,6 @@ func (r *XactPut) Run(*sync.WaitGroup) {
 	r.Finish()
 }
 
-// all requests are equal, throttle TODO
 func (r *XactPut) mainLoop(ticker *time.Ticker) {
 	for {
 		select {

@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
 const fmtErrBckObj = "invalid %s request: expecting bucket and object (names) in the URL, have %v"
@@ -71,7 +72,7 @@ func (t *target) putCopyMpt(w http.ResponseWriter, r *http.Request, config *cmn.
 		s3.WriteErr(w, r, cs.Err(), http.StatusInsufficientStorage)
 		return
 	}
-	bck, err, ecode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	bck, ecode, err := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
@@ -110,7 +111,7 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.C
 		return
 	}
 	// src
-	bckSrc, err, ecode := meta.InitByNameOnly(parts[0], t.owner.bmd)
+	bckSrc, ecode, err := meta.InitByNameOnly(parts[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
@@ -137,35 +138,37 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.C
 		return
 	}
 	// dst
-	bckTo, err, ecode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	bckTo, ecode, err := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
 	}
 
-	coiParams := core.AllocCOI()
+	coiParams := xs.AllocCOI()
 	{
 		coiParams.Config = config
 		coiParams.BckTo = bckTo
 		coiParams.ObjnameTo = s3.ObjName(items)
 		coiParams.OWT = cmn.OwtCopy
 	}
-	coi := (*copyOI)(coiParams)
-	_, err = coi.do(t, nil /*DM*/, lom)
-	core.FreeCOI(coiParams)
+	coi := (*coi)(coiParams)
+	res := coi.do(t, nil /*DM*/, lom)
+	xs.FreeCOI(coiParams)
 
-	if err != nil {
-		if err == cmn.ErrSkip {
+	if res.Err != nil {
+		if res.Err == cmn.ErrSkip {
 			name := lom.Cname()
 			s3.WriteErr(w, r, cos.NewErrNotFound(t, name), http.StatusNotFound)
 		} else {
-			s3.WriteErr(w, r, err, 0)
+			s3.WriteErr(w, r, res.Err, 0)
 		}
 		return
 	}
 
+	// TODO -- FIXME: remote (source) get stats (t.rgetstats)
+
 	var cksumValue string
-	if cksum := lom.Checksum(); cksum.Type() == cos.ChecksumMD5 {
+	if cksum := lom.Checksum(); cksum != nil && cksum.Type() == cos.ChecksumMD5 {
 		cksumValue = cksum.Value()
 	}
 	result := s3.CopyObjectResult{
@@ -216,7 +219,7 @@ func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 		t.FSHC(err, lom.Mountpath(), lom.FQN)
 		s3.WriteErr(w, r, err, ecode)
 	} else {
-		s3.SetEtag(w.Header(), lom)
+		s3.SetS3Headers(w.Header(), lom)
 	}
 	dpqFree(dpq)
 }
@@ -224,7 +227,7 @@ func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 // GET s3/<bucket-name[/<object-name>]
 func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	bucket := items[0]
-	bck, err, ecode := meta.InitByNameOnly(bucket, t.owner.bmd)
+	bck, ecode, err := meta.InitByNameOnly(bucket, t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
@@ -282,7 +285,7 @@ func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string
 // See: https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html
 func (t *target) headObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	bucket, objName := items[0], s3.ObjName(items)
-	bck, err, ecode := meta.InitByNameOnly(bucket, t.owner.bmd)
+	bck, ecode, err := meta.InitByNameOnly(bucket, t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
@@ -325,26 +328,24 @@ func (t *target) headObjS3(w http.ResponseWriter, r *http.Request, items []strin
 
 	custom := op.GetCustomMD()
 	lom.SetCustomMD(custom)
-	if v, ok := custom[cos.HdrETag]; ok {
-		hdr.Set(cos.HdrETag, v)
-	}
-	s3.SetEtag(hdr, lom)
+
+	// set s3 response headers
+	s3.SetS3Headers(hdr, lom)
 	hdr.Set(cos.HdrContentLength, strconv.FormatInt(op.Size, 10))
 	if v, ok := custom[cos.HdrContentType]; ok {
 		hdr.Set(cos.HdrContentType, v)
 	}
-	// e.g. https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Examples
-	// (compare w/ `p.listObjectsS3()`
-	lastModified := cos.FormatNanoTime(op.Atime, cos.RFC1123GMT)
-	hdr.Set(cos.S3LastModified, lastModified)
-
-	// TODO: lom.Checksum() via apc.HeaderPrefix+apc.HdrObjCksumType/Val via
-	// s3 obj Metadata map[string]*string
+	// - https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html
+	// - https://docs.aws.amazon.com/AmazonS3/latest/API/RESTCommonResponseHeaders.html
+	if cksum := lom.Checksum(); cksum != nil && cksum.Ty() != cos.ChecksumNone {
+		hdr.Set(cos.S3MetadataChecksumType, cksum.Ty())
+		hdr.Set(cos.S3MetadataChecksumVal, cksum.Val())
+	}
 }
 
 // DELETE /s3/<bucket-name>/<object-name>
 func (t *target) delObjS3(w http.ResponseWriter, r *http.Request, items []string) {
-	bck, err, ecode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	bck, ecode, err := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
@@ -372,7 +373,7 @@ func (t *target) delObjS3(w http.ResponseWriter, r *http.Request, items []string
 
 // POST /s3/<bucket-name>/<object-name>
 func (t *target) postObjS3(w http.ResponseWriter, r *http.Request, items []string) {
-	bck, err, ecode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	bck, ecode, err := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return

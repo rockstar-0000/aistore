@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -1117,7 +1117,7 @@ func TestMountpathDisableAll(t *testing.T) {
 
 	tools.WaitForResilvering(t, baseParams, target)
 
-	tlog.Logf("waiting for bucket %s to show up on all targets\n", m.bck)
+	tlog.Logf("waiting for bucket %s to show up on all targets\n", m.bck.String())
 	err = checkTargetBMDsFor(m.proxyURL, m.bck)
 	tassert.CheckFatal(t, err)
 
@@ -1185,7 +1185,7 @@ func TestForwardCP(t *testing.T) {
 	})
 
 	tools.CreateBucket(t, nextProxyURL, m.bck, nil, true /*cleanup*/)
-	tlog.Logf("Created bucket %s via non-primary %s\n", m.bck, nextProxyID)
+	tlog.Logf("Created bucket %s via non-primary %s\n", m.bck.String(), nextProxyID)
 
 	// Step 3.
 	m.puts()
@@ -1209,7 +1209,7 @@ func TestForwardCP(t *testing.T) {
 
 	// Step 5. destroy ais bucket via original primary which is not primary at this point
 	tools.DestroyBucket(t, origURL, m.bck)
-	tlog.Logf("Destroyed bucket %s via non-primary %s/%s\n", m.bck, origID, origURL)
+	tlog.Logf("Destroyed bucket %s via non-primary %s/%s\n", m.bck.String(), origID, origURL)
 }
 
 func TestAtimeRebalance(t *testing.T) {
@@ -1396,7 +1396,8 @@ func TestAtimePrefetch(t *testing.T) {
 	for obj := range nameCh {
 		objs = append(objs, obj)
 	}
-	xid, err := api.EvictMultiObj(baseParams, bck, objs, "" /*template*/)
+	evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs}}
+	xid, err := api.EvictMultiObj(baseParams, bck, evdMsg)
 	tassert.CheckFatal(t, err)
 	args := xact.ArgsMsg{ID: xid, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, &args)
@@ -1407,7 +1408,7 @@ func TestAtimePrefetch(t *testing.T) {
 	{
 		var msg apc.PrefetchMsg
 		msg.ObjNames = objs
-		xid, err = api.Prefetch(baseParams, bck, msg)
+		xid, err = api.Prefetch(baseParams, bck, &msg)
 		tassert.CheckFatal(t, err)
 		args = xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
 		_, err = api.WaitForXactionIC(baseParams, &args)
@@ -1421,12 +1422,14 @@ func TestAtimePrefetch(t *testing.T) {
 	if len(lst.Entries) != numObjs {
 		t.Errorf("Number of objects mismatch: expected %d, found %d", numObjs, len(lst.Entries))
 	}
+
+	// NOTE ref 6735188: _not_ setting negative atime any longer
+
 	for _, en := range lst.Entries {
 		atime, err := time.Parse(timeFormat, en.Atime)
 		tassert.CheckFatal(t, err)
 		if atime.After(timeAfterPut) {
-			t.Errorf("Atime should not be updated after prefetch (got: atime after PUT: %s, atime after GET: %s).",
-				timeAfterPut.Format(timeFormat), atime.Format(timeFormat))
+			t.Logf("%s: atime after PUT: %s, atime after GET: %s\n", en.Name, timeAfterPut.Format(timeFormat), atime.Format(timeFormat))
 		}
 	}
 }

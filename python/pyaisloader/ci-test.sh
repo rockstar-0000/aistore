@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 if [ -z "$1" ]; then
     echo "No argument supplied. Please provide a test type: 'short', 'long', or 'etl'."
     exit 1
@@ -10,8 +12,6 @@ pip install -e . --quiet
 
 cd ./pyaisloader || exit
 make install
-
-export AIS_ENDPOINT="http://localhost:8080"
 
 if [ "$1" == "short" ]; then
     yes "y" | head -n 2 | pyaisloader p -b ais://testpyaisloader -d 15s -min 1mb -max 10mb -s 1gb -w 16

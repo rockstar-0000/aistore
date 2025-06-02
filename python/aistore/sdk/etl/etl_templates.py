@@ -6,7 +6,6 @@ kind: Pod
 metadata:
   name: transformer-md5
   annotations:
-    # Values it can take ["hpull://","hrev://","hpush://"]
     communication_type: "{communication_type}://"
     wait_timeout: 5m
 spec:
@@ -16,8 +15,8 @@ spec:
       imagePullPolicy: Always
       ports:
         - name: default
-          containerPort: 80
-      command: ['/code/server.py', '--listen', '0.0.0.0', '--port', '80']
+          containerPort: 8000
+      command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
       readinessProbe:
         httpGet:
           path: /health
@@ -32,7 +31,6 @@ kind: Pod
 metadata:
   name: transformer-hello-world
   annotations:
-    # Values it can take ["hpull://","hrev://","hpush://"]
     communication_type: "{communication_type}://"
     wait_timeout: 5m
 spec:
@@ -43,8 +41,7 @@ spec:
       ports:
         - name: default
           containerPort: 8000
-      command: ["gunicorn", "main:app", "--workers", "20", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
-      # command: ["uvicorn", "main:app", "--reload"]
+      command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
       env:
         - name: ARG_TYPE
           value: "{arg_type}"
@@ -52,14 +49,6 @@ spec:
         httpGet:
           path: /health
           port: default
-      volumeMounts:
-        - name: ais
-          mountPath: /tmp/
-  volumes:
-    - name: ais
-      hostPath:
-        path: /tmp/
-        type: Directory
 """
 
 # Returns "Hello World!" on any request.
@@ -103,7 +92,7 @@ kind: Pod
 metadata:
   name: echo-go
   annotations:
-    # Values it can take ["hpull://","hrev://","hpush://"]
+    # Values it can take ["hpull://","hpush://"]
     communication_type: "{communication_type}://"
     wait_timeout: 5m
 spec:
@@ -137,7 +126,7 @@ kind: Pod
 metadata:
   name: transformer-echo
   annotations:
-    # Values it can take ["hpull://","hrev://","hpush://"]
+    # Values it can take ["hpull://", "hpush://"]
     communication_type: "{communication_type}://"
     wait_timeout: 5m
 spec:
@@ -148,24 +137,16 @@ spec:
       ports:
         - name: default
           containerPort: 8000
-      command: ["gunicorn", "main:app", "--workers", "20", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"] 
+      command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
       readinessProbe:
         httpGet:
           path: /health
           port: default
-      volumeMounts:
-        - name: ais
-          mountPath: /tmp/
-  volumes:
-    - name: ais
-      hostPath:
-        path: /tmp/
-        type: Directory
 """
 
 # Returns the transformed TensorFlow compatible data for the input TAR files. For
 # more information on command options, visit
-# https://github.com/NVIDIA/ais-etl/blob/master/transformers/tar2tf/README.md.
+# https://github.com/NVIDIA/ais-etl/blob/main/transformers/tar2tf/README.md.
 # pylint: disable=unused-variable
 TAR2TF = """
 apiVersion: v1
@@ -173,7 +154,7 @@ kind: Pod
 metadata:
   name: tar2tf
   annotations:
-    # Values it can take ["hpull://","hrev://","hpush://"]
+    # Values it can take ["hpull://","hpush://"]
     communication_type: "{communication_type}://"
     wait_timeout: 5m
 spec:
@@ -193,7 +174,7 @@ spec:
 """
 
 # Returns the compressed/decompressed file. For more information on command options, visit
-# https://github.com/NVIDIA/ais-etl/blob/master/transformers/compress/README.md.
+# https://github.com/NVIDIA/ais-etl/blob/main/transformers/compress/README.md.
 # pylint: disable=unused-variable
 COMPRESS = """
 apiVersion: v1
@@ -201,7 +182,7 @@ kind: Pod
 metadata:
   name: transformer-compress
   annotations:
-    # Values `communication_type` can take are ["hpull://", "hrev://", "hpush://", "io://"].
+    # Values `communication_type` can take are ["hpull://", "hpush://", "io://"].
     # Visit https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#communication-mechanisms
     # for more details.
     communication_type: "{communication_type}://"
@@ -218,7 +199,7 @@ spec:
       env:
       # COMPRESS_OPTIONS is a dictionary (JSON string) of additional parameters
       # `mode` and `compression`. For more information on additional parameters, refer to
-      # https://github.com/NVIDIA/ais-etl/blob/master/transformers/compress/README.md.
+      # https://github.com/NVIDIA/ais-etl/blob/main/transformers/compress/README.md.
       - name: COMPRESS_OPTIONS
         value: '{compress_options}'
       readinessProbe:
@@ -275,7 +256,7 @@ spec:
 """
 
 # Returns the FFMPEG decoded content. For more information on command options, visit
-# https://github.com/NVIDIA/ais-etl/blob/master/transformers/ffmpeg/README.md.
+# https://github.com/NVIDIA/ais-etl/blob/main/transformers/ffmpeg/README.md.
 # pylint: disable=unused-variable
 FFMPEG = """
 apiVersion: v1
@@ -315,7 +296,7 @@ spec:
 
 # Returns the transformed images using `Torchvision` pre-processing. For more
 # information on command options, visit
-# https://github.com/NVIDIA/ais-etl/blob/master/transformers/torchvision_preprocess/README.md.
+# https://github.com/NVIDIA/ais-etl/blob/main/transformers/torchvision_preprocess/README.md.
 # pylint: disable=unused-variable
 TORCHVISION_TRANSFORMER = """
 apiVersion: v1
@@ -323,7 +304,7 @@ kind: Pod
 metadata:
   name: transformer-torchvision
   annotations:
-    # Values `communication_type` can take are ["hpull://", "hrev://", "hpush://", "io://"].
+    # Values `communication_type` can take are ["hpull://", "hpush://", "io://"].
     # Visit https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#communication-mechanisms
     communication_type: "{communication_type}://"
     wait_timeout: 10m
@@ -391,4 +372,32 @@ spec:
       hostPath:
         path: /tmp/ais
         type: Directory
+"""
+
+# Return the XXHASH of the original response
+# https://github.com/NVIDIA/ais-etl/blob/main/transformers/hash_with_args/README.md
+HASH = """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: transformer-hash-with-args
+  annotations:
+    communication_type: "{communication_type}://"
+    wait_timeout: 5m
+spec:
+  containers:
+    - name: server
+      image: aistorage/transformer_hash_with_args:latest
+      imagePullPolicy: Always
+      ports:
+        - name: default
+          containerPort: 8000
+      command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: default
+      env:
+        - name: SEED_DEFAULT
+          value: "0"
 """

@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -23,6 +23,7 @@ import (
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tetl"
 	"github.com/NVIDIA/aistore/tools/tlog"
+
 	"github.com/NVIDIA/go-tfdata/tfdata/core"
 )
 
@@ -34,7 +35,7 @@ func startTar2TfTransformer(t *testing.T) (etlName string) {
 
 	msg := &etl.InitSpecMsg{}
 	{
-		msg.IDX = etlName
+		msg.EtlName = etlName
 		msg.CommTypeX = etl.Hpull
 		msg.Spec = spec
 	}
@@ -71,7 +72,7 @@ func TestETLTar2TFS3(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 	// PUT TAR to the cluster
-	f, err := readers.NewExistingFile(tarPath, cos.ChecksumXXHash)
+	f, err := readers.NewExistingFile(tarPath, cos.ChecksumCesXxh)
 	tassert.CheckFatal(t, err)
 	putArgs := api.PutArgs{
 		BaseParams: baseParams,
@@ -149,7 +150,7 @@ func TestETLTar2TFRanges(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 	// PUT TAR to the cluster
-	f, err := readers.NewExistingFile(tarPath, cos.ChecksumXXHash)
+	f, err := readers.NewExistingFile(tarPath, cos.ChecksumCesXxh)
 	tassert.CheckFatal(t, err)
 	putArgs := api.PutArgs{
 		BaseParams: baseParams,

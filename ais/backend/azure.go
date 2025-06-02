@@ -1,8 +1,8 @@
 //go:build azure
 
-// Package backend contains implementation of various backend providers.
+// Package backend contains core/backend interface implementations for supported backend providers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -32,6 +32,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -40,15 +41,6 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
-)
-
-type (
-	azbp struct {
-		t     core.TargetPut
-		creds *azblob.SharedKeyCredential
-		u     string
-		base
-	}
 )
 
 const (
@@ -65,6 +57,15 @@ const (
 
 const (
 	azErrPrefix = "azure-error["
+)
+
+type (
+	azbp struct {
+		t     core.TargetPut
+		creds *azblob.SharedKeyCredential
+		u     string
+		base
+	}
 )
 
 // parse azure errors
@@ -98,7 +99,7 @@ func asEndpoint() string {
 	}
 }
 
-func NewAzure(t core.TargetPut, tstats stats.Tracker) (core.Backend, error) {
+func NewAzure(t core.TargetPut, tstats stats.Tracker, startingUp bool) (core.Backend, error) {
 	blurl := asEndpoint()
 
 	// NOTE: NewSharedKeyCredential requires account name and its primary or secondary key
@@ -112,7 +113,9 @@ func NewAzure(t core.TargetPut, tstats stats.Tracker) (core.Backend, error) {
 		u:     blurl,
 		base:  base{provider: apc.Azure},
 	}
-	bp.base.init(t.Snode(), tstats)
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
+
 	return bp, nil
 }
 
@@ -170,13 +173,20 @@ func azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (int, 
 		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
 	}
 
-	// azure error is usually a sizeable multi-line text with items including:
-	// request ID, authorization, variery of x-ms-* headers, server and user agent, and more
+	status, err := _azureErr(azureError, stgErr)
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		return status, cmn.NewErrTooManyRequests(err, status)
+	}
+	return status, err
+}
 
+// azure error is usually a sizeable multi-line text with items including:
+// request ID, authorization, variery of x-ms-* headers, server and user agent, and more
+func _azureErr(azureError error, stgErr *azcore.ResponseError) (int, error) {
 	var (
-		status      = stgErr.StatusCode
 		code        string
 		description string
+		status      = stgErr.StatusCode
 		lines       = strings.Split(azureError.Error(), "\n")
 	)
 	if resp := stgErr.RawResponse; resp != nil {
@@ -273,11 +283,11 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 	}
 
 	var (
-		custom     cos.StrKVs
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
+		custom     []string
 	)
 	if wantCustom {
-		custom = make(cos.StrKVs, 4) // reuse
+		custom = make([]string, 0, 8)
 	}
 	lst.Entries = lst.Entries[:0]
 	for _, blob := range resp.Segment.BlobItems {
@@ -295,18 +305,18 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 		etag := azEncodeEtag(*blob.Properties.ETag)
 		en.Version = etag // (TODO a the top)
 		if wantCustom {
-			clear(custom)
-			custom[cmn.ETag] = etag
+			custom = custom[:0]
+			custom = append(custom, cmn.ETag, etag)
 			if !blob.Properties.LastModified.IsZero() {
-				custom[cmn.LastModified] = fmtTime(*blob.Properties.LastModified)
+				custom = append(custom, cmn.LsoLastModified, fmtLsoTime(*blob.Properties.LastModified))
 			}
 			if blob.Properties.ContentType != nil {
-				custom[cos.HdrContentType] = *blob.Properties.ContentType
+				custom = append(custom, cos.HdrContentType, *blob.Properties.ContentType)
 			}
 			if blob.VersionID != nil {
-				custom[cmn.VersionObjMD] = *blob.VersionID
+				custom = append(custom, cmn.VersionObjMD, *blob.VersionID)
 			}
-			en.Custom = cmn.CustomMD2S(custom)
+			en.Custom = cmn.CustomProps2S(custom...)
 		}
 		lst.Entries = append(lst.Entries, &en)
 	}
@@ -386,7 +396,7 @@ func (azbp *azbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (
 		oa.SetCustomKey(cmn.MD5ObjMD, md5)
 	}
 	if v := resp.LastModified; v != nil {
-		oa.SetCustomKey(cmn.LastModified, fmtTime(*v))
+		oa.SetCustomKey(cos.HdrLastModified, fmtHdrTime(*v))
 	}
 	if v := resp.ContentType; v != nil {
 		// unlike other custom attrs, "Content-Type" is not getting stored w/ LOM
@@ -403,6 +413,7 @@ func (azbp *azbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (
 // GET OBJECT
 //
 
+//nolint:dupl // Azure vs GCP: similar code, different BPs
 func (azbp *azbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (int, error) {
 	res := azbp.GetObjReader(ctx, lom, 0, 0)
 	if res.Err != nil {
@@ -425,14 +436,14 @@ func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 	client, err := blockblob.NewClientWithSharedKeyCredential(blURL, azbp.creds, nil)
 	if err != nil {
 		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
-		return
+		return res
 	}
 
 	// Get checksum
 	respProps, err := client.GetProperties(ctx, nil)
 	if err != nil {
 		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
-		return
+		return res
 	}
 
 	// (0, 0) range indicates "whole object"
@@ -473,7 +484,7 @@ func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 // PUT OBJECT
 //
 
-func (azbp *azbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, error) {
+func (azbp *azbp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, error) {
 	defer cos.Close(r)
 
 	client, err := azblob.NewClientWithSharedKeyCredential(azbp.u, azbp.creds, nil)
@@ -487,7 +498,7 @@ func (azbp *azbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, 
 		opts.Concurrency = int(min((size+cos.MiB-1)/cos.MiB, 8))
 	}
 
-	resp, err := client.UploadStream(context.Background(), cloudBck.Name, lom.ObjName, r, &opts)
+	resp, err := client.UploadStream(ctx, cloudBck.Name, lom.ObjName, r, &opts)
 	if err != nil {
 		return azureErrorToAISError(err, cloudBck, lom.ObjName)
 	}
@@ -498,7 +509,8 @@ func (azbp *azbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, 
 	lom.SetVersion(etag) // TODO #200224
 
 	if v := resp.LastModified; v != nil {
-		lom.SetCustomKey(cmn.LastModified, fmtTime(*v))
+		lom.SetCustomKey(cmn.LsoLastModified, fmtLsoTime(*v))
+		lom.SetCustomKey(cos.HdrLastModified, fmtHdrTime(*v))
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
 		nlog.Infof("[put_object] %s", lom)
@@ -510,14 +522,14 @@ func (azbp *azbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (int, 
 // DELETE OBJECT
 //
 
-func (azbp *azbp) DeleteObj(lom *core.LOM) (int, error) {
+func (azbp *azbp) DeleteObj(ctx context.Context, lom *core.LOM) (int, error) {
 	client, err := azblob.NewClientWithSharedKeyCredential(azbp.u, azbp.creds, nil)
 	if err != nil {
 		return azureErrorToAISError(err, &cmn.Bck{Provider: apc.Azure}, "")
 	}
 	cloudBck := lom.Bck().RemoteBck()
 
-	_, err = client.DeleteBlob(context.Background(), cloudBck.Name, lom.ObjName, nil)
+	_, err = client.DeleteBlob(ctx, cloudBck.Name, lom.ObjName, nil)
 	if err != nil {
 		return azureErrorToAISError(err, cloudBck, lom.ObjName)
 	}

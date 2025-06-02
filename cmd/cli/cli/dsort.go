@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with objects in the cluster
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -25,6 +25,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/xact"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
@@ -98,7 +99,7 @@ var dsortStartCmd = cli.Command{
 		indent1 + "Tip: use '--verbose' to print the spec (with all its parameters including applied defaults)\n" +
 		indent1 + "See also: docs/dsort.md, docs/cli/dsort.md, and ais/test/scripts/dsort*",
 	ArgsUsage: dsortSpecArgument,
-	Flags:     startSpecialFlags[cmdDsort],
+	Flags:     sortFlags(startSpecialFlags[cmdDsort]),
 	Action:    startDsortHandler,
 }
 
@@ -108,9 +109,8 @@ var phasesOrdered = [...]string{
 	dsort.CreationPhase,
 }
 
-func startDsortHandler(c *cli.Context) (err error) {
+func startDsortHandler(c *cli.Context) error {
 	var (
-		id             string
 		specPath       string
 		specBytes      []byte
 		shift          int
@@ -129,6 +129,7 @@ func startDsortHandler(c *cli.Context) (err error) {
 		shift = 1
 	}
 	if c.NArg() > shift {
+		var err error
 		srcbck, err = parseBckURI(c, c.Args().Get(shift), true)
 		if err != nil {
 			return fmt.Errorf("failed to parse source bucket: %v\n(see %s for details)",
@@ -136,6 +137,7 @@ func startDsortHandler(c *cli.Context) (err error) {
 		}
 	}
 	if c.NArg() > shift+1 {
+		var err error
 		dstbck, err = parseBckURI(c, c.Args().Get(shift+1), true)
 		if err != nil {
 			return fmt.Errorf("failed to parse destination bucket: %v\n(see %s for details)",
@@ -184,6 +186,7 @@ func startDsortHandler(c *cli.Context) (err error) {
 	}
 
 	if flagIsSet(c, verboseFlag) {
+		var err error
 		flat, config := _flattenSpec(&spec)
 		if flagIsSet(c, noHeaderFlag) {
 			err = teb.Print(flat, teb.PropValTmplNoHdr)
@@ -208,15 +211,18 @@ func startDsortHandler(c *cli.Context) (err error) {
 	}
 
 	// execute
-	if id, err = api.StartDsort(apiBP, &spec); err == nil {
-		fmt.Fprintln(c.App.Writer, id)
+	xid, errV := api.StartDsort(apiBP, &spec)
+	if errV != nil {
+		return errV
 	}
-	return
+	fmt.Fprintln(c.App.Writer, xid)
+	return nil
 }
 
 // with minor editing
 func _flattenSpec(spec *dsort.RequestSpec) (flat, config nvpairList) {
 	var src, dst cmn.Bck
+
 	cmn.IterFields(spec, func(tag string, field cmn.IterField) (error, bool) {
 		v := _toStr(field.Value())
 		// add config override in a 2nd pass
@@ -226,14 +232,14 @@ func _flattenSpec(spec *dsort.RequestSpec) (flat, config nvpairList) {
 			}
 			return nil, false
 		}
-		switch {
-		case tag == "input_bck.name":
+		switch tag {
+		case "input_bck.name":
 			src.Name = v
-		case tag == "input_bck.provider":
+		case "input_bck.provider":
 			src.Provider = v
-		case tag == "output_bck.name":
+		case "output_bck.name":
 			dst.Name = v
-		case tag == "output_bck.provider":
+		case "output_bck.provider":
 			dst.Provider = v
 		default:
 			// defaults
@@ -259,6 +265,7 @@ func _flattenSpec(spec *dsort.RequestSpec) (flat, config nvpairList) {
 		}
 		return nil, false
 	})
+
 	if dst.IsEmpty() {
 		dst = src
 	}
@@ -273,7 +280,8 @@ func _flattenSpec(spec *dsort.RequestSpec) (flat, config nvpairList) {
 			return di.Name < dj.Name
 		})
 	}
-	return
+
+	return flat, config
 }
 
 // Creates bucket if not exists. If exists uses it or deletes and creates new
@@ -305,7 +313,11 @@ func (d dsortResult) String() string {
 		return apc.ActDsort + " job was aborted"
 	}
 
-	var sb strings.Builder
+	var (
+		sb strings.Builder
+		l  = 1024
+	)
+	sb.Grow(l)
 
 	sb.WriteString(fmt.Sprintf("Created %d new shards. Job duration: %s", d.created, d.dur))
 	if len(d.errors) > 0 {
@@ -471,7 +483,7 @@ func (b *dsortPB) result() dsortResult {
 	}
 }
 
-func printMetrics(w io.Writer, jobID string, daemonIDs []string) (aborted, finished bool, errV error) {
+func printMetrics(w io.Writer, jobID string, daemonIDs []string) (aborted, finished bool, _ error) {
 	resp, err := api.MetricsDsort(apiBP, jobID)
 	if err != nil {
 		return false, false, V(err)
@@ -497,14 +509,16 @@ func printMetrics(w io.Writer, jobID string, daemonIDs []string) (aborted, finis
 		aborted = aborted || targetMetrics.Metrics.Aborted.Load()
 		finished = finished && targetMetrics.Metrics.Creation.Finished
 	}
+
 	// NOTE: because of the still-open issue we are using Go-standard json, not jsoniter
 	// https://github.com/json-iterator/go/issues/331
-	b, err := jsonStd.MarshalIndent(resp, "", "    ")
-	if err != nil {
-		return false, false, err
+	b, errV := jsonStd.MarshalIndent(resp, "", "    ")
+	if errV != nil {
+		return false, false, errV
 	}
+
 	fmt.Fprintln(w, string(b))
-	return
+	return aborted, finished, nil
 }
 
 func printCondensedStats(c *cli.Context, id, units string, errhint bool) error {

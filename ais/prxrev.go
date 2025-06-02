@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -112,7 +112,12 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 func rpTransport(config *cmn.Config) *http.Transport {
 	var (
 		err       error
-		transport = cmn.NewTransport(cmn.TransportArgs{Timeout: config.Client.Timeout.D()})
+		transport = cmn.NewTransport(cmn.TransportArgs{
+			Timeout:          config.Client.Timeout.D(),
+			IdleConnTimeout:  config.Net.HTTP.IdleConnTimeout.D(),
+			IdleConnsPerHost: config.Net.HTTP.MaxIdleConnsPerHost,
+			MaxIdleConns:     config.Net.HTTP.MaxIdleConns,
+		})
 	)
 	if config.Net.HTTP.UseHTTPS {
 		transport.TLSClientConfig, err = cmn.NewTLS(config.Net.HTTP.ToTLS(), true /*intra-cluster*/)
@@ -155,7 +160,7 @@ func (p *proxy) reverseRequest(w http.ResponseWriter, r *http.Request, nodeID st
 	rproxy.ServeHTTP(w, r)
 }
 
-func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg, bck *cmn.Bck, query url.Values) (err error) {
+func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg, bck *cmn.Bck, query url.Values) {
 	var (
 		backend     = cmn.BackendConfAIS{}
 		aliasOrUUID = bck.Ns.UUID
@@ -164,7 +169,7 @@ func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.A
 	)
 	if v == nil {
 		p.writeErrMsg(w, r, "no remote ais clusters attached")
-		return err
+		return
 	}
 
 	cos.MustMorphMarshal(v, &backend)
@@ -192,16 +197,16 @@ func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.A
 		}
 	}
 	if !exists {
-		err = cos.NewErrNotFound(p, "remote UUID/alias "+aliasOrUUID)
+		err := cos.NewErrNotFound(p, "remote UUID/alias "+aliasOrUUID)
 		p.writeErr(w, r, err)
-		return err
+		return
 	}
 
 	debug.Assert(len(urls) > 0)
 	u, err := url.Parse(urls[0])
 	if err != nil {
 		p.writeErr(w, r, err)
-		return err
+		return
 	}
 	if msg != nil {
 		body := cos.MustMarshal(msg)
@@ -214,7 +219,6 @@ func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.A
 	query = bck.AddToQuery(query)
 	r.URL.RawQuery = query.Encode()
 	p.reverseRequest(w, r, aliasOrUUID, u)
-	return nil
 }
 
 //////////////////
@@ -229,7 +233,8 @@ func (rp *reverseProxy) init() {
 }
 
 func (rp *reverseProxy) loadOrStore(uuid string, u *url.URL,
-	errHdlr func(w http.ResponseWriter, r *http.Request, err error)) *httputil.ReverseProxy {
+	errHdlr func(w http.ResponseWriter, r *http.Request, err error),
+) *httputil.ReverseProxy {
 	revProxyIf, exists := rp.nodes.Load(uuid)
 	if exists {
 		shrp := revProxyIf.(*singleRProxy)

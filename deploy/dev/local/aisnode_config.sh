@@ -1,6 +1,13 @@
 # NOTE: system environment variables are listed in the `env` package,
 # see https://github.com/NVIDIA/aistore/blob/main/api/env/README.md
 
+# NOTE: aws.extra settings:
+#      "extra.aws.cloud_region"
+#      "extra.aws.endpoint"
+#      "extra.aws.profile"
+#      "extra.aws.max_pagesize"
+#      "extra.aws.multipart_size"
+
 cat > $AIS_CONF_FILE <<EOL
 {
 	"backend": $(make_backend_conf),
@@ -9,6 +16,7 @@ cat > $AIS_CONF_FILE <<EOL
 		"burst_buffer": 128,
 		"enabled":      ${AIS_MIRROR_ENABLED:-false}
 	},
+	$(make_tracing_conf)
 	"ec": {
 		"objsize_limit":	${AIS_OBJ_SIZE_LIMIT:-262144},
 		"compression":		"${AIS_EC_COMPRESSION:-never}",
@@ -22,7 +30,7 @@ cat > $AIS_CONF_FILE <<EOL
 		"level":     "${AIS_LOG_LEVEL:-3}",
 		"max_size":  "4mb",
 		"max_total": "128mb",
-		"flush_time": "40s",
+		"flush_time": "60s",
 		"stats_time": "60s"
 	},
 	"periodic": {
@@ -33,11 +41,13 @@ cat > $AIS_CONF_FILE <<EOL
 	"timeout": {
 		"cplane_operation":     "2s",
 		"max_keepalive":        "4s",
+		"cold_get_conflict":    "5s",
 		"max_host_busy":        "20s",
 		"startup_time":         "1m",
 		"join_startup_time":    "3m",
 		"send_file_time":       "5m",
-		"ec_streams_time":	"10m"
+		"ec_streams_time":	"10m",
+		"object_md":            "2h"
 	},
 	"client": {
 		"client_timeout":      "10s",
@@ -78,7 +88,7 @@ cat > $AIS_CONF_FILE <<EOL
 		"enabled": true
 	},
 	"checksum": {
-		"type":			"xxhash",
+		"type":			"xxhash2",
 		"validate_cold_get":	false,
 		"validate_warm_get":	false,
 		"validate_obj_move":	false,
@@ -95,8 +105,8 @@ cat > $AIS_CONF_FILE <<EOL
 	"memsys": {
 		"min_free":		"2gb",
 		"default_buf":		"32kb",
-		"to_gc":		"2gb",
-		"hk_time":		"90s",
+		"to_gc":		"4gb",
+		"hk_time":		"3m",
 		"min_pct_total":	0,
 		"min_pct_free":		0
 	},
@@ -110,16 +120,19 @@ cat > $AIS_CONF_FILE <<EOL
 			"sndrcv_buf_size":    ${SNDRCV_BUF_SIZE:-131072}
 		},
 		"http": {
-			"use_https":         ${AIS_USE_HTTPS:-false},
-			"server_crt":        "${AIS_SERVER_CRT:-server.crt}",
-			"server_key":        "${AIS_SERVER_KEY:-server.key}",
-			"domain_tls":        "",
-			"client_ca_tls":     "${AIS_CLIENT_CA_TLS}",
-			"client_auth_tls":   ${AIS_CLIENT_AUTH_TLS:-0},
-			"write_buffer_size": ${HTTP_WRITE_BUFFER_SIZE:-0},
-			"read_buffer_size":  ${HTTP_READ_BUFFER_SIZE:-0},
-			"chunked_transfer":  ${AIS_HTTP_CHUNKED_TRANSFER:-true},
-			"skip_verify":       ${AIS_SKIP_VERIFY_CRT:-false}
+			"use_https":          ${AIS_USE_HTTPS:-false},
+			"server_crt":         "${AIS_SERVER_CRT:-server.crt}",
+			"server_key":         "${AIS_SERVER_KEY:-server.key}",
+			"domain_tls":         "",
+			"client_ca_tls":      "${AIS_CLIENT_CA_TLS}",
+			"client_auth_tls":    ${AIS_CLIENT_AUTH_TLS:-0},
+			"idle_conn_time":     "6s",
+			"idle_conns_per_host":32,
+			"idle_conns":         0,
+			"write_buffer_size":  ${HTTP_WRITE_BUFFER_SIZE:-0},
+			"read_buffer_size":   ${HTTP_READ_BUFFER_SIZE:-0},
+			"chunked_transfer":   ${AIS_HTTP_CHUNKED_TRANSFER:-true},
+			"skip_verify":        ${AIS_SKIP_VERIFY_CRT:-false}
 		}
 	},
 	"fshc": {
@@ -144,6 +157,7 @@ cat > $AIS_CONF_FILE <<EOL
 			"name":     "heartbeat",
 			"factor":   3
 		},
+		"num_retries":    3,
 		"retry_factor":   4
 	},
 	"downloader": {
@@ -164,9 +178,33 @@ cat > $AIS_CONF_FILE <<EOL
 		"compression":		"never",
 		"bundle_multiplier":	2
 	},
+	"tco": {
+		"compression":		"never",
+		"bundle_multiplier":	2
+	},
+	"arch": {
+		"compression":		"never",
+		"bundle_multiplier":	2
+	},
 	"write_policy": {
 		"data": "${WRITE_POLICY_DATA:-}",
 		"md": "${WRITE_POLICY_MD:-}"
+	},
+	"rate_limit": {
+		"backend": {
+			"num_retries":       3,
+			"interval":          "1m",
+			"per_op_max_tokens": "",
+			"max_tokens":        1000,
+			"enabled":           false
+		},
+		"frontend": {
+			"burst_size":        375,
+			"interval":          "1m",
+			"per_op_max_tokens": "",
+			"max_tokens":        1000,
+			"enabled":           false
+		}
 	},
 	"features": "0"
 }

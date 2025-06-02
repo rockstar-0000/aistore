@@ -1,6 +1,6 @@
 // Package xreg provides registry and (renew, find) functions for AIS eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xreg
 
@@ -56,8 +56,8 @@ type (
 		UUID   string
 	}
 	RenewBase struct {
-		Args
 		Bck *meta.Bck
+		Args
 	}
 	// simplified non-JSON QueryMsg (internal AIS use)
 	Flt struct {
@@ -79,11 +79,10 @@ type (
 	}
 	// Selects subset of xactions to abort.
 	abortArgs struct {
-		err error // original cause (or reason), e.g. cmn.ErrUserAbort
-		// criteria
-		bcks   []*meta.Bck // run on a slice of buckets
-		scope  []int       // one of { ScopeG, ScopeB, ... } enum
-		kind   string      // all of a kind
+		err    error
+		kind   string      // criteria: all of a kind
+		bcks   []*meta.Bck // buckets to apply
+		scope  []int       // { ScopeG, ScopeB, ... } enum
 		newreb bool        // (rebalance is starting) vs (dtor.AbortRebRes)
 	}
 
@@ -96,11 +95,11 @@ type (
 	// All entries in the registry. The entries are periodically cleaned up
 	// to make sure that we don't keep old entries forever.
 	registry struct {
-		renewMtx    sync.RWMutex // TODO: revisit to optimiz out
-		entries     entries
 		bckXacts    map[string]Renewable
 		nonbckXacts map[string]Renewable
+		entries     entries
 		finDelta    atomic.Int64
+		renewMtx    sync.RWMutex // TODO: revisit
 	}
 )
 
@@ -139,10 +138,9 @@ func RegWithHK() {
 
 func GetXact(uuid string) (core.Xact, error) { return dreg.getXact(uuid) }
 
-func (r *registry) getXact(uuid string) (xctn core.Xact, err error) {
-	if !xact.IsValidUUID(uuid) {
-		err = fmt.Errorf("invalid UUID %q", uuid)
-		return
+func (r *registry) getXact(uuid string) (xctn core.Xact, _ error) {
+	if err := xact.CheckValidUUID(uuid); err != nil {
+		return nil, err
 	}
 	e := &r.entries
 	e.mtx.RLock()
@@ -157,7 +155,7 @@ outer:
 		}
 	}
 	e.mtx.RUnlock()
-	return
+	return xctn, nil
 }
 
 func GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
@@ -710,7 +708,7 @@ func LimitedCoexistence(tsi *meta.Snode, bck *meta.Bck, action string, otherBck 
 func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck ...*meta.Bck) error {
 	var (
 		nd    *xact.Descriptor // the one that wants to run
-		admin bool             // admin-requested action that'd generate protential conflict
+		admin bool             // admin-requested action that'd generate a conflict
 	)
 	switch action {
 	case apc.ActStartMaintenance, apc.ActStopMaintenance, apc.ActShutdownNode, apc.ActDecommissionNode:
@@ -723,7 +721,8 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 		}
 		nd = &d
 	}
-	var locked bool
+
+	var locked bool // rlock/runlock only once
 	for kind, d := range xact.Table {
 		// rebalance-vs-rebalance and resilver-vs-resilver sort it out between themselves
 		// (by preempting)
@@ -833,7 +832,10 @@ func (rns *RenewRes) beingRenewed() {
 /////////
 
 func (flt *Flt) String() string {
-	msg := xact.QueryMsg{OnlyRunning: flt.OnlyRunning, Bck: flt.Bck.Clone(), ID: flt.ID, Kind: flt.Kind}
+	msg := xact.QueryMsg{OnlyRunning: flt.OnlyRunning, ID: flt.ID, Kind: flt.Kind}
+	if flt.Bck != nil {
+		msg.Bck = flt.Bck.Clone()
+	}
 	return msg.String()
 }
 
@@ -851,7 +853,7 @@ func (flt Flt) Matches(xctn core.Xact) (yes bool) {
 		if yes = xctn.ID() == flt.ID; yes {
 			debug.Assert(xctn.Kind() == flt.Kind, xctn.String()+" vs same ID "+flt.String())
 		}
-		return
+		return yes
 	}
 	// kind?
 	if flt.Kind != "" {

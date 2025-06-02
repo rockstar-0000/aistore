@@ -8,7 +8,6 @@ package xs
 import (
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -28,13 +27,14 @@ import (
 // - use probabilistic filtering to skip received and locally copied obj-s (see `reb.FilterAdd` et al)
 
 type prune struct {
-	parent         core.Xact
-	bckFrom, bckTo *meta.Bck
-	smap           *meta.Smap
-	prefix         string
-	// run
+	r       core.Xact
+	bckFrom *meta.Bck
+	bckTo   *meta.Bck
+	smap    *meta.Smap
 	joggers *mpather.Jgroup
 	filter  *prob.Filter
+	prefix  string
+	lsflags uint64
 	same    bool
 }
 
@@ -44,7 +44,6 @@ func (rp *prune) init(config *cmn.Config) {
 		CTs:      []string{fs.ObjectType},
 		VisitObj: rp.do,
 		Prefix:   rp.prefix,
-		Parallel: 1, // TODO: tune-up
 		// DoLoad:  noLoad
 	}
 	rmopts.Bck.Copy(rp.bckTo.Bucket())
@@ -58,33 +57,27 @@ func (rp *prune) run() {
 }
 
 func (rp *prune) wait() {
-	if err := rp.parent.AbortErr(); err != nil {
+	if err := rp.r.AbortErr(); err != nil {
 		rp.joggers.Stop()
 		return
 	}
 
-	// wait for: joggers || parent-aborted
-	ticker := time.NewTicker(cmn.Rom.MaxKeepalive())
-	rp._wait(ticker)
-
-	// cleanup
-	ticker.Stop()
+	rp._wait()
 	rp.filter.Reset()
 }
 
-func (rp *prune) _wait(ticker *time.Ticker) {
+func (rp *prune) _wait() {
+	stopCh := rp.r.ChanAbort()
+outer:
 	for {
 		select {
-		case <-ticker.C:
-			if rp.parent.IsAborted() {
-				rp.joggers.Stop()
-				return
-			}
+		case <-stopCh:
+			break outer
 		case <-rp.joggers.ListenFinished():
-			rp.joggers.Stop()
-			return
+			break outer
 		}
 	}
+	rp.joggers.Stop()
 }
 
 func (rp *prune) do(dst *core.LOM, _ []byte) error {
@@ -104,7 +97,7 @@ func (rp *prune) do(dst *core.LOM, _ []byte) error {
 		}
 	}
 
-	// skip objects already copied by rp.parent (compare w/ reb)
+	// skip objects already copied by rp.r (compare w/ reb)
 	uname := src.UnamePtr()
 	bname := cos.UnsafeBptr(uname)
 	if rp.filter != nil && rp.filter.Lookup(*bname) { // TODO -- FIXME: rm filter nil check once x-tco supports prob. filtering
@@ -120,7 +113,7 @@ func (rp *prune) do(dst *core.LOM, _ []byte) error {
 	if src.Bck().IsAIS() {
 		tsi, errV := rp.smap.HrwHash2T(src.Digest())
 		if errV != nil {
-			return fmt.Errorf("prune %s: fatal err: %w", rp.parent.Name(), errV)
+			return fmt.Errorf("prune %s: fatal err: %w", rp.r.Name(), errV)
 		}
 		if tsi.ID() == core.T.SID() {
 			err = src.Load(false, false)
@@ -149,10 +142,10 @@ func (rp *prune) do(dst *core.LOM, _ []byte) error {
 
 	if err == nil {
 		if cmn.Rom.FastV(5, cos.SmoduleXs) {
-			nlog.Infoln(rp.parent.Name(), dst.Cname())
+			nlog.Infoln(rp.r.Name(), dst.Cname())
 		}
 	} else if !cmn.IsErrObjNought(err) && !cmn.IsErrBucketNought(err) {
-		rp.parent.AddErr(err, 4, cos.SmoduleXs)
+		rp.r.AddErr(err, 4, cos.SmoduleXs)
 	}
 	return nil
 }

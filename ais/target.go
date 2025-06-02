@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -44,6 +44,7 @@ import (
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/volume"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
@@ -59,31 +60,34 @@ type (
 		disabled atomic.Bool // true: standing by
 		prevbmd  atomic.Bool // special
 	}
-	backends map[string]core.Backend
+	backends   map[string]core.Backend
+	rlbackends map[string]*rlbackend
 	// main
 	target struct {
 		htrun
-		backend      backends
-		fshc         *health.FSHC
-		fsprg        fsprungroup
-		reb          *reb.Reb
-		res          *res.Res
-		transactions transactions
-		regstate     regstate
+		bps      backends
+		rlbps    rlbackends
+		fshc     *health.FSHC
+		fsprg    fsprungroup
+		reb      *reb.Reb
+		res      *res.Res
+		txns     txns
+		regstate regstate
 	}
 )
 
 type redial struct {
 	t         *target
+	inUse     string
 	dialTout  time.Duration
 	totalTout time.Duration
-	inUse     string
 }
 
 // interface guard
 var (
 	_ cos.Runner  = (*target)(nil)
 	_ htext       = (*target)(nil)
+	_ xs.COI      = (*target)(nil)
 	_ core.Target = (*target)(nil)
 	_ fs.HC       = (*target)(nil)
 )
@@ -91,20 +95,53 @@ var (
 func (*target) Name() string { return apc.Target } // as cos.Runner
 
 // as htext
-func (*target) interruptedRestarted() (interrupted, restarted bool) {
-	interrupted = fs.MarkerExists(fname.RebalanceMarker)
-	restarted = fs.MarkerExists(fname.NodeRestartedPrev)
-	return
+func (*target) interruptedRestarted() (i, r bool) {
+	i = fs.MarkerExists(fname.RebalanceMarker)
+	r = fs.MarkerExists(fname.NodeRestartedPrev)
+	return i, r
 }
 
 //
-// target
+// backends
 //
 
-func (t *target) initBackends(tstats *stats.Trunner) {
+func (t *target) Backend(bck *meta.Bck) core.Backend { // as core.Target
+	if bck.IsRemoteAIS() {
+		aisbp := t.bps[apc.AIS]
+		return t._rlbp(aisbp, bck.Props, apc.AIS)
+	}
+	provider := bck.Provider
+	if bck.Props != nil {
+		provider = bck.RemoteBck().Provider
+	}
 	config := cmn.GCO.Get()
-	aisbp := backend.NewAIS(t, tstats)
-	t.backend[apc.AIS] = aisbp // always present
+	if _, ok := config.Backend.Providers[provider]; ok {
+		bp, k := t.bps[provider]
+		debug.Assert(k, provider)
+		if bp != nil {
+			return t._rlbp(bp, bck.Props, provider)
+		}
+		// nil when configured & not-built
+	}
+	dummy, _ := backend.NewDummyBackend(t, nil)
+	return dummy
+}
+
+func (t *target) _rlbp(bp core.Backend, bprops *cmn.Bprops, provider string) core.Backend {
+	if bprops == nil || !bprops.RateLimit.Backend.Enabled {
+		return bp
+	}
+	// with rate limit
+	return t.rlbps[provider]
+}
+
+func (t *target) initBackends() {
+	t.bps = make(backends, 8)
+	t.rlbps = make(rlbackends, 8)
+
+	config := cmn.GCO.Get()
+	aisbp := backend.NewAIS(t, t.statsT, true)
+	t.bps[apc.AIS] = aisbp // always present
 
 	if aisConf := config.Backend.Get(apc.AIS); aisConf != nil {
 		if err := aisbp.Apply(aisConf, "init", &config.ClusterConfig); err != nil {
@@ -114,36 +151,47 @@ func (t *target) initBackends(tstats *stats.Trunner) {
 		}
 	}
 
-	if err := t._initBuiltTagged(tstats, config); err != nil {
+	if err := t.initBuiltTagged(config, true /*starting up*/); err != nil {
 		cos.ExitLog(err)
+	}
+
+	// add rate-limited wrappers
+	for provider, bp := range t.bps {
+		t.rlbps[provider] = &rlbackend{Backend: bp, t: t}
 	}
 }
 
 // - remote (e.g. cloud) backends  w/ empty stubs unless populated via build tags
 // - enabled/disabled via config.Backend
-func (t *target) _initBuiltTagged(tstats *stats.Trunner, config *cmn.Config) error {
-	var enabled, disabled, notlinked []string
-
+func (t *target) initBuiltTagged(config *cmn.Config, startingUp bool) error {
+	var (
+		enabled   []string
+		disabled  []string
+		notlinked []string
+		tstats    = t.statsT
+	)
 	for provider := range apc.Providers {
 		var (
-			add core.Backend
+			bp  core.Backend
 			err error
 		)
 		switch provider {
 		case apc.AWS:
-			add, err = backend.NewAWS(t, tstats)
+			bp, err = backend.NewAWS(t, tstats, startingUp)
 		case apc.GCP:
-			add, err = backend.NewGCP(t, tstats)
+			bp, err = backend.NewGCP(t, tstats, startingUp)
 		case apc.Azure:
-			add, err = backend.NewAzure(t, tstats)
+			bp, err = backend.NewAzure(t, tstats, startingUp)
+		case apc.OCI:
+			bp, err = backend.NewOCI(t, tstats, startingUp)
 		case apc.HT:
-			add, err = backend.NewHT(t, config, tstats)
+			bp, err = backend.NewHT(t, config, tstats, startingUp)
 		case apc.AIS:
 			continue
 		default:
-			return fmt.Errorf(cmn.FmtErrUnknown, t, "backend provider", provider)
+			return fmt.Errorf("unknown backend provider %q", provider)
 		}
-		t.backend[provider] = add
+		t.bps[provider] = bp
 
 		configured := config.Backend.Get(provider) != nil
 		switch {
@@ -152,6 +200,10 @@ func (t *target) _initBuiltTagged(tstats *stats.Trunner, config *cmn.Config) err
 		case err == nil && !configured:
 			disabled = append(disabled, provider)
 		case err != nil && configured:
+			if !cmn.IsErrInitMissingBackend(err) {
+				// as is
+				return fmt.Errorf("%s: failed to initialize [%s] backend, err: %v", t, provider, err)
+			}
 			notlinked = append(notlinked, provider)
 		case err != nil && !configured:
 			_, ok := err.(*cmn.ErrInitBackend) // error type to indicate a _mock_ backend
@@ -186,9 +238,13 @@ func (t *target) _initBuiltTagged(tstats *stats.Trunner, config *cmn.Config) err
 }
 
 func (t *target) aisbp() *backend.AISbp {
-	bendp := t.backend[apc.AIS]
+	bendp := t.bps[apc.AIS]
 	return bendp.(*backend.AISbp)
 }
+
+//
+// target init and startup
+//
 
 func (t *target) init(config *cmn.Config) {
 	t.initSnode(config)
@@ -209,7 +265,8 @@ func (t *target) init(config *cmn.Config) {
 	}
 	t.si.Init(tid, apc.Target)
 
-	cos.InitShortID(t.si.Digest())
+	debug.Assert(t.si.IDDigest != 0)
+	cos.InitShortID(t.si.IDDigest)
 
 	memsys.Init(t.SID(), t.SID(), config)
 
@@ -236,8 +293,9 @@ func (t *target) init(config *cmn.Config) {
 
 	t.fsprg.init(t, newVol) // subgroup of the daemon.rg rungroup
 
-	sc := transport.Init(ts) // init transport sub-system; new stream collector
-	daemon.rg.add(sc)
+	sc := transport.Init(ts)                  // init transport sub-system
+	daemon.rg.add(sc)                         // new stream collector
+	bundle.InitSDM(config, apc.CompressNever) // shared streams
 
 	t.fshc = health.NewFSHC(t)
 
@@ -278,25 +336,27 @@ func (t *target) initHostIP(config *cmn.Config) {
 func initTID(config *cmn.Config) (tid string, generated bool) {
 	if tid = envDaemonID(apc.Target); tid != "" {
 		if err := cos.ValidateDaemonID(tid); err != nil {
-			nlog.Errorln("Warning:", err)
+			cos.ExitLog(err) // FATAL
 		}
+		nlog.Infoln("initialized tid", meta.Tname(tid), "from env")
 		return tid, false
 	}
 
 	var err error
-	if tid, err = fs.LoadNodeID(config.FSP.Paths); err != nil {
+	tid, err = fs.LoadNodeID(config.FSP.Paths)
+	switch {
+	case err != nil:
 		cos.ExitLog(err) // FATAL
+	case tid != "":
+		nlog.Infof("loaded tid %s", meta.Tname(tid))
+	default:
+		tid = genDaemonID(apc.Target, config)
+		err = cos.ValidateDaemonID(tid)
+		debug.AssertNoErr(err)
+		nlog.Infoln("generated tid", meta.Tname(tid))
+		generated = true
 	}
-	if tid != "" {
-		return tid, false
-	}
-
-	// this target: generate random ID
-	tid = genDaemonID(apc.Target, config)
-	err = cos.ValidateDaemonID(tid)
-	debug.AssertNoErr(err)
-	nlog.Infoln(meta.Tname(tid) + ": ID randomly generated")
-	return tid, true
+	return tid, generated
 }
 
 func regDiskMetrics(node *meta.Snode, tstats *stats.Trunner, mpi fs.MPI) {
@@ -313,10 +373,9 @@ func (t *target) Run() error {
 	}
 	config := cmn.GCO.Get()
 	t.htrun.init(config)
+	t.setusr1()
 
-	tstats := t.statsT.(*stats.Trunner)
-
-	core.Tinit(t, tstats, true /*run hk*/)
+	core.Tinit(t, config, true /*run hk*/)
 
 	fatalErr, writeErr := t.checkRestarted(config)
 	if fatalErr != nil {
@@ -347,6 +406,8 @@ func (t *target) Run() error {
 	}
 	t.owner.smap.put(smap)
 
+	tstats := t.statsT.(*stats.Trunner)
+
 	if daemon.cli.target.standby {
 		tstats.Standby(true)
 		t.regstate.disabled.Store(true)
@@ -375,7 +436,7 @@ func (t *target) Run() error {
 
 	tstats.RegMetrics(t.si)
 
-	t.initBackends(tstats) // (+ reg backend metrics)
+	t.initBackends() // (+ reg backend metrics)
 
 	// end target metrics -----------------------
 
@@ -385,7 +446,7 @@ func (t *target) Run() error {
 		return err
 	}
 
-	t.transactions.init(t)
+	t.txns.init(t)
 
 	t.reb = reb.New(config)
 	t.res = res.New()
@@ -400,17 +461,20 @@ func (t *target) Run() error {
 
 	marked := xreg.GetResilverMarked()
 	if marked.Interrupted || daemon.resilver.required {
-		go t.goresilver(marked.Interrupted)
+		go t.goresilver(config, marked.Interrupted)
 	}
 
-	dsort.Tinit(t.statsT, db, config)
-	dload.Init(t.statsT, db, &config.Client)
+	dsort.Tinit(db, config)
+	dload.Init(db, &config.Client)
 
 	err = t.htrun.run(config)
 
-	etl.StopAll()                              // stop all running ETLs if any
-	cos.Close(db)                              // close kv db
-	fs.RemoveMarker(fname.NodeRestartedMarker) // exit gracefully
+	etl.StopAll() // stop all running ETLs if any
+	cos.Close(db) // close kv db
+
+	// gracefully
+	fs.RemoveMarker(fname.NodeRestartedPrev, t.statsT)
+	fs.RemoveMarker(fname.NodeRestartedMarker, t.statsT)
 	return err
 }
 
@@ -440,16 +504,16 @@ func (t *target) gojoin(config *cmn.Config) {
 	nlog.Infoln(t.String(), "is ready")
 }
 
-func (t *target) goresilver(interrupted bool) {
+func (t *target) goresilver(config *cmn.Config, interrupted bool) {
 	if interrupted {
 		nlog.Infoln("Resuming resilver...")
 	} else if daemon.resilver.required {
 		nlog.Infoln("Starting resilver, reason:", daemon.resilver.reason)
 	}
-	t.runResilver(res.Args{}, nil /*wg*/)
+	t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}}, nil /*wg*/)
 }
 
-func (t *target) runResilver(args res.Args, wg *sync.WaitGroup) {
+func (t *target) runResilver(args *res.Args, wg *sync.WaitGroup) {
 	// with no cluster-wide UUID it's a local run
 	if args.UUID == "" {
 		args.UUID = cos.GenUUID()
@@ -457,10 +521,15 @@ func (t *target) runResilver(args res.Args, wg *sync.WaitGroup) {
 		msg := t.newAmsgActVal(apc.ActRegGlobalXaction, regMsg)
 		t.bcastAsyncIC(msg)
 	}
+
+	debug.Assert(args.Custom.Config != nil)
+	smap := t.owner.smap.get()
+	args.Custom.Smap = &smap.Smap
+
 	if wg != nil {
 		wg.Done() // compare w/ xact.GoRunW(()
 	}
-	t.res.RunResilver(args)
+	t.res.RunResilver(args, t.statsT)
 }
 
 func (t *target) endStartupStandby() (err error) {
@@ -514,7 +583,7 @@ func (t *target) checkRestarted(config *cmn.Config) (fatalErr, writeErr error) {
 			fatalErr = fmt.Errorf("%s: %q is in use (duplicate or overlapping run?)", t, red.inUse)
 			return
 		}
-		t.statsT.SetFlag(cos.NodeAlerts, cos.Restarted)
+		t.statsT.SetFlag(cos.NodeAlerts, cos.NodeRestarted)
 		fs.PersistMarker(fname.NodeRestartedPrev)
 	}
 	fatalErr, writeErr = fs.PersistMarker(fname.NodeRestartedMarker)
@@ -584,6 +653,10 @@ func (t *target) errURL(w http.ResponseWriter, r *http.Request) {
 		t.writeErrURL(w, r)
 	}
 }
+
+//
+// endpoints
+//
 
 // verb /v1/buckets
 func (t *target) bucketHandler(w http.ResponseWriter, r *http.Request) {
@@ -670,7 +743,7 @@ func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiR
 		return
 	}
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if apireq.dpq.ptime == "" /*isRedirect*/ && t.isIntraCall(r.Header, false /*from primary*/) != nil {
+		if apireq.dpq.ptime == "" /*isRedirect*/ && t.checkIntraCall(r.Header, false /*from primary*/) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
@@ -697,8 +770,8 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 	}
 
 	// two special flows
-	if dpq.etlName != "" {
-		t.getETL(w, r, dpq.etlName, lom)
+	if dpq.etl.name != "" {
+		t.inlineETL(w, r, dpq, lom)
 		return lom, nil
 	}
 	if cos.IsParseBool(r.Header.Get(apc.HdrBlobDownload)) {
@@ -715,7 +788,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		}
 		xid, _, err := t.blobdl(args, nil /*oa*/)
 		if err != nil && xid != "" {
-			// (for the same reason as errSendingResp)
+			// (for the same reason as errGetTxBenign)
 			nlog.Warningln("GET", lom.Cname(), "via blob-download["+xid+"]:", err)
 			err = nil
 		}
@@ -725,6 +798,9 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 	// GET: regular | archive | range
 	goi := allocGOI()
 	{
+		// [TODO]
+		// - consider smth like: goi.atime = (elapsed-since-ref-monotime) + ref-calendar-time
+		// - with periodic readjustment (***)
 		goi.atime = time.Now().UnixNano()
 		goi.ltime = mono.NanoTime()
 		if dpq.ptime != "" {
@@ -763,13 +839,21 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 
 	// do
 	if ecode, err := goi.getObject(); err != nil {
-		t.statsT.IncErr(stats.ErrGetCount)
+		// stats
+		vlabs := map[string]string{stats.VlabBucket: bck.Cname("")}
 		if goi.isIOErr {
-			t.statsT.IncErr(stats.IOErrGetCount)
+			t.statsT.IncWith(stats.ErrGetCount, vlabs)
+			t.statsT.IncWith(stats.IOErrGetCount, vlabs)
+			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+				nlog.Warningln("io-error [", err, "]", goi.lom.String())
+			}
+		} else {
+			t.statsT.IncWith(stats.ErrGetCount, vlabs)
 		}
 
 		// handle right here, return nil
-		if err != errSendingResp {
+		if err != errGetTxBenign && !isErrGetTxSevere(err) {
+			goi.lom.UncacheDel()
 			if dpq.isS3 {
 				s3.WriteErr(w, r, err, ecode)
 			} else {
@@ -809,9 +893,6 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		started = time.Now().UnixNano()
 		t2tput  = isT2TPut(r.Header)
 	)
-	if !t.isValidObjname(w, r, lom.ObjName) {
-		return
-	}
 	if apireq.dpq.ptime == "" && !t2tput {
 		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
 		return
@@ -836,12 +917,6 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 			t.writeErr(w, r, err)
 			return
 		}
-	}
-
-	// load (maybe)
-	skipVC := lom.IsFeatureSet(feat.SkipVC) || apireq.dpq.skipVC
-	if !skipVC {
-		_ = lom.Load(true, false)
 	}
 
 	// do
@@ -878,35 +953,47 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 			w.Header().Set(apc.HdrAppendHandle, handle)
 			return
 		}
-		t.statsT.IncErr(stats.ErrAppendCount)
+		vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
+		t.statsT.IncWith(stats.ErrAppendCount, vlabs)
 	default:
-		poi := allocPOI()
-		{
-			poi.atime = started
-			if apireq.dpq.ptime != "" {
-				if d := ptLatency(poi.atime, apireq.dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
-					t.statsT.Add(stats.PutRedirLatency, d)
-				}
-			}
-			poi.t = t
-			poi.lom = lom
-			poi.config = config
-			poi.skipVC = skipVC // feat.SkipVC || apc.QparamSkipVC
-			poi.restful = true
-			poi.t2t = t2tput
-		}
-		ecode, err = poi.do(w.Header(), r, apireq.dpq)
-		freePOI(poi)
+		ecode, err = t.putObject(w, r, apireq.dpq, lom, t2tput, config)
 	}
 	if err != nil {
-		t.FSHC(err, lom.Mountpath(), "") // TODO -- FIXME: removed from the place where happened, fqn missing...
+		t.FSHC(err, lom.Mountpath(), "") // TODO: removed from the place where happened, fqn missing...
 		t.writeErr(w, r, err, ecode)
 	}
 }
 
+// NOTE: lom bucket needs to be initialized before calling this method
+func (t *target) putObject(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM, t2t bool, config *cmn.Config) (ecode int, err error) {
+	skipVC := lom.IsFeatureSet(feat.SkipVC) || dpq.skipVC
+	if !skipVC {
+		_ = lom.Load(false, false)
+	}
+
+	poi := allocPOI()
+	{
+		poi.atime = time.Now().UnixNano()
+		if dpq.ptime != "" {
+			if d := ptLatency(poi.atime, dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
+				t.statsT.Add(stats.PutRedirLatency, d)
+			}
+		}
+		poi.t = t
+		poi.lom = lom
+		poi.config = config
+		poi.skipVC = skipVC // feat.SkipVC || apc.QparamSkipVC
+		poi.restful = true
+		poi.t2t = t2t
+	}
+	ecode, err = poi.do(w.Header(), r, dpq)
+	freePOI(poi)
+	return ecode, err
+}
+
 // DELETE [ { action } ] /v1/objects/bucket-name/object-name
 func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
-	var msg aisMsg
+	var msg actMsgExt
 	if err := readJSON(w, r, &msg); err != nil {
 		return
 	}
@@ -914,9 +1001,6 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 		return
 	}
 	objName := apireq.items[1]
-	if !t.isValidObjname(w, r, objName) {
-		return
-	}
 	if isRedirect(apireq.query) == "" {
 		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected", t.si, r.Method)
 		return
@@ -968,13 +1052,15 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 			break
 		}
 		if err = t.objMv(lom, msg); err == nil {
-			t.statsT.Inc(stats.RenameCount)
+			t.statsT.IncBck(stats.RenameCount, lom.Bucket())
 			core.FreeLOM(lom)
 			lom = nil
 		} else {
-			t.statsT.IncErr(stats.ErrRenameCount)
+			vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
+			t.statsT.IncWith(stats.ErrRenameCount, vlabs)
 		}
 	case apc.ActBlobDl:
+		// TODO: add stats.GetBlobCount and *ErrCount
 		var (
 			xid     string
 			objName = msg.Name
@@ -998,6 +1084,9 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 
 			// lom is eventually freed by x-blob
 		}
+	case apc.ActCheckLock:
+		t._checkLocked(w, r, apireq.bck, apireq.items[1])
+		return
 	default:
 		t.writeErrAct(w, r, msg.Action)
 		return
@@ -1008,6 +1097,34 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 	}
 }
 
+// return object's lock status (enum { apc.LockNone, ... }) via HTTP status:
+// - 200 OK:       unlocked
+// - 202 Accepted: read lock (NOTE: convention)
+// - 423 Locked:   write lock
+func (t *target) _checkLocked(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string) {
+	var (
+		ecode  int
+		locked int
+		lom    = core.AllocLOM(objName)
+	)
+	defer core.FreeLOM(lom)
+	if err := lom.InitBck(bck.Bucket()); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	locked = lom.IsLocked()
+	switch locked {
+	case apc.LockWrite:
+		ecode = http.StatusLocked
+	case apc.LockRead:
+		ecode = http.StatusAccepted
+	default:
+		debug.Assert(locked == apc.LockNone)
+		ecode = http.StatusOK
+	}
+	w.WriteHeader(ecode)
+}
+
 // HEAD /v1/objects/<bucket-name>/<object-name>
 func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
 	if err := t.parseReq(w, r, apireq); err != nil {
@@ -1016,7 +1133,7 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 	query, bck, objName := apireq.query, apireq.bck, apireq.items[1]
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
 		// validates that the request is internal (by a node in the same cluster)
-		if isRedirect(query) == "" && t.isIntraCall(r.Header, false) != nil {
+		if isRedirect(query) == "" && t.checkIntraCall(r.Header, false) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
@@ -1031,10 +1148,9 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 }
 
 // NOTE: sets whdr.ContentLength = obj-size, with no response body
-func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *meta.Bck, lom *core.LOM) (ecode int, err error) {
+func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *meta.Bck, lom *core.LOM) (int, error) {
 	var (
 		fltPresence int
-		hasEC       bool
 		exists      = true
 	)
 	if tmp := q.Get(apc.QparamFltPresence); tmp != "" {
@@ -1042,24 +1158,22 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 		fltPresence, erp = strconv.Atoi(tmp)
 		debug.AssertNoErr(erp)
 	}
-	if err = lom.InitBck(bck.Bucket()); err != nil {
+	if err := lom.InitBck(bck.Bucket()); err != nil {
 		if cmn.IsErrBucketNought(err) {
-			ecode = http.StatusNotFound
+			return http.StatusNotFound, err
 		}
-		return
+		return 0, err
 	}
-	err = lom.Load(true /*cache it*/, false /*locked*/)
-	if err == nil {
+	if err := lom.Load(true /*cache it*/, false /*locked*/); err == nil {
 		if apc.IsFltNoProps(fltPresence) {
-			return
+			return 0, nil
 		}
 		if fltPresence == apc.FltExistsOutside {
-			err = fmt.Errorf(fmtOutside, lom.Cname(), fltPresence)
-			return
+			return 0, fmt.Errorf(fmtOutside, lom.Cname(), fltPresence)
 		}
 	} else {
 		if !cmn.IsErrObjNought(err) {
-			return
+			return 0, err
 		}
 		exists = false
 		if fltPresence == apc.FltPresentCluster {
@@ -1069,13 +1183,15 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 
 	if !exists {
 		if bck.IsAIS() || apc.IsFltPresent(fltPresence) {
-			err = cos.NewErrNotFound(t, lom.Cname())
-			return http.StatusNotFound, err
+			return http.StatusNotFound, cos.NewErrNotFound(t, lom.Cname())
 		}
 	}
 
 	// props
-	op := cmn.ObjectProps{Name: lom.ObjName, Bck: *lom.Bucket(), Present: exists}
+	var (
+		op    = cmn.ObjectProps{Name: lom.ObjName, Bck: *lom.Bucket(), Present: exists}
+		hasEC bool
+	)
 	if exists {
 		op.ObjAttrs = *lom.ObjAttrs()
 		op.Location = lom.Location()
@@ -1110,18 +1226,20 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 	latest := cos.IsParseBool(q.Get(apc.QparamLatestVer))
 	if !exists || latest {
 		// cold HEAD
-		var oa *cmn.ObjAttrs
-		oa, ecode, err = t.HeadCold(lom, r)
+		oa, ecode, err := t.HeadCold(lom, r)
 		if err != nil {
-			if ecode != http.StatusNotFound {
+			switch {
+			case ecode == http.StatusTooManyRequests || ecode == http.StatusServiceUnavailable:
+				debug.Assertf(cmn.IsErrTooManyRequests(err), "expecting err-remote-retriable, got %T", err)
+			case ecode != http.StatusNotFound:
 				err = cmn.NewErrFailedTo(t, "HEAD", lom.Cname(), err)
-			} else if latest {
+			case latest:
 				ecode = http.StatusGone
 			}
-			return
+			return ecode, err
 		}
 		if apc.IsFltNoProps(fltPresence) {
-			return
+			return 0, nil
 		}
 
 		if exists && latest {
@@ -1141,7 +1259,8 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 		// cos.Cksum does not have default nil/zero value (reflection)
 		op.ObjAttrs.Cksum = cos.NewCksum("", "")
 	}
-	errIter := cmn.IterFields(op, func(tag string, field cmn.IterField) (err error, b bool) {
+	// TODO: revisit
+	errIter := cmn.IterFields(op, func(tag string, field cmn.IterField) (error, bool) {
 		if !hasEC && strings.HasPrefix(tag, "ec.") {
 			return nil, false
 		}
@@ -1158,7 +1277,7 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 		return nil, false
 	})
 	debug.AssertNoErr(errIter)
-	return
+	return 0, nil
 }
 
 // PATCH /v1/objects/<bucket-name>/<object-name>
@@ -1169,12 +1288,13 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		return
 	}
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if isRedirect(apireq.query) == "" && t.isIntraCall(r.Header, false) != nil {
+		if isRedirect(apireq.query) == "" && t.checkIntraCall(r.Header, false) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
 		}
 	}
+
 	msg, err := t.readActionMsg(w, r)
 	if err != nil {
 		return
@@ -1184,11 +1304,9 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, "set-custom", msg.Value, err)
 		return
 	}
+
 	lom := core.AllocLOM(apireq.items[1] /*objName*/)
 	defer core.FreeLOM(lom)
-	if !t.isValidObjname(w, r, lom.ObjName) {
-		return
-	}
 	if err := lom.InitBck(apireq.bck.Bucket()); err != nil {
 		t.writeErr(w, r, err)
 		return
@@ -1276,29 +1394,32 @@ func (t *target) DeleteObject(lom *core.LOM, evict bool) (code int, err error) {
 		if code == http.StatusServiceUnavailable || strings.Contains(err.Error(), "try again") {
 			nlog.Errorf("failed to delete %s: %v(%d) - retrying...", lom, err, code)
 			time.Sleep(time.Second)
-			code, err = t.Backend(lom.Bck()).DeleteObj(lom)
+			bp := t.Backend(lom.Bck())
+			code, err = bp.DeleteObj(context.Background(), lom)
 		}
 	}
 
 	// stats
+	vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
 	switch {
 	case err == nil:
-		t.statsT.Inc(stats.DeleteCount)
+		t.statsT.IncWith(stats.DeleteCount, vlabs)
 	case cos.IsNotExist(err, code) || cmn.IsErrObjNought(err):
 		if !evict {
-			t.statsT.IncErr(stats.ErrDeleteCount) // TODO: count GET/PUT/DELETE remote errors on a per-backend...
+			t.statsT.IncWith(stats.ErrDeleteCount, vlabs)
 		}
 	default:
 		// not to confuse with `stats.RemoteDeletedDelCount` that counts against
 		// QparamLatestVer, 'versioning.validate_warm_get' and friends
-		t.statsT.IncErr(stats.ErrDeleteCount)
+		t.statsT.IncWith(stats.ErrDeleteCount, vlabs)
 		if !isback {
-			t.statsT.IncErr(stats.IOErrDeleteCount)
+			t.statsT.IncWith(stats.IOErrDeleteCount, vlabs)
 		}
 	}
 	return code, err
 }
 
+// NOTE: s3 will return err=nil with OK status to indicate (not deleting) non-existing object (see also aws.go)
 func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 	var (
 		aisErr, backendErr         error
@@ -1309,6 +1430,13 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 	err := lom.Load(false /*cache it*/, true /*locked*/)
 	if err != nil {
 		if !cos.IsNotExist(err, 0) {
+			if cmn.IsErrObjNought(err) {
+				// cleanup in place
+				if errNested := lom.RemoveMain(); errNested != nil {
+					nlog.Errorln(t.String(), "failed to cleanup in place: nested err [", err, errNested, "]")
+				}
+				return http.StatusNotFound, nil, false
+			}
 			return 0, err, false
 		}
 		if !delFromBackend {
@@ -1320,7 +1448,7 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 
 	// do
 	if delFromBackend {
-		backendErrCode, backendErr = t.Backend(lom.Bck()).DeleteObj(lom)
+		backendErrCode, backendErr = t.Backend(lom.Bck()).DeleteObj(context.Background(), lom)
 	}
 	if delFromAIS {
 		size := lom.Lsize()
@@ -1337,10 +1465,8 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 			debug.Assert(aisErr == nil) // expecting lom.RemoveObj() to return nil when IsNotExist
 		} else if evict {
 			debug.Assert(lom.Bck().IsRemote())
-			t.statsT.AddMany(
-				cos.NamedVal64{Name: stats.LruEvictCount, Value: 1},
-				cos.NamedVal64{Name: stats.LruEvictSize, Value: size},
-			)
+			t.statsT.Inc(stats.LruEvictCount)
+			t.statsT.Add(stats.LruEvictSize, size)
 		}
 	}
 	if backendErr != nil {
@@ -1350,7 +1476,8 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 }
 
 // rename obj
-func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) (err error) {
+// TODO: (copy, delete) under a single wlock
+func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) error {
 	if lom.Bck().IsRemote() {
 		return fmt.Errorf("%s: cannot rename object %s from remote bucket", t.si, lom)
 	}
@@ -1362,7 +1489,7 @@ func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) (err error) {
 	}
 
 	buf, slab := t.gmm.Alloc()
-	coiParams := core.AllocCOI()
+	coiParams := xs.AllocCOI()
 	{
 		coiParams.BckTo = lom.Bck()
 		coiParams.ObjnameTo = msg.Name /* new object name */
@@ -1371,15 +1498,14 @@ func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) (err error) {
 		coiParams.OWT = cmn.OwtCopy
 		coiParams.Finalize = true
 	}
-	coi := (*copyOI)(coiParams)
-	_, err = coi.do(t, nil /*DM*/, lom)
-	core.FreeCOI(coiParams)
+	coi := (*coi)(coiParams)
+	res := coi.do(t, nil /*DM*/, lom)
+	xs.FreeCOI(coiParams)
 	slab.Free(buf)
-	if err != nil {
-		return err
+	if res.Err != nil {
+		return res.Err
 	}
 
-	// TODO: combine copy+delete under a single write lock
 	lom.Lock(true)
 	if err := lom.RemoveObj(); err != nil {
 		nlog.Warningf("%s: failed to delete renamed object %s (new name %s): %v", t, lom, msg.Name, err)

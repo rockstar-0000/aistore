@@ -1,22 +1,18 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
-	"fmt"
+	"errors"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/debug"
-)
-
-const (
-	// Number of sync maps
-	MultiSyncMapCount = 0x40 // m.b. a power of two
-	MultiSyncMapMask  = MultiSyncMapCount - 1
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 type (
@@ -48,7 +44,7 @@ type (
 		s chan struct{}
 	}
 
-	// DynSemaphore implements sempahore which can change its size during usage.
+	// DynSemaphore implements semaphore which can change its size.
 	DynSemaphore struct {
 		c    *sync.Cond
 		size int
@@ -68,10 +64,6 @@ type (
 	LimitedWaitGroup struct {
 		wg   *sync.WaitGroup
 		sema *DynSemaphore
-	}
-
-	MultiSyncMap struct {
-		M [MultiSyncMapCount]sync.Map
 	}
 
 	NopLocker struct{}
@@ -141,7 +133,7 @@ func (twg *TimeoutGroup) Done() {
 			twg.fin <- struct{}{}
 		}
 	} else if n < 0 {
-		AssertMsg(false, fmt.Sprintf("invalid num pending %d", n))
+		debug.Assertf(false, "invalid num pending %d", n)
 	}
 }
 
@@ -201,7 +193,7 @@ func (s *DynSemaphore) Size() int {
 }
 
 func (s *DynSemaphore) SetSize(n int) {
-	Assert(n >= 1)
+	debug.Assert(n >= 1, n)
 	s.mu.Lock()
 	s.size = n
 	s.mu.Unlock()
@@ -233,7 +225,7 @@ func (s *DynSemaphore) Release(cnts ...int) {
 
 	s.mu.Lock()
 
-	Assert(s.cur >= cnt)
+	debug.Assert(s.cur >= cnt, s.cur, " vs ", cnt)
 
 	s.cur -= cnt
 	s.c.Broadcast()
@@ -246,7 +238,7 @@ func (s *DynSemaphore) Release(cnts ...int) {
 
 // usage: no more than `limit` (e.g., sys.NumCPU()) goroutines in parallel
 func NewLimitedWaitGroup(limit, wanted int) WG {
-	debug.Assert(limit > 0 || wanted > 0)
+	debug.Assert(limit > 0 || wanted > 0, limit, " ", wanted)
 	if wanted == 0 || wanted > limit {
 		return &LimitedWaitGroup{wg: &sync.WaitGroup{}, sema: NewDynSemaphore(limit)}
 	}
@@ -267,15 +259,45 @@ func (lwg *LimitedWaitGroup) Wait() {
 	lwg.wg.Wait()
 }
 
-//////////////////
-// MultiSyncMap //
-//////////////////
+//
+// common channel-full helper
+//
 
-func (msm *MultiSyncMap) Get(idx int) *sync.Map {
-	Assert(idx >= 0 && idx < MultiSyncMapCount)
-	return &msm.M[idx]
+const (
+	chanFullSleep = 100 * time.Millisecond
+)
+
+type (
+	ChanFull struct {
+		atomic.Int64
+	}
+)
+
+var ErrWorkChanFull = errors.New("work channel full")
+
+func _threshold(c int) int { return c - c>>3 }
+
+// where l = len(workCh), c = cap(workCh)
+// - returns true on error and warning, both
+// - may resched and sleep
+func (u *ChanFull) Check(l, c int) bool {
+	switch {
+	case l < _threshold(c):
+		return false
+	case l == c:
+		cnt := u.Inc()
+		if (cnt > 5 && cnt < 10) || cnt%1000 == 999 {
+			nlog.WarningDepth(1, ErrWorkChanFull, "[ len:", l, "cap:", c, "]")
+		}
+		time.Sleep(chanFullSleep)
+	default:
+		if l == _threshold(c) {
+			nlog.WarningDepth(1, ErrWorkChanFull)
+		} else {
+			runtime.Gosched()
+		}
+	}
+	return true
 }
 
-func (msm *MultiSyncMap) GetByHash(hash uint32) *sync.Map {
-	return &msm.M[hash%MultiSyncMapCount]
-}
+func (u *ChanFull) Load() int64 { return u.Int64.Load() }

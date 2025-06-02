@@ -8,12 +8,15 @@ categories: aistore pytorch sdk python
 
 # PyTorch: Loading Data from AIStore
 
+> **Note:** The `torchdata.datapipes` module has been [deprecated and removed](https://github.com/pytorch/data?tab=readme-ov-file#torchdata-see-note-below-on-current-status) in recent versions of 
+`torchdata`. Some information in this blog post may be outdated.
+
 Listing and loading data from AIS buckets (buckets that are not 3rd
 party backend-based) and remote cloud buckets (3rd party backend-based
 cloud buckets) using
-[AISFileLister](https://pytorch.org/data/main/generated/torchdata.datapipes.iter.AISFileLister.html#aisfilelister)
+[AISFileLister](https://pytorch.org/data/0.8/generated/torchdata.datapipes.iter.AISFileLister.html)
 and
-[AISFileLoader](https://pytorch.org/data/main/generated/torchdata.datapipes.iter.AISFileLoader.html#torchdata.datapipes.iter.AISFileLoader).
+[AISFileLoader](https://pytorch.org/data/0.8/generated/torchdata.datapipes.iter.AISFileLoader.html).
 
 [AIStore](https://github.com/NVIDIA/aistore) (AIS for short) fully supports
 Amazon S3, Google Cloud, and Microsoft Azure backends, providing a
@@ -21,7 +24,7 @@ unified namespace across multiple connected backends and/or other AIS
 clusters, and [more](https://github.com/NVIDIA/aistore#features).
 
 In the following example, we use the [Caltech-256 Object Category
-Dataset](https://authors.library.caltech.edu/7694/) containing 256
+Dataset](https://data.caltech.edu/records/nyy15-4j048) containing 256
 object categories and a total of 30607 images stored on an AIS bucket
 and the [Microsoft COCO Dataset](https://cocodataset.org/#home) which
 has 330K images with over 200K labels of more than 1.5 million object
@@ -195,7 +198,7 @@ for url, file in dp_files.load_from_tar():
 -   [AIStore Documentation](https://aiatscale.org/docs)
 -   [AIStore Python
     SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore)
--   [Caltech 256 Dataset](https://authors.library.caltech.edu/7694/)
+-   [Caltech 256 Dataset](https://data.caltech.edu/records/nyy15-4j048)
 -   [Getting started with
     AIStore](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md)
 -   [Microsoft COCO Dataset](https://cocodataset.org/#home)

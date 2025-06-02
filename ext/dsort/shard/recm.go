@@ -1,7 +1,7 @@
 // Package shard provides Extract(shard), Create(shard), and associated methods
-// across all suppported archival formats (see cmn/archive/mime.go)
+// across all supported archival formats (see cmn/archive/mime.go)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package shard
 
@@ -17,16 +17,18 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/ext/dsort/ct"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+
 	"github.com/pkg/errors"
 )
 
 const (
 	// Extract methods
-	ExtractToMem cos.Bits = 1 << iota
+	ExtractToMem bits = 1 << iota
 	ExtractToDisk
 	ExtractToWriter
 )
@@ -44,7 +46,7 @@ type (
 		r             cos.ReadSizer // body of the record
 		w             io.Writer     // required when method is set to ExtractToWriter
 		metadata      []byte        // metadata of the record
-		extractMethod cos.Bits      // method which needs to be used to extract a record
+		extractMethod bits          // method which needs to be used to extract a record
 		offset        int64         // offset of the body in the shard
 		buf           []byte        // helper buffer for `CopyBuffer` methods
 	}
@@ -219,7 +221,9 @@ func (recm *RecordManager) MergeEnqueuedRecords() {
 
 		recm.Records.merge(records)
 	}
-	cos.FreeMemToOS(false /*force*/)
+	if pressure := core.T.PageMM().Pressure(); pressure >= memsys.PressureHigh {
+		oom.FreeToOS(false /*force*/)
+	}
 }
 
 func (recm *RecordManager) encodeRecordName(storeType, shardName, recordName string) (contentPath, fullContentPath string) {
@@ -276,7 +280,7 @@ func (recm *RecordManager) FullContentPath(obj *RecordObj) string {
 	}
 }
 
-func (recm *RecordManager) FreeMem(fullContentPath, newStoreType string, value any, buf []byte) (n int64) {
+func (recm *RecordManager) FreeMem(fullContentPath, newStoreType string, value any, buf []byte) int64 {
 	sgl, ok := value.(*memsys.SGL)
 	debug.Assert(ok)
 
@@ -292,13 +296,13 @@ func (recm *RecordManager) FreeMem(fullContentPath, newStoreType string, value a
 		// Generally should not happen but it is not proven that it cannot.
 		// There is nothing wrong with just returning here though.
 		nlog.Errorln("failed to find", fullContentPath, recordObjExt, contentPath) // TODO: FastV
-		return
+		return 0
 	}
 
 	idx := record.find(recordObjExt)
 	if idx == -1 {
 		// Duplicated records are removed so we cannot assert here.
-		return
+		return 0
 	}
 	obj := record.Objects[idx]
 
@@ -319,7 +323,7 @@ func (recm *RecordManager) FreeMem(fullContentPath, newStoreType string, value a
 
 		if _, err := cos.SaveReader(diskPath, sgl, buf, cos.ChecksumNone, -1); err != nil {
 			nlog.Errorln(err)
-			return
+			return 0
 		}
 	default:
 		debug.Assert(false, newStoreType)
@@ -327,9 +331,10 @@ func (recm *RecordManager) FreeMem(fullContentPath, newStoreType string, value a
 
 	obj.StoreType = newStoreType
 	recm.contents.Delete(fullContentPath)
-	n = sgl.Size()
+	n := sgl.Size()
 	sgl.Free()
-	return
+
+	return n
 }
 
 func (recm *RecordManager) RecordContents() *sync.Map {
@@ -359,9 +364,8 @@ func (recm *RecordManager) Cleanup() {
 	})
 	recm.contents = nil
 
-	// NOTE: may call cos.FreeMemToOS
+	// NOTE: may call oom.FreeToOS
 	core.T.PageMM().FreeSpec(memsys.FreeSpec{
-		Totally: true,
 		ToOS:    true,
 		MinSize: 1, // force toGC to free all (even small) memory to system
 	})
@@ -396,3 +400,13 @@ func parseRecordUname(recordUniqueName string) (shardName, recordName string) {
 	splits := strings.SplitN(recordUniqueName, recSepa, 2)
 	return splits[0], splits[1]
 }
+
+//////////
+// bits //
+//////////
+
+type bits uint8
+
+func (b *bits) Set(flag bits)      { x := *b; x |= flag; *b = x }
+func (b *bits) Clear(flag bits)    { x := *b; x &^= flag; *b = x }
+func (b *bits) Has(flag bits) bool { return *b&flag != 0 }

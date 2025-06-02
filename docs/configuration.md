@@ -1,12 +1,3 @@
----
-layout: post
-title: CONFIGURATION
-permalink: /docs/configuration
-redirect_from:
- - /configuration.md/
- - /docs/configuration.md/
----
-
 AIS configuration comprises:
 
 | Name | Scope | Comment |
@@ -18,7 +9,7 @@ Cluster-wide (global) configuration is protected, namely: checksummed, versioned
 
 Local config includes:
 
-1. node's own hostnames (or IP addresses) and [mountpaths](overview.md#terminology) (data drives);
+1. node's own hostnames (or IP addresses) and [mountpaths](overview.md#mountpath) (data drives);
 2. optionally, names-and-values that were changed for *this* specific node. For each node in the cluster, the corresponding capability (dubbed *config-override*) boils down to:
    * **inheriting** cluster configuration, and optionally
    * optionally, **locally overriding** assorted inherited defaults (see usage examples below).
@@ -81,7 +72,7 @@ $ ais config cluster log --json
 
 ```console
 $ ais config cluster backend.conf --json
-    "backend": {"aws":{},"azure":{},"gcp":{}}
+    "backend": {"aws":{},"azure":{},"gcp":{},"oci":{}}
 ```
 
 See also:
@@ -256,7 +247,7 @@ $ ais show config CCDpt8088 --json | tail -20
         "port_intra_control": "51082",
         "port_intra_data": "51083"
     },
-    "fspaths": {"/ais/mp1": "","/ais/mp2": "","/ais/mp3":{},"/ais/mp4": ""},
+    "fspaths": {"/ais/mp1": "","/ais/mp2": "","/ais/mp3": "","/ais/mp4": ""},
     "test_fspaths": {
         "root": "/tmp/ais",
         "count": 0,
@@ -339,7 +330,7 @@ Further, `test_fspaths` section (see below) corresponds to a **single local file
 
 ![Configuration: local filesystems](images/ais-config-2-commented.png)
 
-In production, we use an alternative configuration called `fspaths`: the section of the [config](/deploy/dev/local/aisnode_config.sh) that includes a number of local directories, whereby each directory is based on a different local filesystem.
+In production, we use an alternative configuration called `fspaths`: the section of the [config](/deploy/dev/local/aisnode_config.sh) that includes a number of local directories, whereby each directory is based on a _different_ local filesystem solely utilizing one or more _non_ shared disks.
 
 For `fspath` and `mountpath` terminology and details, please see section [Managing Mountpaths](#managing-mountpaths) in this document.
 
@@ -494,7 +485,7 @@ $ aisnode -config=/etc/ais.json -local_config=/etc/ais_local.json -role=target -
 
 ## Managing mountpaths
 
-* [Mountpath](overview.md#terminology) - is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS can fully own and utilize (to store user data and system metadata). Note that any given disk (or RAID) can have (at most) one mountpath (meaning **no disk sharing**) and mountpath directories cannot be nested. Further:
+* [Mountpath](overview.md#mountpath) - is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS can fully own and utilize (to store user data and system metadata). Note that any given disk (or RAID) can have (at most) one mountpath (meaning **no disk sharing**) and mountpath directories cannot be nested. Further:
    - a mountpath can be temporarily disabled and (re)enabled;
    - a mountpath can also be detached and (re)attached, thus effectively supporting growth and "shrinkage" of local capacity;
    - it is safe to execute the 4 listed operations (enable, disable, attach, detach) at any point during runtime;
@@ -504,7 +495,7 @@ Configuration option `fspaths` specifies the list of local mountpath directories
 
 > In regards **non-sharing of disks** between mountpaths: for development we make an exception, such that multiple mountpaths are actually allowed to share a disk and coexist within a single filesystem. This is done strictly for development convenience, though.
 
-AIStore [REST API](http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](/health/fshc.md).
+AIStore [REST API](http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](https://github.com/NVIDIA/aistore/blob/main/fs/health/README.md).
 
 ## Disabling extended attributes
 
@@ -550,7 +541,7 @@ Default installation enables filesystem health checker component called FSHC. FS
 
 When enabled, FSHC gets notified on every I/O error upon which it performs extensive checks on the corresponding local filesystem. One possible outcome of this health-checking process is that FSHC disables the faulty filesystems leaving the target with one filesystem less to distribute incoming data.
 
-Please see [FSHC readme](/health/fshc.md) for further details.
+Please see [FSHC readme](https://github.com/NVIDIA/aistore/blob/main/fs/health/README.md) for further details.
 
 ## Networking
 

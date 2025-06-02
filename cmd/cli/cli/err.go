@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains error handlers and utilities.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -19,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	"github.com/urfave/cli"
 )
 
@@ -51,7 +52,7 @@ type (
 //////////////
 
 func (e *errUsage) Error() string {
-	msg := helpMessage(e.helpTemplate, e.helpData)
+	msg := helpErrMessage(e.helpTemplate, e.helpData)
 
 	// remove "alias for" (simplify)
 	reg := regexp.MustCompile(aliasForRegex)
@@ -89,7 +90,11 @@ func (e *errAdditionalInfo) Error() string {
 /////////////////////
 
 func (e *errDoesNotExist) Error() string {
-	return fmt.Sprintf("%s %q does not exist%s", e.what, e.name, e.suffix)
+	s := fmt.Sprintf("%q does not exist%s", e.name, e.suffix)
+	if e.what != "" {
+		return e.what + " " + s
+	}
+	return s
 }
 
 func isErrDoesNotExist(err error) bool {
@@ -358,7 +363,7 @@ func formatErr(err error) error {
 		errmsg := fmt.Sprintf("AIStore cannot be reached at %s\n", clusterURL)
 		errmsg += fmt.Sprintf("Make sure that environment '%s' has the address of any AIS gateway (proxy).\n"+
 			"For defaults, see CLI config at %s or run `ais show config cli`.",
-			env.AIS.Endpoint, config.Path())
+			env.AisEndpoint, config.Path())
 		return redErr(errors.New(errmsg))
 	}
 	switch err := err.(type) {
@@ -421,4 +426,50 @@ func isStartingUp(err error) bool {
 		}
 	}
 	return false
+}
+
+//
+// misplaced or mistyped flag(s)
+//
+
+func errArgIsFlag(c *cli.Context, arg string) (err error) {
+	if len(arg) > 1 && arg[0] == '-' {
+		err = incorrectUsageMsg(c, "missing command line argument (hint: flag '%s' misplaced?)", arg)
+	}
+	return err
+}
+
+func errTailArgsContainFlag(tail []string) error {
+	for _, arg := range tail {
+		if len(arg) > 1 && arg[0] == '-' {
+			return fmt.Errorf("unrecognized or misplaced option %q", arg)
+		}
+	}
+	return nil
+}
+
+//
+// range read
+//
+
+func errRangeReadArch(what string) error {
+	return fmt.Errorf("cannot range-read (%s, %s) archived content (%s) - "+NIY, qflprn(lengthFlag), qflprn(offsetFlag), what)
+}
+
+//
+// parse uri
+//
+
+func errBucketNameInvalid(c *cli.Context, arg string, err error) error {
+	if errV := errArgIsFlag(c, arg); errV != nil {
+		return errV
+	}
+	if strings.Contains(err.Error(), cos.OnlyPlus) && strings.Contains(err.Error(), "bucket name") {
+		if strings.Contains(arg, ":/") && !strings.Contains(arg, apc.BckProviderSeparator) {
+			a := strings.Replace(arg, ":/", apc.BckProviderSeparator, 1)
+			return fmt.Errorf("bucket name in %q is invalid: (did you mean %q?)", arg, a)
+		}
+		return fmt.Errorf("bucket name in %q is invalid: "+cos.OnlyPlus, arg)
+	}
+	return nil
 }

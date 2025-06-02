@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -42,14 +42,6 @@ const (
 
 type (
 	ContentResolver interface {
-		// When set to true, services like rebalance have permission to move
-		// content for example to another target because it is misplaced (HRW).
-		PermToMove() bool
-		// When set to true, services like LRU have permission to evict/delete content
-		PermToEvict() bool
-		// When set to true, content can be checksumed, shown or processed in other ways.
-		PermToProcess() bool
-
 		// Generates unique base name for original one. This function may add
 		// additional information to the base name.
 		// prefix - user-defined marker
@@ -62,7 +54,6 @@ type (
 		ObjectName() string
 		Bucket() *cmn.Bck
 		Mountpath() *Mountpath
-		CacheIdx() int
 	}
 
 	ContentInfo struct {
@@ -77,7 +68,22 @@ type (
 	}
 )
 
+type (
+	ObjectContentResolver   struct{}
+	WorkfileContentResolver struct{}
+	ECSliceContentResolver  struct{}
+	ECMetaContentResolver   struct{}
+)
+
 var CSM *contentSpecMgr
+
+// interface guard
+var (
+	_ ContentResolver = (*ObjectContentResolver)(nil)
+	_ ContentResolver = (*WorkfileContentResolver)(nil)
+	_ ContentResolver = (*ECSliceContentResolver)(nil)
+	_ ContentResolver = (*ECMetaContentResolver)(nil)
+)
 
 func (f *contentSpecMgr) Resolver(contentType string) ContentResolver {
 	r := f.m[contentType]
@@ -114,6 +120,16 @@ func (f *contentSpecMgr) Gen(parts PartsFQN, contentType, prefix string) (fqn st
 		spec    = f.m[contentType]
 		objName = spec.GenUniqueFQN(parts.ObjectName(), prefix)
 	)
+
+	// [NOTE]
+	// override caller-provided  `objName` to prevent "file name too long" errno 0x24
+	// - full pathname should be fine as (validated) bucket name <= 64
+	// - see related: core/lom and "fixup fntl"
+	if IsFntl(objName) {
+		nlog.Warningln("fntl:", objName)
+		objName = ShortenFntl(objName)
+	}
+
 	return parts.Mountpath().MakePathFQN(parts.Bucket(), contentType, objName)
 }
 
@@ -144,54 +160,11 @@ func (f *contentSpecMgr) FileSpec(fqn string) (resolver ContentResolver, info *C
 	return
 }
 
-func (f *contentSpecMgr) PermToEvict(fqn string) (ok, isOld bool) {
-	spec, info := f.FileSpec(fqn)
-	if spec == nil {
-		return true, false
-	}
-
-	return spec.PermToEvict(), info.Old
-}
-
-func (f *contentSpecMgr) PermToMove(fqn string) (ok bool) {
-	spec, _ := f.FileSpec(fqn)
-	if spec == nil {
-		return false
-	}
-
-	return spec.PermToMove()
-}
-
-func (f *contentSpecMgr) PermToProcess(fqn string) (ok bool) {
-	spec, _ := f.FileSpec(fqn)
-	if spec == nil {
-		return false
-	}
-
-	return spec.PermToProcess()
-}
-
-// FIXME: This should be probably placed somewhere else \/
-
-type (
-	ObjectContentResolver   struct{}
-	WorkfileContentResolver struct{}
-	ECSliceContentResolver  struct{}
-	ECMetaContentResolver   struct{}
-)
-
-func (*ObjectContentResolver) PermToMove() bool                   { return true }
-func (*ObjectContentResolver) PermToEvict() bool                  { return true }
-func (*ObjectContentResolver) PermToProcess() bool                { return true }
 func (*ObjectContentResolver) GenUniqueFQN(base, _ string) string { return base }
 
 func (*ObjectContentResolver) ParseUniqueFQN(base string) (orig string, old, ok bool) {
 	return base, false, true
 }
-
-func (*WorkfileContentResolver) PermToMove() bool    { return false }
-func (*WorkfileContentResolver) PermToEvict() bool   { return true }
-func (*WorkfileContentResolver) PermToProcess() bool { return false }
 
 func (*WorkfileContentResolver) GenUniqueFQN(base, prefix string) string {
 	const (
@@ -233,19 +206,11 @@ func (*WorkfileContentResolver) ParseUniqueFQN(base string) (orig string, old, o
 	return base[:tieIndex], filePID != pid, true
 }
 
-func (*ECSliceContentResolver) PermToMove() bool    { return true }
-func (*ECSliceContentResolver) PermToEvict() bool   { return true }
-func (*ECSliceContentResolver) PermToProcess() bool { return false }
-
 func (*ECSliceContentResolver) GenUniqueFQN(base, _ string) string { return base }
 
 func (*ECSliceContentResolver) ParseUniqueFQN(base string) (orig string, old, ok bool) {
 	return base, false, true
 }
-
-func (*ECMetaContentResolver) PermToMove() bool    { return true }
-func (*ECMetaContentResolver) PermToEvict() bool   { return true }
-func (*ECMetaContentResolver) PermToProcess() bool { return false }
 
 func (*ECMetaContentResolver) GenUniqueFQN(base, _ string) string { return base }
 

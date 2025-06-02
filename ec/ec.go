@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -54,7 +54,7 @@ import (
 //
 // NOTE: All slices must be of the same size. So, the last slice can be padded
 // with zeros. In most cases, padding results in the total size of data
-// replicas being a bit bigger than than the size of the original object.
+// replicas being a bit bigger than the size of the original object.
 //
 // NOTE: Every slice and replica must have corresponding metadata file that is
 // located in the same mountpath as its slice/replica
@@ -122,18 +122,22 @@ const (
 	objSizeHighMem = 50 * cos.MiB
 )
 
+const invalOpcode = "invalid opcode"
+
 type (
+	onFin = func(lom *core.LOM, err error)
+
 	// request - structure to request an object to be EC'ed or restored
 	request struct {
 		LIF      core.LIF   // object info
 		Action   string     // what to do with the object (see Act* consts)
 		ErrCh    chan error // for final EC result (used only in restore)
-		Callback core.OnFinishObj
+		Callback onFin
 
 		putTime time.Time // time when the object is put into main queue
 		tm      time.Time // to measure different steps
 		IsCopy  bool      // replicate or use erasure coding
-		rebuild bool      // true - internal request to reencode, e.g., from ec-encode xaction
+		rebuild bool      // true - internal request to re-encode, e.g., from ec-encode xaction
 	}
 
 	RequestsControlMsg struct {
@@ -478,7 +482,7 @@ func WriteSliceAndMeta(hdr *transport.ObjHdr, args *WriteArgs) error {
 }
 
 // WriteReplicaAndMeta saves replica and its metafile
-func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) (err error) {
+func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) error {
 	lom.Lock(false)
 	if args.Generation != 0 {
 		ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
@@ -489,48 +493,46 @@ func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) (err error) {
 	}
 	lom.Unlock(false)
 
-	if err = writeObject(lom, args.Reader, lom.Lsize(true), args.Xact); err != nil {
-		return
+	// replica
+	if err := writeObject(lom, args.Reader, lom.Lsize(true), args.Xact); err != nil {
+		return err
 	}
-	if !args.Cksum.IsEmpty() && args.Cksum.Value() != "" { // NOTE: empty value
-		if !lom.EqCksum(args.Cksum) {
-			err = cos.NewErrDataCksum(args.Cksum, lom.Checksum(), lom.Cname())
-			return
-		}
+	if !args.Cksum.IsEmpty() && !lom.EqCksum(args.Cksum) {
+		return cos.NewErrDataCksum(args.Cksum, lom.Checksum(), lom.Cname())
 	}
+
+	// meta
 	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
 	ctMeta.Lock(true)
+	err := ctMeta.Write(bytes.NewReader(args.MD), -1, "" /*work fqn*/)
+	if err == nil {
+		err = validateBckBID(ctMeta.Bucket(), args.BID)
+	}
+	ctMeta.Unlock(true)
+	if err == nil {
+		return nil
+	}
 
-	defer func() {
-		ctMeta.Unlock(true)
-		if err == nil {
-			return
-		}
-		if rmErr := lom.RemoveMain(); rmErr != nil {
-			nlog.Errorln("nested error: save replica -> remove replica:", rmErr)
-		}
-		if rmErr := cos.RemoveFile(ctMeta.FQN()); rmErr != nil {
-			nlog.Errorln("nested error: save replica -> remove metafile:", rmErr)
-		}
-	}()
-	if err = ctMeta.Write(bytes.NewReader(args.MD), -1, "" /*work fqn*/); err != nil {
-		return
+	// cleanup
+	if rmErr := lom.RemoveMain(); rmErr != nil {
+		nlog.Errorln("nested error: save replica -> remove replica:", rmErr)
 	}
-	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
-		err = fmt.Errorf("replica-and-meta: %s metafile saved while bucket %s was being destroyed",
-			ctMeta.ObjectName(), ctMeta.Bucket())
-		return
+	if rmErr := cos.RemoveFile(ctMeta.FQN()); rmErr != nil {
+		nlog.Errorln("nested error: save replica -> remove metafile:", rmErr)
 	}
-	err = validateBckBID(lom.Bucket(), args.BID)
-	return
+	return err
 }
 
 // lom <= transport.ObjHdr (NOTE: caller must call freeLOM)
-func AllocLomFromHdr(hdr *transport.ObjHdr) (lom *core.LOM, err error) {
-	lom = core.AllocLOM(hdr.ObjName)
-	if err = lom.InitBck(&hdr.Bck); err != nil {
+func AllocLomFromHdr(hdr *transport.ObjHdr) (*core.LOM, error) {
+	lom := core.AllocLOM(hdr.ObjName)
+	if err := lom.InitBck(&hdr.Bck); err != nil {
 		return nil, err
 	}
 	lom.CopyAttrs(&hdr.ObjAttrs, false /*skip checksum*/)
 	return lom, nil
+}
+
+func errLossMpath(r core.Xact, lom *core.LOM) error {
+	return fmt.Errorf("%s: loss of a mountpath [%s, %s]", r.Name(), lom, lom.Mountpath())
 }

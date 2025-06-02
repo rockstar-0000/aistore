@@ -1,14 +1,13 @@
 // Package hk provides mechanism for registering cleanup
 // functions which are invoked at specified intervals.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package hk
 
 import (
 	"container/heap"
 	"os"
-	"os/signal"
 	"syscall"
 	"time"
 
@@ -52,31 +51,20 @@ type (
 	}
 )
 
+// singleton
 var HK *hk
 
 // interface guard
 var _ cos.Runner = (*hk)(nil)
 
-func TestInit() {
-	_init(false)
-}
-
-func Init() {
-	_init(true)
-}
-
-func _init(mustRun bool) {
+func Init(mustRun bool) {
 	HK = &hk{
 		workCh:  make(chan op, workChanCap),
 		sigCh:   make(chan os.Signal, 1),
 		actions: &timedActions{},
 	}
 	HK.stopCh.Init()
-	if mustRun {
-		HK.running.Store(false)
-	} else {
-		HK.running.Store(true) // tests only
-	}
+	HK.running.Store(!mustRun)
 	heap.Init(HK.actions)
 }
 
@@ -120,18 +108,16 @@ func (hk *hk) terminate() {
 
 func (*hk) Stop(error) { HK.stopCh.Close() }
 
-func (hk *hk) Run() (err error) {
-	signal.Notify(hk.sigCh,
-		syscall.SIGHUP,  // kill -SIGHUP
-		syscall.SIGINT,  // kill -SIGINT (Ctrl-C)
-		syscall.SIGTERM, // kill -SIGTERM
-		syscall.SIGQUIT, // kill -SIGQUIT
-	)
+func (hk *hk) Run() error {
+	hk.setSignal() // SIGINT, et al. (see hk.handleSignal)
+
 	hk.timer = time.NewTimer(time.Hour)
 	hk.running.Store(true)
-	err = hk._run()
+
+	err := hk._run()
+
 	hk.terminate()
-	return
+	return err
 }
 
 func (hk *hk) _run() error {
@@ -199,10 +185,9 @@ func (hk *hk) _run() error {
 
 		case s, ok := <-hk.sigCh:
 			if ok {
-				signal.Stop(hk.sigCh)
-				err := cos.NewSignalError(s.(syscall.Signal))
-				hk.Stop(err)
-				return err
+				if err := hk.handleSignal(s.(syscall.Signal)); err != nil {
+					return err
+				}
 			}
 		}
 	}

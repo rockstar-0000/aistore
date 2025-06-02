@@ -1,19 +1,10 @@
----
-layout: post
-title: AISLOADER
-permalink: /docs/aisloader
-redirect_from:
- - /aisloader.md/
- - /docs/aisloader.md/
----
-
-# AIS Loader
+# AIS Loader (`aisloader`)
 
 AIS Loader ([`aisloader`](/bench/tools/aisloader)) is a tool to measure storage performance. It is a load generator that we constantly use to benchmark and stress-test [AIStore](https://github.com/NVIDIA/aistore) or any S3-compatible backend.
 
 In fact, aisloader can list, write, and read S3(**) buckets _directly_, which makes it quite useful, convenient, and easy to use benchmark to compare storage performance **with** aistore in front of S3 and **without**.
 
-> (**) `aisloader` can be further easily extended to work directly with any Cloud storage provider including, but not limited to, aistore-supported GCP and Azure.
+> (**) `aisloader` can be further easily extended to work directly with any Cloud storage provider including, but not limited to, aistore-supported GCP, OCI, and Azure.
 
 In addition, `aisloader` generates synthetic workloads that mimic training and inference workloads - the capability that allows to run benchmarks in isolation (which is often preferable) avoiding compute-side bottlenecks (if any) and associated complexity.
 
@@ -24,6 +15,12 @@ There's a large set of command-line switches that allow to realize almost any co
 * read and write ratios
 
 Detailed protocol-level tracing statistics are also available - see [HTTP tracing](#http-tracing) section below for brief introduction.
+
+---
+
+**May 2025 UPDATE**: `aisloader`/StatsD integration and associated capabilities described in this document are _obsolete_. The corresponding functionality is not supported and most likely will be eventually completely removed.
+
+---
 
 ## Table of Contents
 
@@ -79,9 +76,10 @@ For the most recently updated command-line options and examples, please run `ais
 | -minsize | `int` | Minimal object size, may contain [multiplicative suffix](#bytes-multiplicative-suffix) | `1MiB` |
 | -numworkers | `int` | Number of goroutine workers operating on AIS in parallel | `10` |
 | -pctput | `int` | Percentage of PUTs in the aisloader-generated workload | `0` |
+| -pctupdate | `int` | Percentage of GET requests that are followed by a PUT "update" (i.e., creation of a new version of the object) | `0` |
 | -latest | `bool` | When true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket | `false` |
 | -port | `int` | Port number for proxy server | `8080` |
-| -provider | `string` | ais - for AIS, cloud - for Cloud bucket; other supported values include "gcp" and "aws", for Amazon and Google clouds, respectively | `ais` |
+| -provider | `string` | ais - for AIS, cloud - for Cloud bucket; other supported values include "gcp", "aws", "azure", "oci" for Google, Amazon, Azure, and Oracle clouds, respectively | `ais` |
 | -putshards | `int` | Spread generated objects over this many subdirectories (max 100k) | `0` |
 | -quiet | `bool` | When starting to run, do not print command line arguments, default settings, and usage examples | `false` |
 | -randomname | `bool` | when true, generate object names of 32 random characters. This option is ignored when loadernum is defined | `true` |
@@ -98,7 +96,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -statsdport | `int` | StatsD UDP port | `8125` |
 | -statsdprobe | `bool` | Test-probe StatsD server prior to benchmarks | `true` |
 | -statsinterval | `int` | Interval in seconds to print performance counters; 0 - disabled | `10` |
-| -subdir | `string` | Virtual destination directory for all aisloader-generated objects | `""` |
+| -subdir | `string` | For GET requests, `-subdir` is a prefix that may or may not be an actual [virtual directory](/docs/howto_virt_dirs.md). For PUT, `-subdir` is a virtual destination directory for all aisloader-generated objects. See closely related [CLI](/docs/cli/object.md) `--prefix` option. | `""` |
 | -test-probe | `bool`| Test StatsD server prior to running benchmarks | `false` |
 | -timeout | `string` | Client HTTP timeout; `0` = infinity) | `10m` |
 | -tmpdir | `string` | Local directory to store temporary files | `/tmp/ais` |
@@ -424,7 +422,7 @@ format:
 * `metric_type` - can be: `gauge`, `timer`, `counter`
 * `hostname` - is the hostname of the machine on which the loader is ran
 * `loaderid` - see: `-loaderid` option
-* `metric` - can be: `latency.*`, `get.*`, `put.*` (see: [aisloader metrics](/docs/metrics.md#ais-loader-metrics))
+* `metric` - can be: `latency.*`, `get.*`, `put.*`
 
 ### Grafana
 
@@ -446,7 +444,7 @@ Following is a brief illustrated sequence to enable detailed tracing, capture st
 **IMPORTANT NOTE:**
 > The amount of generated (and extremely detailed) metrics can put a strain on your StatsD server. That's exactly the reason for runtime switch to **toggle** HTTP tracing on/off. The example below shows how to do it (in particular, see `kill -HUP`).
 
-### 1. Run aisloader for 90s (32 workes, 100% write, sizes between 1KB and 1MB) with detailed tracing enabled:
+### 1. Run aisloader for 90s (32 workers, 100% write, sizes between 1KB and 1MB) with detailed tracing enabled:
 
 ```console
 $ aisloader -bucket=ais://abc -duration 90s -numworkers=32 -minsize=1K -maxsize=1M -pctput=50 --cleanup=false --trace-http=true
@@ -512,18 +510,14 @@ Detailed latency info is enabled
 
 # AISLoader Composer
 
-For benchmarking production-level clusters, a single AISLoader instance may not be able to fully saturate the load the cluster can handle. In this case, multiple aisloader instances can be coordinated via the [AISLoader Composer](/bench/tools/aisloader-composer/). See the [README](/bench/tools/aisloader-composer/README.md) for instructions on setting up. 
+For benchmarking production-level clusters, a single AISLoader instance may not be able to fully saturate the load the cluster can handle. In this case, multiple aisloader instances can be coordinated via the [AISLoader Composer](/bench/tools/aisloader-composer/). See the [README](/bench/tools/aisloader-composer/README.md) for instructions on setting up.
 
 
 ## References
 
-For documented `aisloader` metrics, please refer to:
+For AIS observability (including CLI, Prometheus, and Kubernetes integration), please see:
 
-* [aisloader metrics](/docs/metrics.md#ais-loader-metrics)
-
-The same readme (above) also describes:
-
-* [Statistics, Collected Metrics, Visualization](/docs/metrics.md)
+* [AIS Observability Overview](/docs/monitoring-overview.md)
 
 For [StatsD](https://github.com/etsy/statsd) compliant backends, see:
 
@@ -531,4 +525,4 @@ For [StatsD](https://github.com/etsy/statsd) compliant backends, see:
 
 Finally, for another supported - and alternative to StatsD - monitoring via Prometheus integration, see:
 
-* [Prometheus](/docs/prometheus.md)
+* [Prometheus](/docs/monitoring-prometheus.md)

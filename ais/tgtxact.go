@@ -1,12 +1,13 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -16,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/xact"
@@ -60,7 +62,12 @@ func (t *target) httpxget(w http.ResponseWriter, r *http.Request) {
 	if cmn.ReadJSON(w, r, &xactMsg) != nil {
 		return
 	}
-	debug.Assert(xactMsg.Kind == "" || xact.IsValidKind(xactMsg.Kind), xactMsg.Kind)
+	if xactMsg.Kind != "" {
+		if err := xact.CheckValidKind(xactMsg.Kind); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+	}
 
 	//
 	// TODO: add user option to return idle xactions (separately)
@@ -111,21 +118,26 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// TODO: not checking `xargs.Buckets` vs `xargs.Bck` and not initializing the former :NOTE
+
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		nlog.Infoln(msg.Action, xargs.String())
 	}
 	switch msg.Action {
 	case apc.ActXactStart:
-		debug.Assert(xact.IsValidKind(xargs.Kind), xargs.String())
+		if err := xact.CheckValidKind(xargs.Kind); err != nil {
+			t.writeErrf(w, r, "%v: %s", err, xargs.String())
+			return
+		}
 		if xargs.Kind == apc.ActPrefetchObjects {
-			// TODO: consider adding `Value any` to generic `xact.ArgsMsg`
 			ecode, err := t.runPrefetch(xargs.ID, bck, &apc.PrefetchMsg{})
 			if err != nil {
 				t.writeErr(w, r, err, ecode)
 			}
 			return
 		}
-		// all other "startables"
+		// all other _startable_ xactions
 		xid, err := t.xstart(&xargs, bck, msg)
 		if err != nil {
 			t.writeErr(w, r, err)
@@ -135,13 +147,35 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 			writeXid(w, xid)
 		}
 	case apc.ActXactStop:
-		debug.Assert(xact.IsValidKind(xargs.Kind) || xact.IsValidUUID(xargs.ID), xargs.String())
+		if xargs.Kind != "" {
+			if err := xact.CheckValidKind(xargs.Kind); err != nil {
+				t.writeErrf(w, r, "%v: %s", err, xargs.String())
+				return
+			}
+		}
+		if xargs.ID != "" {
+			if err := xact.CheckValidUUID(xargs.ID); err != nil {
+				t.writeErrf(w, r, "%v: %s", err, xargs.String())
+				return
+			}
+		}
+		if xargs.Kind == "" && xargs.ID == "" {
+			t.writeErrf(w, r, "cannot stop xaction given '%s' - expecting a valid kind and/or UUID", xargs.String())
+			return
+		}
+
 		err := cmn.ErrXactUserAbort
 		if msg.Name == cmn.ErrXactICNotifAbort.Error() {
 			err = cmn.ErrXactICNotifAbort
 		}
 		flt := xreg.Flt{ID: xargs.ID, Kind: xargs.Kind, Bck: bck}
 		xreg.DoAbort(flt, err)
+
+		if xargs.Kind == apc.ActETLInline {
+			if err := etl.StopByXid(xargs.ID, err); err != nil {
+				t.writeErrf(w, r, "%v: %s", err, xargs.String())
+			}
+		}
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
@@ -168,12 +202,34 @@ func (t *target) xget(w http.ResponseWriter, r *http.Request, what, uuid string)
 func (t *target) xquery(w http.ResponseWriter, r *http.Request, what string, xactQuery xreg.Flt) {
 	stats, err := xreg.GetSnap(xactQuery)
 	if err == nil {
-		t.writeJSON(w, r, stats, what)
+		t.writeJSON(w, r, stats, what) // ok
 		return
 	}
-	if cmn.IsErrXactNotFound(err) {
+
+	xactID := xactQuery.ID
+	switch {
+	case cmn.IsErrXactNotFound(err):
 		t.writeErr(w, r, err, http.StatusNotFound, Silent)
-	} else {
+	case xactID != "" && strings.IndexByte(xactID, xact.SepaID[0]) > 0:
+		var (
+			uuids = strings.Split(xactID, xact.SepaID)
+			errN  error
+		)
+		for _, xid := range uuids {
+			xactQuery.ID = xid
+			stats, err := xreg.GetSnap(xactQuery)
+			if err == nil {
+				t.writeJSON(w, r, stats, what) // ok
+				return
+			}
+			errN = err
+		}
+		if cmn.IsErrXactNotFound(err) {
+			t.writeErr(w, r, errN, http.StatusNotFound, Silent)
+		} else {
+			t.writeErr(w, r, errN)
+		}
+	default:
 		t.writeErr(w, r, err)
 	}
 }
@@ -186,9 +242,6 @@ func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck, msg *apc.ActMsg) (xid
 	const erfmb = "global xaction %q does not require bucket (%s) - ignoring it and proceeding to start"
 	const erfmn = "xaction %q requires a bucket to start"
 
-	if !xact.IsValidKind(args.Kind) {
-		return xid, fmt.Errorf(cmn.FmtErrUnknown, t, "xaction kind", args.Kind)
-	}
 	if dtor := xact.Table[args.Kind]; dtor.Scope == xact.ScopeB && bck == nil {
 		return xid, fmt.Errorf(erfmn, args.Kind)
 	}
@@ -200,12 +253,18 @@ func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck, msg *apc.ActMsg) (xid
 		}
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
+		if len(args.Buckets) == 0 && !args.Bck.IsEmpty() {
+			args.Buckets = []cmn.Bck{args.Bck}
+		}
 		go t.runLRU(args.ID, wg, args.Force, args.Buckets...)
 		wg.Wait()
 	case apc.ActStoreCleanup:
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
-		go t.runStoreCleanup(args.ID, wg, args.Buckets...)
+		if len(args.Buckets) == 0 && !args.Bck.IsEmpty() {
+			args.Buckets = []cmn.Bck{args.Bck}
+		}
+		go t.runSpaceCleanup(args, wg)
 		wg.Wait()
 	case apc.ActResilver:
 		if bck != nil {
@@ -224,7 +283,14 @@ func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck, msg *apc.ActMsg) (xid
 			args.ID = cos.GenUUID()
 			xid = args.ID
 		}
-		go t.runResilver(res.Args{UUID: args.ID, Notif: notif}, wg)
+		resargs := &res.Args{
+			UUID:  args.ID,
+			Notif: notif,
+			Custom: xreg.ResArgs{
+				Config: cmn.GCO.Get(),
+			},
+		}
+		go t.runResilver(resargs, wg)
 		wg.Wait()
 	case apc.ActLoadLomCache:
 		rns := xreg.RenewBckLoadLomCache(args.ID, bck)
@@ -275,16 +341,30 @@ func (t *target) httpxpost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	xactID := amsg.Name
-	if xctn, err = xreg.GetXact(xactID); err != nil {
-		t.writeErr(w, r, err)
+	if strings.IndexByte(xactID, xact.SepaID[0]) > 0 {
+		uuids := strings.Split(xactID, xact.SepaID)
+		for _, xid := range uuids {
+			if xctn, err = xreg.GetXact(xid); err == nil {
+				break
+			}
+		}
+	} else {
+		if xctn, err = xreg.GetXact(xactID); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+	}
+	if xctn == nil {
+		t.writeErr(w, r, cos.NewErrNotFound(t, xactID), http.StatusNotFound)
 		return
 	}
-	xtco, ok := xctn.(*xs.XactTCObjs)
+
+	xtco, ok := xctn.(*xs.XactTCO)
 	debug.Assert(ok)
 
 	if err = cos.MorphMarshal(amsg.Value, &tcomsg); err != nil {
 		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, "special", amsg.Value, err)
 		return
 	}
-	xtco.Do(&tcomsg)
+	xtco.ContMsg(&tcomsg)
 }

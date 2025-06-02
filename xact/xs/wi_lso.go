@@ -1,7 +1,7 @@
 // Package xs contains most of the supported eXtended actions (xactions) with some
 // exceptions that include certain storage services (mirror, EC) and extensions (downloader, lru).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -28,6 +28,7 @@ type (
 		smap         *meta.Smap
 		msg          *apc.LsoMsg
 		lomVisitedCb lomVisitedCb
+		custom       cos.StrKVs
 		markerDir    string
 		wanted       cos.BitFlags
 	}
@@ -51,79 +52,102 @@ func newWalkInfo(msg *apc.LsoMsg, lomVisitedCb lomVisitedCb) (wi *walkInfo) {
 			wi.markerDir = ""
 		}
 	}
+	if msg.IsFlagSet(apc.LsDiff) {
+		wi.custom = make(cos.StrKVs)
+	}
 	return
 }
 
 func (wi *walkInfo) lsmsg() *apc.LsoMsg { return wi.msg }
 
-func (wi *walkInfo) processDir(fqn string) error {
+func (wi *walkInfo) processDir(fqn string) (*core.CT, error) {
 	ct, err := core.NewCTFromFQN(fqn, nil)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 
-	if !cmn.DirHasOrIsPrefix(ct.ObjectName(), wi.msg.Prefix) {
-		return filepath.SkipDir
+	if wi.msg.Prefix != "" && !cmn.DirHasOrIsPrefix(ct.ObjectName(), wi.msg.Prefix) {
+		return nil, filepath.SkipDir
 	}
 
 	// e.g., when `markerDir` "b/c/d/" we skip directories "a/", "b/a/",
 	// "b/b/" etc. but do not skip entire "b/" and "b/c/" since it is our
 	// parent that we need to traverse ("b/" < "b/c/d/").
 	if wi.markerDir != "" && ct.ObjectName() < wi.markerDir && !strings.HasPrefix(wi.markerDir, ct.ObjectName()) {
-		return filepath.SkipDir
+		return nil, filepath.SkipDir
 	}
 
-	return nil
+	return ct, nil
 }
 
 func (wi *walkInfo) match(objName string) bool {
-	if !cmn.ObjHasPrefix(objName, wi.msg.Prefix) {
+	if wi.msg.Prefix != "" && !cmn.ObjHasPrefix(objName, wi.msg.Prefix) {
 		return false
 	}
 	return wi.msg.ContinuationToken == "" || !cmn.TokenGreaterEQ(wi.msg.ContinuationToken, objName)
 }
 
 // new entry to be added to the listed page (note: slow path)
-func (wi *walkInfo) ls(lom *core.LOM, status uint16) (e *cmn.LsoEnt) {
-	e = &cmn.LsoEnt{Name: lom.ObjName, Flags: status | apc.EntryIsCached}
-	if wi.msg.IsFlagSet(apc.LsVerChanged) {
-		checkRemoteMD(lom, e)
+func (wi *walkInfo) ls(lom *core.LOM, status uint16) (en *cmn.LsoEnt) {
+	en = &cmn.LsoEnt{Name: lom.ObjName, Flags: status | apc.EntryIsCached}
+
+	if lom.IsFntl() {
+		orig := lom.OrigFntl()
+		if orig != nil {
+			saved := lom.PushFntl(orig)
+			if wi.msg.IsFlagSet(apc.LsDiff) {
+				checkRemoteMD(lom, en)
+			}
+			lom.PopFntl(saved)
+			en.Name = orig[1]
+		}
+	} else if wi.msg.IsFlagSet(apc.LsDiff) {
+		// may set en.custom and en.version
+		checkRemoteMD(lom, en)
 	}
 	if wi.msg.IsFlagSet(apc.LsNameOnly) {
 		return
 	}
-	wi.setWanted(e, lom)
+
+	// fill out even more of `en`
+	wi.setWanted(en, lom)
+
 	wi.lomVisitedCb(lom)
 	return
 }
 
-// NOTE: slow path
-func checkRemoteMD(lom *core.LOM, e *cmn.LsoEnt) {
-	if !lom.Bucket().HasVersioningMD() {
-		debug.Assert(false, lom.Cname())
-		return
-	}
+// NOTE: slow path if lom.Bck is remote
+func checkRemoteMD(lom *core.LOM, en *cmn.LsoEnt) {
 	res := lom.CheckRemoteMD(false /*locked*/, false /*sync*/, nil /*origReq*/)
+
 	switch {
 	case res.Eq:
 		debug.AssertNoErr(res.Err)
 	case cos.IsNotExist(res.Err, res.ErrCode):
-		e.SetVerRemoved()
+		en.SetFlag(apc.EntryVerRemoved)
+	case res.Err == nil:
+		en.SetFlag(apc.EntryVerChanged)
+
+		// expecting custom and version set
+		debug.Assert(len(res.ObjAttrs.CustomMD) > 0)
+		en.Custom = cmn.CustomMD2S(res.ObjAttrs.CustomMD)
+		debug.Assert(res.ObjAttrs.Ver != nil)
+		en.Version = *res.ObjAttrs.Ver
 	default:
-		e.SetVerChanged()
+		en.SetFlag(apc.EntryHeadFail)
 	}
 }
 
 // Performs a number of syscalls to load object metadata.
-func (wi *walkInfo) callback(fqn string, de fs.DirEntry) (entry *cmn.LsoEnt, err error) {
+func (wi *walkInfo) callback(fqn string, de fs.DirEntry) (en *cmn.LsoEnt, err error) {
 	if de.IsDir() {
 		return
 	}
 
 	lom := core.AllocLOM("")
-	entry, err = wi._cb(lom, fqn)
+	en, err = wi._cb(lom, fqn)
 	core.FreeLOM(lom)
-	return
+	return en, err
 }
 
 func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
@@ -146,23 +170,28 @@ func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
 	if !local {
 		status = apc.LocMisplacedNode
 	} else if !lom.IsHRW() {
-		// preliminary
+		// preliminary - IsCopy below
 		status = apc.LocMisplacedMountpath
 	}
 
-	// shortcut #1: name-only optimizes-out loading md (NOTE: won't show misplaced and copies)
-	if wi.msg.IsFlagSet(apc.LsNameOnly) {
+	// [shortcut]: name-only optimizes-out loading md (NOTE: won't show misplaced and copies)
+	if wi.msg.IsFlagSet(apc.LsNameOnly) && !fs.HasPrefixFntl(lom.ObjName) {
 		if !isOK(status) {
 			return nil, nil
 		}
 		return wi.ls(lom, status), nil
 	}
+
 	// load
 	if err := lom.Load(isOK(status) /*cache it*/, false /*locked*/); err != nil {
 		if cmn.IsErrObjNought(err) || !isOK(status) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if lom.IsFntl() {
+		// FIXME: revisit
+		status = apc.LocOK
 	}
 	if local && lom.IsCopy() {
 		// still may change below
@@ -175,18 +204,23 @@ func (wi *walkInfo) _cb(lom *core.LOM, fqn string) (*cmn.LsoEnt, error) {
 	if !wi.msg.IsFlagSet(apc.LsMissing) {
 		return nil, nil
 	}
-	if local {
-		// check hrw mountpath location
-		hlom := &core.LOM{}
-		if err := hlom.InitFQN(*lom.HrwFQN, lom.Bucket()); err != nil {
+
+	// for every copy: check hrw mountpath location ("main replica")
+	if local && status == apc.LocIsCopy {
+		var (
+			hlom   = core.AllocLOM("")
+			hrwFQN = *lom.HrwFQN
+		)
+		debug.Assert(hrwFQN != lom.FQN)
+		if err := hlom.InitFQN(hrwFQN, lom.Bucket()); err != nil {
+			core.FreeLOM(hlom)
 			return nil, err
 		}
 		if err := hlom.Load(true /*cache it*/, false /*locked*/); err != nil {
-			mirror := lom.MirrorConf()
-			if mirror.Enabled && mirror.Copies > 1 {
-				status = apc.LocIsCopyMissingObj
-			}
+			status = apc.LocIsCopyMissingObj
 		}
+		core.FreeLOM(hlom)
 	}
+
 	return wi.ls(lom, status), nil
 }

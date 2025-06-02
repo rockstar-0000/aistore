@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -8,7 +8,6 @@ import (
 	"fmt"
 	iofs "io/fs"
 	"math/rand/v2"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -129,17 +128,15 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	)
 	m.saveCluState(m.proxyURL)
 
-	tempdir, err := os.MkdirTemp("", "prm")
-	tassert.CheckFatal(t, err)
+	tempdir := t.TempDir()
 	subdirFQN := filepath.Join(tempdir, subdir)
-	err = cos.CreateDir(subdirFQN)
+	err := cos.CreateDir(subdirFQN)
 	tassert.CheckFatal(t, err)
 
 	if m.bck.IsRemote() {
 		m.del()
 	}
 	t.Cleanup(func() {
-		_ = os.RemoveAll(tempdir)
 		if m.bck.IsRemote() {
 			m.del()
 		}
@@ -179,7 +176,7 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	cnt, cntsub := countFiles(t, tempdir)
 	if !test.deleteSrc {
 		tassert.Errorf(t, cnt == test.num && cntsub == test.num,
-			"delete-src == false: expected cnt (%d) == cntsub (%d) == num (%d) gererated",
+			"delete-src == false: expected cnt (%d) == cntsub (%d) == num (%d) generated",
 			cnt, cntsub, test.num)
 	}
 
@@ -254,17 +251,18 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	tassert.Errorf(t, len(list.Entries) == expNum, "expected to%s promote %d, got %d", s, test.num*2, len(list.Entries))
 
 	// xaction stats versus `numDel` - but note:
-	// other than the selected few objects that were deleted prior to promoting the 2nd time,
-	// all the rest already exists and is not expected to "show up" in the stats
+	// other than the selected few objects that were deleted prior to promoting the 2nd time
+	// all the rest already exist and are not expected to "show up" in the stats
 	if xid != "" {
 		if test.singleTarget {
 			tassert.Errorf(t, locObjs == int64(numDel),
 				"single-target promote: expected to \"undelete\" %d objects, got %d", expNum, locObjs)
 		} else if !test.notFshare {
 			tassert.Errorf(t, int(locObjs) == numDel && int(inObjs) == 0 && int(outObjs) == 0,
-				"file share: expected each target to handle the entire content locally, got (loc, out, in) = (%d, %d, %d)",
-				locObjs, outObjs, inObjs)
+				"file share: expected each target to handle the entire content locally, got numDel = %d, (loc, out, in) = (%d, %d, %d)",
+				numDel, locObjs, outObjs, inObjs)
 		}
+		//  (loc, out, in) = (10000, 0, 0)
 	}
 }
 
@@ -280,20 +278,21 @@ func (test *prmTests) wait(t *testing.T, xid, tempdir string, target *meta.Snode
 	}
 
 	// wait "cases" 1. through 3.
-	if xid != "" && !test.singleTarget { // 1. cluster-wide xaction
-		tlog.Logf("Waiting for global %s(%s=>%s)\n", xname, tempdir, m.bck)
+	switch {
+	case xid != "" && !test.singleTarget: // 1. cluster-wide xaction
+		tlog.Logf("Waiting for global %s(%s=>%s)\n", xname, tempdir, m.bck.String())
 		notifStatus, err := api.WaitForXactionIC(baseParams, &xargs)
 		tassert.CheckFatal(t, err)
 		if notifStatus != nil && (notifStatus.AbortedX || notifStatus.ErrMsg != "") {
 			tlog.Logf("Warning: notif-status: %+v\n", notifStatus)
 		}
-	} else if xid != "" && test.singleTarget { // 2. single-target xaction
+	case xid != "" && test.singleTarget: // 2. single-target xaction
 		xargs.DaemonID = target.ID()
-		tlog.Logf("Waiting for %s(%s=>%s) at %s\n", xname, tempdir, m.bck, target.StringEx())
+		tlog.Logf("Waiting for %s(%s=>%s) at %s\n", xname, tempdir, m.bck.String(), target.StringEx())
 		err := api.WaitForXactionNode(baseParams, &xargs, xactSnapNotRunning)
 		tassert.CheckFatal(t, err)
-	} else { // 3. synchronous execution
-		tlog.Logf("Promoting without xaction (%s=>%s)\n", tempdir, m.bck)
+	default: // 3. synchronous execution
+		tlog.Logf("Promoting without xaction (%s=>%s)\n", tempdir, m.bck.String())
 	}
 
 	// collect stats

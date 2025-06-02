@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -175,7 +176,7 @@ func (t *traceableTransport) set(l *httpLatencies) {
 
 // implements callback of the type `api.NewRequestCB`
 func (putter *tracePutter) do(reqArgs *cmn.HreqArgs) (*http.Request, error) {
-	req, err := reqArgs.Req()
+	req, err := reqArgs.ReqDeprecated()
 	if err != nil {
 		return nil, err
 	}
@@ -229,12 +230,14 @@ func put(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum, reader 
 
 // PUT with HTTP trace
 func putWithTrace(proxyURL string, bck cmn.Bck, objName string, latencies *httpLatencies, cksum *cos.Cksum, reader cos.ReadOpenCloser) error {
+	q := make(url.Values, 1)
 	reqArgs := cmn.AllocHra()
 	{
 		reqArgs.Method = http.MethodPut
 		reqArgs.Base = proxyURL
 		reqArgs.Path = apc.URLPathObjects.Join(bck.Name, objName)
-		reqArgs.Query = bck.NewQuery()
+		bck.SetQuery(q)
+		reqArgs.Query = q
 		reqArgs.BodyR = reader
 	}
 	putter := tracePutter{
@@ -326,10 +329,10 @@ func s3getDiscard(bck cmn.Bck, objName string) (int64, error) {
 	obj.Body.Close()
 
 	if err != nil {
-		return n, fmt.Errorf("failed to GET %s/%s and discard it (%d, %d): %v", bck, objName, n, size, err)
+		return n, fmt.Errorf("failed to GET %s and discard it (%d, %d): %v", bck.Cname(objName), n, size, err)
 	}
 	if n != size {
-		err = fmt.Errorf("failed to GET %s/%s: wrong size (%d, %d)", bck, objName, n, size)
+		err = fmt.Errorf("failed to GET %s: wrong size (%d, %d)", bck.Cname(objName), n, size)
 	}
 	return size, err
 }
@@ -341,7 +344,10 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, offset, length int
 		return 0, err
 	}
 	api.SetAuxHeaders(req, &runParams.bp)
+
 	resp, err := runParams.bp.Client.Do(req)
+
+	cmn.HreqFree(req)
 	if err != nil {
 		return 0, err
 	}
@@ -379,6 +385,8 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, latencies *ht
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
 
 	resp, err := tctx.tracedClient.Do(req)
+
+	cmn.HreqFree(req)
 	if err != nil {
 		return 0, err
 	}
@@ -432,7 +440,7 @@ func listObjCallback(ctx *api.LsoCounter) {
 	if ctx.Count() < 0 {
 		return
 	}
-	fmt.Printf("\rListing %s objects", cos.FormatBigNum(ctx.Count()))
+	fmt.Printf("\rListing %s objects", cos.FormatBigInt(ctx.Count()))
 	if ctx.IsFinished() {
 		fmt.Println()
 	}
@@ -448,19 +456,19 @@ func listObjectNames(p *params) ([]string, error) {
 		msg      = &apc.LsoMsg{Prefix: p.subDir}
 	)
 	if cached {
-		msg.Flags |= apc.LsObjCached // remote bucket: in-cluster objects only
+		msg.Flags |= apc.LsCached // remote bucket: in-cluster objects only
 	}
 	if !listDirs {
 		msg.Flags |= apc.LsNoDirs // aisloader's default (to override, use --list-dirs)
 	}
 	args := api.ListArgs{Callback: listObjCallback, CallAfter: longListTime}
-	objList, err := api.ListObjects(bp, bck, msg, args)
+	lst, err := api.ListObjects(bp, bck, msg, args)
 	if err != nil {
 		return nil, err
 	}
 
-	objs := make([]string, 0, len(objList.Entries))
-	for _, obj := range objList.Entries {
+	objs := make([]string, 0, len(lst.Entries))
+	for _, obj := range lst.Entries {
 		objs = append(objs, obj.Name)
 	}
 	return objs, nil
@@ -469,7 +477,7 @@ func listObjectNames(p *params) ([]string, error) {
 func initS3Svc() error {
 	// '--s3profile' takes precedence
 	if s3Profile == "" {
-		if profile := os.Getenv(env.AWS.Profile); profile != "" {
+		if profile := os.Getenv(env.AWSProfile); profile != "" {
 			s3Profile = profile
 		}
 	}
@@ -539,7 +547,7 @@ func s3ListObjects() ([]string, error) {
 		}
 		now := mono.NanoTime()
 		if time.Duration(now-prev) >= longListTime {
-			fmt.Printf("\rListing %s objects", cos.FormatBigNum(len(names)))
+			fmt.Printf("\rListing %s objects", cos.FormatBigInt(len(names)))
 			prev = now
 			eol = true
 		}
@@ -551,12 +559,6 @@ func s3ListObjects() ([]string, error) {
 }
 
 func readDiscard(r *http.Response, tag, cksumType string) (int64, string, error) {
-	var (
-		n          int64
-		cksum      *cos.CksumHash
-		err        error
-		cksumValue string
-	)
 	if r.StatusCode >= http.StatusBadRequest {
 		bytes, err := cos.ReadAll(r.Body)
 		if err == nil {
@@ -564,10 +566,12 @@ func readDiscard(r *http.Response, tag, cksumType string) (int64, string, error)
 		}
 		return 0, "", fmt.Errorf("bad status %d from %s: %v", r.StatusCode, tag, err)
 	}
-	n, cksum, err = cos.CopyAndChecksum(io.Discard, r.Body, nil, cksumType)
+
+	n, cksum, err := cos.CopyAndChecksum(io.Discard, r.Body, nil, cksumType)
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to read HTTP response, err: %v", err)
 	}
+	var cksumValue string
 	if cksum != nil {
 		cksumValue = cksum.Value()
 	}

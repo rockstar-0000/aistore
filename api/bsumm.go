@@ -1,13 +1,12 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/xact"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -32,9 +32,9 @@ type (
 		DontWait  bool
 	}
 	BinfoArgs struct {
+		UUID   string
+		Prefix string
 		BsummArgs
-		UUID          string
-		Prefix        string
 		FltPresence   int
 		Summarize     bool
 		WithRemote    bool
@@ -49,7 +49,7 @@ type (
 // - and delivered via apc.HdrBucketInfo header (compare with GetBucketSummary)
 // The API uses http.MethodHead and can be considered an extension of HeadBucket (above)
 func GetBucketInfo(bp BaseParams, bck cmn.Bck, args *BinfoArgs) (string, *cmn.Bprops, *cmn.BsummResult, error) {
-	q := make(url.Values, 4)
+	q := qalloc()
 	q = bck.AddToQuery(q)
 	q.Set(apc.QparamFltPresence, strconv.Itoa(args.FltPresence))
 	if args.DontAddRemote {
@@ -75,6 +75,7 @@ func GetBucketInfo(bp BaseParams, bck cmn.Bck, args *BinfoArgs) (string, *cmn.Bp
 	}
 	xid, p, info, err := _binfo(reqParams, bck, args)
 	FreeRp(reqParams)
+	qfree(q)
 	return xid, p, info, err
 }
 
@@ -92,21 +93,20 @@ func _binfo(reqParams *ReqParams, bck cmn.Bck, args *BinfoArgs) (xid string, p *
 		reqParams.Query.Set(apc.QparamUUID, xid)
 	}
 	if hdr, status, err = reqParams.doReqHdr(); err != nil {
-		err = hdr2msg(bck, status, err)
-		return
+		return "", nil, nil, hdr2msg(bck, status, err)
 	}
 
 	hdrProps := hdr.Get(apc.HdrBucketProps)
 	if hdrProps != "" {
 		p = &cmn.Bprops{}
 		if err = jsoniter.Unmarshal([]byte(hdrProps), p); err != nil {
-			return
+			return "", nil, nil, err
 		}
 	}
 	xid = hdr.Get(apc.HdrXactionID)
 	if xid == "" {
 		debug.Assert(status == http.StatusOK && !args.Summarize, status, " ", args.Summarize)
-		return
+		return "", p, nil, nil
 	}
 	debug.Assert(news || xid == args.UUID)
 	if args.DontWait {
@@ -116,11 +116,10 @@ func _binfo(reqParams *ReqParams, bck cmn.Bck, args *BinfoArgs) (xid string, p *
 				err = jsoniter.Unmarshal([]byte(hdrSumm), info)
 			}
 		}
-		return
+		return xid, p, info, err
 	}
 	if status != http.StatusAccepted {
-		err = _invalidStatus(status)
-		return
+		return xid, p, info, _invalidStatus(status)
 	}
 	if args.Callback != nil {
 		start = mono.NanoTime()
@@ -133,8 +132,7 @@ func _binfo(reqParams *ReqParams, bck cmn.Bck, args *BinfoArgs) (xid string, p *
 	time.Sleep(sleep / 2)
 	for i := 0; ; i++ {
 		if hdr, status, err = reqParams.doReqHdr(); err != nil {
-			err = hdr2msg(bck, status, err)
-			return
+			return xid, p, info, hdr2msg(bck, status, err)
 		}
 
 		hdrSumm := hdr.Get(apc.HdrBucketSumm)
@@ -143,7 +141,7 @@ func _binfo(reqParams *ReqParams, bck cmn.Bck, args *BinfoArgs) (xid string, p *
 			err = jsoniter.Unmarshal([]byte(hdrSumm), info)
 		}
 		if err != nil {
-			return // unlikely
+			return xid, p, info, err // unlikely
 		}
 		debug.Assertf(hdr.Get(apc.HdrXactionID) == xid, "%q vs %q", hdr.Get(apc.HdrXactionID), xid)
 
@@ -155,11 +153,10 @@ func _binfo(reqParams *ReqParams, bck cmn.Bck, args *BinfoArgs) (xid string, p *
 			}
 		}
 		if status == http.StatusOK {
-			return
+			return xid, p, info, nil
 		}
 		if status != http.StatusPartialContent && status != http.StatusAccepted {
-			err = _invalidStatus(status)
-			return
+			return xid, p, info, _invalidStatus(status)
 		}
 
 		time.Sleep(sleep)
@@ -181,14 +178,15 @@ func GetBucketSummary(bp BaseParams, qbck cmn.QueryBcks, msg *apc.BsummCtrlMsg, 
 	if msg == nil {
 		msg = &apc.BsummCtrlMsg{ObjCached: true, BckPresent: true}
 	}
+	q := qalloc()
 	bp.Method = http.MethodGet
-
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathBuckets.Join(qbck.Name)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = qbck.NewQuery()
+		qbck.SetQuery(q)
+		reqParams.Query = q
 	}
 	if args.DontWait {
 		debug.Assert(args.Callback == nil)
@@ -196,11 +194,13 @@ func GetBucketSummary(bp BaseParams, qbck cmn.QueryBcks, msg *apc.BsummCtrlMsg, 
 	} else {
 		xid, err = _bsumm(reqParams, msg, &res, args)
 	}
+
 	if err == nil {
 		sort.Sort(res)
 	}
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, res, err
 }
 
 // Wait/poll bucket-summary:

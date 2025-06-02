@@ -1,6 +1,6 @@
 // Package meta_test: unit tests for the package
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package meta_test
 
@@ -9,6 +9,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -49,6 +50,10 @@ var _ = Describe("Bck", func() {
 			Entry(
 				"gcp provider",
 				"bck", apc.GCP, cmn.NsGlobal, "obj",
+			),
+			Entry(
+				"oci provider",
+				"bck", apc.OCI, cmn.NsGlobal, "obj",
 			),
 			Entry(
 				"backend provider",

@@ -1,6 +1,6 @@
 // Package k8s: initialization, client, and misc. helpers
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package k8s
 
@@ -20,6 +20,9 @@ const (
 func ValidateEtlName(name string) error {
 	const prefix = "ETL name %q "
 	l := len(name)
+	if l == 0 {
+		return fmt.Errorf(prefix+"is empty", name)
+	}
 	if l < shortNameETL {
 		return fmt.Errorf(prefix+"is too short", name)
 	}

@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -18,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/nl"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -111,8 +112,16 @@ func (p *proxy) httpdlpost(w http.ResponseWriter, r *http.Request) {
 		p.writeErrStatusf(w, r, ecode, "Error starting download: %v", err)
 		return
 	}
+
+	// HACK:
+	// download _job_ vs download xaction, see abortReq() in ais/prxnotif
 	smap := p.owner.smap.get()
-	nl := dload.NewDownloadNL(jobID, string(dlb.Type), &smap.Smap, progressInterval)
+	nl := dload.NewDownloadNL(
+		jobID,            // jobID != xid
+		string(dlb.Type), // instead of apc.ActDownload xaction kind
+		&smap.Smap,
+		progressInterval,
+	)
 	nl.SetOwner(equalIC)
 	p.ic.registerEqual(regIC{nl: nl, smap: smap})
 

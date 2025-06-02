@@ -1,11 +1,13 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
+	"errors"
 	"fmt"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	"github.com/urfave/cli"
 )
 
@@ -33,10 +36,12 @@ type (
 	}
 	// recursive walk
 	walkCtx struct {
+		c          *cli.Context
 		pattern    string
 		trimPref   string
 		appendPref string
 		fobjs      fobjs // result
+		cont       bool  // continueOnErrorFlag
 	}
 	fobjs []fobj // sortable
 )
@@ -59,40 +64,53 @@ func rangeTrimPrefix(pt *cos.ParsedTemplate) string {
 
 // Returns files from the 'path' directory. No recursion.
 // If shell filename-matching pattern is present include only those that match.
-func listDir(path, trimPref, appendPref, pattern string) (fobjs fobjs, _ error) {
+func listDir(c *cli.Context, path, trimPref, appendPref, pattern string) (fobjs fobjs, _ error) {
 	dentries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
+	cont := flagIsSet(c, continueOnErrorFlag)
 	for _, dent := range dentries {
 		if dent.IsDir() || !dent.Type().IsRegular() {
 			continue
 		}
-		if matched, err := filepath.Match(pattern, filepath.Base(dent.Name())); !matched || err != nil {
+		if matched, err := filepath.Match(pattern, dent.Name()); !matched || err != nil {
 			continue
 		}
-		if finfo, err := dent.Info(); err == nil {
-			fullPath := filepath.Join(path, dent.Name())
-			fobj := fobj{
-				dstName: appendPref + trimPrefix(fullPath, trimPref), // empty strings ignored
-				path:    fullPath,
-				size:    finfo.Size(),
+		finfo, err := dent.Info()
+		if err != nil {
+			err = fmt.Errorf("failed to info(%s): %w", filepath.Join(path, dent.Name()), err)
+			if !cont {
+				return nil, err
 			}
-			fobjs = append(fobjs, fobj)
+			if cliConfVerbose() {
+				actionWarn(c, err.Error())
+			}
+			continue
 		}
+
+		fullPath := filepath.Join(path, dent.Name())
+		fobj := fobj{
+			dstName: appendPref + trimPrefix(fullPath, trimPref), // empty strings ignored
+			path:    fullPath,
+			size:    finfo.Size(),
+		}
+		fobjs = append(fobjs, fobj)
 	}
 	return fobjs, nil
 }
 
 // Traverse 'path' recursively
 // If shell filename-matching pattern is present include only those that match
-func listRecurs(path, trimPref, appendPref, pattern string) (fobjs, error) {
+func listRecurs(c *cli.Context, path, trimPref, appendPref, pattern string) (fobjs, error) {
 	ctx := &walkCtx{
+		c:          c,
 		pattern:    pattern,
 		trimPref:   trimPref,
 		appendPref: appendPref,
+		cont:       flagIsSet(c, continueOnErrorFlag),
 	}
-	if err := filepath.Walk(path, ctx.do); err != nil {
+	if err := filepath.WalkDir(path, ctx.do); err != nil {
 		return nil, err
 	}
 	return ctx.fobjs, nil
@@ -102,64 +120,84 @@ func listRecurs(path, trimPref, appendPref, pattern string) (fobjs, error) {
 // - source path that may contain wildcard(s)
 // - (trimPref, appendPref) combo to influence destination naming
 // - recursive, etc.
-// Returns:
+// OUT:
 // - a slice of matching triplets: {source fname or dirname, destination name, size in bytes}
-func lsFobj(c *cli.Context, path, trimPref, appendPref string, ndir *int, recurs, incl bool) (fobjs, error) {
-	var (
-		pattern    = cos.WildcardMatchAll // default pattern: entire directory
-		finfo, err = os.Stat(path)
-	)
-	debug.Assert(trimPref == "" || strings.HasPrefix(path, trimPref))
-
-	// single file (uses cases: reg file, --template, --list)
-	if err == nil && !finfo.IsDir() {
-		if trimPref == "" {
-			// [convention] trim _everything_ leaving only the base, unless (below)
-			trimPref = filepath.Dir(path)
-			if incl {
-				// --include-source-(root)-dir: retain the last snippet
-				trimPref = filepath.Dir(trimPref)
-			}
+func lsFobj(c *cli.Context, srcpath, trimPref, appendPref string, ndir *int, recurs, incl, globbed bool) (fobjs fobjs, _ error) {
+	// 1. fstat ok
+	finfo, err := os.Stat(srcpath)
+	if err == nil {
+		if finfo.IsDir() {
+			return _lsDir(c, srcpath, trimPref, appendPref, cos.WildcardMatchAll, ndir, recurs, incl)
 		}
-		fo := fobj{
-			dstName: appendPref + trimPrefix(path, trimPref),
-			path:    path,
-			size:    finfo.Size(),
-		}
-		return []fobj{fo}, nil
+		return _lsFil(finfo, srcpath, trimPref, appendPref, incl)
 	}
 
-	if err != nil {
-		// expecting the base to be a filename-matching pattern (wildcard)
-		pattern = filepath.Base(path)
-		if isPattern(pattern) {
-			warn := fmt.Sprintf("%q is not a directory and does not appear to be a shell filename matching pattern (%q)",
-				path, pattern)
-			actionWarn(c, warn)
+	if globbed {
+		return nil, &errDoesNotExist{what: "srcpath", name: srcpath}
+	}
+	// 2. glob
+	const fmte = "%q is not a directory and does not appear to be a filename-matching pattern"
+	all, e := filepath.Glob(srcpath)
+	if e != nil {
+		return nil, fmt.Errorf(fmte+": %v", srcpath, e)
+	}
+
+	// no matches? extract basename and use it as a pattern to list the parent directory
+	if len(all) == 0 {
+		pattern := filepath.Base(srcpath)
+		if !isPattern(pattern) {
+			return nil, fmt.Errorf(fmte, srcpath)
 		}
-		path = filepath.Dir(path)
-		finfo, err = os.Stat(path)
+		parent := filepath.Dir(srcpath)
+		if _, err := os.Stat(parent); err != nil {
+			return nil, &errDoesNotExist{what: "path", name: parent}
+		}
+		return _lsDir(c, parent, trimPref, appendPref, pattern, ndir, recurs, incl)
+	}
+
+	// 3. append all
+	for _, src := range all {
+		fob, err := lsFobj(c, src, trimPref, appendPref, ndir, recurs, incl, true /*globbed*/)
 		if err != nil {
-			return nil, &errDoesNotExist{what: "path", name: path}
+			return nil, fmt.Errorf("nested failure to 'ls %s': %v", src, err)
 		}
-		if !finfo.IsDir() {
-			return nil, fmt.Errorf("%q is not a directory", path)
-		}
+		fobjs = append(fobjs, fob...)
 	}
+	return fobjs, nil
+}
 
+func _lsDir(c *cli.Context, srcpath, trimPref, appendPref, pattern string, ndir *int, recurs, incl bool) (fobjs, error) {
 	*ndir++
-	// [convention] ditto
+	// [NOTE convention] destination naming:
+	// trim the entire srcpath (dir) _or_ retain its last snippet ("a/b/c/" => "c/<basename>")
 	if trimPref == "" {
-		trimPref = path
+		trimPref = srcpath
 		if incl {
-			trimPref = strings.TrimSuffix(path, filepath.Base(path))
+			// `--include-src-dir` flag: retain the last snippet
+			trimPref = strings.TrimSuffix(srcpath, filepath.Base(srcpath))
 		}
 	}
-	f := listDir
 	if recurs {
-		f = listRecurs
+		return listRecurs(c, srcpath, trimPref, appendPref, pattern)
 	}
-	return f(path, trimPref, appendPref, pattern)
+	return listDir(c, srcpath, trimPref, appendPref, pattern)
+}
+
+func _lsFil(finfo os.FileInfo, srcpath, trimPref, appendPref string, incl bool) (fobjs, error) {
+	if trimPref == "" {
+		// [NOTE convention] destination naming: just the basename or <last-snippet/basename> (e.g. above)
+		trimPref = filepath.Dir(srcpath)
+		if incl {
+			// `--include-src-dir` flag: retain the last snippet
+			trimPref = filepath.Dir(trimPref)
+		}
+	}
+	fo := fobj{
+		dstName: appendPref + trimPrefix(srcpath, trimPref),
+		path:    srcpath,
+		size:    finfo.Size(),
+	}
+	return []fobj{fo}, nil
 }
 
 func groupByExt(files []fobj) (int64, map[string]counter) {
@@ -177,31 +215,62 @@ func groupByExt(files []fobj) (int64, map[string]counter) {
 }
 
 /////////////
-// walkCtx //
+// walkCtx - fs.WalkDir recursive
 /////////////
 
-func (w *walkCtx) do(fqn string, info os.FileInfo, err error) error {
+// callback via `filepath.WalkDir` of the type `fs.WalkDirFunc`
+func (w *walkCtx) do(fqn string, dent iofs.DirEntry, err error) error {
+	const tag = "filepath-walkdir"
 	if err != nil {
-		if os.IsPermission(err) {
-			return nil
+		if dent == nil {
+			return err // FATAL: cannot read root
+		}
+		parent := filepath.Dir(fqn)
+		if errors.Is(err, iofs.ErrPermission) {
+			if cliConfVerbose() {
+				warn := fmt.Sprintf("%s(%s) access denied: %v", tag, parent, err)
+				actionWarn(w.c, warn)
+			}
+			return iofs.SkipDir // NOTE: always skip nested os.ReadDir permissions
 		}
 		if cmn.IsErrObjNought(err) {
 			return nil
 		}
-		return fmt.Errorf("filepath-walk invoked with err: %v", err)
+		return fmt.Errorf("%s(%s) failed: %w", tag, parent, err)
 	}
-	if info.IsDir() {
+
+	if dent.IsDir() {
+		// TODO: optimize-out the entire dir (fs.SkipDir) if it doesn't match (tbd) directory-matching-pattern
 		return nil
 	}
-	if matched, _ := filepath.Match(w.pattern, filepath.Base(fqn)); !matched {
+	if !dent.Type().IsRegular() {
 		return nil
 	}
+	if w.pattern != "" {
+		if matched, _ := filepath.Match(w.pattern, dent.Name()); !matched {
+			return nil
+		}
+	}
+
+	finfo, errV := dent.Info()
+	if errV != nil {
+		err := fmt.Errorf("%s: failed to info(%s): %w", tag, fqn, errV)
+		if !w.cont { // continueOnErrorFlag
+			return err
+		}
+		if cliConfVerbose() {
+			actionWarn(w.c, err.Error())
+		}
+		return nil
+	}
+
 	fobj := fobj{
 		dstName: w.appendPref + trimPrefix(fqn, w.trimPref), // empty strings ignored
 		path:    fqn,
-		size:    info.Size(),
+		size:    finfo.Size(),
 	}
 	w.fobjs = append(w.fobjs, fobj)
+
 	return nil
 }
 

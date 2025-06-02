@@ -1,4 +1,4 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
  * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  */
@@ -15,13 +15,15 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/hk"
+	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
-
-var errCloseStreams = errors.New("EC is currently active, cannot close streams")
 
 func (t *target) ecHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -54,7 +56,7 @@ func (t *target) httpecget(w http.ResponseWriter, r *http.Request) {
 func (t *target) sendECMetafile(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string) {
 	if err := bck.Init(t.owner.bmd); err != nil {
 		if !cmn.IsErrRemoteBckNotFound(err) { // is ais
-			t.writeErr(w, r, err, Silent)
+			t.writeErr(w, r, err, 0, Silent)
 			return
 		}
 	}
@@ -83,6 +85,56 @@ func (t *target) httpecpost(w http.ResponseWriter, r *http.Request) {
 	}
 	action := items[0]
 	switch action {
+	case apc.ActEcRecover:
+		query := r.URL.Query()
+		objName := query.Get(apc.QparamECObject)
+		if objName == "" {
+			err := fmt.Errorf("%s: invalid ec-recover request: object name's empty", t)
+			t.writeErr(w, r, err)
+			return
+		}
+
+		lom := core.AllocLOM(objName)
+		bck, err := newBckFromQuname(query, true)
+		if err != nil {
+			core.FreeLOM(lom)
+			err := fmt.Errorf("%s: %v", t, err) // (unlikely)
+			t.writeErr(w, r, err)
+			return
+		}
+		if err := lom.InitBck(bck.Bucket()); err != nil {
+			core.FreeLOM(lom)
+			err := fmt.Errorf("%s: %v", t, err)
+			t.writeErr(w, r, err)
+			return
+		}
+
+		uuid := query.Get(apc.QparamUUID)
+		xctn, errN := xreg.GetXact(uuid)
+		switch {
+		case errN != nil || xctn == nil:
+			// [TODO]
+			// - to be used to recover individual objects and assorted (ranges, lists of) objects
+			// - requires API & CLI
+			// - remove warning when done
+			nlog.Warningf("%s[%s] not running - proceeding to ec-recover %s anyway..", t, apc.ActECEncode, uuid, lom)
+
+			err := ec.ECM.Recover(lom)
+			cname := lom.Cname()
+			core.FreeLOM(lom)
+			if err != nil {
+				t.writeErr(w, r, cmn.NewErrFailedTo(t, "EC-recover", cname, err))
+			}
+		case !xctn.Finished() && !xctn.IsAborted():
+			xbenc, ok := xctn.(*ec.XactBckEncode)
+			debug.Assert(ok, xctn.String())
+
+			// async, via j.workCh
+			xbenc.RecvRecover(lom)
+		default:
+			nlog.Errorln(xctn.Name(), "already finished - dropping", lom.Cname())
+			core.FreeLOM(lom)
+		}
 	case apc.ActEcOpen:
 		hk.UnregIf(hkname, closeEc) // just in case, a no-op most of the time
 		ec.ECM.OpenStreams(false /*with refc*/)
@@ -91,11 +143,25 @@ func (t *target) httpecpost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if ec.ECM.IsActive() {
-			t.writeErr(w, r, errCloseStreams)
+			t.writeErr(w, r, errors.New("EC is active, cannot close"))
 			return
 		}
 		nlog.Infoln(t.String(), "hk-postpone", action)
 		hk.Reg(hkname, closeEc, postpone)
+
+	case apc.ActDmOpen:
+		if err := bundle.SDM.Open(); err != nil {
+			t.writeErr(w, r, err)
+		}
+	case apc.ActDmClose:
+		if !t.ensureIntraControl(w, r, true /* from primary */) {
+			return
+		}
+		// TODO: consider delaying via hk (see above)
+		if err := bundle.SDM.Close(); err != nil {
+			t.writeErr(w, r, err)
+		}
+
 	default:
 		t.writeErr(w, r, errActEc(action))
 	}
@@ -103,7 +169,7 @@ func (t *target) httpecpost(w http.ResponseWriter, r *http.Request) {
 
 func closeEc(int64) time.Duration {
 	if ec.ECM.IsActive() {
-		nlog.Warningln("hk-cb:", errCloseStreams)
+		nlog.Warningln("hk-cb: cannot close EC streams")
 	} else {
 		ec.ECM.CloseStreams(false /*with refc*/)
 	}
@@ -112,4 +178,26 @@ func closeEc(int64) time.Duration {
 
 func errActEc(act string) error {
 	return fmt.Errorf(fmtErrInvaldAction, act, []string{apc.ActEcOpen, apc.ActEcClose})
+}
+
+func (t *target) ECRestoreReq(ct *core.CT, tsi *meta.Snode, uuid string) error {
+	q := ct.Bck().NewQuery()
+	ct.Bck().AddUnameToQuery(q, apc.QparamBckTo)
+	q.Set(apc.QparamECObject, ct.ObjectName())
+	q.Set(apc.QparamUUID, uuid)
+	cargs := allocCargs()
+	{
+		cargs.si = tsi
+		cargs.req = cmn.HreqArgs{
+			Method: http.MethodPost,
+			Base:   tsi.URL(cmn.NetIntraControl),
+			Path:   apc.URLPathEC.Join(apc.ActEcRecover),
+			Query:  q,
+		}
+	}
+	res := t.call(cargs, t.owner.smap.get())
+	freeCargs(cargs)
+	err := res.toErr()
+	freeCR(res)
+	return err
 }

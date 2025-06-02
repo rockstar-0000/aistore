@@ -1,6 +1,6 @@
 // Package space_test is a unit test for the package.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package space_test
 
@@ -22,7 +22,9 @@ import (
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/tools/trand"
+	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -48,7 +50,7 @@ var gT *testing.T
 
 func TestEvictCleanup(t *testing.T) {
 	xreg.Init()
-	hk.TestInit()
+	hk.Init(false)
 	cos.InitShortID(0)
 
 	RegisterFailHandler(Fail)
@@ -343,7 +345,7 @@ func newTargetLRUMock() *mock.TargetMock {
 
 func newIniLRU() *space.IniLRU {
 	xlru := &space.XactLRU{}
-	xlru.InitBase(cos.GenUUID(), apc.ActLRU, nil)
+	xlru.InitBase(cos.GenUUID(), apc.ActLRU, "" /*ctlmsg*/, nil)
 	return &space.IniLRU{
 		Xaction:             xlru,
 		Config:              cmn.GCO.Get(),
@@ -355,11 +357,12 @@ func newIniLRU() *space.IniLRU {
 
 func newInitStoreCln() *space.IniCln {
 	xcln := &space.XactCln{}
-	xcln.InitBase(cos.GenUUID(), apc.ActStoreCleanup, nil)
+	xcln.InitBase(cos.GenUUID(), apc.ActStoreCleanup, "" /*ctlmsg*/, nil)
 	return &space.IniCln{
 		Xaction: xcln,
 		Config:  cmn.GCO.Get(),
 		StatsT:  mock.NewStatsTracker(),
+		Args:    &xact.ArgsMsg{},
 	}
 }
 

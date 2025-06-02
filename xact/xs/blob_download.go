@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -20,10 +21,14 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
@@ -41,23 +46,27 @@ const (
 	dfltNumWorkers = 4
 
 	maxInitialSizeSGL = 128           // vec length
-	maxTotalChunks    = 128 * cos.MiB // max mem per blob downloader
+	maxTotalChunksMem = 128 * cos.MiB // max mem per blob downloader
+
+	minBlobDlPrefetch = cos.MiB // size threshold for x-prefetch
 )
 
 type (
 	XactBlobDl struct {
-		writer   io.Writer
-		args     *core.BlobParams
-		readers  []*blobReader
-		workCh   chan chunkWi
-		doneCh   chan chunkDone
+		bp      core.Backend
+		writer  io.Writer
+		doneCh  chan chunkDone
+		args    *core.BlobParams
+		vlabs   map[string]string
+		workCh  chan chunkWi
+		cksum   cos.CksumHash
+		sgls    []*memsys.SGL
+		readers []*blobReader
+		xact.Base
+		wg       sync.WaitGroup
 		nextRoff int64
 		woff     int64
-		xact.Base
-		sgls  []*memsys.SGL
-		cksum cos.CksumHash
-		wg    sync.WaitGroup
-		// not necessarily equal user-provided apc.BlobMsg values;
+		// not necessarily user-provided apc.BlobMsg values
 		// in particular, chunk size and num workers might be adjusted based on resources
 		chunkSize  int64
 		fullSize   int64
@@ -125,14 +134,15 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 		return xreg.RenewRes{Err: err}
 	}
 
-	// validate, assign defaults (tune-up below)
-	if pre.chunkSize == 0 {
+	// validate, assign defaults (further tune-up below)
+	switch {
+	case pre.chunkSize == 0:
 		pre.chunkSize = dfltChunkSize
-	} else if pre.chunkSize < minChunkSize {
+	case pre.chunkSize < minChunkSize:
 		nlog.Infoln("Warning: chunk size", cos.ToSizeIEC(pre.chunkSize, 1), "is below permitted minimum",
 			cos.ToSizeIEC(minChunkSize, 0))
 		pre.chunkSize = minChunkSize
-	} else if pre.chunkSize > maxChunkSize {
+	case pre.chunkSize > maxChunkSize:
 		nlog.Infoln("Warning: chunk size", cos.ToSizeIEC(pre.chunkSize, 1), "exceeds permitted maximum",
 			cos.ToSizeIEC(maxChunkSize, 0))
 		pre.chunkSize = maxChunkSize
@@ -142,13 +152,13 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 	if pre.numWorkers == 0 {
 		pre.numWorkers = dfltNumWorkers
 	}
-	if a := cmn.MaxParallelism(); a > pre.numWorkers+4 {
+	if a := sys.MaxParallelism(); a > pre.numWorkers+4 {
 		pre.numWorkers++
 	}
 	if int64(pre.numWorkers)*pre.chunkSize > pre.fullSize {
 		pre.numWorkers = int((pre.fullSize + pre.chunkSize - 1) / pre.chunkSize)
 	}
-	if a := cmn.MaxParallelism(); a < pre.numWorkers {
+	if a := sys.MaxParallelism(); a < pre.numWorkers {
 		pre.numWorkers = a
 	}
 
@@ -169,9 +179,17 @@ func (*blobFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 }
 
 func (p *blobFactory) Start() error {
-	// reuse the same args-carrying structure and keep filling-in
+	// reuse the same args-carrying structure and keep initializing
 	r := p.pre
-	r.InitBase(p.Args.UUID, p.Kind(), r.args.Lom.Bck())
+
+	bck := r.args.Lom.Bck()
+	r.InitBase(p.Args.UUID, p.Kind(), r.args.Lom.Cname(), bck)
+
+	r.bp = core.T.Backend(bck)
+	r.vlabs = map[string]string{
+		stats.VlabBucket: bck.Cname(""),
+		stats.VlabXkind:  r.Kind(),
+	}
 
 	// 2nd (just in time) tune-up
 	var (
@@ -180,13 +198,14 @@ func (p *blobFactory) Start() error {
 		pressure = mm.Pressure()
 	)
 	if pressure >= memsys.PressureExtreme {
+		oom.FreeToOS(true)
 		return errors.New(r.Name() + ": extreme memory pressure - not starting")
 	}
 	switch pressure {
 	case memsys.PressureHigh:
 		slabSize = memsys.DefaultBufSize
 		r.numWorkers = 1
-		nlog.Warningln(r.Name() + ": high memory pressure detected...")
+		nlog.Warningln(r.Name(), "high memory pressure detected...")
 	case memsys.PressureModerate:
 		slabSize >>= 1
 		r.numWorkers = min(3, r.numWorkers)
@@ -199,12 +218,16 @@ func (p *blobFactory) Start() error {
 		cnt = maxInitialSizeSGL
 	}
 
-	// add a reader, if possible
 	nr := int64(r.numWorkers)
-	if pressure == memsys.PressureLow && r.numWorkers < cmn.MaxParallelism() &&
-		nr < (r.fullSize+r.chunkSize-1)/r.chunkSize &&
-		nr*r.chunkSize < maxTotalChunks-r.chunkSize {
-		r.numWorkers++
+	nc := (r.fullSize + r.chunkSize - 1) / r.chunkSize
+	if pressure == memsys.PressureLow && r.numWorkers < sys.MaxParallelism() {
+		if nr < nc && nr*r.chunkSize < maxTotalChunksMem {
+			r.numWorkers++ // add a reader
+		}
+		if r.numWorkers == 1 && r.chunkSize > minChunkSize<<1 {
+			r.numWorkers = 2
+			r.chunkSize >>= 1
+		}
 	}
 
 	// open channels
@@ -275,6 +298,22 @@ func (p *blobFactory) WhenPrevIsRunning(prev xreg.Renewable) (xreg.WPR, error) {
 //
 
 func (r *XactBlobDl) Name() string { return r.Base.Name() + "/" + r.args.Lom.ObjName }
+func (r *XactBlobDl) Size() int64  { return r.fullSize }
+
+func (r *XactBlobDl) String() string {
+	var sb strings.Builder
+	sb.Grow(len(r.args.Lom.ObjName) + 3*16)
+	sb.WriteString("-[")
+	sb.WriteString(r.args.Lom.ObjName)
+	sb.WriteByte('-')
+	sb.WriteString(strconv.FormatInt(r.fullSize, 10))
+	sb.WriteByte('-')
+	sb.WriteString(strconv.FormatInt(r.chunkSize, 10))
+	sb.WriteByte('-')
+	sb.WriteString(strconv.Itoa(r.numWorkers))
+	sb.WriteByte(']')
+	return r.Base.String() + sb.String()
+}
 
 func (r *XactBlobDl) Run(*sync.WaitGroup) {
 	var (
@@ -282,8 +321,9 @@ func (r *XactBlobDl) Run(*sync.WaitGroup) {
 		pending []chunkDone
 		eof     bool
 	)
-	nlog.Infoln(r.Name()+": chunk-size", cos.ToSizeIEC(r.chunkSize, 0)+", num-concurrent-readers", r.numWorkers)
+	nlog.Infoln(r.String())
 	r.start()
+	now := mono.NanoTime()
 outer:
 	for {
 		select {
@@ -314,7 +354,7 @@ outer:
 					}
 				}
 			}
-			// type1 write
+			// type #1 write
 			if err = r.write(sgl); err != nil {
 				goto fin
 			}
@@ -325,26 +365,11 @@ outer:
 				r.nextRoff += r.chunkSize
 			}
 
-			// walk backwards and plug any holes
-			for i := len(pending) - 1; i >= 0; i-- {
-				done := pending[i]
-				if done.roff > r.woff {
-					break
-				}
-				debug.Assert(done.roff == r.woff)
-
-				// type2 write: remove from pending and append
-				sgl := done.sgl
-				pending = pending[:i]
-				if err = r.write(sgl); err != nil {
-					goto fin
-				}
-				if r.nextRoff < r.fullSize {
-					debug.Assert(sgl.Size() == 0)
-					r.workCh <- chunkWi{sgl, r.nextRoff}
-					r.nextRoff += r.chunkSize
-				}
+			// walk backwards and plug any holes (type #2 write)
+			if pending, err = r.plugholes(pending); err != nil {
+				goto fin
 			}
+
 			if r.woff >= r.fullSize {
 				debug.Assertf(r.woff == r.fullSize, "%d > %d", r.woff, r.fullSize)
 				goto fin
@@ -386,7 +411,15 @@ fin:
 				_, err = core.T.FinalizeObj(r.args.Lom, r.args.Wfqn, r, cmn.OwtGetPrefetchLock)
 			}
 		}
+
 		if err == nil {
+			// stats
+			tstats := core.T.StatsUpdater()
+			tstats.IncWith(r.bp.MetricName(stats.GetCount), r.vlabs)
+			tstats.AddWith(
+				cos.NamedVal64{Name: r.bp.MetricName(stats.GetLatencyTotal), Value: mono.SinceNano(now), VarLabs: r.vlabs},
+			)
+
 			r.ObjsAdd(1, 0)
 		} else {
 			if errRemove := cos.RemoveFile(r.args.Wfqn); errRemove != nil && !os.IsNotExist(errRemove) {
@@ -421,11 +454,14 @@ func (r *XactBlobDl) write(sgl *memsys.SGL) (err error) {
 		size    = sgl.Size()
 	)
 	if r.args.WriteSGL != nil {
-		err = r.args.WriteSGL(sgl)
+		err = r.args.WriteSGL(sgl) // custom write
 		written = sgl.Size() - sgl.Len()
 	} else {
-		written, err = io.Copy(r.writer, sgl) // using sgl.ReadFrom
+		written, err = io.Copy(r.writer, sgl) // utilizing sgl.ReadFrom
 	}
+
+	sgl.Reset()
+
 	if err != nil {
 		if cmn.Rom.FastV(4, cos.SmoduleXs) {
 			nlog.Errorf("%s: failed to write (woff=%d, next=%d, sgl-size=%d): %v",
@@ -436,9 +472,38 @@ func (r *XactBlobDl) write(sgl *memsys.SGL) (err error) {
 	debug.Assertf(written == size, "%s: expected written size=%d, got %d (at woff %d)", r.Name(), size, written, r.woff)
 
 	r.woff += size
+
+	// stats
+	tstats := core.T.StatsUpdater()
+	tstats.AddWith(
+		cos.NamedVal64{Name: r.bp.MetricName(stats.GetSize), Value: size, VarLabs: r.vlabs},
+	)
 	r.ObjsAdd(0, size)
-	sgl.Reset()
+
 	return nil
+}
+
+func (r *XactBlobDl) plugholes(pending []chunkDone) ([]chunkDone, error) {
+	for i := len(pending) - 1; i >= 0; i-- {
+		done := pending[i]
+		if done.roff > r.woff {
+			break
+		}
+		debug.Assert(done.roff == r.woff)
+
+		sgl := done.sgl
+		pending = pending[:i]
+		if err := r.write(sgl); err != nil { // type #2 write: remove from pending and append
+			return pending, err
+		}
+
+		if r.nextRoff < r.fullSize {
+			debug.Assert(sgl.Size() == 0)
+			r.workCh <- chunkWi{sgl, r.nextRoff}
+			r.nextRoff += r.chunkSize
+		}
+	}
+	return pending, nil
 }
 
 func (r *XactBlobDl) cleanup() {
@@ -486,8 +551,6 @@ func (reader *blobReader) run() {
 			break
 		}
 		debug.Assert(res.Size == written, res.Size, " ", written)
-		debug.Assert(sgl.Size() == written, sgl.Size(), " ", written)
-		debug.Assert(sgl.Size() == sgl.Len(), sgl.Size(), " ", sgl.Len())
 
 		reader.parent.doneCh <- chunkDone{nil, sgl, msg.roff, res.ErrCode}
 	}

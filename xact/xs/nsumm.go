@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -33,15 +33,16 @@ type (
 		msg  *apc.BsummCtrlMsg
 	}
 	XactNsumm struct {
-		p             *nsummFactory
-		oneRes        cmn.BsummResult
-		mapRes        map[uint64]*cmn.BsummResult
-		buckets       []*meta.Bck
-		_nam, _str    string
-		totalDiskSize uint64
+		p       *nsummFactory
+		mapRes  map[uint64]*cmn.BsummResult
+		_nam    string
+		_str    string
+		buckets []*meta.Bck
 		xact.BckJog
-		single     bool
-		listRemote bool
+		oneRes        cmn.BsummResult
+		totalDiskSize uint64
+		single        bool
+		listRemote    bool
 	}
 )
 
@@ -86,7 +87,7 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 		return nil, err
 	}
 
-	listRemote := p.Bck.IsCloud() && !p.msg.ObjCached
+	listRemote := lsoIsRemote(p.Bck, p.msg.ObjCached)
 	if listRemote {
 		var (
 			smap = core.T.Sowner().Get()
@@ -140,11 +141,11 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 		}
 	}
 
-	r.BckJog.Init(p.UUID(), p.Kind(), p.Bck, opts, cmn.GCO.Get())
+	ctlmsg := p.msg.Str(p.Bck.Cname(p.msg.Prefix))
+	r.BckJog.Init(p.UUID(), p.Kind(), ctlmsg, p.Bck, opts, cmn.GCO.Get())
 
-	s := fmt.Sprintf("-msg-%+v", r.p.msg)
-	r._nam = r.Base.Name() + s
-	r._str = r.Base.String() + s
+	r._nam = r.Base.Name() + "-" + ctlmsg
+	r._str = r.Base.String() + "-" + ctlmsg
 	return r, nil
 }
 
@@ -277,9 +278,9 @@ func (r *XactNsumm) Snap() (snap *core.Snap) {
 
 func (r *XactNsumm) Result() (cmn.AllBsummResults, error) {
 	if r.single {
-		var res cmn.BsummResult
-		r.cloneRes(&res, &r.oneRes)
-		return cmn.AllBsummResults{&res}, r.Err()
+		var dst cmn.BsummResult
+		r.cloneRes(&dst, &r.oneRes)
+		return cmn.AllBsummResults{&dst}, r.Err()
 	}
 
 	all := make(cmn.AllBsummResults, 0, len(r.mapRes))
@@ -303,12 +304,11 @@ func (r *XactNsumm) cloneRes(dst, src *cmn.BsummResult) {
 		dst.TotalSize.RemoteObjs = ratomic.LoadUint64(&src.TotalSize.RemoteObjs)
 	}
 
-	dst.ObjSize.Min = ratomic.LoadInt64(&src.ObjSize.Min)
-	if dst.ObjSize.Min == math.MaxInt64 {
-		dst.ObjSize.Min = 0
-	}
 	dst.ObjSize.Max = ratomic.LoadInt64(&src.ObjSize.Max)
-
+	dst.ObjSize.Min = ratomic.LoadInt64(&src.ObjSize.Min)
+	if dst.ObjSize.Max > 0 {
+		dst.ObjSize.Min = min(dst.ObjSize.Min, dst.ObjSize.Max)
+	}
 	// compute the current (maybe, running-and-changing) average and used %%
 	if dst.ObjCount.Present > 0 {
 		dst.ObjSize.Avg = int64(cos.DivRoundU64(dst.TotalSize.PresentObjs, dst.ObjCount.Present))
@@ -352,10 +352,11 @@ func (r *XactNsumm) visitObj(lom *core.LOM, _ []byte) error {
 func (r *XactNsumm) runCloudBck(bck *meta.Bck, res *cmn.BsummResult) {
 	lsmsg := &apc.LsoMsg{Props: apc.GetPropsSize, Prefix: r.p.msg.Prefix}
 	lsmsg.SetFlag(apc.LsNameSize | apc.LsNoDirs)
+	bp := core.T.Backend(bck)
 	for !r.IsAborted() {
-		npg := newNpgCtx(bck, lsmsg, noopCb, nil) // TODO -- FIXME: inventory offset
+		npg := newNpgCtx(bck, lsmsg, noopCb, nil, bp) // TODO: inventory offset
 		nentries := allocLsoEntries()
-		lst, err := npg.nextPageR(nentries, false /*load LOMs to include status and local MD*/)
+		lst, err := npg.nextPageR(nentries)
 		if err != nil {
 			r.AddErr(err)
 			return

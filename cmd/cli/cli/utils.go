@@ -1,12 +1,11 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +30,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 )
@@ -98,26 +98,6 @@ func arg0Node(c *cli.Context) (node *meta.Snode, sname string, err error) {
 	return
 }
 
-//
-// misplaced or mistyped flag(s)
-//
-
-func errArgIsFlag(c *cli.Context, arg string) (err error) {
-	if len(arg) > 1 && arg[0] == '-' {
-		err = incorrectUsageMsg(c, "missing command line argument (hint: flag '%s' misplaced?)", arg)
-	}
-	return err
-}
-
-func errTailArgsContainFlag(tail []string) error {
-	for _, arg := range tail {
-		if len(arg) > 1 && arg[0] == '-' {
-			return fmt.Errorf("unrecognized or misplaced option %q", arg)
-		}
-	}
-	return nil
-}
-
 func reorderTailArgs(left string, middle []string, right ...string) string {
 	var sb strings.Builder
 	sb.WriteString(left)
@@ -136,17 +116,6 @@ func reorderTailArgs(left string, middle []string, right ...string) string {
 func isWebURL(url string) bool { return cos.IsHT(url) || cos.IsHTTPS(url) }
 
 func jsonMarshalIndent(v any) ([]byte, error) { return jsoniter.MarshalIndent(v, "", "    ") }
-
-func helpMessage(template string, data any) string {
-	var buf bytes.Buffer
-	w := bufio.NewWriter(&buf)
-
-	// Execute the template that generates command usage text
-	cli.HelpPrinterCustom(w, template, data, teb.HelpTemplateFuncMap)
-	_ = w.Flush()
-
-	return buf.String()
-}
 
 func findClosestCommand(cmd string, candidates []cli.Command) (result string, distance int) {
 	var (
@@ -185,13 +154,13 @@ func getPrefixFromPrimary() string {
 	return scheme + apc.BckProviderSeparator
 }
 
+// _refreshRate returns the refresh interval for monitoring operations.
+// This is a generic utility that only handles the common --refresh flag.
 func _refreshRate(c *cli.Context) time.Duration {
-	refreshRate := refreshRateDefault
 	if flagIsSet(c, refreshFlag) {
-		duration := parseDurationFlag(c, refreshFlag)
-		refreshRate = max(duration, refreshRateMinDur)
+		return max(parseDurationFlag(c, refreshFlag), refreshRateMinDur)
 	}
-	return refreshRate // aka sleep
+	return refreshRateDefault
 }
 
 // Users can pass in a comma-separated list
@@ -295,7 +264,7 @@ func parseBucketACL(values []string, idx int) (access apc.AccessAttrs, newIdx in
 			}
 			access |= acc
 		}
-		return
+		return access, newIdx, nil
 	}
 
 	// 2: direct hexadecimal input, e.g. `access 0x342`
@@ -368,7 +337,7 @@ func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 		return nil, false
 	})
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	nvs = make(cos.StrKVs, 8)
@@ -430,44 +399,7 @@ func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 	if cmd != "" {
 		return nil, fmt.Errorf("missing property %q value", cmd)
 	}
-	return
-}
-
-func parseBpropsFromContext(c *cli.Context) (props *cmn.BpropsToSet, err error) {
-	propArgs := c.Args().Tail()
-
-	if c.Command.Name == commandCreate {
-		inputProps := parseStrFlag(c, bucketPropsFlag)
-		if isJSON(inputProps) {
-			err = jsoniter.Unmarshal([]byte(inputProps), &props)
-			return
-		}
-		propArgs = strings.Split(inputProps, " ")
-	}
-
-	if len(propArgs) == 1 && isJSON(propArgs[0]) {
-		err = jsoniter.Unmarshal([]byte(propArgs[0]), &props)
-		return
-	}
-
-	// For setting bucket props via json attributes
-	if len(propArgs) == 0 {
-		err = missingArgumentsError(c, "property key-value pairs")
-		return
-	}
-
-	// For setting bucket props via key-value list
-	nvs, err := makeBckPropPairs(propArgs)
-	if err != nil {
-		return
-	}
-
-	if err = reformatBackendProps(c, nvs); err != nil {
-		return
-	}
-
-	props, err = cmn.NewBpropsToSet(nvs)
-	return
+	return nvs, nil
 }
 
 func bucketsFromArgsOrEnv(c *cli.Context) ([]cmn.Bck, error) {
@@ -516,15 +448,19 @@ func headBucket(bck cmn.Bck, dontAddBckMD bool) (p *cmn.Bprops, err error) {
 		case herr.Message != "":
 			err = errors.New(herr.Message)
 		default:
-			err = fmt.Errorf("failed to HEAD bucket %q: %s", bck, herr.Message)
+			err = fmt.Errorf("failed to HEAD bucket %q: %s", bck.String(), herr.Message)
 		}
 	} else {
 		msg := strings.ToLower(err.Error())
 		if !strings.HasPrefix(msg, "head \"http") && !strings.HasPrefix(msg, "head http") {
-			err = fmt.Errorf("failed to HEAD bucket %q: %v", bck, err)
+			err = fmt.Errorf("failed to HEAD bucket %q: %v", bck.String(), err)
 		}
 	}
 	return
+}
+
+func shouldHeadRemote(c *cli.Context, bck cmn.Bck) bool {
+	return !bck.IsHT() && !flagIsSet(c, dontHeadRemoteFlag)
 }
 
 // Prints multiple lines of fmtStr to writer w.
@@ -612,7 +548,7 @@ func bckPropList(props *cmn.Bprops, verbose bool) (propList nvpairList) {
 	sort.Slice(propList, func(i, j int) bool {
 		return propList[i].Name < propList[j].Name
 	})
-	return
+	return propList
 }
 
 func fmtBucketCreatedTime(created int64) string {
@@ -666,19 +602,19 @@ func confirm(c *cli.Context, prompt string, warning ...string) (ok bool) {
 func isBucketEmpty(bck cmn.Bck, cached bool) (bool, error) {
 	msg := &apc.LsoMsg{}
 	if cached {
-		msg.SetFlag(apc.LsObjCached)
+		msg.SetFlag(apc.LsCached)
 	}
 	msg.SetFlag(apc.LsNameOnly)
-	objList, err := api.ListObjectsPage(apiBP, bck, msg, api.ListArgs{})
+	lst, err := api.ListObjectsPage(apiBP, bck, msg, api.ListArgs{})
 	if err != nil {
 		return false, V(err)
 	}
-	return len(objList.Entries) == 0, nil
+	return len(lst.Entries) == 0, nil
 }
 
 func ensureRemoteProvider(bck cmn.Bck) error {
 	if !apc.IsProvider(bck.Provider) {
-		return fmt.Errorf("invalid bucket %q: missing backend provider", bck)
+		return fmt.Errorf("invalid bucket %q: missing backend provider", bck.String())
 	}
 	if bck.IsRemote() {
 		return nil
@@ -694,7 +630,7 @@ func ensureRemoteProvider(bck cmn.Bck) error {
 			return nil // yes it is
 		}
 	}
-	return fmt.Errorf("invalid bucket %q: expecting remote backend", bck)
+	return fmt.Errorf("invalid bucket %q: expecting remote backend", bck.String())
 }
 
 func parseURLtoBck(strURL string) (bck cmn.Bck) {
@@ -723,16 +659,18 @@ func flattenBackends(backends []string) (flat nvpairList) {
 	for _, b := range backends {
 		nv := nvpair{Name: b}
 		switch b {
-		case "aws":
+		case apc.AWS:
 			nv.Value = "Amazon S3"
-		case "gcp":
+		case apc.GCP:
 			nv.Value = "Google Cloud Storage"
-		case "azure":
+		case apc.Azure:
 			nv.Value = "Azure Blob Storage"
+		case apc.OCI:
+			nv.Value = "Oracle Cloud Infrastructure (OCI) Object Storage"
 		}
 		flat = append(flat, nv)
 	}
-	return
+	return flat
 }
 
 // remove secrets, if any
@@ -806,7 +744,8 @@ func printSectionJSON(c *cli.Context, in any, section string) (done bool) {
 	return
 }
 
-func _printSection(c *cli.Context, in any, section string) (done bool) {
+// return true if successfully parsed and printed
+func _printSection(c *cli.Context, in any, section string) bool {
 	var (
 		beg       = regexp.MustCompile(`\s+"` + section + `\S*": {`)
 		end       = regexp.MustCompile(`},\n`)
@@ -815,14 +754,14 @@ func _printSection(c *cli.Context, in any, section string) (done bool) {
 	)
 	out, err := jsonMarshalIndent(in)
 	if err != nil {
-		return
+		return false
 	}
 
 	from := beg.FindIndex(out)
 	if from == nil {
 		loc := nonstruct.FindIndex(out)
 		if loc == nil {
-			return
+			return false
 		}
 		res := out[loc[0] : loc[1]-1]
 		fmt.Fprintln(c.App.Writer, "{"+string(res)+"\n}")
@@ -831,7 +770,7 @@ func _printSection(c *cli.Context, in any, section string) (done bool) {
 
 	to := end.FindIndex(out[from[1]:])
 	if to == nil {
-		return
+		return false
 	}
 	res := out[from[0] : from[1]+to[1]-1]
 
@@ -840,9 +779,10 @@ func _printSection(c *cli.Context, in any, section string) (done bool) {
 		var cnt, off int
 		res = out[from[0]:]
 		for off = range res {
-			if res[off] == '{' {
+			switch res[off] {
+			case '{':
 				cnt++
-			} else if res[off] == '}' {
+			case '}':
 				cnt--
 				if cnt == 0 {
 					res = out[from[0] : from[0]+off+1]
@@ -850,7 +790,7 @@ func _printSection(c *cli.Context, in any, section string) (done bool) {
 				}
 			}
 		}
-		return
+		return false
 	}
 done:
 	if l := len(res); res[l-1] == ',' {
@@ -952,11 +892,15 @@ func actionX(c *cli.Context, xargs *xact.ArgsMsg, s string) {
 	actionDone(c, msg)
 }
 
-func actionCptn(c *cli.Context, prefix, msg string) {
+func actionCptn(c *cli.Context, prefix string, msgs ...any) {
 	if prefix == "" {
-		fmt.Fprintln(c.App.Writer, fcyan(msg))
+		msgs[0] = fcyan(msgs[0])
+		fmt.Fprintln(c.App.Writer, msgs...)
 	} else {
-		fmt.Fprintln(c.App.Writer, fcyan(prefix)+msg)
+		out := make([]any, len(msgs)+1)
+		out[0] = fcyan(prefix)
+		copy(out[1:], msgs)
+		fmt.Fprintln(c.App.Writer, out...)
 	}
 }
 
@@ -983,11 +927,11 @@ type (
 	}
 )
 
-// Replace protocol (gs://, s3://, az://) with proper GCP/AWS/Azure URL
-func parseSource(rawURL string) (source dlSource, err error) {
+// Replace protocol (gs://, s3://, az://, oc://) with proper GCP/AWS/Azure/OCI URL
+func parseDlSource(rawURL string) (dlSource, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return
+		return dlSource{}, err
 	}
 
 	var (
@@ -1028,6 +972,11 @@ func parseSource(rawURL string) (source dlSource, err error) {
 				prefix: strings.TrimPrefix(fullPath, "/"),
 			},
 		}, nil
+	case apc.OCIScheme, apc.OCI:
+		cloudSource = dlSourceBackend{
+			bck:    cmn.Bck{Name: host, Provider: apc.OCI},
+			prefix: strings.TrimPrefix(fullPath, "/"),
+		}
 	case apc.AISScheme:
 		// TODO: add support for the remote cluster
 		scheme = "http" // TODO: How about `https://`?
@@ -1039,8 +988,7 @@ func parseSource(rawURL string) (source dlSource, err error) {
 		scheme = apc.DefaultScheme
 	case "https", "http":
 	default:
-		err = fmt.Errorf("invalid scheme: %s", scheme)
-		return
+		return dlSource{}, fmt.Errorf("invalid scheme: %s", scheme)
 	}
 
 	normalizedURL := url.URL{

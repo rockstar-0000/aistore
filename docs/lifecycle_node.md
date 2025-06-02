@@ -1,12 +1,3 @@
----
-layout: post
-title: Node lifecycle
-permalink: /docs/lifecycle_node
-redirect_from:
- - /lifecycle_node.md/
- - /docs/lifecycle_node.md/
----
-
 There's a set of topics in system management that can often be found under alternative subtitles:
 "graceful termination and cleanup", "shutting down and restarting", "adding/removing members", "joining and leaving cluster", and similar.
 
@@ -75,7 +66,7 @@ In aistore, all the migration (aka "rebalancing") that's taking in place is the 
 
 ### Proper location
 
-For any object in a cluster, its _proper_ location is defined by the current cluster map and locally - on each target node - by the locally configured target's [mountpaths](overview.md#terminology).
+For any object in a cluster, its _proper_ location is defined by the current cluster map and locally - on each target node - by the locally configured target's [mountpaths](overview.md#mountpath).
 
 In that sense, the "maintenance" state, for instance, has its _beginning_ - when the cluster starts rebalancing, and the post-rebalancing _end_, whereby the corresponding sub-state get recorded in a new version of the cluster map, which then gets safely distributed across all nodes, etc., etc.
 
@@ -152,4 +143,4 @@ When rebalancing, the cluster remains fully operational and can be used to read 
   - [Leaving](/docs/leave_cluster.md)
 * [Global Rebalance](/docs/rebalance.md)
 * [AuthN](/docs/authn.md)
-* [AIS on Kubernetes deployment: playbooks](https://github.com/NVIDIA/ais-k8s/tree/master/playbooks)
+* [AIS on Kubernetes deployment: playbooks](https://github.com/NVIDIA/ais-k8s/tree/main/playbooks)

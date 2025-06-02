@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -75,7 +75,7 @@ func TestMain(m *testing.M) {
 	t.htrun.init(config)
 
 	t.statsT = mock.NewStatsTracker()
-	core.Tinit(t, t.statsT, false)
+	core.Tinit(t, config, false)
 
 	bck := meta.NewBck(testBucket, apc.AIS, cmn.NsGlobal)
 	bmd := newBucketMD()
@@ -176,7 +176,7 @@ func BenchmarkObjAppend(b *testing.B) {
 				lom.RemoveMain()
 				b.StartTimer()
 
-				newHandle, _, err := aoi.apnd(buf)
+				newHandle, err := aoi.apnd(buf)
 				if err != nil {
 					b.Fatal(err)
 				}

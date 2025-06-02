@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -16,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -199,6 +200,8 @@ func (j *Job) String() string {
 		pending  = j.PendingCnt()
 		finished = j.JobFinished()
 	)
+	sb.Grow(256)
+
 	sb.WriteString(j.ID)
 	if j.Description != "" {
 		sb.WriteString(" (")
@@ -215,6 +218,7 @@ func (j *Job) String() string {
 	default:
 		sb.WriteString(fmt.Sprintf("%d file%s still being downloaded", pending, cos.Plural(pending)))
 	}
+
 	return sb.String()
 }
 
@@ -250,13 +254,15 @@ func (d JobInfos) Len() int {
 
 func (d JobInfos) Less(i, j int) bool {
 	di, dj := d[i], d[j]
-	if di.JobRunning() && dj.JobFinished() {
+	switch {
+	case di.JobRunning() && dj.JobFinished():
 		return true
-	} else if di.JobFinished() && dj.JobRunning() {
+	case di.JobFinished() && dj.JobRunning():
 		return false
-	} else if di.JobFinished() && dj.JobFinished() {
+	case di.JobFinished() && dj.JobFinished():
 		return di.FinishedTime.Before(dj.FinishedTime)
 	}
+
 	return di.StartedTime.Before(dj.StartedTime)
 }
 
@@ -330,15 +336,17 @@ func (b *SingleObj) Validate() error {
 ///////////////
 
 func (b *AdminBody) Validate(requireID bool) error {
-	if b.ID != "" && b.Regex != "" {
+	switch {
+	case b.ID != "" && b.Regex != "":
 		return fmt.Errorf("regex %q and job ID %q cannot be defined together (choose one or the other)", b.Regex, b.ID)
-	} else if b.Regex != "" {
+	case b.Regex != "":
 		if _, err := regexp.CompilePOSIX(b.Regex); err != nil {
 			return err
 		}
-	} else if b.ID == "" && requireID {
+	case b.ID == "" && requireID:
 		return errors.New("UUID not specified")
 	}
+
 	return nil
 }
 
@@ -379,7 +387,7 @@ func (b *SingleBody) Describe() string {
 }
 
 func (b *SingleBody) String() string {
-	return fmt.Sprintf("Link: %q, Bucket: %q, ObjName: %q.", b.Link, b.Bck, b.ObjName)
+	return fmt.Sprintf("Link: %q, Bucket: %q, ObjName: %q.", b.Link, b.Bck.String(), b.ObjName)
 }
 
 ///////////////
@@ -400,11 +408,11 @@ func (b *RangeBody) Describe() string {
 	if b.Description != "" {
 		return b.Description
 	}
-	return fmt.Sprintf("%s -> %s", b.Template, b.Bck)
+	return fmt.Sprintf("%s -> %s", b.Template, b.Bck.String())
 }
 
 func (b *RangeBody) String() string {
-	return fmt.Sprintf("bucket: %q, template: %q", b.Bck, b.Template)
+	return fmt.Sprintf("bucket: %q, template: %q", b.Bck.String(), b.Template)
 }
 
 ///////////////
@@ -456,11 +464,11 @@ func (b *MultiBody) Describe() string {
 	if b.Description != "" {
 		return b.Description
 	}
-	return fmt.Sprintf("multi-download -> %s", b.Bck)
+	return "multi-download -> " + b.Bck.Cname("")
 }
 
 func (b *MultiBody) String() string {
-	return fmt.Sprintf("bucket: %q", b.Bck)
+	return fmt.Sprintf("bucket: %q", b.Bck.String())
 }
 
 /////////////////
@@ -473,5 +481,5 @@ func (b *BackendBody) Describe() string {
 	if b.Description != "" {
 		return b.Description
 	}
-	return fmt.Sprintf("remote bucket prefetch -> %s", b.Bck)
+	return "remote bucket prefetch -> " + b.Bck.Cname("")
 }

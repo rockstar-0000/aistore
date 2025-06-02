@@ -1,11 +1,11 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
 import (
-	"fmt"
+	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
@@ -33,12 +33,16 @@ func (mem *MemStat) Get() error {
 	return mem.container()
 }
 
-func (mem *MemStat) String() string {
-	var (
-		used      = cos.ToSizeIEC(int64(mem.Used), 0)
-		free      = cos.ToSizeIEC(int64(mem.Free), 0)
-		buffcache = cos.ToSizeIEC(int64(mem.BuffCache), 0)
-		actfree   = cos.ToSizeIEC(int64(mem.ActualFree), 0)
-	)
-	return fmt.Sprintf("used %s, free %s, buffcache %s, actfree %s", used, free, buffcache, actfree)
+func (mem *MemStat) Str(sb *strings.Builder) {
+	sb.WriteString("used ")
+	sb.WriteString(cos.ToSizeIEC(int64(mem.Used), 0))
+	sb.WriteString(", ")
+	sb.WriteString("free ")
+	sb.WriteString(cos.ToSizeIEC(int64(mem.Free), 0))
+	sb.WriteString(", ")
+	sb.WriteString("buffcache ")
+	sb.WriteString(cos.ToSizeIEC(int64(mem.BuffCache), 0))
+	sb.WriteString(", ")
+	sb.WriteString("actfree ")
+	sb.WriteString(cos.ToSizeIEC(int64(mem.ActualFree), 0))
 }

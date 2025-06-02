@@ -1,22 +1,28 @@
 # Defaults
 DEFAULT_ETL_COMM = "hpush"
 DEFAULT_ETL_TIMEOUT = "5m"
-DEFAULT_ETL_RUNTIME = "python3.8v2"
+DEFAULT_ETL_OBJ_TIMEOUT = "45s"
+DEFAULT_ETL_RUNTIME = "python3.13v2"
 
 # ETL comm types
 # ext/etl/api.go Hpush
 ETL_COMM_HPUSH = "hpush"
 # ext/etl/api.go Hpull
 ETL_COMM_HPULL = "hpull"
-# ext/etl/api.go Hrev
-ETL_COMM_HREV = "hrev"
+# ext/etl/api.go WebSocket
+ETL_COMM_WS = "ws"
 # ext/etl/api.go HpushStdin
 ETL_COMM_IO = "io"
 
-ETL_COMM_CODE = [ETL_COMM_IO, ETL_COMM_HPUSH, ETL_COMM_HREV, ETL_COMM_HPULL]
-ETL_COMM_SPEC = [ETL_COMM_HPUSH, ETL_COMM_HREV, ETL_COMM_HPULL]
+# ETL lifecycle stages (see docs/etl.md#etl-pod-lifecycle)
+ETL_STAGE_INIT = "Initializing"
+ETL_STAGE_RUNNING = "Running"
+ETL_STAGE_STOPPED = "Stopped"
 
-ETL_SUPPORTED_PYTHON_VERSIONS = ["3.10", "3.11"]
+ETL_COMM_CODE = [ETL_COMM_IO, ETL_COMM_HPUSH, ETL_COMM_HPULL]
+ETL_COMM_SPEC = [ETL_COMM_HPUSH, ETL_COMM_HPULL, ETL_COMM_WS]
+
+ETL_SUPPORTED_PYTHON_VERSIONS = ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
 # templates for ETL
 
@@ -31,3 +37,17 @@ for mod in {}:
 transform = pickle.loads(base64.b64decode('{}'))
 {}
 """
+
+# Commands for ETL Containers
+
+FASTAPI_CMD = [
+    "uvicorn",
+    "fastapi_server:fastapi_app",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000",
+    "--workers",
+    "4",
+    "--no-access-log",
+]

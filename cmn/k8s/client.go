@@ -1,6 +1,6 @@
 // Package k8s: initialization, client, and misc. helpers
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package k8s
 
@@ -13,9 +13,11 @@ import (
 	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	tcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
@@ -30,8 +32,8 @@ type (
 		Pod(name string) (*corev1.Pod, error)
 		Pods() (*corev1.PodList, error)
 		Service(name string) (*corev1.Service, error)
-		Node(name string) (*corev1.Node, error)
 		Logs(podName string) ([]byte, error)
+		WatchPodEvents(podName string) (watch.Interface, error)
 		Health(podName string) (string, error)
 		CheckMetricsAvailability() error
 	}
@@ -73,7 +75,7 @@ func _initClient() {
 //   - https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
 func _namespace() (namespace string) {
 	// production
-	if namespace = os.Getenv(env.AIS.K8sNamespace); namespace != "" {
+	if namespace = os.Getenv(env.AisK8sNamespace); namespace != "" {
 		debug.Func(func() {
 			ns := os.Getenv(defaultNamespaceEnv)
 			debug.Assertf(ns == "" || ns == namespace, "%q vs %q", ns, namespace)
@@ -182,10 +184,6 @@ func (c *defaultClient) Service(name string) (*corev1.Service, error) {
 	return c.services().Get(context.Background(), name, metav1.GetOptions{})
 }
 
-func (c *defaultClient) Node(name string) (*corev1.Node, error) {
-	return c.client.CoreV1().Nodes().Get(context.Background(), name, metav1.GetOptions{})
-}
-
 func (c *defaultClient) Logs(podName string) (b []byte, err error) {
 	var (
 		logStream io.ReadCloser
@@ -202,6 +200,13 @@ func (c *defaultClient) Logs(podName string) (b []byte, err error) {
 		err = e
 	}
 	return b, err
+}
+
+func (c *defaultClient) WatchPodEvents(podName string) (watch.Interface, error) {
+	return c.pods().Watch(context.Background(), metav1.ListOptions{
+		FieldSelector: "metadata.name=" + podName,
+		Watch:         true,
+	})
 }
 
 func (c *defaultClient) CheckMetricsAvailability() error {

@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -19,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 )
 
@@ -38,7 +39,7 @@ var (
 		Name:      cmdRebalance,
 		Usage:     "show rebalance status and stats",
 		ArgsUsage: jobShowRebalanceArgument,
-		Flags:     showRebFlags,
+		Flags:     sortFlags(showRebFlags),
 		Action:    showRebalanceHandler,
 	}
 )
@@ -122,7 +123,7 @@ func showRebalanceHandler(c *cli.Context) error {
 		if len(allSnaps) > 0 {
 			sort.Slice(allSnaps, func(i, j int) bool {
 				if allSnaps[i].snap.ID != allSnaps[j].snap.ID {
-					return allSnaps[i].snap.ID > allSnaps[j].snap.ID
+					return allSnaps[i].snap.ID < allSnaps[j].snap.ID
 				}
 				return allSnaps[i].tid < allSnaps[j].tid
 			})
@@ -201,6 +202,6 @@ func displayRebStats(tw *tabwriter.Writer, st *targetRebSnap, units string, date
 		st.snap.ID, st.tid,
 		st.snap.Stats.InObjs, teb.FmtSize(st.snap.Stats.InBytes, units, 2),
 		st.snap.Stats.OutObjs, teb.FmtSize(st.snap.Stats.OutBytes, units, 2),
-		startTime, endTime, teb.FmtXactStatus(st.snap),
+		startTime, endTime, teb.FmtXactRunFinAbrt(st.snap),
 	)
 }

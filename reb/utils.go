@@ -1,6 +1,6 @@
 // Package reb provides global cluster-wide rebalance upon adding/removing storage nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package reb
 
@@ -12,6 +12,8 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -22,7 +24,7 @@ import (
 func (reb *Reb) RebID() int64           { return reb.rebID.Load() }
 func (reb *Reb) FilterAdd(uname []byte) { reb.filterGFN.Insert(uname) }
 
-// (limited usage; compare with `abortAndBroadcast` below)
+// (limited usage; compare with `abortAll` below)
 func (reb *Reb) AbortLocal(olderSmapV int64, err error) {
 	if xreb := reb.xctn(); xreb != nil {
 		// double-check
@@ -30,6 +32,7 @@ func (reb *Reb) AbortLocal(olderSmapV int64, err error) {
 		if smap.Version == olderSmapV {
 			if xreb.Abort(err) {
 				nlog.Warningf("%v - aborted", err)
+				reb.lazydel.stop()
 			}
 		}
 	}
@@ -39,13 +42,18 @@ func (reb *Reb) xctn() *xs.Rebalance        { return reb.xreb.Load() }
 func (reb *Reb) setXact(xctn *xs.Rebalance) { reb.xreb.Store(xctn) }
 
 func (reb *Reb) logHdr(rebID int64, smap *meta.Smap, initializing ...bool) string {
-	var sb strings.Builder
+	var (
+		sb strings.Builder
+		l  = 64
+	)
+	sb.Grow(l)
 
 	sb.WriteString(core.T.String())
 	sb.WriteString("[g")
-	sb.WriteString(strconv.FormatInt(rebID, 10))
+	sb.WriteString(strconv.FormatInt(rebID, 10)) // (compare with `xact.RebID2S`)
 	sb.WriteByte(',')
 	if smap != nil {
+		sb.WriteByte('v')
 		sb.WriteString(strconv.FormatInt(smap.Version, 10))
 	} else {
 		sb.WriteString("v<???>")
@@ -57,6 +65,7 @@ func (reb *Reb) logHdr(rebID int64, smap *meta.Smap, initializing ...bool) strin
 	sb.WriteByte(',')
 	sb.WriteString(stages[reb.stages.stage.Load()])
 	sb.WriteByte(']')
+
 	return sb.String() // "%s[g%d,%s,%s]"
 }
 
@@ -67,7 +76,7 @@ func (reb *Reb) warnID(remoteID int64, tid string) (s string) {
 	} else {
 		s = fmt.Sprintf(warn, tid, "older", remoteID, id)
 	}
-	return
+	return s
 }
 
 func (reb *Reb) _waitForSmap() (smap *meta.Smap, err error) {
@@ -99,62 +108,48 @@ func (reb *Reb) _waitForSmap() (smap *meta.Smap, err error) {
 // - update internal stage
 // - send notification to all other targets that this one is in a new stage
 func (reb *Reb) changeStage(newStage uint32) {
-	// first, set own stage
+	// set our own stage
 	reb.stages.stage.Store(newStage)
+
+	// notify all
 	var (
-		req = stageNtfn{
-			daemonID: core.T.SID(), stage: newStage, rebID: reb.rebID.Load(),
-		}
-		hdr = transport.ObjHdr{}
+		ntfn = &stageNtfn{daemonID: core.T.SID(), stage: newStage, rebID: reb.RebID()}
+		hdr  = transport.ObjHdr{}
 	)
-	hdr.Opaque = reb.encodeStageNtfn(&req)
-	// second, notify all
-	if err := reb.pushes.Send(&transport.Obj{Hdr: hdr}, nil); err != nil {
-		nlog.Warningln("Failed to push new-stage notif:", req.rebID, stages[newStage], "err:", err)
+	hdr.Opaque = ntfn.NewPack(rebMsgNtfn)
+
+	if err := reb.dm.Notif(&hdr); err != nil {
+		nlog.Warningln("failed to bcast new-stage notif: [", ntfn.rebID, stages[newStage], err, "]")
 	}
 }
 
 // Aborts global rebalance and notifies all other targets.
-// (compare with `Abort` above)
-func (reb *Reb) abortAndBroadcast(err error) {
+func (reb *Reb) abortAll(err error) {
 	xreb := reb.xctn()
 	if xreb == nil || !xreb.Abort(err) {
 		return
 	}
+	reb.lazydel.stop()
 	nlog.InfoDepth(1, xreb.Name(), "abort-and-bcast", err)
 
 	var (
-		req = stageNtfn{
-			daemonID: core.T.SID(),
-			rebID:    reb.RebID(),
-			stage:    rebStageAbort,
-		}
-		hdr = transport.ObjHdr{}
+		ntfn = &stageNtfn{daemonID: core.T.SID(), rebID: reb.RebID(), stage: rebStageAbort}
+		hdr  = transport.ObjHdr{}
 	)
-	hdr.Opaque = reb.encodeStageNtfn(&req)
-	if err := reb.pushes.Send(&transport.Obj{Hdr: hdr}, nil); err != nil {
-		nlog.Errorf("Failed to broadcast abort notification: %v", err)
+	hdr.Opaque = ntfn.NewPack(rebMsgNtfn)
+
+	if err := reb.dm.Notif(&hdr); err != nil {
+		nlog.Errorln("failed to bcast abort notif: [", ntfn.rebID, err, "]")
 	}
 }
 
-// Returns if the target is quiescent: transport queue is empty, or xaction
-// has already aborted or finished.
-func (reb *Reb) isQuiescent() bool {
-	// Finished or aborted xaction = no traffic
-	xctn := reb.xctn()
-	if xctn == nil || xctn.IsAborted() || xctn.Finished() {
-		return true
-	}
-
-	// Check for both regular and EC transport queues are empty
-	return reb.inQueue.Load() == 0 && reb.onAir.Load() == 0
-}
-
 /////////////
-// lomAcks TODO: lomAck.q[lom.Uname()] = lom.Bprops().BID and, subsequently, LIF => LOM reinit
+// lomAcks //
 /////////////
 
-func (reb *Reb) lomAcks() *[cos.MultiSyncMapCount]*lomAcks { return &reb.lomacks }
+// transaction: addLomAck => (cleanupLomAck | ackLomAck)
+
+func (reb *Reb) lomAcks() *[cos.MultiHashMapCount]*lomAcks { return &reb.lomacks }
 
 func (reb *Reb) addLomAck(lom *core.LOM) {
 	lomAck := reb.lomAcks()[lom.CacheIdx()]
@@ -163,23 +158,41 @@ func (reb *Reb) addLomAck(lom *core.LOM) {
 	lomAck.mu.Unlock()
 }
 
-func (reb *Reb) delLomAck(lom *core.LOM, rebID int64, freeLOM bool) {
-	if rebID != 0 && rebID != reb.rebID.Load() {
+// called upon failure to send
+func (reb *Reb) cleanupLomAck(lom *core.LOM) {
+	lomAck := reb.lomAcks()[lom.CacheIdx()]
+
+	lomAck.mu.Lock()
+	delete(lomAck.q, lom.Uname())
+	lomAck.mu.Unlock()
+}
+
+// called by recvRegularAck
+func (reb *Reb) ackLomAck(lom *core.LOM, rebID int64) {
+	lomAck := reb.lomAcks()[lom.CacheIdx()]
+
+	lomAck.mu.Lock()
+	uname := lom.Uname()
+	lomOrig, ok := lomAck.q[uname] // via addLomAck() above
+	if !ok {
+		lomAck.mu.Unlock()
 		return
 	}
-	lomAck := reb.lomAcks()[lom.CacheIdx()]
-	lomAck.mu.Lock()
-	if rebID == 0 || rebID == reb.rebID.Load() {
-		if lomOrig, ok := lomAck.q[lom.Uname()]; ok {
-			delete(lomAck.q, lom.Uname())
-			if freeLOM {
-				// counting acknowledged migrations (as initiator)
-				xreb := reb.xctn()
-				xreb.ObjsAdd(1, lomOrig.Lsize())
-
-				core.FreeLOM(lomOrig)
-			}
-		}
-	}
+	delete(lomAck.q, uname)
 	lomAck.mu.Unlock()
+
+	debug.Assert(uname == lomOrig.Uname())
+	size := lomOrig.Lsize()
+	core.FreeLOM(lomOrig)
+
+	// counting acknowledged migrations (as initiator)
+	xreb := reb.xctn()
+	xreb.ObjsAdd(1, size)
+
+	// NOTE: rm migrated object (and local copies, if any) right away
+	// TODO [feature]: mark "deleted" instead
+	if !cmn.Rom.Features().IsSet(feat.DontDeleteWhenRebalancing) {
+		lom.UncacheDel()
+		reb.lazydel.enqueue(lom.LIF(), xreb.Name(), rebID)
+	}
 }

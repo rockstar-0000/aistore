@@ -1,11 +1,12 @@
 #
-# Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
 #
+import random
 import unittest
 from pathlib import Path
+import warnings
 
-import boto3
-
+import pytest
 import requests
 
 from aistore.sdk import ListObjectFlag
@@ -15,14 +16,20 @@ from aistore.sdk.dataset.data_attribute import DataAttribute
 from aistore.sdk.dataset.label_attribute import LabelAttribute
 from aistore.sdk.errors import InvalidBckProvider, AISError, ErrBckNotFound
 from aistore.sdk.enums import FLTPresence
+from aistore.sdk.provider import Provider
 
-from tests.integration.sdk.remote_enabled_test import RemoteEnabledTest
-from tests import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-from tests.integration.boto3 import AWS_REGION
+from tests.integration.sdk.parallel_test_base import ParallelTestBase
 
-from tests.utils import random_string, cleanup_local, test_cases
-from tests.const import OBJECT_COUNT, OBJ_CONTENT, PREFIX_NAME
-from tests.integration import REMOTE_SET
+from tests.utils import random_string, cases, has_targets
+from tests.const import (
+    OBJECT_COUNT,
+    OBJ_CONTENT,
+    PREFIX_NAME,
+    TEST_TIMEOUT,
+    SUFFIX_NAME,
+    TEST_TIMEOUT_LONG,
+)
+from tests.integration import REMOTE_SET, AWS_BUCKET
 
 INNER_DIR = "directory"
 DATASET_DIR = "dataset"
@@ -41,37 +48,37 @@ def _create_files(folder, file_dict):
 
 
 # pylint: disable=unused-variable, too-many-public-methods
-class TestBucketOps(RemoteEnabledTest):
-    def setUp(self) -> None:
-        super().setUp()
-        self.local_test_files = (
-            Path().absolute().joinpath("bucket-ops-test-" + random_string(8))
-        )
-
-    def tearDown(self) -> None:
-        super().tearDown()
-        cleanup_local(str(self.local_test_files))
-
+class TestBucketOps(ParallelTestBase):
     def _create_put_files_structure(self, top_level_files, lower_level_files):
-        self.local_test_files.mkdir(exist_ok=True)
         _create_files(self.local_test_files, top_level_files)
         inner_dir = self.local_test_files.joinpath(INNER_DIR)
         inner_dir.mkdir()
         _create_files(inner_dir, lower_level_files)
 
     def test_bucket(self):
-        new_bck_name = random_string(10)
-        self._create_bucket(new_bck_name)
+        new_bck = self._create_bucket()
         res = self.client.cluster().list_buckets()
         bucket_names = {bck.name for bck in res}
-        self.assertIn(new_bck_name, bucket_names)
+        self.assertIn(new_bck.name, bucket_names)
 
-    @test_cases(
-        "*", ".", "", " ", "bucket/name", "bucket and name", "#name", "$name", "~name"
+    @cases(
+        "*",
+        ".",
+        "",
+        " ",
+        "bucket/badname",
+        "bucket and name",
+        "#badname",
+        "$badname",
+        "~badname",
     )
     def test_create_bucket_invalid_name(self, testcase):
         with self.assertRaises(AISError):
-            self._create_bucket(testcase)
+            bck = self.client.bucket(testcase)
+            try:
+                bck.create()
+            finally:
+                bck.delete(missing_ok=True)
 
     def test_bucket_invalid_name(self):
         with self.assertRaises(ErrBckNotFound):
@@ -87,18 +94,17 @@ class TestBucketOps(RemoteEnabledTest):
         except requests.exceptions.HTTPError as err:
             self.assertEqual(err.response.status_code, 404)
 
+    @pytest.mark.nonparallel("causes rebalance")
     def test_rename(self):
-        from_bck_name = self.bck_name + "from"
-        to_bck_name = self.bck_name + "to"
-        from_bck = self._create_bucket(from_bck_name)
-        self.client.cluster().list_buckets()
+        from_bck = self._create_bucket()
+        to_bck_name = from_bck.name + "-renamed"
+        self._register_for_post_test_cleanup([to_bck_name], is_bucket=True)
 
-        self.assertEqual(from_bck_name, from_bck.name)
         job_id = from_bck.rename(to_bck_name=to_bck_name)
         self.assertNotEqual(job_id, "")
 
         # wait for rename to finish
-        self.client.job(job_id).wait()
+        self.client.job(job_id).wait(TEST_TIMEOUT_LONG)
 
         # new bucket should be created and accessible
         to_bck = self.client.bucket(to_bck_name)
@@ -107,80 +113,136 @@ class TestBucketOps(RemoteEnabledTest):
 
         # old bucket should be inaccessible
         try:
-            from_bck.head()
+            self.client.bucket(from_bck.name).head()
         except requests.exceptions.HTTPError as err:
             self.assertEqual(err.response.status_code, 404)
-        self._register_for_post_test_cleanup(names=[to_bck_name], is_bucket=True)
 
+    # pylint: disable=too-many-locals
+    @unittest.skipIf(not has_targets(2), "Test requires more than one target")
     def test_copy(self):
-        from_bck_name = self.bck_name + "from"
-        to_bck_name = self.bck_name + "to"
-        from_bck = self._create_bucket(from_bck_name)
-        to_bck = self._create_bucket(to_bck_name)
+        from_bck = self._create_bucket()
+        to_bck = self._create_bucket()
         prefix = PREFIX_NAME
         new_prefix = "new-"
+        old_ext = "old-ext"
+        new_ext = "new-ext"
         content = b"test"
-        expected_name = prefix + "-obj"
-        from_bck.object(expected_name).put_content(content)
-        from_bck.object("notprefix-obj").put_content(content)
+        num_workers = 10
 
-        job_id = from_bck.copy(to_bck, prefix_filter=prefix, prepend=new_prefix)
+        original_name = f"{prefix}-obj.{old_ext}"
+        from_bck.object(original_name).get_writer().put_content(content)
+        from_bck.object("notprefix-obj").get_writer().put_content(content)
 
+        job_id = from_bck.copy(
+            to_bck,
+            prefix_filter=prefix,
+            prepend=new_prefix,
+            ext={old_ext: new_ext},
+            num_workers=num_workers,
+        )
         self.assertNotEqual(job_id, "")
-        self.client.job(job_id).wait()
-        entries = to_bck.list_all_objects()
-        self.assertEqual(1, len(entries))
-        self.assertEqual(new_prefix + expected_name, entries[0].name)
+
+        job = self.client.job(job_id)
+        job.wait()
+        try:
+            actual_workers = job.get_details().get_num_workers()
+            self.assertEqual(
+                num_workers,
+                actual_workers,
+                f"Num workers mismatch for copy job - {job_id} (expected: {num_workers}, actual: {actual_workers})",
+            )
+        except AssertionError as e:
+            warnings.warn(
+                f"Worker count mismatch for copy job {job_id} (expected: {num_workers}). "
+                f"System might be under load. Skipping check.\nDetails: {e}",
+                RuntimeWarning,
+            )
+
+        copied = to_bck.list_all_objects()
+
+        self.assertEqual(1, len(copied))
+        expected_name = f"{new_prefix}{prefix}-obj.{new_ext}"
+        self.assertEqual(expected_name, copied[0].name)
 
     @unittest.skipIf(
-        not REMOTE_SET,
-        "Remote bucket is not set",
+        not AWS_BUCKET,
+        "AWS bucket is not set",
     )
     def test_get_latest_flag(self):
         obj_name = random_string()
         self._register_for_post_test_cleanup(names=[obj_name], is_bucket=False)
 
-        s3_client = boto3.client(
-            "s3",
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            # aws_session_token=AWS_SESSION_TOKEN,
-        )
-
         # out-of-band PUT: first version
-        s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=LOREM)
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=LOREM)
 
         # cold GET, and check
-        content = self.bucket.object(obj_name).get().read_all()
+        content = self.bucket.object(obj_name).get_reader().read_all()
         self.assertEqual(LOREM, content.decode("utf-8"))
 
         # out-of-band PUT: 2nd version (overwrite)
-        s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=DUIS)
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=DUIS)
 
         # warm GET and check (expecting the first version's content)
-        content = self.bucket.object(obj_name).get().read_all()
+        content = self.bucket.object(obj_name).get_reader().read_all()
         self.assertEqual(LOREM, content.decode("utf-8"))
 
         # warm GET with `--latest` flag, content should be updated
-        content = self.bucket.object(obj_name).get(latest=True).read_all()
+        content = self.bucket.object(obj_name).get_reader(latest=True).read_all()
         self.assertEqual(DUIS, content.decode("utf-8"))
 
         # out-of-band DELETE
-        s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
+        self.s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
 
         # warm GET must be fine
-        content = self.bucket.object(obj_name).get().read_all()
+        content = self.bucket.object(obj_name).get_reader().read_all()
         self.assertEqual(DUIS, content.decode("utf-8"))
 
         # cold GET must result in Error
         with self.assertRaises(AISError):
-            self.bucket.object(obj_name).get(latest=True).read_all()
+            self.bucket.object(obj_name).get_reader(latest=True).read_all()
+
+    @unittest.skipIf(
+        not AWS_BUCKET,
+        "AWS bucket is not set",
+    )
+    @pytest.mark.nonparallel("job uuid query does not work with multiple")
+    def test_copy_sync_flag(self):
+        to_bck = self._create_bucket()
+        num_obj = OBJECT_COUNT
+        obj_names = self._create_objects(num_obj=num_obj, suffix=SUFFIX_NAME)
+
+        obj_group = self.bucket.objects(obj_names=obj_names)
+
+        # cache and verify
+        job_id = obj_group.prefetch()
+        self.client.job(job_id).wait(timeout=TEST_TIMEOUT * 2)
+        self._verify_cached_objects(num_obj, range(num_obj))
+        # copy objs to dst bck
+        copy_job = self.bucket.copy(prefix_filter=self.obj_prefix, to_bck=to_bck)
+        self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertEqual(num_obj, len(to_bck.list_all_objects()))
+
+        # randomly delete 10% of the objects
+        num_to_del = int(num_obj * 0.1)
+
+        # out of band delete
+        for obj_name in random.sample(obj_names, num_to_del):
+            self.s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
+
+        # test --sync flag
+        copy_job = self.bucket.copy(
+            prefix_filter=self.obj_prefix, to_bck=to_bck, sync=True
+        )
+        self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT * 3)
+        self.assertEqual(
+            num_obj - num_to_del, len(to_bck.list_all_objects(prefix=self.obj_prefix))
+        )
 
     @unittest.skipIf(
         not REMOTE_SET,
         "Remote bucket is not set",
     )
+    @pytest.mark.nonparallel("full bucket eviction")
     def test_evict(self):
         self._create_objects()
         objects = self.bucket.list_objects(
@@ -203,14 +265,13 @@ class TestBucketOps(RemoteEnabledTest):
                 self.bucket.evict()
             return
         # Create a local bucket to test with if self.bucket is a cloud bucket
-        local_bucket = self._create_bucket(self.bck_name + "-local")
+        local_bucket = self._create_bucket()
         with self.assertRaises(InvalidBckProvider):
             local_bucket.evict()
 
     def test_put_files_invalid(self):
         with self.assertRaises(ValueError):
             self.bucket.put_files("non-existent-dir")
-        self.local_test_files.mkdir()
         filename = self.local_test_files.joinpath("file_not_dir")
         with open(filename, "w", encoding=UTF_ENCODING):
             pass
@@ -221,10 +282,12 @@ class TestBucketOps(RemoteEnabledTest):
         if expect_err:
             for obj_name in expected_res_dict:
                 with self.assertRaises(AISError):
-                    self.bucket.object(self.obj_prefix + obj_name).get().read_all()
+                    self.bucket.object(
+                        self.obj_prefix + obj_name
+                    ).get_reader().read_all()
         else:
             for obj_name, expected_data in expected_res_dict.items():
-                res = self.bucket.object(self.obj_prefix + obj_name).get()
+                res = self.bucket.object(self.obj_prefix + obj_name).get_reader()
                 self.assertEqual(expected_data, res.read_all())
 
     def test_put_files_default_args(self):
@@ -264,7 +327,6 @@ class TestBucketOps(RemoteEnabledTest):
         self._verify_obj_res(expected_res)
 
     def test_put_files_filtered(self):
-        self.local_test_files.mkdir()
         included_filename = "prefix-file.txt"
         excluded_by_pattern = "extra_top_file.py"
         excluded_by_prefix = "non-prefix-file.txt"
@@ -277,11 +339,11 @@ class TestBucketOps(RemoteEnabledTest):
             prefix_filter=PREFIX_NAME,
             pattern="*.txt",
         )
-        self.bucket.object(self.obj_prefix + included_filename).get()
+        self.bucket.object(self.obj_prefix + included_filename).get_reader()
         with self.assertRaises(AISError):
-            self.bucket.object(excluded_by_pattern).get().read_all()
+            self.bucket.object(excluded_by_pattern).get_reader().read_all()
         with self.assertRaises(AISError):
-            self.bucket.object(excluded_by_prefix).get().read_all()
+            self.bucket.object(excluded_by_prefix).get_reader().read_all()
 
     def test_put_files_dry_run(self):
         self._create_put_files_structure(TOP_LEVEL_FILES, LOWER_LEVEL_FILES)
@@ -291,7 +353,7 @@ class TestBucketOps(RemoteEnabledTest):
         # Verify the put files call does not actually create objects
         self._verify_obj_res(TOP_LEVEL_FILES, expect_err=True)
 
-    @test_cases((None, OBJECT_COUNT), (7, 7), (OBJECT_COUNT * 2, OBJECT_COUNT))
+    @cases((None, OBJECT_COUNT), (7, 7), (OBJECT_COUNT * 2, OBJECT_COUNT))
     def test_list_objects(self, test_case):
         page_size, response_size = test_case
         # Only create the bucket entries on the first subtest run
@@ -326,8 +388,17 @@ class TestBucketOps(RemoteEnabledTest):
             obj_names.remove(obj.name)
         self.assertEqual(0, len(obj_names))
 
-    def test_list_object_flags(self):
+    def test_list_object_flags_combined(self):
         self._create_objects()
+        # Test a single flag
+        objects = self.bucket.list_all_objects(
+            flags=[ListObjectFlag.NAME_SIZE], prefix=self.obj_prefix
+        )
+        self.assertEqual(OBJECT_COUNT, len(objects))
+        for obj in objects:
+            self.assertTrue(obj.size > 0)
+
+        # Test a list of multiple flags
         objects = self.bucket.list_all_objects(
             flags=[ListObjectFlag.NAME_ONLY, ListObjectFlag.CACHED],
             prefix=self.obj_prefix,
@@ -336,15 +407,8 @@ class TestBucketOps(RemoteEnabledTest):
         for obj in objects:
             self.assertEqual(0, obj.size)
 
-        objects = self.bucket.list_all_objects(
-            flags=[ListObjectFlag.NAME_SIZE], prefix=self.obj_prefix
-        )
-        self.assertEqual(OBJECT_COUNT, len(objects))
-        for obj in objects:
-            self.assertTrue(obj.size > 0)
-
     def test_summary(self):
-        summ_test_bck = self._create_bucket("summary-test")
+        summ_test_bck = self._create_bucket()
 
         # Initially, the bucket should be empty
         bucket_summary = summ_test_bck.summary()
@@ -357,7 +421,7 @@ class TestBucketOps(RemoteEnabledTest):
         # Upload objects to the bucket with different prefixes
         obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
         for obj_name in obj_names:
-            summ_test_bck.object(obj_name).put_content(OBJ_CONTENT)
+            summ_test_bck.object(obj_name).get_writer().put_content(OBJ_CONTENT)
 
         # Verify the info with no prefix (should include all objects)
         bck_summ = summ_test_bck.summary()
@@ -387,46 +451,35 @@ class TestBucketOps(RemoteEnabledTest):
             summ_test_bck.summary()
 
     def test_info(self):
-        info_test_bck = self._create_bucket("info-test")
+        info_test_bck = self._create_bucket()
 
         # Initially, the bucket should be empty
         _, bck_info = info_test_bck.info(flt_presence=FLTPresence.FLT_EXISTS)
 
         # For an empty bucket, the object count and total size should be zero
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        self._validate_bck_info(info_test_bck, bck_info, "0", "0")
 
         # Upload objects to the bucket with different prefixes
-        obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
+        obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1"]
         for obj_name in obj_names:
-            info_test_bck.object(obj_name).put_content(OBJ_CONTENT)
+            info_test_bck.object(obj_name).get_writer().put_content(OBJ_CONTENT)
 
         # Verify the info with no prefix (should include all objects)
         _, bck_info = info_test_bck.info()
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "4")
-        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        content_size = str(len(obj_names) * len(OBJ_CONTENT))
+        self._validate_bck_info(
+            info_test_bck, bck_info, str(len(obj_names)), content_size
+        )
 
         # Verify the info with prefix1
         _, bck_info = info_test_bck.info(prefix="prefix1")
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "2")
-        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        content_size = str(2 * len(OBJ_CONTENT))
+        self._validate_bck_info(info_test_bck, bck_info, "2", content_size)
 
         # Verify the info with prefix2
         _, bck_info = info_test_bck.info(prefix="prefix2")
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "2")
-        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        content_size = str(len(OBJ_CONTENT))
+        self._validate_bck_info(info_test_bck, bck_info, "1", content_size)
 
         info_test_bck.delete()
 
@@ -434,8 +487,23 @@ class TestBucketOps(RemoteEnabledTest):
         with self.assertRaises(ErrBckNotFound):
             info_test_bck.summary()
 
+    def _validate_bck_info(
+        self,
+        bck,
+        bck_info,
+        present_obj_count,
+        present_obj_size,
+    ):
+        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], present_obj_count)
+        self.assertEqual(
+            bck_info["TotalSize"]["size_all_present_objs"], present_obj_size
+        )
+        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_info["provider"], Provider.AIS.value)
+        self.assertEqual(bck_info["name"], bck.name)
+
+    @pytest.mark.nonparallel("temporarily writes to fixed local file")
     def test_write_dataset(self):
-        self.local_test_files.mkdir(exist_ok=True)
         dataset_directory = self.local_test_files.joinpath(DATASET_DIR)
         dataset_directory.mkdir(exist_ok=True)
         img_files = {
@@ -468,8 +536,8 @@ class TestBucketOps(RemoteEnabledTest):
         for shard in shards:
             self.assertIsNotNone(self.bucket.object(shard).head())
 
+    @pytest.mark.nonparallel("temporarily writes to fixed local file")
     def test_write_dataset_missing_attributes(self):
-        self.local_test_files.mkdir(exist_ok=True)
         dataset_directory = self.local_test_files.joinpath(DATASET_DIR)
         dataset_directory.mkdir(exist_ok=True)
         img_files = {

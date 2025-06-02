@@ -3,13 +3,13 @@ from typing import List, Optional
 from unittest.mock import Mock, patch
 
 from aistore.sdk.bucket import Bucket
+from aistore.sdk.provider import Provider
 from aistore.sdk.cluster import Cluster
 from aistore.sdk.const import (
     HTTP_METHOD_GET,
     QPARAM_WHAT,
     QPARAM_PROVIDER,
     ACT_LIST,
-    PROVIDER_AIS,
     WHAT_SMAP,
     URL_PATH_DAEMON,
     URL_PATH_BUCKETS,
@@ -19,12 +19,12 @@ from aistore.sdk.const import (
     WHAT_ALL_XACT_STATUS,
     WHAT_ALL_RUNNING_STATUS,
     URL_PATH_ETL,
+    URL_PATH_REVERSE,
+    WHAT_NODE_STATS_AND_STATUS,
 )
+from aistore.sdk.etl.etl_const import ETL_STAGE_RUNNING, ETL_STAGE_STOPPED
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.types import (
-    NodeStats,
-    NodeTracker,
-    NodeCapacity,
     Smap,
     ActionMsg,
     BucketModel,
@@ -33,12 +33,9 @@ from aistore.sdk.types import (
     ETLInfo,
     Snode,
     NetInfo,
-    NodeCounter,
-    NodeLatency,
-    NodeThroughput,
 )
 
-from tests.utils import test_cases
+from tests.utils import cases
 
 
 class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
@@ -58,13 +55,13 @@ class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
             params={QPARAM_WHAT: WHAT_SMAP},
         )
 
-    def test_list_buckets(self):
-        provider = "any-provider"
-        expected_params = {QPARAM_PROVIDER: provider}
+    @cases(*Provider)
+    def test_list_buckets(self, provider):
+        expected_params = {QPARAM_PROVIDER: provider.value}
         self.list_buckets_exec_assert(expected_params, provider=provider)
 
     def test_list_buckets_default_param(self):
-        expected_params = {QPARAM_PROVIDER: PROVIDER_AIS}
+        expected_params = {QPARAM_PROVIDER: Provider.AIS.value}
         self.list_buckets_exec_assert(expected_params)
 
     def list_buckets_exec_assert(self, expected_params, **kwargs):
@@ -86,7 +83,7 @@ class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
         self.mock_client.request.side_effect = Exception
         self.assertFalse(self.cluster.is_ready())
 
-    @test_cases(True, False)
+    @cases(True, False)
     def test_is_ready(self, test_case):
         expected_params = {QPARAM_PRIMARY_READY_REB: "true"}
         primary_proxy_endpoint = "primary_proxy_url"
@@ -174,17 +171,18 @@ class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
         )
 
     def test_list_running_etls(self):
-        mock_response = Mock()
+        mock_running_etl = Mock(stage=ETL_STAGE_RUNNING)
+        mock_stopped_etl = Mock(stage=ETL_STAGE_STOPPED)
+        mock_response = [mock_running_etl, mock_stopped_etl]
         self.mock_client.request_deserialize.return_value = mock_response
         response = self.cluster.list_running_etls()
-        self.assertEqual(mock_response, response)
+        self.assertEqual([mock_running_etl], response)
         self.mock_client.request_deserialize.assert_called_with(
             HTTP_METHOD_GET, path=URL_PATH_ETL, res_model=List[ETLInfo]
         )
 
     @patch("aistore.sdk.cluster.Cluster._get_smap")
     def test_get_performance(self, mock_get_smap):
-        mock_targets = ["target1", "target2"]
         mock_smap = Smap(
             tmap={"target1": Mock(spec=Snode), "target2": Mock(spec=Snode)},
             pmap={"proxy1": Mock(spec=Snode)},
@@ -192,77 +190,44 @@ class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
         )
         mock_get_smap.return_value = mock_smap
 
-        mock_node_tracker = NodeTracker(
-            append_ns=1000,
-            del_n=10,
-            disk_sdb_util=50.0,
-            disk_sdb_avg_rsize=1024,
-            disk_sdb_avg_wsize=2048,
-            disk_sdb_read_bps=1000000,
-            disk_sdb_write_bps=500000,
-            dl_ns=2000,
-            dsort_creation_req_n=5,
-            dsort_creation_resp_n=5,
-            dsort_creation_resp_ns=100,
-            dsort_extract_shard_mem_n=2,
-            dsort_extract_shard_size=102400,
-            err_del_n=1,
-            err_get_n=2,
-            get_bps=1024000,
-            get_cold_n=20,
-            get_cold_rw_ns=3000,
-            get_cold_size=204800,
-            get_n=100,
-            get_ns=4000,
-            get_redir_ns=500,
-            get_size=409600,
-            kalive_ns=600,
-            lcache_evicted_n=15,
-            lcache_flush_cold_n=10,
-            lru_evict_n=5,
-            lru_evict_size=102400,
-            lst_n=50,
-            lst_ns=700,
-            put_bps=2048000,
-            put_n=80,
-            put_ns=8000,
-            put_redir_ns=600,
-            put_size=819200,
-            remote_deleted_del_n=3,
-            stream_in_n=40,
-            stream_in_size=409600,
-            stream_out_n=35,
-            stream_out_size=204800,
-            up_ns_time=10000,
-            ver_change_n=25,
-            ver_change_size=512000,
-        )
+        mock_response_1 = Mock()
+        mock_response_1.json.return_value = {
+            "tracker": {"get.n": 100, "put.n": 50},
+            "capacity": {"pct_used": 47.5},
+        }
 
-        mock_node_stats = NodeStats(
-            snode=Mock(spec=Snode),
-            tracker=mock_node_tracker,
-            capacity=Mock(spec=NodeCapacity),
-            rebalance_snap={},
-            status="",
-            deployment="",
-            ais_version="",
-            build_time="",
-            k8s_pod_name="",
-            sys_info={},
-            smap_version="",
-        )
+        mock_response_2 = Mock()
+        mock_response_2.json.return_value = {
+            "tracker": {"get.n": 200, "put.n": 80},
+            "capacity": {"pct_used": 55.0},
+        }
 
-        self.mock_client.request_deserialize.return_value = mock_node_stats
+        self.mock_client.request.side_effect = [mock_response_1, mock_response_2]
 
         performance = self.cluster.get_performance()
 
-        for target_id in mock_targets:
-            throughput = performance.throughput[target_id].as_dict()
-            latency = performance.latency[target_id].as_dict()
-            counter = performance.counters[target_id].as_dict()
+        expected = {
+            "target1": {
+                "tracker": {"get.n": 100, "put.n": 50},
+                "capacity": {"pct_used": 47.5},
+            },
+            "target2": {
+                "tracker": {"get.n": 200, "put.n": 80},
+                "capacity": {"pct_used": 55.0},
+            },
+        }
+        self.assertEqual(expected, performance)
+        self.assertEqual(2, self.mock_client.request.call_count)
 
-            self.assertEqual(NodeThroughput(mock_node_tracker).as_dict(), throughput)
-            self.assertEqual(NodeLatency(mock_node_tracker).as_dict(), latency)
-            self.assertEqual(NodeCounter(mock_node_tracker).as_dict(), counter)
-
-        self.mock_client.request_deserialize.assert_called()
+        self.mock_client.request.assert_any_call(
+            HTTP_METHOD_GET,
+            path=f"{URL_PATH_REVERSE}/{URL_PATH_DAEMON}",
+            params={QPARAM_WHAT: WHAT_NODE_STATS_AND_STATUS},
+            headers={"ais-node-id": "target1"},
+        )
+        self.mock_client.request.assert_any_call(
+            HTTP_METHOD_GET,
+            path=f"{URL_PATH_REVERSE}/{URL_PATH_DAEMON}",
+            params={QPARAM_WHAT: WHAT_NODE_STATS_AND_STATUS},
+            headers={"ais-node-id": "target2"},
+        )

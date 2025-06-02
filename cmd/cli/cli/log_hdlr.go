@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -19,21 +19,24 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/sys"
+
 	"github.com/urfave/cli"
 )
 
 const clusterCompletion = "cluster"
 
-// (compare with getCluLogUsage)
-const getLogUsage = "download the current log or entire log history from: a) selected node, or b) entire cluster,\n" +
-	indent1 + "\t e.g.:\n" +
-	indent1 + "\t - 'ais log get NODE_ID /tmp'\t- download the specified node's current log and save it in the specified directory;\n" +
-	indent1 + "\t - 'ais log get NODE_ID /tmp/out --refresh 10'\t- download the node's current log _as_ /tmp/out\n" +
-	indent1 + "\t    \t  and keep updating (ie., appending) the latter every 10s;\n" +
-	indent1 + "\t - 'ais log get cluster /tmp'\t- download TAR.GZ archived logs of _all_ nodes in the cluster\n" +
-	indent1 + "\t    \t  and save the result in the specified local directory (note that 'get cluster' implies '--all');\n" +
-	indent1 + "\t - 'ais log get NODE_ID --all'\t- given 'NODE-ID' download the node's entire log TAR.GZ archive\n" +
-	indent1 + "\t - 'ais log get NODE_ID --all --severity e'\t- archive logged errors and warnings"
+// (compare with getCluLogsUsage)
+const getLogUsage = "Download logs from a selected node or the entire cluster;\n" +
+	indent4 + "\t   supports downloading current logs or TAR.GZ archives.\n" +
+	indent1 + "e.g.:\n" +
+	indent1 + "\t- 'ais log get NODE_ID /tmp'\t- download the current log from NODE_ID and save it in the specified directory;\n" +
+	indent1 + "\t- 'ais log get NODE_ID /tmp/out' --refresh 10\t- download the current log from NODE_ID as /tmp/out\n" +
+	indent1 + "\t\t  and continuously update it every 10 seconds;\n" +
+	indent1 + "\t- 'ais log get cluster /tmp'\t- download TAR.GZ archives from all cluster nodes\n" +
+	indent1 + "\t\t  and save them in the specified directory ('get cluster' implies '--all');\n" +
+	indent1 + "\t- 'ais log get NODE_ID --all'\t- download the complete log archive (TAR.GZ) from NODE_ID;\n" +
+	indent1 + "\t- 'ais log get NODE_ID --all --severity error'\t- download only errors and warnings from NODE_ID;\n" +
+	indent1 + "\t- 'ais log get NODE_ID --all --severity e'\t- same as above."
 
 var (
 	nodeLogFlags = map[string][]cli.Flag{
@@ -53,10 +56,10 @@ var (
 	// 'show log' and 'log show'
 	showCmdLog = cli.Command{
 		Name: cmdLog,
-		Usage: fmt.Sprintf("for a given node: show its current log (use %s to update, %s for details)",
+		Usage: fmt.Sprintf("For a given node: show its current log (use %s to update, %s for details)",
 			qflprn(refreshFlag), qflprn(cli.HelpFlag)),
 		ArgsUsage:    showLogArgument,
-		Flags:        nodeLogFlags[commandShow],
+		Flags:        sortFlags(nodeLogFlags[commandShow]),
 		Action:       showNodeLogHandler,
 		BashComplete: suggestAllNodes,
 	}
@@ -64,7 +67,7 @@ var (
 		Name:      commandGet,
 		Usage:     getLogUsage,
 		ArgsUsage: getLogArgument,
-		Flags:     nodeLogFlags[commandGet],
+		Flags:     sortFlags(nodeLogFlags[commandGet]),
 		Action:    getLogHandler,
 		BashComplete: func(c *cli.Context) {
 			fmt.Println(clusterCompletion)
@@ -75,7 +78,7 @@ var (
 	// top-level
 	logCmd = cli.Command{
 		Name:  commandLog,
-		Usage: "view ais node's log in real time; download the current log; download all logs (history)",
+		Usage: "View ais node's log in real time; download the current log; download all logs (history)",
 		Subcommands: []cli.Command{
 			makeAlias(showCmdLog, "", true, commandShow),
 			getCmdLog,
@@ -156,6 +159,25 @@ func _getAllClusterLogs(c *cli.Context, sev, outFile string) error {
 	if outFile == fileStdIO {
 		return errors.New("cannot download archived logs to standard output")
 	}
+	if outFile != "" {
+		finfo, err := os.Stat(outFile)
+		switch {
+		case err == nil:
+			if !finfo.IsDir() {
+				return fmt.Errorf("path %q exists but is not a directory; a directory is required to download individual log archives", outFile)
+			}
+		case !os.IsNotExist(err):
+			return err
+		case !flagIsSet(c, yesFlag):
+			warn := fmt.Sprintf("create directory %q", outFile)
+			if ok := confirm(c, warn); !ok {
+				return nil
+			}
+			if err := cos.CreateDir(outFile); err != nil {
+				return fmt.Errorf("failed to create directory %q: %v", outFile, err)
+			}
+		}
+	}
 
 	wg := cos.NewLimitedWaitGroup(sys.NumCPU(), smap.Count())
 	_alll(c, smap.Pmap, sev, outFile, wg)
@@ -177,15 +199,16 @@ func _alll(c *cli.Context, nodeMap meta.NodeMap, sev, outFile string, wg cos.WG)
 	}
 }
 
+// get all logs from the specified (*single*) node
 func _getAllNodeLogs(c *cli.Context, node *meta.Snode, sev, outFile, sname string) error {
 	var (
 		tempdir, fname, s string
 		confirmed         bool
 	)
-	if outFile == fileStdIO {
-		return errors.New("cannot download archived logs to standard output")
-	}
-	if outFile == "" {
+	switch outFile {
+	case fileStdIO:
+		return errors.New("cannot download all node's .tar.gz log archives to standard output")
+	case "":
 		tempdir = filepath.Join(os.TempDir(), "aislogs")
 		if err := cos.CreateDir(tempdir); err != nil {
 			return fmt.Errorf("failed to create temp dir %s: %v", tempdir, err)
@@ -195,7 +218,7 @@ func _getAllNodeLogs(c *cli.Context, node *meta.Snode, sev, outFile, sname strin
 			fname = apc.Proxy + "-" + node.ID() + archive.ExtTarGz
 		}
 		outFile = filepath.Join(tempdir, fname)
-	} else {
+	default:
 		outFile, confirmed = _logDestName(c, node, outFile)
 		if !confirmed {
 			return nil

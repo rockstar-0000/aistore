@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
 )
@@ -38,7 +39,7 @@ type cprCtx struct {
 	sinceUpd time.Duration
 }
 
-func (cpr *cprCtx) copyBucket(c *cli.Context, bckFrom, bckTo cmn.Bck, msg *apc.CopyBckMsg, fltPresence int) error {
+func (cpr *cprCtx) copyBucket(c *cli.Context, bckFrom, bckTo cmn.Bck, msg *apc.TCBMsg, fltPresence int) error {
 	actionNote(c, "to initialize progress bar, running 'bucket summary' on the source: "+bckFrom.Cname(""))
 
 	// 1. get from-bck summary
@@ -59,7 +60,7 @@ func (cpr *cprCtx) copyBucket(c *cli.Context, bckFrom, bckTo cmn.Bck, msg *apc.C
 	// 2. got bucket summary(ies)
 	summaries := ctx.res
 	for _, res := range summaries {
-		debug.Assertf(res.Bck.Equal(&bckFrom), "%s != %s", res.Bck, bckFrom)
+		debug.Assertf(res.Bck.Equal(&bckFrom), "%s != %s", res.Bck.String(), bckFrom.String())
 		cpr.totals.size += int64(res.TotalSize.PresentObjs + res.TotalSize.RemoteObjs)
 		cpr.totals.objs += int64(res.ObjCount.Present + res.ObjCount.Remote)
 	}

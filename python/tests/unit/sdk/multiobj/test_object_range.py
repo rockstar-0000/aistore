@@ -2,7 +2,7 @@ import unittest
 
 from aistore.sdk.errors import InvalidObjectRangeIndex
 from aistore.sdk.multiobj import ObjectRange
-from tests.utils import test_cases
+from tests.utils import cases
 from tests.const import PREFIX_NAME, SUFFIX_NAME
 
 
@@ -20,7 +20,7 @@ class TestObjectRange(unittest.TestCase):
         object_range = ObjectRange(
             prefix=self.prefix, min_index=self.min_index, max_index=self.max_index
         )
-        self.assertEqual("prefix-{4..9..1}", str(object_range))
+        self.assertEqual(f"{self.prefix}{{4..9..1}}", str(object_range))
 
     def test_object_range(self):
         object_range = ObjectRange(
@@ -31,7 +31,9 @@ class TestObjectRange(unittest.TestCase):
             step=self.step,
             suffix=self.suffix,
         )
-        self.assertEqual("prefix-{004..009..2}-suffix", str(object_range))
+        self.assertEqual(
+            f"{self.prefix}{{004..009..2}}{self.suffix}", str(object_range)
+        )
 
     def test_object_range_prefix_only(self):
         object_range = ObjectRange(prefix=self.prefix)
@@ -41,7 +43,7 @@ class TestObjectRange(unittest.TestCase):
         with self.assertRaises(ValueError):
             ObjectRange(prefix=self.prefix, suffix="anything")
 
-    @test_cases(
+    @cases(
         (1, 25, 0, True),
         (25, 1, 0, False),
         (20, 25, 1, False),
@@ -77,5 +79,9 @@ class TestObjectRange(unittest.TestCase):
             step=self.step,
             suffix=self.suffix,
         )
-        expected_range = ["prefix-004-suffix", "prefix-006-suffix", "prefix-008-suffix"]
+        expected_range = [
+            f"{self.prefix}004{self.suffix}",
+            f"{self.prefix}006{self.suffix}",
+            f"{self.prefix}008{self.suffix}",
+        ]
         self.assertEqual(expected_range, list(object_range))

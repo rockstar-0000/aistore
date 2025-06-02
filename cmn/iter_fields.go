@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -158,7 +158,8 @@ func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, st
 		}
 
 		var dirtyField bool
-		if srcValField.Kind() == reflect.Slice {
+		switch {
+		case srcValField.Kind() == reflect.Slice:
 			if !jsonTagPresent {
 				continue
 			}
@@ -166,7 +167,7 @@ func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, st
 			field := &field{name: name, v: srcValField, listTag: listTag, opts: opts}
 			err, stop = updf(name, field)
 			dirtyField = field.dirty
-		} else if srcValField.Kind() != reflect.Struct {
+		case srcValField.Kind() != reflect.Struct:
 			// We require that not-omitted fields have JSON tag.
 			debug.Assert(jsonTagPresent, prefix+"["+fieldName+"]")
 
@@ -175,37 +176,30 @@ func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, st
 			field := &field{name: name, v: srcValField, listTag: listTag, opts: opts}
 			err, stop = updf(name, field)
 			dirtyField = field.dirty
-		} else {
+		default:
 			// Recurse into struct
-
 			// Always take address if possible (assuming that we will set value)
 			if srcValField.CanAddr() {
 				srcValField = srcValField.Addr()
 			}
-
 			p := prefix
 			if fieldName != "" {
 				// If struct has JSON tag, we want to include it.
 				p += fieldName
 			}
-
 			if opts.VisitAll {
 				field := &field{name: p, v: srcValField, listTag: listTag, opts: opts}
 				err, stop = updf(p, field)
 				dirtyField = field.dirty
 			}
-
 			if !strings.HasSuffix(p, IterFieldNameSepa) && !isInline {
 				p += IterFieldNameSepa
 			}
-
 			if err == nil && !stop {
 				dirtyField, stop, err = iterFields(p, srcValField.Interface(), updf, opts)
 				if allocatedStruct && !dirtyField {
-					// If we initialized new struct but no field inside
-					// it was set we must set the value of the field to
-					// `nil` (as it was before) otherwise we manipulated
-					// the field for no reason.
+					// if we initialized new struct with no fields set inside
+					// we must restore the value back to `nil`
 					srcValField = srcVal.Field(i)
 					srcValField.Set(reflect.Zero(srcValField.Type()))
 				}
@@ -214,14 +208,14 @@ func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, st
 
 		dirty = dirty || dirtyField
 		if stop {
-			return
+			return dirty, stop, err
 		}
-
 		if err != nil {
 			return dirty, true, err
 		}
 	}
-	return
+
+	return dirty, stop, err
 }
 
 // CopyProps update dst with the values from src
@@ -234,6 +228,10 @@ func CopyProps(src, dst any, asType string) error {
 	if srcVal.Kind() == reflect.Ptr {
 		srcVal = srcVal.Elem()
 	}
+	return _copyProps(srcVal, dstVal, asType)
+}
+
+func _copyProps(srcVal, dstVal reflect.Value, asType string) error {
 	for i := range srcVal.NumField() {
 		copyTag, ok := srcVal.Type().Field(i).Tag.Lookup("copy")
 		if ok && copyTag == "skip" {
@@ -245,9 +243,32 @@ func CopyProps(src, dst any, asType string) error {
 			fieldName   = srcVal.Type().Field(i).Name
 			dstValField = dstVal.FieldByName(fieldName)
 		)
+
+		// copy embedded struct recursively
+		if srcValField.Kind() == reflect.Struct {
+			if i >= dstVal.NumField() {
+				err := fmt.Errorf("source and destination structures mismatch [%s, idx %d, src-num %d, dst-num %d]",
+					fieldName, i, srcVal.NumField(), dstVal.NumField())
+				debug.AssertNoErr(err)
+				return err
+			}
+			dstValField = dstVal.Field(i)
+			if !dstValField.IsValid() {
+				err := fmt.Errorf("destination field is invalid [src-name %s, dst-name %s, idx %d]",
+					fieldName, dstVal.Type().Field(i).Name, i)
+				debug.AssertNoErr(err)
+				return err
+			}
+			if err := _copyProps(srcValField, dstValField, asType); err != nil {
+				return err
+			}
+			continue
+		}
+
 		if srcValField.IsNil() {
 			continue
 		}
+
 		t, ok := dstVal.Type().FieldByName(fieldName)
 		debug.Assert(ok, fieldName)
 

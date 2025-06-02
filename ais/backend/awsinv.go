@@ -1,6 +1,6 @@
 //go:build aws
 
-// Package backend contains implementation of various backend providers.
+// Package backend contains core/backend interface implementations for supported backend providers.
 /*
  * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
  */
@@ -28,6 +28,7 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -254,7 +255,7 @@ func (s3bp *s3bp) getInventory(cloudBck *cmn.Bck, ctx *core.LsoInvCtx, csv invT)
 				lom.SetAtimeUnix(csv.mtime.UnixNano())
 				if errN := lom.PersistMain(); errN != nil {
 					debug.AssertNoErr(errN) // (unlikely)
-					nlog.Errorln("failed to persist", lom.Cname(), "err:", err, "- proceeding anyway...")
+					nlog.Errorln("failed to persist", lom.Cname(), "err:", errN, "- proceeding anyway...")
 				} else if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 					nlog.Infoln("done", xblob.String(), "->", lom.Cname(), ctx.Size)
 				}
@@ -329,7 +330,8 @@ func (*s3bp) listInventory(cloudBck *cmn.Bck, ctx *core.LsoInvCtx, msg *apc.LsoM
 
 		// prefix
 		if msg.IsFlagSet(apc.LsNoRecursion) {
-			if _, errN := cmn.HandleNoRecurs(msg.Prefix, objName); errN != nil {
+			// TODO: revisit no-recurs case when returned addDirEntry = true
+			if _, errN := cmn.CheckDirNoRecurs(msg.Prefix, objName); errN != nil {
 				continue
 			}
 		} else if msg.Prefix != "" && !strings.HasPrefix(objName, msg.Prefix) {
@@ -352,11 +354,11 @@ func (*s3bp) listInventory(cloudBck *cmn.Bck, ctx *core.LsoInvCtx, msg *apc.LsoM
 				}
 			case types.InventoryOptionalFieldETag:
 				if custom != nil {
-					custom[cmn.ETag] = cmn.UnquoteCEV(line[i])
+					custom[cmn.ETag] = line[i]
 				}
 			case types.InventoryOptionalFieldLastModifiedDate:
 				if custom != nil {
-					custom[cmn.LastModified] = cmn.UnquoteCEV(line[i])
+					custom[cmn.LsoLastModified] = cmn.UnquoteCEV(line[i])
 				}
 			}
 		}

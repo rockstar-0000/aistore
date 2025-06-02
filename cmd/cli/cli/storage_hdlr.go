@@ -1,11 +1,12 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -20,9 +21,10 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/ios"
+	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 )
 
@@ -39,6 +41,16 @@ type bsummCtx struct {
 	res     cmn.AllBsummResults
 }
 
+var scrubUsage = "Check in-cluster content for misplaced objects, objects that have insufficient numbers of copies, zero size, and more\n" +
+	indent1 + "e.g.:\n" +
+	indent1 + "\t* ais storage validate \t- validate all in-cluster buckets;\n" +
+	indent1 + "\t* ais scrub \t- same as above;\n" +
+	indent1 + "\t* ais storage validate ais \t- validate (a.k.a. scrub) all ais:// buckets;\n" +
+	indent1 + "\t* ais scrub s3 \t- ditto, all s3:// buckets;\n" +
+	indent1 + "\t* ais scrub s3 --refresh 10\t- same as above while refreshing runtime counter(s) every 10s;\n" +
+	indent1 + "\t* ais scrub gs://abc/images/\t- validate part of the gcp bucket under 'images/`;\n" +
+	indent1 + "\t* ais scrub gs://abc --prefix images/\t- same as above."
+
 var (
 	mpathCmdsFlags = map[string][]cli.Flag{
 		cmdMpathAttach: {
@@ -51,38 +63,38 @@ var (
 
 	mpathCmd = cli.Command{
 		Name:   cmdMountpath,
-		Usage:  "show and attach/detach target mountpaths",
+		Usage:  "Show and attach/detach target mountpaths",
 		Action: showMpathHandler,
 		Subcommands: []cli.Command{
 			makeAlias(showCmdMpath, "", true, commandShow), // alias for `ais show`
 			{
 				Name:         cmdMpathAttach,
-				Usage:        "attach mountpath to a given target node",
+				Usage:        "Attach mountpath to a given target node",
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags[cmdMpathAttach],
+				Flags:        sortFlags(mpathCmdsFlags[cmdMpathAttach]),
 				Action:       mpathAttachHandler,
 				BashComplete: suggestTargets,
 			},
 			{
 				Name:         cmdMpathEnable,
-				Usage:        "(re)enable target's mountpath",
+				Usage:        "(Re)enable target's mountpath",
 				ArgsUsage:    nodeMountpathPairArgument,
 				Action:       mpathEnableHandler,
 				BashComplete: suggestMpathEnable,
 			},
 			{
 				Name:         cmdMpathDetach,
-				Usage:        "detach mountpath from a target node (disable and remove it from the target's volume)",
+				Usage:        "Detach mountpath from a target node (disable and remove it from the target's volume)",
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags["default"],
+				Flags:        sortFlags(mpathCmdsFlags["default"]),
 				Action:       mpathDetachHandler,
 				BashComplete: suggestMpathDetach,
 			},
 			{
 				Name:         cmdMpathDisable,
-				Usage:        "disable mountpath (deactivate but keep in a target's volume for possible future activation)",
+				Usage:        "Disable mountpath (deactivate but keep in a target's volume for possible future activation)",
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags["default"],
+				Flags:        sortFlags(mpathCmdsFlags["default"]),
 				Action:       mpathDisableHandler,
 				BashComplete: suggestMpathActive,
 			},
@@ -91,16 +103,16 @@ var (
 			//
 			{
 				Name: cmdMpathRescanDisks,
-				Usage: "re-resolve (mountpath, filesystem) to its underlying disk(s) and revalidate the disks\n" +
-					indent1 + "\t(advanced use only)",
+				Usage: "Re-resolve (mountpath, filesystem) to its underlying disk(s) and revalidate the disks\n" +
+					indent1 + "\t" + advancedUsageOnly,
 				ArgsUsage:    nodeMountpathPairArgument,
-				Flags:        mpathCmdsFlags["default"],
+				Flags:        sortFlags(mpathCmdsFlags["default"]),
 				Action:       mpathRescanHandler,
 				BashComplete: suggestMpathActive,
 			},
 			{
 				Name:         cmdMpathFshc,
-				Usage:        "run filesystem health checker (FSHC) to test selected mountpath for read and write errors",
+				Usage:        "Run filesystem health checker (FSHC) to test selected mountpath for read and write errors",
 				ArgsUsage:    nodeMountpathPairArgument,
 				Action:       mpathFshcHandler,
 				BashComplete: suggestMpathActive,
@@ -111,14 +123,16 @@ var (
 
 var (
 	cleanupFlags = []cli.Flag{
+		forceClnFlag,
+		rmZeroSizeFlag,
 		waitFlag,
 		waitJobXactFinishedFlag,
 	}
 	cleanupCmd = cli.Command{
 		Name:         cmdStgCleanup,
-		Usage:        "perform storage cleanup: remove deleted objects and old/obsolete workfiles",
-		ArgsUsage:    listAnyCommandArgument,
-		Flags:        cleanupFlags,
+		Usage:        "Remove deleted objects and old/obsolete workfiles; remove misplaced objects; optionally, remove zero size objects",
+		ArgsUsage:    lsAnyCommandArgument,
+		Flags:        sortFlags(cleanupFlags),
 		Action:       cleanupStorageHandler,
 		BashComplete: bucketCompletions(bcmplop{}),
 	}
@@ -128,7 +142,7 @@ var (
 	storageSummFlags = append(
 		longRunFlags,
 		bsummPrefixFlag,
-		listObjCachedFlag,
+		listCachedFlag,
 		unitsFlag,
 		verboseFlag,
 		dontWaitFlag,
@@ -150,10 +164,6 @@ var (
 			longRunFlags,
 			jsonFlag,
 		),
-		cmdStgValidate: append(
-			longRunFlags,
-			waitJobXactFinishedFlag,
-		),
 	}
 
 	//
@@ -161,43 +171,44 @@ var (
 	//
 	showCmdDisk = cli.Command{
 		Name:         cmdShowDisk,
-		Usage:        "show disk utilization and read/write statistics",
+		Usage:        "Show disk utilization and read/write statistics",
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        storageFlags[cmdShowDisk],
+		Flags:        sortFlags(storageFlags[cmdShowDisk]),
 		Action:       showDisksHandler,
 		BashComplete: suggestTargets,
 	}
 	showCmdStgSummary = cli.Command{
 		Name:         cmdSummary,
-		Usage:        "show bucket sizes and %% of used capacity on a per-bucket basis",
-		ArgsUsage:    listAnyCommandArgument,
-		Flags:        storageSummFlags,
+		Usage:        "Show bucket sizes and %% of used capacity on a per-bucket basis",
+		ArgsUsage:    lsAnyCommandArgument,
+		Flags:        sortFlags(storageSummFlags),
 		Action:       summaryStorageHandler,
+		BashComplete: bucketCompletions(bcmplop{}),
+	}
+	scrubCmd = cli.Command{
+		Name:         cmdScrub,
+		Usage:        scrubUsage,
+		ArgsUsage:    lsAnyCommandArgument,
+		Flags:        sortFlags(scrubFlags),
+		Action:       scrubHandler,
 		BashComplete: bucketCompletions(bcmplop{}),
 	}
 	showCmdMpath = cli.Command{
 		Name:         cmdMountpath,
-		Usage:        "show target mountpaths",
+		Usage:        "Show target mountpaths",
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        storageFlags[cmdMountpath],
+		Flags:        sortFlags(storageFlags[cmdMountpath]),
 		Action:       showMpathHandler,
 		BashComplete: suggestTargets,
 	}
 
 	storageCmd = cli.Command{
 		Name:  commandStorage,
-		Usage: "monitor and manage clustered storage",
+		Usage: "Monitor and manage clustered storage",
 		Subcommands: []cli.Command{
 			makeAlias(showCmdStorage, "", true, commandShow), // alias for `ais show`
 			showCmdStgSummary,
-			{
-				Name:         cmdStgValidate,
-				Usage:        "check buckets for misplaced objects and objects that have insufficient numbers of copies or EC slices",
-				ArgsUsage:    listAnyCommandArgument,
-				Flags:        storageFlags[cmdStgValidate],
-				Action:       showMisplacedAndMore,
-				BashComplete: bucketCompletions(bcmplop{}),
-			},
+			scrubCmd,
 			mpathCmd,
 			showCmdDisk,
 			cleanupCmd,
@@ -210,38 +221,46 @@ func showStorageHandler(c *cli.Context) (err error) {
 }
 
 //
-// cleanup
+// cleanup space: remove deleted, misplaced
 //
 
-func cleanupStorageHandler(c *cli.Context) (err error) {
-	var (
-		bck cmn.Bck
-		id  string
-	)
+func cleanupStorageHandler(c *cli.Context) error {
+	var bck cmn.Bck
 	if c.NArg() != 0 {
+		var err error
 		bck, err = parseBckURI(c, c.Args().Get(0), false)
 		if err != nil {
-			return
+			return err
 		}
 		if _, err = headBucket(bck, true /* don't add */); err != nil {
-			return
+			return err
 		}
 	}
-	xargs := xact.ArgsMsg{Kind: apc.ActStoreCleanup, Bck: bck}
-	if id, err = api.StartXaction(apiBP, &xargs, ""); err != nil {
-		return
+
+	// xargs
+	force := flagIsSet(c, forceClnFlag)
+	xargs := xact.ArgsMsg{Kind: apc.ActStoreCleanup, Bck: bck, Force: force}
+	if flagIsSet(c, rmZeroSizeFlag) {
+		xargs.Flags = xact.XrmZeroSize
 	}
-	xargs.ID = id
+
+	// do
+	xid, err := xstart(c, &xargs, "")
+	if err != nil {
+		return err
+	}
+
+	xargs.ID = xid
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
-		if id != "" {
+		if xid != "" {
 			actionX(c, &xargs, "")
 		} else {
 			fmt.Fprintf(c.App.Writer, "Started storage cleanup\n")
 		}
-		return
+		return nil
 	}
 
-	fmt.Fprintf(c.App.Writer, "Started storage cleanup %s...\n", id)
+	fmt.Fprintf(c.App.Writer, "Started storage cleanup %s...\n", xid)
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		xargs.Timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
@@ -331,9 +350,9 @@ func showDiskStats(c *cli.Context, tid string) error {
 			tally.Stat.Wavg += ds.Stat.Wavg
 			tally.Stat.Util += ds.Stat.Util
 		}
-		tally.Stat.Ravg = cos.DivRound(tally.Stat.Ravg, l)
-		tally.Stat.Wavg = cos.DivRound(tally.Stat.Wavg, l)
-		tally.Stat.Util = cos.DivRound(tally.Stat.Util, l)
+		tally.Stat.Ravg = cos.DivRoundI64(tally.Stat.Ravg, l)
+		tally.Stat.Wavg = cos.DivRoundI64(tally.Stat.Wavg, l)
+		tally.Stat.Util = cos.DivRoundI64(tally.Stat.Util, l)
 
 		dsh = append(dsh, &tally)
 	}
@@ -349,17 +368,27 @@ func showDiskStats(c *cli.Context, tid string) error {
 // - currently, only in-cluster buckets - TODO
 
 func summaryStorageHandler(c *cli.Context) error {
-	uri := c.Args().Get(0)
-	qbck, errV := parseQueryBckURI(c, uri)
+	uri := preparseBckObjURI(c.Args().Get(0))
+	qbck, pref, errV := parseQueryBckURI(uri)
 	if errV != nil {
 		return errV
 	}
-	var (
-		prefix     = parseStrFlag(c, bsummPrefixFlag)
-		objCached  = flagIsSet(c, listObjCachedFlag)
-		bckPresent = true // currently, only in-cluster buckets
-	)
-	ctx, err := newBsummCtxMsg(c, qbck, prefix, objCached, bckPresent)
+
+	// embedded prefix vs '--prefix'
+	prefix := parseStrFlag(c, bsummPrefixFlag)
+	switch {
+	case pref != "" && prefix != "":
+		s := fmt.Sprintf(": via '%s' and %s option", uri, qflprn(bsummPrefixFlag))
+		if pref != prefix {
+			return errors.New("two different prefix values" + s)
+		}
+		actionWarn(c, "redundant and duplicated prefix assignment"+s)
+	case pref != "":
+		prefix = pref
+	}
+
+	bckPresent := true // TODO: currently, only in-cluster buckets
+	ctx, err := newBsummCtxMsg(c, qbck, prefix, flagIsSet(c, listCachedFlag), bckPresent)
 	if err != nil {
 		return err
 	}
@@ -478,7 +507,7 @@ func (ctx *bsummCtx) progress(summaries *cmn.AllBsummResults, done bool) {
 		}
 		if res.Bck.IsAIS() {
 			debug.Assert(res.ObjCount.Remote == 0 && res.ObjCount.Present != 0)
-			s += fmt.Sprintf("(%s, size=%s)", cos.FormatBigNum(int(res.ObjCount.Present)),
+			s += fmt.Sprintf("(%s, size=%s)", cos.FormatBigI64(int64(res.ObjCount.Present)),
 				teb.FmtSize(int64(res.TotalSize.PresentObjs), ctx.units, 2))
 			goto emit
 		}
@@ -488,13 +517,13 @@ func (ctx *bsummCtx) progress(summaries *cmn.AllBsummResults, done bool) {
 			s += "[cluster: none"
 		} else {
 			s += fmt.Sprintf("[cluster: (%s, size=%s)",
-				cos.FormatBigNum(int(res.ObjCount.Present)), teb.FmtSize(int64(res.TotalSize.PresentObjs), ctx.units, 2))
+				cos.FormatBigI64(int64(res.ObjCount.Present)), teb.FmtSize(int64(res.TotalSize.PresentObjs), ctx.units, 2))
 		}
 		if res.ObjCount.Remote == 0 {
 			s += "]"
 		} else {
 			s += fmt.Sprintf(", remote: (%s, size=%s)]",
-				cos.FormatBigNum(int(res.ObjCount.Remote)), teb.FmtSize(int64(res.TotalSize.RemoteObjs), ctx.units, 2))
+				cos.FormatBigI64(int64(res.ObjCount.Remote)), teb.FmtSize(int64(res.TotalSize.RemoteObjs), ctx.units, 2))
 		}
 		s += ", " + teb.FmtDuration(elapsed, ctx.units)
 
@@ -518,6 +547,13 @@ func (ctx *bsummCtx) progress(summaries *cmn.AllBsummResults, done bool) {
 //
 
 func showMpathHandler(c *cli.Context) error {
+	type (
+		targetMpath struct {
+			DaemonID string
+			Mpl      *apc.MountpathList
+			Tcdf     fs.Tcdf
+		}
+	)
 	var (
 		nodes           []*meta.Snode
 		tsi, sname, err = arg0Node(c)
@@ -603,7 +639,10 @@ func mpathAction(c *cli.Context, action string) error {
 	kvs, err := makePairs(c.Args())
 	if err != nil {
 		// check whether user typed target ID with no mountpath
-		first, tail, nodeID := c.Args().Get(0), c.Args().Tail(), ""
+		var (
+			nodeID      string
+			first, tail = c.Args().Get(0), c.Args().Tail()
+		)
 		if len(tail) == 0 {
 			nodeID = first
 		} else {
@@ -634,7 +673,7 @@ func mpathAction(c *cli.Context, action string) error {
 		case apc.ActMountpathAttach:
 			acted = "attached"
 			label := parseStrFlag(c, mountpathLabelFlag)
-			err = api.AttachMountpath(apiBP, si, mountpath, ios.Label(label))
+			err = api.AttachMountpath(apiBP, si, mountpath, cos.MountpathLabel(label))
 		case apc.ActMountpathEnable:
 			acted = "enabled"
 			err = api.EnableMountpath(apiBP, si, mountpath)

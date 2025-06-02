@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -17,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/tools"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -56,7 +57,7 @@ func newDiscoverServerPrimary() *proxy {
 	config.Timeout.MaxKeepalive = cos.Duration(4 * time.Second)
 	config.Client.Timeout = cos.Duration(10 * time.Second)
 	config.Client.TimeoutLong = cos.Duration(10 * time.Second)
-	config.Cksum.Type = cos.ChecksumXXHash
+	config.Cksum.Type = cos.ChecksumCesXxh
 	cmn.GCO.CommitUpdate(config)
 
 	p.owner.smap = newSmapOwner(config)

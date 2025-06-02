@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -96,11 +96,13 @@ func (task *singleTask) download(lom *core.LOM) {
 
 	g.store.incFinished(task.jobID())
 
-	g.tstats.AddMany(
-		cos.NamedVal64{Name: stats.DownloadSize, Value: task.currentSize.Load()},
-		cos.NamedVal64{Name: stats.DownloadLatency, Value: int64(task.ended.Load().Sub(task.started.Load()))},
+	vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
+	lsize := task.currentSize.Load()
+	core.T.StatsUpdater().AddWith(
+		cos.NamedVal64{Name: stats.DloadSize, Value: lsize, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.DloadLatencyTotal, Value: int64(task.ended.Load().Sub(task.started.Load())), VarLabs: vlabs},
 	)
-	task.xdl.ObjsAdd(1, task.currentSize.Load())
+	task.xdl.ObjsAdd(1, lsize)
 }
 
 func (task *singleTask) _dlocal(lom *core.LOM, timeout time.Duration) (bool /*err is fatal*/, error) {
@@ -219,7 +221,7 @@ func (task *singleTask) downloadRemote(lom *core.LOM) error {
 	task.getCtx = ctx
 
 	// Do final GET (prefetch) request.
-	_, err := core.T.GetCold(ctx, lom, cmn.OwtGetTryLock)
+	_, err := core.T.GetCold(ctx, lom, task.xdl.Kind(), cmn.OwtGetTryLock)
 	return err
 }
 
@@ -249,7 +251,7 @@ func (task *singleTask) wrapReader(r io.ReadCloser) io.ReadCloser {
 // Probably we need to extend the persistent database (db.go) so that it will contain
 // also information about specific tasks.
 func (task *singleTask) markFailed(statusMsg string) {
-	g.tstats.IncErr(stats.ErrDownloadCount)
+	core.T.StatsUpdater().Inc(stats.ErrDloadCount)
 	g.store.persistError(task.jobID(), task.obj.objName, statusMsg)
 	g.store.incErrorCnt(task.jobID())
 }

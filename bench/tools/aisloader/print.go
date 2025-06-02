@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -19,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -218,6 +219,7 @@ func fprintf(w io.Writer, format string, a ...any) {
 	debug.AssertNoErr(err)
 }
 
+//nolint:dupl // format PUT and GET stats: minor field differences justify seemingly duplicated code blocks
 func writeHumanReadibleIntervalStats(to io.Writer, s, t *sts) {
 	p := fprintf
 	pn := prettyNumber
@@ -300,7 +302,7 @@ func writeHumanReadibleFinalStats(to io.Writer, t *sts) {
 	}
 }
 
-// writeStatus writes stats to the writter.
+// writeStatus writes stats to the specified io.Writer.
 // if final = true, writes the total; otherwise writes the interval stats
 func writeStats(to io.Writer, jsonFormat, final bool, s, t *sts) {
 	if final {
@@ -318,19 +320,19 @@ func printRunParams(p *params) {
 		d = "-"
 	}
 	b, err := jsoniter.MarshalIndent(struct {
-		Seed          int64  `json:"seed,string"`
+		StatsInterval string `json:"stats interval"`
 		URL           string `json:"proxy"`
 		Bucket        string `json:"bucket"`
 		Provider      string `json:"provider"`
 		Namespace     string `json:"namespace"`
 		Duration      string `json:"duration"`
+		Backing       string `json:"backed by"`
 		MaxPutBytes   int64  `json:"PUT upper bound,string"`
-		PutPct        int    `json:"% PUT"`
 		MinSize       int64  `json:"minimum object size (bytes)"`
 		MaxSize       int64  `json:"maximum object size (bytes)"`
 		NumWorkers    int    `json:"# workers"`
-		StatsInterval string `json:"stats interval"`
-		Backing       string `json:"backed by"`
+		PutPct        int    `json:"% PUT"`
+		Seed          int64  `json:"seed,string"`
 		Cleanup       bool   `json:"cleanup"`
 	}{
 		Seed:          p.seed,

@@ -1,12 +1,13 @@
 // Package test provides tests for common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tests_test
 
 import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -140,11 +141,13 @@ var _ = Describe("API", func() {
 						Enabled: apc.Ptr(false),
 					},
 					EC: &cmn.ECConfToSet{
+						XactConfToSet: cmn.XactConfToSet{
+							Compression: apc.Ptr(apc.CompressNever),
+						},
 						Enabled:      apc.Ptr(true),
 						ObjSizeLimit: apc.Ptr[int64](1024),
 						DataSlices:   apc.Ptr(1024),
 						ParitySlices: apc.Ptr(1024),
-						Compression:  apc.Ptr("false"),
 					},
 					Access: apc.Ptr[apc.AccessAttrs](1024),
 					WritePolicy: &cmn.WritePolicyConfToSet{
@@ -169,11 +172,13 @@ var _ = Describe("API", func() {
 						Enabled: false,
 					},
 					EC: cmn.ECConf{
+						XactConf: cmn.XactConf{
+							Compression: apc.CompressNever,
+						},
 						Enabled:      true,
 						ObjSizeLimit: 1024,
 						DataSlices:   1024,
 						ParitySlices: 1024,
-						Compression:  "false",
 					},
 					Access: 1024,
 					WritePolicy: cmn.WritePolicyConf{

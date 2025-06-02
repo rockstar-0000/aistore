@@ -208,7 +208,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	for i := range objCount {
 		objName := fmt.Sprintf("%sobj%04d", objPath, i)
-		r, _ := readers.NewRand(int64(fileSize), cos.ChecksumXXHash)
+		r, _ := readers.NewRand(int64(fileSize), cos.ChecksumCesXxh)
 		_, err := api.PutObject(&api.PutArgs{
 			BaseParams: baseParams,
 			Bck:        bck,
@@ -261,8 +261,8 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 
 	// If any node is in maintenance cancel the state
 	var dcm *meta.Snode
-	for _, node := range smap.Tmap {
-		if smap.InMaintOrDecomm(node) {
+	for tid, node := range smap.Tmap {
+		if smap.InMaintOrDecomm(tid) {
 			dcm = node
 			break
 		}
@@ -501,8 +501,9 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 				tlog.Logf("%v\n", status)
 				break
 			}
-			herr := cmn.Err2HTTPErr(err)
-			tassert.Errorf(t, herr.Status == http.StatusNotFound, "expecting not found, got %+v", herr)
+			if herr := cmn.Err2HTTPErr(err); herr != nil {
+				tassert.Errorf(t, herr.Status == http.StatusNotFound, "expecting not found, got %+v", herr)
+			}
 			time.Sleep(time.Second)
 		}
 	}

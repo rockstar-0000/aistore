@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,62 +28,68 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 // TODO:
-// - enable multi-threaded list-range iter (see lrit.init)
+// - multi-worker list-range iter (see lrit.init)
 // - one source multiple destination buckets (feature)
 
 type (
 	archFactory struct {
 		streamingF
 	}
-	archwi struct { // archival work item; implements lrwi
-		j       *jogger
-		writer  archive.Writer
-		r       *XactArch
-		msg     *cmn.ArchiveBckMsg
-		tsi     *meta.Snode
-		archlom *core.LOM
-		fqn     string        // workFQN --/--
-		wfh     cos.LomWriter // -> workFQN
-		cksum   cos.CksumHashSize
-		cnt     atomic.Int32 // num archived
-		// tar only
-		appendPos int64 // append to existing
+	// archival work item; implements lrwi
+	archwi struct {
+		wfh       cos.LomWriter // -> workFQN
+		writer    archive.Writer
+		r         *XactArch
+		msg       *cmn.ArchiveBckMsg
+		tsi       *meta.Snode
+		archlom   *core.LOM
+		j         *jogger
+		fqn       string // workFQN --/--
+		cksum     cos.CksumHashSize
+		appendPos int64 // append to existing (tar only)
 		tarFormat tar.Format
-		// finishing
-		refc atomic.Int32
+		cnt       atomic.Int32 // num archived
+		refc      atomic.Int32 // finishing
 	}
 	archtask struct {
 		wi   *archwi
 		lrit *lrit
 	}
 	jogger struct {
-		mpath  *fs.Mountpath
-		workCh chan *archtask
-		stopCh cos.StopCh
+		r        *XactArch
+		mi       *fs.Mountpath
+		workCh   chan *archtask
+		chanFull cos.ChanFull
 	}
+)
+
+type (
 	XactArch struct {
-		streamingX
 		bckTo   *meta.Bck
+		smap    *meta.Smap
 		joggers struct {
-			wg sync.WaitGroup
-			m  map[string]*jogger
-			sync.RWMutex
+			m   map[string]*jogger
+			wg  sync.WaitGroup
+			mtx sync.RWMutex
 		}
 		pending struct {
-			m map[string]*archwi
-			sync.RWMutex
+			m   map[string]*archwi
+			mtx sync.Mutex
 		}
+		streamingX
 	}
 )
 
 // interface guard
 var (
 	_ core.Xact      = (*XactArch)(nil)
+	_ lrxact         = (*XactArch)(nil)
 	_ xreg.Renewable = (*archFactory)(nil)
 	_ lrwi           = (*archwi)(nil)
 )
@@ -109,33 +116,43 @@ func (p *archFactory) Start() (err error) {
 	if err != nil {
 		return err
 	}
-	//
-	// new x-archive
-	//
-	r := &XactArch{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}}
-	r.pending.m = make(map[string]*archwi, maxNumInParallel)
-	avail := fs.GetAvail()
-	r.joggers.m = make(map[string]*jogger, len(avail))
-	p.xctn = r
-	r.DemandBase.Init(p.UUID() /*== p.Args.UUID above*/, p.kind, p.Bck /*from*/, xact.IdleDefault)
 
-	if err := p.newDM(p.Args.UUID /*trname*/, r.recv, r.config, cmn.OwtPut, 0 /*pdu*/); err != nil {
+	// new x-archive
+	var (
+		config = cmn.GCO.Get()
+		burst  = max(minArchWorkChSize, config.Arch.Burst)
+		r      = &XactArch{streamingX: streamingX{p: &p.streamingF, config: config}}
+	)
+	r.pending.m = make(map[string]*archwi, burst)
+
+	r.joggers.m = make(map[string]*jogger, fs.NumAvail())
+	r.smap = core.T.Sowner().Get()
+	p.xctn = r
+
+	// delay ctlmsg until DoMsg()
+	r.DemandBase.Init(p.UUID(), p.kind, "" /*ctlmsg*/, p.Bck /*from*/, xact.IdleDefault)
+
+	dmxtra := bundle.Extra{
+		RecvAck:     nil, // no ACKs
+		Config:      r.config,
+		Compression: r.config.Arch.Compression,
+		Multiplier:  r.config.Arch.SbundleMult,
+		SizePDU:     0,
+	}
+	if err := p.newDM(p.Args.UUID /*trname*/, r.recv, r.smap, dmxtra, cmn.OwtPut); err != nil {
 		return err
 	}
-	if r.p.dm != nil {
-		r.p.dm.SetXact(r)
-		r.p.dm.Open()
-	}
+
 	xact.GoRunW(r)
-	return
+	return nil
 }
 
 //////////////
 // XactArch //
 //////////////
 
-func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) {
-	if err = archlom.InitBck(&msg.ToBck); err != nil {
+func (r *XactArch) BeginMsg(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) {
+	if err := archlom.InitBck(&msg.ToBck); err != nil {
 		r.AddErr(err, 4, cos.SmoduleXs)
 		return err
 	}
@@ -146,37 +163,44 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) 
 	wi.cksum.Init(archlom.CksumType())
 
 	// here and elsewhere: an extra check to make sure this target is active (ref: ignoreMaintenance)
-	smap := core.T.Sowner().Get()
-	if err = core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
+	if err := core.InMaintOrDecomm(r.smap, core.T.Snode(), r); err != nil {
 		return err
 	}
-	nat := smap.CountActiveTs()
+	nat := r.smap.CountActiveTs()
 	wi.refc.Store(int32(nat - 1))
 
-	wi.tsi, err = smap.HrwName2T(msg.ToBck.MakeUname(msg.ArchName))
+	wi.tsi, err = r.smap.HrwName2T(msg.ToBck.MakeUname(msg.ArchName))
 	if err != nil {
 		r.AddErr(err, 4, cos.SmoduleXs)
 		return err
 	}
 
-	// bind a new/existing jogger to this archwi based on archlom's mountpath
-	var exists bool
-	mpath := archlom.Mountpath()
-	r.joggers.Lock()
-	if wi.j, exists = r.joggers.m[mpath.Path]; !exists {
-		r.joggers.m[mpath.Path] = &jogger{
-			mpath:  mpath,
-			workCh: make(chan *archtask, maxNumInParallel*2),
+	// set archwi jogger based on the archlom's mountpath
+	var (
+		burst = max(minArchWorkChSize, r.config.Arch.Burst)
+		mi    = archlom.Mountpath()
+	)
+	r.joggers.mtx.Lock()
+	if j, ok := r.joggers.m[mi.Path]; ok {
+		wi.j = j
+	} else {
+		// [on demand] create and run just once for this job
+		j = &jogger{
+			r:      r,
+			mi:     mi,
+			workCh: make(chan *archtask, burst),
 		}
-		wi.j = r.joggers.m[mpath.Path]
-		wi.j.stopCh.Init()
+		r.joggers.m[mi.Path] = j
+		wi.j = j
+
+		// and run this one right away
 		r.joggers.wg.Add(1)
-		go func() {
-			wi.j.run()
-			r.joggers.wg.Done()
-		}()
+		go func(j *jogger, wg *sync.WaitGroup) {
+			j.run()
+			wg.Done()
+		}(j, &r.joggers.wg)
 	}
-	r.joggers.Unlock()
+	r.joggers.mtx.Unlock()
 
 	// fcreate at BEGIN time
 	if core.T.SID() == wi.tsi.ID() {
@@ -225,40 +249,78 @@ func (r *XactArch) Begin(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) 
 		}
 	}
 
-	r.pending.Lock()
+	r.pending.mtx.Lock()
 	r.pending.m[msg.TxnUUID] = wi
 	r.wiCnt.Inc()
-	r.pending.Unlock()
+	r.pending.mtx.Unlock()
 	return nil
 }
 
-func (r *XactArch) Do(msg *cmn.ArchiveBckMsg) {
+func (r *XactArch) DoMsg(msg *cmn.ArchiveBckMsg) {
 	r.IncPending()
-	r.pending.RLock()
+	r.pending.mtx.Lock()
 	wi, ok := r.pending.m[msg.TxnUUID]
-	r.pending.RUnlock()
-	if !ok {
+	r.pending.mtx.Unlock()
+	if !ok || wi == nil {
+		// NOTE: unexpected and unlikely - aborting
 		debug.Assert(r.ErrCnt() > 0) // see cleanup
 		r.Abort(r.Err())
 		r.DecPending()
 		r.cleanup()
+		return
 	}
-	var lrit = &lrit{}
 
-	// lrpWorkersNone since we need a single writer to serialize adding files
-	// into an eventual `archlom`
-	err := lrit.init(r, &msg.ListRange, r.Bck(), lrpWorkersNone)
+	var (
+		lsflags uint64
+		lrit    = &lrit{}
+	)
+	if msg.NonRecurs {
+		lsflags = apc.LsNoRecursion
+	}
+
+	// `nwpNone` since we need a single writer to serialize adding files into an eventual `archlom`
+	err := lrit.init(r, &msg.ListRange, r.Bck(), lsflags, nwpNone, r.config.Arch.Burst)
 	if err != nil {
 		r.Abort(err)
 		r.DecPending()
 		r.cleanup()
+		return
+	}
+
+	// dynamic ctlmsg // TODO: ref
+	{
+		var sb strings.Builder
+		sb.Grow(80)
+		sb.WriteString(r.Bck().Cname(""))
+		if r.bckTo != nil && !r.bckTo.IsEmpty() {
+			sb.WriteString("=>")
+			sb.WriteString(r.bckTo.Cname(""))
+		}
+		sb.WriteByte(' ')
+		msg.ListRange.Str(&sb, lrit.lrp == lrpPrefix)
+		if msg.BaseNameOnly {
+			sb.WriteString(", basename-only")
+		}
+		if msg.InclSrcBname {
+			sb.WriteString(", incl-src-basename")
+		}
+		if msg.AppendIfExists {
+			sb.WriteString(", append-iff")
+		}
+
+		r.Base.SetCtlMsg(sb.String())
 	}
 
 	if r.IsAborted() {
 		return
 	}
-	wi.j.workCh <- &archtask{wi, lrit}
-	if r.Err() != nil {
+
+	j := wi.j
+	l, c := len(j.workCh), cap(j.workCh)
+	j.chanFull.Check(l, c)
+
+	j.workCh <- &archtask{wi, lrit}
+	if r.ErrCnt() > 0 {
 		wi.cleanup()
 		r.Abort(r.Err())
 		r.cleanup()
@@ -268,6 +330,7 @@ func (r *XactArch) Do(msg *cmn.ArchiveBckMsg) {
 func (r *XactArch) Run(wg *sync.WaitGroup) {
 	nlog.Infoln(r.Name())
 	wg.Done()
+
 	select {
 	case <-r.IdleTimer():
 		r.cleanup()
@@ -278,24 +341,18 @@ func (r *XactArch) Run(wg *sync.WaitGroup) {
 
 func (r *XactArch) cleanup() {
 	r.streamingX.fin(true /*unreg Rx*/)
-	if r.Err() == nil {
+	if r.ErrCnt() == 0 {
 		return
 	}
 
 	// [cleanup] close and rm unfinished archives (compare w/ finalize)
-	r.pending.Lock()
+	r.pending.mtx.Lock()
 	for _, wi := range r.pending.m {
 		wi.cleanup()
 	}
 	clear(r.pending.m)
-	r.pending.Unlock()
+	r.pending.mtx.Unlock()
 
-	r.joggers.Lock()
-	for _, jogger := range r.joggers.m {
-		jogger.stopCh.Close()
-	}
-	clear(r.joggers.m)
-	r.joggers.Unlock()
 	r.joggers.wg.Wait()
 }
 
@@ -327,21 +384,24 @@ func (r *XactArch) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) e
 }
 
 func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
-	r.pending.RLock()
+	r.pending.mtx.Lock()
 	wi, ok := r.pending.m[cos.UnsafeS(hdr.Opaque)] // txnUUID
-	r.pending.RUnlock()
+	r.pending.mtx.Unlock()
 	if !ok {
 		if r.Finished() || r.IsAborted() {
 			return nil
 		}
 		cnt, err := r.JoinErr()
-		debug.Assert(cnt > 0) // see cleanup
+		if cnt == 0 { // see cleanup
+			err = fmt.Errorf("%s: recv: failed to begin(?)", r.Name())
+			nlog.Errorln(err)
+		}
 		return err
 	}
 	debug.Assert(wi.tsi.ID() == core.T.SID() && wi.msg.TxnUUID == cos.UnsafeS(hdr.Opaque))
 
 	// NOTE: best-effort via ref-counting
-	if hdr.Opcode == opcodeDone {
+	if hdr.Opcode == opDone {
 		refc := wi.refc.Dec()
 		debug.Assert(refc >= 0)
 		return nil
@@ -365,10 +425,10 @@ func (r *XactArch) finalize(wi *archwi) {
 		r.AddErr(err, 4, cos.SmoduleXs)
 	}
 
-	r.pending.Lock()
+	r.pending.mtx.Lock()
 	delete(r.pending.m, wi.msg.TxnUUID)
 	r.wiCnt.Dec()
-	r.pending.Unlock()
+	r.pending.mtx.Unlock()
 
 	ecode, err := r._fini(wi)
 	r.DecPending()
@@ -394,7 +454,7 @@ func (r *XactArch) _fini(wi *archwi) (ecode int, err error) {
 	if r.IsAborted() {
 		wi.cleanup()
 		core.FreeLOM(wi.archlom)
-		return
+		return 0, nil
 	}
 
 	var size int64
@@ -414,8 +474,7 @@ func (r *XactArch) _fini(wi *archwi) (ecode int, err error) {
 	if err != nil {
 		wi.cleanup()
 		core.FreeLOM(wi.archlom)
-		ecode = http.StatusInternalServerError
-		return
+		return http.StatusInternalServerError, err
 	}
 	debug.Assert(wi.wfh == nil)
 
@@ -424,7 +483,7 @@ func (r *XactArch) _fini(wi *archwi) (ecode int, err error) {
 	core.FreeLOM(wi.archlom)
 	r.ObjsAdd(1, size-wi.appendPos)
 
-	return
+	return ecode, err
 }
 
 func (r *XactArch) Name() (s string) {
@@ -450,9 +509,20 @@ func (r *XactArch) FromTo() (src, dst *meta.Bck) {
 	return
 }
 
+func (r *XactArch) chanFullTotal() (n int64) {
+	r.joggers.mtx.Lock()
+	for _, j := range r.joggers.m {
+		n += j.chanFull.Load()
+	}
+	r.joggers.mtx.Unlock()
+	return n
+}
+
 func (r *XactArch) Snap() (snap *core.Snap) {
 	snap = &core.Snap{}
 	r.ToSnap(snap)
+
+	snap.Pack(len(r.joggers.m), 0 /*currently, always zero*/, r.chanFullTotal())
 
 	snap.IdleX = r.IsIdle()
 	if f, t := r.FromTo(); f != nil {
@@ -466,32 +536,45 @@ func (r *XactArch) Snap() (snap *core.Snap) {
 ////////////
 
 func (j *jogger) run() {
-	nlog.Infoln("jogger started in mount path", j.mpath)
+	nlog.Infoln("start jogger", j.r.Name(), j.mi)
+outer:
 	for {
 		select {
-		case archtask := <-j.workCh:
-			lrit, wi := archtask.lrit, archtask.wi
-			smap := core.T.Sowner().Get()
-			err := lrit.run(wi, smap)
-			if err != nil {
-				wi.r.AddErr(err)
+		case archtask, ok := <-j.workCh:
+			if !ok {
+				break outer
 			}
-			lrit.wait()
-			if core.T.SID() == wi.tsi.ID() {
-				go wi.r.finalize(wi) // async finalize this shard
-			} else {
-				wi.r.sendTerm(wi.msg.TxnUUID, wi.tsi, nil)
-				wi.r.pending.Lock()
-				delete(wi.r.pending.m, wi.msg.TxnUUID)
-				wi.r.wiCnt.Dec()
-				wi.r.pending.Unlock()
-				wi.r.DecPending()
-
-				core.FreeLOM(wi.archlom)
-			}
-		case <-j.stopCh.Listen():
-			return
+			j.do(archtask)
+		case <-j.r.ChanAbort():
+			break outer
 		}
+	}
+	nlog.Infoln("stop jogger", j.r.Name(), j.mi)
+}
+
+func (j *jogger) do(archtask *archtask) {
+	var (
+		r        = j.r
+		lrit, wi = archtask.lrit, archtask.wi
+	)
+	debug.Assert(r == wi.r)
+	if err := lrit.run(wi, j.r.smap, false /*prealloc buf*/); err != nil {
+		wi.r.AddErr(err)
+	}
+
+	lrit.wait()
+
+	if core.T.SID() == wi.tsi.ID() {
+		go wi.r.finalize(wi) // TODO -- FIXME: async finalize this shard vs stopping
+	} else {
+		wi.r.sendTerm(wi.msg.TxnUUID, wi.tsi, nil)
+		wi.r.pending.mtx.Lock()
+		delete(wi.r.pending.m, wi.msg.TxnUUID)
+		wi.r.wiCnt.Dec()
+		wi.r.pending.mtx.Unlock()
+		wi.r.DecPending()
+
+		core.FreeLOM(wi.archlom)
 	}
 }
 
@@ -543,7 +626,7 @@ func (wi *archwi) openTarForAppend() (err error) {
 }
 
 // multi-object iterator i/f: "handle work item"
-func (wi *archwi) do(lom *core.LOM, lrit *lrit) {
+func (wi *archwi) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	var coldGet bool
 	if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
 		if !cos.IsNotExist(err, 0) {
@@ -561,7 +644,7 @@ func (wi *archwi) do(lom *core.LOM, lrit *lrit) {
 
 	if coldGet {
 		// cold
-		if ecode, err := core.T.GetCold(context.Background(), lom, cmn.OwtGetLock); err != nil {
+		if ecode, err := core.T.GetCold(context.Background(), lom, wi.r.Kind(), cmn.OwtGetLock); err != nil {
 			if lrit.lrp != lrpList && cos.IsNotExist(err, ecode) {
 				return // range or prefix, not found
 			}
@@ -579,7 +662,13 @@ func (wi *archwi) do(lom *core.LOM, lrit *lrit) {
 		wi.r.doSend(lom, wi, fh)
 		return
 	}
-	debug.Assert(wi.wfh != nil) // see Begin
+	// see Begin
+	if wi.wfh == nil {
+		// NOTE: unexpected and unlikely - aborting
+		err = fmt.Errorf("%s: destination %q does not exist (not open)", wi.r.Name(), wi.fqn)
+		wi.r.Abort(err)
+		return
+	}
 	err = wi.writer.Write(wi.nameInArch(lom.ObjName), lom, fh /*reader*/)
 	cos.Close(fh)
 	if err == nil {

@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror_test
 
@@ -16,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/tools/readers"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -47,7 +48,7 @@ var _ = Describe("Mirror", func() {
 
 	var (
 		props = &cmn.Bprops{
-			Cksum:  cmn.CksumConf{Type: cos.ChecksumXXHash},
+			Cksum:  cmn.CksumConf{Type: cos.ChecksumCesXxh},
 			LRU:    cmn.LRUConf{Enabled: true},
 			Mirror: cmn.MirrorConf{Enabled: true, Copies: 2},
 			BID:    1,

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -25,31 +26,31 @@ import (
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tarch"
 	"github.com/NVIDIA/aistore/tools/tassert"
-	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
 )
 
-func runIshardTest(t *testing.T, cfg *config.Config, baseParams api.BaseParams, numRecords, numExtensions int, fileSize int64, sampleKeyPattern config.SampleKeyPattern, randomize, dropout bool) {
+func runIshardTest(t *testing.T, cfg *config.Config, baseParams api.BaseParams, numRecords, numExtensions int,
+	fileSize int64, sampleKeyPattern config.SampleKeyPattern, randomize bool) {
 	tools.CreateBucket(t, cfg.URL, cfg.SrcBck, nil, true /*cleanup*/)
 	tools.CreateBucket(t, cfg.URL, cfg.DstBck, nil, true /*cleanup*/)
 
-	var extensions []string
+	extensions := make([]string, 0, numExtensions)
 	for range numExtensions {
 		extensions = append(extensions, "."+trand.String(3))
 	}
 
-	totalSize, err := generateNestedStructure(baseParams, cfg.SrcBck, numRecords, "", extensions, fileSize, randomize, dropout)
+	totalSize, err := generateNestedStructure(baseParams, cfg.SrcBck, numRecords, "", extensions, fileSize, randomize, false)
 	tassert.CheckFatal(t, err)
 
 	isharder, err := ishard.NewISharder(cfg)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("starting ishard, from %s to %s\n", cfg.SrcBck, cfg.DstBck)
+	fmt.Printf("starting ishard, from %s to %s\n", cfg.SrcBck.String(), cfg.DstBck.String())
 
 	err = isharder.Start()
 	tassert.CheckFatal(t, err)
 
-	checkOutputShards(t, baseParams, cfg.DstBck, numRecords*numExtensions, totalSize, sampleKeyPattern, dropout)
+	checkOutputShards(t, baseParams, cfg.DstBck, numRecords*numExtensions, totalSize, sampleKeyPattern, false)
 }
 
 func TestIshardNoRecordsSplit(t *testing.T) {
@@ -96,7 +97,7 @@ func TestIshardNoRecordsSplit(t *testing.T) {
 				tc.numRecords /= 10
 			}
 
-			runIshardTest(t, cfg, baseParams, tc.numRecords, tc.numExtensions, tc.fileSize, config.BaseFileNamePattern, false /*randomize*/, false /*dropout*/)
+			runIshardTest(t, cfg, baseParams, tc.numRecords, tc.numExtensions, tc.fileSize, config.BaseFileNamePattern, false /*randomize*/)
 		})
 	}
 }
@@ -158,7 +159,7 @@ func TestIshardShardSize(t *testing.T) {
 				tc.numRecords /= 10
 			}
 
-			runIshardTest(t, cfg, baseParams, tc.numRecords, numExtensions, tc.fileSize, config.BaseFileNamePattern, false /*randomize*/, false /*dropout*/)
+			runIshardTest(t, cfg, baseParams, tc.numRecords, numExtensions, tc.fileSize, config.BaseFileNamePattern, false /*randomize*/)
 
 			lsmsg := &apc.LsoMsg{}
 			lsmsg.SetFlag(apc.LsNameSize)
@@ -166,12 +167,12 @@ func TestIshardShardSize(t *testing.T) {
 				lsmsg.SetFlag(apc.LsArchDir)
 				recs := shard.NewRecords(tc.numRecords)
 
-				objList, err := api.ListObjects(baseParams, cfg.DstBck, lsmsg, api.ListArgs{})
+				lst, err := api.ListObjects(baseParams, cfg.DstBck, lsmsg, api.ListArgs{})
 				tassert.CheckFatal(t, err)
 
-				for _, en := range objList.Entries {
+				for _, en := range lst.Entries {
 					// Only counts objects inside archive
-					if !en.IsInsideArch() {
+					if !en.IsAnyFlagSet(apc.EntryInArch) {
 						continue
 					}
 					ext := filepath.Ext(en.Name)
@@ -257,7 +258,7 @@ func TestIshardPrefix(t *testing.T) {
 	isharder, err := ishard.NewISharder(cfg)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("starting ishard, from %s to %s\n", cfg.SrcBck, cfg.DstBck)
+	fmt.Printf("starting ishard, from %s to %s\n", cfg.SrcBck.String(), cfg.DstBck.String())
 
 	err = isharder.Start()
 	tassert.CheckFatal(t, err)
@@ -306,7 +307,7 @@ func TestIshardTemplate(t *testing.T) {
 				numExtensions = 3
 			)
 
-			runIshardTest(t, cfg, baseParams, tc.numRecords, numExtensions, tc.fileSize, config.BaseFileNamePattern, false /*randomize*/, false /*dropout*/)
+			runIshardTest(t, cfg, baseParams, tc.numRecords, numExtensions, tc.fileSize, config.BaseFileNamePattern, false /*randomize*/)
 
 			tarballs, err := api.ListObjects(baseParams, cfg.DstBck, &apc.LsoMsg{}, api.ListArgs{})
 			tassert.CheckFatal(t, err)
@@ -325,7 +326,7 @@ func TestIshardTemplate(t *testing.T) {
 				}
 
 				re := regexp.MustCompile(expectedFormat)
-				tassert.Fatalf(t, re.MatchString(en.Name), fmt.Sprintf("expected %s to match %s", en.Name, expectedFormat))
+				tassert.Fatalf(t, re.MatchString(en.Name), "expected %s to match %s", en.Name, expectedFormat)
 			}
 		})
 	}
@@ -381,7 +382,7 @@ func TestIshardSampleKeyPattern(t *testing.T) {
 				fileSize      = 32 * cos.KiB
 			)
 
-			runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), tc.pattern, true /*randomize*/, false /*dropout*/)
+			runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), tc.pattern, true /*randomize*/)
 		})
 	}
 }
@@ -434,10 +435,10 @@ func TestIshardMissingExtension(t *testing.T) {
 		isharder, err := ishard.NewISharder(cfg)
 		tassert.CheckFatal(t, err)
 
-		tlog.Logf("starting ishard, from %s to %s\n", cfg.SrcBck, cfg.DstBck)
+		fmt.Printf("starting ishard, from %s to %s\n", cfg.SrcBck.String(), cfg.DstBck.String())
 
 		err = isharder.Start() // error is expected to occur since `dropout` is set, ishard should abort
-		if err == nil || !strings.HasPrefix(err.Error(), "missing extension: ") {
+		if err == nil || !strings.HasPrefix(err.Error(), config.ErrorPrefix) {
 			tassert.Fatalf(t, false, "expected error with 'missing extension:', but got: %v", err)
 		}
 	})
@@ -465,7 +466,7 @@ func TestIshardMissingExtension(t *testing.T) {
 		isharder, err := ishard.NewISharder(cfg)
 		tassert.CheckFatal(t, err)
 
-		tlog.Logf("starting ishard, from %s to %s\n", cfg.SrcBck, cfg.DstBck)
+		fmt.Printf("starting ishard, from %s to %s\n", cfg.SrcBck.String(), cfg.DstBck.String())
 
 		err = isharder.Start()
 		tassert.CheckFatal(t, err)
@@ -498,9 +499,56 @@ func TestIshardMissingExtension(t *testing.T) {
 		}
 		tassert.CheckFatal(t, err)
 	})
+
+	t.Run("TestIshardMissingExtension/action=warn", func(t *testing.T) {
+		cfg.SrcBck = cmn.Bck{
+			Name:     trand.String(15),
+			Provider: apc.AIS,
+		}
+		cfg.DstBck = cmn.Bck{
+			Name:     trand.String(15),
+			Provider: apc.AIS,
+		}
+		tools.CreateBucket(t, cfg.URL, cfg.SrcBck, nil, true /*cleanup*/)
+		tools.CreateBucket(t, cfg.URL, cfg.DstBck, nil, true /*cleanup*/)
+
+		expectedExts := []string{".jpeg", ".cls", ".json"}
+		var err error
+		cfg.MExtMgr, err = config.NewMissingExtManager("warn", expectedExts)
+		tassert.CheckFatal(t, err)
+
+		_, err = generateNestedStructure(baseParams, cfg.SrcBck, numRecords, "", expectedExts, int64(fileSize), true /*randomize*/, true /*dropout*/)
+		tassert.CheckFatal(t, err)
+
+		isharder, err := ishard.NewISharder(cfg)
+		tassert.CheckFatal(t, err)
+
+		fmt.Printf("starting ishard, from %s to %s\n", cfg.SrcBck.String(), cfg.DstBck.String())
+
+		// Capture stdout output to verify warning messages
+		r, w, _ := os.Pipe()
+		stdout := os.Stdout
+		defer func() { os.Stdout = stdout }() // Restore original stdout at the end
+		os.Stdout = w
+
+		err = isharder.Start()
+		w.Close()
+
+		var outputBuffer bytes.Buffer
+		_, _ = outputBuffer.ReadFrom(r)
+		output := outputBuffer.String()
+
+		if !strings.HasPrefix(output, config.WarningPrefix) {
+			t.Errorf("Expected warning message not found in output: %s", output)
+		}
+
+		tassert.CheckFatal(t, err)
+	})
 }
 
 func TestIshardEKM(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
+
 	var (
 		cfg = &config.Config{
 			SrcBck: cmn.Bck{
@@ -536,14 +584,14 @@ func TestIshardEKM(t *testing.T) {
 	tools.CreateBucket(t, cfg.URL, cfg.DstBck, nil, true /*cleanup*/)
 	tools.CreateBucket(t, cfg.URL, dsortedBck, nil, true /*cleanup*/)
 
-	var extensions []string
+	extensions := make([]string, 0, numExtensions)
 	for range numExtensions {
 		extensions = append(extensions, "."+trand.String(3))
 	}
 	_, err := generateNestedStructure(baseParams, cfg.SrcBck, numRecords, "", extensions, int64(fileSize), false, false)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("building and configuring EKM as JSON string")
+	fmt.Printf("building and configuring EKM as JSON string")
 	var builder strings.Builder
 	builder.WriteString("{")
 	for i, letter := range "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" {
@@ -555,7 +603,7 @@ func TestIshardEKM(t *testing.T) {
 	builder.WriteString("\n}")
 	cfg.EKMFlag.Set(builder.String())
 
-	tlog.Logf("starting ishard, from %s to %s\n", cfg.SrcBck, cfg.DstBck)
+	fmt.Printf("starting ishard, from %s to %s\n", cfg.SrcBck.String(), cfg.DstBck.String())
 	isharder, err := ishard.NewISharder(cfg)
 	tassert.CheckFatal(t, err)
 
@@ -617,7 +665,7 @@ func TestIshardParallel(t *testing.T) {
 		wg.Add(1)
 		go func(cfg config.Config, baseParams api.BaseParams) {
 			defer wg.Done()
-			runIshardTest(t, &cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.BaseFileNamePattern, false /*randomize*/, false /*dropout*/)
+			runIshardTest(t, &cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.BaseFileNamePattern, false /*randomize*/)
 		}(*cfg, baseParams)
 	}
 	wg.Wait()
@@ -658,7 +706,7 @@ func TestIshardChain(t *testing.T) {
 			fileSize      = 32 * cos.KiB
 		)
 
-		runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.BaseFileNamePattern, false /*randomize*/, false /*dropout*/)
+		runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.BaseFileNamePattern, false /*randomize*/)
 	}
 }
 
@@ -693,7 +741,7 @@ func TestIshardLargeBucket(t *testing.T) {
 		fileSize      = 32 * cos.KiB
 	)
 
-	runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.BaseFileNamePattern, false /*randomize*/, false /*dropout*/)
+	runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.BaseFileNamePattern, false /*randomize*/)
 }
 
 func TestIshardLargeFiles(t *testing.T) {
@@ -727,7 +775,7 @@ func TestIshardLargeFiles(t *testing.T) {
 		fileSize      = 2 * cos.GiB
 	)
 
-	runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.FullNamePattern, false /*randomize*/, false /*dropout*/)
+	runIshardTest(t, cfg, baseParams, numRecords, numExtensions, int64(fileSize), config.FullNamePattern, false /*randomize*/)
 }
 
 // Helper function to generate a nested directory structure
@@ -743,6 +791,7 @@ func generateNestedStructure(baseParams api.BaseParams, bucket cmn.Bck, numRecor
 
 	// Queue to hold objects temporarily to random insertion
 	randomizeQueue := make([]string, 0)
+	dropOnce := dropout
 
 	basePath := randomFilePath()
 	for range numRecords {
@@ -774,6 +823,12 @@ func generateNestedStructure(baseParams api.BaseParams, bucket cmn.Bck, numRecor
 
 		baseName := trand.String(5)
 		for _, ext := range extensions {
+			// Ensure to drop an extension at least once
+			if dropOnce {
+				dropOnce = false
+				continue
+			}
+
 			// Randomly skip an extension if dropout is set
 			if dropout && rand.IntN(10) == 0 {
 				continue
@@ -818,7 +873,7 @@ func generateNestedStructure(baseParams api.BaseParams, bucket cmn.Bck, numRecor
 		}
 	}
 
-	tlog.Logf("generated %d records in %s bucket\n", numRecords, bucket)
+	fmt.Printf("generated %d records in %s bucket\n", numRecords, bucket.String())
 	return totalSize, nil
 }
 
@@ -848,18 +903,18 @@ func checkOutputShards(t *testing.T, baseParams api.BaseParams, bucket cmn.Bck, 
 	if !dropout {
 		tassert.Fatalf(t, totalFileNum == expectedNumFiles, "The total number of files in output shards (%d) doesn't match to the initially generated amount (%d)", totalFileNum, expectedNumFiles)
 	}
-	tlog.Logf("finished ishard, archived %d files with total size %s\n", expectedNumFiles, cos.ToSizeIEC(totalSize, 2))
+	fmt.Printf("finished ishard, archived %d files with total size %s\n", expectedNumFiles, cos.ToSizeIEC(totalSize, 2))
 }
 
 func getShardContents(baseParams api.BaseParams, bucket cmn.Bck) (map[string][]string, error) {
 	msg := &apc.LsoMsg{}
-	objList, err := api.ListObjects(baseParams, bucket, msg, api.ListArgs{})
+	lst, err := api.ListObjects(baseParams, bucket, msg, api.ListArgs{})
 	if err != nil {
 		return nil, err
 	}
 
 	shardContents := make(map[string][]string)
-	for _, en := range objList.Entries {
+	for _, en := range lst.Entries {
 		var buffer bytes.Buffer
 		_, err := api.GetObject(baseParams, bucket, en.Name, &api.GetArgs{Writer: &buffer})
 		if err != nil {

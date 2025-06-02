@@ -1,6 +1,6 @@
 // Package authn is authentication server for AIStore.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -33,7 +33,7 @@ func (cluList cluACLList) updated(cluACL *authn.CluACL) bool {
 }
 
 // mergeBckACLs appends bucket ACLs from fromACLs which are not in toACL.
-// If a bucket ACL is already in the list, its persmissions are updated.
+// If a bucket ACL is already in the list, its permissions are updated.
 // If cluIDFlt is set, only ACLs for buckets of the cluster with this ID are appended.
 func mergeBckACLs(toACLs, fromACLs bckACLList, cluIDFlt string) []*authn.BckACL {
 	for _, n := range fromACLs {
@@ -48,7 +48,7 @@ func mergeBckACLs(toACLs, fromACLs bckACLList, cluIDFlt string) []*authn.BckACL 
 }
 
 // mergeClusterACLs appends cluster ACLs from fromACLs which are not in toACL.
-// If a cluster ACL is already in the list, its persmissions are updated.
+// If a cluster ACL is already in the list, its permissions are updated.
 // If cluIDFlt is set, only ACLs for cluster with this ID are appended.
 func mergeClusterACLs(toACLs, fromACLs cluACLList, cluIDFlt string) []*authn.CluACL {
 	for _, n := range fromACLs {

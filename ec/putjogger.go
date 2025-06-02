@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -19,18 +19,20 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/transport"
+
 	"github.com/klauspost/reedsolomon"
 )
 
 type (
 	encodeCtx struct {
 		lom          *core.LOM        // replica
-		meta         *Metadata        //
+		md           *Metadata        //
 		fh           *cos.FileHandle  // file handle for the replica
 		sliceSize    int64            // calculated slice size
 		padSize      int64            // zero tail of the last object's data slice
@@ -52,7 +54,9 @@ type (
 		xactCh chan *request // low priority operation (ec-encode)
 		stopCh cos.StopCh    // jogger management channel: to stop it
 
-		toDisk bool // use files or SGL
+		ntotal int64 // (throttle to prevent OOM)
+		micro  bool  // (throttle tuneup)
+		toDisk bool  // use files or SGL (NOTE: toDisk == false may cause OOM)
 	}
 )
 
@@ -87,10 +91,10 @@ func (c *putJogger) run(wg *sync.WaitGroup) {
 	for {
 		select {
 		case req := <-c.putCh:
-			c.processRequest(req)
+			c.do(req)
 			freeReq(req)
 		case req := <-c.xactCh:
-			c.processRequest(req)
+			c.do(req)
 			freeReq(req)
 		case <-c.stopCh.Listen():
 			c.freeResources()
@@ -105,23 +109,31 @@ func (c *putJogger) freeResources() {
 	c.slab = nil
 }
 
-func (c *putJogger) processRequest(req *request) {
+func (c *putJogger) do(req *request) {
 	lom, err := req.LIF.LOM()
 	if err != nil {
+		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+			nlog.Warningln(err)
+		}
 		return
 	}
-
 	c.parent.IncPending()
-	defer func() {
-		if req.Callback != nil {
-			req.Callback(lom, err)
-		}
-		core.FreeLOM(lom)
-		c.parent.DecPending()
-	}()
 
+	c._do(req, lom)
+
+	if req.Callback != nil {
+		req.Callback(lom, err)
+	}
+	core.FreeLOM(lom)
+	c.parent.DecPending()
+}
+
+func (c *putJogger) _do(req *request, lom *core.LOM) {
 	if req.Action == ActSplit {
-		if err = lom.Load(false /*cache it*/, false /*locked*/); err != nil {
+		if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
+			if cmn.Rom.FastV(4, cos.SmoduleEC) {
+				nlog.Warningln(err)
+			}
 			return
 		}
 		ecConf := lom.Bprops().EC
@@ -129,11 +141,24 @@ func (c *putJogger) processRequest(req *request) {
 		c.toDisk = useDisk(memRequired, c.parent.config)
 	}
 
-	c.parent.stats.updateWaitTime(time.Since(req.tm))
-	req.tm = time.Now()
-	if err = c.ec(req, lom); err != nil {
+	now := time.Now()
+	c.parent.stats.updateWaitTime(now.Sub(req.tm))
+	req.tm = now
+
+	if err := c.ec(req, lom); err != nil {
 		err = cmn.NewErrFailedTo(core.T, req.Action, lom.Cname(), err)
 		c.parent.AddErr(err, 0)
+	}
+	c.ntotal++
+	if (c.micro && fs.IsMicroThrottle(c.ntotal)) || fs.IsMiniThrottle(c.ntotal) {
+		if pressure := g.pmm.Pressure(); pressure >= memsys.PressureHigh {
+			time.Sleep(fs.Throttle100ms)
+			if !c.micro && pressure >= memsys.PressureExtreme {
+				// too late?
+				c.micro = true
+				oom.FreeToOS(true /*force*/)
+			}
+		}
 	}
 }
 
@@ -155,7 +180,7 @@ func (c *putJogger) ec(req *request, lom *core.LOM) (err error) {
 		err = c.cleanup(lom)
 		c.parent.stats.updateDeleteTime(time.Since(req.tm), err != nil)
 	default:
-		err = fmt.Errorf("invalid EC action for putJogger: %v", req.Action)
+		err = fmt.Errorf("%s: invalid action %q", c.parent, req.Action)
 	}
 
 	if err == nil {
@@ -212,7 +237,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 		generation            = mono.NanoTime()
 		cksumType, cksumValue = lom.Checksum().Get()
 	)
-	meta := &Metadata{
+	md := &Metadata{
 		MDVersion:   MDVersionLast,
 		Generation:  generation,
 		Size:        lom.Lsize(),
@@ -227,7 +252,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 
 	c.parent.LomAdd(lom)
 
-	ctx, err := c.newCtx(lom, meta)
+	ctx, err := c.newCtx(lom, md)
 	defer c.freeCtx(ctx)
 	if err != nil {
 		return err
@@ -237,16 +262,16 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 		return err
 	}
 	ctx.targets = targets[1:]
-	meta.Daemons[targets[0].ID()] = 0 // main or full replica always on the first target
+	md.Daemons[targets[0].ID()] = 0 // main or full replica always on the first target
 	for i, tgt := range ctx.targets {
 		sliceID := uint16(i + 1)
-		if meta.IsCopy {
+		if md.IsCopy {
 			sliceID = 0
 		}
-		meta.Daemons[tgt.ID()] = sliceID
+		md.Daemons[tgt.ID()] = sliceID
 	}
 
-	if meta.IsCopy {
+	if md.IsCopy {
 		err = c.replicate(ctx)
 	} else {
 		err = c.splitAndDistribute(ctx)
@@ -254,7 +279,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 	if err != nil {
 		return err
 	}
-	metaBuf := bytes.NewReader(meta.NewPack())
+	metaBuf := bytes.NewReader(md.NewPack())
 	if err := ctMeta.Write(metaBuf, -1, "" /*work fqn*/); err != nil {
 		return err
 	}
@@ -267,12 +292,12 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 	return nil
 }
 
-func (*putJogger) newCtx(lom *core.LOM, meta *Metadata) (ctx *encodeCtx, err error) {
+func (*putJogger) newCtx(lom *core.LOM, md *Metadata) (ctx *encodeCtx, err error) {
 	ctx = allocCtx()
 	ctx.lom = lom
 	ctx.dataSlices = lom.Bprops().EC.DataSlices
 	ctx.paritySlices = lom.Bprops().EC.ParitySlices
-	ctx.meta = meta
+	ctx.md = md
 
 	totalCnt := ctx.paritySlices + ctx.dataSlices
 	ctx.sliceSize = SliceSize(ctx.lom.Lsize(), ctx.dataSlices)
@@ -336,7 +361,7 @@ func (c *putJogger) createCopies(ctx *encodeCtx) error {
 	src := &dataSource{
 		reader:   ctx.fh,
 		size:     ctx.lom.Lsize(),
-		metadata: ctx.meta,
+		metadata: ctx.md,
 		reqType:  reqPut,
 	}
 	return c.parent.writeRemote(nodes, ctx.lom, src, nil)
@@ -477,7 +502,7 @@ func (c *putJogger) sendSlice(ctx *encodeCtx, data *slice, node *meta.Snode, idx
 	}
 
 	mcopy := &Metadata{}
-	cos.CopyStruct(mcopy, ctx.meta)
+	cos.CopyStruct(mcopy, ctx.md)
 	mcopy.SliceID = idx + 1
 	mcopy.ObjVersion = ctx.lom.Version()
 	if ctx.slices[idx].cksum != nil {

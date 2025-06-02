@@ -19,14 +19,19 @@ from aistore.sdk.etl.etl_const import (
     ETL_COMM_HPUSH,
     ETL_COMM_HPULL,
     ETL_COMM_IO,
+    DEFAULT_ETL_TIMEOUT,
+    DEFAULT_ETL_OBJ_TIMEOUT,
 )
 
 from aistore.sdk.etl.etl import Etl, _get_default_runtime
 from aistore.sdk.types import ETLDetails
+from aistore.sdk.utils import convert_to_seconds
 from tests.const import ETL_NAME
 
 
-class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
+class TestEtl(
+    unittest.TestCase
+):  # pylint: disable=unused-variable, too-many-public-methods
     def setUp(self) -> None:
         self.mock_client = Mock()
         self.etl_name = ETL_NAME
@@ -35,7 +40,8 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
     def test_init_spec_default_params(self):
         expected_action = {
             "communication": "hpush://",
-            "timeout": "5m",
+            "init_timeout": DEFAULT_ETL_TIMEOUT,
+            "obj_timeout": DEFAULT_ETL_OBJ_TIMEOUT,
             "argument": "",
         }
         self.init_spec_exec_assert(expected_action)
@@ -46,14 +52,16 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
 
     def test_init_spec(self):
         communication_type = ETL_COMM_HPUSH
-        timeout = "6m"
+        init_timeout = "6m"
+        obj_timeout = "20s"
         expected_action = {
             "communication": f"{communication_type}://",
-            "timeout": timeout,
+            "init_timeout": init_timeout,
+            "obj_timeout": obj_timeout,
             "argument": "",
         }
         self.init_spec_exec_assert(
-            expected_action, communication_type=communication_type, timeout=timeout
+            expected_action, init_timeout=init_timeout, obj_timeout=obj_timeout
         )
 
     def init_spec_exec_assert(self, expected_action, **kwargs):
@@ -61,7 +69,8 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         expected_action["spec"] = base64.b64encode(
             template.encode(UTF_ENCODING)
         ).decode(UTF_ENCODING)
-        expected_action["id"] = self.etl_name
+        expected_action["name"] = self.etl_name
+
         expected_response_text = self.etl_name
         mock_response = Mock()
         mock_response.text = expected_response_text
@@ -70,17 +79,29 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         response = self.etl.init_spec(template, **kwargs)
 
         self.assertEqual(expected_response_text, response)
+
+        # All ETL messages are called with timeout
+        if "init_timeout" not in kwargs:
+            kwargs["init_timeout"] = DEFAULT_ETL_TIMEOUT
+
+        req_timeout = convert_to_seconds(kwargs.pop("init_timeout"))
+
         self.mock_client.request.assert_called_with(
-            HTTP_METHOD_PUT, path=URL_PATH_ETL, json=expected_action
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=req_timeout,
+            json=expected_action,
         )
 
     def test_init_code_default_runtime(self):
         version_to_runtime = {
-            (3, 7): "python3.8v2",
-            (3, 1234): "python3.8v2",
-            (3, 8): "python3.8v2",
+            (3, 7): "python3.13v2",
+            (3, 1234): "python3.13v2",
+            (3, 8): "python3.13v2",
             (3, 10): "python3.10v2",
             (3, 11): "python3.11v2",
+            (3, 12): "python3.12v2",
+            (3, 13): "python3.13v2",
         }
         for version, runtime in version_to_runtime.items():
             with patch.object(aistore.sdk.etl.etl.sys, "version_info") as version_info:
@@ -94,10 +115,11 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         expected_action = {
             "runtime": _get_default_runtime(),
             "communication": f"{communication_type}://",
-            "timeout": "5m",
+            "init_timeout": DEFAULT_ETL_TIMEOUT,
+            "obj_timeout": DEFAULT_ETL_OBJ_TIMEOUT,
             "funcs": {"transform": "transform"},
             "code": self.encode_fn([], self.transform_fn, communication_type),
-            "dependencies": base64.b64encode(b"cloudpickle==2.2.0").decode(
+            "dependencies": base64.b64encode(b"cloudpickle>=3.0.0").decode(
                 UTF_ENCODING
             ),
             "argument": "",
@@ -111,14 +133,15 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
     def test_init_code(self):
         runtime = "python-non-default"
         communication_type = ETL_COMM_HPULL
-        timeout = "6m"
+        init_timeout = "6m"
+        obj_timeout = "6m"
         preimported = ["pytorch"]
         user_dependencies = ["pytorch"]
         chunk_size = 123
         arg_type = "url"
 
         expected_dependencies = user_dependencies.copy()
-        expected_dependencies.append("cloudpickle==2.2.0")
+        expected_dependencies.append("cloudpickle>=3.0.0")
         expected_dep_str = base64.b64encode(
             "\n".join(expected_dependencies).encode(UTF_ENCODING)
         ).decode(UTF_ENCODING)
@@ -126,7 +149,8 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         expected_action = {
             "runtime": runtime,
             "communication": f"{communication_type}://",
-            "timeout": timeout,
+            "init_timeout": init_timeout,
+            "obj_timeout": obj_timeout,
             "funcs": {"transform": "transform"},
             "code": self.encode_fn(preimported, self.transform_fn, communication_type),
             "dependencies": expected_dep_str,
@@ -139,7 +163,8 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
             dependencies=user_dependencies,
             runtime=runtime,
             communication_type=communication_type,
-            timeout=timeout,
+            init_timeout=init_timeout,
+            obj_timeout=obj_timeout,
             chunk_size=chunk_size,
             arg_type=arg_type,
         )
@@ -158,7 +183,7 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         return base64.b64encode(template).decode(UTF_ENCODING)
 
     def init_code_exec_assert(self, expected_action, **kwargs):
-        expected_action["id"] = self.etl_name
+        expected_action["name"] = self.etl_name
 
         expected_response_text = "response text"
         mock_response = Mock()
@@ -168,8 +193,16 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         response = self.etl.init_code(transform=self.transform_fn, **kwargs)
 
         self.assertEqual(expected_response_text, response)
+
+        if "init_timeout" not in kwargs:
+            kwargs["init_timeout"] = DEFAULT_ETL_TIMEOUT
+        req_timeout = convert_to_seconds(kwargs.pop("init_timeout"))
+
         self.mock_client.request.assert_called_with(
-            HTTP_METHOD_PUT, path=URL_PATH_ETL, json=expected_action
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=req_timeout,
+            json=expected_action,
         )
 
     def test_view(self):
@@ -184,19 +217,25 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
     def test_start(self):
         self.etl.start()
         self.mock_client.request.assert_called_with(
-            HTTP_METHOD_POST, path=f"etl/{ self.etl_name }/start"
+            HTTP_METHOD_POST,
+            path=f"etl/{ self.etl_name }/start",
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
         )
 
     def test_stop(self):
         self.etl.stop()
         self.mock_client.request.assert_called_with(
-            HTTP_METHOD_POST, path=f"etl/{ self.etl_name }/stop"
+            HTTP_METHOD_POST,
+            path=f"etl/{ self.etl_name }/stop",
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
         )
 
     def test_delete(self):
         self.etl.delete()
         self.mock_client.request.assert_called_with(
-            HTTP_METHOD_DELETE, path=f"etl/{ self.etl_name }"
+            HTTP_METHOD_DELETE,
+            path=f"etl/{ self.etl_name }",
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
         )
 
     def test_valid_names(self):
@@ -235,3 +274,112 @@ class TestEtl(unittest.TestCase):  # pylint: disable=unused-variable
         for name in invalid_names:
             with self.assertRaises(ValueError):
                 Etl.validate_etl_name(name)
+
+    def test_init_default_params(self):
+        image = "my-image"
+        command = ["run", "me"]
+        expected_action = {
+            "name": self.etl_name,
+            "communication": f"{ETL_COMM_HPUSH}://",
+            "init_timeout": DEFAULT_ETL_TIMEOUT,
+            "obj_timeout": DEFAULT_ETL_OBJ_TIMEOUT,
+            "argument": "",
+            "support_direct_put": False,
+            "runtime": {
+                "image": image,
+                "command": command,
+                "env": [],
+            },
+        }
+
+        mock_resp = Mock()
+        mock_resp.text = "job-123"
+        self.mock_client.request.return_value = mock_resp
+
+        result = self.etl.init(image, command)
+        self.assertEqual("job-123", result)
+        self.mock_client.request.assert_called_with(
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
+            json=expected_action,
+        )
+
+    def test_init_with_string_command_and_env(self):
+        image = "img2"
+        cmd_str = "echo hello world"
+        expected_action = {
+            "name": self.etl_name,
+            "communication": f"{ETL_COMM_HPUSH}://",
+            "init_timeout": DEFAULT_ETL_TIMEOUT,
+            "obj_timeout": DEFAULT_ETL_OBJ_TIMEOUT,
+            "argument": "",
+            "support_direct_put": False,
+            "runtime": {
+                "image": image,
+                "command": cmd_str.split(),
+                "env": [{"name": "FOO", "value": "BAR"}],
+            },
+        }
+
+        mock_resp = Mock()
+        mock_resp.text = "job-456"
+        self.mock_client.request.return_value = mock_resp
+
+        result = self.etl.init(image, cmd_str, FOO="BAR")
+        self.assertEqual("job-456", result)
+        self.mock_client.request.assert_called_with(
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=convert_to_seconds(DEFAULT_ETL_TIMEOUT),
+            json=expected_action,
+        )
+
+    def test_init_custom_params(self):
+        image = "img3"
+        command = ["run3"]
+        comm_type = ETL_COMM_HPULL
+        init_t = "10m"
+        obj_t = "30s"
+        arg_t = "url"
+        direct = True
+
+        expected_action = {
+            "name": self.etl_name,
+            "communication": f"{comm_type}://",
+            "init_timeout": init_t,
+            "obj_timeout": obj_t,
+            "argument": arg_t,
+            "support_direct_put": direct,
+            "runtime": {
+                "image": image,
+                "command": command,
+                "env": [{"name": "BAZ", "value": "QUX"}],
+            },
+        }
+
+        mock_resp = Mock()
+        mock_resp.text = "job-789"
+        self.mock_client.request.return_value = mock_resp
+
+        result = self.etl.init(
+            image,
+            command,
+            comm_type=comm_type,
+            init_timeout=init_t,
+            obj_timeout=obj_t,
+            arg_type=arg_t,
+            direct_put=direct,
+            BAZ="QUX",
+        )
+        self.assertEqual("job-789", result)
+        self.mock_client.request.assert_called_with(
+            HTTP_METHOD_PUT,
+            path=URL_PATH_ETL,
+            timeout=convert_to_seconds(init_t),
+            json=expected_action,
+        )
+
+    def test_init_invalid_comm(self):
+        with self.assertRaises(ValueError):
+            self.etl.init("img", ["cmd"], comm_type="not-a-valid-type")

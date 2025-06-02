@@ -1,15 +1,21 @@
----
-layout: post
-title: BATCH
-permalink: /docs/batch
-redirect_from:
- - /batch.md/
- - /docs/batch.md/
----
-
 ## Introduction
 
-Extended actions (_xactions_) are batch operations, or jobs, that run asynchronously, report satistics (viewable at runtime and later), can be waited upon, and can be stopped.
+Extended actions (_xactions_) are batch operations, or jobs, that run asynchronously, report statistics (viewable at runtime and later), can be waited upon, and can be stopped (aborted).
+
+The list of supported jobs can be viewed via the CLI `show` command and currently includes:
+
+```console
+$ ais show job --help
+
+NAME:
+   ais show job - Show running and/or finished jobs:
+
+     archive        blob-download  cleanup     copy-bucket       copy-objects      delete-objects
+     download       dsort          ec-bucket   ec-get            ec-put            ec-resp
+     elect-primary  etl-bucket     etl-inline  etl-objects       evict-objects     evict-remote-bucket
+     list           lru-eviction   mirror      prefetch-objects  promote-files     put-copies
+     rebalance      rename-bucket  resilver    summary           warm-up-metadata
+```
 
 Terminology-wise, in the code we mostly call it _xaction_ by the name of the corresponding software abstraction. But elsewhere, it is simply a _job_ - the two terms are interchangeable.
 
@@ -22,14 +28,20 @@ For users, there's an API to start, stop, and wait for a job:
 
 In CLI, there's `ais job` command and its subcommands (`<TAB-TAB>` completions):
 
-```commandline
+```console
 $ ais job
 start   stop    wait    rm      show
 
-$ ais job start
-prefetch           download           lru                rebalance          resilver           ec-encode          copy-bck
-blob-download      dsort              etl                cleanup            mirror             warm-up-metadata   move-bck
+$ ais start
+prefetch           lru                cleanup            copy-bck
+blob-download      etl                mirror             move-bck
+download           rebalance          ec-encode
+dsort              resilver           warm-up-metadata
 ```
+
+> Note that `ais start` is an [alias](/docs/cli/alias.md) for the `ais job start` command - both (versions) can be used interchangeably.
+
+**Not all supported jobs are _startable_**.
 
 Not all supported jobs can be started via `ais start` or by the corresponding Go or Python API call. Example, the job to copy or (ETL) transform datasets has its own dedicated API (both Python and Go) and CLI.
 

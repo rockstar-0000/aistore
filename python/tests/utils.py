@@ -4,17 +4,100 @@ import shutil
 import string
 import tarfile
 import io
+import unittest
+from itertools import product
 from pathlib import Path
+from unittest.mock import Mock
 
-from typing import Dict, List
+from typing import Any, Callable, Dict, List, Iterator, Tuple
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
 
-from aistore.sdk import Client
+import requests
+from requests.exceptions import ChunkedEncodingError
+
+from aistore.sdk import Client, Object
 from aistore.sdk.const import UTF_ENCODING
-from aistore.sdk.errors import ErrBckNotFound
+from aistore.sdk.obj.content_iterator import ContentIterator
+from aistore.sdk.response_handler import ResponseHandler
+from aistore.sdk.types import BucketModel
+from tests.const import KB
+from tests.integration.sdk import DEFAULT_TEST_CLIENT
+
+
+# pylint: disable=too-few-public-methods
+class BadContentStream(io.BytesIO):
+    """
+    Simulates a stream that fails intermittently with a specified error after a set number of reads.
+
+    Args:
+        data (bytes): The data to be streamed.
+        fail_on_read (int): The number of reads after which the error is raised.
+        error (Exception): The error instance to raise after `fail_on_read` reads.
+    """
+
+    def __init__(self, data: bytes, fail_on_read: int, error: Exception):
+        super().__init__(data)
+        self.read_count = 0
+        self.fail_on_read = fail_on_read
+        self.error = error
+
+    def read(self, size: int = -1) -> bytes:
+        """Overrides `BytesIO.read` to raise an error after a specific number of reads."""
+        self.read_count += 1
+        if self.read_count == self.fail_on_read:
+            raise self.error
+        return super().read(size)
+
+
+# pylint: disable=too-few-public-methods
+class BadContentIterator(ContentIterator):
+    """
+    Simulates a ContentIterator that streams data in chunks and intermittently raises errors
+    via a `BadContentStream`.
+
+    Args:
+        data (bytes): The data to be streamed in chunks.
+        fail_on_read (int): The number of reads after which an error will be raised.
+        chunk_size (int): The size of each chunk to be read from the data.
+        error (Exception): The error instance to raise after `fail_on_read` reads.
+    """
+
+    def __init__(
+        self,
+        data: bytes,
+        fail_on_read: int,
+        chunk_size: int,
+        error: Exception = ChunkedEncodingError("Simulated ChunkedEncodingError"),
+    ):
+        super().__init__(client=Mock(), chunk_size=chunk_size)
+        self.data = data
+        self.fail_on_read = fail_on_read
+        self.error = error
+        self.read_position = 0
+
+    def iter(self, offset: int = 0) -> Iterator[bytes]:
+        """Streams data using `BadContentStream`, starting from `offset`."""
+        stream = BadContentStream(
+            self.data[offset:], fail_on_read=self.fail_on_read, error=self.error
+        )
+        self.read_position = offset
+
+        def iterator():
+            while self.read_position < len(self.data):
+                chunk = stream.read(self._chunk_size)
+                self.read_position += len(chunk)
+                yield chunk
+
+        return iterator()
 
 
 # pylint: disable=unused-variable
-def random_string(length: int = 10):
+def random_string(length: int = 10) -> str:
     return "".join(random.choices(string.ascii_lowercase, k=length))
 
 
@@ -29,23 +112,15 @@ def string_to_dict(input_string: str) -> Dict:
 # pylint: disable=unused-variable
 def create_and_put_object(
     client: Client,
-    bck_name: str,
+    bck: BucketModel,
     obj_name: str,
-    provider: str = "ais",
     obj_size: int = 0,
-):
+) -> Tuple["Object", bytes]:
     obj_size = obj_size if obj_size else random.randrange(10, 20)
-    obj_body = "".join(random.choices(string.ascii_letters, k=obj_size))
-    content = obj_body.encode(UTF_ENCODING)
-    client.bucket(bck_name, provider=provider).object(obj_name).put_content(content)
-    return content
-
-
-def destroy_bucket(client: Client, bck_name: str):
-    try:
-        client.bucket(bck_name).delete()
-    except ErrBckNotFound:
-        pass
+    content = random_string(obj_size).encode(UTF_ENCODING)
+    obj = client.bucket(bck.name, provider=bck.provider).object(obj_name)
+    obj.get_writer().put_content(content)
+    return obj, content
 
 
 def cleanup_local(path: str):
@@ -55,29 +130,24 @@ def cleanup_local(path: str):
         pass
 
 
-# pylint: disable=too-many-arguments
-def create_and_put_objects(
-    client, bucket, prefix, suffix, num_obj, obj_names, obj_size=None
-):
-    if not obj_names:
-        obj_names = [prefix + str(i) + suffix for i in range(num_obj)]
-    for obj_name in obj_names:
-        create_and_put_object(
-            client,
-            bck_name=bucket.name,
-            provider=bucket.provider,
-            obj_name=obj_name,
-            obj_size=obj_size,
-        )
-    return obj_names
-
-
-def test_cases(*args):
+def cases(*args):
     def decorator(func):
         def wrapper(self, *inner_args, **kwargs):
             for arg in args:
                 with self.subTest(arg=arg):
                     func(self, arg, *inner_args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def case_matrix(*args_list):
+    def decorator(func):
+        def wrapper(self, *inner_args, **kwargs):
+            for args in product(*args_list):
+                with self.subTest(args=args):
+                    func(self, *args, *inner_args, **kwargs)
 
         return wrapper
 
@@ -97,40 +167,33 @@ def create_archive(archive_name, content_dict):
 
 
 def create_random_tarballs(
-    num_files: int, num_extensions: int, min_shard_size: int, dest_dir: str
+    num_files: int, num_extensions: int, min_shard_size: int, dest_dir: Path
 ):
-    def generate_random_string(length: int) -> str:
-        return "".join(random.choices(string.ascii_letters + string.digits, k=length))
-
-    def generate_random_content(min_size: int = 1024, max_size: int = 10240) -> bytes:
-        size = random.randint(min_size, max_size)
-        return os.urandom(size)
-
-    def generate_files(num_files: int, num_extensions: int, dest_dir: str) -> List:
+    def generate_files(
+        num_files: int, num_extensions: int, dest_dir: Path
+    ) -> Tuple[List[Path], List[str]]:
         files_list = []
         filenames_list = []
 
-        dest_dir_path = Path(dest_dir)
-        dest_dir_path.mkdir(parents=True, exist_ok=True)
-
-        extension_list = [generate_random_string(3) for _ in range(num_extensions)]
+        extension_list = [random_string(3) for _ in range(num_extensions)]
         for _ in range(num_files):
-            filename = generate_random_string(10)
+            filename = random_string(10)
             filenames_list.append(filename)
 
             for ext in extension_list:
-                file_path = dest_dir_path / f"{filename}.{ext}"
+                file_path = dest_dir.joinpath(f"{filename}.{ext}")
                 with open(file_path, "wb") as file:
-                    file.write(generate_random_content())
+                    file.write(os.urandom((random.randint(KB, 10 * KB))))
                 files_list.append(file_path)
 
         return files_list, extension_list
 
-    def create_tarballs(min_shard_size: int, dest_dir: str, files_list: List) -> None:
+    def create_tarballs(
+        min_shard_size: int, dest_dir: Path, files_list: List[Path]
+    ) -> int:
         num_input_shards = 0
         current_size = 0
-        dest_dir_path = Path(dest_dir).resolve()
-        current_tarball = dest_dir_path / f"input-shard-{num_input_shards}.tar"
+        current_tarball = dest_dir.joinpath(f"input-shard-{num_input_shards}.tar")
         total_size = 0
         file_count = 0
         tarball_info = []
@@ -144,7 +207,9 @@ def create_random_tarballs(
                     f"{current_tarball.name}\t{current_size}\t{file_count}"
                 )
                 num_input_shards += 1
-                current_tarball = dest_dir_path / f"input-shard-{num_input_shards}.tar"
+                current_tarball = dest_dir.joinpath(
+                    f"input-shard-{num_input_shards}.tar"
+                )
                 current_size = 0
                 file_count = 0
 
@@ -160,7 +225,76 @@ def create_random_tarballs(
         tarball_info.append(f"{current_tarball.name}\t{current_size}\t{file_count}")
         return num_input_shards
 
-    filename_list, extension_list = generate_files(num_files, num_extensions, dest_dir)
-    num_input_shards = create_tarballs(min_shard_size, dest_dir, filename_list)
-    filename_list = list(map(lambda filepath: filepath.stem, filename_list))
+    file_list, extension_list = generate_files(num_files, num_extensions, dest_dir)
+    num_input_shards = create_tarballs(min_shard_size, dest_dir, file_list)
+    filename_list = list(map(lambda filepath: filepath.stem, file_list))
     return filename_list, extension_list, num_input_shards
+
+
+def create_api_error_response(req_url: str, status: int, msg: str) -> requests.Response:
+    """
+       Given test details, manually generate a requests.Response object
+
+    Args:
+        req_url (str): Original request url
+        status (str): Response HTTP status code
+        msg (str): Response text content
+
+    Returns: requests.Response containing the given details
+    """
+    req = requests.PreparedRequest()
+    req.url = req_url
+    response = requests.Response()
+    response.status_code = status
+    # pylint: disable=protected-access
+    response._content = msg.encode("utf-8")
+    response.request = req
+    return response
+
+
+def has_targets(n: int = 2) -> bool:
+    """Check if the cluster has at least two targets before running tests."""
+    try:
+        return len(DEFAULT_TEST_CLIENT.cluster().get_info().tmap) >= n
+    except Exception:
+        return False  # Assume failure means insufficient targets or unreachable cluster (AuthN)
+
+
+def handler_parse_and_assert(
+    test: unittest.TestCase,
+    handler: "ResponseHandler",
+    error_type: Any,
+    test_case: Tuple[str, Any, int],
+):
+    """
+    Utility function for different response handler tests to pass their handler class type, expected parsed error,
+        and test parameters and assert the proper error is created.
+    Args:
+        test: TestCase using this function.
+        handler: Type of ResponseHandler class.
+        error_type: Expected error type created by the handler's parser.
+        test_case:  Parameters to test.
+    """
+    err_msg, expected_err, err_status = test_case
+    test_url = "http://test-url"
+    response = create_api_error_response(test_url, err_status, err_msg)
+
+    err = handler.parse_error(response)
+    test.assertIsInstance(err, error_type)
+    test.assertIsInstance(err, expected_err)
+    test.assertEqual(err_status, err.status_code)
+    test.assertEqual(err_msg, err.message)
+    test.assertEqual(test_url, err.req_url)
+    test.assertEqual(response.request, err.req)
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.4, max=6),
+    retry=retry_if_exception_type(AssertionError),
+    reraise=True,
+)
+def assert_with_retries(
+    assertion_fn: Callable[..., None], *args: Any, **kwargs: Any
+) -> None:
+    assertion_fn(*args, **kwargs)

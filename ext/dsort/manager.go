@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -24,11 +24,11 @@ import (
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact/xreg"
+
 	"github.com/pkg/errors"
 )
 
@@ -53,8 +53,7 @@ const (
 
 type (
 	global struct {
-		tstats stats.Tracker
-		mem    *memsys.MMSA
+		mem *memsys.MMSA
 
 		// internal
 		mg   *managerGroup
@@ -113,13 +112,21 @@ type (
 		}
 		finishedAck struct {
 			mu sync.Mutex
-			m  map[string]struct{} // finished acks: tid -> ack
+			m  cos.StrSet // finished acks: tid -> ack
 		}
 		dsorter        dsorter
 		dsorterStarted sync.WaitGroup
 		callTimeout    time.Duration // max time to wait for another node to respond
 		config         *cmn.Config
 		xctn           *xaction
+	}
+)
+
+type (
+	dsortStreams struct {
+		cleanupDone atomic.Bool
+		request     *bundle.Streams // streams for sending information about building shards
+		response    *bundle.Streams // streams for sending the record
 	}
 )
 
@@ -137,16 +144,14 @@ func Pinit(si core.Node, config *cmn.Config) {
 	newBcastClient(config)
 }
 
-func Tinit(tstats stats.Tracker, db kvdb.Driver, config *cmn.Config) {
+func Tinit(db kvdb.Driver, config *cmn.Config) {
 	g.mg = newManagerGroup(db)
 
 	xreg.RegBckXact(&factory{})
 
 	debug.Assert(g.mem == nil) // only once
-	{
-		g.tstats = tstats
-		g.mem = core.T.PageMM()
-	}
+	g.mem = core.T.PageMM()
+
 	fs.CSM.Reg(ct.DsortFileType, &ct.DsortFile{})
 	fs.CSM.Reg(ct.DsortWorkfileType, &ct.DsortFile{})
 
@@ -185,7 +190,8 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 		return err
 	}
 
-	if err := m.dsorter.init(); err != nil {
+	m.config = cmn.GCO.Get()
+	if err := m.dsorter.init(m.config); err != nil {
 		return err
 	}
 
@@ -193,10 +199,7 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 		return err
 	}
 
-	// NOTE: Total size of the records metadata can sometimes be large
-	// and so this is why we need such a long timeout.
-	m.config = cmn.GCO.Get()
-
+	// NOTE: total size of the records metadata can sometimes be large, and so this is why such a long timeout
 	cargs := cmn.TransportArgs{
 		DialTimeout: m.config.Client.Timeout.D(),
 		Timeout:     m.config.Client.TimeoutLong.D(),
@@ -230,12 +233,12 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 	// Fill ack map with current daemons. Once the finished ack is received from
 	// another daemon we will remove it from the map until len(ack) == 0 (then
 	// we will know that all daemons have finished operation).
-	m.finishedAck.m = make(map[string]struct{}, targetCount)
-	for sid, si := range m.smap.Tmap {
-		if m.smap.InMaintOrDecomm(si) {
+	m.finishedAck.m = make(cos.StrSet, targetCount)
+	for tid := range m.smap.Tmap {
+		if m.smap.InMaintOrDecomm(tid) {
 			continue
 		}
-		m.finishedAck.m[sid] = struct{}{}
+		m.finishedAck.m.Add(tid)
 	}
 
 	m.setInProgressTo(true)
@@ -286,6 +289,36 @@ func (m *Manager) cleanupStreams() (err error) {
 		if streamBundle != nil {
 			// NOTE: We don't want stream to send a message at this point as the
 			// receiver might have closed its corresponding stream.
+			streamBundle.Close(false /*gracefully*/)
+		}
+	}
+
+	return err
+}
+
+func (m *Manager) cleanupDsortStreams(streams *dsortStreams) (err error) {
+	if !streams.cleanupDone.CAS(false, true) {
+		return nil
+	}
+
+	if streams.request != nil {
+		trname := fmt.Sprintf(recvReqStreamNameFmt, m.ManagerUUID)
+		if unhandleErr := transport.Unhandle(trname); unhandleErr != nil {
+			err = errors.WithStack(unhandleErr)
+		}
+	}
+
+	if streams.response != nil {
+		trname := fmt.Sprintf(recvRespStreamNameFmt, m.ManagerUUID)
+		if unhandleErr := transport.Unhandle(trname); unhandleErr != nil {
+			err = errors.WithStack(unhandleErr)
+		}
+	}
+
+	for _, streamBundle := range []*bundle.Streams{streams.request, streams.response} {
+		if streamBundle != nil {
+			// NOTE: We don't want stream to send a message at this point as the
+			//  receiver might have closed its corresponding stream.
 			streamBundle.Close(false /*gracefully*/)
 		}
 	}
@@ -368,7 +401,7 @@ func (m *Manager) finalCleanup() {
 	// that this can be freed once we cleanup streams - streams are asynchronous
 	// and we may have race between in-flight request and cleanup.
 	// Also, NOTE:
-	// recm.Cleanup => gmm.freeMemToOS => cos.FreeMemToOS to forcefully free memory to the OS
+	// recm.Cleanup => gmm.freeMemToOS => oom.FreeToOS to forcefully free memory to the OS
 	m.recm.Cleanup()
 
 	m.creationPhase.metadata.SendOrder = nil
@@ -481,12 +514,16 @@ func (m *Manager) setRW() (err error) {
 // updateFinishedAck marks tid as finished. If all daemons ack then the
 // finalCleanup is dispatched in separate goroutine.
 func (m *Manager) updateFinishedAck(tid string) {
+	var l int
+
 	m.finishedAck.mu.Lock()
 	delete(m.finishedAck.m, tid)
-	if len(m.finishedAck.m) == 0 {
+	l = len(m.finishedAck.m)
+	m.finishedAck.mu.Unlock()
+
+	if l == 0 {
 		go m.finalCleanup()
 	}
-	m.finishedAck.mu.Unlock()
 }
 
 // incrementReceived increments number of received records batches. Also puts
@@ -622,6 +659,9 @@ func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err erro
 	}
 	if err == nil {
 		if lom.EqCksum(hdr.ObjAttrs.Cksum) {
+			//
+			// compare with: coi.isNOP, "PUT is a no-op", and reb/recv.go no-op
+			//
 			if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 				nlog.Infof("[dsort] %s shard (%s) already exists and checksums are equal, skipping",
 					m.ManagerUUID, lom)

@@ -1,13 +1,13 @@
 // Package xact provides core functionality for the AIStore eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xact
 
 import (
-	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,18 +49,22 @@ const (
 	NumConsecutiveIdle = 2
 )
 
+// ArgsMsg.Flags
+const (
+	XrmZeroSize = 1 << iota // usage: x-cleanup (apc.ActStoreCleanup) to remove zero size objects
+)
+
 type (
 	// either xaction ID or Kind must be specified
 	// is getting passed via ActMsg.Value w/ MorphMarshal extraction
 	ArgsMsg struct {
-		ID   string // xaction UUID
-		Kind string // xaction kind _or_ name (see `xact.Table`)
-
-		// optional parameters
+		ID          string        // xaction UUID
+		Kind        string        // xaction kind _or_ name (see `xact.Table`)
 		DaemonID    string        // node that runs this xaction
 		Bck         cmn.Bck       // bucket
 		Buckets     []cmn.Bck     // list of buckets (e.g., copy-bucket, lru-evict, etc.)
 		Timeout     time.Duration // max time to wait
+		Flags       uint32        `json:"flags,omitempty"` // enum (XrmZeroSize, ...) bitwise
 		Force       bool          // force
 		OnlyRunning bool          // only for running xactions
 	}
@@ -194,6 +198,13 @@ var Table = map[string]Descriptor{
 		Startable:   false,
 		RefreshCap:  true,
 	},
+	apc.ActEvictRemoteBck: {
+		DisplayName: "evict-remote-bucket",
+		Scope:       ScopeB,
+		Access:      apc.AceObjDELETE,
+		Startable:   false,
+		RefreshCap:  true,
+	},
 	apc.ActDeleteObjects: {
 		DisplayName: "delete-objects",
 		Scope:       ScopeB,
@@ -257,14 +268,10 @@ var Table = map[string]Descriptor{
 
 	apc.ActList: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false, Metasync: false, Idles: true},
 
-	// cache management, internal usage
-	apc.ActLoadLomCache:   {DisplayName: "warm-up-metadata", Scope: ScopeB, Startable: true},
-	apc.ActInvalListCache: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false},
-}
+	apc.ActGetBatch: {Scope: ScopeGB, Startable: false, Metasync: false, Idles: true},
 
-func IsValidKind(kind string) bool {
-	_, ok := Table[kind]
-	return ok
+	// cache management, internal usage
+	apc.ActLoadLomCache: {DisplayName: "warm-up-metadata", Scope: ScopeB, Startable: true},
 }
 
 func GetDescriptor(kindOrName string) (string, Descriptor, error) {
@@ -287,6 +294,27 @@ func GetKindName(kindOrName string) (kind, name string) {
 	name = dtor.DisplayName
 	if name == "" {
 		name = kind
+	}
+	return
+}
+
+func GetSimilar(kindOrName string) (simKind, simName string) {
+	for kind, dtor := range Table {
+		if kind == kindOrName || dtor.DisplayName == kindOrName {
+			return kind, dtor.DisplayName
+		}
+		// e.g., "prefetch" vs "prefetch-listrange"
+		for _, s := range []string{kind, dtor.DisplayName} {
+			if strings.HasPrefix(s, kindOrName) && len(s) > len(kindOrName) {
+				if s[len(kindOrName)] == '-' {
+					if simKind != "" {
+						return "", "" // ambiguity
+					}
+					simKind, simName = kind, cos.Left(dtor.DisplayName, kind)
+					break
+				}
+			}
+		}
 	}
 	return
 }
@@ -353,26 +381,63 @@ func getDtor(kindOrName string) (string, *Descriptor) {
 	return "", nil
 }
 
+//
+// validators (helpers)
+//
+
+func IsValidKind(kind string) bool {
+	_, ok := Table[kind]
+	return ok
+}
+
+func CheckValidKind(kind string) (err error) {
+	if _, ok := Table[kind]; !ok {
+		err = fmt.Errorf("invalid xaction (job) kind %q", kind)
+	}
+	return err
+}
+
+func IsValidUUID(id string) bool { return cos.IsValidUUID(id) || IsValidRebID(id) }
+
+func CheckValidUUID(id string) (err error) {
+	if !cos.IsValidUUID(id) && !IsValidRebID(id) {
+		err = fmt.Errorf("invalid xaction (job) UUID %q", id)
+	}
+	return err
+}
+
 /////////////
 // ArgsMsg //
 /////////////
 
-func (args *ArgsMsg) String() (s string) {
-	if args.ID == "" {
-		s = "x-" + args.Kind
-	} else {
-		s = fmt.Sprintf("x-%s[%s]", args.Kind, args.ID)
+func (args *ArgsMsg) String() string {
+	var sb strings.Builder
+	sb.Grow(128)
+	sb.WriteString("xa-")
+	sb.WriteString(args.Kind)
+	sb.WriteByte('[')
+	if args.ID != "" {
+		sb.WriteString(args.ID)
 	}
+	sb.WriteByte(']')
 	if !args.Bck.IsEmpty() {
-		s += "-" + args.Bck.String()
+		sb.WriteByte('-')
+		sb.WriteString(args.Bck.String())
 	}
 	if args.Timeout > 0 {
-		s += "-" + args.Timeout.String()
+		sb.WriteByte('-')
+		sb.WriteString(args.Timeout.String())
 	}
 	if args.DaemonID != "" {
-		s += "-node[" + args.DaemonID + "]"
+		sb.WriteString("-node[")
+		sb.WriteString(args.DaemonID)
+		sb.WriteByte(']')
 	}
-	return
+	if args.Flags > 0 {
+		sb.WriteString("-0x")
+		sb.WriteString(strconv.FormatUint(uint64(args.Flags), 16))
+	}
+	return sb.String()
 }
 
 //////////////
@@ -498,7 +563,8 @@ func (xs MultiSnap) _get(xid string) (aborted, running, notstarted bool) {
 func (xs MultiSnap) ObjCounts(xid string) (locObjs, outObjs, inObjs int64) {
 	if xid == "" {
 		uuids := xs.GetUUIDs()
-		debug.Assert(len(uuids) == 1, uuids)
+		l := len(uuids)
+		debug.Assert(l == 1, uuids[:min(l, 4)], "( len:", l, " )")
 		xid = uuids[0]
 	}
 	for _, snaps := range xs {
@@ -554,7 +620,7 @@ func (xs MultiSnap) TotalRunningTime(xid string) (time.Duration, error) {
 		}
 	}
 	if !found {
-		return 0, errors.New("xaction [" + xid + "] not found")
+		return 0, fmt.Errorf("xaction (job) UUID=%q not found", xid)
 	}
 	if running {
 		end = time.Now()

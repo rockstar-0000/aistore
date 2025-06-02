@@ -1,6 +1,6 @@
 // Package config provides types and functions to configure AIS CLI.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package config
 
@@ -88,6 +88,9 @@ var (
 		apc.ActDsort:    "job start " + apc.ActDsort,
 		apc.ActDownload: "job start " + apc.ActDownload,
 		apc.ActBlobDl:   "job start " + apc.ActBlobDl,
+		// storage
+		"space-cleanup": "storage cleanup",
+		"scrub":         "storage validate",
 	}
 )
 
@@ -95,7 +98,7 @@ func init() {
 	// $HOME/.config/ais/cli
 	ConfigDir = cos.HomeConfigDir(fname.HomeCLI)
 	proto := "http"
-	if value := os.Getenv(env.AIS.UseHTTPS); cos.IsParseBool(value) {
+	if value := os.Getenv(env.AisUseHTTPS); cos.IsParseBool(value) {
 		proto = "https"
 	}
 	aisURL := fmt.Sprintf(urlFmt, proto, defaultAISIP, defaultAISPort)
@@ -104,7 +107,7 @@ func init() {
 			URL:               aisURL,
 			DefaultAISHost:    aisURL,
 			DefaultDockerHost: fmt.Sprintf(urlFmt, proto, defaultDockerIP, defaultAISPort),
-			SkipVerifyCrt:     cos.IsParseBool(os.Getenv(env.AIS.SkipVerifyCrt)),
+			SkipVerifyCrt:     cos.IsParseBool(os.Getenv(env.AisSkipVerifyCrt)),
 		},
 		Timeout: TimeoutConfig{
 			TCPTimeoutStr:  "60s",

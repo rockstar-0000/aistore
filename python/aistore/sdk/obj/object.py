@@ -1,76 +1,106 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 #
+
+import warnings
+
+from dataclasses import dataclass
 from io import BufferedWriter
-from typing import Dict, NewType
+from pathlib import Path
+from typing import Dict, Optional
+import os
+from json import dumps as json_dumps
+from urllib.parse import quote
 
 from requests import Response
 from requests.structures import CaseInsensitiveDict
-
 from aistore.sdk.archive_config import ArchiveConfig
 from aistore.sdk.blob_download_config import BlobDownloadConfig
+from aistore.sdk.etl import ETLConfig
 from aistore.sdk.const import (
+    BYTE_RANGE_PREFIX_LENGTH,
     DEFAULT_CHUNK_SIZE,
     HTTP_METHOD_DELETE,
     HTTP_METHOD_HEAD,
-    HTTP_METHOD_PUT,
     QPARAM_ARCHPATH,
     QPARAM_ARCHREGX,
     QPARAM_ARCHMODE,
-    QPARAM_OBJ_APPEND,
-    QPARAM_OBJ_APPEND_HANDLE,
     QPARAM_ETL_NAME,
+    QPARAM_ETL_ARGS,
     QPARAM_LATEST,
-    QPARAM_NEW_CUSTOM,
     ACT_PROMOTE,
-    HTTP_METHOD_PATCH,
     HTTP_METHOD_POST,
     URL_PATH_OBJECTS,
     HEADER_RANGE,
-    HEADER_OBJECT_APPEND_HANDLE,
     ACT_BLOB_DOWNLOAD,
     HEADER_OBJECT_BLOB_DOWNLOAD,
     HEADER_OBJECT_BLOB_WORKERS,
     HEADER_OBJECT_BLOB_CHUNK_SIZE,
 )
+from aistore.sdk.provider import Provider
 from aistore.sdk.obj.object_client import ObjectClient
 from aistore.sdk.obj.object_reader import ObjectReader
+from aistore.sdk.obj.object_writer import ObjectWriter
+from aistore.sdk.request_client import RequestClient
 from aistore.sdk.types import (
     ActionMsg,
     PromoteAPIArgs,
     BlobMsg,
 )
-from aistore.sdk.utils import read_file_bytes, validate_file
 from aistore.sdk.obj.object_props import ObjectProps
 
-Header = NewType("Header", CaseInsensitiveDict)
+
+@dataclass
+class BucketDetails:
+    """
+    Metadata about a bucket, used by objects within that bucket.
+    """
+
+    name: str
+    provider: Provider
+    qparams: Dict[str, str]
+    path: str
 
 
-# pylint: disable=consider-using-with,unused-variable
 class Object:
     """
-    A class representing an object of a bucket bound to a client.
+    Provides methods for interacting with an object in AIS.
 
     Args:
-        bucket (Bucket): Bucket to which this object belongs
-        name (str): name of object
-        size (int, optional): size of object in bytes
-        props (ObjectProps, optional): Properties of object
+        client (RequestClient): Client used for all http requests.
+        bck_details (BucketDetails): Metadata about the bucket to which this object belongs.
+        name (str): Name of the object.
+        props (ObjectProps, optional): Properties of the object, as updated by head(), optionally pre-initialized.
     """
 
-    def __init__(self, bucket: "Bucket", name: str, props: ObjectProps = None):
-        self._bucket = bucket
-        self._client = bucket.client
-        self._bck_name = bucket.name
-        self._qparams = bucket.qparam
+    def __init__(
+        self,
+        client: RequestClient,
+        bck_details: BucketDetails,
+        name: str,
+        props: ObjectProps = None,
+    ):
+        self._client = client
+        self._bck_details = bck_details
+        self._bck_path = f"{URL_PATH_OBJECTS}/{ bck_details.name}"
         self._name = name
-        self._object_path = f"{URL_PATH_OBJECTS}/{ self._bck_name}/{ self.name }"
         self._props = props
+        self._object_path = f"{self._bck_path}/{quote(name)}"
 
     @property
-    def bucket(self):
-        """Bucket containing this object."""
-        return self._bucket
+    def bucket_name(self) -> str:
+        """Name of the bucket where this object resides."""
+        return self._bck_details.name
+
+    @property
+    def bucket_provider(self) -> Provider:
+        """Provider of the bucket where this object resides (e.g. ais, s3, gcp)."""
+        return self._bck_details.provider
+
+    @property
+    def query_params(self) -> Dict[str, str]:
+        """Query params used as a base for constructing all requests for this object."""
+        return self._bck_details.qparams
 
     @property
     def name(self) -> str:
@@ -79,10 +109,34 @@ class Object:
 
     @property
     def props(self) -> ObjectProps:
-        """Properties of this object."""
+        """
+        Get the latest properties of the object.
+
+        This will make a HEAD request to the AIStore cluster to fetch up-to-date object headers
+        and refresh the internal `_props` cache. Use this when you want to ensure you're accessing
+        the most recent metadata for the object.
+
+        Returns:
+            ObjectProps: The latest object properties from the server.
+        """
+        self.head()
         return self._props
 
-    def head(self) -> Header:
+    @property
+    def props_cached(self) -> Optional[ObjectProps]:
+        """
+        Get the cached object properties (without making a network call).
+
+        This is useful when:
+        - You want to avoid a network request.
+        - You're sure the cached `_props` was already set via a previous call to `head()` or during object construction.
+
+        Returns:
+            ObjectProps or None: Cached object properties, or None if not set.
+        """
+        return self._props
+
+    def head(self) -> CaseInsensitiveDict:
         """
         Requests object properties and returns headers. Updates props.
 
@@ -99,86 +153,179 @@ class Object:
         headers = self._client.request(
             HTTP_METHOD_HEAD,
             path=self._object_path,
-            params=self._qparams,
+            params=self.query_params,
         ).headers
         self._props = ObjectProps(headers)
         return headers
 
-    # pylint: disable=too-many-arguments
-    def get(
+    # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    def get_reader(
         self,
-        archive_config: ArchiveConfig = None,
-        blob_download_config: BlobDownloadConfig = None,
+        archive_config: Optional[ArchiveConfig] = None,
+        blob_download_config: Optional[BlobDownloadConfig] = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
-        etl_name: str = None,
-        writer: BufferedWriter = None,
+        etl: Optional[ETLConfig] = None,
+        writer: Optional[BufferedWriter] = None,
         latest: bool = False,
-        byte_range: str = None,
+        byte_range: Optional[str] = None,
+        direct: bool = False,
     ) -> ObjectReader:
         """
-        Creates and returns an ObjectReader with access to object contents and optionally writes to a provided writer.
+        Creates and returns an ObjectReader with access to object contents
+        and optionally writes to a provided writer.
 
         Args:
-            archive_config (ArchiveConfig, optional): Settings for archive extraction
-            blob_download_config (BlobDownloadConfig, optional): Settings for using blob download
-            chunk_size (int, optional): chunk_size to use while reading from stream
-            etl_name (str, optional): Transforms an object based on ETL with etl_name
-            writer (BufferedWriter, optional): User-provided writer for writing content output
-                User is responsible for closing the writer
-            latest (bool, optional): GET the latest object version from the associated remote bucket
-            byte_range (str, optional): Specify a specific data segment of the object for transfer, including
-                both the start and end of the range (e.g. "bytes=0-499" to request the first 500 bytes)
+            archive_config (Optional[ArchiveConfig]): Settings for archive extraction.
+            blob_download_config (Optional[BlobDownloadConfig]): Settings for using blob download.
+            chunk_size (int, optional): Chunk size to use while reading from stream.
+            etl (Optional[ETLConfig]): Settings for ETL-specific operations (name, args).
+            writer (Optional[BufferedWriter]): User-provided writer for writing content output.
+                The user is responsible for closing the writer.
+            latest (bool, optional): GET the latest object version from the associated remote bucket.
+            byte_range (Optional[str]): Byte range in RFC 7233 format for single-range requests
+                (e.g., "bytes=0-499", "bytes=500-", "bytes=-500").
+                See: https://www.rfc-editor.org/rfc/rfc7233#section-2.1.
+            direct (bool, optional): If True, the object content is read directly from the target node,
+                bypassing the proxy.
 
         Returns:
-            An ObjectReader which can be iterated over to stream chunks of object content or used to read all content
-            directly.
+            ObjectReader: An iterator for streaming object content.
 
         Raises:
-            requests.RequestException: "There was an ambiguous exception that occurred while handling..."
-            requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
-            requests.ReadTimeout: Timed out waiting response from AIStore
+            ValueError: If Byte Range is used with Blob Download.
+            requests.RequestException: If an error occurs during the request.
+            requests.ConnectionError: If there is a connection error.
+            requests.ConnectionTimeout: If the connection times out.
+            requests.ReadTimeout: If the read operation times out.
         """
-        params = self._qparams.copy()
+
+        params = self.query_params.copy()
         headers = {}
+        byte_range_tuple = (None, None)
+
+        # Archive Configuration
         if archive_config:
             if archive_config.mode:
-                archive_config.mode = archive_config.mode.value
-            params[QPARAM_ARCHPATH] = archive_config.archpath
-            params[QPARAM_ARCHREGX] = archive_config.regex
-            params[QPARAM_ARCHMODE] = archive_config.mode
+                params[QPARAM_ARCHMODE] = archive_config.mode.value
+            params.update(
+                {
+                    QPARAM_ARCHPATH: archive_config.archpath,
+                    QPARAM_ARCHREGX: archive_config.regex,
+                }
+            )
 
+        # Blob Download Configuration
         if blob_download_config:
-            headers[HEADER_OBJECT_BLOB_DOWNLOAD] = "true"
-            headers[HEADER_OBJECT_BLOB_CHUNK_SIZE] = blob_download_config.chunk_size
-            headers[HEADER_OBJECT_BLOB_WORKERS] = blob_download_config.num_workers
-        if etl_name:
-            params[QPARAM_ETL_NAME] = etl_name
+            headers.update(
+                {
+                    HEADER_OBJECT_BLOB_DOWNLOAD: "true",
+                    HEADER_OBJECT_BLOB_CHUNK_SIZE: blob_download_config.chunk_size,
+                    HEADER_OBJECT_BLOB_WORKERS: blob_download_config.num_workers,
+                }
+            )
+
+        # ETL Configuration
+        if etl:
+            params[QPARAM_ETL_NAME] = etl.name
+            params[QPARAM_ETL_ARGS] = (
+                json_dumps(etl.args, separators=(",", ":"))
+                if isinstance(etl.args, dict)
+                else etl.args
+            )
+
+        # Latest Object Version
         if latest:
             params[QPARAM_LATEST] = "true"
 
+        # Byte Range Validation
         if byte_range and blob_download_config:
-            raise ValueError("Cannot use Byte Range with Blob Download")
+            raise ValueError("Cannot use Byte Range with Blob Download.")
 
         if byte_range:
             # For range formatting, see the spec:
             # https://www.rfc-editor.org/rfc/rfc7233#section-2.1
             headers = {HEADER_RANGE: byte_range}
+            # Extract left (range_l) and right (range_r) bounds from the byte range string
+            headers[HEADER_RANGE] = byte_range
+            byte_range_l, _, byte_range_r = byte_range[
+                BYTE_RANGE_PREFIX_LENGTH:
+            ].partition("-")
+            byte_range_tuple = (
+                int(byte_range_l) if byte_range_l else None,
+                int(byte_range_r) if byte_range_r else None,
+            )
 
+        # Object Client
         obj_client = ObjectClient(
             request_client=self._client,
             path=self._object_path,
             params=params,
             headers=headers,
+            byte_range=byte_range_tuple,
+            uname=os.path.join(self._bck_details.path, self.name) if direct else None,
         )
 
-        obj_reader = ObjectReader(
-            object_client=obj_client,
-            chunk_size=chunk_size,
-        )
+        obj_reader = ObjectReader(object_client=obj_client, chunk_size=chunk_size)
+
         if writer:
             writer.writelines(obj_reader)
+
         return obj_reader
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def get(
+        self,
+        archive_config: ArchiveConfig = None,
+        blob_download_config: BlobDownloadConfig = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        etl: ETLConfig = None,
+        writer: BufferedWriter = None,
+        latest: bool = False,
+        byte_range: str = None,
+    ) -> ObjectReader:
+        """
+        Deprecated: Use 'get_reader' instead.
+
+        Creates and returns an ObjectReader with access to object contents and optionally writes to a provided writer.
+
+        Args:
+            archive_config (ArchiveConfig, optional): Settings for archive extraction.
+            blob_download_config (BlobDownloadConfig, optional): Settings for using blob download.
+            chunk_size (int, optional): Chunk size to use while reading from stream.
+            etl (ETLConfig, optional): Settings for ETL-specific operations (name, meta).
+            writer (BufferedWriter, optional): User-provided writer for writing content output.
+                The user is responsible for closing the writer.
+            latest (bool, optional): GET the latest object version from the associated remote bucket.
+            byte_range (str, optional): Byte range in RFC 7233 format for single-range requests
+                (e.g., "bytes=0-499", "bytes=500-", "bytes=-500").
+                See: https://www.rfc-editor.org/rfc/rfc7233#section-2.1.
+
+        Returns:
+            ObjectReader: An ObjectReader that can be iterated over to stream chunks of object content
+            or used to read all content directly.
+
+        Raises:
+            ValueError: If Byte Range is used with Blob Download.
+            requests.RequestException: If an error occurs during the request.
+            requests.ConnectionError: If there is a connection error.
+            requests.ConnectionTimeout: If the connection times out.
+            requests.ReadTimeout: If the read operation times out.
+        """
+        warnings.warn(
+            "The 'get' method is deprecated and will be removed in a future release. "
+            "Please use 'get_reader' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_reader(
+            archive_config=archive_config,
+            blob_download_config=blob_download_config,
+            chunk_size=chunk_size,
+            etl=etl,
+            writer=writer,
+            latest=latest,
+            byte_range=byte_range,
+        )
 
     def get_semantic_url(self) -> str:
         """
@@ -188,30 +335,37 @@ class Object:
             Semantic URL to get object
         """
 
-        return f"{self.bucket.provider}://{self._bck_name}/{self._name}"
+        return f"{self.bucket_provider.value}://{self.bucket_name}/{self._name}"
 
-    def get_url(self, archpath: str = "", etl_name: str = None) -> str:
+    def get_url(self, archpath: str = "", etl: ETLConfig = None) -> str:
         """
         Get the full url to the object including base url and any query parameters
 
         Args:
             archpath (str, optional): If the object is an archive, use `archpath` to extract a single file
                 from the archive
-            etl_name (str, optional): Transforms an object based on ETL with etl_name
+            etl (ETLConfig, optional): Settings for ETL-specific operations (name, meta).
 
         Returns:
             Full URL to get object
 
         """
-        params = self._qparams.copy()
+        params = self.query_params.copy()
         if archpath:
             params[QPARAM_ARCHPATH] = archpath
-        if etl_name:
-            params[QPARAM_ETL_NAME] = etl_name
+
+        # ETL Configuration
+        if etl:
+            params[QPARAM_ETL_NAME] = etl.name
+            if etl.args:
+                params[QPARAM_ETL_ARGS] = etl.args
+
         return self._client.get_full_url(self._object_path, params)
 
     def put_content(self, content: bytes) -> Response:
         """
+        Deprecated: Use 'ObjectWriter.put_content' instead.
+
         Puts bytes as an object to a bucket in AIS storage.
 
         Args:
@@ -223,14 +377,22 @@ class Object:
             requests.ConnectionTimeout: Timed out connecting to AIStore
             requests.ReadTimeout: Timed out waiting response from AIStore
         """
-        return self._put_data(self.name, content)
+        warnings.warn(
+            "The 'put_content' method is deprecated and will be removed in a future release. "
+            "Please use 'ObjectWriter.put_content' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_writer().put_content(content)
 
-    def put_file(self, path: str = None) -> Response:
+    def put_file(self, path: str or Path) -> Response:
         """
+        Deprecated: Use 'ObjectWriter.put_file' instead.
+
         Puts a local file as an object to a bucket in AIS storage.
 
         Args:
-            path (str): Path to local file
+            path (str or Path): Path to local file
 
         Raises:
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
@@ -239,19 +401,24 @@ class Object:
             requests.ReadTimeout: Timed out waiting response from AIStore
             ValueError: The path provided is not a valid file
         """
-        validate_file(path)
-        return self._put_data(self.name, read_file_bytes(path))
-
-    def _put_data(self, obj_name: str, data: bytes) -> Response:
-        url = f"{URL_PATH_OBJECTS}/{ self._bck_name }/{ obj_name }"
-        return self._client.request(
-            HTTP_METHOD_PUT,
-            path=url,
-            params=self._qparams,
-            data=data,
+        warnings.warn(
+            "The 'put_file' method is deprecated and will be removed in a future release. "
+            "Please use 'ObjectWriter.put_file' instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
+        return self.get_writer().put_file(path)
 
-    # pylint: disable=too-many-arguments
+    def get_writer(self) -> ObjectWriter:
+        """
+        Create an ObjectWriter to write to object contents and attributes.
+
+        Returns:
+            An ObjectWriter which can be used to write to an object's contents and attributes.
+        """
+        return ObjectWriter(self._client, self._object_path, self.query_params)
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def promote(
         self,
         path: str,
@@ -285,7 +452,6 @@ class Object:
             requests.ReadTimeout: Timed out waiting response from AIStore
             AISError: Path does not exist on the AIS cluster storage
         """
-        url = f"{URL_PATH_OBJECTS}/{ self._bck_name }"
         value = PromoteAPIArgs(
             source_path=path,
             object_name=self.name,
@@ -298,7 +464,10 @@ class Object:
         json_val = ActionMsg(action=ACT_PROMOTE, name=path, value=value).dict()
 
         return self._client.request(
-            HTTP_METHOD_POST, path=url, params=self._qparams, json=json_val
+            HTTP_METHOD_POST,
+            path=self._bck_path,
+            params=self.query_params,
+            json=json_val,
         ).text
 
     def delete(self) -> Response:
@@ -318,7 +487,7 @@ class Object:
         return self._client.request(
             HTTP_METHOD_DELETE,
             path=self._object_path,
-            params=self._qparams,
+            params=self.query_params,
         )
 
     def blob_download(
@@ -346,7 +515,7 @@ class Object:
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
         """
-        params = self._qparams.copy()
+        params = self.query_params.copy()
         value = BlobMsg(
             chunk_size=chunk_size,
             num_workers=num_workers,
@@ -355,15 +524,16 @@ class Object:
         json_val = ActionMsg(
             action=ACT_BLOB_DOWNLOAD, value=value, name=self.name
         ).dict()
-        url = f"{URL_PATH_OBJECTS}/{ self._bck_name }"
         return self._client.request(
-            HTTP_METHOD_POST, path=url, params=params, json=json_val
+            HTTP_METHOD_POST, path=self._bck_path, params=params, json=json_val
         ).text
 
     def append_content(
         self, content: bytes, handle: str = "", flush: bool = False
     ) -> str:
         """
+        Deprecated: Use 'ObjectWriter.append_content' instead.
+
         Append bytes as an object to a bucket in AIS storage.
 
         Args:
@@ -381,39 +551,30 @@ class Object:
             requests.ReadTimeout: Timed out waiting response from AIStore
             requests.exceptions.HTTPError(404): The object does not exist
         """
-
-        url = f"{URL_PATH_OBJECTS}/{ self._bck_name }/{ self.name }"
-        params = self._qparams.copy()
-        params[QPARAM_OBJ_APPEND] = "append" if not flush else "flush"
-        params[QPARAM_OBJ_APPEND_HANDLE] = handle
-
-        resp_headers = self._client.request(
-            HTTP_METHOD_PUT,
-            path=url,
-            params=params,
-            data=content,
-        ).headers
-
-        return resp_headers.get(HEADER_OBJECT_APPEND_HANDLE, "")
+        warnings.warn(
+            "The 'append_content' method is deprecated and will be removed in a future release. "
+            "Please use 'ObjectWriter.append_content' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_writer().append_content(content, handle, flush)
 
     def set_custom_props(
         self, custom_metadata: Dict[str, str], replace_existing: bool = False
     ) -> Response:
         """
+        Deprecated: Use 'ObjectWriter.set_custom_props' instead.
+
         Set custom properties for the object.
 
         Args:
             custom_metadata (Dict[str, str]): Custom metadata key-value pairs.
             replace_existing (bool, optional): Whether to replace existing metadata. Defaults to False.
         """
-        params = self._qparams.copy()
-        if replace_existing:
-            params[QPARAM_NEW_CUSTOM] = "true"
-
-        url = f"{URL_PATH_OBJECTS}/{self._bck_name}/{self.name}"
-
-        json_val = ActionMsg(action="", value=custom_metadata).dict()
-
-        return self._client.request(
-            HTTP_METHOD_PATCH, path=url, params=params, json=json_val
+        warnings.warn(
+            "The 'set_custom_props' method is deprecated and will be removed in a future release. "
+            "Please use 'ObjectWriter.set_custom_props' instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
+        return self.get_writer().set_custom_props(custom_metadata, replace_existing)

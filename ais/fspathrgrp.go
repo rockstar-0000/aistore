@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -15,7 +15,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/volume"
@@ -50,7 +49,7 @@ func (g *fsprungroup) enableMpath(mpath string) (enabledMi *fs.Mountpath, err er
 
 // attachMpath adds mountpath and notifies necessary runners about the change
 // if the mountpath was actually added.
-func (g *fsprungroup) attachMpath(mpath string, label ios.Label) (addedMi *fs.Mountpath, err error) {
+func (g *fsprungroup) attachMpath(mpath string, label cos.MountpathLabel) (addedMi *fs.Mountpath, err error) {
 	addedMi, err = fs.AddMpath(g.t.SID(), mpath, label, g.redistributeMD)
 	if err != nil || addedMi == nil {
 		return
@@ -63,8 +62,9 @@ func (g *fsprungroup) attachMpath(mpath string, label ios.Label) (addedMi *fs.Mo
 func (g *fsprungroup) _postAdd(action string, mi *fs.Mountpath) {
 	fspathsConfigAddDel(mi.Path, true /*add*/)
 	go func() {
-		if cmn.GCO.Get().Resilver.Enabled {
-			g.t.runResilver(res.Args{}, nil /*wg*/)
+		config := cmn.GCO.Get()
+		if config.Resilver.Enabled {
+			g.t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}}, nil /*wg*/)
 		}
 		xreg.RenewMakeNCopies(cos.GenUUID(), action)
 	}()
@@ -116,8 +116,11 @@ func (g *fsprungroup) rescanMpath(mpath string, dontResilver bool) error {
 	if err != nil || warn == nil {
 		return err
 	}
-	if !dontResilver && cmn.GCO.Get().Resilver.Enabled {
-		go g.t.runResilver(res.Args{}, nil /*wg*/)
+	if !dontResilver {
+		config := cmn.GCO.Get()
+		if config.Resilver.Enabled {
+			go g.t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}}, nil /*wg*/)
+		}
 	}
 	return warn
 }
@@ -134,7 +137,7 @@ func (g *fsprungroup) doDD(action string, flags uint64, mpath string, dontResilv
 		return rmi, nil
 	}
 
-	core.UncacheMountpath(rmi)
+	core.LcacheClearMpath(rmi)
 
 	config := cmn.GCO.Get()
 	if noResil || dontResilver || !config.Resilver.Enabled {
@@ -151,11 +154,12 @@ func (g *fsprungroup) doDD(action string, flags uint64, mpath string, dontResilv
 	} else {
 		nlog.Infof("%s: %q %s: starting to resilver", g.t, action, rmi)
 	}
-	args := res.Args{
+	args := &res.Args{
 		Rmi:             rmi,
 		Action:          action,
 		PostDD:          g.postDD,    // callback when done
 		SingleRmiJogger: !prevActive, // NOTE: optimization for the special/common case
+		Custom:          xreg.ResArgs{Config: config},
 	}
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -285,7 +289,7 @@ func (g *fsprungroup) checkEnable(action string, mi *fs.Mountpath) {
 	} else {
 		nlog.Infoln(action, "the first mountpath", mi.String())
 		if err := g.t.enable(); err != nil {
-			nlog.Errorf("Failed to re-join %s (self): %v", g.t, err) // (FATAL, unlikely)
+			nlog.Errorln(g.t.String(), "(self) failed to rejoin cluster:", err) // (FATAL, unlikely)
 		}
 	}
 }

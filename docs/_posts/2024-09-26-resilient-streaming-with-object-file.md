@@ -39,7 +39,7 @@ During each `read` operation, `ObjectFile` will attempt to resume a disconnected
 
 ## Background
 
-The basic `object.get()` function in the AIS SDK returns an `ObjectReader`, which enables efficient streaming of data by providing an iterator that fetches data in chunks (using the [requests library's stream option](https://requests.readthedocs.io/en/latest/user/advanced/#body-content-workflow)). However, it doesn’t account for network interruptions, such as unexpected stream closures that may lead to a `ChunkedEncodingError`. In the case of a failure, the entire stream may need to be manually restarted, resulting in major inefficiencies and redundant data transfer.
+The basic `object.get()` function in the AIS SDK returns an `ObjectReader`, which enables efficient streaming of data by providing an iterator that fetches data in chunks (using the [requests library's stream option](https://requests.readthedocs.io/en/latest/user/advanced/#body-content-workflow)). However, it doesn’t account for network interruptions, such as unexpected stream closures or timeouts. In the case of a failure, the entire stream may need to be manually restarted, resulting in major inefficiencies and redundant data transfer.
 
 `ObjectFile` addresses this problem by wrapping `ObjectReader` with a file-like interface that incorporates buffer management and logic to handle unexpected interruptions to the object stream. By resuming streams from the exact byte where an interruption occurred, `ObjectFile` eliminates the need to re-fetch previously read data, ensuring uninterrupted data access even in unstable network conditions.
 
@@ -65,7 +65,7 @@ The basic `object.get()` function in the AIS SDK returns an `ObjectReader`, whic
 
 When a `read` operation is initiated, `ObjectFile` first checks if the requested data is already in the buffer. If sufficient data is available, it reads directly from the buffer. If not, it fetches additional chunks from the object stream using the iterator and refills the buffer.
 
-If a network interruption occurs and the iterator raises a `ChunkedEncodingError`, `ObjectFile` automatically attempts to re-establish the connection to the object in AIS. It does this by issuing an [HTTP range request](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) starting at the next byte that hasn’t yet been loaded into the buffer. This ensures that no previously accessed data is fetched again, and the stream resumes seamlessly from where it left off.
+In case of unexpected stream interruptions (e.g. `ChunkedEncodingError`, `ConnectionError`) or timeouts (e.g. `ReadTimeout`), `ObjectFile` automatically attempts to re-establish the connection to the object in AIS. It does this by issuing an [HTTP range request](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) starting at the next byte that hasn’t yet been loaded into the buffer. This ensures that no previously accessed data is fetched again, and the stream resumes seamlessly from where it left off.
 
 Once the buffer has sufficient data, `ObjectFile` reads directly from it to complete the `read` operation.
 
@@ -129,8 +129,8 @@ Easy integration with existing workflows and familiar file-like behavior makes `
 - [AIS Repository](https://github.com/NVIDIA/aistore)
 - [AIS Python SDK PyPI](https://pypi.org/project/aistore/)
 - ObjectFile
-    - [Source](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/object_file.py)
-    - [Docs](https://github.com/NVIDIA/aistore/blob/main/docs/python_sdk.md#object_file)
+    - [Source](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/obj/obj_file/object_file.py)
+    - [Docs](https://github.com/NVIDIA/aistore/blob/main/docs/python_sdk.md#obj.obj_file.object_file.ObjectFile)
     - [Demo](https://github.com/NVIDIA/aistore/blob/main/python/examples/sdk/resilient-streaming-object-file.ipynb)
 - [Python BufferedIOBase](https://docs.python.org/3/library/io.html#io.BufferedIOBase)
 - [Requests Library Streams](https://requests.readthedocs.io/en/latest/user/advanced/#body-content-workflow)

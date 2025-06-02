@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -40,7 +40,7 @@ func (p *factory) Start() error {
 	args, ok := custom.(*xreg.DsortArgs)
 	debug.Assert(ok)
 	p.xctn = &xaction{args: args}
-	p.xctn.InitBase(p.UUID(), apc.ActDsort, args.BckTo /*compare w/ tcb and tco*/)
+	p.xctn.InitBase(p.UUID(), apc.ActDsort, "" /*ctlmsg*/, args.BckTo /*compare w/ tcb and tco*/)
 
 	g.once.Do(func() {
 		hk.Reg(apc.ActDsort+hk.NameSuffix, g.mg.housekeep, hk.DayInterval)

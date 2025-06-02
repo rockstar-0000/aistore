@@ -1,12 +1,13 @@
 // Package shard provides Extract(shard), Create(shard), and associated methods
-// across all suppported archival formats (see cmn/archive/mime.go)
+// across all supported archival formats (see cmn/archive/mime.go)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package shard_test
 
 import (
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )

@@ -1,6 +1,6 @@
 // Package readers provides implementation for common reader types
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package readers_test
 
@@ -232,7 +232,7 @@ func testReaderAdv(t *testing.T, r readers.Reader, size int64) {
 
 func TestRandReader(t *testing.T) {
 	size := int64(1024)
-	r, err := readers.NewRand(size, cos.ChecksumXXHash)
+	r, err := readers.NewRand(size, cos.ChecksumCesXxh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestRandReader(t *testing.T) {
 }
 
 func TestSGReader(t *testing.T) {
-	mmsa, _ := memsys.NewMMSA(mmName, false)
+	mmsa := memsys.NewMMSA(mmName, false)
 	defer mmsa.Terminate(false)
 	{
 		// Basic read
@@ -250,7 +250,7 @@ func TestSGReader(t *testing.T) {
 		sgl := mmsa.NewSGL(size)
 		defer sgl.Free()
 
-		r, err := readers.NewSG(sgl, size, cos.ChecksumXXHash)
+		r, err := readers.NewSG(sgl, size, cos.ChecksumCesXxh)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -284,7 +284,7 @@ func TestSGReader(t *testing.T) {
 		sgl := mmsa.NewSGL(size)
 		defer sgl.Free()
 
-		r, err := readers.NewSG(sgl, size, cos.ChecksumXXHash)
+		r, err := readers.NewSG(sgl, size, cos.ChecksumCesXxh)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -298,7 +298,7 @@ func BenchmarkFileReaderCreateWithHash1M(b *testing.B) {
 	fn := "reader-test"
 
 	for range b.N {
-		r, err := readers.NewRandFile(filepath, fn, cos.MiB, cos.ChecksumXXHash)
+		r, err := readers.NewRandFile(filepath, fn, cos.MiB, cos.ChecksumCesXxh)
 		if err != nil {
 			os.Remove(path.Join(filepath, fn))
 			b.Fatal(err)
@@ -313,7 +313,7 @@ func BenchmarkFileReaderCreateWithHash1M(b *testing.B) {
 
 func BenchmarkRandReaderCreateWithHash1M(b *testing.B) {
 	for range b.N {
-		r, err := readers.NewRand(cos.MiB, cos.ChecksumXXHash)
+		r, err := readers.NewRand(cos.MiB, cos.ChecksumCesXxh)
 		r.Close()
 		if err != nil {
 			b.Fatal(err)
@@ -322,7 +322,7 @@ func BenchmarkRandReaderCreateWithHash1M(b *testing.B) {
 }
 
 func BenchmarkSGReaderCreateWithHash1M(b *testing.B) {
-	mmsa, _ := memsys.NewMMSA(mmName, false)
+	mmsa := memsys.NewMMSA(mmName, false)
 	sgl := mmsa.NewSGL(cos.MiB)
 	defer func() {
 		sgl.Free()
@@ -331,7 +331,7 @@ func BenchmarkSGReaderCreateWithHash1M(b *testing.B) {
 
 	for range b.N {
 		sgl.Reset()
-		r, err := readers.NewSG(sgl, cos.MiB, cos.ChecksumXXHash)
+		r, err := readers.NewSG(sgl, cos.MiB, cos.ChecksumCesXxh)
 		r.Close()
 		if err != nil {
 			b.Fatal(err)
@@ -368,7 +368,7 @@ func BenchmarkRandReaderCreateNoHash1M(b *testing.B) {
 }
 
 func BenchmarkSGReaderCreateNoHash1M(b *testing.B) {
-	mmsa, _ := memsys.NewMMSA(mmName, false)
+	mmsa := memsys.NewMMSA(mmName, false)
 	sgl := mmsa.NewSGL(cos.MiB)
 	defer func() {
 		sgl.Free()

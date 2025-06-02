@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -32,8 +32,10 @@ import (
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
-	"github.com/OneOfOne/xxhash"
+
+	onexxh "github.com/OneOfOne/xxhash"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 	"github.com/tinylib/msgp/msgp"
@@ -47,7 +49,7 @@ type (
 		shard.ContentLoader
 
 		name() string
-		init() error
+		init(*cmn.Config) error
 		start() error
 		postExtraction()
 		postRecordDistribution()
@@ -154,7 +156,7 @@ func _torder(salt uint64, tmap meta.NodeMap) []*meta.Snode {
 		if d.InMaintOrDecomm() {
 			continue
 		}
-		c := xxhash.Checksum64S(cos.UnsafeB(i), salt)
+		c := onexxh.Checksum64S(cos.UnsafeB(i), salt)
 		targets[c] = d
 		keys = append(keys, c)
 	}
@@ -251,14 +253,14 @@ outer:
 	return group.Wait()
 }
 
-func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
+func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 	var (
 		metrics   = m.Metrics.Creation
 		shardName = s.Name
 		errCh     = make(chan error, 2)
 	)
-	if err = lom.InitBck(&m.Pars.OutputBck); err != nil {
-		return
+	if err := lom.InitBck(&m.Pars.OutputBck); err != nil {
+		return err
 	}
 	lom.SetAtimeUnix(time.Now().UnixNano())
 
@@ -272,9 +274,9 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 	defer m.dsorter.postShardCreation(lom.Mountpath())
 
 	cs := fs.Cap()
-	if err = cs.Err(); err != nil {
+	if err := cs.Err(); err != nil {
 		m.abort(err)
-		return
+		return err
 	}
 
 	beforeCreation := time.Now()
@@ -322,7 +324,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 		debug.Assert(shardRW != nil, m.Pars.OutputExtension)
 	}
 
-	_, err = shardRW.Create(s, w, m.dsorter)
+	_, err := shardRW.Create(s, w, m.dsorter)
 	w.CloseWithError(err)
 	if err != nil {
 		r.CloseWithError(err)
@@ -348,9 +350,9 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 		return err
 	}
 
-	si, err := m.smap.HrwHash2T(lom.Digest())
-	if err != nil {
-		return err
+	si, errH := m.smap.HrwHash2T(lom.Digest())
+	if errH != nil {
+		return errH
 	}
 
 	// If the newly created shard belongs on a different target
@@ -370,9 +372,9 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 			goto exit
 		}
 
-		file, err := cos.NewFileHandle(lom.FQN)
-		if err != nil {
-			return err
+		file, errO := cos.NewFileHandle(lom.FQN)
+		if errO != nil {
+			return errO
 		}
 
 		o := transport.AllocSend()
@@ -390,8 +392,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) (err error) {
 			streamWg.Done()
 		}
 		streamWg.Add(1)
-		err = m.streams.shards.Send(o, file, si)
-		if err != nil {
+		if err := m.streams.shards.Send(o, file, si); err != nil {
 			return err
 		}
 		streamWg.Wait()
@@ -426,7 +427,7 @@ exit:
 // repeats until len(targetOrder) == 1, in which case the single target in the
 // slice is the final target with the final, complete, sorted slice of Record
 // structs.
-func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (currentTargetIsFinal bool, err error) {
+func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (currentTargetIsFinal bool, _ error) {
 	var (
 		i           int
 		d           *meta.Snode
@@ -511,7 +512,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 			metrics.mu.Lock()
 			metrics.SentStats.updateTime(time.Since(beforeSend))
 			metrics.mu.Unlock()
-			return
+			return false, nil
 		}
 
 		beforeRecv := time.Now()
@@ -526,8 +527,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 			select {
 			case <-m.listenReceived():
 			case <-m.listenAborted():
-				err = m.newErrAborted()
-				return
+				return false, m.newErrAborted()
 			}
 		}
 		expectedReceived++
@@ -547,7 +547,7 @@ func (m *Manager) participateInRecordDistribution(targetOrder meta.Nodes) (curre
 		m.recm.MergeEnqueuedRecords()
 	}
 
-	err = sortRecords(m.recm.Records, m.Pars.Algorithm)
+	err := sortRecords(m.recm.Records, m.Pars.Algorithm)
 	m.dsorter.postRecordDistribution()
 	return true, err
 }
@@ -786,13 +786,13 @@ func (m *Manager) phase3(maxSize int64) error {
 		sendOrder      = make(map[string]map[string]*shard.Shard, m.smap.CountActiveTs())
 		errCh          = make(chan error, m.smap.CountActiveTs())
 	)
-	for _, d := range m.smap.Tmap {
-		if m.smap.InMaintOrDecomm(d) {
+	for tid, tsi := range m.smap.Tmap {
+		if m.smap.InMaintOrDecomm(tid) {
 			continue
 		}
-		shardsToTarget[d] = nil
+		shardsToTarget[tsi] = nil
 		if m.dsorter.name() == MemType {
-			sendOrder[d.ID()] = make(map[string]*shard.Shard, 100)
+			sendOrder[tid] = make(map[string]*shard.Shard, 100)
 		}
 	}
 	if m.Pars.EKMFileURL != "" {
@@ -837,7 +837,7 @@ func (m *Manager) phase3(maxSize int64) error {
 
 	m.recm.Records.Drain()
 
-	wg := cos.NewLimitedWaitGroup(cmn.MaxParallelism(), len(shardsToTarget))
+	wg := cos.NewLimitedWaitGroup(sys.MaxParallelism(), len(shardsToTarget))
 	for si, s := range shardsToTarget {
 		wg.Add(1)
 		go m._dist(si, s, sendOrder[si.ID()], errCh, wg)
@@ -874,12 +874,13 @@ func (m *Manager) _dist(si *meta.Snode, s []*shard.Shard, order map[string]*shar
 		return err
 	})
 	group.Go(func() error {
-		query := m.Pars.InputBck.NewQuery()
+		q := make(url.Values, 1)
+		m.Pars.InputBck.SetQuery(q)
 		reqArgs := &cmn.HreqArgs{
 			Method: http.MethodPost,
 			Base:   si.URL(cmn.NetIntraData),
 			Path:   apc.URLPathdSortShards.Join(m.ManagerUUID),
-			Query:  query,
+			Query:  q,
 			BodyR:  r,
 		}
 		err := m._do(reqArgs, si, "distribute shards")
@@ -899,6 +900,8 @@ func (m *Manager) _do(reqArgs *cmn.HreqArgs, tsi *meta.Snode, act string) error 
 		return errV
 	}
 	resp, err := m.client.Do(req) //nolint:bodyclose // cos.Close below
+
+	cmn.HreqFree(req)
 	if err != nil {
 		return err
 	}
@@ -1024,11 +1027,11 @@ func (es *extractShard) _do(lom *core.LOM) error {
 	}
 
 	if toDisk {
-		g.tstats.Add(stats.DsortExtractShardDskCnt, 1)
+		core.T.StatsUpdater().Add(stats.DsortExtractShardDskCnt, 1)
 	} else {
-		g.tstats.Add(stats.DsortExtractShardMemCnt, 1)
+		core.T.StatsUpdater().Add(stats.DsortExtractShardMemCnt, 1)
 	}
-	g.tstats.Add(stats.DsortExtractShardSize, extractedSize)
+	core.T.StatsUpdater().Add(stats.DsortExtractShardSize, extractedSize)
 
 	//
 	// update metrics, check OOM

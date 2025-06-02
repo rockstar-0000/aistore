@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -194,7 +194,7 @@ retry:
 }
 
 func TestRProxyInvalidURL(t *testing.T) {
-	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true}) // NOTE: ht:// is now conditionally linked, requires 'ht' build tag
+	t.Skipf("skipping %s: requires 'ht' build tag", t.Name())
 	var (
 		proxyURL   = tools.GetPrimaryURL()
 		baseParams = tools.BaseAPIParams(proxyURL)
@@ -223,7 +223,7 @@ func TestRProxyInvalidURL(t *testing.T) {
 			// case 1: bad response on GET followed by a failure to HEAD
 			tassert.DoAndCheckResp(t, client, req, test.statusCode, http.StatusForbidden)
 			_, err = api.HeadBucket(baseParams, hbo.Bck, false /* don't add */)
-			tassert.Errorf(t, err != nil, "shouldn't create bucket (%s) for invalid resource URL %q", hbo.Bck, test.url)
+			tassert.Errorf(t, err != nil, "shouldn't create bucket (%s) for invalid resource URL %q", hbo.Bck.String(), test.url)
 		} else {
 			// case 2: cannot GET but can still do a HEAD (even though ETag is not provided)
 			resp, err := client.Do(req)

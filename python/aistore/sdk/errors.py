@@ -1,17 +1,38 @@
 #
-# Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
 #
+import requests
 
 
-class AISError(Exception):
+class APIRequestError(Exception):
+    """
+    Base class for errors from HTTP servers, e.g. AIS or AuthN
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        req_url: str,
+        req: requests.PreparedRequest,
+    ):
+        self.status_code = status_code
+        self.message = message
+        self.req_url = req_url
+        self.req = req
+        super().__init__(f"STATUS:{status_code}, MESSAGE:{message}, REQ_URL:{req_url}")
+
+
+class AISError(APIRequestError):
     """
     Raised when an error is encountered from a query to the AIS cluster
     """
 
-    def __init__(self, status_code: int, message: str):
-        self.status_code = status_code
-        self.message = message
-        super().__init__(f"STATUS:{status_code}, MESSAGE:{message}")
+
+class AISRetryableError(AISError):
+    """
+    Exception raised for AIStore related errors that may resolve by retrying.
+    """
 
 
 # pylint: disable=unused-variable
@@ -21,7 +42,7 @@ class InvalidBckProvider(Exception):
     """
 
     def __init__(self, provider):
-        super().__init__(f"Invalid bucket provider {provider}")
+        super().__init__(f"Invalid bucket provider: '{provider}'")
 
 
 # pylint: disable=unused-variable
@@ -39,6 +60,13 @@ class ErrBckNotFound(AISError):
 
 
 # pylint: disable=unused-variable
+class ErrObjNotFound(AISRetryableError):
+    """
+    Raised when an object is expected and not found
+    """
+
+
+# pylint: disable=unused-variable
 class ErrBckAlreadyExists(AISError):
     """
     Raised when a bucket is created but already exists in AIS
@@ -49,6 +77,19 @@ class ErrBckAlreadyExists(AISError):
 class ErrETLAlreadyExists(AISError):
     """
     Raised when an ETL is created but already exists in AIS
+    """
+
+
+class ErrGETConflict(AISRetryableError):
+    """
+    Raised when AIS cannot obtain a write lock because another process is currently writing this object to local storage
+    """
+
+
+# pylint: disable=unused-variable
+class ErrETLNotFound(AISError):
+    """
+    Raised when an ETL is expected but not found
     """
 
 
@@ -105,4 +146,15 @@ class InvalidURLException(Exception):
     def __init__(self, url):
         super().__init__(
             f"Invalid URL: '{url}'. Ensure it follows the format 'provider://bucket/object'."
+        )
+
+
+class NoTargetError(Exception):
+    """
+    Raised when attempting to select a target for an object, but none were found in cluster map
+    """
+
+    def __init__(self, total_nodes: int):
+        super().__init__(
+            f"No available targets in the cluster map. Total nodes: {total_nodes}"
         )

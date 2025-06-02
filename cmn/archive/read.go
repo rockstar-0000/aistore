@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -17,7 +17,8 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/pierrec/lz4/v3"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 const (
@@ -65,10 +66,9 @@ type ErrMatchMode struct{ mmode string }
 // private
 type (
 	matcher struct {
+		re    *regexp.Regexp // when (and if) compiled
 		regex string
 		mmode string
-		// when (and if) compiled
-		re *regexp.Regexp
 	}
 )
 
@@ -86,8 +86,8 @@ type (
 	}
 	zipReader struct {
 		baseR
-		size int64
 		zr   *zip.Reader
+		size int64
 	}
 	lz4Reader struct {
 		tr  tarReader
@@ -172,9 +172,9 @@ func (tr *tarReader) init(fh io.Reader) error {
 	return nil
 }
 
-func (tr *tarReader) ReadUntil(rcb ArchRCB, regex, mmode string) (err error) {
+func (tr *tarReader) ReadUntil(rcb ArchRCB, regex, mmode string) error {
 	matcher := matcher{regex: regex, mmode: mmode}
-	if err = matcher.init(); err != nil {
+	if err := matcher.init(); err != nil {
 		return err
 	}
 	for {
@@ -258,9 +258,9 @@ func (zr *zipReader) init(fh io.Reader) (err error) {
 	return
 }
 
-func (zr *zipReader) ReadUntil(rcb ArchRCB, regex, mmode string) (err error) {
+func (zr *zipReader) ReadUntil(rcb ArchRCB, regex, mmode string) error {
 	matcher := matcher{regex: regex, mmode: mmode}
-	if err = matcher.init(); err != nil {
+	if err := matcher.init(); err != nil {
 		return err
 	}
 	for _, f := range zr.zr.File {
@@ -276,14 +276,16 @@ func (zr *zipReader) ReadUntil(rcb ArchRCB, regex, mmode string) (err error) {
 		}
 
 		csf := &cslFile{size: int64(f.FileHeader.UncompressedSize64)}
-		if csf.file, err = f.Open(); err != nil {
+		r, err := f.Open()
+		if err != nil {
 			return err
 		}
-		if stop, err := rcb.Call(f.FileHeader.Name, csf, &f.FileHeader); stop || err != nil {
-			return err
+		csf.file = r
+		if stop, e := rcb.Call(f.FileHeader.Name, csf, &f.FileHeader); stop || e != nil {
+			return e
 		}
 	}
-	return
+	return nil
 }
 
 func (zr *zipReader) ReadOne(filename string) (reader cos.ReadCloseSizer, err error) {

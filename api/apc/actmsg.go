@@ -1,6 +1,6 @@
 // Package apc: API constant and control messages
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -50,7 +51,6 @@ const (
 	ActStoreCleanup = "cleanup-store"
 
 	ActEvictRemoteBck = "evict-remote-bck" // evict remote bucket's data
-	ActInvalListCache = "inval-listobj-cache"
 	ActList           = "list"
 	ActLoadLomCache   = "load-lom-cache"
 	ActNewPrimary     = "new-primary"
@@ -63,6 +63,10 @@ const (
 	ActSetConfig   = "set-config"
 
 	ActRotateLogs = "rotate-logs"
+
+	ActReloadBackendCreds = "reload-creds"
+
+	ActClearLcache = "clear-lcache"
 
 	ActShutdownCluster = "shutdown" // see also: ActShutdownNode
 
@@ -95,20 +99,26 @@ const (
 	ActKeepaliveUpdate = "keepalive-update"
 
 	// IC
-	ActSendOwnershipTbl  = "ic-send-own-tbl"
 	ActListenToNotif     = "watch-xaction"
 	ActMergeOwnershipTbl = "ic-merge-own-tbl"
 	ActRegGlobalXaction  = "reg-global-xaction"
+
+	// advanced usage
+	ActCheckLock = "check-lock"
+
+	// Moss
+	ActGetBatch = "get-batch"
 )
 
 // internal use
 const (
-	ActAddRemoteBck   = "add-remote-bck"         // add to BMD existing remote bucket, usually on the fly
-	ActRmNodeUnsafe   = "rm-unsafe"              // primary => the node to be removed
-	ActStartGFN       = "start-gfn"              // get-from-neighbor
-	ActStopGFN        = "stop-gfn"               // off
-	ActCleanupMarkers = "cleanup-markers"        // part of the target joining sequence
-	ActSelfRemove     = "self-initiated-removal" // e.g., when losing last mountpath
+	ActAddRemoteBck = "add-remote-bck"         // add to BMD existing remote bucket, usually on the fly
+	ActRmNodeUnsafe = "rm-unsafe"              // primary => the node to be removed
+	ActStartGFN     = "start-gfn"              // get-from-neighbor
+	ActStopGFN      = "stop-gfn"               // off
+	ActSelfRemove   = "self-initiated-removal" // e.g., when losing last mountpath
+	ActPrimaryForce = "primary-force"          // set primary with force (BEWARE! advanced usage only)
+	ActBumpMetasync = "bump-metasync"          // when executing ActPrimaryForce - the final step
 )
 
 const (
@@ -129,7 +139,7 @@ const (
 	ActTransient = "transient" // transient - in-memory only
 )
 
-// xaction begin-commit phases and related control
+// xaction 2-phase commit and related control (compare w/ QparamPrepare)
 const (
 	ActBegin  = "begin"
 	ActCommit = "commit"
@@ -144,8 +154,14 @@ const (
 )
 
 const (
-	ActEcOpen  = "open-ec-streams"
-	ActEcClose = "close-ec-streams"
+	ActDmOpen  = "open-shared-streams"
+	ActDmClose = "close-shared-streams"
+)
+
+const (
+	ActEcOpen    = "open-ec-streams"
+	ActEcClose   = "close-ec-streams"
+	ActEcRecover = "recover" // check and recover missing or corrupted EC metadata and/or slices, if any
 )
 
 // ActMsg is a JSON-formatted control structures used in a majority of API calls

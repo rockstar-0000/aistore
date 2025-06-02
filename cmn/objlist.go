@@ -11,10 +11,11 @@ import (
 
 const MsgpLsoBufSize = 32 * cos.KiB
 
-//
-// NOTE: changes in this source MAY require re-running `msgp` code generation - see docs/msgp.md for details.
-// NOTE: all json tags except `Flags` must belong to the (apc.GetPropsName, apc.GetPropsSize, etc.) enumeration
-//
+// [NOTE]
+// - changes in this source MAY require re-running `msgp` code generation - see docs/msgp.md for details.
+// - all json tags except `Flags` must belong to the (apc.GetPropsName, apc.GetPropsSize, etc.) enumeration
+// [TODO]
+// - revisit (make) allocation of LsoEntries (optimize)
 
 type (
 	// a single entry in LsoRes.Entries (below); contains list-objects results

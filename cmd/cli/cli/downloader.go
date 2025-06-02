@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles download jobs in the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -18,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ext/dload"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
 	"github.com/vbauerster/mpb/v4/decor"
@@ -44,6 +45,7 @@ type (
 		id          string
 		apiBP       api.BaseParams
 		refreshTime time.Duration
+		timeout     time.Duration
 
 		states map[string]*fileDownloadingState
 
@@ -79,8 +81,11 @@ func (d downloadingResult) String() string {
 			d.finishedFiles, d.errFiles)
 	}
 
-	var sb strings.Builder
-
+	var (
+		sb strings.Builder
+		l  = 1024
+	)
+	sb.Grow(l)
 	if d.totalFiles > 0 {
 		sb.WriteString(fmt.Sprintf("Downloaded %d out of %d files.", d.finishedFiles, d.totalFiles))
 	} else {
@@ -96,11 +101,12 @@ func (d downloadingResult) String() string {
 	return sb.String()
 }
 
-func newDownloaderPB(baseParams api.BaseParams, id string, refreshTime time.Duration) *downloaderPB {
+func newDownloaderPB(baseParams api.BaseParams, id string, refreshTime, timeout time.Duration) *downloaderPB {
 	return &downloaderPB{
 		id:          id,
 		apiBP:       baseParams,
 		refreshTime: refreshTime,
+		timeout:     timeout,
 		states:      make(map[string]*fileDownloadingState),
 		p:           mpb.New(mpb.WithWidth(barWidth)),
 	}
@@ -119,8 +125,16 @@ func (b *downloaderPB) run() (downloadingResult, error) {
 	// TODO: factor in:
 	// 1) no-change in downloaded stats for more than `timeoutNoChange`
 	// 2) resp.JobFinished()
+	var elapsed time.Duration
 	for !b.jobFinished() {
 		time.Sleep(b.refreshTime)
+		elapsed += b.refreshTime
+
+		// Check timeout if specified (fixes issue where progress monitoring ignores user-specified timeout)
+		if b.timeout > 0 && elapsed > b.timeout {
+			b.cleanBars()
+			return downloadingResult{}, fmt.Errorf("download timed out after %v", b.timeout)
+		}
 
 		resp, err := api.DownloadStatus(b.apiBP, b.id, true)
 		if err != nil {
@@ -329,7 +343,7 @@ func downloadJobsList(c *cli.Context, regex string, caption bool) (int, error) {
 		return 0, V(err)
 	}
 	if caption {
-		jobCptn(c, cmdDownload, onlyActive, "", false)
+		jobCptn(c, cmdDownload, "" /*xid*/, "" /*ctlmsg*/, onlyActive, false)
 	}
 	l := len(list)
 	if l == 0 {
@@ -388,7 +402,9 @@ func downloadJobStatus(c *cli.Context, id string) error {
 	// with progress bar
 	if flagIsSet(c, progressFlag) {
 		refreshRate := _refreshRate(c)
-		downloadingResult, err := newDownloaderPB(apiBP, id, refreshRate).run()
+		// Note: timeout=0 for monitoring existing jobs (server-side timeout still applies)
+		// This is different from pbDownload() which applies user-specified timeout for new downloads
+		downloadingResult, err := newDownloaderPB(apiBP, id, refreshRate, 0).run()
 		if err != nil {
 			return err
 		}

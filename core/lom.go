@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -43,16 +43,17 @@ const (
 	// lcache stats
 	LcacheCollisionCount = "lcache.collision.n"
 	LcacheEvictedCount   = "lcache.evicted.n"
+	LcacheErrCount       = "err.lcache.n" // errPrefix + "lcache.n"
 	LcacheFlushColdCount = "lcache.flush.cold.n"
 )
 
 type (
-	lmeta struct {
+	lmeta struct { // sizeof = 72
 		copies fs.MPI
 		uname  *string
 		cmn.ObjAttrs
 		atimefs uint64 // (high bit `lomDirtyMask` | int64: atime)
-		lid     lomBID
+		lid     lomBID // (for bitwise structure, see lombid.go)
 	}
 	LOM struct {
 		mi      *fs.Mountpath
@@ -67,11 +68,11 @@ type (
 
 type (
 	global struct {
-		tstats   cos.StatsUpdater // (stats.Trunner)
-		pmm, smm *memsys.MMSA
-		maxLmeta atomic.Int64
+		pmm      *memsys.MMSA
+		smm      *memsys.MMSA
 		locker   nameLocker
 		lchk     lchk
+		maxLmeta atomic.Int64
 	}
 )
 
@@ -95,18 +96,17 @@ var (
 
 func Pinit() { bckLocker = newNameLocker() }
 
-func Tinit(t Target, tstats cos.StatsUpdater, runHK bool) {
+func Tinit(t Target, config *cmn.Config, runHK bool) {
 	bckLocker = newNameLocker()
 	T = t
 	{
 		g.maxLmeta.Store(xattrMaxSize)
 		g.locker = newNameLocker()
-		g.tstats = tstats
 		g.pmm = t.PageMM()
 		g.smm = t.ByteMM()
 	}
 	if runHK {
-		regLomCacheWithHK()
+		g.lchk.init(config)
 	}
 	for i := range recordSepa {
 		recdupSepa[i] = recordSepa[i]
@@ -118,7 +118,7 @@ func Term() {
 	for i := 0; i < 8 && !g.lchk.running.CAS(false, true); i++ {
 		time.Sleep(sleep)
 	}
-	g.lchk.evictOlder(termDuration)
+	g.lchk.term()
 }
 
 /////////
@@ -168,9 +168,11 @@ func (lom *LOM) Digest() uint64    { return lom.digest }
 
 func (lom *LOM) SetSize(size int64) { lom.md.Size = size }
 
-func (lom *LOM) Checksum() *cos.Cksum          { return lom.md.Cksum }
-func (lom *LOM) SetCksum(cksum *cos.Cksum)     { lom.md.Cksum = cksum }
-func (lom *LOM) EqCksum(cksum *cos.Cksum) bool { return lom.md.Cksum.Equal(cksum) }
+func (lom *LOM) Checksum() *cos.Cksum      { return lom.md.Cksum }
+func (lom *LOM) SetCksum(cksum *cos.Cksum) { lom.md.Cksum = cksum }
+func (lom *LOM) EqCksum(cksum *cos.Cksum) bool {
+	return !lom.md.Cksum.IsEmpty() && lom.md.Cksum.Equal(cksum)
+}
 
 func (lom *LOM) Atime() time.Time      { return time.Unix(0, lom.md.Atime) }
 func (lom *LOM) AtimeUnix() int64      { return lom.md.Atime }
@@ -192,24 +194,23 @@ func (lom *LOM) IsHRW() bool {
 	return lom.HrwFQN == p || lom.FQN == *lom.HrwFQN
 }
 
-func (lom *LOM) Bprops() *cmn.Bprops { return lom.bck.Props }
-
-// bprops accessors for convenience
+// assorted accessors
+func (lom *LOM) Bck() *meta.Bck                 { return &lom.bck }
+func (lom *LOM) Bprops() *cmn.Bprops            { return lom.bck.Props }
 func (lom *LOM) ECEnabled() bool                { return lom.Bprops().EC.Enabled }
 func (lom *LOM) IsFeatureSet(f feat.Flags) bool { return lom.Bprops().Features.IsSet(f) }
 func (lom *LOM) MirrorConf() *cmn.MirrorConf    { return &lom.Bprops().Mirror }
 func (lom *LOM) CksumConf() *cmn.CksumConf      { return lom.bck.CksumConf() }
 func (lom *LOM) CksumType() string              { return lom.bck.CksumConf().Type }
 func (lom *LOM) VersionConf() cmn.VersionConf   { return lom.bck.VersionConf() }
+func (lom *LOM) Location() string               { return T.String() + apc.LocationPropSepa + lom.mi.String() }
 
 // as fs.PartsFQN
 func (lom *LOM) ObjectName() string       { return lom.ObjName }
-func (lom *LOM) Bck() *meta.Bck           { return &lom.bck }
 func (lom *LOM) Bucket() *cmn.Bck         { return (*cmn.Bck)(&lom.bck) }
 func (lom *LOM) Mountpath() *fs.Mountpath { return lom.mi }
-func (lom *LOM) Location() string         { return T.String() + apc.LocationPropSepa + lom.mi.String() }
 
-// chunks vs whole // TODO -- FIXME: NIY
+// chunks vs whole // TODO: NIY
 func (lom *LOM) IsChunked(special ...bool) bool {
 	debug.Assert(len(special) > 0 || lom.loaded())
 	return false
@@ -309,7 +310,7 @@ func (lom *LOM) ValidateMetaChecksum() error {
 	// different versions may have different checksums
 	if md.Version() == lom.md.Version() && !lom.EqCksum(md.Cksum) {
 		err = cos.NewErrDataCksum(lom.md.Cksum, md.Cksum, lom.String())
-		lom.Uncache()
+		lom.UncacheDel()
 	}
 	return err
 }
@@ -328,13 +329,13 @@ func (lom *LOM) ValidateContentChecksum() (err error) {
 	)
 recomp:
 	if cksumType == cos.ChecksumNone { // as far as do-no-checksum-checking bucket rules
-		return
+		return nil
 	}
 	if !lom.md.Cksum.IsEmpty() {
 		cksumType = lom.md.Cksum.Ty() // takes precedence on the other hand
 	}
 	if cksums.comp, err = lom.ComputeCksum(cksumType); err != nil {
-		return
+		return err
 	}
 	if lom.md.Cksum.IsEmpty() { // store computed
 		lom.md.Cksum = cksums.comp.Clone()
@@ -344,10 +345,10 @@ recomp:
 		if err = lom.Persist(); err != nil {
 			lom.md.Cksum = cksums.stor
 		}
-		return
+		return err
 	}
 	if cksums.comp.Equal(lom.md.Cksum) {
-		return
+		return nil
 	}
 	if reloaded {
 		goto ex
@@ -363,13 +364,13 @@ recomp:
 		}
 		// otherwise, check
 		if cksums.comp.Equal(lom.md.Cksum) {
-			return
+			return nil
 		}
 	}
 ex:
 	err = cos.NewErrDataCksum(&cksums.comp.Cksum, cksums.stor, lom.String())
-	lom.Uncache()
-	return
+	lom.UncacheDel()
+	return err
 }
 
 func (lom *LOM) ComputeSetCksum() (*cos.Cksum, error) {
@@ -413,6 +414,9 @@ func (lom *LOM) Load(cacheit, locked bool) error {
 	// fast path
 	if lmd != nil {
 		lom.md = *lmd
+		if lom.IsFntl() {
+			lom.fixupFntl()
+		}
 		return lom._checkBucket(bmd)
 	}
 
@@ -423,21 +427,22 @@ func (lom *LOM) Load(cacheit, locked bool) error {
 	if err := lom.FromFS(); err != nil {
 		return err
 	}
-	if lom.bid() == 0 {
-		// copies, etc.
-		lom.setbid(lom.Bprops().BID)
-	}
+
+	// MetaverLOM = 1: always zero (not storing lom.md.lid)
+	debug.Assert(lom.bid() == 0 || lom.bid() == lom.Bprops().BID, lom.bid())
+	lom.setbid(lom.Bprops().BID)
+
 	if err := lom._checkBucket(bmd); err != nil {
 		return err
 	}
-	if cacheit && lcache != nil {
+	if cacheit {
 		md := lom.md
 		lcache.Store(lom.digest, &md)
 	}
 	return nil
 }
 
-func (lom *LOM) _checkBucket(bmd *meta.BMD) (err error) {
+func (lom *LOM) _checkBucket(bmd *meta.BMD) error {
 	bck := &lom.bck
 	bprops, present := bmd.Get(bck)
 	if !present {
@@ -446,12 +451,10 @@ func (lom *LOM) _checkBucket(bmd *meta.BMD) (err error) {
 		}
 		return cmn.NewErrBckNotFound(bck.Bucket())
 	}
-	// TODO -- FIXME: lom.bid() is 52 bits, bprops.BID is not
-	// (see core/meta/bid.go)
 	if lom.bid() != bprops.BID {
-		err = cmn.NewErrObjDefunct(lom.String(), lom.bid(), bprops.BID)
+		return cmn.NewErrObjDefunct(lom.String(), lom.bid(), bprops.BID)
 	}
-	return err
+	return nil
 }
 
 // usage: fast (and unsafe) loading object metadata except atime - no locks
@@ -464,16 +467,18 @@ func (lom *LOM) LoadUnsafe() (err error) {
 	// fast path
 	if lmd != nil {
 		lom.md = *lmd
+		if lom.IsFntl() {
+			lom.fixupFntl()
+		}
 		return lom._checkBucket(bmd)
 	}
 
 	// read and decode xattr; NOTE: fs.GetXattr* vs fs.SetXattr race possible and must be
 	// either a) handled or b) benign from the caller's perspective
 	if _, err = lom.lmfs(true); err == nil {
-		if lom.bid() == 0 {
-			// copies, etc.
-			lom.setbid(lom.Bprops().BID)
-		}
+		// MetaverLOM = 1: always zero (not storing lom.md.lid)
+		debug.Assert(lom.bid() == 0 || lom.bid() == lom.Bprops().BID, lom.bid())
+		lom.setbid(lom.Bprops().BID)
 		err = lom._checkBucket(bmd)
 	}
 	return err
@@ -508,7 +513,7 @@ func (lom *LOM) _collide(lmd *lmeta) {
 	if cmn.Rom.FastV(4, cos.SmoduleCore) || lom.digest&0xf == 5 {
 		nlog.InfoDepth(1, LcacheCollisionCount, lom.digest, "[", *lmd.uname, "]", *lom.md.uname, lom.Cname())
 	}
-	g.tstats.Inc(LcacheCollisionCount)
+	T.StatsUpdater().Inc(LcacheCollisionCount)
 }
 
 func (lom *LOM) Uncache() {
@@ -525,6 +530,12 @@ func (lom *LOM) Uncache() {
 	}
 }
 
+// upon: error; RemoveObj
+func (lom *LOM) UncacheDel() {
+	lcache := lom.lcache()
+	lcache.Delete(lom.digest)
+}
+
 // remove from cache unless dirty
 func (lom *LOM) UncacheUnless() {
 	lcache, lmd := lom.fromCache()
@@ -537,8 +548,8 @@ func (lom *LOM) UncacheUnless() {
 	}
 }
 
-func (lom *LOM) CacheIdx() int     { return fs.LcacheIdx(lom.digest) } // (lif.CacheIdx())
-func (lom *LOM) lcache() *sync.Map { return lom.mi.LomCache(lom.CacheIdx()) }
+func (lom *LOM) CacheIdx() int     { return lcacheIdx(lom.digest) }
+func (lom *LOM) lcache() *sync.Map { return lom.mi.LomCaches.Get(lom.CacheIdx()) }
 
 func (lom *LOM) fromCache() (lcache *sync.Map, lmd *lmeta) {
 	lcache = lom.lcache()
@@ -553,13 +564,42 @@ func (lom *LOM) fromCache() (lcache *sync.Map, lmd *lmeta) {
 
 func (lom *LOM) FromFS() error {
 	size, atimefs, _, err := lom.Fstat(true /*get-atime*/)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			err = os.NewSyscallError("stat", err)
-			T.FSHC(err, lom.Mountpath(), lom.FQN)
-		}
-		return err
+	if err == nil {
+		goto exist
 	}
+
+	switch {
+	case os.IsNotExist(err):
+		return err
+
+	case strings.Contains(err.Error(), "not a directory") && cos.IsPathErr(err):
+		// e.g. err "stat .../aaa/111: not a directory" when there's existing ".../aaa" object
+		return fmt.Errorf("%w (object in the path?)", err)
+	case cos.IsErrFntl(err):
+		lom.md.lid = lomBID(lom.Bprops().BID)
+		lom.md.lid = lom.md.lid.setlmfl(lmflFntl)
+
+		// temp substitute to check existence
+		short := lom.ShortenFntl()
+		saved := lom.PushFntl(short)
+		size, atimefs, _, err = lom.Fstat(true)
+		if err == nil {
+			goto exist
+		}
+
+		lom.PopFntl(saved)
+		debug.Assert(!cos.IsErrFntl(err))
+		if os.IsNotExist(err) {
+			return err
+		}
+		lom.md.lid = lom.md.lid.clrlmfl(lmflFntl)
+		fallthrough
+	default:
+		err = os.NewSyscallError("stat", err)
+		T.FSHC(err, lom.Mountpath(), lom.FQN)
+	}
+
+exist:
 	if _, err = lom.lmfs(true); err != nil {
 		// retry once
 		if cmn.IsErrLmetaNotFound(err) {
@@ -587,38 +627,16 @@ func (lom *LOM) whingeSize(size int64) error {
 	return fmt.Errorf("errsize (%d != %d)", lom.md.Size, size)
 }
 
-func lomCaches() []*sync.Map {
-	var (
-		i         int
-		avail     = fs.GetAvail()
-		cachesCnt = len(avail) * cos.MultiSyncMapCount
-		caches    = make([]*sync.Map, cachesCnt)
-	)
-	for _, mi := range avail {
-		for idx := range cos.MultiSyncMapCount {
-			caches[i] = mi.LomCache(idx)
-			i++
-		}
-	}
-	return caches
-}
-
 //
 // lock/unlock ------------------------------------------
 //
 
 func (lom *LOM) getLocker() *nlc { return &g.locker[lom.CacheIdx()] } // (lif.getLocker())
 
-func (lom *LOM) isLockedExcl() (exclusive bool) {
+// returns {apc.LockNone, ...} enum
+func (lom *LOM) IsLocked() int {
 	nlc := lom.getLocker()
-	_, exclusive = nlc.IsLocked(lom.Uname())
-	return exclusive
-}
-
-func (lom *LOM) isLockedRW() bool {
-	nlc := lom.getLocker()
-	rc, exclusive := nlc.IsLocked(lom.Uname())
-	return exclusive || rc > 0
+	return nlc.IsLocked(lom.Uname())
 }
 
 func (lom *LOM) TryLock(exclusive bool) bool {
@@ -644,4 +662,59 @@ func (lom *LOM) DowngradeLock() {
 func (lom *LOM) Unlock(exclusive bool) {
 	nlc := lom.getLocker()
 	nlc.Unlock(lom.Uname(), exclusive)
+}
+
+//
+// file name too long (0x24) ----------------------------
+//
+
+func (lom *LOM) IsFntl() bool {
+	return lom.md.lid.haslmfl(lmflFntl)
+}
+
+// (compare with fs/content Gen())
+func (lom *LOM) ShortenFntl() []string {
+	debug.Assert(fs.IsFntl(lom.ObjName), lom.FQN)
+
+	noname := fs.ShortenFntl(lom.FQN)
+	nfqn := lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, noname)
+
+	debug.Assert(len(nfqn) < 4096, "PATH_MAX /usr/include/limits.h", len(nfqn))
+	return []string{nfqn, noname}
+}
+
+func (lom *LOM) fixupFntl() {
+	if !fs.IsFntl(lom.ObjName) {
+		return
+	}
+	lom.ObjName = fs.ShortenFntl(lom.FQN)                                  // noname
+	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName) // nfqn
+	lom.HrwFQN = &lom.FQN
+}
+
+func (lom *LOM) OrigFntl() []string {
+	debug.Assert(lom.IsFntl())
+	ofqn, ok := lom.GetCustomKey(cmn.OrigFntl)
+	if !ok {
+		debug.Assert(false)
+		return nil
+	}
+	var parsed fs.ParsedFQN
+	if err := parsed.Init(ofqn); err != nil {
+		debug.Assert(false)
+		return nil
+	}
+	return []string{ofqn, parsed.ObjName}
+}
+
+func (lom *LOM) PushFntl(short []string) (saved []string) {
+	saved = []string{lom.FQN, lom.ObjName}
+	lom.FQN, lom.ObjName = short[0], short[1]
+	lom.HrwFQN = &lom.FQN
+	return saved
+}
+
+func (lom *LOM) PopFntl(saved []string) {
+	lom.FQN, lom.ObjName = saved[0], saved[1]
+	lom.HrwFQN = &lom.FQN
 }

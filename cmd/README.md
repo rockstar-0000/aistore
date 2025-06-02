@@ -13,6 +13,7 @@
 | `cmd/aisnodeprofile` | `aisnode` | ... with profiling enabled | |
 | `cmd/authn` | `authn` | Standalone server providing token-based secure access to AIS clusters | [AuthN](/docs/authn.md) |
 | `cmd/xmeta` | `xmeta` | Low-level tool to format (or extract in plain text) assorted AIS metadata and control structures | [xmeta](/cmd/xmeta/README.md) |
+| `cmd/ishard` | `ishard` | AIS integrated utility to create well-formed shards from the original dataset | [ishard](/cmd/ishard/README.md) |
 
 **NOTE**: installed CLI executable is named `ais`.
 
@@ -20,7 +21,7 @@
 
 Generally, AIStore (cluster) requires at least some sort of [deployment](/deploy#contents) process or sequence.
 
-Standalone binaries, on the other hand, can be [built](Makefile) from source or installed directly from the latest or previous GitHub releases.
+Standalone binaries, on the other hand, can be [built](/Makefile) from source or installed directly from the latest or previous GitHub releases.
 
 **NOTE:** binary installation is supported only for the `linux-amd64` platform.
 
@@ -42,7 +43,7 @@ OPTIONS:
   --completions         install and enable _only_ CLI autocompletions (ie., skip installing binaries)
 ```
 
-**NOTE:** For CLI, the script will also enable auto-completions. CLI can be used without (bash, zsh) auto-completions but, generally, using using auto-completions is strongly recommended.
+**NOTE:** For CLI, the script will also enable auto-completions. CLI can be used without (bash, zsh) auto-completions but, generally, using auto-completions is strongly recommended.
 
 ### Example: download 'ais' and 'aisloader' binaries from the latest release
 
@@ -116,4 +117,29 @@ OR, same:
 ```console
 $ cd cmd/xmeta
 $ go install
+```
+
+## ishard
+
+`ishard` is a AIS integrated utility to create well-formed shards from the original dataset - see [usage](/cmd/ishard/README.md).
+
+For command line options and usage examples, simply run `ishard` with no arguments:
+
+```console
+$ ishard
+Usage of ishard:
+  ...
+...
+```
+
+To install, run:
+
+```console
+$ make ishard
+```
+
+You could also use `go install`:
+
+```console
+$ go install github.com/NVIDIA/aistore/cmd/ishard@latest
 ```

@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -38,7 +38,7 @@ func (t *Table) addRow(row row) {
 }
 
 func (t *Table) Template(hideHeader bool) string {
-	sb := strings.Builder{}
+	var sb strings.Builder
 	if !hideHeader {
 		headers := make([]string, 0, len(t.headers))
 		for _, header := range t.headers {

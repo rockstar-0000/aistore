@@ -1,12 +1,17 @@
 #
-# Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
 #
+
+# Units
+GB = 10**9
+KIB = 2**10
 
 # Standard Header Keys
 HEADER_ACCEPT = "Accept"
 HEADER_USER_AGENT = "User-Agent"
 HEADER_CONTENT_TYPE = "Content-Type"
 HEADER_CONTENT_LENGTH = "Content-Length"
+HEADER_LOCATION = "Location"
 # Standard Header Values
 USER_AGENT_BASE = "ais/python"
 JSON_CONTENT_TYPE = "application/json"
@@ -30,6 +35,7 @@ HEADER_BUCKET_PROPS = HEADER_PREFIX + "bucket-props"
 HEADER_BUCKET_SUMM = HEADER_PREFIX + "bucket-summ"
 HEADER_XACTION_ID = HEADER_PREFIX + "xaction-id"
 HEADER_NODE_ID = HEADER_PREFIX + "node-id"
+HEADER_NODE_URL = HEADER_PREFIX + "node-url"
 # Object Props Header Keys
 HEADER_OBJECT_BLOB_DOWNLOAD = HEADER_PREFIX + "blob-download"
 HEADER_OBJECT_BLOB_CHUNK_SIZE = HEADER_PREFIX + "blob-chunk"
@@ -43,7 +49,6 @@ HEADER_AUTHORIZATION = "Authorization"
 # URL Params
 # See api/apc/query.go
 QPARAM_WHAT = "what"
-QPARAM_ETL_NAME = "etl_name"
 QPARAM_PROVIDER = "provider"
 QPARAM_BCK_TO = "bck_to"
 QPARAM_FLT_PRESENCE = "presence"
@@ -61,6 +66,13 @@ DSORT_UUID = "uuid"
 QPARAM_UUID = "uuid"
 QPARAM_LATEST = "latest-ver"
 QPARAM_NEW_CUSTOM = "set-new-custom"
+# etl
+QPARAM_ETL_NAME = "etl_name"
+QPARAM_ETL_ARGS = "etl_args"
+# etl websocket
+ETL_WS_DESTINATION_ADDR = "dst_addr"
+ETL_WS_FQN = "fqn"
+ETL_WS_PATH = "path"
 
 # URL Param values
 # See api/apc/query.go
@@ -69,7 +81,6 @@ WHAT_ONE_XACT_STATUS = "status"
 WHAT_ALL_XACT_STATUS = "status_all"
 WHAT_ALL_RUNNING_STATUS = "running_all"
 WHAT_QUERY_XACT_STATS = "qryxstats"
-WHAT_NODE_STATS_AND_STATUS_V322 = "status"
 WHAT_NODE_STATS_AND_STATUS = "node_status"
 
 # URL paths
@@ -87,14 +98,6 @@ URL_PATH_AUTHN_USERS = "users"
 URL_PATH_AUTHN_CLUSTERS = "clusters"
 URL_PATH_AUTHN_ROLES = "roles"
 URL_PATH_AUTHN_TOKENS = "tokens"
-
-# Bucket providers
-# See api/apc/provider.go
-PROVIDER_AIS = "ais"
-PROVIDER_AMAZON = "aws"
-PROVIDER_AZURE = "azure"
-PROVIDER_GOOGLE = "gcp"
-PROVIDER_HTTP = "ht"
 
 # HTTP Methods
 HTTP_METHOD_GET = "get"
@@ -127,7 +130,7 @@ ACT_ARCHIVE_OBJECTS = "archive"
 ACT_START = "start"
 
 # Defaults
-DEFAULT_CHUNK_SIZE = 32768
+DEFAULT_CHUNK_SIZE = 32 * KIB
 DEFAULT_JOB_WAIT_TIMEOUT = 300
 DEFAULT_DSORT_WAIT_TIMEOUT = 300
 DEFAULT_DATASET_MAX_COUNT = 100000
@@ -138,13 +141,22 @@ UTF_ENCODING = "utf-8"
 
 # Status Codes
 STATUS_ACCEPTED = 202
+STATUS_NO_CONTENT = 204
 STATUS_OK = 200
 STATUS_BAD_REQUEST = 400
 STATUS_PARTIAL_CONTENT = 206
+STATUS_REDIRECT_TMP = 307
+STATUS_REDIRECT_PERM = 301
+
+# Protocol
+HTTP = "http://"
+HTTPS = "https://"
 
 # Environment Variables
 AIS_CLIENT_CA = "AIS_CLIENT_CA"
 AIS_AUTHN_TOKEN = "AIS_AUTHN_TOKEN"
+AIS_CLIENT_CRT = "AIS_CRT"
+AIS_CLIENT_KEY = "AIS_CRT_KEY"
 
 # Content Constants
 LOREM = (
@@ -167,3 +179,26 @@ AWS_DEFAULT_REGION = "us-east-1"
 NANOSECONDS_IN_SECOND = 1_000_000_000
 
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s: %(message)s"
+
+# Ref: https://www.rfc-editor.org/rfc/rfc7233#section-2.1
+BYTE_RANGE_PREFIX_LENGTH = 6
+
+# Custom seed (MLCG32)
+XX_HASH_SEED = 1103515245
+
+# Job Masked Field Constants
+# Ref:
+# ┌──────────────────────────────────────────┬───────────────┬──────────────────────────┐
+# │             bits 20 through 63           │ bits 10–19    │ bits 0–9                 │
+# │        CHANNEL_BUFFERED_COUNT (44 bits)  │ WORKER_COUNT  │ JOGGER_COUNT             │
+# └──────────────────────────────────────────┴───────────────┴──────────────────────────┘
+JOGGER_COUNT_BITS = 10
+WORKER_COUNT_BITS = 10
+CHANNEL_COUNT_BITS = 64 - (JOGGER_COUNT_BITS + WORKER_COUNT_BITS)
+
+# bit‐masks and shifts
+JOGGER_COUNT_MASK = (1 << JOGGER_COUNT_BITS) - 1
+WORKER_COUNT_SHIFT = JOGGER_COUNT_BITS
+WORKER_COUNT_MASK = ((1 << WORKER_COUNT_BITS) - 1) << WORKER_COUNT_SHIFT
+CHANNEL_COUNT_SHIFT = JOGGER_COUNT_BITS + WORKER_COUNT_BITS
+CHANNEL_COUNT_MASK = ((1 << CHANNEL_COUNT_BITS) - 1) << CHANNEL_COUNT_SHIFT

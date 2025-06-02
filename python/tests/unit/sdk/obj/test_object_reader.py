@@ -3,7 +3,7 @@ from unittest.mock import patch, Mock
 import requests
 
 from aistore.sdk.obj.content_iterator import ContentIterator
-from aistore.sdk.obj.object_file import ObjectFile
+from aistore.sdk.obj.obj_file.object_file import ObjectFileReader
 from aistore.sdk.obj.object_reader import ObjectReader
 from aistore.sdk.obj.object_attributes import ObjectAttributes
 
@@ -55,7 +55,7 @@ class TestObjectReader(unittest.TestCase):
 
         # Assert the result, the call to object client
         self.assertEqual(chunk1 + chunk2, content)
-        self.object_client.get.assert_called_with(stream=False, start_position=0)
+        self.object_client.get.assert_called_with(stream=False)
         # Assert attributes parsed and updated
         self.assertIsInstance(self.object_reader.attributes, ObjectAttributes)
         mock_attr.assert_called_with(self.response_headers)
@@ -71,7 +71,7 @@ class TestObjectReader(unittest.TestCase):
 
         # Assert the result, the call to object client
         self.assertEqual(mock_response.raw, raw_stream)
-        self.object_client.get.assert_called_with(stream=True, start_position=0)
+        self.object_client.get.assert_called_with(stream=True)
         # Assert attributes parsed and updated
         self.assertIsInstance(self.object_reader.attributes, ObjectAttributes)
         mock_attr.assert_called_with(self.response_headers)
@@ -82,34 +82,24 @@ class TestObjectReader(unittest.TestCase):
 
         res = iter(self.object_reader)
 
-        mock_cont_iter.iter_from_position.assert_called_with(0)
-        self.assertEqual(iterable_bytes, res)
-
-    @patch("aistore.sdk.obj.object_reader.ContentIterator")
-    def test_iter_start_position(self, mock_cont_iter_class):
-        mock_cont_iter, iterable_bytes = self.setup_mock_iterator(mock_cont_iter_class)
-        start_position = 2048
-
-        res = self.object_reader.iter_from_position(start_position)
-
-        mock_cont_iter.iter_from_position.assert_called_with(start_position)
+        mock_cont_iter.iter.assert_called_with()
         self.assertEqual(iterable_bytes, res)
 
     def setup_mock_iterator(self, mock_cont_iter_class):
         # We patch the class, so use it to create a new instance of a mock content iterator
         mock_cont_iter = Mock()
         iterable_bytes = iter(b"test")
-        mock_cont_iter.iter_from_position.return_value = iterable_bytes
+        mock_cont_iter.iter.return_value = iterable_bytes
         mock_cont_iter_class.return_value = mock_cont_iter
         # Re-create to use the patched ContentIterator in constructor
         self.object_reader = ObjectReader(self.object_client)
         return mock_cont_iter, iterable_bytes
 
-    @patch("aistore.sdk.obj.object_reader.ObjectFile", autospec=True)
+    @patch("aistore.sdk.obj.object_reader.ObjectFileReader", autospec=True)
     def test_as_file(self, mock_obj_file):
-        # Returns an object file with the default resume count
+        # Returns an ObjectFileReader with the default resume count
         res = self.object_reader.as_file()
-        self.assertIsInstance(res, ObjectFile)
+        self.assertIsInstance(res, ObjectFileReader)
         mock_obj_file.assert_called_once()
         # Get the arguments passed to the mock
         args, kwargs = mock_obj_file.call_args
@@ -118,12 +108,12 @@ class TestObjectReader(unittest.TestCase):
         # Check the max_resume argument
         self.assertEqual(kwargs.get("max_resume"), 5)
 
-    @patch("aistore.sdk.obj.object_reader.ObjectFile", autospec=True)
+    @patch("aistore.sdk.obj.object_reader.ObjectFileReader", autospec=True)
     def test_as_file_max_resume(self, mock_obj_file):
         max_resume = 12
-        # Returns an object file with the default resume count
+        # Returns an ObjectFileReader with the default resume count
         res = self.object_reader.as_file(max_resume=max_resume)
-        self.assertIsInstance(res, ObjectFile)
+        self.assertIsInstance(res, ObjectFileReader)
         mock_obj_file.assert_called_once()
         # Get the arguments passed to the mock
         args, kwargs = mock_obj_file.call_args
@@ -131,3 +121,12 @@ class TestObjectReader(unittest.TestCase):
         self.assertIsInstance(args[0], ContentIterator)
         # Check the max_resume argument
         self.assertEqual(kwargs.get("max_resume"), max_resume)
+
+    def test_as_file_invalid_max_resume(self):
+        # Test for invalid max_resume value
+        with self.assertRaises(ValueError) as context:
+            self.object_reader.as_file(max_resume=-1)
+        self.assertEqual(
+            str(context.exception),
+            "Invalid max_resume (must be a non-negative integer): -1.",
+        )

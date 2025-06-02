@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -20,9 +20,11 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -31,7 +33,7 @@ const clusterMap = "Smap"
 // NOTE: to access Snode, Smap and related structures, external
 //       packages and HTTP clients must import aistore/cluster (and not ais)
 
-//=====================================================================
+// =====================================================================
 //
 // - smapX is a server-side extension of the meta.Smap
 // - smapX represents AIStore cluster in terms of its member nodes and their properties
@@ -46,7 +48,7 @@ const clusterMap = "Smap"
 // (*) for merges and conflict resolution, check smapX version prior to put()
 //     (version check must be protected by the same critical section)
 //
-//=====================================================================
+// =====================================================================
 
 type (
 	smapX struct {
@@ -102,6 +104,7 @@ var (
 // as revs
 func (*smapX) tag() string       { return revsSmapTag }
 func (m *smapX) version() int64  { return m.Version }
+func (m *smapX) uuid() string    { return m.UUID }
 func (*smapX) jit(p *proxy) revs { return p.owner.smap.get() }
 
 func (m *smapX) sgl() *memsys.SGL {
@@ -195,6 +198,11 @@ func (m *smapX) _setIC(psi *meta.Snode) (ok bool) {
 // check configured "original" and "discovery" URLs vs IC members' control,
 // or pick IC members to provide alternative ones
 func (m *smapX) configURLsIC(original, discovery string) (orig, disc string) {
+	// Do not modify discovery once set for K8s as we expect it to be the dynamic headless service URL
+	if k8s.IsK8s() && discovery != "" {
+		disc = discovery
+	}
+
 	// extra effort to avoid changing existing URLs if they work
 	for _, psi := range m.Pmap {
 		if !m.IsIC(psi) {
@@ -210,16 +218,18 @@ func (m *smapX) configURLsIC(original, discovery string) (orig, disc string) {
 		}
 	}
 	// pick alternatives
+outer:
 	for _, psi := range m.Pmap {
 		if !m.IsIC(psi) {
 			continue
 		}
-		if orig == "" {
+		switch {
+		case orig == "":
 			orig = psi.URL(cmn.NetIntraControl)
-		} else if disc == "" {
+		case disc == "":
 			disc = psi.URL(cmn.NetIntraControl)
-		} else {
-			break
+		default:
+			break outer
 		}
 	}
 	return orig, disc
@@ -245,6 +255,8 @@ func (m *smapX) isValid() bool {
 }
 
 // a stronger version of the above
+//
+//nolint:staticcheck // making an exception for Smap
 func (m *smapX) validate() error {
 	if m == nil {
 		return errors.New(clusterMap + " is <nil>")
@@ -544,10 +556,10 @@ func (r *smapOwner) put(smap *smapX) {
 
 func (r *smapOwner) get() *smapX { return r.smap.Load() }
 
-func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayload, cb smapUpdatedCB) (err error) {
-	if err = newSmap.validate(); err != nil {
+func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayload, cb smapUpdatedCB) error {
+	if err := newSmap.validate(); err != nil {
 		debug.Assertf(false, "%s: %s is invalid: %v", si, newSmap, err)
-		return
+		return err
 	}
 
 	var (
@@ -564,29 +576,32 @@ func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayloa
 	if smap != nil {
 		curVer, newVer := smap.Version, newSmap.version()
 		if newVer <= curVer {
+			var err error
 			if newVer < curVer {
-				// NOTE: considered benign in most cases
+				// considered benign in most cases
 				err = newErrDowngrade(si, smap.String(), newSmap.String())
 			}
 			r.mu.Unlock()
-			return
+			return err
 		}
 	}
+
 	if !r.persistBytes(payload) {
-		err = r.persist(newSmap)
+		if err := r.persist(newSmap); err != nil {
+			r.mu.Unlock()
+			return err
+		}
 	}
-	if err == nil {
-		r.put(newSmap)
-	}
+	r.put(newSmap)
+
 	r.mu.Unlock()
 
-	if err == nil {
-		if ofl != nfl {
-			nlog.Infof("%s flags: from %s to %s", si, ofs, nfs)
-		}
-		cb(newSmap, smap, nfl, ofl)
+	if ofl != nfl {
+		nlog.Infof("%s flags: from %s to %s", si, ofs, nfs)
 	}
-	return
+	cb(newSmap, smap, nfl, ofl)
+
+	return nil
 }
 
 // write metasync-sent bytes directly (no json)

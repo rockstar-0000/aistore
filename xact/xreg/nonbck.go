@@ -1,6 +1,6 @@
 // Package xreg provides registry and (renew, find) functions for AIS eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xreg
 
@@ -17,13 +17,13 @@ func RegNonBckXact(entry Renewable) {
 	dreg.nonbckXacts[entry.Kind()] = entry // no locking: all reg-s are done at init time
 }
 
-func RenewRebalance(id int64) RenewRes {
-	e := dreg.nonbckXacts[apc.ActRebalance].New(Args{UUID: xact.RebID2S(id)}, nil)
+func RenewRebalance(id int64, ctlmsg string) RenewRes {
+	e := dreg.nonbckXacts[apc.ActRebalance].New(Args{UUID: xact.RebID2S(id), Custom: ctlmsg}, nil)
 	return dreg.renew(e, nil)
 }
 
-func RenewResilver(id string) core.Xact {
-	e := dreg.nonbckXacts[apc.ActResilver].New(Args{UUID: id}, nil)
+func RenewResilver(id string, args *ResArgs) core.Xact {
+	e := dreg.nonbckXacts[apc.ActResilver].New(Args{UUID: id, Custom: args}, nil)
 	rns := dreg.renew(e, nil)
 	debug.Assert(!rns.IsRunning()) // NOTE: resilver is always preempted
 	return rns.Entry.Get()
@@ -34,13 +34,13 @@ func RenewElection() RenewRes {
 	return dreg.renew(e, nil)
 }
 
-func RenewLRU(id string) RenewRes {
-	e := dreg.nonbckXacts[apc.ActLRU].New(Args{UUID: id}, nil)
+func RenewLRU(id, ctlmsg string) RenewRes {
+	e := dreg.nonbckXacts[apc.ActLRU].New(Args{UUID: id, Custom: ctlmsg}, nil)
 	return dreg.renew(e, nil)
 }
 
-func RenewStoreCleanup(id string) RenewRes {
-	e := dreg.nonbckXacts[apc.ActStoreCleanup].New(Args{UUID: id}, nil)
+func RenewStoreCleanup(id, ctlmsg string) RenewRes {
+	e := dreg.nonbckXacts[apc.ActStoreCleanup].New(Args{UUID: id, Custom: ctlmsg}, nil)
 	return dreg.renew(e, nil)
 }
 

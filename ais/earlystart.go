@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -37,7 +37,7 @@ type (
 	smaps map[*meta.Snode]*smapX
 
 	// sourced from: (env, config, smap)
-	prim struct {
+	primRes struct {
 		url    string
 		isSmap bool // <-- loaded Smap
 		isCfg  bool // <-- config.proxy.primary_url
@@ -73,13 +73,16 @@ func (p *proxy) bootstrap() {
 	// 3: start as primary
 	forcePrimaryChange := prim.isCfg || prim.isEP
 	if prim.isSmap || forcePrimaryChange {
-		if prim.isSmap {
+		// log
+		switch {
+		case prim.isSmap:
 			nlog.Infof("%s: assuming primary role _for now_ %+v", p, prim)
-		} else if prim.isEP && isSelf != "" {
-			nlog.Infof("%s: assuming primary role (and note that env %s=%s is redundant)", p, env.AIS.PrimaryEP, daemon.EP)
-		} else {
+		case prim.isEP && isSelf != "":
+			nlog.Infof("%s: assuming primary role (and note that env %s=%s is redundant)", p, env.AisPrimaryEP, daemon.EP)
+		default:
 			nlog.Infof("%s: assuming primary role as per: %+v", p, prim)
 		}
+		// go
 		go p.primaryStartup(smap, config, daemon.cli.primary.ntargets, prim)
 		return
 	}
@@ -107,7 +110,7 @@ func (p *proxy) bootstrap() {
 // 3: next, loaded Smap (but it can be overridden by newer versions from other nodes);
 // 3: finally, if none of the above applies, take into account cluster config (its "proxy" section).
 // See also: "change-of-mind"
-func (p *proxy) determineRole(smap *smapX /*loaded*/, config *cmn.Config) (prim prim) {
+func (p *proxy) determineRole(smap *smapX /*loaded*/, config *cmn.Config) (prim primRes) {
 	switch {
 	case daemon.EP != "":
 		// 1. user override local Smap (if exists) via env-set primary URL
@@ -146,7 +149,7 @@ func (p *proxy) determineRole(smap *smapX /*loaded*/, config *cmn.Config) (prim 
 		}
 	}
 
-	return
+	return prim
 }
 
 // join cluster
@@ -173,7 +176,7 @@ func (p *proxy) secondaryStartup(smap *smapX, primaryURLs ...string) error {
 // Proxy/gateway that is, potentially, the leader of the cluster.
 // It waits a configured time for other nodes to join,
 // discovers cluster-wide metadata, and resolve remaining conflicts.
-func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets int, prim prim) {
+func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets int, prim primRes) {
 	var (
 		smap          = newSmap()
 		uuid, created string
@@ -336,8 +339,8 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 	// 10. metasync (smap, config, etl & bmd) and startup as primary
 	smap = p.owner.smap.get()
 	var (
-		aisMsg = p.newAmsgStr(metaction2, bmd)
-		pairs  = []revsPair{{smap, aisMsg}, {bmd, aisMsg}, {cluConfig, aisMsg}}
+		actMsgExt = p.newAmsgStr(metaction2, bmd)
+		pairs     = []revsPair{{smap, actMsgExt}, {bmd, actMsgExt}, {cluConfig, actMsgExt}}
 	)
 	wg := p.metasyncer.sync(pairs...)
 	wg.Wait()
@@ -346,7 +349,7 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 	nlog.Infoln(smap.StringEx()+",", bmd.StringEx())
 
 	if etlMD.Version > 0 {
-		_ = p.metasyncer.sync(revsPair{etlMD, aisMsg})
+		_ = p.metasyncer.sync(revsPair{etlMD, actMsgExt})
 	}
 
 	// 11. Clear regpool
@@ -450,9 +453,9 @@ until:
 
 	// do
 	var (
-		msg    = &apc.ActMsg{Action: apc.ActRebalance, Value: metaction3}
-		aisMsg = p.newAmsg(msg, nil)
-		ctx    = &rmdModifier{
+		msg       = &apc.ActMsg{Action: apc.ActRebalance, Value: metaction3}
+		actMsgExt = p.newAmsg(msg, nil)
+		ctx       = &rmdModifier{
 			pre:     func(_ *rmdModifier, clone *rebMD) { clone.Version += 100 },
 			smapCtx: &smapModifier{smap: smap},
 			cluID:   smap.UUID,
@@ -462,7 +465,7 @@ until:
 	if err != nil {
 		cos.ExitLog(err)
 	}
-	wg := p.metasyncer.sync(revsPair{rmd, aisMsg})
+	wg := p.metasyncer.sync(revsPair{rmd, actMsgExt})
 
 	p.owner.rmd.starting.Store(false) // done
 	p.owner.smap.mu.Unlock()
@@ -471,9 +474,11 @@ until:
 	nlog.Errorln("Warning: resumed global rebalance", ctx.rebID, smap.StringEx(), rmd.String())
 }
 
-// maxVerSmap != nil iff there's a primary change _and_ the cluster has moved on
-func (p *proxy) acceptRegistrations(smap, loadedSmap *smapX, config *cmn.Config, ntargets int) (maxVerSmap *smapX) {
-	const quiescentIter = 4 // Number of iterations to consider the cluster quiescent.
+// return maxVerSmap != nil iff there's a primary change _and_ the cluster has moved on
+func (p *proxy) acceptRegistrations(smap, loadedSmap *smapX, config *cmn.Config, ntargets int) *smapX {
+	const (
+		quiescentIter = 4 // Number of iterations to consider the cluster quiescent.
+	)
 	var (
 		deadlineTime         = config.Timeout.Startup.D()
 		checkClusterInterval = deadlineTime / quiescentIter
@@ -484,11 +489,11 @@ func (p *proxy) acceptRegistrations(smap, loadedSmap *smapX, config *cmn.Config,
 	)
 	for wait, iter := time.Duration(0), 0; wait < deadlineTime && iter < quiescentIter; wait += sleepDuration {
 		time.Sleep(sleepDuration)
+
 		// Check the cluster Smap only once at max.
 		if doClusterCheck && wait >= checkClusterInterval {
-			if bcastSmap := p.bcastMaxVerBestEffort(loadedSmap); bcastSmap != nil {
-				maxVerSmap = bcastSmap
-				return
+			if maxVerSmap := p.bcastMaxVerBestEffort(loadedSmap); maxVerSmap != nil {
+				return maxVerSmap
 			}
 			doClusterCheck = false
 		}
@@ -498,6 +503,7 @@ func (p *proxy) acceptRegistrations(smap, loadedSmap *smapX, config *cmn.Config,
 		if !smap.isPrimary(p.si) {
 			break
 		}
+
 		targetCnt := smap.CountTargets()
 		if targetCnt > prevTargetCnt || (definedTargetCnt && targetCnt < ntargets) {
 			// Reset the counter in case there are new targets or we wait for
@@ -529,7 +535,8 @@ func (p *proxy) acceptRegistrations(smap, loadedSmap *smapX, config *cmn.Config,
 	} else {
 		nlog.Infoln(p.String(), "joined", targetCnt, s1)
 	}
-	return
+
+	return nil
 }
 
 // the final major step in the primary startup sequence:
@@ -648,7 +655,7 @@ func (p *proxy) uncoverMeta(bcastSmap *smapX) (cm cluMeta) {
 	for {
 		if nlog.Stopping() {
 			cm.Smap = nil
-			return
+			return cm
 		}
 		last := time.Now().After(deadline)
 		cm, done, slowp = p.bcastMaxVer(bcastSmap, bmds, smaps)
@@ -658,7 +665,7 @@ func (p *proxy) uncoverMeta(bcastSmap *smapX) (cm cluMeta) {
 		time.Sleep(config.Timeout.CplaneOperation.D())
 	}
 	if !slowp {
-		return
+		return cm
 	}
 	nlog.Infoln(p.String(), "(primary) slow path...")
 	if cm.BMD, err = resolveUUIDBMD(bmds); err != nil {
@@ -694,7 +701,8 @@ func (p *proxy) uncoverMeta(bcastSmap *smapX) (cm cluMeta) {
 			cm.Smap = smap
 		}
 	}
-	return
+
+	return cm
 }
 
 func (p *proxy) bcastMaxVer(bcastSmap *smapX, bmds bmds, smaps smaps) (out cluMeta, done, slowp bool) {
@@ -727,7 +735,7 @@ func (p *proxy) bcastMaxVer(bcastSmap *smapX, bmds bmds, smaps smaps) (out cluMe
 	}
 	args.nodes = append(args.nodes, pmap)
 
-	args.cresv = cresCM{} // -> cluMeta
+	args.cresv = cresjGeneric[cluMeta]{}
 	results := p.bcastGroup(args)
 	freeBcArgs(args)
 	done = true
@@ -743,11 +751,12 @@ func (p *proxy) bcastMaxVer(bcastSmap *smapX, bmds bmds, smaps smaps) (out cluMe
 		cm, ok := res.v.(*cluMeta)
 		debug.Assert(ok)
 		if cm.BMD != nil && cm.BMD.version() > 0 {
-			if out.BMD == nil { // 1. init
+			switch {
+			case out.BMD == nil: // 1. init
 				borigin, out.BMD = cm.BMD.UUID, cm.BMD
-			} else if borigin != "" && borigin != cm.BMD.UUID { // 2. slow path
+			case borigin != "" && borigin != cm.BMD.UUID: // 2. slow path
 				slowp = true
-			} else if !slowp && out.BMD.Version < cm.BMD.Version { // 3. fast path max(version)
+			case !slowp && out.BMD.Version < cm.BMD.Version: // 3. fast path max(version)
 				out.BMD = cm.BMD
 				borigin = cm.BMD.UUID
 			}
@@ -780,11 +789,12 @@ func (p *proxy) bcastMaxVer(bcastSmap *smapX, bmds bmds, smaps smaps) (out cluMe
 			break
 		}
 		if cm.Smap != nil && cm.Smap.version() > 0 {
-			if out.Smap == nil { // 1. init
+			switch {
+			case out.Smap == nil: // 1. init
 				sorigin, out.Smap = cm.Smap.UUID, cm.Smap
-			} else if sorigin != "" && sorigin != cm.Smap.UUID { // 2. slow path
+			case sorigin != "" && sorigin != cm.Smap.UUID: // 2. slow path
 				slowp = true
-			} else if !slowp && out.Smap.Version < cm.Smap.Version { // 3. fast path max(version)
+			case !slowp && out.Smap.Version < cm.Smap.Version: // 3. fast path max(version)
 				out.Smap = cm.Smap
 				sorigin = cm.Smap.UUID
 			}
@@ -797,7 +807,8 @@ func (p *proxy) bcastMaxVer(bcastSmap *smapX, bmds bmds, smaps smaps) (out cluMe
 		}
 	}
 	freeBcastRes(results)
-	return
+
+	return out, done, slowp
 }
 
 func (p *proxy) bcastMaxVerBestEffort(smap *smapX) *smapX {

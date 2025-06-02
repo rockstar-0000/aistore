@@ -1,10 +1,11 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -27,7 +28,6 @@ type (
 	tokenList   authn.TokenList       // token strings
 	tkList      map[string]*tok.Token // tk structs
 	authManager struct {
-		sync.Mutex
 		// cache of decrypted tokens
 		tkList tkList
 		// list of invalid tokens(revoked or of deleted users)
@@ -36,6 +36,8 @@ type (
 		version       int64
 		// signing key secret
 		secret string
+		// lock
+		sync.Mutex
 	}
 )
 
@@ -48,7 +50,7 @@ func newAuthManager(config *cmn.Config) *authManager {
 		tkList:        make(tkList),
 		revokedTokens: make(map[string]bool), // TODO: preallocate
 		version:       1,
-		secret:        cos.Right(config.Auth.Secret, os.Getenv(env.AuthN.SecretKey)), // environment override
+		secret:        cos.Right(config.Auth.Secret, os.Getenv(env.AisAuthSecretKey)), // environment override
 	}
 }
 
@@ -64,7 +66,7 @@ func (a *authManager) updateRevokedList(newRevoked *tokenList) (allRevoked *toke
 		a.version = newRevoked.Version
 	default:
 		nlog.Errorf("Current token list v%d is greater than received v%d", a.version, newRevoked.Version)
-		return
+		return nil
 	}
 
 	// Add new revoked tokens and remove them from the valid token list.
@@ -93,7 +95,7 @@ func (a *authManager) updateRevokedList(newRevoked *tokenList) (allRevoked *toke
 	if len(allRevoked.Tokens) == 0 {
 		allRevoked = nil
 	}
-	return
+	return allRevoked
 }
 
 func (a *authManager) revokedTokenList() (allRevoked *tokenList) {
@@ -156,6 +158,7 @@ var _ revs = (*tokenList)(nil)
 
 func (*tokenList) tag() string         { return revsTokenTag }
 func (t *tokenList) version() int64    { return t.Version } // no versioning: receivers keep adding tokens to their lists
+func (*tokenList) uuid() string        { return "" }        // TODO: add
 func (t *tokenList) marshal() []byte   { return cos.MustMarshal(t) }
 func (t *tokenList) jit(_ *proxy) revs { return t }
 func (*tokenList) sgl() *memsys.SGL    { return nil }
@@ -181,15 +184,14 @@ func (p *proxy) validateSecret(w http.ResponseWriter, r *http.Request) {
 	if _, err := p.parseURL(w, r, apc.URLPathTokens.L, 0, false); err != nil {
 		return
 	}
-	cksum := cos.NewCksumHash(cos.ChecksumSHA256)
-	cksum.H.Write([]byte(p.authn.secret))
-	cksum.Finalize()
 
 	cluConf := &authn.ServerConf{}
 	if err := cmn.ReadJSON(w, r, cluConf); err != nil {
 		return
 	}
-	if cksum.Val() != cluConf.Secret {
+
+	cksumVal := cos.ChecksumB2S(cos.UnsafeB(p.authn.secret), cos.ChecksumSHA256)
+	if cksumVal != cluConf.Secret {
 		p.writeErrf(w, r, "%s: invalid secret sha256(%q)", p, cos.SHead(cluConf.Secret))
 	}
 }
@@ -244,9 +246,9 @@ func (p *proxy) checkAccess(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 }
 
 func aceErrToCode(err error) (status int) {
-	switch err {
-	case nil:
-	case tok.ErrNoToken, tok.ErrInvalidToken:
+	switch {
+	case err == nil:
+	case errors.Is(err, tok.ErrNoToken) || errors.Is(err, tok.ErrInvalidToken):
 		status = http.StatusUnauthorized
 	default:
 		status = http.StatusForbidden
@@ -259,7 +261,7 @@ func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err
 		tk     *tok.Token
 		bucket *cmn.Bck
 	)
-	if p.isIntraCall(hdr, false /*from primary*/) == nil {
+	if p.checkIntraCall(hdr, false /*from primary*/) == nil {
 		return nil
 	}
 	if cmn.Rom.AuthEnabled() { // config.Auth.Enabled

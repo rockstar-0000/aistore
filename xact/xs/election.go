@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -37,7 +37,7 @@ func (*eleFactory) New(xreg.Args, *meta.Bck) xreg.Renewable { return &eleFactory
 
 func (p *eleFactory) Start() error {
 	p.xctn = &Election{}
-	p.xctn.InitBase(cos.GenUUID(), apc.ActElection, nil)
+	p.xctn.InitBase(cos.GenUUID(), apc.ActElection, "", nil)
 	return nil
 }
 

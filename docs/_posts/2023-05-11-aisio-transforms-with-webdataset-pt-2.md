@@ -25,7 +25,7 @@ For more advanced workloads such as audio or video transcoding or other computer
 --- 
 ## WebDataset-compatible Transforms
  
-We start with a bucket in AIStore filled with objects where each object is a shard of multiple samples (the output of [part 1](https://aiatscale.org/blog/2023/05/08/aisio-transforms-with-webdataset-pt-1.md)). For our ETL to be able to operate on these objects, we need to write a function that can parse this WebDataset-formatted shard and perform the transform on each sample inside. 
+We start with a bucket in AIStore filled with objects where each object is a shard of multiple samples (the output of [part 1](https://aiatscale.org/blog/2023/05/05/aisio-transforms-with-webdataset-pt-1)). For our ETL to be able to operate on these objects, we need to write a function that can parse this WebDataset-formatted shard and perform the transform on each sample inside. 
 
 Below is a diagram and some simple example code for an ETL that parses these tar files and transforms all image files found inside (without creating any residual files). Since each object in AIS is a shard of multiple records, the first step is to load it from the URL as a WebDataset object. With this done, the WebDataset library makes it easy to iterate over each record, transform individual components, and then write out the result as a complete transformed shard. 
 
@@ -135,7 +135,7 @@ In the next post, we'll show how to put ETL to use when training a dataset by pe
 
 1. GitHub:
     - [AIStore](https://github.com/NVIDIA/aistore)
-    - [Local Kubernetes Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/README.md)
+    - [Local Kubernetes Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/kustomize/README.md)
     - [AIS/Kubernetes Operator, AIS on bare-metal, Deployment Playbooks, Helm](https://github.com/NVIDIA/ais-k8s)
     - [AIS-ETL containers and specs](https://github.com/NVIDIA/ais-etl)
     - [WebDataset Library](https://github.com/webdataset/webdataset)

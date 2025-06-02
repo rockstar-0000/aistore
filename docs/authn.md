@@ -1,11 +1,3 @@
----
-layout: post
-title: AUTHN
-permalink: /docs/authn
-redirect_from:
- - /authn.md/
- - /docs/authn.md/
----
 The AIStore Authentication Server (AuthN) provides secure access to AIStore by leveraging [OAuth 2.0](https://oauth.net/2/) compliant [JSON Web Tokens (JWT)](https://datatracker.ietf.org/doc/html/rfc7519).
 
 For more details:
@@ -206,7 +198,7 @@ Separately, there's also client-side AuthN environment that includes:
 
 | Name                  | Description                                                                                                                         |
 |-----------------------|-------------------------------------------------------------------------------------------------------------------------------------|
-| `AIS_AUTHN_URL`       | Used by [CLI](docs/cli/auth.md) to configure and query the authentication server (AuthN).                                           |
+| `AIS_AUTHN_URL`       | Used by [CLI](/docs/cli/auth.md) to configure and query the authentication server (AuthN).                                           |
 | `AIS_AUTHN_TOKEN_FILE`| Token file pathname; can be used to override the default `$HOME/.config/ais/cli/<fname.Token>`.                                     |
 | `AIS_AUTHN_TOKEN`     | The JWT token itself (excluding the file and JSON); can be used to specify the token directly, bypassing the need for a token file. |
 

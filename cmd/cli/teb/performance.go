@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -16,6 +16,9 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 )
 
+// to indicate end-of-row error
+const errIndication = "<<<"
+
 type PerfTabCtx struct {
 	Smap      *meta.Smap
 	Sid       string           // single target, unless ""
@@ -26,9 +29,11 @@ type PerfTabCtx struct {
 	TotalsHdr string
 	AvgSize   bool // compute average size on the fly (and show it), e.g.: `get.size/get.n`
 	Idle      bool // currently idle
+	NoColor   bool
 }
 
-func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero metrics OR bad status*/, error) {
+// return numNZ (non-zero) metrics OR bad status
+func (c *PerfTabCtx) MakeTab(st StstMap) (*Table, int, error) {
 	var (
 		numNZ int        // num non-zero metrics
 		numTs int        // num active targets in `st`
@@ -72,7 +77,7 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 
 	// 2. exclude zero columns unless requested specific match or (--all)
 	if c.Regex == nil {
-		cols = _zerout(cols, st)
+		cols = st._zerout(cols)
 	}
 
 	// 3. sort (remaining) columns and shift `err-*` columns to the right
@@ -90,7 +95,7 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 	})
 
 	// 4. add STATUS column unless all nodes are online (`NodeOnline`)
-	cols = _addStatus(cols, st)
+	cols = st._addStatus(cols)
 
 	// 5. add regex-specified (ie, user-requested) metrics that are missing
 	// ------ api.GetStatsAndStatus() does not return zero counters -------
@@ -106,18 +111,24 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 		cols, printedColumns = _filter(cols, printedColumns, c.Regex)
 	}
 
-	// 8. apply color
-	for i := range cols {
-		if stats.IsErrMetric(cols[i].name) {
-			printedColumns[i].name = fred("\t%s", printedColumns[i].name)
-		}
+	// 8. (not) coloring err columns (TODO: indentation)
+	var (
+		last             = len(cols) - 1
+		eorErrIndication string
+	)
+	if !c.NoColor {
+		eorErrIndication = " " + fred(errIndication)
 	}
 
 	// 9. sort targets by IDs
-	tids := st.sortedSIDs()
+	tids := st.sortSIDs()
 
 	// 10. construct an empty table
 	table := newTable(printedColumns...)
+
+	if len(cols) < 2 {
+		return table, numNZ, nil
+	}
 
 	// 11. finally, add rows
 	for _, tid := range tids {
@@ -128,9 +139,15 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 		if ds.Status == NodeOnline {
 			numTs++
 		}
-		row := make([]string, 0, len(cols))
+
+		// add row
+		var (
+			row      = make([]string, 0, len(cols))
+			haveErrs bool
+		)
 		row = append(row, fmtDaemonID(tid, c.Smap, ds.Status))
-		for _, h := range cols[1:] {
+		for i := 1; i < len(cols); i++ {
+			h := cols[i]
 			if h.name == colStatus {
 				row = append(row, ds.Status)
 				continue
@@ -144,11 +161,15 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 			v, ok := ds.Tracker[h.name]
 			if !ok {
 				// t[tid] doesn't have this metric (likely, zero value)
-				row = append(row, unknownVal)
+				if haveErrs && i == last {
+					row = append(row, unknownVal+eorErrIndication)
+				} else {
+					row = append(row, unknownVal)
+				}
 				continue
 			}
 
-			// format value
+			// format value (TODO: show zero latency and throughput as '-')
 			kind, ok := c.Metrics[h.name]
 			debug.Assert(ok, h.name)
 			printedValue := FmtStatValue(h.name, kind, v.Value, c.Units)
@@ -159,14 +180,19 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 
 			// add some color
 			if stats.IsErrMetric(h.name) {
-				printedValue = fred("\t%s", printedValue)
+				haveErrs = v.Value != 0
 			} else if kind == stats.KindSize && c.AvgSize {
 				if v, ok := _compAvgSize(ds, h.name, v.Value, n2n); ok {
 					printedValue += "  " + FmtStatValue("", kind, v, c.Units)
 				}
 			}
+
+			if haveErrs && i == last {
+				printedValue += eorErrIndication // <<<
+			}
 			row = append(row, printedValue)
 		}
+
 		table.addRow(row)
 	}
 
@@ -213,7 +239,7 @@ func NewPerformanceTab(st StstMap, c *PerfTabCtx) (*Table, int /*numNZ non-zero 
 //
 
 // remove all-zeros columns
-func _zerout(cols []*header, st StstMap) []*header {
+func (st StstMap) _zerout(cols []*header) []*header {
 	for i := 0; i < len(cols); i++ {
 		var found bool
 		h := cols[i]
@@ -239,7 +265,7 @@ func _zerout(cols []*header, st StstMap) []*header {
 }
 
 // (aternatively, could always add, conditionally hide)
-func _addStatus(cols []*header, st StstMap) []*header {
+func (st StstMap) _addStatus(cols []*header) []*header {
 	for _, ds := range st {
 		if ds.Status != NodeOnline {
 			cols = append(cols, &header{name: colStatus, hide: false})
@@ -336,7 +362,7 @@ func _metricToPrintedColName(mname string, cols []*header, metrics, n2n cos.StrK
 	case stats.KindCounter:
 		printedName += "(n)"
 	}
-	return
+	return printedName
 }
 
 func _filter(cols, printedColumns []*header, regex *regexp.Regexp) ([]*header, []*header) {
@@ -387,7 +413,7 @@ func _compAvgSize(ds *stats.NodeStatus, ns string, vs int64, n2n cos.StrKVs) (av
 	}
 	ok = false
 	if vc, exists := ds.Tracker[nc]; exists {
-		avg, ok = cos.DivRound(vs, vc.Value), true
+		avg, ok = cos.DivRoundI64(vs, vc.Value), true
 	}
 	return
 }

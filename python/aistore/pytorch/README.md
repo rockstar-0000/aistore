@@ -6,9 +6,9 @@ AIS plugin is a PyTorch dataset library to access datasets stored on AIStore.
 
 PyTorch comes with powerful data loading capabilities, but loading data in PyTorch is fairly complex. One of the best ways to handle it is to start small and then add complexities as and when you need them.
 
-![PyTorch Structure](../../../docs/images/pytorch_structure.webp)
+![PyTorch Structure](/docs/images/pytorch_structure.webp)
 
-In our plugin, we extend the base Dataset, Sampler, and IterableDataset Torch clases to provide AIStore Object functionality natively to PyTorch. You can extend AISBaseMapDataset instead of Dataset and AISBaseIterDataset instead of IterableDataset in your custom datasets to automatically obtain object fetching functionality. But if you'd like fully complete datasets that fetch objects and load their data, then you can use AISMapDataset and AISIterData.
+In our plugin, we extend the base Dataset, Sampler, and IterableDataset Torch classes to provide AIStore Object functionality natively to PyTorch. You can extend AISBaseMapDataset instead of Dataset and AISBaseIterDataset instead of IterableDataset in your custom datasets to automatically obtain object fetching functionality. But if you'd like fully complete datasets that fetch objects and load their data, then you can use AISMapDataset and AISIterData.
 
 ### PyTorch DataLoader
 
@@ -83,7 +83,7 @@ for data_sample in dataset:
     print(data_sample)  # Each iteration fetches a data sample (object name and byte array)
 ```
 
-For more examples on how to use AISMapDataset and AISIterDataset, see the [Dataset Example Notebook](../../examples/aisio-pytorch/dataset_example.ipynb).
+For more examples on how to use AISMapDataset and AISIterDataset, see the [Dataset Example Notebook](../../examples/pytorch/dataset_example.ipynb).
 
 
 **Creating DataLoader from AISMapDataset**
@@ -126,37 +126,4 @@ for basename, content_dict in shard_reader:
     # Since you know the file extension, we can load the file content in the appropriate way
 ```
 
-See the [ShardReader example notebook](../../examples/aisio-pytorch/shard_reader_example.ipynb) for more examples. Since the shard reader is also an iterable dataset, you can also use it with the `torch.utils.data.DataLoader` class for additional features.
-
-## AIS IO Datapipe
-
-### AIS File Lister
-
-Iterable Datapipe that lists files from the AIS backends with the given URL  prefixes. Acceptable prefixes include but not limited to - `ais://bucket-name`, `ais://bucket-name/`, `ais://bucket-name/folder`, `ais://bucket-name/folder/`, `ais://bucket-name/prefix`.
-
-**Note:**
-1) This function also supports files from multiple backends (`aws://..`, `gcp://..`, etc)
-2) Input *must* be a list and direct URLs are not supported.
-3) `length` is -1 by default, all calls to `len()` are invalid as not all items are iterated at the start.
-4) This internally uses [AIStore Python SDK](https://github.com/NVIDIA/aistore/tree/main/python).
-
-### AIS File Loader
-
-Iterable Datapipe that loads files from the AIS backends with the given list of URLs (no prefixes allowed). Iterates all files in BytesIO format and returns a tuple (url, BytesIO).
-**Note:**
-1) This function also supports files from multiple backends (`aws://..`, `gcp://..`, etc)
-2) Input *must* be a list and direct URLs are not supported.
-3) This internally uses [AIStore Python SDK](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk).
-
-### Example
-```python
-from aistore.pytorch.aisio import AISFileListerIterDataPipe, AISFileLoaderIterDataPipe
-
-prefixes = ['ais://bucket1/train/', 'aws://bucket2/train/']
-
-list_of_files = AISFileListerIterDataPipe(url='http://ais-gateway-url:8080', source_datapipe=prefixes)
-
-files = AISFileLoaderIterDataPipe(url='http://ais-gateway-url:8080', source_datapipe=list_of_files)
-```
-
-For a more in-depth example, see [here](https://github.com/NVIDIA/aistore/blob/main/python/examples/aisio_pytorch_example.ipynb)
+See the [ShardReader example notebook](../../examples/pytorch/shard_reader_example.ipynb) for more examples. Since the shard reader is also an iterable dataset, you can also use it with the `torch.utils.data.DataLoader` class for additional features.

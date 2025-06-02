@@ -1,6 +1,6 @@
 // Package xact provides core functionality for the AIStore eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xact
 
@@ -26,19 +26,20 @@ import (
 
 type (
 	Base struct {
-		notif  *NotifXact
-		bck    meta.Bck
+		notif *NotifXact
+		bck   meta.Bck
+		abort struct {
+			ch     chan error
+			err    ratomic.Pointer[error]
+			done   atomic.Bool
+			closed atomic.Bool
+		}
 		id     string
 		kind   string
 		_nam   string
-		sutime atomic.Int64
-		eutime atomic.Int64
-		abort  struct {
-			ch   chan error
-			err  ratomic.Pointer[error]
-			done atomic.Bool
-		}
-		stats struct {
+		ctlmsg string // via InitBase, SetCtlMsg
+		err    cos.Errs
+		stats  struct {
 			objs     atomic.Int64 // locally processed
 			bytes    atomic.Int64
 			outobjs  atomic.Int64 // transmit
@@ -46,7 +47,8 @@ type (
 			inobjs   atomic.Int64 // receive
 			inbytes  atomic.Int64
 		}
-		err cos.Errs
+		sutime atomic.Int64
+		eutime atomic.Int64
 	}
 	Marked struct {
 		Xact        core.Xact
@@ -65,16 +67,17 @@ func GoRunW(xctn core.Xact) {
 	wg.Wait()
 }
 
-func IsValidUUID(id string) bool { return cos.IsValidUUID(id) || IsValidRebID(id) }
-
 //////////////
 // Base - partially implements `core.Xact` interface
 //////////////
 
-func (xctn *Base) InitBase(id, kind string, bck *meta.Bck) {
+func (xctn *Base) InitBase(id, kind, ctlmsg string, bck *meta.Bck) {
 	debug.Assert(kind == apc.ActETLInline || cos.IsValidUUID(id) || IsValidRebID(id), id)
 	debug.Assert(IsValidKind(kind), kind)
+
 	xctn.id, xctn.kind = id, kind
+	xctn.ctlmsg = ctlmsg
+
 	xctn.abort.ch = make(chan error, 1)
 	if bck != nil {
 		xctn.bck = *bck
@@ -159,13 +162,64 @@ func (xctn *Base) Abort(err error) bool {
 	debug.Assert(perr == nil, xctn.String())
 	debug.Assert(len(xctn.abort.ch) == 0, xctn.String()) // CAS above
 
-	xctn.abort.ch <- err
-	close(xctn.abort.ch)
+	if xctn.abort.closed.CAS(false, true) {
+		xctn.abort.ch <- err
+		close(xctn.abort.ch)
+	}
 
 	if xctn.Kind() != apc.ActList {
 		nlog.InfoDepth(1, xctn.Name(), err)
 	}
 	return true
+}
+
+// atomically set end-time
+func (xctn *Base) Finish() {
+	if !xctn.eutime.CAS(0, 1) {
+		return
+	}
+
+	var (
+		err     error
+		n, xerr = xctn._nerr()
+		xname   = xctn.String()
+		now     = time.Now()
+		aborted bool
+	)
+	xctn.eutime.Store(now.UnixNano())
+	if aborted = xctn.IsAborted(); aborted {
+		if perr := xctn.abort.err.Load(); perr != nil {
+			err = *perr
+		}
+	}
+
+	if xctn.abort.closed.CAS(false, true) {
+		close(xctn.abort.ch)
+	}
+
+	if err == nil {
+		debug.Assert(!aborted) // expecting xctn.abort.err
+		err = xerr
+	}
+
+	xctn.onFinished(err, aborted)
+
+	// log
+	switch {
+	case err == nil:
+		debug.Assert(n == 0, n)
+		nlog.Infoln(xname, "finished")
+		return
+	case xctn.Kind() == apc.ActList:
+		// skip
+	case aborted:
+		nlog.Warningln(xname, "aborted:", err)
+	default:
+		nlog.Warningln(xname, "finished w/err: [", err, "]")
+	}
+	if xerr != nil && xerr != err {
+		nlog.Warningln("\t\t[", xerr, n, "]")
+	}
 }
 
 //
@@ -196,11 +250,18 @@ func (xctn *Base) AddErr(err error, logExtra ...int) {
 	}
 }
 
-func (xctn *Base) Err() error {
-	if xctn.ErrCnt() == 0 {
-		return nil
+func (xctn *Base) _nerr() (n int, err error) {
+	if n = xctn.ErrCnt(); n > 0 {
+		err = &xctn.err
 	}
-	return &xctn.err
+	return
+}
+
+func (xctn *Base) Err() (err error) {
+	if xctn.ErrCnt() > 0 {
+		err = &xctn.err
+	}
+	return
 }
 
 func (xctn *Base) JoinErr() (int, error) { return xctn.err.JoinErr() }
@@ -222,18 +283,22 @@ func (xctn *Base) Quiesce(d time.Duration, cb core.QuiCB) core.QuiRes {
 			return core.QuiAborted
 		}
 		total += sleep
-		switch res := cb(total); res {
-		case core.QuiInactiveCB: // NOTE: used by callbacks, converts to one of the returned codes
+		switch qui := cb(total); qui {
+		case core.QuiInactiveCB: // used by callbacks, converts to one of the returned codes
 			idle += sleep
 		case core.QuiActive:
-			idle = 0                  // reset
-			dur = min(dur+sleep, 2*d) // bump up to 2x initial
+			idle = 0                   // reset
+			dur = min(dur+sleep, d<<1) // bump inactivity duration (cannot increase beyond 2x initial)
+		case core.QuiActiveDontBump: //       reset, don't bump
+			idle = 0
 		case core.QuiActiveRet:
 			return core.QuiActiveRet
 		case core.QuiDone:
 			return core.QuiDone
 		case core.QuiTimeout:
 			return core.QuiTimeout
+		case core.QuiAborted:
+			return core.QuiAborted
 		}
 	}
 	return core.Quiescent
@@ -243,13 +308,19 @@ func (xctn *Base) Cname() string { return Cname(xctn.Kind(), xctn.ID()) }
 
 func (xctn *Base) Name() (s string) { return xctn._nam }
 
-func (xctn *Base) _sb() (sb strings.Builder) {
+func (xctn *Base) String() string {
+	var (
+		sb strings.Builder
+		l  = 256
+	)
+	sb.Grow(l)
+
 	sb.WriteString(xctn._nam)
 	sb.WriteByte('-')
 	sb.WriteString(cos.FormatTime(xctn.StartTime(), cos.StampMicro))
 
 	if !xctn.Finished() { // ok to (rarely) miss _aborted_ state as this is purely informational
-		return sb
+		return sb.String()
 	}
 	etime := cos.FormatTime(xctn.EndTime(), cos.StampMicro)
 	if xctn.IsAborted() {
@@ -257,11 +328,7 @@ func (xctn *Base) _sb() (sb strings.Builder) {
 	}
 	sb.WriteByte('-')
 	sb.WriteString(etime)
-	return sb
-}
 
-func (xctn *Base) String() string {
-	sb := xctn._sb()
 	return sb.String()
 }
 
@@ -305,44 +372,6 @@ func (xctn *Base) AddNotif(n core.Notif) {
 	debug.Assert(!n.Upon(core.UponProgress) || xctn.notif.P != nil) // progress notification is optional
 }
 
-// atomically set end-time
-func (xctn *Base) Finish() {
-	var (
-		err     error
-		info    string
-		aborted bool
-	)
-	if !xctn.eutime.CAS(0, 1) {
-		return
-	}
-	xctn.eutime.Store(time.Now().UnixNano())
-	if aborted = xctn.IsAborted(); aborted {
-		if perr := xctn.abort.err.Load(); perr != nil {
-			err = *perr
-		}
-	}
-	if xctn.ErrCnt() > 0 {
-		if err == nil {
-			debug.Assert(!aborted)
-			err = xctn.Err()
-		} else {
-			// abort takes precedence
-			info = "(" + xctn.Err().Error() + ")"
-		}
-	}
-	xctn.onFinished(err, aborted)
-	// log
-	switch {
-	case xctn.Kind() == apc.ActList:
-	case err == nil:
-		nlog.Infoln(xctn.String(), "finished")
-	case aborted:
-		nlog.Warningln(xctn.String(), "aborted:", err.Error(), info)
-	default:
-		nlog.Infoln("Warning:", xctn.String(), "finished w/err:", err.Error())
-	}
-}
-
 // base stats: locally processed
 func (xctn *Base) Objs() int64  { return xctn.stats.objs.Load() }
 func (xctn *Base) Bytes() int64 { return xctn.stats.bytes.Load() }
@@ -380,6 +409,7 @@ func (xctn *Base) InObjsAdd(cnt int, size int64) {
 func (xctn *Base) ToSnap(snap *core.Snap) {
 	snap.ID = xctn.ID()
 	snap.Kind = xctn.Kind()
+	snap.CtlMsg = xctn.ctlmsg
 	snap.StartTime = xctn.StartTime()
 	snap.EndTime = xctn.EndTime()
 	if err := xctn.AbortErr(); err != nil {
@@ -404,9 +434,13 @@ func (xctn *Base) ToStats(stats *core.Stats) {
 	stats.InBytes = xctn.InBytes()
 }
 
-// RebID helpers
+func (xctn *Base) SetCtlMsg(s string) { xctn.ctlmsg = s } // see InitBase
 
-func RebID2S(id int64) string          { return fmt.Sprintf("g%d", id) }
+//
+// RebID helpers
+//
+
+func RebID2S(id int64) string          { return "g" + strconv.FormatInt(id, 10) }
 func S2RebID(id string) (int64, error) { return strconv.ParseInt(id[1:], 10, 64) }
 
 func IsValidRebID(id string) (valid bool) {
@@ -414,7 +448,7 @@ func IsValidRebID(id string) (valid bool) {
 		_, err := S2RebID(id)
 		valid = err == nil
 	}
-	return
+	return valid
 }
 
 func CompareRebIDs(someID, fltID string) int {

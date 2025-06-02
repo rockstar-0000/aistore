@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -9,36 +9,24 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	"github.com/urfave/cli"
 )
-
-func errBucketNameInvalid(c *cli.Context, arg string, err error) error {
-	if errV := errArgIsFlag(c, arg); errV != nil {
-		return errV
-	}
-	if strings.Contains(err.Error(), cos.OnlyPlus) && strings.Contains(err.Error(), "bucket name") {
-		if strings.Contains(arg, ":/") && !strings.Contains(arg, apc.BckProviderSeparator) {
-			a := strings.Replace(arg, ":/", apc.BckProviderSeparator, 1)
-			return fmt.Errorf("bucket name in %q is invalid: (did you mean %q?)", arg, a)
-		}
-		return fmt.Errorf("bucket name in %q is invalid: "+cos.OnlyPlus, arg)
-	}
-	return nil
-}
 
 // Return `bckFrom` and `bckTo` - the [shift] and the [shift+1] arguments, respectively
 func parseBcks(c *cli.Context, bckFromArg, bckToArg string, shift int, optionalSrcObjname bool) (bckFrom, bckTo cmn.Bck, objFrom string,
 	err error) {
 	if c.NArg() == shift {
 		err = missingArgumentsError(c, bckFromArg, bckToArg)
-		return
+		return cmn.Bck{}, cmn.Bck{}, "", err
 	}
 	if c.NArg() == shift+1 {
 		err = missingArgumentsError(c, bckToArg)
-		return
+		return cmn.Bck{}, cmn.Bck{}, "", err
 	}
 
 	// src
@@ -56,7 +44,7 @@ func parseBcks(c *cli.Context, bckFromArg, bckToArg string, shift int, optionalS
 		} else {
 			err = incorrectUsageMsg(c, "invalid %s argument '%s' - %v", bckFromArg, c.Args().Get(shift), err)
 		}
-		return
+		return cmn.Bck{}, cmn.Bck{}, "", err
 	}
 
 	// dst
@@ -68,12 +56,14 @@ func parseBcks(c *cli.Context, bckFromArg, bckToArg string, shift int, optionalS
 		} else {
 			err = incorrectUsageMsg(c, "invalid %s argument '%s' - %v", bckToArg, c.Args().Get(shift+1), err)
 		}
+		return cmn.Bck{}, cmn.Bck{}, "", err
 	}
-	return
+
+	return bckFrom, bckTo, objFrom, err
 }
 
 func parseBckURI(c *cli.Context, uri string, errorOnly bool) (cmn.Bck, error) {
-	const validNames = ": ais://mmm, s3://nnn or aws://nnn, gs://ppp or gcp://ppp"
+	const validNames = ": ais://mmm, s3://nnn or aws://nnn, gs://ppp, gcp://ppp, oc://ppp or oci://ppp"
 	if isWebURL(uri) {
 		bck := parseURLtoBck(uri)
 		return bck, nil
@@ -124,31 +114,29 @@ func preparseBckObjURI(uri string) string {
 	return uri // unchanged
 }
 
-func parseDest(c *cli.Context, uri string) (bck cmn.Bck, pathSuffix string, err error) {
-	bck, pathSuffix, err = parseBckObjURI(c, uri, true /*optional objName*/)
+func parseBckObjAux(c *cli.Context, uri string) (bck cmn.Bck, objnameOrPrefix string, err error) {
+	bck, objnameOrPrefix, err = parseBckObjURI(c, uri, true /*optional objName*/)
 	if err != nil {
-		return
-	} else if bck.IsHT() {
-		err = errors.New("http bucket is not supported as destination")
-		return
+		return bck, "", err
 	}
-	pathSuffix = strings.Trim(pathSuffix, "/")
-	return
+	if bck.IsHT() {
+		return bck, "", errors.New("http bucket is not supported as destination")
+	}
+	return bck, strings.Trim(objnameOrPrefix, "/"), nil
 }
 
-func parseQueryBckURI(c *cli.Context, uri string) (cmn.QueryBcks, error) {
+func parseQueryBckURI(uri string) (cmn.QueryBcks, string, error) {
 	uri = preparseBckObjURI(uri)
 	if isWebURL(uri) {
 		bck := parseURLtoBck(uri)
-		return cmn.QueryBcks(bck), nil
+		return cmn.QueryBcks(bck), "", nil
 	}
-	bck, objName, err := cmn.ParseBckObjectURI(uri, cmn.ParseURIOpts{IsQuery: true})
-	if err != nil {
-		return cmn.QueryBcks(bck), err
-	} else if objName != "" {
-		return cmn.QueryBcks(bck), objectNameArgNotExpected(c, objName)
+	bck, prefix, err := cmn.ParseBckObjectURI(uri, cmn.ParseURIOpts{IsQuery: true})
+	if prefix != "" && bck.IsQuery() {
+		return cmn.QueryBcks(bck), prefix,
+			fmt.Errorf("bucket query (%q) with embedded prefix (%q) is not supported", bck.String(), prefix)
 	}
-	return cmn.QueryBcks(bck), nil
+	return cmn.QueryBcks(bck), prefix, err
 }
 
 func parseBckObjURI(c *cli.Context, uri string, emptyObjnameOK bool) (bck cmn.Bck, objName string, err error) {
@@ -156,7 +144,7 @@ func parseBckObjURI(c *cli.Context, uri string, emptyObjnameOK bool) (bck cmn.Bc
 		var hbo *cmn.HTTPBckObj
 		hbo, err = cmn.NewHTTPObjPath(uri)
 		if err != nil {
-			return
+			return bck, "", err
 		}
 		bck, objName = hbo.Bck, hbo.ObjName
 	} else {
@@ -193,43 +181,125 @@ func parseBckObjURI(c *cli.Context, uri string, emptyObjnameOK bool) (bck cmn.Bc
 	return bck, objName, err
 }
 
-func parseObjListTemplate(c *cli.Context, objNameOrTmpl string) (objName, listObjs, tmplObjs string, err error) {
+//
+// - handle (obj names) list, template (range), embedded prefix, and single object name
+// - possibly call list-objects (via `lsObjVsPref`) to disambiguate
+//
+
+type (
+	// disambiguate objname vs prefix
+	dop struct {
+		isObj    bool
+		isPref   bool
+		notFound bool
+	}
+	// parsing result
+	oltp struct {
+		objName  string
+		list     string
+		tmpl     string
+		notFound bool
+	}
+)
+
+func lsObjVsPref(bck cmn.Bck, oname string) (dop dop, _ error) {
+	msg := &apc.LsoMsg{Prefix: oname}
+
+	// NOTE: never "cached" (apc.LsCached)
+	msg.SetFlag(apc.LsNameOnly)
+	msg.SetFlag(apc.LsNoRecursion)
+	lst, err := api.ListObjectsPage(apiBP, bck, msg, api.ListArgs{Limit: 32})
+
+	if err != nil {
+		return dop, V(err)
+	}
+	if len(lst.Entries) == 0 {
+		dop.isObj, dop.notFound = true, true
+		return dop, nil
+	}
+
+	for _, en := range lst.Entries {
+		if en.Name == oname {
+			dop.isObj = true
+			break
+		}
+	}
+	dop.isPref = len(lst.Entries) > 1 || !dop.isObj
+	return dop, nil
+}
+
+func dopOLTP(c *cli.Context, bck cmn.Bck, objNameOrTmpl string) (oltp oltp, err error) {
 	var prefix string
 	if flagIsSet(c, listFlag) {
-		listObjs = parseStrFlag(c, listFlag)
+		oltp.list = parseStrFlag(c, listFlag)
 	}
 	if flagIsSet(c, templateFlag) {
-		tmplObjs = parseStrFlag(c, templateFlag)
+		oltp.tmpl = parseStrFlag(c, templateFlag)
 	}
 
 	// when template is a "pure" prefix (use '--prefix' to disambiguate vs. objName)
 	if flagIsSet(c, verbObjPrefixFlag) {
 		prefix = parseStrFlag(c, verbObjPrefixFlag)
-		if tmplObjs != "" {
+		if oltp.tmpl != "" {
 			err = incorrectUsageMsg(c, errFmtExclusive, qflprn(verbObjPrefixFlag), qflprn(templateFlag))
-			return "", "", "", err
+			return oltp, err
 		}
-		tmplObjs = prefix
+		oltp.tmpl = prefix
 	}
 
-	if listObjs != "" && tmplObjs != "" {
+	if oltp.list != "" && oltp.tmpl != "" {
 		err = incorrectUsageMsg(c, errFmtExclusive, qflprn(listFlag), qflprn(templateFlag))
-		return "", "", "", err
+		return oltp, err
+	}
+	if objNameOrTmpl == "" {
+		return oltp, err
 	}
 
-	if objNameOrTmpl != "" {
-		if listObjs != "" || tmplObjs != "" {
-			what := "object name or prefix"
-			if isPattern(objNameOrTmpl) {
-				what = "pattern or template"
-			}
-			err = fmt.Errorf("%s (%s) cannot be used together with flags %s and %s (tip: use either one or the other)",
-				what, objNameOrTmpl, qflprn(listFlag), qflprn(templateFlag))
-		} else if isPattern(objNameOrTmpl) {
-			tmplObjs = objNameOrTmpl
-		} else {
-			objName = objNameOrTmpl
+	switch {
+	case oltp.list != "" || oltp.tmpl != "":
+		what := "object name or prefix"
+		if isPattern(objNameOrTmpl) {
+			what = "pattern or template"
+		}
+		err = fmt.Errorf("%s (%s) cannot be used together with flags %s and %s (tip: use one or the other)",
+			what, objNameOrTmpl, qflprn(listFlag), qflprn(templateFlag))
+		return oltp, err
+	case isPattern(objNameOrTmpl):
+		oltp.tmpl = objNameOrTmpl
+
+	case flagIsSet(c, nonRecursFlag) && !cos.IsLastB(objNameOrTmpl, '/'):
+		// ambiguity #1
+		warn := fmt.Sprintf("ambiguity resolving %q as an object name or embedded prefix - use %s to disambiguate",
+			objNameOrTmpl, qflprn(verbObjPrefixFlag))
+		actionWarn(c, warn)
+		briefPause(1)
+		oltp.objName = objNameOrTmpl
+
+	case len(objNameOrTmpl) > 255:
+		// not running lsObjVsPref when "prefix-or-objname" is that long
+		oltp.objName = objNameOrTmpl
+
+	default:
+		// [NOTE] calling api.ListObjectsPage to disambiguate embedded prefix vs object name
+		dop, err := lsObjVsPref(bck, objNameOrTmpl)
+		oltp.notFound = dop.notFound
+		switch {
+		case err != nil:
+			return oltp, err
+
+		// ambiguity #2
+		case dop.isObj && dop.isPref:
+			err := fmt.Errorf("part of the URI %q can be interpreted as an object name and/or mutli-object matching prefix\n"+
+				"(Tip:  to disambiguate, use either %s or %s)", objNameOrTmpl, qflprn(nonRecursFlag), qflprn(verbObjPrefixFlag))
+			return oltp, err
+
+		case dop.isObj:
+			oltp.objName = objNameOrTmpl
+		case dop.isPref:
+			// (operation on all 'prefix'-ed objects)
+			oltp.tmpl, oltp.objName = objNameOrTmpl, ""
 		}
 	}
-	return objName, listObjs, tmplObjs, err
+
+	return oltp, err
 }

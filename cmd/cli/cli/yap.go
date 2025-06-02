@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	"github.com/urfave/cli"
 )
 
@@ -93,8 +94,8 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 	if flagIsSet(c, progressFlag) || flagIsSet(c, listFlag) || flagIsSet(c, templateFlag) {
 		// check connectivity (since '--progress' steals STDOUT with multi-object producing
 		// scary looking errors when there's no cluster)
-		if _, err = api.GetClusterMap(apiBP); err != nil {
-			return
+		if _, err := api.GetClusterMap(apiBP); err != nil {
+			return err
 		}
 	}
 	switch {
@@ -102,7 +103,7 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 		uri := c.Args().Get(0) // dst
 		a.dst.bck, a.dst.oname, err = parseBckObjURI(c, uri, emptyDstOnameOK)
 		if err != nil {
-			return
+			return err
 		}
 
 		// source files via '--list' or '--template'
@@ -114,9 +115,10 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 		case flagIsSet(c, templateFlag):
 			a.src.tmpl = parseStrFlag(c, templateFlag)
 			pt, err := cos.NewParsedTemplate(a.src.tmpl)
-			if err == nil {
+			switch err {
+			case nil:
 				a.pt = &pt
-			} else if err == cos.ErrEmptyTemplate {
+			case cos.ErrEmptyTemplate:
 				err = errors.New("template to select source files cannot be empty")
 			}
 			return err
@@ -133,7 +135,7 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 			return err
 		}
 
-		const efmt = "source (%q) and flag (%s) cannot are mutually exclusive"
+		const efmt = "source (%q) and flag (%s) are mutually exclusive"
 		if flagIsSet(c, listFlag) {
 			return fmt.Errorf(efmt, a.src.arg, qflprn(listFlag))
 		}
@@ -148,24 +150,27 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 				err = fmt.Errorf("missing destination object name (in %s) - required when writing directly from standard input",
 					c.Command.ArgsUsage)
 			}
-			return
+			return err
 		}
 		// file or files
 		if a.src.abspath, err = absPath(a.src.arg); err != nil {
-			return
+			return err
 		}
+
+		// best-effort parsing: (inline range) | (local file or directory)
+
 		// inline "range" w/ no flag, e.g.: "/tmp/www/test{0..2}{0..2}.txt" ais://nnn/www
-		pt, errV := cos.ParseBashTemplate(a.src.abspath)
-		if errV == nil {
+		pt, e1 := cos.ParseBashTemplate(a.src.abspath)
+		if e1 == nil {
 			a.pt = &pt
-			return
+			return nil
 		}
 		// local file or dir?
-		finfo, errV := os.Stat(a.src.abspath)
-		if errV != nil {
+		finfo, e2 := os.Stat(a.src.abspath)
+		if e2 != nil {
 			// must be a csv list of files embedded with the first arg
 			a.src.fdnames = splitCsv(a.src.arg)
-			return
+			return nil
 		}
 
 		a.src.finfo = finfo
@@ -175,25 +180,21 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 				// PUT [convention]: use `basename` as the destination object name, unless specified
 				a.dst.oname = filepath.Base(a.src.abspath)
 			}
-			return
+			return nil
 		}
+
 		// finally: a local (or rather, client-accessible) directory
 		a.src.isdir = true
 		a.src.recurs = flagIsSet(c, recursFlag)
-		return
+		return nil
 	}
 
 	if err := errTailArgsContainFlag(c.Args()[2:]); err != nil {
 		return err
 	}
 
-	const efmt = "too many arguments: '%s'"
-	var hint = fmt.Sprintf("(hint: wildcards must be in single or double quotes, see %s for details)", qflprn(cli.HelpFlag))
-	l := c.NArg()
-	if l > 4 {
-		return fmt.Errorf(efmt+" ...\n%s\n", strings.Join(c.Args()[2:4], " "), hint)
-	}
-	return fmt.Errorf(efmt+"\n%s\n", strings.Join(c.Args()[2:], " "), hint)
+	hint := fmt.Sprintf("(hint: wildcards must be in single or double quotes, see %s for details)", qflprn(cli.HelpFlag))
+	return fmt.Errorf("too many arguments: '%s'\n"+hint, strings.Join(c.Args(), " "))
 }
 
 func (*archbck) verb() string { return "ARCHIVE" }
@@ -201,21 +202,33 @@ func (*archbck) verb() string { return "ARCHIVE" }
 func (a *archbck) dest() string { return a.dst.bck.Cname(a.dst.oname) }
 
 func (a *archbck) parse(c *cli.Context) (err error) {
-	err = a.putargs.parse(c, false /*empty dst oname ok*/)
-	if a.dst.bck.IsEmpty() || err == nil {
-		return err
+	if c.NArg() == 1 {
+		err = a.putargs.parse(c, false /*empty dst oname ok*/)
+		if err != nil {
+			return err
+		}
+	} else {
+		uri := c.Args().Get(1) // dst
+		a.dst.bck, a.dst.oname, err = parseBckObjURI(c, uri, false)
+		if err != nil {
+			return err
+		}
 	}
+
 	//
-	// parse a.rsrc (TODO -- FIXME: support archiving local a.src)
+	// parse a.rsrc
 	//
-	if !flagIsSet(c, listFlag) && !flagIsSet(c, templateFlag) {
-		return missingArgumentsError(c,
-			fmt.Sprintf("either a list of object names via %s or selection template (%s)",
-				flprn(listFlag), flprn(templateFlag)))
-	}
 	if flagIsSet(c, listFlag) && flagIsSet(c, templateFlag) {
 		return incorrectUsageMsg(c, fmt.Sprintf("%s and %s options are mutually exclusive",
 			flprn(listFlag), flprn(templateFlag)))
+	}
+	if flagIsSet(c, listFlag) && flagIsSet(c, verbObjPrefixFlag) {
+		return incorrectUsageMsg(c, fmt.Sprintf("%s and %s options are mutually exclusive",
+			flprn(listFlag), flprn(verbObjPrefixFlag)))
+	}
+	if flagIsSet(c, templateFlag) && flagIsSet(c, verbObjPrefixFlag) {
+		return incorrectUsageMsg(c, fmt.Sprintf("%s and %s options are mutually exclusive",
+			flprn(templateFlag), flprn(verbObjPrefixFlag)))
 	}
 
 	// source bucket[/obj-or-range]
@@ -226,19 +239,29 @@ func (a *archbck) parse(c *cli.Context) (err error) {
 	if a.rsrc.bck, objNameOrTmpl, err = parseBckObjURI(c, uri, true /*emptyObjnameOK*/); err != nil {
 		return err
 	}
-	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
-	if err != nil {
-		return err
+
+	oltp, errV := dopOLTP(c, a.rsrc.bck, objNameOrTmpl)
+	if errV != nil {
+		return errV
 	}
-	if listObjs == "" && tmplObjs == "" {
-		listObjs = objName // NOTE: "pure" prefix comment in parseObjListTemplate (above)
+
+	if oltp.objName == "" && oltp.list == "" && oltp.tmpl == "" {
+		a.rsrc.lr.Template = cos.WildcardMatchAll
 	}
-	if listObjs != "" {
-		a.rsrc.lr.ObjNames = splitCsv(listObjs)
+	if oltp.list == "" && oltp.tmpl == "" {
+		if flagIsSet(c, nonRecursFlag) {
+			oltp.tmpl = oltp.objName
+		} else {
+			oltp.list = oltp.objName
+		}
+	}
+	if oltp.list != "" {
+		a.rsrc.lr.ObjNames = splitCsv(oltp.list)
 	} else {
-		a.rsrc.lr.Template = tmplObjs
+		a.rsrc.lr.Template = oltp.tmpl
 	}
-	return
+
+	return nil
 }
 
 func (*archput) verb() string { return "APPEND" }

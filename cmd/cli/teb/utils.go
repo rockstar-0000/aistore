@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -19,9 +20,212 @@ import (
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/stats"
 )
 
-// this file: low-level formatting routines and misc.
+//
+// low-level formatting routines and misc. helpers
+//
+
+type (
+	// Used to return specific fields/objects for marshaling (MarshalIdent).
+	forMarshaler interface {
+		forMarshal() any
+	}
+	DiskStatsHelper struct {
+		TargetID string
+		DiskName string
+		Stat     cos.DiskStats
+		Tcdf     *fs.Tcdf
+	}
+	SmapHelper struct {
+		Smap         *meta.Smap
+		ExtendedURLs bool
+	}
+	StatsAndStatusHelper struct {
+		Pmap StstMap
+		Tmap StstMap
+	}
+	StatusHelper struct {
+		Smap      *meta.Smap
+		CluConfig *cmn.ClusterConfig
+		Stst      StatsAndStatusHelper
+		Capacity  string
+		Version   string // when all equal
+		BuildTime string // ditto
+		NumDisks  int
+	}
+	ListBucketsHelper struct {
+		XactID string
+		Bck    cmn.Bck
+		Props  *cmn.Bprops
+		Info   *cmn.BsummResult
+	}
+)
+
+var (
+	// for extensions and override, see also:
+	// - FuncMapUnits
+	// - HelpTemplateFuncMap
+	// - `altMap template.FuncMap` below
+	funcMap = template.FuncMap{
+		// formatting
+		"FormatBytesSig":       func(size int64, digits int) string { return FmtSize(size, cos.UnitsIEC, digits) },
+		"FormatBytesSig2":      fmtSize2,
+		"FormatBytesUns":       func(size uint64, digits int) string { return FmtSize(int64(size), cos.UnitsIEC, digits) },
+		"FormatMAM":            func(u int64) string { return fmt.Sprintf("%-10s", FmtSize(u, cos.UnitsIEC, 2)) },
+		"FormatMilli":          func(dur cos.Duration) string { return fmtMilli(dur, cos.UnitsIEC) },
+		"FormatDuration":       FormatDuration,
+		"FormatStart":          FmtTime,
+		"FormatEnd":            FmtTime,
+		"FormatDsortStatus":    dsortJobInfoStatus,
+		"FormatLsObjStatus":    fmtLsObjStatus,
+		"FormatLsObjIsCached":  fmtLsObjIsCached,
+		"FormatObjCustom":      fmtObjCustom,
+		"FormatDaemonID":       fmtDaemonID,
+		"FormatSmap":           fmtSmap,
+		"FormatCluSoft":        fmtCluSoft,
+		"FormatRebalance":      fmtRebalance,
+		"FormatProxiesSumm":    fmtProxiesSumm,
+		"FormatTargetsSumm":    fmtTargetsSumm,
+		"FormatCapPctMAM":      fmtCapPctMAM,
+		"FormatCDFDisks":       fmtCDFDisks,
+		"FormatFloat":          func(f float64) string { return fmt.Sprintf("%.2f", f) },
+		"FormatBool":           FmtBool,
+		"FormatBckName":        fmtBckName,
+		"FormatACL":            fmtACL,
+		"FormatNameDirArch":    fmtNameDirArch,
+		"FormatXactRunFinAbrt": FmtXactRunFinAbrt,
+		//  misc. helpers
+		"IsUnsetTime":      isUnsetTime,
+		"IsEqS":            func(a, b string) bool { return a == b },
+		"IsTotals":         func(a string) bool { return a == XactColTotals },
+		"FancyTotalsCheck": func() string { return fblue(" ✓") },
+		"IsFalse":          func(v bool) bool { return !v },
+		"JoinList":         fmtStringList,
+		"JoinListNL":       func(lst []string) string { return fmtStringListGeneric(lst, "\n") },
+		"ExtECGetStats":    extECGetStats,
+		"ExtECPutStats":    extECPutStats,
+		// StatsAndStatusHelper:
+		// select specific field and make a slice, and then a string out of it
+		"OnlineStatus": func(h StatsAndStatusHelper) string { return toString(h.onlineStatus()) },
+		"Deployments":  func(h StatsAndStatusHelper) string { return toString(h.deployments()) },
+		"Versions":     func(h StatsAndStatusHelper) string { return toString(h.versions()) },
+		"BuildTimes":   func(h StatsAndStatusHelper) string { return toString(h.buildTimes()) },
+	}
+
+	AliasTemplate = "ALIAS\tCOMMAND\n" +
+		"=====\t=======\n" +
+		"{{range $alias := .}}" +
+		"{{ $alias.Name }}\t{{ $alias.Value }}\n" +
+		"{{end}}"
+)
+
+////////////////
+// SmapHelper //
+////////////////
+
+var _ forMarshaler = SmapHelper{}
+
+func (sth SmapHelper) forMarshal() any {
+	return sth.Smap
+}
+
+//
+// stats.NodeStatus
+//
+
+func calcCap(ds *stats.NodeStatus) (total uint64) {
+	for _, cdf := range ds.Tcdf.Mountpaths {
+		total += cdf.Capacity.Avail
+		// TODO: a simplifying local-playground assumption and shortcut - won't work with loop devices, etc.
+		// (ref: 152408)
+		if ds.DeploymentType == apc.DeploymentDev {
+			break
+		}
+	}
+	return total
+}
+
+////////////////////////
+// StatsAndStatusHelper //
+////////////////////////
+
+// for all stats.NodeStatus structs: select specific field and append to the returned slice
+// (using the corresponding jtags here for no particular reason)
+func (h *StatsAndStatusHelper) onlineStatus() []string { return h.toSlice("status") }
+func (h *StatsAndStatusHelper) deployments() []string  { return h.toSlice("deployment") }
+func (h *StatsAndStatusHelper) versions() []string     { return h.toSlice("ais_version") }
+func (h *StatsAndStatusHelper) buildTimes() []string   { return h.toSlice("build_time") }
+func (h *StatsAndStatusHelper) rebalance() []string    { return h.toSlice("rebalance_snap") }
+func (h *StatsAndStatusHelper) pods() []string         { return h.toSlice("k8s_pod_name") }
+
+// internal helper for the methods above
+func (h *StatsAndStatusHelper) toSlice(jtag string) []string {
+	if jtag == "status" {
+		counts := make(map[string]int, 2)
+		for _, m := range []StstMap{h.Pmap, h.Tmap} {
+			for _, s := range m {
+				status := s.Status
+				if status == "" {
+					status = UnknownStatusVal
+				}
+				if _, ok := counts[status]; !ok {
+					counts[status] = 0
+				}
+				counts[status]++
+			}
+		}
+		res := make([]string, 0, len(counts))
+		for status, count := range counts {
+			res = append(res, fmt.Sprintf("%d %s", count, status))
+		}
+		return res
+	}
+
+	// all other tags
+	set := cos.NewStrSet()
+	for _, m := range []StstMap{h.Pmap, h.Tmap} {
+		for _, s := range m {
+			switch jtag {
+			case "deployment":
+				if s.DeploymentType != "" { // (node offline)
+					set.Add(s.DeploymentType)
+				}
+			case "ais_version":
+				if s.Version != "" { // ditto
+					set.Add(s.Version)
+				}
+			case "build_time":
+				if s.BuildTime != "" { // ditto
+					set.Add(s.BuildTime)
+				}
+			case "k8s_pod_name":
+				set.Add(s.K8sPodName)
+			case "rebalance_snap":
+				if s.RebSnap != nil {
+					set.Add(fmtRebStatus(s.RebSnap))
+				}
+			default:
+				debug.Assert(false, jtag)
+			}
+		}
+	}
+	res := set.ToSlice()
+	if len(res) == 0 {
+		res = []string{UnknownStatusVal}
+	}
+	return res
+}
+
+func (m StstMap) allStateFlagsOK() bool {
+	for _, ds := range m {
+		if !ds.Cluster.Flags.IsOK() {
+			return false
+		}
+	}
+	return true
+}
 
 // FmtBool returns "yes" if true, else "no"
 func FmtBool(t bool) string {
@@ -195,6 +399,18 @@ func fmtCluSoft(version, build string) string {
 	return version + " (build: " + build + ")"
 }
 
+func fmtRebalance(h StatsAndStatusHelper, config *cmn.ClusterConfig) (out string) {
+	out = toString(h.rebalance())
+	if config.Rebalance.Enabled {
+		return out
+	}
+	disabled := fred("disabled")
+	if out == NotSetVal || out == UnknownStatusVal {
+		return disabled
+	}
+	return out + " (" + disabled + ")"
+}
+
 func fmtStringList(lst []string) string {
 	if len(lst) == 0 {
 		return unknownVal
@@ -242,6 +458,10 @@ func fmtACL(acl apc.AccessAttrs) string {
 	}
 	return acl.Describe(true /*incl. all*/)
 }
+
+// [NOTE]
+// in re: `apc.LsNoDirs` and `apc.LsNoRecursion`, see:
+// * https://github.com/NVIDIA/aistore/blob/main/docs/howto_virt_dirs.md
 
 func fmtNameDirArch(val string, flags uint16) string {
 	if flags&apc.EntryInArch == 0 {
@@ -300,7 +520,7 @@ func fmtRebStatus(snap *core.Snap) string {
 	return unknownVal
 }
 
-func FmtXactStatus(snap *core.Snap) (s string) {
+func FmtXactRunFinAbrt(snap *core.Snap) (s string) {
 	switch {
 	case snap.AbortedX:
 		if snap.AbortErr == cmn.ErrXactUserAbort.Error() {

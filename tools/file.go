@@ -1,6 +1,7 @@
+//nolint:usetesting // need mkdir(dir = bdir)
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -156,7 +157,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 			Provider: apc.AIS,
 			Ns:       cmn.NsGlobal,
 			Props: &cmn.Bprops{
-				Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash},
+				Cksum: cmn.CksumConf{Type: cos.ChecksumCesXxh},
 				BID:   0xa5b6e7d8,
 			},
 		}
@@ -297,4 +298,18 @@ func FilesEqual(file1, file2 string) (bool, error) {
 		return false, err
 	}
 	return bytes.Equal(f1, f2), nil
+}
+
+func ReaderEqual(r1, r2 io.Reader) bool {
+	buf1 := new(bytes.Buffer)
+	buf2 := new(bytes.Buffer)
+
+	_, err1 := buf1.ReadFrom(r1)
+	_, err2 := buf2.ReadFrom(r2)
+
+	if err1 != nil || err2 != nil {
+		return false
+	}
+
+	return bytes.Equal(buf1.Bytes(), buf2.Bytes())
 }

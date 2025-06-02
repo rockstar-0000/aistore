@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -27,6 +27,7 @@ import (
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/tassert"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -87,7 +88,7 @@ func newPrimary() *proxy {
 	config.Timeout.MaxKeepalive = cos.Duration(4 * time.Second)
 	config.Client.Timeout = cos.Duration(10 * time.Second)
 	config.Client.TimeoutLong = cos.Duration(10 * time.Second)
-	config.Cksum.Type = cos.ChecksumXXHash
+	config.Cksum.Type = cos.ChecksumOneXxh
 	cmn.GCO.CommitUpdate(config)
 	cmn.GCO.SetInitialGconfPath("/tmp/ais-tests/ais.config")
 
@@ -123,7 +124,7 @@ func newSecondary(name string) *proxy {
 	config.Keepalive.Proxy.Interval = cos.Duration(3 * time.Second)
 	config.Timeout.CplaneOperation = cos.Duration(2 * time.Second)
 	config.Timeout.MaxKeepalive = cos.Duration(4 * time.Second)
-	config.Cksum.Type = cos.ChecksumXXHash
+	config.Cksum.Type = cos.ChecksumOneXxh
 	cmn.GCO.CommitUpdate(config)
 
 	o := newBMDOwnerPrx(cmn.GCO.Get())
@@ -174,22 +175,22 @@ func TestMetasyncDeepCopy(t *testing.T) {
 	bmd := newBucketMD()
 	bmd.add(meta.NewBck("bucket1", apc.AIS, cmn.NsGlobal), &cmn.Bprops{
 		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumXXHash,
+			Type: cos.ChecksumOneXxh,
 		},
 	})
 	bmd.add(meta.NewBck("bucket2", apc.AIS, cmn.NsGlobal), &cmn.Bprops{
 		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumXXHash,
+			Type: cos.ChecksumOneXxh,
 		},
 	})
 	bmd.add(meta.NewBck("bucket3", apc.AWS, cmn.NsGlobal), &cmn.Bprops{
 		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumXXHash,
+			Type: cos.ChecksumOneXxh,
 		},
 	})
 	bmd.add(meta.NewBck("bucket4", apc.AWS, cmn.NsGlobal), &cmn.Bprops{
 		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumXXHash,
+			Type: cos.ChecksumOneXxh,
 		},
 	})
 
@@ -607,7 +608,7 @@ func TestMetasyncData(t *testing.T) {
 		bmd      = newBucketMD()
 	)
 
-	emptyAisMsg, err := jsoniter.Marshal(aisMsg{})
+	emptyAisMsg, err := jsoniter.Marshal(actMsgExt{})
 	if err != nil {
 		t.Fatal("Failed to marshal empty apc.ActMsg, err =", err)
 	}
@@ -634,18 +635,18 @@ func TestMetasyncData(t *testing.T) {
 	exp[revsSmapTag+revsActionTag] = emptyAisMsg
 	expRetry[revsSmapTag+revsActionTag] = emptyAisMsg
 
-	syncer.sync(revsPair{smap, &aisMsg{}})
+	syncer.sync(revsPair{smap, &actMsgExt{}})
 	match(t, expRetry, ch, 1)
 
 	// sync bucketmd, fail target and retry
 	bmd.add(meta.NewBck("bucket1", apc.AIS, cmn.NsGlobal), &cmn.Bprops{
 		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumXXHash,
+			Type: cos.ChecksumOneXxh,
 		},
 	})
 	bmd.add(meta.NewBck("bucket2", apc.AIS, cmn.NsGlobal), &cmn.Bprops{
 		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumXXHash,
+			Type: cos.ChecksumOneXxh,
 		},
 	})
 	primary.owner.bmd.putPersist(bmd, nil)
@@ -656,7 +657,7 @@ func TestMetasyncData(t *testing.T) {
 	exp[revsBMDTag+revsActionTag] = emptyAisMsg
 	expRetry[revsBMDTag+revsActionTag] = emptyAisMsg
 
-	syncer.sync(revsPair{bmd, &aisMsg{}})
+	syncer.sync(revsPair{bmd, &actMsgExt{}})
 	match(t, exp, ch, 1)
 	match(t, expRetry, ch, 1)
 
@@ -664,7 +665,7 @@ func TestMetasyncData(t *testing.T) {
 	// after rejecting a few sync requests
 	bmd = bmd.clone()
 	bprops := &cmn.Bprops{
-		Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash},
+		Cksum: cmn.CksumConf{Type: cos.ChecksumOneXxh},
 		LRU:   cmn.GCO.Get().LRU,
 	}
 	bmd.add(meta.NewBck("bucket3", apc.AIS, cmn.NsGlobal), bprops)
@@ -794,8 +795,8 @@ func TestMetasyncMembership(t *testing.T) {
 // TestMetasyncReceive tests extracting received sync data.
 func TestMetasyncReceive(t *testing.T) {
 	{
-		emptyAisMsg := func(a *aisMsg) {
-			if a.Action != "" || a.Name != "" || a.Value != nil {
+		emptyAisMsg := func(a *actMsgExt) {
+			if a != nil && a.Action != "" {
 				t.Fatal("Expecting empty action message", a)
 			}
 		}
@@ -847,7 +848,7 @@ func TestMetasyncReceive(t *testing.T) {
 			t.Fatal("Extract smap from empty payload returned data")
 		}
 
-		wg1 := syncer.sync(revsPair{primary.owner.smap.get(), &aisMsg{}})
+		wg1 := syncer.sync(revsPair{primary.owner.smap.get(), &actMsgExt{}})
 		wg1.Wait()
 		payload := <-chProxy
 

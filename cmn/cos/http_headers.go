@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -17,9 +17,6 @@ const (
 	// not present in IANA registry
 	// mozilla.org has it though, and also https://en.wikipedia.org/wiki/List_of_archive_formats
 	ContentTar = "application/x-tar"
-
-	// not currently used
-	ContentZip = "application/zip"
 )
 
 // Ref: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers
@@ -45,6 +42,8 @@ const (
 	HdrETag      = "ETag" // Ref: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
 
 	HdrHSTS = "Strict-Transport-Security"
+
+	HdrLastModified = "Last-Modified" // RFC1123GMT or, same, http.TimeFormat ("Mon, 02 Jan 2006 15:04:05 GMT")
 )
 
 //
@@ -65,23 +64,16 @@ const (
 
 	// s3 api request headers
 	S3HdrObjSrc = "x-amz-copy-source"
-	S3HdrMptCnt = "x-amz-mp-parts-count"
 
 	// https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
 	S3UnsignedPayload  = "UNSIGNED-PAYLOAD"
 	S3HdrContentSHA256 = "x-amz-content-sha256"
+	S3HdrSignedHeaders = "x-ams-signedheaders"
 
 	S3HdrBckRegion = "x-amz-bucket-region"
 
-	S3ChecksumCRC32  = "x-amz-checksum-crc32"
-	S3ChecksumCRC32C = "x-amz-checksum-crc32c"
-	S3ChecksumSHA1   = "x-amz-checksum-sha1"
-	S3ChecksumSHA256 = "x-amz-checksum-sha256"
-
 	S3MetadataChecksumType = "x-amz-meta-ais-cksum-type"
 	S3MetadataChecksumVal  = "x-amz-meta-ais-cksum-val"
-
-	S3LastModified = "Last-Modified"
 )
 
 const (

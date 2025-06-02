@@ -7,6 +7,7 @@ Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 """
 
 from aistore.sdk import Bucket, ListObjectFlag
+from aistore.sdk.etl.etl_config import ETLConfig
 from typing import Dict, Iterator, List, Union
 from aistore.pytorch.utils import get_basename, get_extension
 from aistore.pytorch.base_iter_dataset import AISBaseIterDataset
@@ -130,8 +131,8 @@ class AISShardReader(AISBaseIterDataset):
 
         # Read shard, get samples, and yield
         for shard in worker_iter:
-            shard_content = shard.get(
-                etl_name=self._etl_name,
+            shard_content = shard.get_reader(
+                etl=ETLConfig(self._etl_name),
             ).read_all()
 
             sample_dict = self._read_samples_from_shards(shard_content)

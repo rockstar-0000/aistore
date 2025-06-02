@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 )
 
 // stream TCP/HTTP session: inactive <=> active transitions
@@ -68,6 +69,7 @@ type (
 	streamBase struct {
 		streamer streamer
 		client   Client        // stream's http client
+		xctn     core.Xact     // xaction
 		stopCh   cos.StopCh    // stop/abort stream
 		lastCh   cos.StopCh    // end-of-stream
 		pdu      *spdu         // PDU buffer
@@ -121,8 +123,9 @@ func newBase(client Client, dstURL, dstID string, extra *Extra) (s *streamBase) 
 	s.postCh = make(chan struct{}, 1)
 
 	// default overrides
-	if extra.SenderID != "" {
-		sid = "-" + extra.SenderID
+	if extra.Xact != nil {
+		s.xctn = extra.Xact
+		sid = "-" + extra.Xact.ID()
 	}
 	// NOTE: PDU-based traffic - a MUST-have for "unsized" transmissions
 	if extra.UsePDU() {
@@ -136,10 +139,7 @@ func newBase(client Client, dstURL, dstID string, extra *Extra) (s *streamBase) 
 	if extra.IdleTeardown > 0 {
 		s.time.idleTeardown = extra.IdleTeardown
 	} else {
-		s.time.idleTeardown = extra.Config.Transport.IdleTeardown.D()
-		if s.time.idleTeardown == 0 {
-			s.time.idleTeardown = dfltIdleTeardown
-		}
+		s.time.idleTeardown = cos.NonZero(extra.Config.Transport.IdleTeardown.D(), dfltIdleTeardown)
 	}
 	debug.Assert(s.time.idleTeardown >= dfltTick, s.time.idleTeardown, " vs ", dfltTick)
 	s.time.ticks = int(s.time.idleTeardown / dfltTick)
@@ -149,11 +149,15 @@ func newBase(client Client, dstURL, dstID string, extra *Extra) (s *streamBase) 
 	s.maxhdr, _ = g.mm.AllocSize(_sizeHdr(extra.Config, int64(extra.MaxHdrSize)))
 
 	s.sessST.Store(inactive) // initiate HTTP session upon the first arrival
-	return
+	return s
 }
 
 func (s *streamBase) _lid(sid, dstID string, extra *Extra) {
-	var sb strings.Builder
+	var (
+		sb strings.Builder
+		l  = 2 + len(s.trname) + len(sid) + 32 + len(dstID)
+	)
+	sb.Grow(l)
 
 	sb.WriteString("s-")
 	sb.WriteString(s.trname)
@@ -161,7 +165,7 @@ func (s *streamBase) _lid(sid, dstID string, extra *Extra) {
 	sb.WriteByte('[')
 	sb.WriteString(strconv.FormatInt(s.sessID, 10))
 
-	extra.Lid(&sb)
+	extra.Lid(&sb) // + compressed
 
 	sb.WriteString("]=>")
 	sb.WriteString(dstID)
@@ -174,10 +178,8 @@ func _sizeHdr(config *cmn.Config, size int64) int64 {
 	if size != 0 {
 		debug.Assert(size <= cmn.MaxTransportHeader, size)
 		size = min(size, cmn.MaxTransportHeader)
-	} else if config.Transport.MaxHeaderSize != 0 {
-		size = int64(config.Transport.MaxHeaderSize)
 	} else {
-		size = cmn.DfltTransportHeader
+		size = cos.NonZero(int64(config.Transport.MaxHeaderSize), int64(cmn.DfltTransportHeader))
 	}
 	return size
 }
@@ -305,7 +307,12 @@ func (s *streamBase) sendLoop(dryrun bool) {
 	// termination is caused by anything other than Fin()
 	// (reasonStopped is, effectively, abort via Stop() - totally legit)
 	if reason != reasonStopped {
-		nlog.Errorf("%s: terminating (%s, %v)", s, reason, err)
+		errExt := fmt.Errorf("%s[term-reason: %s, err: %v]", s, reason, err)
+		nlog.Errorln(errExt)
+		// NOTE: abort grandparent xaction
+		if s.xctn != nil {
+			s.xctn.Abort(errExt)
+		}
 	}
 
 	// wait for the SCQ/cmplCh to empty
@@ -314,10 +321,15 @@ func (s *streamBase) sendLoop(dryrun bool) {
 	// cleanup
 	s.streamer.abortPending(err, false /*completions*/)
 
-	verbose := cmn.Rom.FastV(5, cos.SmoduleTransport)
-	if cnt := s.chanFull.Load(); (cnt >= 10 && cnt <= 20) || (cnt > 0 && verbose) {
-		nlog.Errorln(s.String(), cos.ErrWorkChanFull, "cnt:", cnt)
+	if cnt := s.chanFull.Load(); cnt > 0 {
+		if (cnt >= 10 && cnt <= 20) || cmn.Rom.FastV(4, cos.SmoduleTransport) {
+			nlog.Errorln(s.String(), cos.ErrWorkChanFull, "cnt:", cnt)
+		}
 	}
+}
+
+func (s *streamBase) yelp(err error) {
+	nlog.WarningDepth(1, "Error:", s.String(), "[", err, "]")
 }
 
 ///////////

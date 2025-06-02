@@ -28,10 +28,13 @@ AIS_BACKEND_PROVIDERS=""
 loopback=0
 target_cnt=5
 proxy_cnt=5
+remote_target_cnt=1
+remote_proxy_cnt=1
 mountpath_cnt=5
 deployment="local"
 remote_alias="remais"
 cleanup="false"
+tracing="n"
 
 usage="NAME:
   $(basename "$0") - locally deploy AIS clusters for development
@@ -46,15 +49,19 @@ OPTIONS:
   --cleanup           Cleanup data and metadata from the previous deployments
   --deployment        Choose which AIS cluster(s) to deploy, one of: 'local', 'remote', 'all' (default: 'local')
   --remote-alias      Alias to assign to the remote cluster (default: 'remais')
+  --remote-target-cnt Number of remote cluster (remais) target nodes in the cluster (default: 1)
+  --remote-proxy-cnt  Number of remote proxies/gateways (default: 1)
   --aws               Build with AWS S3 backend
   --gcp               Build with Google Cloud Storage backend
   --azure             Build with Azure Blob Storage backend
+  --oci               Build with OCI Object Storage backend
   --ht                Build with ht:// backend (experimental)
   --loopback          Loopback device size, e.g. 10G, 100M (default: 0). Zero size means emulated mountpaths (with no loopback devices).
   --dir               The root directory of the aistore repository
   --https             Use HTTPS (note: X509 certificates may be required)
   --standby           When starting up, do not join cluster - wait instead for admin request (advanced usage, target-only)
   --transient         Do not store config changes, keep all the updates in memory
+  --tracing           Enable distributed tracing
   -h, --help          Show this help text
 "
 
@@ -80,7 +87,9 @@ while (( "$#" )); do
     --aws)   AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} aws"; shift;;
     --azure) AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} azure"; shift;;
     --gcp)   AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} gcp"; shift;;
+    --oci)   AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} oci"; shift;;
     --ht)    AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS} ht"; shift;;
+    --tracing) tracing="y\n${AIS_TRACING_ENDPOINT}\n${AIS_TRACING_AUTH_TOKEN_HEADER}\n${AIS_TRACING_AUTH_TOKEN_FILE}"; shift;;
 
     --loopback) loopback=$2;
 
@@ -137,6 +146,8 @@ while (( "$#" )); do
     --cleanup) cleanup="true"; shift;;
     --transient) RUN_ARGS="$RUN_ARGS -transient"; shift;;
     --standby) RUN_ARGS="$RUN_ARGS -standby"; shift;;
+    --remote-proxy-cnt) remote_proxy_cnt=$2; shift; shift;;
+    --remote-target-cnt) remote_target_cnt=$2; shift; shift;;
     --https)
       export AIS_USE_HTTPS="true"
       export AIS_SKIP_VERIFY_CRT="true"
@@ -158,7 +169,7 @@ if [[ ${cleanup} == "true" ]]; then
 fi
 
 if [[ ${deployment} == "local" || ${deployment} == "all" ]]; then
-  echo -e "${target_cnt}\n${proxy_cnt}\n${mountpath_cnt}\nn\nn\nn\n${loopback}\n" |\
+  echo -e "${target_cnt}\n${proxy_cnt}\n${mountpath_cnt}\nn\nn\nn\nn\n${loopback}\n${tracing}\n" |\
 	  AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS}" make deploy "RUN_ARGS=${RUN_ARGS}"
 fi
 
@@ -172,7 +183,7 @@ if [[ ${deployment} == "remote" || ${deployment} == "all" ]]; then
   ## NOTE: must have the same build tags and, in particular, same backends -
   ## otherwise, `make deploy` below will rebuild and replace aisnode binary
 
-  echo -e "1\n1\n3\n" | DEPLOY_AS_NEXT_TIER="true" AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS}" AIS_AUTHN_ENABLED=false make deploy
+  echo -e "${remote_target_cnt}\n${remote_proxy_cnt}\n3\n" | DEPLOY_AS_NEXT_TIER="true" AIS_BACKEND_PROVIDERS="${AIS_BACKEND_PROVIDERS}" AIS_AUTHN_ENABLED=false make deploy
 
   # Do not try attach remote cluster if the main cluster did not start.
   if [[ ${deployment} == "all" ]]; then

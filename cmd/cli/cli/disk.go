@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains implementation of the top-level `show` command.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -17,7 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"golang.org/x/sync/errgroup"
@@ -26,7 +26,7 @@ import (
 type (
 	dstats struct {
 		tid   string
-		stats ios.AllDiskStats
+		stats cos.AllDiskStats
 		tcdf  *fs.Tcdf
 	}
 	dstatsCtx struct {
@@ -52,7 +52,7 @@ func (ctx *dstatsCtx) get() error {
 	}
 
 	// 3. v3.23 and older
-	var stats ios.AllDiskStats
+	var stats cos.AllDiskStats
 	err = jsoniter.Unmarshal(out, &stats)
 	if err != nil {
 		return err
@@ -156,9 +156,9 @@ func collapseDisks(dsh []*teb.DiskStatsHelper, numTs int) {
 	}
 	for tid, dst := range tsums {
 		dn := int64(dnums[tid])
-		dst.Stat.Ravg = cos.DivRound(dst.Stat.Ravg, dn)
-		dst.Stat.Wavg = cos.DivRound(dst.Stat.Wavg, dn)
-		dst.Stat.Util = cos.DivRound(dst.Stat.Util, dn)
+		dst.Stat.Ravg = cos.DivRoundI64(dst.Stat.Ravg, dn)
+		dst.Stat.Wavg = cos.DivRoundI64(dst.Stat.Wavg, dn)
+		dst.Stat.Util = cos.DivRoundI64(dst.Stat.Util, dn)
 	}
 	// finally, re-append & sort
 	dsh = dsh[:0]

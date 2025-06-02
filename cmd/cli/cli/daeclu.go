@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles cluster and daemon operations.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -15,8 +15,11 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
+
 	"github.com/urfave/cli"
 )
+
+// TODO: cluster summary to show "err.io.get.n" counters - generally, all metrics that are stats.IsIOErrMetric()
 
 func cluDaeStatus(c *cli.Context, smap *meta.Smap, tstatusMap, pstatusMap teb.StstMap, cfg *cmn.ClusterConfig, sid string) error {
 	var (
@@ -30,28 +33,30 @@ func cluDaeStatus(c *cli.Context, smap *meta.Smap, tstatusMap, pstatusMap teb.St
 	body := teb.StatusHelper{
 		Smap:      smap,
 		CluConfig: cfg,
-		Status: teb.StatsAndStatusHelper{
+		Stst: teb.StatsAndStatusHelper{
 			Pmap: pstatusMap,
 			Tmap: tstatusMap,
 		},
 	}
 	if res, ok := pstatusMap[sid]; ok {
-		table := teb.NewDaeStatus(res, smap, apc.Proxy, units)
+		h := teb.StatsAndStatusHelper{Pmap: teb.StstMap{res.Snode.ID(): res}}
+		table := h.MakeTabP(smap, units)
 		out := table.Template(hideHeader)
 		return teb.Print(res, out, teb.Jopts(usejs))
 	}
 	if res, ok := tstatusMap[sid]; ok {
-		table := teb.NewDaeStatus(res, smap, apc.Target, units)
+		h := teb.StatsAndStatusHelper{Tmap: teb.StstMap{res.Snode.ID(): res}}
+		table := h.MakeTabT(smap, units)
 		out := table.Template(hideHeader)
 		return teb.Print(res, out, teb.Jopts(usejs))
 	}
 	if sid == apc.Proxy {
-		table := teb.NewDaeMapStatus(&body.Status, smap, apc.Proxy, units)
+		table := body.Stst.MakeTabP(smap, units)
 		out := table.Template(hideHeader)
 		return teb.Print(body, out, teb.Jopts(usejs))
 	}
 	if sid == apc.Target {
-		table := teb.NewDaeMapStatus(&body.Status, smap, apc.Target, units)
+		table := body.Stst.MakeTabT(smap, units)
 		out := table.Template(hideHeader)
 		return teb.Print(body, out, teb.Jopts(usejs))
 	}
@@ -62,19 +67,19 @@ func cluDaeStatus(c *cli.Context, smap *meta.Smap, tstatusMap, pstatusMap teb.St
 	//
 	// `ais show cluster` (two tables and Summary)
 	//
-	tableP := teb.NewDaeMapStatus(&body.Status, smap, apc.Proxy, units)
-	tableT := teb.NewDaeMapStatus(&body.Status, smap, apc.Target, units)
+	tableP := body.Stst.MakeTabP(smap, units)
+	tableT := body.Stst.MakeTabT(smap, units)
 
 	// totals: num disks and capacity; software version and build tiume
-	body.NumDisks, body.Capacity = _totals(body.Status.Tmap, units, cfg)
-	body.Version, body.BuildTime = _clusoft(body.Status.Tmap, body.Status.Pmap)
+	body.NumDisks, body.Capacity = _totals(body.Stst.Tmap, units, cfg)
+	body.Version, body.BuildTime = _clusoft(body.Stst.Tmap, body.Stst.Pmap)
 
 	out := tableP.Template(false) + "\n"
 	out += tableT.Template(false) + "\n"
 
 	// summary
 	title := fgreen("Summary:")
-	if isRebalancing(body.Status.Tmap) {
+	if isRebalancing(body.Stst.Tmap) {
 		title = fcyan("Summary:")
 	}
 
@@ -100,8 +105,9 @@ outer:
 			avail += int64(cdf.Avail)
 			num += len(cdf.Disks)
 
-			// TODO: a simplifying local-playground assumption and shortcut - won't work with loop devices, etc.
-			// (ref: 152408)
+			// [TODO]
+			// - simplifying local-playground assumption and shortcut - won't work with loop devices, etc.
+			// - ref: 152408
 			if ds.DeploymentType == apc.DeploymentDev {
 				break outer
 			}

@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -16,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/hk"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 )
@@ -75,10 +76,10 @@ func (mg *managerGroup) List(descRegex *regexp.Regexp, onlyActive bool) []JobInf
 	}
 
 	// Always check persistent db
-	records, err := mg.db.GetAll(dsortCollection, managersKey)
+	records, code, err := mg.db.GetAll(dsortCollection, managersKey)
 	if err != nil {
 		if !cos.IsErrNotFound(err) {
-			nlog.Errorln(err)
+			nlog.Errorln(err, code)
 		}
 		return jobsInfos
 	}
@@ -114,9 +115,9 @@ func (mg *managerGroup) Get(managerUUID string, inclArchived bool) (*Manager, bo
 	manager, exists := mg.managers[managerUUID]
 	if !exists && inclArchived {
 		key := path.Join(managersKey, managerUUID)
-		if err := mg.db.Get(dsortCollection, key, &manager); err != nil {
+		if code, err := mg.db.Get(dsortCollection, key, &manager); err != nil {
 			if !cos.IsErrNotFound(err) {
-				nlog.Errorln(err)
+				nlog.Errorln(err, code)
 			}
 			return nil, false
 		}
@@ -137,7 +138,7 @@ func (mg *managerGroup) Remove(managerUUID string) error {
 	}
 
 	key := path.Join(managersKey, managerUUID)
-	_ = mg.db.Delete(dsortCollection, key) // Delete only returns err when record does not exist, which should be ignored
+	_, _ = mg.db.Delete(dsortCollection, key) // Delete only returns err when record does not exist, which should be ignored
 	return nil
 }
 
@@ -157,8 +158,8 @@ func (mg *managerGroup) persist(managerUUID string) {
 
 	manager.Metrics.Archived.Store(true)
 	key := path.Join(managersKey, managerUUID)
-	if err := mg.db.Set(dsortCollection, key, manager); err != nil {
-		nlog.Errorln(err)
+	if code, err := mg.db.Set(dsortCollection, key, manager); err != nil {
+		nlog.Errorln(err, code)
 		return
 	}
 	delete(mg.managers, managerUUID)
@@ -173,12 +174,12 @@ func (mg *managerGroup) housekeep(int64) time.Duration {
 	mg.mtx.Lock()
 	defer mg.mtx.Unlock()
 
-	records, err := mg.db.GetAll(dsortCollection, managersKey)
+	records, code, err := mg.db.GetAll(dsortCollection, managersKey)
 	if err != nil {
 		if cos.IsErrNotFound(err) {
 			return regularInterval
 		}
-		nlog.Errorln(err)
+		nlog.Errorln(err, code)
 		return retryInterval
 	}
 
@@ -190,7 +191,7 @@ func (mg *managerGroup) housekeep(int64) time.Duration {
 		}
 		if time.Since(m.Metrics.Extraction.End) > regularInterval {
 			key := path.Join(managersKey, m.ManagerUUID)
-			_ = mg.db.Delete(dsortCollection, key)
+			_, _ = mg.db.Delete(dsortCollection, key)
 		}
 	}
 

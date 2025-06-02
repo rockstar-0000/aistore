@@ -2,7 +2,7 @@
 // least recently used cache replacement). It also serves as a built-in garbage-collection
 // mechanism for orphaned workfiles.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package space
 
@@ -21,7 +21,6 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact"
@@ -121,7 +120,8 @@ func (*lruFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 
 func (p *lruFactory) Start() error {
 	p.xctn = &XactLRU{}
-	p.xctn.InitBase(p.UUID(), apc.ActLRU, nil)
+	ctlmsg := p.Args.Custom.(string)
+	p.xctn.InitBase(p.UUID(), apc.ActLRU, ctlmsg, nil)
 	return nil
 }
 
@@ -249,37 +249,39 @@ func (j *lruJ) jog(providers []string) (err error) {
 	return
 }
 
-func (j *lruJ) jogBcks(bcks []cmn.Bck, force bool) (err error) {
+func (j *lruJ) jogBcks(bcks []cmn.Bck, force bool) error {
 	if len(bcks) == 0 {
-		return
+		return nil
 	}
 	if len(bcks) > 1 {
 		j.sortBsize(bcks)
 	}
 	for _, bck := range bcks { // for each bucket under a given provider
-		var size int64
 		j.bck = bck
-		if j.allowDelObj, err = j.allow(); err != nil {
-			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck)
-			err = nil
+		a, err := j.allow()
+		if err != nil {
+			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck.String())
 			continue
 		}
-		j.allowDelObj = j.allowDelObj || force
-		if size, err = j.jogBck(); err != nil {
-			return
+		j.allowDelObj = a || force
+
+		size, err := j.jogBck()
+		if err != nil {
+			return err
 		}
 		if size < cos.KiB {
 			continue
 		}
+
 		// recompute size-to-evict
-		if err = j.evictSize(); err != nil {
-			return
+		if err := j.evictSize(); err != nil {
+			return err
 		}
 		if j.totalSize < cos.KiB {
-			return
+			return nil
 		}
 	}
-	return
+	return nil
 }
 
 func (j *lruJ) jogBck() (size int64, err error) {
@@ -329,7 +331,7 @@ func (j *lruJ) _visit(lom *core.LOM) (pushed bool) {
 		return
 	}
 	// do nothing if the heap's curSize >= totalSize and
-	// the file is more recent then the the heap's newest.
+	// the file is more recent then the heap's newest.
 	if j.curSize >= j.totalSize && lom.AtimeUnix() > j.newest {
 		return
 	}
@@ -389,14 +391,14 @@ func (j *lruJ) evict() (size int64, err error) {
 	return
 }
 
-func (j *lruJ) postRemove(prev, size int64) (capCheck int64, err error) {
+func (j *lruJ) postRemove(prev, size int64) (capCheck int64, _ error) {
 	j.totalSize -= size
 	capCheck = prev + size
-	if err = j.yieldTerm(); err != nil {
-		return
+	if err := j.yieldTerm(); err != nil {
+		return capCheck, err
 	}
 	if capCheck < capCheckThresh {
-		return
+		return capCheck, nil
 	}
 	// init, recompute, and throttle - once per capCheckThresh
 	capCheck = 0
@@ -406,27 +408,29 @@ func (j *lruJ) postRemove(prev, size int64) (capCheck int64, err error) {
 	j.now = time.Now().UnixNano()
 	usedPct, ok := j.ini.GetFSUsedPercentage(j.mi.Path)
 	if ok && usedPct < j.config.Space.HighWM {
-		err = j._throttle(usedPct)
+		err := j._throttle(usedPct)
+		return capCheck, err
 	}
-	return
+	return capCheck, nil
 }
 
-func (j *lruJ) _throttle(usedPct int64) (err error) {
-	if j.mi.IsIdle(j.config) {
-		return
+func (j *lruJ) _throttle(usedPct int64) error {
+	if u := j.mi.GetUtil(); u >= 0 && u < j.config.Disk.DiskUtilLowWM {
+		return nil
 	}
-	// throttle self
-	ratioCapacity := cos.Ratio(j.config.Space.HighWM, j.config.Space.LowWM, usedPct)
-	curr := fs.GetMpathUtil(j.mi.Path)
-	ratioUtilization := cos.Ratio(j.config.Disk.DiskUtilHighWM, j.config.Disk.DiskUtilLowWM, curr)
-	if ratioUtilization > ratioCapacity {
+	var (
+		ratioCap  = cos.RatioPct(j.config.Space.HighWM, j.config.Space.LowWM, usedPct)
+		curr      = fs.GetMpathUtil(j.mi.Path)
+		ratioUtil = cos.RatioPct(j.config.Disk.DiskUtilHighWM, j.config.Disk.DiskUtilLowWM, curr)
+	)
+	if ratioUtil > ratioCap {
 		if usedPct < (j.config.Space.LowWM+j.config.Space.HighWM)/2 {
 			j.throttle = true
 		}
-		time.Sleep(mpather.ThrottleMaxDur)
-		err = j.yieldTerm()
+		time.Sleep(fs.Throttle100ms)
+		return j.yieldTerm()
 	}
-	return
+	return nil
 }
 
 // remove local copies that "belong" to different LRU joggers (space accounting may be temporarily not precise)
@@ -444,20 +448,23 @@ func (j *lruJ) evictObj(lom *core.LOM) bool {
 	return true
 }
 
-func (j *lruJ) evictSize() (err error) {
-	lwm, hwm := j.config.Space.LowWM, j.config.Space.HighWM
+func (j *lruJ) evictSize() error {
 	blocks, bavail, bsize, err := j.ini.GetFSStats(j.mi.Path)
 	if err != nil {
 		return err
 	}
-	used := blocks - bavail
-	usedPct := used * 100 / blocks
+
+	var (
+		lwm, hwm = j.config.Space.LowWM, j.config.Space.HighWM
+		used     = blocks - bavail
+		usedPct  = used * 100 / blocks
+	)
 	if usedPct < uint64(hwm) {
-		return
+		return nil
 	}
 	lwmBlocks := blocks * uint64(lwm) / 100
 	j.totalSize = int64(used-lwmBlocks) * bsize
-	return
+	return nil
 }
 
 func (j *lruJ) yieldTerm() error {
@@ -469,7 +476,7 @@ func (j *lruJ) yieldTerm() error {
 		return cmn.NewErrAborted(xlru.Name(), "", nil)
 	default:
 		if j.throttle {
-			time.Sleep(mpather.ThrottleMinDur)
+			time.Sleep(fs.Throttle1ms)
 		}
 		break
 	}
@@ -498,16 +505,16 @@ func (j *lruJ) sortBsize(bcks []cmn.Bck) {
 	}
 }
 
-func (j *lruJ) allow() (ok bool, err error) {
+func (j *lruJ) allow() (bool, error) {
 	var (
 		bowner = core.T.Bowner()
 		b      = meta.CloneBck(&j.bck)
 	)
-	if err = b.Init(bowner); err != nil {
-		return
+	if err := b.Init(bowner); err != nil {
+		return false, err
 	}
-	ok = b.Props.LRU.Enabled && b.Allow(apc.AceObjDELETE) == nil
-	return
+	ok := b.Props.LRU.Enabled && b.Allow(apc.AceObjDELETE) == nil
+	return ok, nil
 }
 
 //////////////

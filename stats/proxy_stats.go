@@ -63,13 +63,13 @@ func (r *Prunner) Init(p core.Node) *atomic.Bool {
 func (r *Prunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 	s := r.core
 	s.updateUptime(uptime)
-	s.promLock()
 	idle := s.copyT(r.ctracker)
-	s.promUnlock()
 
-	if now >= r.next || !idle {
+	verbose := cmn.Rom.FastV(4, cos.SmoduleStats)
+
+	if (!idle && now >= r.next) || verbose {
 		s.sgl.Reset() // sharing w/ CoreStats.copyT
-		r.ctracker.write(s.sgl, r.sorted, false /*target*/, idle)
+		r.write(s.sgl, false /*target*/, idle)
 		if l := s.sgl.Len(); l > 3 { // skip '{}'
 			line := string(s.sgl.Bytes())
 			debug.Assert(l < s.sgl.Slab().Size(), l, " vs slab ", s.sgl.Slab().Size())
@@ -78,12 +78,11 @@ func (r *Prunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 				r.prev = line
 			}
 		}
-		if idle {
-			r._next(config, now)
-		}
+		r._next(config, now)
 	}
 
-	r._mem(r.node.PageMM(), 0, 0)
+	// memory and CPU alerts
+	r._memload(r.node.PageMM(), 0, 0)
 }
 
 func (r *Prunner) statsTime(newval time.Duration) {

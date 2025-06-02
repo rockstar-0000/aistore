@@ -1,6 +1,6 @@
 // Package statsd provides a client to send basic statd metrics (timer, counter and gauge) to listening UDP StatsD server.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package statsd
 
@@ -162,7 +162,6 @@ func (c Client) write(bytes []byte, l int) {
 	}
 }
 
-// TODO: MTU size limitation
 func (c Client) AppMetric(m Metric, sgl *memsys.SGL) {
 	var (
 		t, prefix string

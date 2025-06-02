@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -48,10 +48,10 @@ type (
 	// rmdOwner is used to keep the information about the rebalances. Currently
 	// it keeps the Version of the latest rebalance.
 	rmdOwner struct {
+		rmd   ratomic.Pointer[rebMD]
 		cluID string
 		fpath string
 		sync.Mutex
-		rmd         ratomic.Pointer[rebMD]
 		interrupted atomic.Bool // when joining target reports interrupted rebalance
 		starting    atomic.Bool // when starting up
 	}
@@ -60,14 +60,15 @@ type (
 		pre   func(ctx *rmdModifier, clone *rebMD)
 		final func(ctx *rmdModifier, clone *rebMD)
 
-		prev  *rebMD // pre-modification rmd
-		cur   *rebMD // CoW clone
-		rebID string // cluster-wide rebalance ID, "g[uuid]" in the logs
-
-		cluID   string // cluster ID (== smap.UUID) - never changes
+		prev    *rebMD // pre-modification rmd
+		cur     *rebMD // CoW clone
 		p       *proxy
 		smapCtx *smapModifier
-		wait    bool
+
+		rebID string // cluster-wide rebalance ID, "g[uuid]" in the logs
+		cluID string // cluster ID (== smap.UUID) - never changes
+
+		wait bool
 	}
 )
 
@@ -77,6 +78,7 @@ var _ revs = (*rebMD)(nil)
 // as revs
 func (*rebMD) tag() string       { return revsRMDTag }
 func (r *rebMD) version() int64  { return r.Version }
+func (r *rebMD) uuid() string    { return r.CluID }
 func (r *rebMD) marshal() []byte { return cos.MustMarshal(r) }
 func (*rebMD) jit(p *proxy) revs { return p.owner.rmd.get() }
 func (*rebMD) sgl() *memsys.SGL  { return nil }
@@ -132,6 +134,19 @@ func (r *rmdOwner) load() {
 
 func (r *rmdOwner) put(rmd *rebMD) { r.rmd.Store(rmd) }
 func (r *rmdOwner) get() *rebMD    { return r.rmd.Load() }
+
+func (r *rmdOwner) synch(rmd *rebMD, locked bool) (err error) {
+	if !locked {
+		r.Lock()
+	}
+	r.put(rmd)
+	err = r.persist(rmd)
+	debug.AssertNoErr(err)
+	if !locked {
+		r.Unlock()
+	}
+	return err
+}
 
 func (r *rmdOwner) modify(ctx *rmdModifier) (clone *rebMD, err error) {
 	r.Lock()
@@ -199,7 +214,15 @@ func rmdInc(_ *rmdModifier, clone *rebMD) { clone.inc() }
 func rmdSync(m *rmdModifier, clone *rebMD) {
 	debug.Assert(m.cur == clone)
 	m.listen(nil)
-	msg := &aisMsg{ActMsg: apc.ActMsg{Action: apc.ActRebalance}, UUID: m.rebID} // user-requested rebalance
+
+	msg := &actMsgExt{
+		ActMsg: apc.ActMsg{
+			Value:  m.smapCtx.msg.Value, // from the original action msg
+			Name:   m.smapCtx.msg.Name,  // ditto
+			Action: apc.ActRebalance,
+		},
+		UUID: m.rebID, // user-requested rebalance
+	}
 	wg := m.p.metasyncer.sync(revsPair{m.cur, msg})
 	if m.wait {
 		wg.Wait()

@@ -1,12 +1,3 @@
----
-layout: post
-title: Environment Variables
-permalink: /docs/environment-vars
-redirect_from:
- - /environment-vars.md/
- - /docs/environment-vars.md/
----
-
 ## Introduction
 
 Generally, aistore configuration comprises several sources:
@@ -55,7 +46,7 @@ The remainder of this text groups aistore environment variables by their respect
 - [Package: memsys](#package-memsys)
 - [Package: transport](#package-transport)
 
-separately, there's authenication server config:
+separately, there's authentication server config:
 - [AuthN](#authn)
 
 and finally:
@@ -145,9 +136,9 @@ See also:
 
 | name | comment |
 | ---- | ------- |
-| `MY_POD` and `HOSTNAME` | Kubernetes POD name. `MY_POD` is used in [production](operator/pkg/resources/cmn/env.go); `HOSTNAME`, on the other hand, is usually considered a Kubernetes default |
+| `MY_POD` and `HOSTNAME` | Kubernetes POD name. `MY_POD` is used in [production](https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go); `HOSTNAME`, on the other hand, is usually considered a Kubernetes default |
 | `MY_NODE` | Kubernetes node name |
-| `K8S_NS` and `POD_NAMESPACE` | Kubernetes namespace. `K8S_NS` is used in [production](operator/pkg/resources/cmn/env.go), while `POD_NAMESPACE` - development |
+| `K8S_NS` and `POD_NAMESPACE` | Kubernetes namespace. `K8S_NS` is used in [production](https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go), while `POD_NAMESPACE` - development |
 
 Kubernetes POD name is also reported via `ais show cluster` CLI - when it is a Kubernetes deployment, e.g.:
 
@@ -182,6 +173,7 @@ The corresponding environment "belongs" to the internal [backend](https://github
 | `GOOGLE_CLOUD_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS` | GCP account with permissions to access Google Cloud Storage buckets |
 | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY` | Azure account with  permissions to access Blob Storage containers |
 | `AIS_AZURE_URL` | Azure endpoint, e.g. `http://<account_name>.blob.core.windows.net` |
+| `OCI_TENANCY_OCID`, `OCI_USER_OCID`, `OCI_REGION`, `OCI_FINGERPRINT`, `OCI_PRIVATE_KEY`, `OCI_COMPARTMENT_OCID` | OCI account with permissions to access Object Storage buckets and compartments |
 
 Notice in the table above that the variables `S3_ENDPOINT` and `AWS_PROFILE` are designated as _global_: cluster-wide.
 
@@ -231,9 +223,11 @@ See also:
 
 AIStore is a fully compliant [Prometheus exporter](https://prometheus.io/docs/instrumenting/writing_exporters/).
 
-In addition and separately, AIStore supports [StatsD](https://github.com/etsy/statsd), and via StatsD - Graphite (collection) and Grafana (graphics).
+In addition and separately, AIStore supports [StatsD](https://github.com/statsd/statsd), and via StatsD - Graphite (collection) and Grafana (graphics).
 
 The corresponding binary choice between StatsD and Prometheus is a **build-time** switch controlled by a single build tag: **statsd**.
+
+> For the complete list of supported build tags, please see [conditional linkage](/docs/build_tags.md).
 
 > As a side note, the entire assortment of supported build tags is demonstrated by the following `aisnode` building examples:
 
@@ -262,7 +256,7 @@ As far as, specifically, StatsD alternative, additional environment includes:
 
 | name | comment |
 | ---- | ------- |
-| `AIS_STATSD_PORT` | use it to override the default `8125` (see https://github.com/etsy/stats) |
+| `AIS_STATSD_PORT` | use it to override the default `8125` (see https://github.com/etsy/statsd) |
 | `AIS_STATSD_PROBE` | a startup option that, when true, tells an ais node to _probe_ whether StatsD server exists (and responds); if the probe fails, the node will disable its StatsD functionality completely - i.e., will not be sending any metrics to the StatsD port (above) |
 
 ## Package: memsys
@@ -270,7 +264,7 @@ As far as, specifically, StatsD alternative, additional environment includes:
 | name | comment |
 | ---- | ------- |
 | `AIS_MINMEM_FREE` | for details, see [Memory Manager, Slab Allocator (MMSA)](https://github.com/NVIDIA/aistore/blob/main/memsys/README.md) |
-| `AIS_MINMEM_PCT_TOTAL` | same as above and, specifically, te section "Minimum Available Memory" |
+| `AIS_MINMEM_PCT_TOTAL` | same as above and, specifically, the section "Minimum Available Memory" |
 | `AIS_MINMEM_PCT_FREE` | (ditto) |
 
 ## Package: transport
@@ -304,7 +298,7 @@ Separately, there's also client-side AuthN environment that includes:
 
 | Name                  | Description                                                                                                                          |
 |-----------------------|--------------------------------------------------------------------------------------------------------------------------------------|
-| `AIS_AUTHN_URL`       | Used by [CLI](docs/cli/auth.md) to configure and query the authentication server (AuthN).                                            |
+| `AIS_AUTHN_URL`       | Used by [CLI](./cli/auth.md) to configure and query the authentication server (AuthN).                                            |
 | `AIS_AUTHN_TOKEN_FILE`| Token file pathname; can be used to override the default `$HOME/.config/ais/cli/<fname.Token>`.                                      |
 | `AIS_AUTHN_TOKEN`     | The JWT token itself (excluding the file and JSON); can be used to specify the token directly, bypassing the need for a token file.  |
 

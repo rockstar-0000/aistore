@@ -1,12 +1,3 @@
----
-layout: post
-title: HELP
-permalink: /docs/cli/help
-redirect_from:
- - /cli/help.md/
- - /docs/cli/help.md/
----
-
 This readme is a loose assortment of quick tips.
 
 ## Installing CLI directly from the latest GitHub release
@@ -65,7 +56,7 @@ NAME:
    ais - AIS CLI: command-line management utility for AIStore
 
 USAGE:
-   ais [global options] command [command options] [arguments...]
+   ais [global options] command [arguments...] [command options]
 
 VERSION:
    1.1.950525a50

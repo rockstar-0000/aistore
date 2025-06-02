@@ -1,6 +1,6 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
@@ -8,9 +8,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -18,6 +21,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/xact/xreg"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -29,21 +33,23 @@ type etlBootstrapper struct {
 	// construction
 	errCtx *cmn.ETLErrCtx
 	config *cmn.Config
-	msg    InitSpecMsg
-	env    map[string]string
+	msg    InitMsg
+	secret string
 
 	// runtime
+	k8sClient       k8s.Client
 	xctn            core.Xact
 	pod             *corev1.Pod
 	svc             *corev1.Service
 	uri             string
 	originalPodName string
+	podAddr         string
 	originalCommand []string
 }
 
 func (b *etlBootstrapper) createPodSpec() (err error) {
-	if b.pod, err = ParsePodSpec(b.errCtx, b.msg.Spec); err != nil {
-		return
+	if b.pod, err = b.msg.ParsePodSpec(); err != nil {
+		return cmn.NewErrETLf(b.errCtx, "failed to parse: %v", err)
 	}
 	b.originalPodName = b.pod.GetName()
 	b.errCtx.ETLName = b.originalPodName
@@ -53,19 +59,27 @@ func (b *etlBootstrapper) createPodSpec() (err error) {
 func (b *etlBootstrapper) _prepSpec() (err error) {
 	// Override pod name: append target ID
 	// (K8s doesn't allow `_` and uppercase)
-	b.pod.SetName(k8s.CleanName(b.msg.IDX + "-" + core.T.SID()))
+	b.pod.SetName(k8s.CleanName(b.msg.Name() + "-" + core.T.SID()))
 	b.errCtx.PodName = b.pod.GetName()
 	b.pod.APIVersion = "v1"
+	b.pod.Kind = "Pod"
 
 	// The following combination of Affinity and Anti-Affinity provides for:
 	// 1. The ETL container is always scheduled on the target invoking it.
 	// 2. No more than a single ETL container with the same target is scheduled on
 	//    the same node at any given point in time.
 	if err = b._setAffinity(); err != nil {
-		return
+		return err
 	}
 	if err = b._setAntiAffinity(); err != nil {
-		return
+		return err
+	}
+
+	if b.msg.ArgType() == ArgTypeFQN {
+		if err = b._setVol(); err != nil {
+			nlog.Errorln(err)
+			return err
+		}
 	}
 
 	b._updPodCommand()
@@ -77,7 +91,36 @@ func (b *etlBootstrapper) _prepSpec() (err error) {
 	if cmn.Rom.FastV(4, cos.SmoduleETL) {
 		nlog.Infof("prep pod spec: %s, %+v", b.msg.String(), b.errCtx)
 	}
-	return
+	return err
+}
+
+func (b *etlBootstrapper) _setVol() (err error) {
+	var (
+		targetPodName = os.Getenv(env.AisK8sPod)
+		targetPod     *corev1.Pod
+	)
+
+	if targetPod, err = b.k8sClient.Pod(targetPodName); err != nil {
+		return fmt.Errorf("failed to get target pod %q: %w", targetPodName, err)
+	}
+	debug.Assert(len(targetPod.Spec.Containers) > 0)
+	mounts := make([]corev1.VolumeMount, 0, len(targetPod.Spec.Containers[0].VolumeMounts))
+	for _, vol := range targetPod.Spec.Containers[0].VolumeMounts {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      vol.Name,
+			MountPath: vol.MountPath,
+			ReadOnly:  true, // restrict access from ETL Pods to read-only
+		})
+	}
+
+	debug.Assertf(len(mounts) > 0, "target pod %q has no volume mounts for container %q", targetPodName, targetPod.Spec.Containers[0].Name)
+	debug.Assertf(len(targetPod.Spec.Volumes) > 0, "target pod %q has no volumes with PVCs", targetPodName)
+
+	for i := range b.pod.Spec.Containers {
+		b.pod.Spec.Containers[i].VolumeMounts = mounts
+	}
+	b.pod.Spec.Volumes = targetPod.Spec.Volumes
+	return nil
 }
 
 func (b *etlBootstrapper) createServiceSpec() {
@@ -104,71 +147,72 @@ func (b *etlBootstrapper) createServiceSpec() {
 	b.errCtx.SvcName = b.svc.Name
 }
 
-func (b *etlBootstrapper) setupConnection() (err error) {
+func (b *etlBootstrapper) setupConnection(schema string) (err error) {
 	// Retrieve host IP of the pod.
 	var hostIP string
 	if hostIP, err = b._getHost(); err != nil {
-		return
+		return err
 	}
 
 	// Retrieve assigned port by the service.
-	var nodePort uint
+	var nodePort int
 	if nodePort, err = b._getPort(); err != nil {
-		return
-	}
-
-	// Make sure we can access the pod via TCP socket address to ensure that
-	// it is accessible from target.
-	etlSocketAddr := fmt.Sprintf("%s:%d", hostIP, nodePort)
-	if err = b._dial(etlSocketAddr); err != nil {
-		if cmn.Rom.FastV(4, cos.SmoduleETL) {
-			nlog.Warningf("failed to dial -> %s: %s, %+v, %s", etlSocketAddr, b.msg.String(), b.errCtx, b.uri)
-		}
-		err = cmn.NewErrETL(b.errCtx, err.Error())
-		return
-	}
-
-	b.uri = "http://" + etlSocketAddr
-	if cmn.Rom.FastV(4, cos.SmoduleETL) {
-		nlog.Infof("setup connection -> %s, %+v, %s", b.uri, b.msg.String(), b.errCtx)
-	}
-	return nil
-}
-
-func (b *etlBootstrapper) _dial(socketAddr string) error {
-	probeInterval := cmn.Rom.MaxKeepalive()
-	err := cmn.NetworkCallWithRetry(&cmn.RetryArgs{
-		Call: func() (int, error) {
-			conn, err := net.DialTimeout("tcp", socketAddr, probeInterval)
-			if err != nil {
-				return 0, err
-			}
-			cos.Close(conn)
-			return 0, nil
-		},
-		SoftErr: 10,
-		HardErr: 2,
-		Sleep:   3 * time.Second,
-		Action:  "dial POD " + b.pod.Name + " at " + socketAddr,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to wait for ETL Service/Pod %q to respond, err: %v", b.pod.Name, err)
-	}
-	return nil
-}
-
-func (b *etlBootstrapper) createEntity(entity string) error {
-	client, err := k8s.GetClient()
-	if err != nil {
 		return err
 	}
+
+	// the pod must be reachable via its tcp addr
+	var ecode int
+	b.podAddr = hostIP + ":" + strconv.Itoa(nodePort)
+	if ecode, err = b.dial(); err != nil {
+		if cmn.Rom.FastV(4, cos.SmoduleETL) {
+			nlog.Warningf("%s: failed to dial %s [%+v, %s]", b.msg, b.podAddr, b.errCtx, b.uri)
+		}
+		return cmn.NewErrETL(b.errCtx, err.Error(), ecode)
+	}
+
+	b.uri = schema + b.podAddr
+	if cmn.Rom.FastV(4, cos.SmoduleETL) {
+		nlog.Infof("%s: setup connection to %s [%+v]", b.msg, b.uri, b.errCtx)
+	}
+	return nil
+}
+
+// TODO -- FIXME: hardcoded (time, error counts) tunables
+func (b *etlBootstrapper) dial() (int, error) {
+	action := "dial POD " + b.pod.Name + " at " + b.podAddr
+	ecode, err := cmn.NetworkCallWithRetry(&cmn.RetryArgs{
+		Call:      b.call,
+		SoftErr:   10,
+		HardErr:   2,
+		Sleep:     3 * time.Second,
+		Verbosity: cmn.RetryLogOff,
+		Action:    action,
+	})
+	if err != nil {
+		return ecode, fmt.Errorf("failed to wait for ETL Service/Pod %q to respond: %v", b.pod.Name, err)
+	}
+	return 0, nil
+}
+
+func (b *etlBootstrapper) call() (int, error) {
+	conn, err := net.DialTimeout("tcp", b.podAddr, cmn.Rom.MaxKeepalive())
+	if err != nil {
+		return 0, err
+	}
+	cos.Close(conn)
+	return 0, nil
+}
+
+func (b *etlBootstrapper) createEntity(entity string) (err error) {
 	switch entity {
 	case k8s.Pod:
-		err = client.Create(b.pod)
+		err = b.k8sClient.Create(b.pod)
 	case k8s.Svc:
-		err = client.Create(b.svc)
+		err = b.k8sClient.Create(b.svc)
 	default:
-		cos.AssertMsg(false, "invalid K8s entity :"+entity)
+		err = fmt.Errorf("invalid K8s entity %q", entity)
+		debug.AssertNoErr(err)
+		nlog.Errorln(err)
 	}
 
 	if err != nil {
@@ -183,51 +227,44 @@ func (b *etlBootstrapper) createEntity(entity string) error {
 // `readinessProbe` config specified the last step gets skipped.
 //
 // NOTE: currently, we do require readinessProbe config in the ETL spec.
-func (b *etlBootstrapper) waitPodReady() error {
-	var (
-		timeout     = b.msg.Timeout.D()
-		interval    = cos.ProbingFrequency(timeout)
-		client, err = k8s.GetClient()
-	)
-	if err != nil {
-		return cmn.NewErrETL(b.errCtx, err.Error())
-	}
+func (b *etlBootstrapper) waitPodReady(podCtx context.Context) error {
+	initTimeout, _ := b.msg.Timeouts()
+	interval := cos.ProbingFrequency(initTimeout.D())
 	if cmn.Rom.FastV(4, cos.SmoduleETL) {
-		nlog.Infof("waiting pod %q ready (%+v, %s) timeout=%v ival=%v",
-			b.pod.Name, b.msg.String(), b.errCtx, timeout, interval)
+		nlog.Infof("waiting pod %q ready (%+v, %s) initTimeout=%v ival=%v",
+			b.pod.Name, b.msg.String(), b.errCtx, initTimeout, interval)
 	}
 	// wait
-	err = wait.PollUntilContextTimeout(context.Background(), interval, timeout, false, /*immediate*/
+	err := wait.PollUntilContextTimeout(podCtx, interval, initTimeout.D(), false, /*immediate*/
 		func(context.Context) (ready bool, err error) {
-			return checkPodReady(client, b.pod.Name)
+			return checkPodReady(b.k8sClient, b.pod.Name)
 		},
 	)
 
 	if err == nil {
 		return nil
 	}
-	pod, _ := client.Pod(b.pod.Name)
+	pod, _ := b.k8sClient.Pod(b.pod.Name)
 	if pod == nil {
 		return cmn.NewErrETL(b.errCtx, err.Error())
 	}
 	err = cmn.NewErrETLf(b.errCtx,
-		`%v (pod phase: %q, pod conditions: %s; expected condition: %s)`,
+		`%v (pod phase: %q, pod conditions: %s`,
 		err, pod.Status.Phase, podConditionsToString(pod.Status.Conditions),
-		podConditionToString(&corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}),
 	)
 	return err
 }
 
-func (b *etlBootstrapper) setupXaction(xid string) {
+func (b *etlBootstrapper) setupXaction(xid string) core.Xact {
 	rns := xreg.RenewETL(b.msg, xid)
 	debug.AssertNoErr(rns.Err)
-	debug.Assert(!rns.IsRunning())
 	b.xctn = rns.Entry.Get()
 	debug.Assertf(b.xctn.ID() == xid, "%s vs %s", b.xctn.ID(), xid)
+	return b.xctn
 }
 
 func (b *etlBootstrapper) _updPodCommand() {
-	if b.msg.CommTypeX != HpushStdin {
+	if b.msg.CommType() != HpushStdin {
 		return
 	}
 
@@ -332,44 +369,45 @@ func (b *etlBootstrapper) _setPodEnv() {
 	for idx := range containers {
 		containers[idx].Env = append(containers[idx].Env, corev1.EnvVar{
 			Name:  "AIS_TARGET_URL",
-			Value: core.T.Snode().URL(cmn.NetPublic) + apc.URLPathETLObject.Join(reqSecret),
+			Value: core.T.Snode().URL(cmn.NetIntraData) + apc.URLPathETLObject.Join(b.msg.Name(), b.secret),
 		})
-		for k, v := range b.env {
+		if b.msg.ArgType() == ArgTypeFQN {
 			containers[idx].Env = append(containers[idx].Env, corev1.EnvVar{
-				Name:  k,
-				Value: v,
+				Name:  ArgType,
+				Value: ArgTypeFQN,
+			})
+		}
+		containers[idx].Env = append(containers[idx].Env, corev1.EnvVar{
+			Name:  DirectPut,
+			Value: strconv.FormatBool(b.msg.IsDirectPut()),
+		})
+		for _, v := range b.msg.GetEnv() {
+			containers[idx].Env = append(containers[idx].Env, corev1.EnvVar{
+				Name:  v.Name,
+				Value: v.Value,
 			})
 		}
 	}
 	for idx := range b.pod.Spec.InitContainers {
-		for k, v := range b.env {
+		for _, v := range b.msg.GetEnv() {
 			b.pod.Spec.InitContainers[idx].Env = append(b.pod.Spec.InitContainers[idx].Env, corev1.EnvVar{
-				Name:  k,
-				Value: v,
+				Name:  v.Name,
+				Value: v.Value,
 			})
 		}
 	}
 }
 
 func (b *etlBootstrapper) _getHost() (string, error) {
-	client, err := k8s.GetClient()
-	if err != nil {
-		return "", cmn.NewErrETL(b.errCtx, err.Error())
-	}
-	p, err := client.Pod(b.pod.Name)
+	p, err := b.k8sClient.Pod(b.pod.Name)
 	if err != nil {
 		return "", err
 	}
 	return p.Status.HostIP, nil
 }
 
-func (b *etlBootstrapper) _getPort() (uint, error) {
-	client, err := k8s.GetClient()
-	if err != nil {
-		return 0, cmn.NewErrETL(b.errCtx, err.Error())
-	}
-
-	s, err := client.Service(b.svc.Name)
+func (b *etlBootstrapper) _getPort() (int, error) {
+	s, err := b.k8sClient.Service(b.svc.Name)
 	if err != nil {
 		return 0, cmn.NewErrETL(b.errCtx, err.Error())
 	}
@@ -379,5 +417,5 @@ func (b *etlBootstrapper) _getPort() (uint, error) {
 	if err != nil {
 		return 0, cmn.NewErrETL(b.errCtx, err.Error())
 	}
-	return uint(port), nil
+	return port, nil
 }

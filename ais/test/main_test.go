@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -40,7 +40,7 @@ func setBucket() (bck cmn.Bck, err error) {
 	} else if err := bck.Validate(); err != nil {
 		return bck, fmt.Errorf("failed to validate 'BUCKET' env variable, err: %v", err)
 	}
-	tlog.Logf("Using bucket %s\n", bck)
+	tlog.Logf("Using bucket %s\n", bck.String())
 	return bck, nil
 }
 
@@ -52,17 +52,17 @@ func waitForCluster() (primaryURL string, err error) {
 	var (
 		proxyCnt, targetCnt, retry int
 	)
-	pc := os.Getenv(env.AIS.NumProxy)
-	tc := os.Getenv(env.AIS.NumTarget)
+	pc := os.Getenv(env.AisNumProxy)
+	tc := os.Getenv(env.AisNumTarget)
 	if pc != "" || tc != "" {
 		proxyCnt, err = strconv.Atoi(pc)
 		if err != nil {
-			err = fmt.Errorf("error EnvVars: %s. err: %v", env.AIS.NumProxy, err)
+			err = fmt.Errorf("error EnvVars: %s. err: %v", env.AisNumProxy, err)
 			return
 		}
 		targetCnt, err = strconv.Atoi(tc)
 		if err != nil {
-			err = fmt.Errorf("error EnvVars: %s. err: %v", env.AIS.NumTarget, err)
+			err = fmt.Errorf("error EnvVars: %s. err: %v", env.AisNumTarget, err)
 			return
 		}
 	}

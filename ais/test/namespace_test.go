@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -37,7 +37,7 @@ func listAllBuckets(t *testing.T, baseParams api.BaseParams, includeRemote bool,
 			fltPresence)
 		tassert.CheckFatal(t, err)
 
-		// TODO -- FIXME: do intead smth like: `remoteClusterBuckets.Equal(allRemaisBuckets)`
+		// TODO -- FIXME: do instead smth like: `remoteClusterBuckets.Equal(allRemaisBuckets)`
 		tassert.Errorf(
 			t, len(remoteClusterBuckets) == len(allRemaisBuckets),
 			"specific namespace %q => %v, while all-remote %q => %v, where presence=%d\n",
@@ -267,8 +267,8 @@ func TestNamespace(t *testing.T) {
 					)
 				}
 			}
-			tassert.Errorf(t, bck1Found, "%s not found in %v summ", m1.bck, summaries)
-			tassert.Errorf(t, bck2Found, "%s not found in %v summ", m2.bck, summaries)
+			tassert.Errorf(t, bck1Found, "%s not found in %v summ", m1.bck.String(), summaries)
+			tassert.Errorf(t, bck2Found, "%s not found in %v summ", m2.bck.String(), summaries)
 			m1.gets(nil, false)
 			m2.gets(nil, false)
 

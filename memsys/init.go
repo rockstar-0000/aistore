@@ -1,7 +1,7 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
@@ -32,16 +32,13 @@ func Init(gmmName, smmName string, config *cmn.Config) {
 	debug.Assert(gmm == nil && smm == nil)
 
 	// page mmsa config (see also "AIS_MINMEM_FREE" and related environment)
-	defBufSize := int64(DefaultBufSize)
-	if config.Memsys.DefaultBufSize != 0 {
-		defBufSize = int64(config.Memsys.DefaultBufSize)
-	}
+	defBufSize := cos.NonZero(int64(config.Memsys.DefaultBufSize), int64(DefaultBufSize))
 	gmm = &MMSA{Name: gmmName + ".gmm", defBufSize: defBufSize, slabIncStep: PageSlabIncStep}
 	gmm.MinFree = uint64(config.Memsys.MinFree)
 	gmm.MinPctTotal = config.Memsys.MinPctTotal
 	gmm.MinPctFree = config.Memsys.MinPctFree
 
-	// hk config
+	// hk tunables
 	if config.Memsys.SizeToGC != 0 {
 		sizeToGC = int64(config.Memsys.SizeToGC)
 	}
@@ -59,8 +56,8 @@ func Init(gmmName, smmName string, config *cmn.Config) {
 	gmm.sibling = smm
 }
 
-func NewMMSA(name string, silent bool) (mem *MMSA, err error) {
-	mem = &MMSA{defBufSize: DefaultBufSize, slabIncStep: PageSlabIncStep, MinFree: minMemFreeTests}
+func NewMMSA(name string, silent bool) *MMSA {
+	mem := &MMSA{defBufSize: DefaultBufSize, slabIncStep: PageSlabIncStep, MinFree: minMemFreeTests}
 	if gmm == nil {
 		// (alt) gmm via alternative init path - prevent once.do below
 		mem.Name = name + ".gmm"
@@ -68,11 +65,11 @@ func NewMMSA(name string, silent bool) (mem *MMSA, err error) {
 	} else {
 		mem.Name = name + ".pmm" // additional
 	}
-	err = mem.Init(0)
+	mem.Init(0)
 	if !silent {
 		cos.Infoln(mem.Str(&mem.mem))
 	}
-	return
+	return mem
 }
 
 // system page-based memory-manager-slab-allocator (MMSA)
@@ -134,15 +131,14 @@ func (r *MMSA) RegWithHK() {
 }
 
 // initialize new MMSA instance
-func (r *MMSA) Init(maxUse int64) (err error) {
+func (r *MMSA) Init(maxUse int64) {
 	// 1. environment overrides defaults and MMSA{...} hard-codings
-	if err = r.env(); err != nil {
+	if err := r.env(); err != nil {
 		cos.Errorf("%v", err)
 	}
 
 	// 2. compute min-free (must remain free at all times) and low watermark
-	err = r.mem.Get()
-	if err != nil {
+	if err := r.mem.Get(); err != nil {
 		cos.Errorf("%v", err)
 	}
 	free := memFree(&r.mem)
@@ -173,7 +169,7 @@ func (r *MMSA) Init(maxUse int64) (err error) {
 
 	// 3. validate min-free & low-wm
 	if free < min(r.MinFree*2, r.MinFree+minMemFree) {
-		err = fmt.Errorf("memsys: insufficient free memory %s (see %s for guidance)", r.Str(&r.mem), readme)
+		err := fmt.Errorf("memsys: insufficient free memory %s (see %s for guidance)", r.Str(&r.mem), readme)
 		cos.Errorf("%v", err)
 		r.lowWM = min(r.lowWM, r.MinFree+minMemFreeTests)
 		r.info = ""
@@ -199,27 +195,23 @@ func (r *MMSA) Init(maxUse int64) (err error) {
 	if !r.isPage() {
 		r.maxSlabSize, r.numSlabs = MaxSmallSlabSize, NumSmallSlabs
 	}
-	r.slabStats = &slabStats{}
-	r.statsSnapshot = &Stats{}
 	r.rings = make([]*Slab, r.numSlabs)
-	r.sorted = make([]*Slab, r.numSlabs)
 	for i := range r.numSlabs {
 		bufSize := r.slabIncStep * int64(i+1)
 		slab := &Slab{
 			m:       r,
 			tag:     r.Name + "." + cos.ToSizeIEC(bufSize, 0),
 			bufSize: bufSize,
+			idx:     i,
 			get:     make([][]byte, 0, optDepth),
 			put:     make([][]byte, 0, optDepth),
 		}
 		slab.pMinDepth = &r.optDepth
 		r.rings[i] = slab
-		r.sorted[i] = slab
 	}
-	return
 }
 
-// terminate this MMSA instance and, possibly, GC as well
+// [tests only] terminate this MMSA instance, run GC
 func (r *MMSA) Terminate(unregHK bool) {
 	var freed int64
 	if unregHK {
@@ -229,6 +221,6 @@ func (r *MMSA) Terminate(unregHK bool) {
 		freed += s.cleanup()
 	}
 	r.toGC.Add(freed)
-	r.freeMemToOS(sizeToGC, true /*force*/)
+	r.freeMemToOS(sizeToGC, PressureLow, true /*force*/)
 	debug.Infof("%s terminated", r)
 }

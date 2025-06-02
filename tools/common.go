@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
@@ -24,6 +25,26 @@ import (
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/trand"
 )
+
+var DefaultWaitRetry = WaitRetryOpts{MaxRetries: 3, Interval: time.Second * 3}
+
+func WaitForCondition(condition func() bool, opts WaitRetryOpts) error {
+	var (
+		i             int
+		retries       = opts.MaxRetries
+		retryInterval = opts.Interval
+	)
+	for {
+		if success := condition(); success {
+			return nil
+		}
+		time.Sleep(retryInterval)
+		i++
+		if i >= retries {
+			return fmt.Errorf("max retries (%d) exceeded", retries)
+		}
+	}
+}
 
 // Generates an object name that hashes to a different target than `baseName`.
 func GenerateNotConflictingObjectName(baseName, newNamePrefix string, bck cmn.Bck, smap *meta.Smap) string {
@@ -83,9 +104,9 @@ func BucketsContain(bcks cmn.Bcks, qbck cmn.QueryBcks) bool {
 func BucketExists(tb testing.TB, proxyURL string, bck cmn.Bck) (bool, error) {
 	if bck.IsQuery() {
 		if tb == nil {
-			return false, fmt.Errorf("expecting a named bucket, got %q", bck)
+			return false, fmt.Errorf("expecting a named bucket, got %q", bck.String())
 		}
-		tassert.CheckFatal(tb, fmt.Errorf("expecting a named bucket, got %q", bck))
+		tassert.CheckFatal(tb, fmt.Errorf("expecting a named bucket, got %q", bck.String()))
 	}
 	bp := api.BaseParams{Client: gctx.Client, URL: proxyURL, Token: LoggedUserToken}
 	_, err := api.HeadBucket(bp, bck, true /*dontAddRemote*/)
@@ -140,8 +161,8 @@ func PutRR(tb testing.TB, bp api.BaseParams, objSize int64, cksumType string,
 	bck cmn.Bck, dir string, objCount int) []string {
 	objNames := make([]string, objCount)
 	for i := range objCount {
-		fname := trand.String(20)
-		objName := filepath.Join(dir, fname)
+		fn := trand.String(20)
+		objName := filepath.Join(dir, fn)
 		objNames[i] = objName
 		// FIXME: Separate RandReader per object created inside PutObjRR to workaround
 		// https://github.com/golang/go/issues/30597

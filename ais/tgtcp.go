@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -20,19 +20,18 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -48,7 +47,7 @@ type delb struct {
 }
 
 func (t *target) joinCluster(action string, primaryURLs ...string) (status int, err error) {
-	res, err := t.join(nil, t, primaryURLs...)
+	res, err := t.join(t /*htext*/, primaryURLs...)
 	if err != nil {
 		return status, err
 	}
@@ -183,7 +182,42 @@ func (t *target) daeputMsg(w http.ResponseWriter, r *http.Request) {
 	case apc.ActResetStats:
 		errorsOnly := msg.Value.(bool)
 		t.statsT.ResetStats(errorsOnly)
+	case apc.ActClearLcache:
+		core.LcacheClear()
 
+	case apc.ActReloadBackendCreds:
+		provider := msg.Name
+
+		// all
+		if provider == "" {
+			if err := t.initBuiltTagged(cmn.GCO.Get(), false); err != nil {
+				t.writeErr(w, r, err)
+			}
+			// rate-limited wrappers, respectively
+			for provider, bp := range t.bps {
+				t.rlbps[provider] = &rlbackend{Backend: bp, t: t}
+			}
+			return
+		}
+		// one
+		var bp core.Backend
+		switch provider {
+		case apc.AWS:
+			bp, err = backend.NewAWS(t, t.statsT, false /*starting up*/)
+		case apc.GCP:
+			bp, err = backend.NewGCP(t, t.statsT, false)
+		case apc.Azure:
+			bp, err = backend.NewAzure(t, t.statsT, false)
+		case apc.OCI:
+			bp, err = backend.NewOCI(t, t.statsT, false)
+		}
+		if err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		debug.Assert(bp != nil)
+		t.bps[provider] = bp
+		t.rlbps[provider] = &rlbackend{Backend: bp, t: t}
 	case apc.ActStartMaintenance:
 		if !t.ensureIntraControl(w, r, true /* from primary */) {
 			return
@@ -213,23 +247,13 @@ func (t *target) daeputMsg(w http.ResponseWriter, r *http.Request) {
 		}
 		t.termKaliveX(msg.Action, opts.NoShutdown)
 		t.decommission(msg.Action, &opts)
-	case apc.ActCleanupMarkers:
-		if !t.ensureIntraControl(w, r, true /* from primary */) {
-			return
-		}
-		var ctx cleanmark
-		if err := cos.MorphMarshal(msg.Value, &ctx); err != nil {
-			t.writeErr(w, r, err)
-			return
-		}
-		t.cleanupMark(&ctx)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
 }
 
 func (t *target) daeputItems(w http.ResponseWriter, r *http.Request, apiItems []string) {
-	switch apiItems[0] {
+	switch act := apiItems[0]; act {
 	case apc.Proxy:
 		// PUT /v1/daemon/proxy/newprimaryproxyid
 		t.daeSetPrimary(w, r, apiItems)
@@ -243,89 +267,103 @@ func (t *target) daeputItems(w http.ResponseWriter, r *http.Request, apiItems []
 		}
 		nlog.Infof("%s: %s %s done", t, apc.SyncSmap, newsmap)
 	case apc.Mountpaths:
-		t.handleMountpathReq(w, r)
+		t.handleMpathReq(w, r)
 	case apc.ActSetConfig: // set-config #1 - via query parameters and "?n1=v1&n2=v2..."
 		t.setDaemonConfigQuery(w, r)
-	case apc.ActEnableBackend:
+	case apc.ActEnableBackend, apc.ActDisableBackend:
 		t.regstate.mu.Lock()
-		t.enableBackend(w, r, apiItems)
-		t.regstate.mu.Unlock()
-	case apc.ActDisableBackend:
-		t.regstate.mu.Lock()
-		t.disableBackend(w, r, apiItems)
-		t.regstate.mu.Unlock()
+		defer t.regstate.mu.Unlock()
+		if len(apiItems) < 3 { // act, provider, phase
+			t.writeErrURL(w, r)
+			return
+		}
+		var (
+			provider = apiItems[1]
+			phase    = apiItems[2]
+		)
+		if !apc.IsCloudProvider(provider) {
+			t.writeErrf(w, r, "expecting cloud storage provider (have %q)", provider)
+			return
+		}
+		if phase != apc.ActBegin && phase != apc.ActCommit {
+			t.writeErrf(w, r, "expecting 'begin' or 'commit' phase (have %q)", phase)
+			return
+		}
+		if act == apc.ActEnableBackend {
+			t.enableBackend(w, r, provider, phase)
+		} else {
+			t.disableBackend(w, r, provider, phase)
+		}
 	case apc.LoadX509:
 		t.daeLoadX509(w, r)
 	}
 }
 
-func (t *target) enableBackend(w http.ResponseWriter, r *http.Request, items []string) {
+func (t *target) enableBackend(w http.ResponseWriter, r *http.Request, provider, phase string) {
 	var (
-		provider = items[1]
-		phase    = items[2]
-		config   = cmn.GCO.Get()
+		config = cmn.GCO.Get()
 	)
-	debug.Assert(apc.IsCloudProvider(provider), provider)
-	debug.Assert(phase == apc.ActBegin || phase == apc.ActCommit, phase)
-
 	_, ok := config.Backend.Providers[provider]
 	if !ok {
 		t.writeErrf(w, r, "backend %q is not configured, cannot enable", provider)
 		return
 	}
-	bp, k := t.backend[provider]
+	bp, k := t.bps[provider]
 	debug.Assert(k, provider)
-	if bp != nil {
-		// TODO: return http.StatusNoContent
+
+	switch {
+	case bp != nil:
 		t.writeErrf(w, r, "backend %q is already enabled, nothing to do", provider)
-		return
-	}
-	if phase == apc.ActCommit {
+	case phase == apc.ActBegin:
+		nlog.Infof("ready to enable backend %q", provider)
+	default:
 		var err error
 		switch provider {
 		case apc.AWS:
-			bp, err = backend.NewAWS(t, t.statsT)
+			bp, err = backend.NewAWS(t, t.statsT, false /*starting up*/)
 		case apc.GCP:
-			bp, err = backend.NewGCP(t, t.statsT)
+			bp, err = backend.NewGCP(t, t.statsT, false /*starting up*/)
 		case apc.Azure:
-			bp, err = backend.NewAzure(t, t.statsT)
+			bp, err = backend.NewAzure(t, t.statsT, false /*starting up*/)
+		case apc.OCI:
+			bp, err = backend.NewOCI(t, t.statsT, false /*starting up*/)
 		}
 		if err != nil {
 			debug.AssertNoErr(err) // (unlikely)
 			t.writeErr(w, r, err)
 			return
 		}
-		t.backend[provider] = bp
+
+		debug.Assert(bp != nil)
+		t.bps[provider] = bp
+		t.rlbps[provider] = &rlbackend{Backend: bp, t: t}
+
+		nlog.Infof("enabled backend %q", provider)
 	}
-	nlog.Infoln(phase+":", "enable", provider)
 }
 
-func (t *target) disableBackend(w http.ResponseWriter, r *http.Request, items []string) {
+func (t *target) disableBackend(w http.ResponseWriter, r *http.Request, provider, phase string) {
 	var (
-		provider = items[1]
-		phase    = items[2]
-		config   = cmn.GCO.Get()
+		config = cmn.GCO.Get()
 	)
-	debug.Assert(apc.IsCloudProvider(provider), provider)
-	debug.Assert(phase == apc.ActBegin || phase == apc.ActCommit, phase)
-
 	_, ok := config.Backend.Providers[provider]
 	if !ok {
-		// TODO: return http.StatusNoContent
 		t.writeErrf(w, r, "backend %q is not configured, nothing to do", provider)
 		return
 	}
-	bp, k := t.backend[provider]
+	bp, k := t.bps[provider]
 	debug.Assert(k, provider)
-	if bp == nil {
-		// TODO: return http.StatusNoContent
+
+	switch {
+	case bp == nil:
 		t.writeErrf(w, r, "backend %q is already disabled, nothing to do", provider)
-		return
+	case phase == apc.ActBegin:
+		nlog.Infof("ready to disable backend %q", provider)
+	default:
+		// NOTE: not locking bp := t.Backend()
+		t.bps[provider] = nil
+		nlog.Infof("disabled backend %q", provider)
 	}
-	if phase == apc.ActCommit {
-		t.backend[provider] = nil
-	}
-	nlog.Infoln(phase+":", "disable", provider)
 }
 
 func (t *target) daeSetPrimary(w http.ResponseWriter, r *http.Request, apiItems []string) {
@@ -365,7 +403,7 @@ func (t *target) _setPrim(ctx *smapModifier, clone *smapX) (err error) {
 	}
 	psi := clone.GetProxy(ctx.sid)
 	if psi == nil {
-		return &errNodeNotFound{"cannot set new primary", ctx.sid, t.si, clone}
+		return &errNodeNotFound{t.si, clone, "cannot set new primary", ctx.sid}
 	}
 	clone.Primary = psi
 	return
@@ -390,11 +428,6 @@ func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		ds.Tracker = daeStats.Tracker
 		ds.Tcdf = daeStats.Tcdf
 		t.writeJSON(w, r, ds, httpdaeWhat)
-	case apc.WhatNodeStatsV322: // [backward compatibility] v3.22 and prior
-		ds := t.statsAndStatusV322()
-		daeStats := t.statsT.GetStatsV322()
-		ds.Tracker = daeStats.Tracker
-		t.writeJSON(w, r, ds, httpdaeWhat)
 	case apc.WhatNodeStatsAndStatus:
 		ds := t.statsAndStatus()
 		ds.RebSnap = _rebSnap()
@@ -403,18 +436,11 @@ func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		ds.Tcdf = daeStats.Tcdf
 		t.fillNsti(&ds.Cluster)
 		t.writeJSON(w, r, ds, httpdaeWhat)
-	case apc.WhatNodeStatsAndStatusV322: // [ditto]
-		ds := t.statsAndStatusV322()
-		ds.RebSnap = _rebSnap()
-		daeStats := t.statsT.GetStatsV322()
-		ds.Tracker = daeStats.Tracker
-		ds.Tcdf = daeStats.Tcdf
-		t.writeJSON(w, r, ds, httpdaeWhat)
 
 	case apc.WhatMountpaths:
 		var (
 			num    = fs.NumAvail()
-			dstats = make(ios.AllDiskStats, num)
+			dstats = make(cos.AllDiskStats, num)
 			config = cmn.GCO.Get()
 		)
 		if num == 0 {
@@ -429,7 +455,7 @@ func (t *target) httpdaeget(w http.ResponseWriter, r *http.Request) {
 			num     = fs.NumAvail()
 			config  = cmn.GCO.Get()
 		)
-		tcdfExt.AllDiskStats = make(ios.AllDiskStats, num)
+		tcdfExt.AllDiskStats = make(cos.AllDiskStats, num)
 		tcdfExt.Mountpaths = make(map[string]*fs.CDF, num)
 		if num == 0 {
 			nlog.Warningln(t.String(), cmn.ErrNoMountpaths)
@@ -480,16 +506,20 @@ func (t *target) httpdaepost(w http.ResponseWriter, r *http.Request) {
 		t.writeErrURL(w, r)
 		return
 	}
-	apiOp := apiItems[0]
-	if apiOp == apc.Mountpaths {
-		t.handleMountpathReq(w, r)
-		return
-	}
-	if apiOp != apc.AdminJoin {
+	act := apiItems[0]
+	switch act {
+	case apc.Mountpaths:
+		t.handleMpathReq(w, r)
+	case apc.ActPrimaryForce:
+		t.daeForceJoin(w, r)
+	case apc.AdminJoin:
+		t.adminJoin(w, r)
+	default:
 		t.writeErrURL(w, r)
-		return
 	}
+}
 
+func (t *target) adminJoin(w http.ResponseWriter, r *http.Request) {
 	// user request to join cluster (compare with `apc.SelfJoin`)
 	if !t.regstate.disabled.Load() {
 		if t.keepalive.paused() {
@@ -529,36 +559,13 @@ func (t *target) httpdaedelete(w http.ResponseWriter, r *http.Request) {
 	}
 	switch apiItems[0] {
 	case apc.Mountpaths:
-		t.handleMountpathReq(w, r)
+		t.handleMpathReq(w, r)
 	default:
 		t.writeErrURL(w, r)
 	}
 }
 
-// called by p.cleanupMark
-func (t *target) cleanupMark(ctx *cleanmark) {
-	smap := t.owner.smap.get()
-	if smap.version() > ctx.NewVer {
-		nlog.Warningf("%s: %s is newer - ignoring (and dropping) %v", t, smap, ctx)
-		return
-	}
-	if ctx.Interrupted {
-		if err := fs.RemoveMarker(fname.RebalanceMarker); err == nil {
-			nlog.Infof("%s: cleanmark 'rebalance', %s", t, smap)
-		} else {
-			nlog.Errorf("%s: failed to cleanmark 'rebalance': %v, %s", t, err, smap)
-		}
-	}
-	if ctx.Restarted {
-		if err := fs.RemoveMarker(fname.NodeRestartedPrev); err == nil {
-			nlog.Infof("%s: cleanmark 'restarted', %s", t, smap)
-		} else {
-			nlog.Errorf("%s: failed to cleanmark 'restarted': %v, %s", t, err, smap)
-		}
-	}
-}
-
-func (t *target) handleMountpathReq(w http.ResponseWriter, r *http.Request) {
+func (t *target) handleMpathReq(w http.ResponseWriter, r *http.Request) {
 	msg, err := t.readActionMsg(w, r)
 	if err != nil {
 		return
@@ -622,7 +629,7 @@ func (t *target) enableMpath(w http.ResponseWriter, r *http.Request, mpath strin
 
 func (t *target) attachMpath(w http.ResponseWriter, r *http.Request, mpath string) {
 	q := r.URL.Query()
-	label := ios.Label(q.Get(apc.QparamMpathLabel))
+	label := cos.MountpathLabel(q.Get(apc.QparamMpathLabel))
 	addedMi, err := t.fsprg.attachMpath(mpath, label)
 	if err != nil {
 		t.writeErr(w, r, err)
@@ -697,27 +704,26 @@ func (t *target) detachMpath(w http.ResponseWriter, r *http.Request, mpath strin
 	}
 }
 
-func (t *target) receiveBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, tag, caller string, silent bool) (err error) {
-	var oldVer int64
+func (t *target) receiveBMD(newBMD *bucketMD, msg *actMsgExt, payload msPayload, tag, caller string, silent bool) error {
 	if msg.UUID == "" {
-		oldVer, err = t.applyBMD(newBMD, msg, payload, tag)
-		if newBMD.Version > oldVer {
-			if err == nil {
-				logmsync(oldVer, newBMD, msg, caller, newBMD.StringEx())
-			}
+		oldVer, err := t.applyBMD(newBMD, msg, payload, tag)
+		if err == nil && newBMD.Version > oldVer {
+			logmsync(oldVer, newBMD, msg, caller, newBMD.StringEx())
 		}
-		return
+		return err
 	}
 
 	// txn [before -- do -- after]
-	if errDone := t.transactions.commitBefore(caller, msg); errDone != nil {
-		err = fmt.Errorf("%s commit-before %s, errDone: %v", t, newBMD, errDone)
+	if errDone := t.txns.commitBefore(caller, msg); errDone != nil {
+		err := fmt.Errorf("%s commit-before %s, errDone: %v", t, newBMD, errDone)
 		if !silent {
 			nlog.Errorln(err)
 		}
-		return
+		return err
 	}
-	oldVer, err = t.applyBMD(newBMD, msg, payload, tag)
+
+	oldVer, err := t.applyBMD(newBMD, msg, payload, tag)
+
 	// log
 	switch {
 	case err != nil:
@@ -728,17 +734,18 @@ func (t *target) receiveBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, ta
 		nlog.Warningf("%s (same version w/ txn commit): receive %s from %q (action %q, uuid %q)",
 			t, newBMD.StringEx(), caller, msg.Action, msg.UUID)
 	}
+
 	// --after]
-	if errDone := t.transactions.commitAfter(caller, msg, err, newBMD); errDone != nil {
+	if errDone := t.txns.commitAfter(caller, msg, err, newBMD); errDone != nil {
 		err = fmt.Errorf("%s commit-after %s, err: %v, errDone: %v", t, newBMD, err, errDone)
 		if !silent {
 			nlog.Errorln(err)
 		}
 	}
-	return
+	return err
 }
 
-func (t *target) applyBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, tag string) (int64, error) {
+func (t *target) applyBMD(newBMD *bucketMD, msg *actMsgExt, payload msPayload, tag string) (int64, error) {
 	var (
 		smap = t.owner.smap.get()
 		psi  *meta.Snode
@@ -764,27 +771,37 @@ func (t *target) applyBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, tag 
 }
 
 // executes under lock
-func (t *target) _syncBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, psi *meta.Snode) (rmbcks []*meta.Bck,
-	oldVer int64, emsg string, err error) {
+// returns: removed buckets, old (ie., prev) version, errmsg(remove buckets), error
+func (t *target) _syncBMD(newBMD *bucketMD, msg *actMsgExt, payload msPayload, psi *meta.Snode) ([]*meta.Bck, int64, string, error) {
 	var (
-		createErrs  []error
-		destroyErrs []error
-		bmd         = t.owner.bmd.get()
+		bmd    = t.owner.bmd.get()
+		oldVer int64
 	)
-	if err = bmd.validateUUID(newBMD, t.si, psi, ""); err != nil {
-		cos.ExitLog(err) // FATAL: cluster integrity error (cie)
-		return
+	// special
+	if msg.Action == apc.ActPrimaryForce {
+		nlog.Warningln(t.String(), "sync BMD with force [", bmd.String(), bmd.UUID, "] <- [", newBMD.String(), newBMD.UUID, "]")
+		goto skip
 	}
-	// check downgrade
+
+	// validate; check downgrade
+	if err := bmd.validateUUID(newBMD, t.si, psi, ""); err != nil {
+		nlog.Errorln(msg.String(), "-> cluster integrity error")
+		cos.ExitLog(err) // FATAL: cluster integrity error (cie)
+		return nil, 0, "", err
+	}
 	if oldVer = bmd.version(); newBMD.version() <= oldVer {
 		if newBMD.version() < oldVer {
-			err = newErrDowngrade(t.si, bmd.StringEx(), newBMD.StringEx())
+			return nil, oldVer, "", newErrDowngrade(t.si, bmd.StringEx(), newBMD.StringEx())
 		}
-		return
+		return nil, oldVer, "", nil
 	}
-	nilbmd := bmd.version() == 0 || t.regstate.prevbmd.Load()
 
+skip:
 	// 1. create
+	var (
+		createErrs []error
+		nilbmd     = bmd.version() == 0 || t.regstate.prevbmd.Load()
+	)
 	newBMD.Range(nil, nil, func(bck *meta.Bck) bool {
 		if _, present := bmd.Get(bck); present {
 			return false
@@ -796,18 +813,23 @@ func (t *target) _syncBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, psi 
 		return false
 	})
 	if len(createErrs) > 0 {
-		err = fmt.Errorf("%s: failed to add new buckets: %s, old/cur %s(%t): %v",
+		err := fmt.Errorf("%s: failed to add new buckets: %s, old/cur %s(%t): %v",
 			t, newBMD, bmd, nilbmd, errors.Join(createErrs...))
-		return
+		return nil, oldVer, "", err
 	}
 
 	// 2. persist
-	if err = t.owner.bmd.putPersist(newBMD, payload); err != nil {
+	if err := t.owner.bmd.putPersist(newBMD, payload); err != nil {
 		cos.ExitLog(err)
-		return
+		return nil, oldVer, "", err
 	}
 
 	// 3. delete, ignore errors
+	var (
+		destroyErrs []error
+		rmbcks      []*meta.Bck
+		emsg        string
+	)
 	bmd.Range(nil, nil, func(obck *meta.Bck) bool {
 		f := &delb{obck: obck}
 		newBMD.Range(nil, nil, f.do)
@@ -823,7 +845,7 @@ func (t *target) _syncBMD(newBMD *bucketMD, msg *aisMsg, payload msPayload, psi 
 		emsg = fmt.Sprintf("%s: failed to cleanup destroyed buckets: %s, old/cur %s(%t): %v",
 			t, newBMD, bmd, nilbmd, errors.Join(destroyErrs...))
 	}
-	return
+	return rmbcks, oldVer, emsg, nil
 }
 
 func (f *delb) do(nbck *meta.Bck) bool {
@@ -848,20 +870,21 @@ func (f *delb) do(nbck *meta.Bck) bool {
 func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {
 	// evict LOM cache
 	if len(rmbcks) > 0 {
+		wg := &sync.WaitGroup{}
+		core.LcacheClearBcks(wg, rmbcks...)
+
 		errV := fmt.Errorf("[post-bmd] %s %s: remove bucket%s", tag, newBMD, cos.Plural(len(rmbcks)))
 		xreg.AbortAllBuckets(errV, rmbcks...)
-		go func(bcks ...*meta.Bck) {
-			for _, b := range bcks {
-				core.UncacheBck(b)
-			}
-		}(rmbcks...)
+
+		defer wg.Wait()
 	}
+	// EC
 	if tag != bmdReg {
 		if err := ec.ECM.BMDChanged(); err != nil {
-			nlog.Errorf("Failed to initialize EC manager: %v", err)
+			nlog.Errorln("failed to initialize EC upon BMD change:", err)
 		}
 	}
-	// since some buckets may have been destroyed
+	// capacity (since some buckets may have been destroyed)
 	cs := fs.Cap()
 	if cs.Err() != nil {
 		_ = t.oos(cmn.GCO.Get())
@@ -869,21 +892,25 @@ func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {
 }
 
 // is called under lock
-func (t *target) receiveRMD(newRMD *rebMD, msg *aisMsg) (err error) {
+func (t *target) receiveRMD(newRMD *rebMD, msg *actMsgExt) error {
+	if msg.Action == apc.ActPrimaryForce {
+		return t.owner.rmd.synch(newRMD, true)
+	}
+
 	rmd := t.owner.rmd.get()
 	if newRMD.Version <= rmd.Version {
 		if newRMD.Version < rmd.Version {
-			err = newErrDowngrade(t.si, rmd.String(), newRMD.String())
+			return newErrDowngrade(t.si, rmd.String(), newRMD.String())
 		}
-		return
+		return nil
 	}
+
 	smap := t.owner.smap.get()
-	if err = smap.validate(); err != nil {
-		return
+	if err := smap.validate(); err != nil {
+		return err
 	}
 	if smap.GetNode(t.SID()) == nil {
-		err = fmt.Errorf(fmtSelfNotPresent, t, smap.StringEx())
-		return
+		return fmt.Errorf(fmtSelfNotPresent, t, smap.StringEx())
 	}
 	for _, tsi := range rmd.TargetIDs {
 		if smap.GetNode(tsi) == nil {
@@ -892,35 +919,64 @@ func (t *target) receiveRMD(newRMD *rebMD, msg *aisMsg) (err error) {
 		}
 	}
 	if !t.regstate.disabled.Load() {
-		t._runRe(newRMD, msg, smap)
-	} else if msg.Action == apc.ActAdminJoinTarget && daemon.cli.target.standby && msg.Name == t.SID() {
-		nlog.Warningln(t.String()+": standby => join", msg.String())
-		if _, err = t.joinCluster(msg.Action); err == nil {
+		oxid := xact.RebID2S(rmd.Version)
+		t._runRe(newRMD, msg, smap, oxid)
+		return nil
+	}
+
+	// standby => join
+	if msg.Action == apc.ActAdminJoinTarget && daemon.cli.target.standby && msg.Name == t.SID() {
+		nlog.Warningln(t.String(), "standby => join:", msg.String())
+		_, err := t.joinCluster(msg.Action)
+		if err == nil {
 			err = t.endStartupStandby()
 		}
 		t.owner.rmd.put(newRMD)
+		return err
 	}
-	return
+
+	return nil
 }
 
-func (t *target) _runRe(newRMD *rebMD, msg *aisMsg, smap *smapX) {
+func (t *target) _runRe(newRMD *rebMD, msg *actMsgExt, smap *smapX, oxid string) {
 	const tag = "rebalance["
-	notif := &xact.NotifXact{
-		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+	var (
+		nxid    = xact.RebID2S(newRMD.Version)
+		tname   = t.String()
+		extArgs = reb.ExtArgs{
+			Notif: &xact.NotifXact{
+				Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+			},
+			Tstats: t.statsT,
+			Oxid:   oxid,
+			NID:    newRMD.Version,
+		}
+	)
+	if msg.UUID != nxid && msg.UUID != "" {
+		nlog.Warningln(tag, msg.UUID, "vs", nxid)
 	}
 
-	// 1. by user
+	// 1. by user aka admin
 	if msg.Action == apc.ActRebalance {
 		xname := tag + msg.UUID + "]"
-		nlog.Infoln(t.String(), "starting user-requested", t, xname)
+
+		if msg.Value != nil {
+			var xargs xact.ArgsMsg
+			if err := cos.MorphMarshal(msg.Value, &xargs); err == nil {
+				extArgs.Bck = (*meta.Bck)(&xargs.Bck)
+				extArgs.Prefix = msg.Name
+			}
+		}
+
+		nlog.Infoln(tname, "starting user-requested", xname, nxid)
 
 		// (##a)
-		go t.reb.RunRebalance(&smap.Smap, newRMD.Version, notif, t.statsT)
+		go t.reb.RunRebalance(&smap.Smap, &extArgs)
 		return
 	}
 
 	// 2. by RMD
-	xname := tag + xact.RebID2S(newRMD.Version) + "]"
+	xname := tag + nxid + "]"
 
 	switch msg.Action {
 	// 2.1. action => metasync(newRMD)
@@ -928,15 +984,16 @@ func (t *target) _runRe(newRMD *rebMD, msg *aisMsg, smap *smapX) {
 		var opts apc.ActValRmNode
 		if err := cos.MorphMarshal(msg.Value, &opts); err != nil {
 			debug.AssertNoErr(err) // unlikely
-		} else {
-			var s string
-			if opts.DaemonID == t.SID() {
-				s = " (to subsequently deactivate or remove _this_ target)"
-			}
-			nlog.Infof("%s: starting '%s' triggered %s%s: %+v", t, msg.Action, xname, s, opts)
+			return
 		}
+
+		var s string
+		if opts.DaemonID == t.SID() {
+			s = " (to subsequently deactivate or remove _this_ target)"
+		}
+		nlog.Infoln(tname, "starting", msg.String(), "-triggered", xname, s, opts)
 		// (##b)
-		go t.reb.RunRebalance(&smap.Smap, newRMD.Version, notif, t.statsT)
+		go t.reb.RunRebalance(&smap.Smap, &extArgs)
 
 	// 2.2. "pure" metasync(newRMD) w/ no action - double-check with cluster config
 	default:
@@ -944,9 +1001,9 @@ func (t *target) _runRe(newRMD *rebMD, msg *aisMsg, smap *smapX) {
 		debug.Assert(config.Version > 0 && config.UUID == smap.UUID, config.String(), " vs ", smap.StringEx())
 
 		if config.Rebalance.Enabled {
-			nlog.Infoln(t.String(), "starting", xname)
+			nlog.Infoln(tname, "starting", xname)
 			// (##c)
-			go t.reb.RunRebalance(&smap.Smap, newRMD.Version, notif, t.statsT)
+			go t.reb.RunRebalance(&smap.Smap, &extArgs)
 		} else {
 			runtime.Gosched()
 
@@ -961,28 +1018,35 @@ func (t *target) _runRe(newRMD *rebMD, msg *aisMsg, smap *smapX) {
 					//
 					// NOTE: trusting local copy of the config, _not_ checking with primary via reqHealth()
 					//
-					nlog.Warningln(t.String(), "not starting", xname, "- disabled in the", config.String())
+					nlog.Warningln(tname, "not starting", xname, "- disabled in the", config.String())
 					return
 				}
 
 				// (##d)
-				nlog.Infoln(t.String(), "starting", xname)
-				t.reb.RunRebalance(&smap.Smap, newRMD.Version, notif, t.statsT)
+				nlog.Infoln(tname, "starting", xname)
+				t.reb.RunRebalance(&smap.Smap, &extArgs)
 			}()
 		}
 	}
 
 	if newRMD.Resilver != "" {
-		nlog.Infoln(t.String(), "... and resilver")
+		nlog.Infoln(tname, "... and resilver")
 
 		// (##resilver)
-		go t.runResilver(res.Args{UUID: newRMD.Resilver, SkipGlobMisplaced: true}, nil /*wg*/)
+		args := &res.Args{
+			UUID: newRMD.Resilver,
+			Custom: xreg.ResArgs{
+				Config:            cmn.GCO.Get(),
+				SkipGlobMisplaced: true,
+			},
+		}
+		go t.runResilver(args, nil /*wg*/)
 	}
 
 	t.owner.rmd.put(newRMD)
 }
 
-func (t *target) ensureLatestBMD(msg *aisMsg, r *http.Request) {
+func (t *target) ensureLatestBMD(msg *actMsgExt, r *http.Request) {
 	bmd, bmdVersion := t.owner.bmd.Get(), msg.BMDVersion
 	if bmd.Version < bmdVersion {
 		nlog.Errorf("%s: local %s < v%d %s - running fixup...", t, bmd, bmdVersion, msg)
@@ -993,9 +1057,9 @@ func (t *target) ensureLatestBMD(msg *aisMsg, r *http.Request) {
 	}
 }
 
-func (t *target) getPrimaryBMD(renamed string) (bmd *bucketMD, err error) {
+func (t *target) getPrimaryBMD(renamed string) (*bucketMD, error) {
 	smap := t.owner.smap.get()
-	if err = smap.validate(); err != nil {
+	if err := smap.validate(); err != nil {
 		return nil, cmn.NewErrFailedTo(t, "get-primary-bmd", smap, err)
 	}
 	var (
@@ -1014,23 +1078,29 @@ func (t *target) getPrimaryBMD(renamed string) (bmd *bucketMD, err error) {
 		cargs.si = psi
 		cargs.req = cmn.HreqArgs{Method: http.MethodGet, Base: url, Path: path, Query: q}
 		cargs.timeout = timeout
-		cargs.cresv = cresBM{}
+		cargs.cresv = cresjGeneric[bucketMD]{}
 	}
 	res := t.call(cargs, smap)
 	if res.err != nil {
+		freeCR(res)
 		time.Sleep(timeout / 2)
 		smap = t.owner.smap.get()
 		res = t.call(cargs, smap)
-		if res.err != nil {
-			err = res.errorf("%s: failed to GET(%q)", t.si, what)
-		}
 	}
-	if err == nil {
-		bmd = res.v.(*bucketMD)
-	}
+
+	bmd, err := _getbmd(res, t.String(), what)
 	freeCargs(cargs)
 	freeCR(res)
-	return
+	return bmd, err
+}
+
+func _getbmd(res *callResult, tname, what string) (bmd *bucketMD, err error) {
+	if res.err != nil {
+		err = res.errorf("%s: failed to GET(%q)", tname, what)
+	} else {
+		bmd = res.v.(*bucketMD)
+	}
+	return bmd, err
 }
 
 func (t *target) BMDVersionFixup(r *http.Request, bcks ...cmn.Bck) {
@@ -1072,7 +1142,7 @@ func (t *target) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
 		t.regstate.mu.Lock()
-		if nlog.Stopping() {
+		if nlog.Stopping() || !t.NodeStarted() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		} else {
 			t.metasyncPut(w, r)
@@ -1101,6 +1171,9 @@ func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErr(w, r, errP)
 		return
 	}
+
+	t.warnMsync(r, t.owner.smap.get())
+
 	// 1. extract
 	var (
 		caller                       = r.Header.Get(apc.HdrCallerName)
@@ -1121,9 +1194,6 @@ func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 		errBMD = t.receiveBMD(newBMD, msgBMD, payload, bmdRecv, caller, false /*silent*/)
 	}
 	if errRMD == nil && newRMD != nil {
-		rmd := t.owner.rmd.get()
-		logmsync(rmd.Version, newRMD, msgRMD, caller)
-
 		t.owner.rmd.Lock()
 		errRMD = t.receiveRMD(newRMD, msgRMD)
 		t.owner.rmd.Unlock()
@@ -1152,22 +1222,22 @@ func _stopETLs(newEtlMD, oldEtlMD *etlMD) {
 }
 
 // compare w/ p.receiveConfig
-func (t *target) receiveConfig(newConfig *globalConfig, msg *aisMsg, payload msPayload, caller string) (err error) {
+func (t *target) receiveConfig(newConfig *globalConfig, msg *actMsgExt, payload msPayload, caller string) error {
 	oldConfig := cmn.GCO.Get()
-	logmsync(oldConfig.Version, newConfig, msg, caller)
+	logmsync(oldConfig.Version, newConfig, msg, caller, newConfig.String(), oldConfig.UUID)
 
 	t.owner.config.Lock()
-	err = t._recvCfg(newConfig, payload)
+	err := t._recvCfg(newConfig, msg, payload)
 	t.owner.config.Unlock()
 	if err != nil {
-		return
+		return err
 	}
 
 	if !t.NodeStarted() {
 		if msg.Action == apc.ActAttachRemAis || msg.Action == apc.ActDetachRemAis {
 			nlog.Errorf("%s: cannot handle %s (%s => %s) - starting up...", t, msg, oldConfig, newConfig)
 		}
-		return
+		return nil
 	}
 
 	if oldConfig.Space != newConfig.Space {
@@ -1179,18 +1249,21 @@ func (t *target) receiveConfig(newConfig *globalConfig, msg *aisMsg, payload msP
 		return t.attachDetachRemAis(newConfig, msg)
 	}
 
-	if !newConfig.Backend.EqualRemAIS(&oldConfig.Backend, t.String()) {
-		if aisConf := newConfig.Backend.Get(apc.AIS); aisConf != nil {
-			err = t.attachDetachRemAis(newConfig, msg)
-		} else {
-			t.backend[apc.AIS] = backend.NewAIS(t, t.statsT)
-		}
+	if newConfig.Backend.EqualRemAIS(&oldConfig.Backend, t.String()) {
+		return nil
 	}
-	return
+	if aisConf := newConfig.Backend.Get(apc.AIS); aisConf != nil {
+		return t.attachDetachRemAis(newConfig, msg)
+	}
+	aisbp := backend.NewAIS(t, t.statsT, false)
+	t.bps[apc.AIS] = aisbp
+	t.rlbps[apc.AIS] = &rlbackend{Backend: aisbp, t: t}
+
+	return nil
 }
 
 // NOTE: apply the entire config: add new and update existing entries (remote clusters)
-func (t *target) attachDetachRemAis(newConfig *globalConfig, msg *aisMsg) (err error) {
+func (t *target) attachDetachRemAis(newConfig *globalConfig, msg *actMsgExt) (err error) {
 	var (
 		aisbp   *backend.AISbp
 		aisConf = newConfig.Backend.Get(apc.AIS)

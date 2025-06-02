@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -9,7 +9,6 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/ios"
 )
 
 // available mountpaths: disk name suffix
@@ -38,40 +37,24 @@ type (
 	}
 	// Capacity, Disks, Filesystem (CDF)
 	CDF struct {
+		Label cos.MountpathLabel `json:"mountpath_label"`
+		FS    cos.FS             `json:"fs"`
+		Disks []string           `json:"disks"` // owned or shared disks (ios.FsDisks map => slice); "name[.faulted | degraded]"
 		Capacity
-		Disks []string  `json:"disks"` // owned or shared disks (ios.FsDisks map => slice); "name[.faulted | degraded]"
-		Label ios.Label `json:"mountpath_label"`
-		FS    cos.FS    `json:"fs"`
 	}
 	// Target (cumulative) CDF
 	Tcdf struct {
 		Mountpaths map[string]*CDF // mpath => [Capacity, Disks, FS (CDF)]
+		CsErr      string          `json:"cs_err"`             // OOS or high-wm error message; disk fault
 		TotalUsed  uint64          `json:"total_used,string"`  // bytes
 		TotalAvail uint64          `json:"total_avail,string"` // bytes
 		PctMax     int32           `json:"pct_max"`            // max used (%)
 		PctAvg     int32           `json:"pct_avg"`            // avg used (%)
 		PctMin     int32           `json:"pct_min"`            // min used (%)
-		CsErr      string          `json:"cs_err"`             // OOS or high-wm error message; disk fault
 	}
 	TcdfExt struct {
-		ios.AllDiskStats
+		cos.AllDiskStats
 		Tcdf
-	}
-)
-
-// [backward compatibility]: v3.22 cdf* structures
-type (
-	CDFv322 struct {
-		Capacity
-		Disks []string `json:"disks"`
-		FS    string   `json:"fs"`
-	}
-	TargetCDFv322 struct {
-		Mountpaths map[string]*CDFv322
-		PctMax     int32  `json:"pct_max"`
-		PctAvg     int32  `json:"pct_avg"`
-		PctMin     int32  `json:"pct_min"`
-		CsErr      string `json:"cs_err"`
 	}
 )
 

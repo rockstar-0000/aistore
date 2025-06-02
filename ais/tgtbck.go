@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -38,7 +40,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 	if err != nil {
 		return
 	}
-	if err = t.isIntraCall(r.Header, false); err != nil {
+	if err = t.checkIntraCall(r.Header, false); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
@@ -84,7 +86,6 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 				}
 			}
 			if err != nil {
-				t.statsT.IncErr(stats.ErrListCount)
 				t.writeErr(w, r, err)
 				return
 			}
@@ -103,13 +104,15 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 			return
 		}
 		if ok := t.listObjects(w, r, bck, lsmsg); !ok {
-			t.statsT.IncErr(stats.ErrListCount)
+			t.statsT.IncBck(stats.ErrListCount, bck.Bucket())
 			return
 		}
+
 		delta := mono.SinceNano(begin)
-		t.statsT.AddMany(
-			cos.NamedVal64{Name: stats.ListCount, Value: 1},
-			cos.NamedVal64{Name: stats.ListLatency, Value: delta},
+		vlabs := map[string]string{stats.VlabBucket: bck.Cname("")}
+		t.statsT.IncWith(stats.ListCount, vlabs)
+		t.statsT.AddWith(
+			cos.NamedVal64{Name: stats.ListLatency, Value: delta, VarLabs: vlabs},
 		)
 	case apc.ActSummaryBck:
 		var bucket, phase string // txn
@@ -215,47 +218,46 @@ func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config) (bcks cmn.Bcks, 
 	debug.Assert(!qbck.IsAIS())
 	if qbck.IsCloud() { // must be configured
 		if config.Backend.Get(qbck.Provider) == nil {
-			err = &cmn.ErrMissingBackend{Provider: qbck.Provider}
-			return
+			return nil, 0, &cmn.ErrMissingBackend{Provider: qbck.Provider}
 		}
 	} else if qbck.IsRemoteAIS() && qbck.Ns.IsAnyRemote() {
 		if config.Backend.Get(apc.AIS) == nil {
 			nlog.Warningln(&cmn.ErrMissingBackend{Provider: qbck.Provider, Msg: "no remote ais clusters"})
-			return
+			return nil, 0, nil
 			// otherwise go ahead and try to list below
 		}
 	}
-	backend := t.Backend((*meta.Bck)(qbck))
+
+	bp := t.Backend((*meta.Bck)(qbck))
 	if qbck.IsBucket() {
-		var (
-			bck = (*meta.Bck)(qbck)
-			ctx = context.Background()
-		)
-		_, ecode, err = backend.HeadBucket(ctx, bck)
+		bck := (*meta.Bck)(qbck)
+		ctx := context.Background()
+		_, ecode, err = bp.HeadBucket(ctx, bck)
 		if err == nil {
 			bcks = cmn.Bcks{bck.Clone()}
 		} else if ecode == http.StatusNotFound {
 			err = nil
 		}
 	} else {
-		bcks, ecode, err = backend.ListBuckets(*qbck)
+		bcks, ecode, err = bp.ListBuckets(*qbck)
+		if err == nil && len(bcks) > 1 {
+			sort.Sort(bcks)
+		}
 	}
-	if err == nil && len(bcks) > 1 {
-		sort.Sort(bcks)
-	}
-	return
+
+	return bcks, ecode, err
 }
 
 // returns `cmn.LsoRes` containing object names and (requested) props
 // control/scope - via `apc.LsoMsg`
-func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lsmsg *apc.LsoMsg) (ok bool) {
+func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lsmsg *apc.LsoMsg) bool /*ok*/ {
 	// (advanced) user-selected target to execute remote ls
 	if lsmsg.SID != "" {
 		smap := t.owner.smap.get()
 		if smap.GetTarget(lsmsg.SID) == nil {
-			err := &errNodeNotFound{"list-objects failure:", lsmsg.SID, t.si, smap}
+			err := &errNodeNotFound{t.si, smap, "list-objects failure:", lsmsg.SID}
 			t.writeErr(w, r, err)
-			return
+			return false
 		}
 	}
 
@@ -270,7 +272,7 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 	}
 	if rns.Err != nil {
 		t.writeErr(w, r, rns.Err)
-		return
+		return false
 	}
 	// run
 	xctn = rns.Entry.Get()
@@ -293,14 +295,14 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 		resp.Lst.Flags = 1
 	}
 
-	return t.writeMsgPack(w, resp.Lst, "list_objects")
+	return t.writeMsgPack(w, resp.Lst, "list_objects") // ok
 }
 
 func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck *meta.Bck, msg *apc.BsummCtrlMsg, dpq *dpq) {
 	if phase == apc.ActBegin {
 		rns := xreg.RenewBckSummary(bck, msg)
 		if rns.Err != nil {
-			t.writeErr(w, r, rns.Err, http.StatusInternalServerError)
+			t.writeErr(w, r, rns.Err, http.StatusInternalServerError, Silent)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -344,7 +346,7 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck
 // DELETE { action } /v1/buckets/bucket-name
 // (evict | delete) (list | range)
 func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
-	msg := aisMsg{}
+	msg := actMsgExt{}
 	if err := readJSON(w, r, &msg); err != nil {
 		return
 	}
@@ -365,37 +367,52 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	switch msg.Action {
 	case apc.ActEvictRemoteBck:
 		keepMD := cos.IsParseBool(apireq.query.Get(apc.QparamKeepRemote))
-		if keepMD {
-			nlp := newBckNLP(apireq.bck)
-			nlp.Lock()
-			defer nlp.Unlock()
+		if !keepMD {
+			t.writeErrAct(w, r, apc.ActEvictRemoteBck) // (instead, expecting updated BMD from primary)
+			return
+		}
+		// arrived via p.evictRemoteKeepMD
+		// (compare with t.destroyBucket transaction)
+		var (
+			wg  = &sync.WaitGroup{}
+			nlp = newBckNLP(apireq.bck)
+			xid = apireq.query.Get(apc.QparamUUID)
+		)
+		nlp.Lock()
+		defer nlp.Unlock()
+		defer wg.Wait()
 
-			core.UncacheBck(apireq.bck)
-			err := fs.DestroyBucket(msg.Action, apireq.bck.Bucket(), apireq.bck.Props.BID)
-			if err != nil {
-				t.writeErr(w, r, err)
-				return
-			}
-			// Recreate bucket directories (now empty), since bck is still in BMD
-			errs := fs.CreateBucket(apireq.bck.Bucket(), false /*nilbmd*/)
-			if len(errs) > 0 {
-				debug.AssertNoErr(errs[0])
-				t.writeErr(w, r, errs[0]) // only 1 err is possible for 1 bck
-			}
+		// start and immdiately finish xaction with a singular purpose:
+		// to have a record in xreg (via `ais show job`): name and timestamp only
+		debug.Assert(strings.HasPrefix(xid, prefixEvictKpmdXid), xid)
+		_ = xreg.RenewEvictDelete(xid, apc.ActEvictRemoteBck, apireq.bck, nil)
+
+		core.LcacheClearBcks(wg, apireq.bck)
+		err := fs.DestroyBucket(msg.Action, apireq.bck.Bucket(), apireq.bck.Props.BID)
+		if err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		// Recreate bucket directories (now empty), since bck is still in BMD
+		errs := fs.CreateBucket(apireq.bck.Bucket(), false /*nilbmd*/)
+		if len(errs) > 0 {
+			debug.AssertNoErr(errs[0])
+			t.writeErr(w, r, errs[0]) // only 1 err is possible for 1 bck
 		}
 	case apc.ActDeleteObjects, apc.ActEvictObjects:
-		lrMsg := &apc.ListRange{}
-		if err := cos.MorphMarshal(msg.Value, lrMsg); err != nil {
+		evdMsg := &apc.EvdMsg{}
+		if err := cos.MorphMarshal(msg.Value, evdMsg); err != nil {
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
 			return
 		}
-		// note extra safety check
-		for _, name := range lrMsg.ObjNames {
-			if !t.isValidObjname(w, r, name) {
+		// NOTE: validate object names - each name individually
+		for _, name := range evdMsg.ObjNames {
+			if err := cmn.ValidateOname(name); err != nil {
+				t.writeErr(w, r, err)
 				return
 			}
 		}
-		rns := xreg.RenewEvictDelete(msg.UUID, msg.Action /*xaction kind*/, apireq.bck, lrMsg)
+		rns := xreg.RenewEvictDelete(msg.UUID, msg.Action /*xaction kind*/, apireq.bck, evdMsg)
 		if rns.Err != nil {
 			t.writeErr(w, r, rns.Err)
 			return
@@ -501,11 +518,11 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 		}
 	}
 	// + cloud
-	bucketProps, code, err = t.Backend(apireq.bck).HeadBucket(ctx, apireq.bck)
+	bp := t.Backend(apireq.bck)
+	bucketProps, code, err = bp.HeadBucket(ctx, apireq.bck)
 	if err != nil {
 		if !inBMD {
 			if code == http.StatusNotFound {
-				err = cmn.NewErrRemoteBckNotFound(apireq.bck.Bucket())
 				t.writeErr(w, r, err, code, Silent)
 			} else {
 				err = cmn.NewErrFailedTo(t, "HEAD remote bucket", apireq.bck, err, code)
@@ -513,7 +530,7 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 			}
 			return
 		}
-		nlog.Warningf("%s: bucket %s, err: %v(%d)", t, apireq.bck, err, code)
+		nlog.Warningf("%s: bucket %s, err: %v(%d)", t, apireq.bck.String(), err, code)
 		bucketProps = make(cos.StrKVs)
 		bucketProps[apc.HdrBackendProvider] = apireq.bck.Provider
 		bucketProps[apc.HdrRemoteOffline] = strconv.FormatBool(apireq.bck.IsRemote())
@@ -522,7 +539,7 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 		if k == apc.HdrBucketVerEnabled && apireq.bck.Props != nil {
 			if curr := strconv.FormatBool(apireq.bck.VersionConf().Enabled); curr != v {
 				// e.g., change via vendor-provided CLI and similar
-				nlog.Errorf("%s: %s versioning got out of sync: %s != %s", t, apireq.bck, v, curr)
+				nlog.Errorf("%s: %s versioning got out of sync: %s != %s", t, apireq.bck.String(), v, curr)
 			}
 		}
 		hdr.Set(k, v)

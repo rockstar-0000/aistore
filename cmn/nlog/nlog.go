@@ -1,7 +1,7 @@
 // Package nlog - aistore logger, provides buffering, timestamping, writing, and
 // flushing/syncing/rotating
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package nlog
 
@@ -60,13 +60,15 @@ func log(sev severity, depth int, format string, args ...any) {
 	case LogToStderr:
 		fb := alloc()
 		sprintf(sev, depth, format, fb, args...)
-		fb.flush(os.Stderr)
+		_, err := fb.flush(os.Stderr)
+		assert(err == nil)
 		free(fb)
 	case sev >= sevWarn:
 		fb := alloc()
 		sprintf(sev, depth, format, fb, args...)
 		if sev >= sevErr {
-			fb.flush(os.Stderr)
+			_, err := fb.flush(os.Stderr)
+			assert(err == nil)
 		}
 		if sev >= sevWarn {
 			nlog := nlogs[sevErr]
@@ -128,15 +130,15 @@ func (nlog *nlog) write(line *fixed) {
 func (nlog *nlog) get() {
 	prev := nlog.pw
 	assert(prev == nlog.toFlush[len(nlog.toFlush)-1])
-	switch {
-	case prev == nlog.buf1:
+	switch prev {
+	case nlog.buf1:
 		if nlog.buf2 != nil {
 			nlog.pw = nlog.buf2
 		} else {
 			nlog.pw = alloc()
 		}
 		nlog.buf1 = nil
-	case prev == nlog.buf2:
+	case nlog.buf2:
 		if nlog.buf1 != nil {
 			nlog.pw = nlog.buf1
 		} else {
@@ -144,11 +146,12 @@ func (nlog *nlog) get() {
 		}
 		nlog.buf2 = nil
 	default: // prev was alloc-ed
-		if nlog.buf1 != nil {
+		switch {
+		case nlog.buf1 != nil:
 			nlog.pw = nlog.buf1
-		} else if nlog.buf2 != nil {
+		case nlog.buf2 != nil:
 			nlog.pw = nlog.buf2
-		} else {
+		default:
 			nlog.pw = alloc()
 		}
 	}
@@ -156,11 +159,12 @@ func (nlog *nlog) get() {
 
 func (nlog *nlog) put(pw *fixed /* to reuse */) {
 	nlog.mw.Lock()
-	if nlog.buf1 == nil {
+	switch {
+	case nlog.buf1 == nil:
 		nlog.buf1 = pw
-	} else if nlog.buf2 == nil {
+	case nlog.buf2 == nil:
 		nlog.buf2 = pw
-	} else {
+	default:
 		assert(nlog.buf1 == pw || nlog.buf2 == pw) // via Flush(true)
 	}
 	nlog.mw.Unlock()

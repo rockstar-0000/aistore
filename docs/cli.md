@@ -1,12 +1,3 @@
----
-layout: post
-title: CLI
-permalink: /docs/cli
-redirect_from:
- - /cli.md/
- - /docs/cli.md/
----
-
 ## Table of contents
 
 - [Getting Started](#getting-started)
@@ -23,7 +14,7 @@ AIS command-line interface (CLI) is a tool to easily manage and monitor every as
 
 In addition, CLI provides dataset management commands, reading and writing primitives, and more.
 
-Goven an existing aistore instance, maybe the very first command you execute would be `ais show cluster` - a variant of numerous `ais show` subcommands.  For example:
+Given an existing aistore instance, maybe the very first command you execute would be `ais show cluster` - a variant of numerous `ais show` subcommands.  For example:
 
 ```console
 $ ais show cluster
@@ -57,7 +48,7 @@ Summary:
    Build:               2024-01-29T00:29:36+0000
 ```
 
-Next, montoring wise, you'd maybe run `ais show performance`, etc.
+Next, monitoring-wise, you'd maybe run `ais show performance`, etc.
 
 ## Getting Started
 
@@ -115,19 +106,19 @@ The recommended and, actually, fastest way to get started with CLI is to type `a
 ```console
 $ ais <TAB-TAB>
 
-bucket           job              storage          remote-cluster   prefetch         evict            create
-object           auth             archive          alias            put              rmo              dsort
-cluster          show             log              ls               start            wait             search
-config           help             tls              stop             get              blob-download
-etl              advanced         performance      download         rmb              cp
+advanced         config           get              prefetch         show
+alias            cp               help             put              space-cleanup
+archive          create           job              remote-cluster   start
+auth             download         log              rmb              stop
+blob-download    dsort            ls               rmo              storage
+bucket           etl              object           scrub            tls
+cluster          evict            performance      search           wait
 ```
 
 These are the current set of top-level commands. Each command has its own extended help (the `--help` option) and, usually, multiple sub-commands
 (which, in turn, have their respective inline helps and subcommands).
 
-The list of top-level commands must give maybe the first idea of the supported functionality and functional grouping.
-
-Following is a brief summary (that's non-exhaustive and slightly outdated):
+The list of top-level commands provides an overview of the supported functionality and functional grouping. The following is a brief (non-exhaustive and possibly slightly outdated) **summary**:
 
 | Command | Use Case |
 |---------|----------|
@@ -136,6 +127,7 @@ Following is a brief summary (that's non-exhaustive and slightly outdated):
 | [`ais alias`](/docs/cli/alias.md) | User-defined command aliases. |
 | [`ais archive`](/docs/cli/archive.md) | Read, write, and list archives (i.e., objects formatted as TAR, TGZ, ZIP, etc.) |
 | [`ais auth`](/docs/cli/auth.md) | Add/remove/show users, manage user roles, manage access to remote clusters. |
+| [`ais blob-download`](/docs/cli/blob-downloader.md) | Download a large object or multiple objects from remote storage. |
 | [`ais bucket`](/docs/cli/bucket.md) | Create/destroy buckets, list bucket's content, show existing buckets and their properties. |
 | [`ais cluster`](/docs/cli/cluster.md) | Monitor and manage AIS cluster: add/remove nodes, change primary gateway, etc. |
 | [`ais config`](/docs/cli/config.md) | Set local/global AIS cluster configurations. |

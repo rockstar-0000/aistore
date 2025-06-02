@@ -1,6 +1,6 @@
 //go:build !aws
 
-// Package backend contains implementation of various backend providers.
+// Package backend contains core/backend interface implementations for supported backend providers.
 /*
  * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
@@ -18,7 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 )
 
-func NewAWS(_ core.TargetPut, _ stats.Tracker) (core.Backend, error) {
+func NewAWS(core.TargetPut, stats.Tracker, bool) (core.Backend, error) {
 	return nil, &cmn.ErrInitBackend{Provider: apc.AWS}
 }
 
@@ -30,8 +30,8 @@ func PutMptPart(*core.LOM, io.ReadCloser, *http.Request, url.Values, string, int
 	return "", http.StatusBadRequest, cmn.NewErrUnsupp("put-mpt-part", mock)
 }
 
-func CompleteMpt(*core.LOM, *http.Request, url.Values, string, *s3types.CompleteMptUpload) (string, int, error) {
-	return "", http.StatusBadRequest, cmn.NewErrUnsupp("complete-part", mock)
+func CompleteMpt(*core.LOM, *http.Request, url.Values, string, []byte, *s3types.CompleteMptUpload) (string, string, int, error) {
+	return "", "", http.StatusBadRequest, cmn.NewErrUnsupp("complete-part", mock)
 }
 
 func AbortMpt(*core.LOM, *http.Request, url.Values, string) (int, error) {

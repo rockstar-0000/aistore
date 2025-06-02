@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -192,7 +192,7 @@ func (*factory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 func newXact(p *factory) (xld *Xact) {
 	xld = &Xact{p: p}
 	xld.dispatcher = newDispatcher(xld)
-	xld.DemandBase.Init(p.UUID(), apc.Download, p.bck, 0 /*use default*/)
+	xld.DemandBase.Init(p.UUID(), apc.Download, "" /*ctlmsg*/, p.bck, 0 /*use default*/)
 	return
 }
 

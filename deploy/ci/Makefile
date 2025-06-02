@@ -1,11 +1,12 @@
-DOCKER       ?= docker
-REGISTRY_URL ?= docker.io
-CI_IMAGE     ?= aistorage/ci
-IMAGE_TAG    ?= latest
+DOCKER          ?= docker
+REGISTRY_URL    ?= docker.io
+CI_IMAGE        ?= aistorage/gitlab-ci
+IMAGE_TAG       ?= latest
+IMAGE_URL = $(REGISTRY_URL)/$(CI_IMAGE):$(IMAGE_TAG)
 
 all: build push
 
 build:
-	$(DOCKER) build --network host --no-cache -t $(REGISTRY_URL)/$(CI_IMAGE):$(IMAGE_TAG) -f general.dockerfile .
+	DOCKER=$(DOCKER) IMAGE_URL=$(IMAGE_URL) ./build.sh
 push:
-	$(DOCKER) push $(REGISTRY_URL)/$(CI_IMAGE):$(IMAGE_TAG)
+	$(DOCKER) push $(IMAGE_URL)

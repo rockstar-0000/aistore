@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch, call
 
+from tests.const import LARGE_FILE_SIZE, ETL_NAME, PREFIX_NAME
+
 from aistore.sdk import Bucket
 from aistore.sdk.const import (
     HTTP_METHOD_DELETE,
@@ -11,13 +13,13 @@ from aistore.sdk.const import (
     ACT_COPY_OBJECTS,
     ACT_TRANSFORM_OBJECTS,
     ACT_ARCHIVE_OBJECTS,
-    PROVIDER_AMAZON,
     HTTP_METHOD_PUT,
 )
+from aistore.sdk.provider import Provider
 from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
 from aistore.sdk.multiobj import ObjectGroup, ObjectRange
 from aistore.sdk.types import Namespace, BucketModel, ArchiveMultiObj
-from tests.const import LARGE_FILE_SIZE, ETL_NAME, PREFIX_NAME
+from aistore.sdk.etl import ETLConfig
 
 
 # pylint: disable=unused-variable,too-many-instance-attributes
@@ -35,10 +37,7 @@ class TestObjectGroup(unittest.TestCase):
         )
         self.mock_bck.as_model.return_value = self.mock_bck_model
         namespace = Namespace(name="ns-name", uuid="ns-id")
-        provider = "any provider"
-        self.dest_bucket = Bucket(
-            name="to-bucket", namespace=namespace, provider=provider
-        )
+        self.dest_bucket = Bucket(name="to-bucket", namespace=namespace)
 
         self.obj_names = ["obj-1", "obj-2"]
         self.object_group = ObjectGroup(self.mock_bck, obj_names=self.obj_names)
@@ -200,6 +199,7 @@ class TestObjectGroup(unittest.TestCase):
         prepend_val = "new_prefix-"
         self.expected_value["coer"] = True
         self.expected_value["prepend"] = prepend_val
+        self.expected_value["ext"] = {"wav": "flac"}
         self.expected_value["request_timeout"] = timeout
         self.expected_value["dry_run"] = True
         self.expected_value["force"] = True
@@ -211,6 +211,7 @@ class TestObjectGroup(unittest.TestCase):
             self.expected_value,
             to_bck=self.dest_bucket,
             prepend=prepend_val,
+            ext={"wav": "flac"},
             etl_name=ETL_NAME,
             timeout=timeout,
             dry_run=True,
@@ -252,7 +253,7 @@ class TestObjectGroup(unittest.TestCase):
         archive_name = "test-arch"
         namespace = Namespace(name="ns-name", uuid="ns-id")
         to_bck = Bucket(
-            name="dest-bck-name", namespace=namespace, provider=PROVIDER_AMAZON
+            name="dest-bck-name", namespace=namespace, provider=Provider.AMAZON
         )
         mime = "text"
         include_source = True
@@ -285,8 +286,8 @@ class TestObjectGroup(unittest.TestCase):
         # Should create an object reference and get url for every object returned by listing
         for name in self.obj_names:
             expected_obj_calls.append(call(name))
-            expected_obj_calls.append(call().get_url(etl_name=ETL_NAME))
-        list(self.object_group.list_urls(etl_name=ETL_NAME))
+            expected_obj_calls.append(call().get_url(etl=ETLConfig(name=ETL_NAME)))
+        list(self.object_group.list_urls(etl=ETLConfig(name=ETL_NAME)))
         self.mock_bck.object.assert_has_calls(expected_obj_calls)
 
     def test_list_all_objects_iter(self):

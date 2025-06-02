@@ -1,12 +1,3 @@
----
-layout: post
-title: RESTFUL API
-permalink: /docs/http-api
-redirect_from:
- - /http_api.md/
- - /docs/http_api.md/
----
-
 ## Table of Contents
 
 - [Notation](#notation)
@@ -58,7 +49,7 @@ Run `curl --help` for help.
 
 2. **HTTP verb** aka method, one of: `PUT`, `GET`, `HEAD`, `POST`, `DELETE`, or `PATCH`.
 
-In the example, it's a GET but it can also be POST, PUT, and DELETE. For a brief summary of the standard HTTP verbs and their CRUD semantics, see, for instance, this [REST API tutorial](http://www.restapitutorial.com/lessons/httpmethods.html).
+In the example, it's a GET but it can also be POST, PUT, and DELETE. For a brief summary of the standard HTTP verbs and their CRUD semantics, see, for instance, this [REST API tutorial](https://www.restapitutorial.com/introduction/httpmethods).
 
 3. **Hostname** (or IPv4 address) and TCP port of one of the AIStore daemons.
 
@@ -74,7 +65,7 @@ For example: /v1/cluster where `v1` is the currently supported API version and `
 | `daemon` (aka **node**) | control-plane request to update or query specific AIS daemon (proxy or target). In the documentation, the terms "daemon" and "node" are used interchangeably. |
 | `buckets` | create, destroy, rename, copy, transform (entire) buckets; list objects in a given bucket; get bucket names for a given provider (or all providers); get bucket properties |
 | `objects` | datapath request to GET, PUT and DELETE objects, read their properties |
-| `download` | download external datasets and/or selected files from remote buckets, HDFS, or even specific HTTP locations |
+| `download` | download external datasets and/or selected files from remote buckets or even specific HTTP locations |
 | `sort` | user-defined distributed shuffle |
 
 and more.
@@ -93,7 +84,7 @@ In particular, all API requests that operate on a bucket carry the bucket's spec
 
 > The reference below is "formulated" in [curl](https://curl.se/) - i.e., using `curl` command lines. It is possible, however, and often much easier (and, therefore, **preferable**), to execute the same operations using [AIS CLI](/docs/cli.md). For more `curl` examples, please also see:
 
-* [Assorted Curl](/docs/getting_started.md#assorted-curl)
+* [Assorted Curl](/docs/getting_started.md#curl)
 
 6. And finally, **HTTP request and response headers**
 
@@ -145,7 +136,7 @@ $ curl -s -L -X GET 'http://aistore/gs/my-google-bucket' | jq
 
 > AIS provides S3 compatibility layer via its "/s3" endpoint. [S3 compatibility](/docs/s3compat.md) shall not be confused with "easy URL" mapping, whereby a path (e.g.) "gs/mybucket/myobject" gets replaced with "v1/objects/mybucket/myobject?provider=gcp" with _no_ other changes to the request and response parameters and components.
 
-> For detals and additional usage examples, please see [easy URL readme](/docs/easy_url.md).
+> For details and additional usage examples, please see [easy URL readme](/docs/easy_url.md).
 
 ## API Reference
 
@@ -255,7 +246,7 @@ To the (fully expected) question of where the `prr` query comes from - all suppo
 
 ### Mountpaths and Disks
 
-Special subset of node operations (see previous section) to manage disks attached to specific storage target. The corresponding AIS abstraction is called [mountpath](/docs/overview.md#terminology).
+Special subset of node operations (see previous section) to manage disks attached to specific storage target. The corresponding AIS abstraction is called [mountpath](/docs/overview.md#mountpath).
 
 These APIs also require specific node ID (to identify the target in the cluster to operate on):
 
@@ -546,7 +537,7 @@ $ curl -s -L -X GET -H 'Content-Type: application/json' -d '{"action": "list", "
 
 ### Starting, stopping, and querying batch operations (jobs)
 
-The term we use in the code and elsewhere is [xaction](/docs/overview.md#terminology) - a shortcut for *eXtended action*. For definition and further references, see:
+The term we use in the code and elsewhere is [xaction](/docs/overview.md#xaction) - a shortcut for *eXtended action*. For definition and further references, see:
 
 * [Terminology](/docs/overview.md#terminology)
 * [Batch operations](/docs/batch.md)
@@ -727,7 +718,7 @@ For API Reference of ETL please refer to [ETL Readme](/docs/etl.md#api-reference
 
 ## Footnotes
 
-<a name="ft1">1</a>) This will fetch the object "myS3object" from the bucket "myS3bucket". Notice the -L - this option must be used in all AIStore supported commands that read or write data - usually via the URL path /v1/objects/. For more on the -L and other useful options, see [Everything curl: HTTP redirect](https://ec.haxx.se/http-redirects.html). [↩](#a1)
+<a name="ft1">1</a>) This will fetch the object "myS3object" from the bucket "myS3bucket". Notice the -L - this option must be used in all AIStore supported commands that read or write data - usually via the URL path /v1/objects/. For more on the -L and other useful options, see [Everything curl: HTTP redirect](https://everything.curl.dev/http/redirects.html). [↩](#a1)
 
 <a name="ft2">2</a>) See the [List Objects section](/docs/bucket.md#list-objects) for details. [↩](#a2)
 

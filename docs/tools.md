@@ -1,12 +1,3 @@
----
-layout: post
-title: TOOLS
-permalink: /docs/tools
-redirect_from:
- - /tools.md/
- - /docs/tools.md/
----
-
 ## Table of Contents
 - [Executables](#executables)
 - [Installing from GitHub](#installing-from-github)
@@ -30,7 +21,7 @@ redirect_from:
 
 Generally, AIStore (cluster) requires at least some sort of [deployment](/deploy#contents) process or sequence. 
 
-Standalone binaries, on the other hand, can be [built](Makefile) from source or installed directly from the latest or previous GitHub releases.
+Standalone binaries, on the other hand, can be [built](/Makefile) from source or installed directly from the latest or previous GitHub releases.
 
 **NOTE:** binary installation is supported only for the `linux-amd64` platform.
 

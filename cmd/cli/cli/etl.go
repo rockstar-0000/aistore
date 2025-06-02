@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that control running jobs in the cluster.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -20,8 +20,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/ext/etl"
-	"github.com/fatih/color"
+
 	"github.com/urfave/cli"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -36,6 +37,7 @@ var (
 			argTypeFlag,
 			chunkSizeFlag,
 			waitPodReadyTimeoutFlag,
+			etlObjectRequestTimeout,
 			etlNameFlag,
 		},
 		cmdSpec: {
@@ -43,10 +45,14 @@ var (
 			commTypeFlag,
 			argTypeFlag,
 			waitPodReadyTimeoutFlag,
+			etlObjectRequestTimeout,
 			etlNameFlag,
 		},
 		cmdStop: {
 			allRunningJobsFlag,
+		},
+		cmdObject: {
+			etlTransformArgsFlag,
 		},
 		cmdBucket: {
 			etlAllObjsFlag,
@@ -55,82 +61,92 @@ var (
 			forceFlag,
 			copyPrependFlag,
 			copyDryRunFlag,
-			etlBucketRequestTimeout,
 			listFlag,
 			templateFlag,
-			numListRangeWorkersFlag,
+			numWorkersFlag,
 			verbObjPrefixFlag,
 			// TODO: progressFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
 		},
-		cmdStart: {},
+		cmdStart:      {},
+		commandRemove: {},
 	}
 	showCmdETL = cli.Command{
 		Name:   commandShow,
-		Usage:  "show ETL(s)",
+		Usage:  "Show ETL(s)",
 		Action: etlListHandler,
 		Subcommands: []cli.Command{
 			{
-				Name:      cmdDetails,
-				Usage:     "show ETL details",
-				ArgsUsage: etlNameArgument,
-				Action:    etlShowDetailsHandler,
+				Name:         cmdDetails,
+				Usage:        "Show ETL details",
+				ArgsUsage:    etlNameArgument,
+				Action:       etlShowDetailsHandler,
+				BashComplete: etlIDCompletions,
 			},
 		},
 	}
 	stopCmdETL = cli.Command{
 		Name:         cmdStop,
-		Usage:        "stop ETL",
+		Usage:        "Stop ETL",
 		ArgsUsage:    etlNameListArgument,
 		Action:       etlStopHandler,
 		BashComplete: etlIDCompletions,
-		Flags:        etlSubFlags[cmdStop],
+		Flags:        sortFlags(etlSubFlags[cmdStop]),
 	}
 	startCmdETL = cli.Command{
 		Name:         cmdStart,
-		Usage:        "start ETL",
+		Usage:        "Start ETL",
 		ArgsUsage:    etlNameArgument,
 		Action:       etlStartHandler,
 		BashComplete: etlIDCompletions,
-		Flags:        etlSubFlags[cmdStart],
+		Flags:        sortFlags(etlSubFlags[cmdStart]),
+	}
+	removeCmdETL = cli.Command{
+		Name:         commandRemove,
+		Usage:        "Remove ETL",
+		ArgsUsage:    etlNameArgument,
+		Action:       etlRemoveHandler,
+		BashComplete: etlIDCompletions,
+		Flags:        sortFlags(etlSubFlags[commandRemove]),
 	}
 	initCmdETL = cli.Command{
 		Name:  cmdInit,
-		Usage: "start ETL job: 'spec' job (requires pod yaml specification) or 'code' job (with transforming function or script in a local file)",
+		Usage: "Start ETL job: 'spec' job (requires pod yaml specification) or 'code' job (with transforming function or script in a local file)",
 		Subcommands: []cli.Command{
 			{
 				Name:   cmdSpec,
-				Usage:  "start ETL job with YAML Pod specification",
-				Flags:  etlSubFlags[cmdSpec],
+				Usage:  "Start ETL job with YAML Pod specification",
+				Flags:  sortFlags(etlSubFlags[cmdSpec]),
 				Action: etlInitSpecHandler,
 			},
 			{
 				Name:   cmdCode,
-				Usage:  "start ETL job using the specified transforming function or script",
-				Flags:  etlSubFlags[cmdCode],
+				Usage:  "Start ETL job using the specified transforming function or script",
+				Flags:  sortFlags(etlSubFlags[cmdCode]),
 				Action: etlInitCodeHandler,
 			},
 		},
 	}
 	objCmdETL = cli.Command{
 		Name:         cmdObject,
-		Usage:        "transform object",
+		Usage:        "Transform an object",
 		ArgsUsage:    etlNameArgument + " " + objectArgument + " OUTPUT",
 		Action:       etlObjectHandler,
+		Flags:        sortFlags(etlSubFlags[cmdObject]),
 		BashComplete: etlIDCompletions,
 	}
 	bckCmdETL = cli.Command{
 		Name:         cmdBucket,
-		Usage:        "transform entire bucket or selected objects (to select, use '--list', '--template', or '--prefix')",
+		Usage:        "Transform entire bucket or selected objects (to select, use '--list', '--template', or '--prefix')",
 		ArgsUsage:    etlNameArgument + " " + bucketObjectSrcArgument + " " + bucketDstArgument,
 		Action:       etlBucketHandler,
-		Flags:        etlSubFlags[cmdBucket],
+		Flags:        sortFlags(etlSubFlags[cmdBucket]),
 		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{etlIDCompletions}, 1, 2),
 	}
 	logsCmdETL = cli.Command{
 		Name:         cmdViewLogs,
-		Usage:        "view ETL logs",
+		Usage:        "View ETL logs",
 		ArgsUsage:    etlNameArgument + " " + optionalTargetIDArgument,
 		Action:       etlLogsHandler,
 		BashComplete: etlIDCompletions,
@@ -138,13 +154,14 @@ var (
 	// subcommands
 	etlCmd = cli.Command{
 		Name:  commandETL,
-		Usage: "execute custom transformations on objects",
+		Usage: "Execute custom transformations on objects",
 		Subcommands: []cli.Command{
 			initCmdETL,
 			showCmdETL,
 			logsCmdETL,
 			startCmdETL,
 			stopCmdETL,
+			removeCmdETL,
 			objCmdETL,
 			bckCmdETL,
 		},
@@ -164,7 +181,7 @@ func suggestEtlName(c *cli.Context, shift int) {
 		return
 	}
 	for _, l := range list {
-		fmt.Print(l.Name)
+		fmt.Println(l.Name)
 	}
 }
 
@@ -192,7 +209,7 @@ func findETL(etlName, xid string) *etl.Info {
 	return nil
 }
 
-func etlInitSpecHandler(c *cli.Context) (err error) {
+func etlInitSpecHandler(c *cli.Context) error {
 	fromFile := parseStrFlag(c, fromFileFlag)
 	if fromFile == "" {
 		return fmt.Errorf("flag %s must be specified", qflprn(fromFileFlag))
@@ -202,17 +219,22 @@ func etlInitSpecHandler(c *cli.Context) (err error) {
 		return err
 	}
 
-	msg := &etl.InitSpecMsg{}
-	{
-		msg.IDX = parseStrFlag(c, etlNameFlag)
-		msg.CommTypeX = parseStrFlag(c, commTypeFlag)
-		msg.ArgTypeX = parseStrFlag(c, argTypeFlag)
-		msg.Spec = spec
+	var (
+		etlSpec  etl.ETLSpecMsg
+		initSpec etl.InitSpecMsg
+		msg      etl.InitMsg
+	)
+
+	if err := yaml.Unmarshal(spec, &etlSpec); err == nil && etlSpec.Validate() == nil {
+		populateCommonFields(c, &etlSpec.InitMsgBase)
+		msg = &etlSpec
+	} else {
+		populateCommonFields(c, &initSpec.InitMsgBase)
+		initSpec.Spec = spec
+		msg = &initSpec
 	}
-	if !strings.HasSuffix(msg.CommTypeX, etl.CommTypeSeparator) {
-		msg.CommTypeX += etl.CommTypeSeparator
-	}
-	if err = msg.Validate(); err != nil {
+
+	if err := msg.Validate(); err != nil {
 		if e, ok := err.(*cmn.ErrETL); ok {
 			err = errors.New(e.Reason)
 		}
@@ -220,14 +242,15 @@ func etlInitSpecHandler(c *cli.Context) (err error) {
 	}
 
 	// msg.ID is `metadata.name` from podSpec
-	if err = etlAlreadyExists(msg.Name()); err != nil {
-		return
+	if err := etlAlreadyExists(msg.Name()); err != nil {
+		return err
 	}
 
-	xid, err := api.ETLInit(apiBP, msg)
-	if err != nil {
-		return V(err)
+	xid, errV := api.ETLInit(apiBP, msg)
+	if errV != nil {
+		return V(errV)
 	}
+
 	fmt.Fprintf(c.App.Writer, "ETL[%s]: job %q\n", msg.Name(), xid)
 	return nil
 }
@@ -241,13 +264,13 @@ func etlInitCodeHandler(c *cli.Context) (err error) {
 		return fmt.Errorf("flag %s cannot be empty", qflprn(fromFileFlag))
 	}
 
-	msg.IDX = parseStrFlag(c, etlNameFlag)
+	msg.EtlName = parseStrFlag(c, etlNameFlag)
 	if msg.Name() != "" {
-		if err = k8s.ValidateEtlName(msg.Name()); err != nil {
-			return
+		if err := k8s.ValidateEtlName(msg.Name()); err != nil {
+			return err
 		}
-		if err = etlAlreadyExists(msg.Name()); err != nil {
-			return
+		if err := etlAlreadyExists(msg.Name()); err != nil {
+			return err
 		}
 	}
 
@@ -277,7 +300,8 @@ func etlInitCodeHandler(c *cli.Context) (err error) {
 		}
 	}
 
-	msg.Timeout = cos.Duration(parseDurationFlag(c, waitPodReadyTimeoutFlag))
+	msg.InitTimeout = cos.Duration(parseDurationFlag(c, waitPodReadyTimeoutFlag))
+	msg.ObjTimeout = cos.Duration(parseDurationFlag(c, etlObjectRequestTimeout))
 
 	// funcs
 	msg.Funcs.Transform = parseStrFlag(c, funcTransformFlag)
@@ -291,10 +315,11 @@ func etlInitCodeHandler(c *cli.Context) (err error) {
 	}
 
 	// start
-	xid, err := api.ETLInit(apiBP, msg)
-	if err != nil {
-		return V(err)
+	xid, errV := api.ETLInit(apiBP, msg)
+	if errV != nil {
+		return V(errV)
 	}
+
 	fmt.Fprintf(c.App.Writer, "ETL[%s]: job %q\n", msg.Name(), xid)
 	return nil
 }
@@ -320,7 +345,7 @@ func etlList(c *cli.Context, caption bool) (int, error) {
 	}
 	if caption {
 		onlyActive := !flagIsSet(c, allJobsFlag)
-		jobCptn(c, commandETL, onlyActive, "", false)
+		jobCptn(c, commandETL, "" /*xid*/, "" /*ctlmsg*/, onlyActive, false)
 	}
 
 	hideHeader := flagIsSet(c, noHeaderFlag)
@@ -345,25 +370,36 @@ func etlPrintDetails(c *cli.Context, id string) error {
 		return V(err)
 	}
 
-	fmt.Fprintln(c.App.Writer, fblue("NAME: "), msg.Name())
-	fmt.Fprintln(c.App.Writer, fblue("COMMUNICATION TYPE: "), msg.CommType())
-	fmt.Fprintln(c.App.Writer, fblue("ARGUMENT TYPE: "), msg.ArgType())
+	fmt.Fprintln(c.App.Writer, fblue(etl.Name+": "), msg.Name())
+	fmt.Fprintln(c.App.Writer, fblue(etl.CommunicationType+": "), msg.CommType())
+	fmt.Fprintln(c.App.Writer, fblue(etl.ArgType+": "), msg.ArgType())
 
-	if initMsg, ok := msg.(*etl.InitCodeMsg); ok {
-		fmt.Fprintln(c.App.Writer, fblue("RUNTIME: "), initMsg.Runtime)
-		fmt.Fprintln(c.App.Writer, fblue("CODE: "))
+	switch initMsg := msg.(type) {
+	case *etl.InitCodeMsg:
+		fmt.Fprintln(c.App.Writer, fblue(etl.Runtime+": "), initMsg.Runtime)
+		fmt.Fprintln(c.App.Writer, fblue(etl.Code+": "))
 		fmt.Fprintln(c.App.Writer, string(initMsg.Code))
-		fmt.Fprintln(c.App.Writer, fblue("DEPS: "), string(initMsg.Deps))
-		fmt.Fprintln(c.App.Writer, fblue("CHUNK SIZE: "), initMsg.ChunkSize)
+		fmt.Fprintln(c.App.Writer, fblue(etl.Deps+": "), string(initMsg.Deps))
+		fmt.Fprintln(c.App.Writer, fblue(etl.ChunkSize+": "), initMsg.ChunkSize)
 		return nil
-	}
-	if initMsg, ok := msg.(*etl.InitSpecMsg); ok {
-		fmt.Fprintln(c.App.Writer, fblue("SPEC: "))
+	case *etl.InitSpecMsg:
+		fmt.Fprintln(c.App.Writer, fblue(etl.Spec+": "))
 		fmt.Fprintln(c.App.Writer, string(initMsg.Spec))
 		return nil
+	case *etl.ETLSpecMsg:
+		fmt.Fprintln(c.App.Writer, fblue(etl.Runtime+": "))
+		fmt.Fprintln(c.App.Writer, indent1+fblue(etl.Image+": "), initMsg.Runtime.Image)
+		if len(initMsg.Runtime.Command) > 0 {
+			fmt.Fprintf(c.App.Writer, indent1+"%s %v\n", fblue(etl.Command+": "), initMsg.Runtime.Command)
+		}
+		if len(initMsg.Runtime.Env) > 0 {
+			fmt.Fprintln(c.App.Writer, indent1+fblue(etl.Env+": "), initMsg.FormatEnv())
+		}
+	default:
+		err = fmt.Errorf("invalid response [%+v, %T]", msg, msg)
+		debug.AssertNoErr(err)
 	}
-	err = fmt.Errorf("invalid response [%+v, %T]", msg, msg)
-	debug.AssertNoErr(err)
+
 	return err
 }
 
@@ -441,21 +477,29 @@ func etlStartHandler(c *cli.Context) (err error) {
 	}
 	etlName := c.Args()[0]
 	if err := api.ETLStart(apiBP, etlName); err != nil {
-		if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
-			color.New(color.FgYellow).Fprintf(c.App.Writer, "ETL[%s] not found", etlName)
-		}
 		return V(err)
 	}
 	fmt.Fprintf(c.App.Writer, "ETL[%s] started successfully\n", etlName)
 	return nil
 }
 
-func etlObjectHandler(c *cli.Context) error {
+func etlRemoveHandler(c *cli.Context) (err error) {
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() == 1 {
+	}
+	etlName := c.Args()[0]
+	if err := api.ETLDelete(apiBP, etlName); err != nil {
+		return V(err)
+	}
+	fmt.Fprintf(c.App.Writer, "ETL[%s] successfully deleted\n", etlName)
+	return nil
+}
+
+func etlObjectHandler(c *cli.Context) error {
+	switch c.NArg() {
+	case 0, 1:
 		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() == 2 {
+	case 2:
 		return missingArgumentsError(c, "OUTPUT")
 	}
 
@@ -469,12 +513,18 @@ func etlObjectHandler(c *cli.Context) error {
 		return errV
 	}
 
+	etlArgs := &api.ETLObjArgs{ETLName: etlName}
+	if transformArgs := parseStrFlag(c, etlTransformArgsFlag); transformArgs != "" {
+		etlArgs.TransformArgs = transformArgs
+	}
+
 	var w io.Writer
-	if outputDest == "-" {
+	switch {
+	case outputDest == "-":
 		w = os.Stdout
-	} else if discardOutput(outputDest) {
+	case discardOutput(outputDest):
 		w = io.Discard
-	} else {
+	default:
 		f, err := os.Create(outputDest)
 		if err != nil {
 			return err
@@ -483,6 +533,24 @@ func etlObjectHandler(c *cli.Context) error {
 		defer f.Close()
 	}
 
-	err := api.ETLObject(apiBP, etlName, bck, objName, w)
+	_, err := api.ETLObject(apiBP, etlArgs, bck, objName, w)
 	return handleETLHTTPError(err, etlName)
+}
+
+func populateCommonFields(c *cli.Context, base *etl.InitMsgBase) {
+	if flagIsSet(c, etlNameFlag) {
+		base.EtlName = parseStrFlag(c, etlNameFlag)
+	}
+	if flagIsSet(c, commTypeFlag) {
+		base.CommTypeX = parseStrFlag(c, commTypeFlag)
+	}
+	if flagIsSet(c, argTypeFlag) {
+		base.ArgTypeX = parseStrFlag(c, argTypeFlag)
+	}
+	if flagIsSet(c, waitPodReadyTimeoutFlag) {
+		base.InitTimeout = cos.Duration(parseDurationFlag(c, waitPodReadyTimeoutFlag))
+	}
+	if flagIsSet(c, etlObjectRequestTimeout) {
+		base.ObjTimeout = cos.Duration(parseDurationFlag(c, etlObjectRequestTimeout))
+	}
 }

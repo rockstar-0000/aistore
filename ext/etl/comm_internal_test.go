@@ -1,6 +1,6 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
-	"testing"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -21,35 +21,31 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 )
 
-func TestETLTransform(t *testing.T) {
-	if testing.Short() {
-		t.Skipf("skipping %s in short mode", t.Name())
-	}
-	RegisterFailHandler(Fail)
-	RunSpecs(t, t.Name())
-}
-
 var _ = Describe("CommunicatorTest", func() {
 	var (
 		tmpDir            string
-		comm              Communicator
+		comm              httpCommunicator
 		transformerServer *httptest.Server
 		targetServer      *httptest.Server
 		proxyServer       *httptest.Server
 
-		dataSize      = int64(cos.MiB * 50)
+		dataSize      = int64(50 * cos.MiB)
 		transformData = make([]byte, dataSize)
 
-		bck        = cmn.Bck{Name: "commBck", Provider: apc.AIS, Ns: cmn.NsGlobal}
-		objName    = "commObj"
-		clusterBck = meta.NewBck(
+		bck                      = cmn.Bck{Name: "commBck", Provider: apc.AIS, Ns: cmn.NsGlobal}
+		objName                  = "commObj"
+		etlTransformArgs         = "{\"from_time\":2.43,\"to_time\":3.43}"
+		expectedEtlTransformArgs = ""
+		paramLatestVer           = "false"
+		clusterBck               = meta.NewBck(
 			bck.Name, bck.Provider, bck.Ns,
-			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}},
+			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumCesXxh}},
 		)
 		bmdMock = mock.NewBaseBownerMock(clusterBck)
 	)
@@ -85,16 +81,42 @@ var _ = Describe("CommunicatorTest", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Initialize the HTTP servers.
-		transformerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		transformerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedEtlTransformArgs := r.URL.Query().Get(apc.QparamETLTransformArgs)
+			Expect(receivedEtlTransformArgs).To(Equal(expectedEtlTransformArgs))
+
+			switch r.Method {
+			case http.MethodGet: // hpull
+				latestVer, err := cos.ParseBool(r.URL.Query().Get(apc.QparamLatestVer))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(latestVer).To(BeFalse(), "Expected 'latestVer' parameter in hpull")
+
+			case http.MethodPut: // hpush
+				hasLatestVer := r.URL.Query().Has(apc.QparamLatestVer)
+				// 'latestVer' should not be passed to ETL in hpush since targets handle synchronization during read.
+				Expect(hasLatestVer).To(BeFalse(), "Unexpected 'latestVer' parameter in hpush; sync is handled by the target.")
+			}
+
 			_, err := w.Write(transformData)
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		targetServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			err := comm.InlineTransform(w, r, lom)
+			receivedEtlTransformArgs := r.URL.Query().Get(apc.QparamETLTransformArgs)
+			ver := r.URL.Query().Get(apc.QparamLatestVer)
+			val, err := cos.ParseBool(ver)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(BeFalse())
+
+			ecode, err := comm.InlineTransform(w, r, lom, val, receivedEtlTransformArgs)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ecode).To(Equal(0))
 		}))
 		proxyServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, targetServer.URL, http.StatusMovedPermanently)
+			redirectURL := targetServer.URL + r.URL.Path + "?"
+			if r.URL.RawQuery != "" {
+				redirectURL += r.URL.RawQuery + "&"
+			}
+			http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
 		}))
 	})
 
@@ -105,39 +127,59 @@ var _ = Describe("CommunicatorTest", func() {
 		targetServer.Close()
 	})
 
-	tests := []string{
-		Hpush,
-		Hpull,
-		Hrev,
-	}
+	tests := []string{Hpush, Hpull}
 
-	for _, commType := range tests {
-		It("should perform transformation "+commType, func() {
-			pod := &corev1.Pod{}
-			pod.SetName("somename")
+	for _, testType := range []string{"inline", "offline"} {
+		for _, commType := range tests {
+			It("should perform "+testType+" transformation "+commType, func() {
+				pod := &corev1.Pod{}
+				pod.SetName("somename")
 
-			xctn := mock.NewXact(apc.ActETLInline)
-			boot := &etlBootstrapper{
-				msg: InitSpecMsg{
-					InitMsgBase: InitMsgBase{
-						CommTypeX: commType,
+				xctn := mock.NewXact(apc.ActETLInline)
+				boot := &etlBootstrapper{
+					msg: &InitSpecMsg{
+						InitMsgBase: InitMsgBase{
+							CommTypeX:   commType,
+							InitTimeout: cos.Duration(DefaultInitTimeout),
+						},
 					},
-				},
-				pod:  pod,
-				uri:  transformerServer.URL,
-				xctn: xctn,
-			}
-			comm = newCommunicator(nil, boot)
+					pod:  pod,
+					uri:  transformerServer.URL,
+					xctn: xctn,
+				}
+				comm = newCommunicator(nil, boot, nil).(httpCommunicator)
 
-			resp, err := http.Get(proxyServer.URL)
-			Expect(err).NotTo(HaveOccurred())
-			defer resp.Body.Close()
+				switch testType {
+				case "inline":
+					q := url.Values{}
+					q.Add(apc.QparamETLTransformArgs, etlTransformArgs)
+					expectedEtlTransformArgs = etlTransformArgs
 
-			b, err := cos.ReadAll(resp.Body)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(len(b)).To(Equal(len(transformData)))
-			Expect(b).To(Equal(transformData))
-		})
+					q.Add(apc.QparamLatestVer, paramLatestVer)
+					resp, err := http.Get(cos.JoinQuery(proxyServer.URL, q))
+					Expect(err).NotTo(HaveOccurred())
+					defer resp.Body.Close()
+
+					b, err := cos.ReadAll(resp.Body)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(len(b)).To(Equal(len(transformData)))
+					Expect(b).To(Equal(transformData))
+				case "offline":
+					lom := &core.LOM{ObjName: objName}
+					err := lom.InitBck(clusterBck.Bucket())
+					Expect(err).NotTo(HaveOccurred())
+
+					expectedEtlTransformArgs = ""
+					resp := comm.OfflineTransform(lom, false, false, nil)
+					Expect(resp.Err).NotTo(HaveOccurred())
+					defer resp.R.Close()
+
+					b, err := cos.ReadAll(resp.R)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(len(b)).To(Equal(len(transformData)))
+				}
+			})
+		}
 	}
 })
 

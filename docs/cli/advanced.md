@@ -1,12 +1,3 @@
----
-layout: post
-title: ADVANCED
-permalink: /docs/cli/advanced
-redirect_from:
- - /cli/advanced.md/
- - /docs/cli/advanced.md/
----
-
 Commands for special use cases (e.g. scripting) and *advanced* usage scenarios, whereby a certain level of understanding of possible consequences is assumed (and required).
 
 ## Table of Contents
@@ -16,26 +7,34 @@ Commands for special use cases (e.g. scripting) and *advanced* usage scenarios, 
 - [Remove node from Smap](#remove-node-from-smap)
 - [Rotate logs: individual nodes or entire cluster](#rotate-logs-individual-nodes-or-entire-cluster)
 - [Disable/Enable cloud backend at runtime](#disableenable-cloud-backend-at-runtime)
+- [Check object(s) lock status](#check-objects-lock-status)
 
 ## `ais advanced`
 
 ```console
 $ ais advanced --help
 
+NAME:
+   ais advanced - Special commands intended for development and advanced usage
+
 USAGE:
-   ais advanced command [command options] [arguments...]
+   ais advanced command [arguments...]  [command options]
 
 COMMANDS:
-   resilver          resilver user data on a given target (or all targets in the cluster); entails:
+   resilver          Resilver user data on a given target (or all targets in the cluster); entails:
                      - fix data redundancy with respect to bucket configuration;
                      - remove migrated objects and old/obsolete workfiles.
-   preload           preload object metadata into in-memory cache
-   remove-from-smap  immediately remove node from cluster map (beware: potential data loss!)
-   random-node       print random node ID (by default, ID of a randomly selected target)
-   random-mountpath  print a random mountpath from a given target
-   rotate-logs       rotate aistore logs
-   enable-backend    (re)enable cloud backend (see also: 'ais config cluster backend')
-   disable-backend   disable cloud backend (see also: 'ais config cluster backend')
+   preload           Preload object metadata into in-memory cache
+   remove-from-smap  Immediately remove node from cluster map (beware: potential data loss!)
+   random-node       Print random node ID (by default, ID of a randomly selected target)
+   random-mountpath  Print a random mountpath from a given target
+   rotate-logs       Rotate aistore logs
+   enable-backend    (Re)enable cloud backend (see also: 'ais config cluster backend')
+   disable-backend   Disable cloud backend (see also: 'ais config cluster backend')
+   check-lock        Check object lock status (read/write/unlocked)
+
+OPTIONS:
+   --help, -h  Show help
 ```
 
 ## Manual Resilvering
@@ -130,7 +129,7 @@ Node t[kOktEWrTg], Version 3.21.1.69a90d64b, build time 2023-11-07T18:06:19-0500
 
 ## Disable/Enable cloud backend at runtime
 
-AIStore build supports conditional linkage of the supported remote backends: [S3, GCS, Azure](https://github.com/NVIDIA/aistore/blob/main/docs/images/cluster-block-2024.png).
+AIStore build supports conditional linkage of the supported remote backends: [S3, GCS, Azure](https://github.com/NVIDIA/aistore/blob/main/docs/images/cluster-block-v3.26.png).
 
 > For the most recently updated list, please see [3rd party Backend providers](/docs/providers.md).
 
@@ -218,4 +217,111 @@ NAME     SIZE            CACHED
 
 $ ais get s3://test-bucket/333 /dev/null
 GET (and discard) 333 from s3://test-bucket (15.97KiB)
+```
+
+## Check object(s) lock status
+
+Prefix-based (multi-object) selection is also supported:
+
+```console
+$ ais advanced check-lock --help
+NAME:
+   ais advanced check-lock - Check object lock status (read/write/unlocked)
+
+USAGE:
+   ais advanced check-lock BUCKET[/OBJECT_NAME_or_PREFIX] [command options]
+
+OPTIONS:
+   prefix     Select virtual directories or objects with names starting with the specified prefix, e.g.:
+              '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+              '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
+   max-pages  Maximum number of pages to display (see also '--page-size' and '--limit')
+              e.g.: 'ais ls az://abc --paged --page-size 123 --max-pages 7
+   limit      The maximum number of objects to list, get, or otherwise handle (0 - unlimited; see also '--max-pages'),
+              e.g.:
+              - 'ais ls gs://abc/dir --limit 1234 --cached --props size,custom,atime'  - list no more than 1234 objects
+              - 'ais get gs://abc /dev/null --prefix dir --limit 1234'                 - get --/--
+              - 'ais scrub gs://abc/dir --limit 1234'                                  - scrub --/--
+   page-size  Maximum number of object names per page; when the flag is omitted or 0
+              the maximum is defined by the corresponding backend; see also '--max-pages' and '--paged'
+   help, h    Show help
+```
+
+### Check a single object
+
+```
+$ ais get s3://test-bucket/large-object /dev/null & for i in {1..10}; do ais advanced check-lock s3://test-bucket/large-object; sleep 1; done
+[1] 443660
+
+s3://test-bucket/large-object: unlocked
+s3://test-bucket/large-object: write-locked
+s3://test-bucket/large-object: write-locked
+s3://test-bucket/large-object: write-locked
+s3://test-bucket/large-object: write-locked
+s3://test-bucket/large-object: write-locked
+GET and discard large-object from s3://test-bucket (54.14MiB)
+[1]+  Done                    ais get s3://test-bucket/large-object /dev/null
+s3://test-bucket/large-object: unlocked
+s3://test-bucket/large-object: unlocked
+s3://test-bucket/large-object: unlocked
+...
+^C  ## Ctrl-C
+```
+
+### Check entire virtual directory
+
+```
+$ ais get s3://test-bucket/dir/large-object /dev/null & for i in {1..10}; do ais advanced check-lock s3://test-bucket/dir/ --page-size 20; sleep 1; done
+[1] 466350
+...
+
+Page 5 =========
+OBJECT                            LOCK STATUS
+s3://test-bucket/dir/1000cd6      unlocked
+s3://test-bucket/dir/1000cea      unlocked
+s3://test-bucket/dir/1000d52      unlocked
+s3://test-bucket/dir/1000d6       unlocked
+s3://test-bucket/dir/1000da2      unlocked
+s3://test-bucket/dir/1000db4      unlocked
+s3://test-bucket/dir/1000dbd      unlocked
+s3://test-bucket/dir/1000dd6      unlocked
+s3://test-bucket/dir/large-object write-locked
+s3://test-bucket/dir/1000e52      unlocked
+s3://test-bucket/dir/1000ea       unlocked
+s3://test-bucket/dir/1000ea2      unlocked
+s3://test-bucket/dir/1000eb4      unlocked
+s3://test-bucket/dir/1000ebd      unlocked
+
+GET and discard dir/large-object from s3://test-bucket (54.14MiB)
+[1]+  Done                    ais get s3://test-bucket/dir/large-object /dev/null
+
+s3://test-bucket/dir/1000ed6      unlocked
+s3://test-bucket/dir/1000eea      unlocked
+s3://test-bucket/dir/1000f52      unlocked
+s3://test-bucket/dir/1000fa2      unlocked
+s3://test-bucket/dir/1000fb4      unlocked
+s3://test-bucket/dir/1000fbd      unlocked
+
+Page 6 =========
+OBJECT                            LOCK STATUS
+s3://test-bucket/dir/1000cd6      unlocked
+s3://test-bucket/dir/1000cea      unlocked
+s3://test-bucket/dir/1000d52      unlocked
+s3://test-bucket/dir/1000d6       unlocked
+s3://test-bucket/dir/1000da2      unlocked
+s3://test-bucket/dir/1000db4      unlocked
+s3://test-bucket/dir/1000dbd      unlocked
+s3://test-bucket/dir/1000dd6      unlocked
+s3://test-bucket/dir/large-object unlocked
+s3://test-bucket/dir/1000e52      unlocked
+s3://test-bucket/dir/1000ea       unlocked
+s3://test-bucket/dir/1000ea2      unlocked
+s3://test-bucket/dir/1000eb4      unlocked
+s3://test-bucket/dir/1000ebd      unlocked
+s3://test-bucket/dir/1000ed6      unlocked
+s3://test-bucket/dir/1000eea      unlocked
+s3://test-bucket/dir/1000f52      unlocked
+s3://test-bucket/dir/1000fa2      unlocked
+s3://test-bucket/dir/1000fb4      unlocked
+s3://test-bucket/dir/1000fbd      unlocked
 ```

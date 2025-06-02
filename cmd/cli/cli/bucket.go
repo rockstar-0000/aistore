@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -16,8 +16,8 @@ import (
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
+
 	"github.com/urfave/cli"
 )
 
@@ -26,7 +26,7 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadR
 	if err = api.CreateBucket(apiBP, bck, props, dontHeadRemote); err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); ok {
 			if herr.Status == http.StatusConflict {
-				desc := fmt.Sprintf("Bucket %q already exists", bck)
+				desc := fmt.Sprintf("Bucket %q already exists", bck.String())
 				if flagIsSet(c, ignoreErrorFlag) {
 					fmt.Fprintln(c.App.Writer, desc)
 					return nil
@@ -36,9 +36,9 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadR
 			if cliConfVerbose() {
 				herr.Message = herr.StringEx()
 			}
-			return fmt.Errorf("failed to create %q: %w", bck, herr)
+			return fmt.Errorf("failed to create %q: %w", bck.String(), herr)
 		}
-		return fmt.Errorf("failed to create %q: %v", bck, err)
+		return fmt.Errorf("failed to create %q: %v", bck.String(), err)
 	}
 	// NOTE: see docs/bucket.md#default-bucket-properties
 	fmt.Fprintf(c.App.Writer, "%q created\n", bck.Cname(""))
@@ -52,7 +52,7 @@ func destroyBuckets(c *cli.Context, buckets []cmn.Bck) (cmn.Bck, error) {
 		empty, errEmp := isBucketEmpty(bck, true /*cached*/)
 		if errEmp == nil && !empty {
 			if !flagIsSet(c, yesFlag) {
-				if ok := confirm(c, fmt.Sprintf("Proceed to destroy %s?", bck)); !ok {
+				if !confirm(c, fmt.Sprintf("Proceed to destroy %s?", bck.String())) {
 					continue
 				}
 			}
@@ -78,15 +78,17 @@ func destroyBuckets(c *cli.Context, buckets []cmn.Bck) (cmn.Bck, error) {
 
 // Rename ais bucket
 func mvBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
-	if _, err := headBucket(bckFrom, true /* don't add */); err != nil {
-		return err
+	if !flagIsSet(c, dontHeadRemoteFlag) {
+		if _, err := headBucket(bckFrom, true /* don't add */); err != nil {
+			return err
+		}
 	}
 	xid, err := api.RenameBucket(apiBP, bckFrom, bckTo)
 	if err != nil {
 		return V(err)
 	}
 	_, xname := xact.GetKindName(apc.ActMoveBck)
-	text := fmt.Sprintf("%s %s => %s", xact.Cname(xname, xid), bckFrom, bckTo)
+	text := fmt.Sprintf("%s %s => %s", xact.Cname(xname, xid), bckFrom.String(), bckTo.String())
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
 		if flagIsSet(c, nonverboseFlag) {
 			fmt.Fprintln(c.App.Writer, xid)
@@ -104,66 +106,10 @@ func mvBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 	fmt.Fprintln(c.App.Writer, text+" ...")
 	xargs := xact.ArgsMsg{ID: xid, Kind: apc.ActMoveBck, Timeout: timeout}
 	if err := waitXact(&xargs); err != nil {
-		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, "rename", bckFrom, bckTo)
+		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, "rename", bckFrom.String(), bckTo.String())
 		return err
 	}
 	fmt.Fprint(c.App.Writer, fmtXactSucceeded)
-	return nil
-}
-
-// Evict remote bucket
-func evictBucket(c *cli.Context, bck cmn.Bck) error {
-	if flagIsSet(c, dryRunFlag) {
-		fmt.Fprintf(c.App.Writer, "Evict: %q\n", bck.Cname(""))
-		return nil
-	}
-	bmd, err := api.GetBMD(apiBP)
-	if err != nil {
-		return err
-	}
-	if !bck.IsQuery() {
-		// check presence unless remais (in re: bck/@alias/name vs bck/@uuid/name)
-		if !bck.IsRemoteAIS() {
-			if _, present := bmd.Get((*meta.Bck)(&bck)); !present {
-				return fmt.Errorf("%s does not exist - nothing to do", bck)
-			}
-		}
-		return _evictBck(c, bck)
-	}
-
-	// evict multiple
-	var (
-		provider *string
-		ns       *cmn.Ns
-		qbck     = cmn.QueryBcks(bck)
-	)
-	if qbck.Provider != "" {
-		provider = &qbck.Provider
-	}
-	if !qbck.Ns.IsGlobal() {
-		ns = &qbck.Ns
-	}
-	bmd.Range(provider, ns, func(bck *meta.Bck) bool {
-		err = _evictBck(c, bck.Clone())
-		return err != nil
-	})
-
-	return err
-}
-
-func _evictBck(c *cli.Context, bck cmn.Bck) (err error) {
-	if err = ensureRemoteProvider(bck); err != nil {
-		return err
-	}
-	keep := flagIsSet(c, keepMDFlag)
-	if err = api.EvictRemoteBucket(apiBP, bck, keep); err != nil {
-		return V(err)
-	}
-	if !keep {
-		actionDone(c, "Evicted bucket "+bck.Cname("")+" from aistore")
-	} else {
-		actionDone(c, "Evicted "+bck.Cname("")+" contents from aistore: the bucket is now empty")
-	}
 	return nil
 }
 
@@ -277,17 +223,17 @@ func _lsTip(c *cli.Context, qbck cmn.QueryBcks) {
 //   - e.g., `backend_bck=gcp://bucket_name` with `backend_bck.name=bucket_name` and
 //     `backend_bck.provider=gcp` to match expected fields.
 //   - `backend_bck=none` with `backend_bck.name=""` and `backend_bck.provider=""`.
-func reformatBackendProps(c *cli.Context, nvs cos.StrKVs) (err error) {
+func reformatBackendProps(c *cli.Context, nvs cos.StrKVs) error {
 	var (
 		originBck cmn.Bck
 		v         string
 		ok        bool
 	)
-
 	if v, ok = nvs[cmn.PropBackendBckName]; ok && v != "" {
+		var err error
 		if v, ok = nvs[cmn.PropBackendBckProvider]; ok && v != "" {
 			nvs[cmn.PropBackendBckProvider], err = cmn.NormalizeProvider(v)
-			return
+			return err
 		}
 	}
 
@@ -298,6 +244,7 @@ func reformatBackendProps(c *cli.Context, nvs cos.StrKVs) (err error) {
 	}
 
 	if v != apc.NilValue {
+		var err error
 		if originBck, err = parseBckURI(c, v, true /*error only*/); err != nil {
 			return fmt.Errorf("invalid '%s=%s': expecting %q to be a valid bucket name",
 				cmn.PropBackendBck, v, v)
@@ -306,7 +253,11 @@ func reformatBackendProps(c *cli.Context, nvs cos.StrKVs) (err error) {
 
 	nvs[cmn.PropBackendBckName] = originBck.Name
 	if v, ok = nvs[cmn.PropBackendBckProvider]; ok && v != "" {
+		var err error
 		nvs[cmn.PropBackendBckProvider], err = cmn.NormalizeProvider(v)
+		if err != nil {
+			return err
+		}
 	} else {
 		nvs[cmn.PropBackendBckProvider] = originBck.Provider
 	}
@@ -316,28 +267,24 @@ validate:
 		return fmt.Errorf("invalid %q: bucket name cannot be empty when bucket provider (%q) is set",
 			cmn.PropBackendBckName, cmn.PropBackendBckProvider)
 	}
-	return err
+	return nil
 }
 
 // Get bucket props
-func showBucketProps(c *cli.Context) (err error) {
-	var (
-		bck cmn.Bck
-		p   *cmn.Bprops
-	)
-
+func showBucketProps(c *cli.Context) error {
 	if c.NArg() > 2 {
 		return incorrectUsageMsg(c, "", c.Args()[2:])
 	}
 
+	bck, err := parseBckURI(c, c.Args().Get(0), false)
+	if err != nil {
+		return err
+	}
+	p, err := headBucket(bck, !flagIsSet(c, addRemoteFlag) /* don't add */)
+	if err != nil {
+		return err
+	}
 	section := c.Args().Get(1)
-
-	if bck, err = parseBckURI(c, c.Args().Get(0), false); err != nil {
-		return
-	}
-	if p, err = headBucket(bck, !flagIsSet(c, addRemoteFlag) /* don't add */); err != nil {
-		return
-	}
 
 	if bck.IsRemoteAIS() {
 		if all, err := api.GetRemoteAIS(apiBP); err == nil {
@@ -364,14 +311,16 @@ func showBucketProps(c *cli.Context) (err error) {
 		return teb.Print(p, "", opts)
 	}
 
-	defProps, err := defaultBckProps(bck)
-	if err != nil {
-		return err
+	defProps, errV := defaultBckProps(bck)
+	if errV != nil {
+		return errV
 	}
 	return headBckTable(c, p, defProps, section)
 }
 
-func headBckTable(c *cli.Context, props, defProps *cmn.Bprops, section string) error {
+// compare w/ showClusterConfig using the same generic template
+// for "flattened" cluster config
+func headBckTable(c *cli.Context, props, defProps *cmn.Bprops, section string) (err error) {
 	var (
 		defList nvpairList
 		colored = !cfg.NoColor
@@ -423,7 +372,17 @@ func headBckTable(c *cli.Context, props, defProps *cmn.Bprops, section string) e
 	}
 
 	if flagIsSet(c, noHeaderFlag) {
-		return teb.Print(propList, teb.PropValTmplNoHdr)
+		err = teb.Print(propList, teb.PropValTmplNoHdr)
+	} else {
+		err = teb.Print(propList, teb.PropValTmpl)
 	}
-	return teb.Print(propList, teb.PropValTmpl)
+	if err != nil {
+		return err
+	}
+
+	// feature flags: show all w/ descriptions
+	if section == featureFlagsJname {
+		err = printFeatVerbose(c, props.Features, true /*bucket scope*/)
+	}
+	return err
 }

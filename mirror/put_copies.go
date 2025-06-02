@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
@@ -11,7 +11,6 @@ import (
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
@@ -25,6 +24,8 @@ import (
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
+// TODO: support num-workers (see xact/xs)
+
 type (
 	putFactory struct {
 		xreg.RenewBase
@@ -34,10 +35,9 @@ type (
 	XactPut struct {
 		// implements core.Xact interface
 		xact.DemandBase
-		// runtime
-		workers  *mpather.WorkerGroup
-		workCh   chan core.LIF
-		chanFull atomic.Int64
+		// mountpath workers
+		wkg    *mpather.WorkerGroup
+		workCh chan core.LIF
 		// init
 		mirror cmn.MirrorConf
 		config *cmn.Config
@@ -78,7 +78,7 @@ func (p *putFactory) Start() error {
 
 	bck, mirror := lom.Bck(), lom.MirrorConf()
 	if !mirror.Enabled {
-		return fmt.Errorf("%s: mirroring disabled, nothing to do", bck)
+		return fmt.Errorf("%s: mirroring disabled, nothing to do", bck.String())
 	}
 	if err = fs.ValidateNCopies(core.T.String(), int(mirror.Copies)); err != nil {
 		nlog.Errorln(err)
@@ -95,14 +95,17 @@ func (p *putFactory) Start() error {
 		// is Ok (compare with x-archive, x-tco)
 		beid = cos.GenUUID()
 	}
-	r.DemandBase.Init(beid, p.Kind(), bck, xact.IdleDefault)
+	r.DemandBase.Init(beid, p.Kind(), "" /*ctlmsg*/, bck, xact.IdleDefault)
 
 	// joggers
-	r.workers = mpather.NewWorkerGroup(&mpather.WorkerGroupOpts{
-		Callback:  r.do,
-		Slab:      slab,
-		QueueSize: mirror.Burst,
+	r.wkg, err = mpather.NewWorkerGroup(&mpather.WorkerGroupOpts{
+		Callback:   r.do,
+		Slab:       slab,
+		WorkChSize: mirror.Burst,
 	})
+	if err != nil {
+		return err
+	}
 	p.xctn = r
 
 	// run
@@ -145,7 +148,7 @@ func (r *XactPut) Run(*sync.WaitGroup) {
 	var err error
 	nlog.Infoln(r.Name())
 	r.config = cmn.GCO.Get()
-	r.workers.Run()
+	r.wkg.Run()
 loop:
 	for {
 		select {
@@ -170,13 +173,9 @@ func (r *XactPut) Repl(lom *core.LOM) {
 
 	// ref-count on-demand, decrement via worker.Callback = r.do
 	r.IncPending()
-	chanFull, err := r.workers.PostLIF(lom)
-	if err != nil {
+	if err := r.wkg.PostLIF(lom); err != nil {
 		r.DecPending()
 		r.Abort(fmt.Errorf("%s: %v", r, err))
-	}
-	if chanFull {
-		r.chanFull.Inc()
 	}
 }
 
@@ -205,7 +204,7 @@ func (r *XactPut) waitPending() {
 
 func (r *XactPut) stop() (err error) {
 	r.DemandBase.Stop()
-	n := r.workers.Stop()
+	n := r.wkg.Stop()
 	if nn := drainWorkCh(r.workCh); nn > 0 {
 		n += nn
 	}
@@ -213,10 +212,10 @@ func (r *XactPut) stop() (err error) {
 		r.SubPending(n)
 		err = fmt.Errorf("%s: dropped %d object%s", r, n, cos.Plural(n))
 	}
-	if cnt := r.chanFull.Load(); (cnt >= 10 && cnt <= 20) || (cnt > 0 && cmn.Rom.FastV(5, cos.SmoduleMirror)) {
-		nlog.Errorln(cos.ErrWorkChanFull, "(all mp workers)", r.String(), "cnt", cnt)
+	if a := r.wkg.ChanFullTotal(); a > 0 {
+		nlog.Warningln(r.Name(), "work channel full (total final)", a)
 	}
-	return
+	return err
 }
 
 func (r *XactPut) Snap() (snap *core.Snap) {
@@ -224,5 +223,5 @@ func (r *XactPut) Snap() (snap *core.Snap) {
 	r.ToSnap(snap)
 
 	snap.IdleX = r.IsIdle()
-	return
+	return snap
 }

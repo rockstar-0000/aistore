@@ -1,11 +1,12 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -22,14 +23,22 @@ type (
 	evdFactory struct {
 		xreg.RenewBase
 		xctn *evictDelete
-		msg  *apc.ListRange
+		msg  *apc.EvdMsg
 		kind string
 	}
 	evictDelete struct {
+		config *cmn.Config
 		lrit
 		xact.Base
-		config *cmn.Config
 	}
+)
+
+// interface guard
+var (
+	_ core.Xact      = (*evictDelete)(nil)
+	_ xreg.Renewable = (*evdFactory)(nil)
+	_ lrwi           = (*evictDelete)(nil)
+	_ lrxact         = (*evictDelete)(nil)
 )
 
 //
@@ -37,10 +46,12 @@ type (
 //
 
 func (p *evdFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
-	msg := args.Custom.(*apc.ListRange)
+	if p.kind == apc.ActEvictRemoteBck {
+		return &evdFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, kind: p.kind}
+	}
+	msg := args.Custom.(*apc.EvdMsg)
 	debug.Assert(!msg.IsList() || !msg.HasTemplate())
-	np := &evdFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, kind: p.kind, msg: msg}
-	return np
+	return &evdFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, kind: p.kind, msg: msg}
 }
 
 func (p *evdFactory) Start() (err error) {
@@ -55,18 +66,33 @@ func (*evdFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 	return xreg.WprKeepAndStartNew, nil
 }
 
-func newEvictDelete(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.ListRange) (ed *evictDelete, err error) {
-	ed = &evictDelete{config: cmn.GCO.Get()}
-	if err = ed.lrit.init(ed, msg, bck, lrpWorkersDflt); err != nil {
+func newEvictDelete(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.EvdMsg) (*evictDelete, error) {
+	r := &evictDelete{config: cmn.GCO.Get()}
+	if kind == apc.ActEvictRemoteBck {
+		r.InitBase(xargs.UUID, kind, "" /*ctlmsg*/, bck)
+		r.Finish()
+		return r, nil
+	}
+
+	var lsflags uint64
+	if msg.NonRecurs {
+		lsflags = apc.LsNoRecursion
+	}
+	if err := r.lrit.init(r, &msg.ListRange, bck, lsflags, msg.NumWorkers, 0 /*burst*/); err != nil {
 		return nil, err
 	}
-	ed.InitBase(xargs.UUID, kind, bck)
-	return ed, nil
+
+	var sb strings.Builder
+	sb.Grow(80)
+	msg.Str(&sb, r.lrp == lrpPrefix)
+	r.InitBase(xargs.UUID, kind, sb.String() /*ctlmsg*/, bck)
+
+	return r, nil
 }
 
 func (r *evictDelete) Run(wg *sync.WaitGroup) {
 	wg.Done()
-	err := r.lrit.run(r, core.T.Sowner().Get())
+	err := r.lrit.run(r, core.T.Sowner().Get(), false /*prealloc buf*/)
 	if err != nil {
 		r.AddErr(err, 5, cos.SmoduleXs) // duplicated?
 	}
@@ -74,7 +100,7 @@ func (r *evictDelete) Run(wg *sync.WaitGroup) {
 	r.Finish()
 }
 
-func (r *evictDelete) do(lom *core.LOM, lrit *lrit) {
+func (r *evictDelete) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	ecode, err := core.T.DeleteObject(lom, r.Kind() == apc.ActEvictObjects)
 	if err == nil { // done
 		r.ObjsAdd(1, lom.Lsize(true))
@@ -93,6 +119,8 @@ eret:
 func (r *evictDelete) Snap() (snap *core.Snap) {
 	snap = &core.Snap{}
 	r.ToSnap(snap)
+
+	snap.Pack(0, len(r.lrit.nwp.workers), r.lrit.nwp.chanFull.Load())
 
 	snap.IdleX = r.IsIdle()
 	return

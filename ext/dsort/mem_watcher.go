@@ -1,6 +1,6 @@
 // Package dsort provides APIs for distributed archive file shuffling.
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -10,7 +10,9 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
+	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/sys"
 )
 
@@ -154,7 +156,9 @@ func (mw *memoryWatcher) watchExcess(memStat sys.MemStat) {
 				return memExcess > 0 // continue if we need more
 			})
 
-			cos.FreeMemToOS(false /*force*/)
+			if pressure := g.mem.Pressure(); pressure >= memsys.PressureHigh {
+				oom.FreeToOS(false /*force*/)
+			}
 		case <-mw.m.listenAborted():
 			return
 		case <-mw.excess.stopCh.Listen():

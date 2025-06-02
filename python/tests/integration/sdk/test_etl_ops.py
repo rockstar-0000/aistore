@@ -1,140 +1,124 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
-from itertools import cycle
-import unittest
 import hashlib
-import sys
 import time
+import unittest
+from itertools import cycle
 
 import pytest
+import xxhash
 
-from aistore.sdk import Client, Bucket
-from aistore.sdk.etl.etl_const import ETL_COMM_HPUSH, ETL_COMM_IO
+from aistore.sdk import Bucket
+from aistore.sdk.etl import ETLConfig
 from aistore.sdk.errors import AISError
-from aistore.sdk.etl.etl_templates import MD5, ECHO
-from tests.integration import CLUSTER_ENDPOINT
-from tests.utils import create_and_put_object, random_string
+from aistore.sdk.etl.etl_templates import MD5, ECHO, HASH
+from aistore.sdk.etl.etl_const import (
+    ETL_COMM_HPUSH,
+    ETL_COMM_HPULL,
+    FASTAPI_CMD,
+)
+from aistore.sdk.types import EnvVar
+from tests.integration.sdk import DEFAULT_TEST_CLIENT
+from tests.utils import cases, create_and_put_object, random_string, has_targets
 
-ETL_NAME_CODE = "etl-" + random_string(5)
-ETL_NAME_CODE_IO = "etl-" + random_string(5)
-ETL_NAME_CODE_STREAM = "etl-" + random_string(5)
-ETL_NAME_SPEC = "etl-" + random_string(5)
-ETL_NAME_SPEC_COMP = "etl-" + random_string(5)
 
-
-# pylint: disable=unused-variable
 class TestETLOps(unittest.TestCase):
     def setUp(self) -> None:
-        self.bck_name = random_string()
-        print("URL END PT ", CLUSTER_ENDPOINT)
-        self.client = Client(CLUSTER_ENDPOINT)
+        self.client = DEFAULT_TEST_CLIENT
 
-        self.bucket = self.client.bucket(bck_name=self.bck_name).create()
+        self.bucket = self.client.bucket(bck_name=random_string()).create()
         self.obj_name = "temp-obj1.jpg"
         self.obj_size = 128
-        self.content = create_and_put_object(
+        _, self.content = create_and_put_object(
             client=self.client,
-            bck_name=self.bck_name,
+            bck=self.bucket.as_model(),
             obj_name=self.obj_name,
             obj_size=self.obj_size,
         )
         create_and_put_object(
-            client=self.client, bck_name=self.bck_name, obj_name="obj2.jpg"
+            client=self.client, bck=self.bucket.as_model(), obj_name="obj2.jpg"
         )
 
-        self.current_etl_count = len(self.client.cluster().list_running_etls())
+        self.etl_name = "etl-" + random_string(5)
 
     def tearDown(self) -> None:
-        # Try to destroy all temporary buckets if there are left.
-        for bucket in self.client.cluster().list_buckets():
-            self.client.bucket(bucket.name).delete(missing_ok=True)
+        # Try to delete the bucket
+        self.bucket.delete(missing_ok=True)
 
-        # delete all the etls
-        for etl in self.client.cluster().list_running_etls():
-            self.client.etl(etl.id).stop()
-            self.client.etl(etl.id).delete()
+        # Try to delete the intialized ETLs
+        try:
+            self.client.etl(self.etl_name).stop()
+            self.client.etl(self.etl_name).delete()
+        except AISError:
+            # If the ETL was not initialized, it will raise an error
+            pass
 
-    # pylint: disable=too-many-statements,too-many-locals
     @pytest.mark.etl
-    def test_etl_apis(self):
+    def test_init_code(self):
         # code
         def transform(input_bytes):
             md5 = hashlib.md5()
             md5.update(input_bytes)
             return md5.hexdigest().encode()
 
-        code_etl = self.client.etl(ETL_NAME_CODE)
+        code_etl = self.client.etl(self.etl_name)
         code_etl.init_code(transform=transform)
 
-        obj = self.bucket.object(self.obj_name).get(etl_name=code_etl.name).read_all()
+        obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=code_etl.name))
+            .read_all()
+        )
         self.assertEqual(obj, transform(bytes(self.content)))
-        self.assertEqual(
-            self.current_etl_count + 1, len(self.client.cluster().list_running_etls())
-        )
 
-        # code (io comm)
-        def main():
-            md5 = hashlib.md5()
-            chunk = sys.stdin.buffer.read()
-            md5.update(chunk)
-            sys.stdout.buffer.write(md5.hexdigest().encode())
-
-        code_io_etl = self.client.etl(ETL_NAME_CODE_IO)
-        code_io_etl.init_code(transform=main, communication_type=ETL_COMM_IO)
-
-        obj_io = (
-            self.bucket.object(self.obj_name).get(etl_name=code_io_etl.name).read_all()
-        )
-        self.assertEqual(obj_io, transform(bytes(self.content)))
-
-        code_io_etl.stop()
-        code_io_etl.delete()
-
+    @pytest.mark.etl
+    def test_init_spec_md5(self):
         # spec
         template = MD5.format(communication_type=ETL_COMM_HPUSH)
-        spec_etl = self.client.etl(ETL_NAME_SPEC)
+        spec_etl = self.client.etl(self.etl_name)
         spec_etl.init_spec(template=template)
 
-        obj = self.bucket.object(self.obj_name).get(etl_name=spec_etl.name).read_all()
-        self.assertEqual(obj, transform(bytes(self.content)))
-
-        self.assertEqual(
-            self.current_etl_count + 2, len(self.client.cluster().list_running_etls())
+        obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=spec_etl.name))
+            .read_all()
         )
+        md5 = hashlib.md5()
+        md5.update(bytes(self.content))
+        self.assertEqual(obj, md5.hexdigest().encode())
 
-        self.assertIsNotNone(code_etl.view())
         self.assertIsNotNone(spec_etl.view())
 
         temp_bck1 = self.client.bucket(random_string()).create()
 
         # Transform Bucket with MD5 Template
-        job_id = self.bucket.transform(
-            etl_name=spec_etl.name, to_bck=temp_bck1, prefix_filter="temp-"
-        )
+        job_id = self.bucket.transform(etl_name=spec_etl.name, to_bck=temp_bck1)
         self.client.job(job_id).wait()
 
         starting_obj = self.bucket.list_objects().entries
         transformed_obj = temp_bck1.list_objects().entries
-        # Should transform only the object defined by the prefix filter
-        self.assertEqual(len(starting_obj) - 1, len(transformed_obj))
 
-        md5_obj = temp_bck1.object(self.obj_name).get().read_all()
+        self.assertEqual(len(starting_obj), len(transformed_obj))
 
+        md5_obj = temp_bck1.object(self.obj_name).get_reader().read_all()
+        temp_bck1.delete(missing_ok=True)
         # Verify bucket-level transformation and object-level transformation are the same
         self.assertEqual(obj, md5_obj)
 
+    @pytest.mark.etl
+    def test_init_spec_echo(self):
         # Start ETL with ECHO template
         template = ECHO.format(communication_type=ETL_COMM_HPUSH)
-        echo_spec_etl = self.client.etl(ETL_NAME_SPEC_COMP)
+        echo_spec_etl = self.client.etl(self.etl_name)
         echo_spec_etl.init_spec(template=template)
 
         temp_bck2 = self.client.bucket(random_string()).create()
 
         # Transform bucket with ECHO template
         job_id = self.bucket.transform(
-            etl_name=echo_spec_etl.name,
+            etl_name=self.etl_name,
             to_bck=temp_bck2,
             ext={"jpg": "txt"},
         )
@@ -144,14 +128,10 @@ class TestETLOps(unittest.TestCase):
         for obj_iter in temp_bck2.list_objects().entries:
             self.assertEqual(obj_iter.name.split(".")[1], "txt")
 
-        echo_obj = temp_bck2.object("temp-obj1.txt").get().read_all()
+        echo_obj = temp_bck2.object("temp-obj1.txt").get_reader().read_all()
+        original_obj = self.bucket.object(self.obj_name).get_reader().read_all()
 
-        # Verify different bucket-level transformations are not the same (compare ECHO transformation and MD5
-        # transformation)
-        self.assertNotEqual(md5_obj, echo_obj)
-
-        echo_spec_etl.stop()
-        echo_spec_etl.delete()
+        self.assertEqual(echo_obj, original_obj, "Echo transformation failed")
 
         # Transform w/ non-existent ETL name raises exception
         with self.assertRaises(AISError):
@@ -159,31 +139,7 @@ class TestETLOps(unittest.TestCase):
                 etl_name="faulty-name", to_bck=Bucket(random_string())
             )
 
-        # Stop ETLs
-        code_etl.stop()
-        spec_etl.stop()
-        self.assertEqual(
-            len(self.client.cluster().list_running_etls()), self.current_etl_count
-        )
-
-        # Start stopped ETLs
-        code_etl.start()
-        spec_etl.start()
-        self.assertEqual(
-            len(self.client.cluster().list_running_etls()), self.current_etl_count + 2
-        )
-
-        # Delete stopped ETLs
-        code_etl.stop()
-        spec_etl.stop()
-        code_etl.delete()
-        spec_etl.delete()
-
-        # Starting deleted ETLs raises error
-        with self.assertRaises(AISError):
-            code_etl.start()
-        with self.assertRaises(AISError):
-            spec_etl.start()
+        temp_bck2.delete(missing_ok=True)
 
     @pytest.mark.etl
     def test_etl_apis_stress(self):
@@ -191,8 +147,8 @@ class TestETLOps(unittest.TestCase):
         content = {}
         for i in range(num_objs):
             obj_name = f"obj{ i }"
-            content[obj_name] = create_and_put_object(
-                client=self.client, bck_name=self.bck_name, obj_name=obj_name
+            _, content[obj_name] = create_and_put_object(
+                client=self.client, bck=self.bucket.as_model(), obj_name=obj_name
             )
 
         # code (hpush)
@@ -201,18 +157,8 @@ class TestETLOps(unittest.TestCase):
             md5.update(input_bytes)
             return md5.hexdigest().encode()
 
-        md5_hpush_etl = self.client.etl(ETL_NAME_CODE)
+        md5_hpush_etl = self.client.etl(self.etl_name)
         md5_hpush_etl.init_code(transform=transform)
-
-        # code (io comm)
-        def main():
-            md5 = hashlib.md5()
-            chunk = sys.stdin.buffer.read()
-            md5.update(chunk)
-            sys.stdout.buffer.write(md5.hexdigest().encode())
-
-        md5_io_etl = self.client.etl(ETL_NAME_CODE_IO)
-        md5_io_etl.init_code(transform=main, communication_type=ETL_COMM_IO)
 
         start_time = time.time()
         job_id = self.bucket.transform(
@@ -221,43 +167,13 @@ class TestETLOps(unittest.TestCase):
         self.client.job(job_id).wait()
         print("Transform bucket using HPUSH took ", time.time() - start_time)
 
-        start_time = time.time()
-        job_id = self.bucket.transform(
-            etl_name=md5_io_etl.name, to_bck=Bucket("transformed-etl-io")
-        )
-        self.client.job(job_id).wait()
-        print("Transform bucket using IO took ", time.time() - start_time)
-
         for key, value in content.items():
             transformed_obj_hpush = (
-                self.bucket.object(key).get(etl_name=md5_hpush_etl.name).read_all()
+                self.bucket.object(key)
+                .get_reader(etl=ETLConfig(name=md5_hpush_etl.name))
+                .read_all()
             )
-            transformed_obj_io = (
-                self.bucket.object(key).get(etl_name=md5_io_etl.name).read_all()
-            )
-
             self.assertEqual(transform(bytes(value)), transformed_obj_hpush)
-            self.assertEqual(transform(bytes(value)), transformed_obj_io)
-
-    @pytest.mark.etl
-    def test_etl_apis_stream(self):
-        def transform(reader, writer):
-            checksum = hashlib.md5()
-            for byte in reader:
-                checksum.update(byte)
-            writer.write(checksum.hexdigest().encode())
-
-        code_stream_etl = self.client.etl(ETL_NAME_CODE_STREAM)
-        code_stream_etl.init_code(transform=transform, chunk_size=32768)
-
-        obj = (
-            self.bucket.object(self.obj_name)
-            .get(etl_name=code_stream_etl.name)
-            .read_all()
-        )
-        md5 = hashlib.md5()
-        md5.update(self.content)
-        self.assertEqual(obj, md5.hexdigest().encode())
 
     @pytest.mark.etl
     def test_etl_api_xor(self):
@@ -270,29 +186,21 @@ class TestETLOps(unittest.TestCase):
                 checksum.update(out)
             writer.write(checksum.hexdigest().encode())
 
-        xor_etl = self.client.etl("etl-xor1")
+        xor_etl = self.client.etl(self.etl_name)
         xor_etl.init_code(transform=transform, chunk_size=32)
         transformed_obj = (
-            self.bucket.object(self.obj_name).get(etl_name=xor_etl.name).read_all()
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(xor_etl.name))
+            .read_all()
         )
         data, checksum = transformed_obj[:-32], transformed_obj[-32:]
         computed_checksum = hashlib.md5(data).hexdigest().encode()
         self.assertEqual(checksum, computed_checksum)
 
-    @pytest.mark.etl
-    def test_etl_transform_url(self):
-        def url_transform(url):
-            return url.encode("utf-8")
-
-        url_etl = self.client.etl("etl-hpull-url")
-        url_etl.init_code(
-            transform=url_transform, arg_type="url", communication_type="hpull"
-        )
-        res = self.bucket.object(self.obj_name).get(etl_name=url_etl.name).read_all()
-        result_url = res.decode("utf-8")
-
-        self.assertTrue(self.bucket.name in result_url)
-        self.assertTrue(self.obj_name in result_url)
+        xor_etl_details = xor_etl.view()
+        self.assertIsNotNone(xor_etl_details)
+        self.assertEqual(xor_etl_details.name, self.etl_name)
+        self.assertIsNotNone(xor_etl_details.code)
 
     @pytest.mark.etl
     def test_etl_with_various_sizes(self):
@@ -305,67 +213,172 @@ class TestETLOps(unittest.TestCase):
 
         for obj_size in obj_sizes:
             obj_name = f"obj-{obj_size}.jpg"
-            content = create_and_put_object(
+            _, content = create_and_put_object(
                 client=self.client,
-                bck_name=self.bck_name,
+                bck=self.bucket.as_model(),
                 obj_name=obj_name,
                 obj_size=obj_size,
             )
 
-            etl = self.client.etl(f"etl-{random_string(5)}")
+            etl = self.client.etl(self.etl_name)
             etl.init_code(transform=transform)
 
-            obj = self.bucket.object(obj_name).get(etl_name=etl.name).read_all()
+            obj = (
+                self.bucket.object(obj_name)
+                .get_reader(etl=ETLConfig(etl.name))
+                .read_all()
+            )
             self.assertEqual(obj, transform(bytes(content)))
+            try:
+                etl.stop()
+                etl.delete()
+            except AISError:
+                # If the ETL was not initialized, it will raise an error
+                pass
 
     @pytest.mark.etl
-    def test_etl_concurrent_transformations(self):
+    @cases(ETL_COMM_HPUSH, ETL_COMM_HPULL)
+    def test_etl_args(self, communication_type):
+        """
+        Test ETL with different communication types: HPUSH, HPULL.
+        """
+        template = HASH.format(communication_type=communication_type)
+        spec_etl = self.client.etl(self.etl_name)
+        spec_etl.init_spec(template=template)
+
+        # Function to calculate xxhash
+        def calculate_xxhash(data, seed):
+            hasher = xxhash.xxh64(seed=seed)
+            hasher.update(data)
+            return hasher.hexdigest()
+
+        # Default hash (seed = 0)
+        default_hash = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=spec_etl.name))
+            .read_all()
+        )
+        self.assertEqual(
+            default_hash.decode(), calculate_xxhash(bytes(self.content), 0)
+        )
+
+        # Hash with seed = 10000
+        seed = 10000
+        new_hash = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=spec_etl.name, args=seed))
+            .read_all()
+        )
+        self.assertEqual(new_hash.decode(), calculate_xxhash(bytes(self.content), seed))
+
+        # Ensure hashes are different
+        self.assertNotEqual(default_hash, new_hash)
+
+        spec_etl_details = spec_etl.view()
+        self.assertIsNotNone(spec_etl_details)
+        self.assertEqual(spec_etl_details.name, self.etl_name)
+        self.assertIsNotNone(spec_etl_details.spec)
+
+        # Need to add this because of @cases decorator
+        try:
+            spec_etl.stop()
+            spec_etl.delete()
+        except AISError:
+            # If the ETL was not initialized, it will raise an error
+            pass
+
+    @pytest.mark.etl
+    @unittest.skipIf(not has_targets(2), "Test requires more than one target")
+    def test_etl_concurrent_workers(self):
         def transform(input_bytes):
             md5 = hashlib.md5()
             md5.update(input_bytes)
             return md5.hexdigest().encode()
 
-        num_transformations = 5
-        num_objects = 5
-        etl_jobs = []
-        contents_in_bucket = []
+        dst_bck = self.client.bucket(random_string()).create()
 
-        start_time = time.time()
-        for i in range(num_transformations):
-            content = {}
-            src_bck_name = f"src-bck{i}"
-            dst_bck_name = f"dst-bck{i}"
-            bck = self.client.bucket(src_bck_name).create()
-            for j in range(num_objects):
-                obj_name = f"obj{j}.jpg"
-                content[obj_name] = create_and_put_object(
-                    client=self.client,
-                    bck_name=src_bck_name,
-                    obj_name=obj_name,
-                    obj_size=self.obj_size,
-                )
-            contents_in_bucket.append((bck, content))
+        etl = self.client.etl(self.etl_name)
+        etl.init_code(transform=transform)
 
-            etl = self.client.etl(f"etl-{src_bck_name}")
-            etl.init_code(transform=transform)
-
-            job_id = bck.transform(etl_name=etl.name, to_bck=Bucket(dst_bck_name))
-            etl_jobs.append(job_id)
-
-        for job_id in etl_jobs:
-            self.client.job(job_id).wait()
-
-        print(
-            f"Transform {num_transformations} buckets with {num_objects} objects took ",
-            time.time() - start_time,
+        num_workers = 10
+        job_id = self.bucket.transform(
+            etl_name=etl.name,
+            to_bck=dst_bck,
+            num_workers=num_workers,
         )
 
-        for src_bck, content in contents_in_bucket:
-            for key, value in content.items():
-                transformed_obj = (
-                    src_bck.object(key).get(etl_name=f"etl-{src_bck.name}").read_all()
-                )
-                self.assertEqual(transform(bytes(value)), transformed_obj)
+        job = self.client.job(job_id)
+        job.wait()
+        self.assertEqual(num_workers, job.get_details().get_num_workers())
+
+        self.assertEqual(2, len(dst_bck.list_all_objects()))
+
+    @pytest.mark.etl
+    def test_etl_init_hello_world(self):
+        etl = self.client.etl(self.etl_name)
+
+        etl.init(
+            image="aistorage/transformer_hello_world:latest",
+            command=FASTAPI_CMD,
+        )
+        obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=etl.name))
+            .read_all()
+        )
+        self.assertEqual(
+            obj, b"Hello World!", "ETL initialization with image and command failed"
+        )
+        etl_details = etl.view()
+        self.assertIsNotNone(etl_details)
+        self.assertEqual(etl_details.name, self.etl_name)
+        self.assertEqual(
+            etl_details.runtime.image, "aistorage/transformer_hello_world:latest"
+        )
+        self.assertEqual(etl_details.runtime.command, FASTAPI_CMD)
+
+    @pytest.mark.etl
+    def test_etl_init_hash_with_args(self):
+        etl = self.client.etl(self.etl_name)
+
+        etl.init(
+            image="aistorage/transformer_hash_with_args:latest",
+            command=FASTAPI_CMD,
+            SEED_DEFAULT=500,
+        )
+        obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=etl.name))
+            .read_all()
+        )
+
+        # Function to calculate xxhash
+        def calculate_xxhash(data, seed):
+            hasher = xxhash.xxh64(seed=seed)
+            hasher.update(data)
+            return hasher.hexdigest()
+
+        self.assertEqual(obj.decode(), calculate_xxhash(bytes(self.content), 500))
+
+        # different seed
+        seed = 10000
+        new_obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=etl.name, args=seed))
+            .read_all()
+        )
+        self.assertEqual(new_obj.decode(), calculate_xxhash(bytes(self.content), seed))
+
+        etl_details = etl.view()
+        self.assertIsNotNone(etl_details)
+        self.assertEqual(etl_details.name, self.etl_name)
+        self.assertEqual(
+            etl_details.runtime.image, "aistorage/transformer_hash_with_args:latest"
+        )
+        self.assertEqual(etl_details.runtime.command, FASTAPI_CMD)
+        self.assertEqual(
+            etl_details.runtime.env[0], EnvVar(name="SEED_DEFAULT", value="500")
+        )
 
 
 if __name__ == "__main__":

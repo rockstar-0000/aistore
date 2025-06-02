@@ -3,12 +3,13 @@ import pkg_resources
 
 from pyaisloader.benchmark import PutGetMixedBenchmark, ListBenchmark
 from pyaisloader.pytorch_benchmark import AISDatasetBenchmark, AISIterDatasetBenchmark
-from pyaisloader.const import PROVIDERS
 from pyaisloader.client_config import client
 
 from pyaisloader.utils.parse_utils import parse_size, parse_time
 from pyaisloader.utils.print_utils import bold
 from pyaisloader.utils.etl_utils import init_etl, cleanup_etls
+
+from aistore.sdk.provider import Provider
 
 
 VERSION = pkg_resources.require("pyaisloader")[0].version
@@ -307,8 +308,10 @@ def main():
 
     # Instantiate bucket and etl objects for the benchmark
     provider, bck_name = args.bucket.split("://")
-    bucket = client.bucket(bck_name, provider=PROVIDERS[provider])
+    bucket_model = client.bucket(bck_name, provider=Provider.parse(provider)).as_model()
     etl = init_etl(client=client, spec_type=args.etl)
+    etl_name = etl.name if etl else None
+    etl_spec_type = etl.spec_type if etl else None
 
     benchmark_type = args.type.lower()
 
@@ -329,8 +332,9 @@ def main():
                 maxsize=args.maxsize,
                 duration=args.duration,
                 totalsize=args.totalsize,
-                bucket=bucket,
-                etl=etl,
+                bucket_model=bucket_model,
+                etl_name=etl_name,
+                etl_spec_type=etl_spec_type,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -341,8 +345,9 @@ def main():
                 maxsize=args.maxsize,
                 duration=args.duration,
                 totalsize=args.totalsize,
-                bucket=bucket,
-                etl=etl,
+                bucket_model=bucket_model,
+                etl_name=etl_name,
+                etl_spec_type=etl_spec_type,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -352,7 +357,7 @@ def main():
                 maxsize=args.maxsize,
                 duration=args.duration,
                 totalsize=args.totalsize,
-                bucket=bucket,
+                bucket_model=bucket_model,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -363,7 +368,7 @@ def main():
                 duration=args.duration,
                 iterations=args.iterations,
                 totalsize=args.totalsize,
-                bucket=bucket,
+                bucket_model=bucket_model,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -373,7 +378,7 @@ def main():
                 maxsize=args.maxsize,
                 duration=args.duration,
                 totalsize=args.totalsize,
-                bucket=bucket,
+                bucket_model=bucket_model,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -384,7 +389,7 @@ def main():
                 duration=args.duration,
                 iterations=args.iterations,
                 totalsize=args.totalsize,
-                bucket=bucket,
+                bucket_model=bucket_model,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -394,8 +399,9 @@ def main():
                 minsize=args.minsize,
                 maxsize=args.maxsize,
                 duration=args.duration,
-                bucket=bucket,
-                etl=etl,
+                bucket_model=bucket_model,
+                etl_name=etl_name,
+                etl_spec_type=etl_spec_type,
                 workers=args.workers,
                 cleanup=args.cleanup,
             )
@@ -403,7 +409,7 @@ def main():
     elif benchmark_type in ["list", "l"]:
         benchmark = ListBenchmark(
             num_objects=args.objects,
-            bucket=bucket,
+            bucket_model=bucket_model,
             workers=args.workers,
             cleanup=args.cleanup,
         )

@@ -94,8 +94,8 @@ Please note that certain operations do **not** support external cloud storage bu
 
 The SDK supports HTTPS connectivity if the AIS cluster is configured to use HTTPS. To start using HTTPS:
 
-1. Set up HTTPS on your cluster: [Guide for K8s cluster](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/docs/ais_https_configuration.md)
-2. If using a self-signed certificate with your own CA, copy the CA certificate to your local machine. If using our built-in cert-manager config to generate your certificates, you can use [our playbook](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/docs/ais_generate_https_cert.md)
+1. Set up HTTPS on your cluster: [Guide for K8s cluster](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/ais-deployment/docs/ais_https_configuration.md)
+2. If using a self-signed certificate with your own CA, copy the CA certificate to your local machine. If using our built-in cert-manager config to generate your certificates, you can use [our playbook](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/ais-deployment/docs/generate_https_cert.md)
 3. Options to configure the SDK for HTTPS connectivity:
     - Skip verification (for testing, insecure):
       - `client = Client(skip_verify=True)`
@@ -105,15 +105,22 @@ The SDK supports HTTPS connectivity if the AIS cluster is configured to use HTTP
      - Use the environment variable
        - Set `AIS_CLIENT_CA` to the path of your certificate before initializing the client
     - If your AIS cluster is using a certificate signed by a trusted CA, the client will default to using verification without needing to provide a CA cert.
+4. Options to configure the SDK to work with mTLS:
+   - Pass a tuple argument containing path to client certificate and key pair
+      - `client = Client(client_cert=('client.crt', 'client.key'))
+   - Pass a path to a PEM file that contains both client certificate and key
+      - `client = Client(client_cert='client.pem')
+   - Use the environment variable
+      - Set 'AIS_CRT' and 'AIS_CRT_KEY' to the path of client certificate and key respectively before initializing the client
 ---
 
 ### ETLs
 
 AIStore also supports [ETLs](https://aistore.nvidia.com/docs/etl), short for Extract-Transform-Load. ETLs with AIS are beneficial given that the transformations occur *locally*, which largely contributes to the linear scalability of AIS.
 
-> Note: AIS-ETL requires [Kubernetes](https://kubernetes.io/). For more information on deploying AIStore with Kubernetes (or Minikube), refer [here](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/README.md).
+> Note: AIS-ETL requires [Kubernetes](https://kubernetes.io/). For more information on deploying AIStore with local Kubernetes, refer [here](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/kustomize/README.md).
 
-Check out the [provided examples](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl_templates.py) to learn more about working with AIS ETL.
+To learn more about working with AIS ETL, check out [examples](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl).
 
 ---
 
@@ -121,14 +128,14 @@ Check out the [provided examples](https://github.com/NVIDIA/aistore/blob/main/py
 
 |Module|Summary|
 |--|--|
-|[api.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/client.py)|Contains `Client` class, which has methods for making HTTP requests to an AIStore server. Includes factory constructors for `Bucket`, `Cluster`, and `Job` classes.|
+|[client.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/client.py)|Contains `Client` class, which has methods for making HTTP requests to an AIStore server. Includes factory constructors for `Bucket`, `Cluster`, and `Job` classes.|
 |[cluster.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/cluster.py)|Contains `Cluster` class that represents a cluster bound to a client and contains all cluster-related operations, including checking the cluster's health and retrieving vital cluster information.|
 |[bucket.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/bucket.py)|Contains `Bucket` class that represents a bucket in an AIS cluster and contains all bucket-related operations, including (but not limited to) creating, deleting, evicting, renaming, copying.|
-|[object.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/object.py)|Contains class `Object` that represents an object belonging to a bucket in an AIS cluster, and contains all object-related operations, including (but not limited to) retreiving, adding and deleting objects.|
-|[object_group.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/object_group.py)|Contains class `ObjectGroup`, representing a collection of objects belonging to a bucket in an AIS cluster. Includes all multi-object operations such as deleting, evicting, prefetching, copying, and transforming objects.|
+|[object.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/obj/object.py)|Contains class `Object` that represents an object belonging to a bucket in an AIS cluster, and contains all object-related operations, including (but not limited to) retrieving, adding and deleting objects.|
+|[object_group.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/multiobj/object_group.py)|Contains class `ObjectGroup`, representing a collection of objects belonging to a bucket in an AIS cluster. Includes all multi-object operations such as deleting, evicting, prefetching, copying, and transforming objects.|
 |[job.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/job.py)|Contains class `Job` and all job-related operations.|
-|[dsort.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/dsort.py)|Contains class `Dsort` and all dsort-related operations.|
-|[etl.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl.py)|Contains class `Etl` and all ETL-related operations.|
+|[dsort/core.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/dsort/core.py)|Contains class `Dsort` and all dsort-related operations.|
+|[etl.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl/etl.py)|Contains class `Etl` and all ETL-related operations.|
 
 For more information on SDK usage, refer to the [SDK reference documentation](https://aistore.nvidia.com/docs/python_sdk.md) or see the examples [here](https://github.com/NVIDIA/aistore/blob/main/python/examples/sdk/).
 
@@ -138,4 +145,5 @@ For more information on SDK usage, refer to the [SDK reference documentation](ht
 * [AIStore GitHub](https://github.com/NVIDIA/aistore)
 * [Documentation](https://aistore.nvidia.com/docs)
 * [AIStore pip package](https://pypi.org/project/aistore/)
-* [Videos and demos](https://github.com/NVIDIA/aistore/blob/main/docs/videos.md)
+* [Blog](https://aistore.nvidia.com/blog)
+* [KubeCon 2024 presentation](https://www.youtube.com/watch?v=N-d9cbROndg)

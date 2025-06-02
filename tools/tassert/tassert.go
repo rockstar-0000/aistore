@@ -1,6 +1,6 @@
 // Package tassert provides common asserts for tests
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tassert
 
@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/NVIDIA/aistore/tools/tlog"
 )
 
 var (
@@ -28,7 +30,7 @@ func CheckFatal(tb testing.TB, err error) {
 	mu.Lock()
 	if _, ok := fatalities[tb.Name()]; ok {
 		mu.Unlock()
-		fmt.Printf("--- %s: duplicate CheckFatal: %v\n", tb.Name(), err) // see #1057
+		tlog.Logf("--- %s: duplicate CheckFatal: %v\n", tb.Name(), err) // see #1057
 		runtime.Goexit()
 	} else {
 		fatalities[tb.Name()] = struct{}{}

@@ -1,16 +1,16 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
@@ -20,6 +20,8 @@ import (
 )
 
 // rebalance & resilver xactions
+
+const fmtpend = "%s: rebalance[%s] is "
 
 type (
 	rebFactory struct {
@@ -35,6 +37,7 @@ type (
 		xact.Base
 	}
 	Resilver struct {
+		Args *xreg.ResArgs
 		xact.Base
 	}
 )
@@ -48,6 +51,8 @@ var (
 	_ xreg.Renewable = (*resFactory)(nil)
 )
 
+var _rebID atomic.Int64
+
 ///////////////
 // Rebalance //
 ///////////////
@@ -56,33 +61,59 @@ func (*rebFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 	return &rebFactory{RenewBase: xreg.RenewBase{Args: args}}
 }
 
-func (p *rebFactory) Start() error {
-	p.xctn = NewRebalance(p.Args.UUID, p.Kind())
-	return nil
+func (p *rebFactory) Start() (err error) {
+	p.xctn, err = newRebalance(p)
+	return err
 }
 
 func (*rebFactory) Kind() string     { return apc.ActRebalance }
 func (p *rebFactory) Get() core.Xact { return p.xctn }
 
 func (p *rebFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, err error) {
-	xreb := prevEntry.(*rebFactory)
-	wpr = xreg.WprAbort
-	if xreb.Args.UUID > p.Args.UUID {
-		nlog.Errorf("(reb: %s) %s is greater than %s", xreb.xctn, xreb.Args.UUID, p.Args.UUID)
-		wpr = xreg.WprUse
-	} else if xreb.Args.UUID == p.Args.UUID {
-		if cmn.Rom.FastV(4, cos.SmoduleXs) {
-			nlog.Infof("%s already running, nothing to do", xreb.xctn)
-		}
-		wpr = xreg.WprUse
+	prev := prevEntry.(*rebFactory)
+	if prev.Args.UUID == p.Args.UUID {
+		return xreg.WprUse, nil
 	}
-	return
+
+	//
+	// NOTE: we always abort _previous_ (via `reb._preempt`) prior to starting a new one
+	//
+	nlog.Errorln(core.T.String(), "unexpected when-prev-running call:", prev.Args.UUID, p.Args.UUID)
+
+	ic, ec := xact.S2RebID(p.Args.UUID)
+	if ec != nil {
+		nlog.Errorln("FATAL:", p.Args.UUID, ec)
+		return xreg.WprAbort, ec // (unlikely)
+	}
+	ip, ep := xact.S2RebID(prev.Args.UUID)
+	if ep != nil {
+		nlog.Errorln("FATAL:", prev.Args.UUID, ep)
+		return xreg.WprAbort, ep
+	}
+	debug.Assert(ip <= ic, "curr ", p.Args.UUID, "> prev ", prev.Args.UUID)
+	return xreg.WprAbort, nil
 }
 
-func NewRebalance(id, kind string) (xreb *Rebalance) {
+func newRebalance(p *rebFactory) (xreb *Rebalance, err error) {
 	xreb = &Rebalance{}
-	xreb.InitBase(id, kind, nil)
-	return
+	ctlmsg, ok := p.Args.Custom.(string)
+	debug.Assert(ok)
+	xreb.InitBase(p.Args.UUID, p.Kind(), ctlmsg, nil)
+
+	id, err := xact.S2RebID(p.Args.UUID)
+	if err != nil {
+		return nil, err
+	}
+	rebID := _rebID.Load()
+	if rebID > id {
+		return nil, fmt.Errorf(fmtpend+"old", core.T.String(), p.Args.UUID)
+	}
+	if rebID == id {
+		return nil, fmt.Errorf(fmtpend+"current", core.T.String(), p.Args.UUID)
+	}
+	_rebID.Store(id)
+
+	return xreb, nil
 }
 
 func (*Rebalance) Run(*sync.WaitGroup) { debug.Assert(false) }
@@ -96,7 +127,6 @@ func (xreb *Rebalance) RebID() int64 {
 func (xreb *Rebalance) Snap() (snap *core.Snap) {
 	snap = &core.Snap{}
 	xreb.ToSnap(snap)
-	snap.RebID = xreb.RebID()
 
 	snap.IdleX = xreb.IsIdle()
 
@@ -116,7 +146,7 @@ func (*resFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 }
 
 func (p *resFactory) Start() error {
-	p.xctn = NewResilver(p.UUID(), p.Kind())
+	p.xctn = newResilver(p)
 	return nil
 }
 
@@ -124,10 +154,14 @@ func (*resFactory) Kind() string                                       { return 
 func (p *resFactory) Get() core.Xact                                   { return p.xctn }
 func (*resFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) { return xreg.WprAbort, nil }
 
-func NewResilver(id, kind string) (xres *Resilver) {
+func newResilver(p *resFactory) (xres *Resilver) {
 	xres = &Resilver{}
-	xres.InitBase(id, kind, nil)
-	return
+	xres.InitBase(p.UUID(), p.Kind(), "" /*ctlmsg*/, nil /*bck*/)
+
+	xres.Args = p.Args.Custom.(*xreg.ResArgs)
+	debug.Assert(xres.Args != nil)
+
+	return xres
 }
 
 func (*Resilver) Run(*sync.WaitGroup) { debug.Assert(false) }

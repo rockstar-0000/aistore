@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 )
 
 // LOM custom metadata stored under `lomCustomMD`.
@@ -35,8 +36,11 @@ const (
 
 	OrigURLObjMD = "orig_url"
 
-	// additional backend
-	LastModified = "LastModified"
+	// RFC3339; see also: cos.HdrLastModified formatted RFC1123GMT
+	LsoLastModified = "LastModified"
+
+	// as the name implies
+	OrigFntl = "orig_fntl"
 )
 
 // object properties
@@ -106,6 +110,10 @@ func (oa *ObjAttrs) AtimeUnix() int64        { return oa.Atime }
 func (oa *ObjAttrs) Checksum() *cos.Cksum    { return oa.Cksum }
 func (oa *ObjAttrs) SetCksum(ty, val string) { oa.Cksum = cos.NewCksum(ty, val) }
 
+func (oa *ObjAttrs) EqCksum(cksum *cos.Cksum) bool {
+	return !oa.Cksum.IsEmpty() && oa.Cksum.Equal(cksum)
+}
+
 func (oa *ObjAttrs) Version(_ ...bool) string {
 	if oa.Ver == nil {
 		return ""
@@ -129,37 +137,6 @@ func (oa *ObjAttrs) SetSize(size int64) {
 	oa.Size = size
 }
 
-//
-// custom metadata
-//
-
-func CustomMD2S(md cos.StrKVs) string { return fmt.Sprintf("%+v", md) }
-
-func S2CustomMD(custom, version string) (md cos.StrKVs) {
-	if len(custom) < 8 || !strings.HasPrefix(custom, "map[") { // Sprintf above
-		return nil
-	}
-	s := custom[4 : len(custom)-1]
-	lst := strings.Split(s, " ")
-	md = make(cos.StrKVs, len(lst))
-	md[VersionObjMD] = version
-	parseCustom(md, lst, SourceObjMD)
-	parseCustom(md, lst, CRC32CObjMD)
-	parseCustom(md, lst, MD5ObjMD)
-	parseCustom(md, lst, ETag)
-	return md
-}
-
-func parseCustom(md cos.StrKVs, lst []string, key string) {
-	keyX := key + ":"
-	for _, kv := range lst {
-		if strings.HasPrefix(kv, keyX) {
-			md[key] = kv[len(keyX):]
-			return
-		}
-	}
-}
-
 func (oa *ObjAttrs) GetCustomMD() cos.StrKVs   { return oa.CustomMD }
 func (oa *ObjAttrs) SetCustomMD(md cos.StrKVs) { oa.CustomMD = md }
 
@@ -176,8 +153,8 @@ func (oa *ObjAttrs) SetCustomKey(k, v string) {
 	oa.CustomMD[k] = v
 }
 
-func (oa *ObjAttrs) DelCustomKeys(keys ...string) {
-	for _, key := range keys {
+func (oa *ObjAttrs) DelStdCustom() {
+	for _, key := range stdCustomProps {
 		delete(oa.CustomMD, key)
 	}
 }
@@ -268,14 +245,6 @@ func (oa *ObjAttrs) FromHeader(hdr http.Header) (cksum *cos.Cksum) {
 	return
 }
 
-func (oa *ObjAttrs) FromLsoEntry(e *LsoEnt) {
-	oa.Size = e.Size
-	oa.SetVersion(e.Version)
-
-	// entry.Custom = cmn.CustomMD2S(custom)
-	_ = CustomMD2S(nil)
-}
-
 // local <=> remote equality in the context of cold-GET and download. This function
 // decides whether we need to go ahead and re-read the object from its remote location.
 //
@@ -284,33 +253,30 @@ func (oa *ObjAttrs) FromLsoEntry(e *LsoEnt) {
 // b) the same remote "source" and at least one matching checksum, or c) two matching checksums.
 // (See also note below.)
 //
-// Note that mismatch in any given checksum type immediately renders inequality and return
-// from the function.
+// Note that ETag, checksum, or version mismatch leads to immediate return with error
+// specifying the exact cause.
+//
+// Note version comparison may fail even when the objects are identical, content-wise:
+// same size, ETag, and checksums may still "co-exist" with different versions.
+//
+// TODO: count == 1 with matching checksum being xxhash - must be configurable :NOTE
 func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 	var (
-		ver      string
-		md5      string
-		etag     string
-		cksumVal string
-		count    int
-		sameEtag bool
+		ver       string
+		md5       string
+		etag      string
+		cksumVal  string
+		count     int // number of matches
+		sameEtag  bool
+		sameCksum bool
 	)
 	// size check
 	if remSize := rem.Lsize(true); oa.Size != 0 && remSize != 0 && oa.Size != remSize {
 		return fmt.Errorf("size %d != %d remote", oa.Size, remSize)
 	}
 
-	// version check
-	if remVer, v := rem.Version(true), oa.Version(); remVer != "" && v != "" {
-		if v != remVer {
-			return fmt.Errorf("version %s != %s remote", oa.Version(), remVer)
-		}
-		ver = v
-		// NOTE: ais own version is, currently, a nonunique sequence number - not counting
-		if remSrc, _ := rem.GetCustomKey(SourceObjMD); remSrc != apc.AIS {
-			count++
-		}
-	} else if remMeta, ok := rem.GetCustomKey(VersionObjMD); ok && remMeta != "" {
+	// Cloud version check (NOTE: ais own version is currently a non-unique sequence number)
+	if remMeta, ok := rem.GetCustomKey(VersionObjMD); ok && remMeta != "" {
 		if locMeta, ok := oa.GetCustomKey(VersionObjMD); ok && locMeta != "" {
 			if remMeta != locMeta {
 				return fmt.Errorf("version-md %s != %s remote", locMeta, remMeta)
@@ -321,22 +287,38 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 	}
 
 	// checksum check
-	if a, b := rem.Checksum(), oa.Cksum; !a.IsEmpty() && !b.IsEmpty() && a.Ty() == b.Ty() {
-		if !a.Equal(b) {
-			return fmt.Errorf("%s checksum %s != %s remote", a.Ty(), b, a)
+	if a, b := rem.Checksum(), oa.Cksum; a != nil && b != nil {
+		cksumType := a.Ty()
+		if !a.IsEmpty() && !b.IsEmpty() && cksumType == b.Ty() {
+			if !a.Equal(b) {
+				return fmt.Errorf("%s checksum %s != %s remote", cksumType, b, a)
+			}
+			cksumVal = a.Val()
+
+			// [NOTE]
+			// unless overridden via feature flag
+			// trust two checksums, namely md5 and xxhash, that are _not_ cryptographically secure
+
+			switch {
+			case Rom.Features().IsSet(feat.TrustCryptoSafeChecksums):
+				sameCksum = (cksumType == cos.ChecksumSHA256 || cksumType == cos.ChecksumSHA512)
+			default:
+				debug.Assert(cksumType != cos.ChecksumNone)
+				sameCksum = cksumType != cos.ChecksumCRC32C
+			}
+
+			count++
 		}
-		cksumVal = a.Val()
-		count++
 	}
 
-	// custom MD: ETag check
+	// custom MD: ETag check (ignoring enclosing quotes)
 	if remMeta, ok := rem.GetCustomKey(ETag); ok && remMeta != "" {
 		if locMeta, ok := oa.GetCustomKey(ETag); ok && locMeta != "" {
-			if remMeta != locMeta {
+			if !_eqIgnoreQuotes(remMeta, locMeta) {
 				return fmt.Errorf("ETag %s != %s remote", locMeta, remMeta)
 			}
 			etag = locMeta
-			if ver != locMeta && cksumVal != locMeta { // against double-counting
+			if !_eqIgnoreQuotes(ver, locMeta) && !_eqIgnoreQuotes(cksumVal, locMeta) { // against double-counting
 				count++
 				sameEtag = true
 			}
@@ -363,7 +345,7 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 					return fmt.Errorf("MD5 %s != %s remote", locMeta, remMeta)
 				}
 				md5 = locMeta
-				if etag != md5 && cksumVal != md5 {
+				if !_eqIgnoreQuotes(etag, md5) && cksumVal != md5 {
 					count++ //  (ditto)
 				}
 			}
@@ -374,17 +356,26 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 	case count >= 2: // e.g., equal because they have the same (version & md5, where version != md5)
 		return nil
 	case count == 0:
-	default:
-		// same version or ETag from the same (remote) backend
-		// (arguably, must be configurable)
-		if remMeta, ok := rem.GetCustomKey(SourceObjMD); ok && remMeta != "" {
-			if locMeta, ok := oa.GetCustomKey(SourceObjMD); ok && locMeta != "" {
-				if (ver != "" || etag != "") && remMeta == locMeta {
-					return nil
-				}
-			}
-		}
+	case sameEtag || sameCksum:
+		// making exception for the same (trusted) checksum or ETag
+		return nil
 	}
 
 	return fmt.Errorf("local (%v) vs remote (%v)", oa.GetCustomMD(), rem.GetCustomMD())
+}
+
+// background: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
+// NOTE: _not_ ignoring 'W/` weak validator
+func _eqIgnoreQuotes(a, b string) bool {
+	la, lb := len(a), len(b)
+	if la < 16 || lb < 16 || a[0] == b[0] {
+		return a == b
+	}
+	if a[0] == '"' && a[la-1] == '"' {
+		return b == a[1:la-1]
+	}
+	if b[0] == '"' && b[lb-1] == '"' {
+		return a == b[1:lb-1]
+	}
+	return a == b
 }

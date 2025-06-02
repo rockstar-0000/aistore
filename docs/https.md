@@ -1,12 +1,3 @@
----
-layout: post
-title: Loading, reloading, and generating certificates; switching cluster between HTTP and HTTPS
-permalink: /docs/https
-redirect_from:
- - /https.md/
- - /docs/https.md/
----
-
 In this document:
 
 - [Generating self-signed certificates](#generating-self-signed-certificates)
@@ -98,7 +89,7 @@ In the following example, we run https based deployment where `AIS_SKIP_VERIFY_C
 $ make kill
 $ # delete smaps
 $ find ~/.ais* -type f -name ".ais.smap" | xargs rm
-$ # substitute varibles in below files to point to correct certificates
+$ # substitute variables in below files to point to correct certificates
 $ source ais/test/tls-env/server.conf
 $ source ais/test/tls-env/client.conf
 $ AIS_USE_HTTPS=true make deploy <<< $'6\n6\n4\ny\ny\nn\n\n'

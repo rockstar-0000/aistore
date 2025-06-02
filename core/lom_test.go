@@ -1,7 +1,6 @@
-//nolint:dupl // copy-paste benign and can wait
 // Package core_test provides tests for cluster package
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core_test
 
@@ -21,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/fs"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -79,12 +79,12 @@ var _ = Describe("LOM", func() {
 		),
 		meta.NewBck(
 			bucketLocalB, apc.AIS, cmn.NsGlobal,
-			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}, LRU: cmn.LRUConf{Enabled: true}, BID: 2},
+			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumOneXxh}, LRU: cmn.LRUConf{Enabled: true}, BID: 2},
 		),
 		meta.NewBck(
 			bucketLocalC, apc.AIS, cmn.NsGlobal,
 			&cmn.Bprops{
-				Cksum:  cmn.CksumConf{Type: cos.ChecksumXXHash},
+				Cksum:  cmn.CksumConf{Type: cos.ChecksumOneXxh},
 				LRU:    cmn.LRUConf{Enabled: true},
 				Mirror: cmn.MirrorConf{Enabled: true, Copies: 2},
 				BID:    3,
@@ -301,7 +301,7 @@ var _ = Describe("LOM", func() {
 				lom := &core.LOM{}
 				err := lom.InitFQN(localFQN, nil)
 				Expect(err).NotTo(HaveOccurred())
-				lom.AcquireAtimefs()
+				lom.TestAtime()
 				Expect(lom.Persist()).NotTo(HaveOccurred())
 				err = lom.Load(false, false)
 				Expect(err).NotTo(HaveOccurred())
@@ -316,7 +316,7 @@ var _ = Describe("LOM", func() {
 				lom := &core.LOM{}
 				err := lom.InitFQN(localFQN, nil)
 				Expect(err).NotTo(HaveOccurred())
-				lom.AcquireAtimefs()
+				lom.TestAtime()
 				Expect(lom.Persist()).NotTo(HaveOccurred())
 				err = lom.Load(false, false)
 				Expect(err).NotTo(HaveOccurred())
@@ -330,7 +330,7 @@ var _ = Describe("LOM", func() {
 			testObjectName := "cksum-foldr/test-obj.ext"
 			// Bucket needs to have checksum enabled
 			localFQN := mis[0].MakePathFQN(&localBckB, fs.ObjectType, testObjectName)
-			dummyCksm := cos.NewCksum(cos.ChecksumXXHash, "dummycksm")
+			dummyCksm := cos.NewCksum(cos.ChecksumOneXxh, "dummycksm")
 
 			Describe("ComputeCksumIfMissing", func() {
 				It("should ignore if bucket checksum is none", func() {
@@ -362,7 +362,7 @@ var _ = Describe("LOM", func() {
 					cksum, err := lom.ComputeSetCksum()
 					Expect(err).NotTo(HaveOccurred())
 					cksumType, cksumValue := cksum.Get()
-					Expect(cksumType).To(BeEquivalentTo(cos.ChecksumXXHash))
+					Expect(cksumType).To(BeEquivalentTo(cos.ChecksumOneXxh))
 					Expect(cksumValue).To(BeEquivalentTo(expectedChecksum))
 					Expect(lom.Checksum().Equal(cksum)).To(BeTrue())
 
@@ -423,7 +423,7 @@ var _ = Describe("LOM", func() {
 					lom := filePut(localFQN, testFileSize)
 					Expect(lom.ValidateMetaChecksum()).NotTo(HaveOccurred())
 
-					lom.SetCksum(cos.NewCksum(cos.ChecksumXXHash, "wrong checksum"))
+					lom.SetCksum(cos.NewCksum(cos.ChecksumOneXxh, "wrong checksum"))
 					Expect(persist(lom)).NotTo(HaveOccurred())
 					Expect(lom.ValidateContentChecksum()).To(HaveOccurred())
 				})
@@ -449,8 +449,26 @@ var _ = Describe("LOM", func() {
 					lom := filePut(localFQN, testFileSize)
 					Expect(lom.ValidateContentChecksum()).NotTo(HaveOccurred())
 
-					lom.SetCksum(cos.NewCksum(cos.ChecksumXXHash, "wrong checksum"))
+					lom.SetCksum(cos.NewCksum(cos.ChecksumOneXxh, "wrong checksum"))
 					Expect(lom.ValidateMetaChecksum()).To(HaveOccurred())
+				})
+
+				// This may happen when the checksum was set to `none` previously and someone updated the config.
+				// After that, old objects will have old checksum type saved, whereas in the `lom.CksumType()`
+				// the new checksum type will be returned.
+				It("should correctly validate meta checksum after the checksum type has changed", func() {
+					// Using bucket that has checksum type that is *not* `none`.
+					createTestFile(localFQN, testFileSize)
+					lom := NewBasicLom(localFQN)
+					// Set checksum type to `none` to simulate LOM with old checksum type (set to `none`).
+					orig := lom.Bck().Props.Cksum.Type
+					lom.Bck().Props.Cksum.Type = cos.ChecksumNone
+					lom.SetCksum(cos.NewCksum(cos.ChecksumNone, ""))
+
+					Expect(persist(lom)).NotTo(HaveOccurred())
+					Expect(lom.ValidateMetaChecksum()).NotTo(HaveOccurred())
+
+					lom.Bck().Props.Cksum.Type = orig
 				})
 			})
 
@@ -515,6 +533,16 @@ var _ = Describe("LOM", func() {
 					Expect(err).ShouldNot(HaveOccurred())
 
 					Expect(lom.ValidateContentChecksum()).To(HaveOccurred())
+				})
+
+				It("should correctly validate content checksum after the checksum type has changed", func() {
+					// Using bucket that has checksum type that is *not* `none`.
+					createTestFile(localFQN, testFileSize)
+					lom := NewBasicLom(localFQN)
+					// Set checksum type to `none` to simulate LOM with old checksum type (set to `none`).
+					lom.SetCksum(cos.NewCksum(cos.ChecksumNone, ""))
+
+					Expect(lom.ValidateContentChecksum()).NotTo(HaveOccurred())
 				})
 			})
 
@@ -1078,7 +1106,7 @@ func createTestFile(fqn string, size int) {
 
 func getTestFileHash(fqn string) (hash string) {
 	reader, _ := os.Open(fqn)
-	_, cksum, err := cos.CopyAndChecksum(io.Discard, reader, nil, cos.ChecksumXXHash)
+	_, cksum, err := cos.CopyAndChecksum(io.Discard, reader, nil, cos.ChecksumOneXxh)
 	Expect(err).NotTo(HaveOccurred())
 	hash = cksum.Value()
 	reader.Close()

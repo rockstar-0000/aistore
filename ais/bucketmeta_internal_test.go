@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/core/meta"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -33,7 +34,7 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 		// Set path for proxy (it uses ConfigDir)
 		config := cmn.GCO.BeginUpdate()
 		config.ConfigDir = mpath
-		config.Cksum.Type = cos.ChecksumXXHash
+		config.Cksum.Type = cos.ChecksumOneXxh
 		config.Space = cmn.SpaceConf{
 			LowWM: 75, HighWM: 90, OOS: 95,
 		}

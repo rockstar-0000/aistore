@@ -12,26 +12,40 @@ run_tests() {
     tests_dir="${AISTORE_PATH}/${TESTS_DIR}"
   fi
 
-  ## NOTE: when changing, make sure to update .gitlab-ci.yml and GitLab /settings/ci_cd
-  timeout="-timeout=4h"
   shuffle="-shuffle=on"
   if [[ -n "${SHORT}" ]]; then
     short="-short"
-    timeout="-timeout=30m"
   fi
+
+  if [[ -n "${CI_JOB_TIMEOUT}" ]]; then
+    timeout="-timeout=${CI_JOB_TIMEOUT}s"
+  elif [[ -n "${SHORT}" ]]; then
+    timeout="-timeout=45m"
+  else
+    timeout="-timeout=4h"
+  fi
+
+  LOG_FILE=$(mktemp)
 
   # NOTE: cannot run tests in parallel (e.g. `-parallel 4`) because of ginkgo v2
   # ("Ginkgo detected configuration issues...")
   failed_tests=$(
     BUCKET="${BUCKET}" AIS_ENDPOINT="${AIS_ENDPOINT}" \
       go test -v -p 1 -tags debug -count 1 ${timeout} ${short} ${shuffle} ${re} "${tests_dir}" 2>&1 \
-    | tee -a /dev/stderr \
+    | tee "${LOG_FILE}" | tee -a /dev/stderr \
     | grep -ae "^---FAIL: Bench\|^--- FAIL: Test\|^FAIL[[:space:]]github.com/NVIDIA/.*$"; \
     exit ${PIPESTATUS[0]} # Exit with the status of the first command in the pipe(line).
   )
   exit_code=$?
 
   echo "Tests took: $((SECONDS/3600))h$(((SECONDS%3600)/60))m$((SECONDS%60))s"
+
+  echo -e "\nTop-20 Slowest Tests:"
+  grep -E '^--- (PASS|FAIL):' "${LOG_FILE}" \
+    | sort -t'(' -k2,2nr \
+    | head -20
+
+  rm -f "${LOG_FILE}"
 
   if [[ $exit_code -ne 0 ]]; then
     echo "${failed_tests}"
@@ -51,7 +65,7 @@ lint)
   echo "Running lint..." >&2
   if [[ -z ${TAGS} ]]; then
     # using build tags from .golangci.yml
-    golangci-lint --timeout=15m run $(list_all_go_dirs)
+    golangci-lint --timeout=15m --max-issues-per-linter=0 run $(list_all_go_dirs)
   else
     # using build tags from env
     golangci-lint --timeout=15m --build-tags="${TAGS}" run $(list_all_go_dirs)
@@ -74,7 +88,6 @@ fmt)
     echo "Running style check..." >&2
 
     check_gomod
-    check_imports
     check_deps
     check_files_headers
     check_python_formatting
@@ -86,10 +99,10 @@ spell)
   echo "Running spell check..." >&2
   case $2 in
   --fix)
-    ${GOPATH}/bin/misspell -i "colour,importas" -w -locale=US ${AISTORE_PATH}
+    ${GOPATH}/bin/misspell -i "colour,importas,lustre" -w -locale=US ${AISTORE_PATH}
     ;;
   *)
-    ${GOPATH}/bin/misspell -i "colour,importas" -error -locale=US ${AISTORE_PATH}
+    ${GOPATH}/bin/misspell -i "colour,importas,lustre" -error -locale=US "" ${AISTORE_PATH}
     ;;
   esac
   ;;
@@ -158,7 +171,6 @@ test-docker)
   errs=$("${AISTORE_PATH}/deploy/test-in-docker/test.sh" --name=${branch} 2>&1 | tee -a /dev/stderr | grep -e "^--- FAIL: Bench\|^--- FAIL: Test"  )
   perror $1 "${errs}"
   ;;
-
 
 test-bench)
   echo "Running benchmark tests..." >&2

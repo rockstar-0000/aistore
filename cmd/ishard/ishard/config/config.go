@@ -1,10 +1,11 @@
 // Package config provides types and functions to configure ishard executable.
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package config
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -115,7 +117,7 @@ type SortFlag struct {
 func (alg *SortFlag) Set(value string) error {
 	parts := strings.Split(value, ":")
 	if len(parts) == 0 {
-		return fmt.Errorf("invalid sort flag format")
+		return errors.New("invalid sort flag format")
 	}
 
 	alg.IsSet = true
@@ -124,12 +126,13 @@ func (alg *SortFlag) Set(value string) error {
 	case "alpha", "alphanumeric":
 		alg.Kind = "alphanumeric"
 		if len(parts) > 1 {
-			if parts[1] == "inc" {
+			switch parts[1] {
+			case "inc":
 				alg.Decreasing = false
-			} else if parts[1] == "dec" {
+			case "dec":
 				alg.Decreasing = true
-			} else {
-				return fmt.Errorf("invalid alphanumeric sort option, expected 'inc' or 'dec'")
+			default:
+				return errors.New("invalid alphanumeric sort option, expected 'inc' or 'dec'")
 			}
 		}
 	case "shuffle":
@@ -137,11 +140,11 @@ func (alg *SortFlag) Set(value string) error {
 		if len(parts) > 1 {
 			alg.Seed = parts[1]
 			if _, err := strconv.ParseInt(alg.Seed, 10, 64); err != nil {
-				return fmt.Errorf("invalid shuffle seed, must be a valid integer")
+				return errors.New("invalid shuffle seed, must be a valid integer")
 			}
 		}
 	default:
-		return fmt.Errorf("invalid sort kind, expected 'alpha' or 'shuffle'")
+		return errors.New("invalid sorting algorithm, expected 'alpha' or 'shuffle'")
 	}
 
 	return nil
@@ -234,18 +237,18 @@ func (d *DryRunFlag) Set(value string) error {
 	return nil
 }
 
-func (d *DryRunFlag) IsBoolFlag() bool {
+func (*DryRunFlag) IsBoolFlag() bool {
 	return true
 }
 
-// Load configuration for ishard from cli, or spec files (TODO)
-func Load() (*Config, error) {
+// Load configuration for ishard from CLI
+func LoadFromCLI() (*Config, error) {
 	cfg := DefaultConfig
-	parseCliParams(&cfg)
-	return &cfg, nil
+	err := parseCliParams(&cfg)
+	return &cfg, err
 }
 
-func parseCliParams(cfg *Config) {
+func parseCliParams(cfg *Config) error {
 	flag.StringVar(&cfg.SrcBck.Name, "src_bck", "", "Source bucket name or URI.")
 	flag.StringVar(&cfg.DstBck.Name, "dst_bck", "", "Destination bucket name or URI.")
 	flag.StringVar(&cfg.ShardTemplate, "shard_template", "shard-%06d", "The template used for generating output shards. Default is `\"shard-%06d\"`. Accepts Bash, Fmt, or At formats.\n"+
@@ -293,17 +296,14 @@ func parseCliParams(cfg *Config) {
 
 	var reactions = []string{"ignore", "warn", "abort", "exclude"}
 	if !cos.StringInSlice(missingExtActStr, reactions) {
-		fmt.Printf("Invalid action: %s. Accepted values are: abort, warn, ignore, exclude\n", missingExtActStr)
-		flag.Usage()
-		os.Exit(1)
+		msg := fmt.Sprintf("Invalid action: %s. Accepted values are: abort, warn, ignore, exclude\n", missingExtActStr)
+		return errWithUsage(errors.New(msg))
 	}
 
 	if sampleExts != "" {
 		cfg.MExtMgr, err = NewMissingExtManager(missingExtActStr, strings.Split(sampleExts, ","))
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			flag.Usage()
-			os.Exit(1)
+			return errWithUsage(err)
 		}
 	}
 
@@ -321,27 +321,29 @@ func parseCliParams(cfg *Config) {
 	} else {
 		fmt.Printf("\"sample_key_pattern\" %s is not built-in (\"base_file_name\" | \"full_name\" | \"collapse_all_dir\"), compiled as custom regex\n", sampleKeyPatternStr)
 		if _, err := regexp.Compile(sampleKeyPatternStr); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			flag.Usage()
-			os.Exit(1)
+			return errWithUsage(err)
 		}
 		cfg.SampleKeyPattern = SampleKeyPattern{Regex: sampleKeyPatternStr, CaptureGroup: "$1"}
 	}
 
 	if cfg.SrcBck.Name == "" || cfg.DstBck.Name == "" {
-		fmt.Fprintln(os.Stderr, "Error: src_bck and dst_bck are required parameters.")
-		flag.Usage()
-		os.Exit(1)
+		return errWithUsage(errors.New("src_bck and dst_bck are required parameters.\n%s"))
 	}
 
 	if cfg.SrcBck, cfg.SrcPrefix, err = cmn.ParseBckObjectURI(cfg.SrcBck.Name, cmn.ParseURIOpts{DefaultProvider: apc.AIS}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		flag.Usage()
-		os.Exit(1)
+		return errWithUsage(err)
 	}
 	if cfg.DstBck, _, err = cmn.ParseBckObjectURI(cfg.DstBck.Name, cmn.ParseURIOpts{DefaultProvider: apc.AIS}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		flag.Usage()
-		os.Exit(1)
+		return errWithUsage(err)
 	}
+
+	return nil
+}
+
+func errWithUsage(err error) error {
+	var buf strings.Builder
+	flag.CommandLine.SetOutput(&buf)
+	flag.Usage()
+	flag.CommandLine.SetOutput(os.Stderr)
+	return fmt.Errorf("%v\n%s", err, buf.String())
 }

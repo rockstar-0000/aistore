@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -27,23 +27,17 @@ import (
 //
 
 const (
-	opcodeDone = iota + 27182
-	opcodeAbrt
-)
-
-const (
+	// TODO -- FIXME: derive from config.Timeout
 	waitRegRecv   = 4 * time.Second
 	waitUnregRecv = 2 * waitRegRecv
 	waitUnregMax  = 2 * waitUnregRecv
-
-	maxNumInParallel = 256
 )
 
 type (
 	streamingF struct {
 		xreg.RenewBase
 		xctn core.Xact
-		dm   *bundle.DataMover
+		dm   *bundle.DM
 		kind string
 	}
 	streamingX struct {
@@ -67,7 +61,8 @@ func (p *streamingF) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	return xreg.WprUse, nil
 }
 
-// NOTE: transport endpoint (aka "trname") identifies the flow and MUST be identical
+// [NOTE]
+// transport endpoint (aka "trname") identifies the flow and MUST be identical
 // across all participating targets. The mechanism involves generating so-called "best-effort UUID"
 // independently on (by) all targets and using the latter as both xaction ID and receive endpoint (trname)
 // for target=>target streams.
@@ -108,8 +103,7 @@ func (p *streamingF) genBEID(fromBck, toBck *meta.Bck) (string, error) {
 	return "", err
 }
 
-func (p *streamingF) newDM(trname string, recv transport.RecvObj, config *cmn.Config, owt cmn.OWT, sizePDU int32) (err error) {
-	smap := core.T.Sowner().Get()
+func (p *streamingF) newDM(trname string, recv transport.RecvObj, smap *meta.Smap, dmxtra bundle.Extra, owt cmn.OWT) error {
 	if err := core.InMaintOrDecomm(smap, core.T.Snode(), p.xctn); err != nil {
 		return err
 	}
@@ -117,24 +111,29 @@ func (p *streamingF) newDM(trname string, recv transport.RecvObj, config *cmn.Co
 		return nil
 	}
 
-	// consider adding config.X.Compression, config.X.SbundleMult (currently, always 1), etc.
-	dmxtra := bundle.Extra{Config: config, Multiplier: 1, SizePDU: sizePDU}
-	p.dm, err = bundle.NewDataMover(trname, recv, owt, dmxtra)
+	p.dm = bundle.NewDM(trname, recv, owt, dmxtra)
+
+	err := p.dm.RegRecv()
+	if err != nil {
+		nlog.Errorln(err)
+		sleep := cos.ProbingFrequency(waitRegRecv)
+		for total := time.Duration(0); err != nil && transport.IsErrDuplicateTrname(err) && total < waitRegRecv; total += sleep {
+			time.Sleep(sleep)
+			err = p.dm.RegRecv()
+		}
+	}
 	if err != nil {
 		return err
 	}
-	if err = p.dm.RegRecv(); err == nil {
-		return nil
-	}
 
-	nlog.Errorln(err)
-	sleep := cos.ProbingFrequency(waitRegRecv)
-	for total := time.Duration(0); err != nil && transport.IsErrDuplicateTrname(err) && total < waitRegRecv; total += sleep {
-		time.Sleep(sleep)
-		err = p.dm.RegRecv()
-	}
-	return err
+	p.dm.SetXact(p.xctn)
+	p.dm.Open()
+	return nil
 }
+
+////////////////
+// streamingX //
+////////////////
 
 func (r *streamingX) String() (s string) {
 	s = r.DemandBase.String()
@@ -147,29 +146,45 @@ func (r *streamingX) String() (s string) {
 // limited pre-run abort
 func (r *streamingX) TxnAbort(err error) {
 	err = cmn.NewErrAborted(r.Name(), "txn-abort", err)
-	r.p.dm.Close(err)
-	r.p.dm.UnregRecv()
+	if r.p.dm != nil {
+		r.p.dm.Close(err)
+		r.p.dm.UnregRecv()
+	}
 	r.AddErr(err)
 	r.Base.Finish()
 }
 
-func (r *streamingX) sendTerm(uuid string, tsi *meta.Snode, err error) {
+// TODO: dup sentinel.bcast
+func (r *streamingX) sendTerm(uuid string, tsi *meta.Snode, abortErr error) {
 	if r.p.dm == nil { // single target
 		return
 	}
 	o := transport.AllocSend()
 	o.Hdr.SID = core.T.SID()
-	o.Hdr.Opaque = []byte(uuid)
-	if err == nil {
-		o.Hdr.Opcode = opcodeDone
+	o.Hdr.Opaque = cos.UnsafeB(uuid)
+	if abortErr == nil {
+		o.Hdr.Opcode = opDone
 	} else {
-		o.Hdr.Opcode = opcodeAbrt
-		o.Hdr.ObjName = err.Error()
+		o.Hdr.Opcode = opAbort
+		o.Hdr.ObjName = abortErr.Error()
 	}
+
+	var err error
 	if tsi != nil {
-		r.p.dm.Send(o, nil, tsi) // to the responsible target
+		err = r.p.dm.Send(o, nil, tsi) // to the responsible target
 	} else {
-		r.p.dm.Bcast(o, nil) // to all
+		err = r.p.dm.Bcast(o, nil) // to all
+	}
+
+	switch {
+	case abortErr != nil:
+		nlog.WarningDepth(1, r.String(), "aborted [", abortErr, err, "]")
+	case err != nil:
+		nlog.WarningDepth(1, r.String(), err)
+	default:
+		if cmn.Rom.FastV(4, cos.SmoduleXs) {
+			nlog.Infoln(r.Name(), "done")
+		}
 	}
 }
 
@@ -180,17 +195,16 @@ func (r *streamingX) fin(unreg bool) {
 		r.p.dm.UnregRecv()
 		return
 	}
-
 	r.DemandBase.Stop()
 	r.p.dm.Close(r.Err())
 	r.Finish()
 	if unreg && r.p.dm != nil {
 		r.maxWt = 0
-		hk.Reg(r.ID()+hk.NameSuffix, r.wurr, waitUnregRecv) // compare w/ lso
+		hk.Reg(r.ID()+hk.NameSuffix, r._wurr, waitUnregRecv) // compare w/ lso
 	}
 }
 
-func (r *streamingX) wurr(int64) time.Duration {
+func (r *streamingX) _wurr(int64) time.Duration {
 	if cnt := r.wiCnt.Load(); cnt > 0 {
 		r.maxWt += waitUnregRecv
 		if r.maxWt < waitUnregMax {

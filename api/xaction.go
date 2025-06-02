@@ -1,6 +1,6 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -13,22 +13,22 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
 )
 
-// Start xaction
-func StartXaction(bp BaseParams, args *xact.ArgsMsg, extra string) (xid string, err error) {
+func StartXaction(bp BaseParams, args *xact.ArgsMsg, extra string /* e.g. blob-downloader objname */) (xid string, err error) {
 	if !xact.Table[args.Kind].Startable {
 		return "", fmt.Errorf("xaction %q is not startable", args.Kind)
 	}
-	q := args.Bck.NewQuery()
+	q := qalloc()
+	args.Bck.SetQuery(q)
 	if args.Force {
 		q.Set(apc.QparamForce, "true")
 	}
 	msg := apc.ActMsg{Action: apc.ActXactStart, Value: args, Name: extra}
+
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
 	{
@@ -39,13 +39,19 @@ func StartXaction(bp BaseParams, args *xact.ArgsMsg, extra string) (xid string, 
 		reqParams.Query = q
 	}
 	_, err = reqParams.doReqStr(&xid)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, err
 }
 
-// Abort ("stop") xactions
+// a.k.a. stop
 func AbortXaction(bp BaseParams, args *xact.ArgsMsg) (err error) {
-	msg := apc.ActMsg{Action: apc.ActXactStop, Value: args}
+	var (
+		q   = qalloc()
+		msg = apc.ActMsg{Action: apc.ActXactStop, Value: args}
+	)
+
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
 	{
@@ -53,11 +59,14 @@ func AbortXaction(bp BaseParams, args *xact.ArgsMsg) (err error) {
 		reqParams.Path = apc.URLPathClu.S
 		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = args.Bck.NewQuery()
+		args.Bck.SetQuery(q)
+		reqParams.Query = q
 	}
 	err = reqParams.DoRequest()
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return err
 }
 
 //
@@ -68,28 +77,39 @@ func AbortXaction(bp BaseParams, args *xact.ArgsMsg) (err error) {
 // e.g.: put-copies[D-ViE6HEL_j] list[H96Y7bhR2s] copy-bck[matRQMRes] put-copies[pOibtHExY]
 // TODO: return idle xactions separately
 func GetAllRunningXactions(bp BaseParams, kindOrName string) (out []string, err error) {
-	msg := xact.QueryMsg{Kind: kindOrName}
+	var (
+		msg       = xact.QueryMsg{Kind: kindOrName}
+		q         = qalloc()
+		reqParams = AllocRp()
+	)
+	q.Set(apc.QparamWhat, apc.WhatAllRunningXacts)
 	bp.Method = http.MethodGet
-	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathClu.S
 		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatAllRunningXacts}}
+		reqParams.Query = q
 	}
+
 	_, err = reqParams.DoReqAny(&out)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return out, err
 }
 
 // QueryXactionSnaps gets all xaction snaps based on the specified selection.
 // NOTE: args.Kind can be either xaction kind or name - here and elsewhere
 func QueryXactionSnaps(bp BaseParams, args *xact.ArgsMsg) (xs xact.MultiSnap, err error) {
-	msg := xact.QueryMsg{ID: args.ID, Kind: args.Kind, Bck: args.Bck}
+	var (
+		msg = xact.QueryMsg{ID: args.ID, Kind: args.Kind, Bck: args.Bck}
+		q   = qalloc()
+	)
 	if args.OnlyRunning {
 		msg.OnlyRunning = apc.Ptr(true)
 	}
+	q.Set(apc.QparamWhat, apc.WhatQueryXactStats)
 	bp.Method = http.MethodGet
 	reqParams := AllocRp()
 	{
@@ -97,11 +117,14 @@ func QueryXactionSnaps(bp BaseParams, args *xact.ArgsMsg) (xs xact.MultiSnap, er
 		reqParams.Path = apc.URLPathClu.S
 		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatQueryXactStats}}
+		reqParams.Query = q
 	}
+
 	_, err = reqParams.DoReqAny(&xs)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xs, err
 }
 
 // GetOneXactionStatus queries one of the IC (proxy) members for status
@@ -115,14 +138,19 @@ func QueryXactionSnaps(bp BaseParams, args *xact.ArgsMsg) (xs xact.MultiSnap, er
 // if exists
 func GetOneXactionStatus(bp BaseParams, args *xact.ArgsMsg) (status *nl.Status, err error) {
 	status = &nl.Status{}
-	q := url.Values{apc.QparamWhat: []string{apc.WhatOneXactStatus}}
+	q := qalloc()
+	q.Set(apc.QparamWhat, apc.WhatOneXactStatus)
+
 	err = getxst(status, q, bp, args)
-	return
+
+	qfree(q)
+	return status, err
 }
 
 // same as above, except that it returns _all_ matching xactions
 func GetAllXactionStatus(bp BaseParams, args *xact.ArgsMsg) (matching nl.StatusVec, err error) {
-	q := url.Values{apc.QparamWhat: []string{apc.WhatAllXactStatus}}
+	q := qalloc()
+	q.Set(apc.QparamWhat, apc.WhatAllXactStatus)
 	if args.Force {
 		// (force just-in-time)
 		// for each args-selected xaction:
@@ -130,8 +158,11 @@ func GetAllXactionStatus(bp BaseParams, args *xact.ArgsMsg) (matching nl.StatusV
 		// and query those targets directly
 		q.Set(apc.QparamForce, "true")
 	}
+
 	err = getxst(&matching, q, bp, args)
-	return
+
+	qfree(q)
+	return matching, err
 }
 
 func getxst(out any, q url.Values, bp BaseParams, args *xact.ArgsMsg) (err error) {
@@ -205,7 +236,20 @@ func WaitForXactionIC(bp BaseParams, args *xact.ArgsMsg) (status *nl.Status, err
 // - xact.IdlesBeforeFinishing()
 // - x-resilver (as it usually runs on a single node)
 func WaitForXactionNode(bp BaseParams, args *xact.ArgsMsg, fn func(xact.MultiSnap) (bool, bool)) error {
-	debug.Assert(args.Kind != "" || xact.IsValidUUID(args.ID))
+	if args.Kind != "" {
+		if err := xact.CheckValidKind(args.Kind); err != nil {
+			return err
+		}
+	}
+	if args.ID != "" {
+		if err := xact.CheckValidUUID(args.ID); err != nil {
+			return err
+		}
+	}
+	if args.Kind == "" && args.ID == "" {
+		return fmt.Errorf("cannot wait for xaction given '%s' - expecting a valid kind and/or UUID", args.String())
+	}
+
 	_, err := _waitx(bp, args, fn)
 	return err
 }
@@ -239,14 +283,13 @@ func _waitx(bp BaseParams, args *xact.ArgsMsg, fn func(xact.MultiSnap) (bool, bo
 		}
 		canRetry := err == nil || cos.IsRetriableConnErr(err) || cmn.IsStatusServiceUnavailable(err)
 		if done || !canRetry /*fail*/ {
-			return
+			return status, err
 		}
 		time.Sleep(sleep)
 		sleep = min(maxSleep, sleep+sleep/2)
 
 		if elapsed = mono.Since(begin); elapsed >= total {
-			err = fmt.Errorf("api.wait: timed out (%v) waiting for %s", total, args.String())
-			return
+			return nil, fmt.Errorf("api.wait: timed out (%v) waiting for %s", total, args.String())
 		}
 	}
 }

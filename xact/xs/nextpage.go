@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -10,6 +10,7 @@ package xs
 import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -17,15 +18,17 @@ import (
 )
 
 type npgCtx struct {
+	bp   core.Backend
 	bck  *meta.Bck
+	ctx  *core.LsoInvCtx
 	wi   walkInfo
 	page cmn.LsoRes
-	ctx  *core.LsoInvCtx
 	idx  int
 }
 
-func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb, ctx *core.LsoInvCtx) (npg *npgCtx) {
+func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb, ctx *core.LsoInvCtx, bp core.Backend) (npg *npgCtx) {
 	npg = &npgCtx{
+		bp:  bp,
 		bck: bck,
 		wi: walkInfo{
 			msg:          msg.Clone(),
@@ -35,23 +38,21 @@ func newNpgCtx(bck *meta.Bck, msg *apc.LsoMsg, cb lomVisitedCb, ctx *core.LsoInv
 		},
 		ctx: ctx,
 	}
-	return
+	if msg.IsFlagSet(apc.LsDiff) {
+		npg.wi.custom = make(cos.StrKVs) // TODO: move to parent x-lso; clear and reuse here
+	}
+	return npg
 }
 
-// limited usage: bucket summary, multi-obj
+// limited usage: lrit (compare w/ LsoXact.doWalk)
 func (npg *npgCtx) nextPageA() error {
 	npg.page.UUID = npg.wi.msg.UUID
 	npg.idx = 0
 	opts := &fs.WalkBckOpts{
-		WalkOpts: fs.WalkOpts{CTs: []string{fs.ObjectType}, Callback: npg.cb, Sorted: true},
+		ValidateCb: npg.validateCb,
+		WalkOpts:   fs.WalkOpts{CTs: []string{fs.ObjectType}, Callback: npg.cb, Sorted: true},
 	}
 	opts.WalkOpts.Bck.Copy(npg.bck.Bucket())
-	opts.ValidateCb = func(fqn string, de fs.DirEntry) error {
-		if de.IsDir() {
-			return npg.wi.processDir(fqn)
-		}
-		return nil
-	}
 	err := fs.WalkBck(opts)
 	if err != nil {
 		freeLsoEntries(npg.page.Entries)
@@ -61,8 +62,26 @@ func (npg *npgCtx) nextPageA() error {
 	return err
 }
 
+func (npg *npgCtx) validateCb(fqn string, de fs.DirEntry) error {
+	if !de.IsDir() {
+		return nil
+	}
+	ct, err := npg.wi.processDir(fqn)
+	if err != nil || ct == nil {
+		return err
+	}
+	if !npg.wi.msg.IsFlagSet(apc.LsNoRecursion) {
+		return nil
+	}
+	// multi-object (lrit) operation: skip virtual dir entries
+	// ie., always ignore returned `addDirEntry`
+	_, err = cmn.CheckDirNoRecurs(npg.wi.msg.Prefix, ct.ObjectName())
+	return err
+}
+
 func (npg *npgCtx) cb(fqn string, de fs.DirEntry) error {
 	entry, err := npg.wi.callback(fqn, de)
+
 	if entry == nil && err == nil {
 		return nil
 	}
@@ -80,66 +99,89 @@ func (npg *npgCtx) cb(fqn string, de fs.DirEntry) error {
 }
 
 // Returns the next page from the remote bucket's "list-objects" result set.
-func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries, inclStatusLocalMD bool) (lst *cmn.LsoRes, err error) {
-	debug.Assert(!npg.wi.msg.IsFlagSet(apc.LsObjCached))
+func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries) (lst *cmn.LsoRes, err error) {
+	debug.Assert(!npg.wi.msg.IsFlagSet(apc.LsCached))
 	lst = &cmn.LsoRes{Entries: nentries}
 	if npg.ctx != nil {
 		if npg.ctx.Lom == nil {
-			_, err = core.T.Backend(npg.bck).GetBucketInv(npg.bck, npg.ctx)
+			_, err = npg.bp.GetBucketInv(npg.bck, npg.ctx)
 		}
 		if err == nil {
-			err = core.T.Backend(npg.bck).ListObjectsInv(npg.bck, npg.wi.msg, lst, npg.ctx)
+			err = npg.bp.ListObjectsInv(npg.bck, npg.wi.msg, lst, npg.ctx)
 		}
 	} else {
-		_, err = core.T.Backend(npg.bck).ListObjects(npg.bck, npg.wi.msg, lst)
+		_, err = npg.bp.ListObjects(npg.bck, npg.wi.msg, lst)
 	}
 	if err != nil {
 		freeLsoEntries(nentries)
 		return nil, err
 	}
+
 	debug.Assert(lst.UUID == "" || lst.UUID == npg.wi.msg.UUID)
 	lst.UUID = npg.wi.msg.UUID
-
-	if inclStatusLocalMD {
-		err = npg.populate(lst)
-	}
 	return lst, err
 }
 
-func (npg *npgCtx) populate(lst *cmn.LsoRes) error {
-	post := npg.wi.lomVisitedCb
-	for _, obj := range lst.Entries {
-		if obj.IsDir() {
-			// collecting virtual dir-s when apc.LsNoRecursion is on - skipping here
-			continue
-		}
-		si, err := npg.wi.smap.HrwName2T(npg.bck.MakeUname(obj.Name))
+// - filter entries to keep only mine
+// - add or set local metadata
+// - see also: cmn.ConcatLso
+func (npg *npgCtx) filterAddLmeta(lst *cmn.LsoRes) error {
+	var (
+		bck  = npg.bck.Bucket()
+		post = npg.wi.lomVisitedCb
+		msg  = npg.wi.msg
+		i    int
+	)
+
+	for _, en := range lst.Entries {
+		si, err := npg.wi.smap.HrwName2T(npg.bck.MakeUname(en.Name))
 		if err != nil {
 			return err
 		}
 		if si.ID() != core.T.SID() {
 			continue
 		}
-		lom := core.AllocLOM(obj.Name)
-		if err := lom.InitBck(npg.bck.Bucket()); err != nil {
-			core.FreeLOM(lom)
-			if cmn.IsErrBucketNought(err) {
-				return err
-			}
+
+		// [NOTE]
+		// in re: `apc.LsNoDirs` and `apc.LsNoRecursion`, see:
+		// * https://github.com/NVIDIA/aistore/blob/main/docs/howto_virt_dirs.md
+
+		if en.IsAnyFlagSet(apc.EntryIsDir) && !msg.IsFlagSet(apc.LsNoDirs) {
+			// collect virtual dir-s aka "common prefixes"
+			lst.Entries[i] = en
+			i++
 			continue
 		}
+
+		lom := core.AllocLOM(en.Name)
+		if err := lom.InitBck(bck); err != nil {
+			if cmn.IsErrBucketNought(err) {
+				core.FreeLOM(lom)
+				return err
+			}
+			goto keep
+		}
 		if err := lom.Load(true /* cache it*/, false /*locked*/); err != nil {
+			goto keep
+		}
+		if msg.IsFlagSet(apc.LsNotCached) {
 			core.FreeLOM(lom)
 			continue
 		}
 
-		npg.wi.setWanted(obj, lom)
-		obj.SetPresent()
+		npg.wi.setWanted(en, lom)
+		en.SetFlag(apc.EntryIsCached) // formerly, SetPresent
 
 		if post != nil {
 			post(lom)
 		}
+
+	keep:
 		core.FreeLOM(lom)
+		lst.Entries[i] = en
+		i++
 	}
+
+	lst.Entries = lst.Entries[:i]
 	return nil
 }

@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -15,7 +15,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/pierrec/lz4/v3"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // object stream & private types
@@ -26,6 +27,7 @@ type (
 		callback ObjSentCB // to free SGLs, close files, etc.
 		lz4s     *lz4Stream
 		sendoff  sendoff
+		chanFull cos.ChanFull
 		streamBase
 	}
 	lz4Stream struct {
@@ -159,7 +161,7 @@ func (s *Stream) doCmpl(obj *Obj, err error) {
 func (s *Stream) doRequest() error {
 	s.numCur, s.sizeCur = 0, 0
 	if !s.compressed() {
-		return s.do(s)
+		return s.doPlain(s)
 	}
 	s.lz4s.sgl.Reset()
 	if s.lz4s.zw == nil {
@@ -167,11 +169,15 @@ func (s *Stream) doRequest() error {
 	} else {
 		s.lz4s.zw.Reset(s.lz4s.sgl)
 	}
-	// lz4 framing spec at http://fastcompression.blogspot.com/2013/04/lz4-streaming-format-final.html
-	s.lz4s.zw.Header.BlockChecksum = false
-	s.lz4s.zw.Header.NoChecksum = !s.lz4s.frameChecksum
-	s.lz4s.zw.Header.BlockMaxSize = s.lz4s.blockMaxSize
-	return s.do(s.lz4s)
+
+	err := s.lz4s.zw.Apply(
+		lz4.BlockChecksumOption(false),
+		lz4.ChecksumOption(s.lz4s.frameChecksum),
+		lz4.BlockSizeOption(lz4.BlockSize(s.lz4s.blockMaxSize)),
+	)
+	debug.AssertNoErr(err)
+
+	return s.doCmpr(s.lz4s)
 }
 
 // as io.Reader
@@ -187,8 +193,7 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 			return s.sendData(b)
 		}
 		if obj.Hdr.isFin() {
-			err = io.EOF
-			return
+			return 0, io.EOF
 		}
 		s.eoObj(nil)
 	case inPDU:
@@ -209,7 +214,7 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 				s.pdu.reset()
 			}
 		}
-		return
+		return n, err
 	case inHdr:
 		return s.sendHdr(b)
 	}
@@ -217,9 +222,9 @@ repeat:
 	select {
 	case obj, ok := <-s.workCh: // next object OR idle tick
 		if !ok {
-			err = fmt.Errorf("%s closed prior to stopping", s)
+			err := fmt.Errorf("%s closed prior to stopping", s)
 			nlog.Warningln(err)
-			return
+			return 0, err
 		}
 		s.sendoff.obj = *obj
 		obj = &s.sendoff.obj
@@ -237,8 +242,7 @@ repeat:
 		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
 			nlog.Infoln(s.String(), "stopped [", s.numCur, s.stats.Num.Load(), "]")
 		}
-		err = io.EOF
-		return
+		return 0, io.EOF
 	}
 }
 
@@ -455,5 +459,5 @@ ex:
 	if last && err == nil {
 		err = io.EOF
 	}
-	return
+	return n, err
 }

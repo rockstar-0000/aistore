@@ -1,7 +1,7 @@
 // Package ios is a collection of interfaces to the local storage subsystem;
 // the package includes OS-dependent implementations for those interfaces.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ios
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -39,10 +40,10 @@ type (
 	blockDev struct {
 		name     string
 		blksize  int64
-		children BlockDevices
+		children BlockDevs
 	}
 
-	BlockDevices []*blockDev
+	BlockDevs []*blockDev
 )
 
 var (
@@ -71,7 +72,7 @@ func (bd *blockDev) MarshalJSON() ([]byte, error) {
 	return cos.UnsafeB(s), nil
 }
 
-func _dump(blockDevs BlockDevices) {
+func _dump(blockDevs BlockDevs) {
 	dump, _ := jsoniter.MarshalIndent(blockDevs, "", " ") // (custom MarshalJSON above)
 	s := strings.Repeat("=", 32)
 	nlog.Infoln("Begin dump block devices", s)
@@ -82,7 +83,7 @@ func _dump(blockDevs BlockDevices) {
 // fs2disks retrieves the underlying disk or disks; it may return multiple disks
 // but only if the filesystem is RAID; it is called upon adding/enabling mountpath.
 // NOTE: blockDevs here are not nil only at startup - see fs.New()
-func fs2disks(mpath, fs string, label Label, blockDevs BlockDevices, num int, testingEnv bool) (disks FsDisks, err error) {
+func fs2disks(mpath, fsname string, label cos.MountpathLabel, blockDevs BlockDevs, num int, testingEnv bool) (disks FsDisks, err error) {
 	if blockDevs == nil {
 		blockDevs, err = _lsblk("", nil /*parent*/)
 		if err != nil && !testingEnv {
@@ -91,10 +92,10 @@ func fs2disks(mpath, fs string, label Label, blockDevs BlockDevices, num int, te
 	}
 
 	var trimmedFS string
-	if strings.HasPrefix(fs, devPrefixLVM) {
-		trimmedFS = strings.TrimPrefix(fs, devPrefixLVM)
+	if strings.HasPrefix(fsname, devPrefixLVM) {
+		trimmedFS = strings.TrimPrefix(fsname, devPrefixLVM)
 	} else {
-		trimmedFS = strings.TrimPrefix(fs, devPrefixReg)
+		trimmedFS = strings.TrimPrefix(fsname, devPrefixReg)
 	}
 	disks = make(FsDisks, num)
 	findDevs(blockDevs, trimmedFS, label, disks) // map trimmed(fs) <= disk(s)
@@ -110,17 +111,17 @@ func fs2disks(mpath, fs string, label Label, blockDevs BlockDevices, num int, te
 	switch {
 	case len(disks) > 0:
 		s := disks._str()
-		nlog.Infoln("["+fs+label.ToLog()+"]:", s)
-	case testingEnv || cmn.AllowSharedDisksAndNoDisks:
+		nlog.Infoln("["+fsname+label.ToLog()+"]:", s)
+	case testingEnv:
 		// anything goes
 	case label.IsNil():
 		// empty label implies _resolvable_ underlying disk or disks
 		e := errors.New("empty label implies _resolvable_ underlying disk (" + trimmedFS + ")")
-		err = cmn.NewErrMpathNoDisks(mpath, fs, e)
+		err = cmn.NewErrMpathNoDisks(mpath, fsname, e)
 		nlog.Errorln(err)
 		_dump(blockDevs)
 	default:
-		nlog.Infoln("No disks for", fs, "[", trimmedFS, label, "]")
+		nlog.Infoln("No disks for", fsname, "[", trimmedFS, label, "]")
 	}
 	return disks, err
 }
@@ -130,7 +131,7 @@ func fs2disks(mpath, fs string, label Label, blockDevs BlockDevices, num int, te
 //
 
 // (see recursion below)
-func _lsblk(parentDir string, parent *blockDev) (BlockDevices, error) {
+func _lsblk(parentDir string, parent *blockDev) (BlockDevs, error) {
 	if parentDir == "" {
 		debug.Assert(parent == nil)
 		parentDir = sysBlockPath
@@ -140,7 +141,7 @@ func _lsblk(parentDir string, parent *blockDev) (BlockDevices, error) {
 		return nil, fmt.Errorf("_lsblk: failed to read-dir %q: %w", parentDir, err)
 	}
 
-	blockDevs := make(BlockDevices, 0, initialNumDevs)
+	blockDevs := make(BlockDevs, 0, initialNumDevs)
 	for _, dirent := range dirents {
 		var (
 			devDirPath  = filepath.Join(parentDir, dirent.Name())
@@ -263,7 +264,7 @@ func _readAny[T any](path string) (value T, err error) {
 	}
 }
 
-func findDevs(blockDevs BlockDevices, trimmedFS string, label Label, disks FsDisks) {
+func findDevs(blockDevs BlockDevs, trimmedFS string, label cos.MountpathLabel, disks FsDisks) {
 	for _, bd := range blockDevs {
 		// by dev name
 		if bd.name == trimmedFS {
@@ -281,7 +282,7 @@ func findDevs(blockDevs BlockDevices, trimmedFS string, label Label, disks FsDis
 	}
 }
 
-func _match(blockDevs BlockDevices, device string) bool {
+func _match(blockDevs BlockDevs, device string) bool {
 	for _, dev := range blockDevs {
 		if dev.name == device {
 			return true

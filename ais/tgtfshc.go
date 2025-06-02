@@ -1,10 +1,12 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
+	"fmt"
+
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -47,13 +49,16 @@ func (t *target) FSHC(err error, mi *fs.Mountpath, fqn string) {
 		return
 	}
 
-	nlog.Errorf("%s: waking up FSHC to check %s, err: %v", t, mi, err)
+	warn := fmt.Sprintf("%s: waking up FSHC to check %s, err: %v", t, mi, err)
+	nlog.ErrorDepth(1, warn)
 
-	//
-	// counting I/O errors on a per mountpath
-	// TODO -- FIXME: remove `NameSuffix`
-	//
-	t.statsT.AddMany(cos.NamedVal64{Name: stats.ErrFSHCCount, NameSuffix: mi.Path, Value: 1})
+	// counting I/O errors per mountpath
+	vlabs := map[string]string{stats.VlabMountpath: mi.String()}
+	t.statsT.AddWith(cos.NamedVal64{
+		Name:    stats.ErrFSHCCount,
+		Value:   1,
+		VarLabs: vlabs},
+	)
 	t.fshc.OnErr(mi, fqn)
 }
 

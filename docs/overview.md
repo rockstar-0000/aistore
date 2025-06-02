@@ -1,53 +1,46 @@
----
-layout: post
-title: OVERVIEW
-permalink: /docs/overview
-redirect_from:
- - /overview.md/
- - /docs/overview.md/
----
-
 ## Introduction
 
-Training deep learning (DL) models on petascale datasets is essential for achieving competitive and state-of-the-art performance in applications such as speech, video analytics, and object recognition. However, existing distributed filesystems were not developed for the access patterns and usability requirements of DL jobs.
+Training large models on petascale datasets is essential for achieving competitive and state-of-the-art performance in applications such as speech, video analytics, and object recognition. However, existing distributed filesystems were not designed for the access patterns and usability requirements of petascale AI jobs.
 
-In this [white paper](https://arxiv.org/abs/2001.01858) we describe AIStore (AIS) and components, and then compare system performance experimentally using image classification workloads and storing training data on a variety of backends.
-
-See also:
-
-* [blog](https://aistore.nvidia.com/blog)
-* [white paper](https://arxiv.org/abs/2001.01858)
-* [at-a-glance poster](https://storagetarget.files.wordpress.com/2019/12/deep-learning-large-scale-phys-poster-1.pdf)
+In this [original white paper](https://arxiv.org/abs/2001.01858) we describe AIStore (AIS) and components, and then compare system performance experimentally using image classification workloads and storing training data on a variety of backends.
 
 The rest of this document is structured as follows:
 
 - [At a glance](#at-a-glance)
 - [Terminology](#terminology)
+  - [Backend Provider](#backend-provider)
+  - [Mountpath](#mountpath)
+  - [Proxy](#proxy)
+  - [Read-after-Write Consistency](#read-after-write-consistency)
+  - [Xaction](#xaction)
+  - [Shard](#shard)
+  - [Target](#target)
+  - [Unified Namespace](#unified-namespace)
+  - [Write-through](#write-through)
 - [Design Philosophy](#design-philosophy)
-- [Key Concepts and Diagrams](#key-concepts-and-diagrams)
+- [Original Diagrams](#original-diagrams)
+- [CLI](#cli)
 - [AIStore API](#aistore-api)
 - [Traffic Patterns](#traffic-patterns)
-- [Read-after-write consistency](#read-after-write-consistency)
 - [Open Format](#open-format)
 - [Existing Datasets](#existing-datasets)
 - [Data Protection](#data-protection)
   - [Erasure Coding vs IO Performance](#erasure-coding-vs-io-performance)
+- [Observability](#observability)
 - [Scale-Out](#scale-out)
 - [Networking](#networking)
 - [HA](#ha)
-- [Other Services](#other-services)
-- [dSort](#dsort)
-- [CLI](#cli)
+- [Sharding extensions: dSort and iShard](#sharding-extensions-dsort-and-ishard)
 - [ETL](#etl)
 - [_No limitations_ principle](#no-limitations-principle)
 
 ## At a glance
 
-Following is a high-level **block diagram** with an emphasis on supported frontend and backend APIs, and the capability to scale-out horizontally. The picture also tries to make the point that AIS aggregates an arbitrary numbers of storage servers ("targets") with local or locally accessible drives, whereby each drive is formatted with a local filesystem of choice (e.g., xfs or zfs).
+Following is a high-level **block diagram** with an emphasis on supported frontend and backend APIs, and the capability to scale-out horizontally. The picture also tries to make the point that AIS aggregates an arbitrary number of storage servers ([targets](#target)) with local or locally accessible drives, whereby each drive is formatted with a local filesystem of choice (e.g., xfs or zfs).
 
-![At-a-Glance](images/cluster-block-2024.png)
+![At-a-Glance](images/cluster-block-v3.26.png)
 
-In any aistore cluster, there are **two kinds of nodes**: proxies (a.k.a. gateways) and storage nodes (targets):
+In any AIS cluster, there are **two kinds of nodes**: proxies (a.k.a. gateways) and targets (storage nodes):
 
 ![Proxies and Targets](images/proxy-target-block-2024.png)
 
@@ -57,25 +50,113 @@ All user data is equally distributed (or [balanced](/docs/rebalance.md)) across 
 
 ## Terminology
 
-* **Target** - a storage node. To store user data, targets utilize **mountpaths** (see next). In the docs and the code, instead of saying something like "storage node in an aistore cluster" we simply say: "target."
+> **Tip:** Terms are listed alphabetically so you can quickly jump to the one you need.
+> Cross-links like **[Target](#target)** and **[Backend Provider](#backend-provider)** resolve within this page.
 
-* **Proxy** - a **gateway** providing [API](#aistore-api) access point. Proxies are diskless - they do not have direct access to user data, and do not "see" user data in-flight. One of the proxies is elected, or designated, as the _primary_ (or leader) of the cluster. There may be any number of ais proxies/gateways (but only one _primary_ at any given time).
+---
 
-> AIS proxy/gateway implements RESTful APIs, both [native](#aistore-api) and S3 compatible. Upon _primary_ failure, remaining proxies collaborate with each other to perform majority-voted HA failover. The terms "proxy" and "gateway" are used interchangeably.
+### Backend Provider
+Backend provider (or simply **backend**) is an abstraction, and simultaneously an API-supported option that differentiates between "remote" (e.g., `s3://`) and "local" (`ais://`) buckets with respect to a given AIS cluster. AIS [supports multiple storage backends](images/supported-backends.png) including its own.
 
-> In AIS cluster, there is no correlation between the numbers of proxies and targets, although for symmetry we usually deploy one proxy for each target (storage) node.
+> See [providers](providers.md) for the current list of supported clouds and instructions on chaining AIS clusters.
 
-* [Mountpath](configuration.md) - a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS can fully own and utilize (to store user data and system metadata). Note that any given disk (or RAID) can have (at most) one mountpath - meaning **no disk sharing**. Secondly, mountpath directories cannot be nested. Further:
-   - a mountpath can be temporarily disabled and (re)enabled;
-   - a mountpath can also be detached and (re)attached, thus effectively supporting growth and "shrinkage" of local capacity;
-   - it is safe to execute the 4 listed operations (enable, disable, attach, detach) at any point during runtime;
-   - in a typical deployment, the total number of mountpaths would compute as a direct product of (number of storage targets) x (number of disks in each target).
+---
 
-* [Backend Provider](providers.md) - an abstraction, and simultaneously an API-supported option, that allows to delineate between "remote" and "local" buckets with respect to a given AIS cluster.
+### Mountpath
+AIS target mountpath is a formatted disk (or RAID volume) **plus** a directory that AIS fully owns for storing user data and system metadata.
 
-* [Unified Global Namespace](providers.md) - AIS clusters *attached* to each other, effectively, form a super-cluster providing unified global namespace whereby all buckets and all objects of all included clusters are uniformly accessible via any and all individual access points (of those clusters).
+* One mountpath per physical disk/RAID (no sharing).
+* Mountpath directories cannot be nested.
+* Mountpaths can be **enabled / disabled** and **attached / detached** at runtime to replace faulted drives, expand or shrink capacity with no downtime.
+* In a typical deployment, *total mountpaths = number of targets × disks-per-target*.
 
-* [Xaction](https://github.com/NVIDIA/aistore/blob/main/xact/README.md) - asynchronous batch operations that may take many seconds (minutes, hours, etc.) to execute - are called *eXtended actions* or simply *xactions*. CLI and [CLI documentation](/docs/cli) refers to such operations as **jobs** - the more familiar term that can be used interchangeably. Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, archiving multiple objects, copying buckets, and many more. All [eXtended actions](https://github.com/NVIDIA/aistore/blob/main/xact/README.md) support generic [API](/api/xaction.go) and [CLI](/docs/cli/job.md#show-job-statistics) to show both common counters (byte and object numbers) as well as operation-specific extended statistics.
+> **Note on Kubernetes deployments**: While AIStore natively supports hot-plugging mountpaths at runtime, this capability is limited in Kubernetes environments. Kubernetes (as of v1.33) does not support attaching new Persistent Volumes to running pods. In production Kubernetes deployments, adding new storage typically requires a controlled pod restart (meaning, zero-downtime is not possible without specialized extensions).
+
+---
+
+### Proxy
+A disk-less **gateway** that exposes the AIS REST and S3-compatible APIs.
+
+* Proxies never see or touch user data in flight.
+* Exactly one proxy is elected **primary** (leader); only the primary can update cluster-level metadata including the cluster map.
+* The terms *proxy* and *gateway* are interchangeable.
+* For symmetry we usually deploy one proxy per target, but that is not a requirement.
+
+---
+
+### Read-after-Write Consistency
+`PUT(object)` is a transaction. An object (or new version) becomes visible **only after** AIS has:
+
+1. Written the first local replica and its metadata.
+2. (For remote backends) completed remote `PUT` (using the vendor SDK), stored remote metadata (in-cluster), and optionally validated checksums.
+
+Subsequent reads through **any** gateway always return the same content. Extra replicas or erasure-coded slices are created asynchronously.
+
+The same guarantee applies to every _writing scenario_, including cold-GET request(s), bucket copies, transforms, archives, prefetches, large-blob downloads, renames, promotions, and more.
+
+---
+
+### Shard
+In AIStore, sharding refers to the process of serializing original files and/or objects (such as images and labels) into larger-sized objects formatted as TAR, TGZ, ZIP, or TAR.LZ4 archives.
+
+The benefits of serialization are well-established: iterable formats like TAR enable purely sequential I/O operations, significantly improving performance on local drives. In the context of machine learning, sharding enhances data shuffling and eliminates bias, allowing for global shuffling of shard names and the use of a shuffle buffer on the client side to ensure adequate randomization of training data.
+
+Additionally, a shard is an object that can follow a specific convention, where related files (such as abc.jpeg, abc.cls, and abc.json) are packaged together in a single TAR archive. While AIS can read, write, and list any TAR, using this convention ensures that components necessary for ML training are kept together.
+
+In short, sharding:
+* Enables fully sequential I/O for high throughput.
+* Ideal for ML workflows: global shuffling of shard names + client-side shuffle buffer eliminates bias.
+* AIS can **read, write, append, and list** archives natively.
+* Convention: related files (`abc.jpeg`, `abc.cls`, `abc.json`, …) live in the same shard so all components stay together.
+
+Further reading:
+* [Archive support](/docs/archive.md)
+* [CLI archive command](/docs/cli/archive.md)
+* [`ishard` tool](https://github.com/NVIDIA/aistore/blob/main/cmd/ishard/README.md)
+* [Distributed Shuffle](/docs/cli/dsort.md)
+* WebDataset format: [Hugging Face WebDataset docs](https://huggingface.co/docs/hub/datasets-webdataset)
+
+---
+
+### Target
+A storage node in an AIS cluster.
+
+* Stores user objects on one or more [mountpaths](#mountpath).
+
+> In documentation and code, "target" always means "storage node in an AIS cluster."
+
+---
+
+### Unified Namespace
+When AIS clusters are **attached** to each other they form a super-cluster with a single, global namespace: every bucket and object is reachable via any node in any member cluster.
+Clients use a single endpoint and reference shared buckets with cluster-specific identifiers.
+
+---
+
+### Write-through
+With remote backends, the remote `PUT` is part of the same write transaction that finalizes the first local replica.
+If the remote `PUT` fails, the whole operation fails and AIS rolls back locally.
+
+---
+
+### Xaction
+Xaction (*eXtended action*) is a supported batch job that executes asynchronously.
+
+All xactions support uniform [API](#aistore-api) and [CLI](#cli) to start, stop, and wait for, as well as common (generic) and job-specific stats.
+
+Common jobs include erasure coding (EC), n-way mirroring, resharding, transforming a given virtual directory, archiving ([sharding](#shard)) multiple objects, copying remote bucket, and more:
+
+```console
+$ ais show job --help
+NAME:
+   ais show job - Show running and/or finished jobs:
+
+     archive        blob-download  cleanup     copy-bucket       copy-objects      delete-objects
+     download       dsort          ec-bucket   ec-get            ec-put            ec-resp
+     elect-primary  etl-bucket     etl-inline  etl-objects       evict-objects     evict-remote-bucket
+     list           lru-eviction   mirror      prefetch-objects  promote-files     put-copies
+     rebalance      rename-bucket  resilver    summary           warm-up-metadata
+```
 
 ## Design Philosophy
 
@@ -88,9 +169,7 @@ The corollary of this statement is two-fold:
 
 Notice that the same exact approach works for the other side of the spectrum - the proverbial [small-file problem](https://www.quora.com/What-is-the-small-file-problem-in-Hadoop). Here again, instead of optimizing small-size IOPS, we focus on application-specific (re)sharding, whereby each shard would have a desirable size, contain a batch of the original (small) files, and where the files (aka samples) would be sorted to optimizes subsequent computation.
 
-## Key Concepts and Diagrams
-
-In this section: high-level diagrams that introduce key concepts and architecture, as well as possible deployment options.
+## Original Diagrams
 
 AIS cluster *comprises* arbitrary (and not necessarily equal) numbers of **gateways** and **storage targets**. Targets utilize local disks while gateways are HTTP **proxies** that provide most of the control plane and never touch the data.
 
@@ -98,21 +177,56 @@ AIS cluster *comprises* arbitrary (and not necessarily equal) numbers of **gatew
 
 Both **gateways** and **targets** are userspace daemons that join (and, by joining, form) a storage cluster at their respective startup times, or upon user request. AIStore can be deployed on any commodity hardware with pretty much any Linux distribution (although we do recommend 4.x kernel). There are no designed-in size/scale type limitations. There are no dependencies on special hardware capabilities. The code itself is free, open, and MIT-licensed.
 
-The diagram depicting AIS clustered node follows below, and makes the point that gateways and storage targets can be colocated in a single machine (or a VM) but not necessarily:
-
-![One AIS machine](images/ais-host-20-block.png)
-
 AIS can be deployed as a self-contained standalone persistent storage cluster or a fast tier in front of any of the supported backends including Amazon S3 and Google Cloud (GCP). The built-in caching mechanism provides LRU replacement policy on a per-bucket basis while taking into account configurable high and low capacity watermarks (see [LRU](storage_svcs.md#lru) for details). AWS/GCP integration is *turnkey* and boils down to provisioning AIS targets with credentials to access Cloud-based buckets.
 
 If (compute + storage) rack is a *unit of deployment*, it may as well look as follows:
 
 ![One rack](images/ais-rack-20-block.png)
 
-Finally, AIS target provides a number of storage services with [S3-like RESTful API](http_api.md) on top and a MapReduce layer that we call [dSort](#dsort).
+Here's an older (and simpler) diagram that depicts AIS target node:
 
 ![AIS target block diagram](images/ais-target-20-block.png)
 
-## AIStore API
+## CLI
+
+AIS CLI is an integrated, easy-to-use management and monitoring tool. Once installed (e.g., see `./scripts/install_from_binaries.sh --help`), you can immediately start using it by executing:
+
+> For more information on how to build, install, and get started with AIS CLI, please see [getting started](/docs/cli.md#getting-started).
+
+```console
+$ export AIS_ENDPOINT=http://ais-gateway:port
+```
+
+Here, `ais-gateway:port` represents the `<hostname:port>` address of any AIS gateway (for developers, this is often `localhost:8080`). Note that the "export" command only needs to be executed once.
+
+Your first command could be:
+
+```console
+$ ais --help
+```
+
+One notable feature of AIS CLI is its Bash-style auto-completions), which allow users to easily navigate supported operations and options by simply pressing the TAB key:
+
+```console
+$ ais  <TAB-TAB>
+advanced         bucket           download         help             performance      rmo              start
+alias            cluster          dsort            job              prefetch         scrub            stop
+archive          config           etl              log              put              search           storage
+auth             cp               evict            ls               remote-cluster   show             tls
+blob-download    create           get              object           rmb              space-cleanup    wait
+
+$ ais cluster <TAB-TAB>
+show                   rebalance              shutdown               reset-stats
+remote-attach          set-primary            decommission           drop-lcache
+remote-detach          download-logs          add-remove-nodes       reload-backend-creds
+$ ais cluster
+
+## and so on...
+```
+
+At the time of this writing, AIS CLI is at version (ais version) v1.17 and is actively being maintained, improved, and extended. For more information, please see the [CLI overview](/docs/cli.md).
+
+## AIStore APIs
 
 In addition to industry-standard [S3](/docs/s3compat.md), AIS provides its own (value-added) native API that can be (conveniently) called directly from Go and Python programs:
 
@@ -121,7 +235,7 @@ In addition to industry-standard [S3](/docs/s3compat.md), AIS provides its own (
 - [HTTP REST](/docs/http_api.md)
 
 For Amazon S3 compatibility and related topics, see also:
-  - [`s3cmd` client](/docs/s3cmd.md)
+  - [`s3cmd` client](/docs/s3compat.md#quick-start-with-s3cmd)
   - [S3 compatibility](/docs/s3compat.md)
   - [Presigned S3 requests](/docs/s3compat.md#presigned-s3-requests)
   - [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch)
@@ -144,36 +258,6 @@ As far as the datapath is concerned, there are no extra hops in the line of comm
 
 Distribution of objects across AIS cluster is done via (lightning fast) two-dimensional consistent-hash whereby objects get distributed across all storage targets and, within each target, all local disks.
 
-## Read-after-write consistency
-
-`PUT(object)` is a transaction. New object (or new version of the object) becomes visible/accessible only when aistore finishes writing the first replica and its metadata.
-
-For S3 or any other remote [backend](/docs/providers.md), the latter includes:
-
-* remote PUT via vendor's SDK library;
-* local write under a temp name;
-* getting successful remote response that carries remote metadata;
-* simultaneously, computing checksum (per bucket config);
-* optionally, checksum validation, if configured;
-* finally, writing combined object metadata, at which point the object becomes visible and accessible.
-
-But _not_ prior to that point!
-
-If configured, additional copies and EC slices are added asynchronously. E.g., given a bucket with 3-way replication you may already read the first replica when the other two (copies) are still pending.
-
-It is worth emphasizing that the same rules of data protection and consistency are universally enforced across the board for all _data writing_ scenarios, including (but not limited to):
-
-* RESTful PUT (above);
-* cold GET (as in: `ais get s3://abc/xyz /dev/null` when S3 has `abc/xyz` while aistore doesn't);
-* copy bucket; transform bucket;
-* multi-object copy; multi-object transform; multi-object archive;
-* prefetch remote bucket;
-* download very large remote objects (blobs);
-* rename bucket;
-* promote NFS share
-
-and more.
-
 ## Open Format
 
 AIS targets utilize local Linux filesystems including (but not limited to) xfs, ext4, and openzfs. User data is checksummed and stored *as is* without any alteration (that also allows us to support direct client <=> disk datapath). AIS on-disk format is, therefore, largely defined by local filesystem(s) chosen at deployment time.
@@ -188,29 +272,39 @@ Notwithstanding, AIS stores and then maintains object replicas, erasure-coded sl
 
 ## Existing Datasets
 
-Common way to use AIStore include the most fundamental and, often, the very first step: populating AIS cluster with an existing dataset, or datasets. Those (datasets) can come from remote buckets (AWS, Google Cloud, Azure), HDFS directories, NFS shares, local files, or any vanilla HTTP(S) locations.
+Common ways to utilize AIStore entail populating an AIS cluster with existing datasets. These datasets can originate from various sources, including:
 
-To this end, AIS provides 6 (six) easy ways ranging from the conventional on-demand caching to *promoting* colocated files and directories.
+* remote buckets: AWS, Google Cloud, Azure, Oracle Cloud, and remote AIS clusters
+* NFS or SMB shares
+* local files and directories
+* standard HTTP(S) locations.
 
-> Related references and examples include this [technical blog](https://aistore.nvidia.com/blog/2021/12/07/cp-files-to-ais) that shows how to copy a file-based dataset in two easy steps.
+### Example: user starts training
+
+User starts training a model on a dataset called `s3://dataset`, with AIStore performing as a fast tier between the user's GPU nodes and AWS Cloud.
+
+Regardless of whether the in-cluster part of the `s3://dataset` is complete or non-existent, after the first training epoch, the in-cluster content will fully synchronize with the remote dataset. This process is facilitated by a mechanism known as **cold GET**.
+
+**Cold GET** is a compound transaction that involves three key operations: a remote GET, a local write with checksumming, and in-cluster redundancy. The primary goal of a cold GET is to perform this operation quickly and efficiently, minimizing the need to repeatedly read from the slower cloud storage. This ensures rapid data synchronization while maintaining data integrity and, of course, performance during subsequent access to the same data.
+
+Overall, some of the ways to _get_ an existing dataset _into_ an AIS cluster include (but are not limited to):
 
 1. [Cold GET](#existing-datasets-cold-get)
-2. [Prefetch](#existing-datasets-batch-prefetch)
-3. [Internet Downloader](#existing-datasets-integrated-downloader)
-4. [HTTP(S) Datasets](#existing-datasets-https-datasets)
-5. [Promote local or shared files](#promote-local-or-shared-files)
-6. [Backend Bucket](bucket.md#backend-bucket)
-7. [Download very large objects (BLOBs)](/docs/cli/blob-downloader.md)
-8. [Copy remote bucket](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
-9. [Copy multiple remote objects](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+2. [Prefetch (ie, load data in advance for faster access)](#existing-datasets-batch-prefetch)
+3. [Copy remote bucket](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+4. [Copy multiple remote objects](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+5. [Download very large objects (BLOBs)](/docs/cli/blob-downloader.md)
+6. [Downloader](#existing-datasets-downloader)
+7. [HTTP(S) Datasets](#existing-datasets-https-datasets)
+8. [Promote local or shared files](#promote-local-or-shared-files)
 
-In particular:
+> Note: The terms **in-cluster** and **cached** are used interchangeably in this documentation. However, it's important to note that AIS is not primarily a caching solution, although it can function as one when the LRU feature is enabled. AIS is designed for reliable storage, offering a comprehensive set of data protection features and configurable redundancy options on a per-bucket basis.
 
 ### Existing Datasets: Cold GET
 
-If the dataset in question is accessible via S3-like object API, start working with it via GET primitive of the [AIS API](http_api.md). Just make sure to provision AIS with the corresponding credentials to access the dataset's bucket in the Cloud.
+If the dataset in question is accessible via S3-like object API, use one of the supported [APIs](#aistore-api) or CLI to read it. Just make sure to provision AIS with the corresponding credentials to access the dataset's bucket in the Cloud.
 
-> As far as supported S3-like backends, AIS currently supports Amazon S3, Google Cloud, and Azure.
+> As far as supported S3-like backends, AIS currently supports Amazon S3, Google Cloud, Microsoft Azure, and Oracle OCI.
 
 > AIS executes *cold GET* from the Cloud if and only if the object is not stored (by AIS), **or** the object has a bad checksum, **or** the object's version is outdated.
 
@@ -224,7 +318,7 @@ For CLI usage, see:
 
 * [CLI: prefetch](/docs/cli/object.md#prefetch-objects)
 
-### Existing Datasets: integrated Downloader
+### Existing Datasets: Downloader
 
 But what if the dataset in question exists in the form of (vanilla) HTTP/HTTPS URL(s)? What if there's a popular bucket in, say, Google Cloud that contains images that you'd like to bring over into your Data Center and make available locally for AI researchers?
 
@@ -232,7 +326,7 @@ For these and similar use cases we have [AIS Downloader](/docs/downloader.md) - 
 
 ### Promote local or shared files
 
-AIS can also `promote` files and directories to objects. The operation entails synchronous or asynchronus massively-parallel downloading of any accessible file source, including:
+AIS can also `promote` files and directories to objects. The operation entails synchronous or asynchronous massively-parallel downloading of any accessible file source, including:
 
 - a local directory (or directories) of any target node (or nodes);
 - a file share mounted on one or several (or all) target nodes in the cluster.
@@ -272,6 +366,40 @@ This is because AIS was created to perform and scale in the first place. AIS alw
 AIS will utilize EC to automatically self-heal upon detecting corruption (of the full replica). When a client performs a read on a non-existing (or not found) name, AIS will check with EC - assuming, obviously, that the bucket is erasure coded.
 
 EC-related philosophy can be summarized as one word: **recovery**. EC plays no part in the fast path.
+
+## Observability
+
+AIS provides multiple _layers_ of observability:
+
+```
+┌─────────────────────────────────┐
+│       Visualization Layer       │
+│  ┌───────────┐    ┌───────────┐ │
+│  │  Grafana  │    │   Custom  │ │
+│  │ Dashboard │    │   UIs     │ │
+│  └───────────┘    └───────────┘ │
+├─────────────────────────────────┤
+│       Collection Layer          │
+│  ┌───────────┐    ┌───────────┐ │
+│  │ Prometheus│    │  StatsD*  │ │
+│  │           │    │           │ │
+│  └───────────┘    └───────────┘ │
+├─────────────────────────────────┤
+│       Instrumentation Layer     │
+│  ┌───────────┐    ┌───────────┐ │
+│  │  Metrics  │    │   Logs    │ │
+│  │ Endpoints │    │           │ │
+│  └───────────┘    └───────────┘ │
+├─────────────────────────────────┤
+│          Access Layer           │
+│  ┌───────────┐    ┌───────────┐ │
+│  │    CLI    │    │   REST    │ │
+│  │ Interface │    │   APIs    │ │
+│  └───────────┘    └───────────┘ │
+└─────────────────────────────────┘
+```
+
+See [Observability](/docs/monitoring-overview.md) for details.
 
 ## Scale-Out
 
@@ -345,50 +473,28 @@ See also:
 
 ## HA
 
-AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](http_api.md).
+AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](#aistore-api).
 
 Gateways can be ad hoc added and removed, deployed remotely and/or locally to the compute clients (the latter option will eliminate one network roundtrip to resolve object locations).
 
 ## Fast Tier
-AIS can be deployed as a fast tier in front of any of the multiple supported [backends](providers.md).
+AIS can be deployed as a fast tier in front of any of the supported [backends](providers.md).
 
 As a fast tier, AIS populates itself on demand (via *cold* GETs) and/or via its own *prefetch* API (see [List/Range Operations](batch.md#listrange-operations)) that runs in the background to download batches of objects.
 
-## Other Services
+## Sharding extensions: dSort and iShard
 
-The (quickly growing) list of services includes (but is not limited to):
-* [health monitoring and recovery](/health/fshc.md)
-* [range read](http_api.md)
-* [dry-run (to measure raw network and disk performance)](performance.md#performance-testing)
-* performance and capacity monitoring with full observability via StatsD/Grafana
-* load balancing
+Distributed shuffle (codename dSort) “views” AIS data as named shards that comprise archived key/value data. The service supports tar, zip, tar-gzip, and tar-lz4 formats and a variety of built-in sorting algorithms; it is designed, though, to incorporate other popular archival formats including `tf.Record` and `tf.Example` ([TensorFlow](https://www.tensorflow.org/tutorials/load_data/tfrecord)) and [MessagePack](https://msgpack.org/index.html).
 
-> Load balancing consists in optimal selection of a local object replica and, therefore, requires buckets configured for [local mirroring](storage_svcs.md#read-load-balancing).
+User runs dSort by specifying an input dataset, by-key or by-value (i.e., by content) sorting algorithm, and a desired size of the resulting shards. The rest is done automatically and in parallel by the AIS storage targets, with no part of the processing that’d involve a single-host centralization and with dSort stage and progress-within-stage that can be monitored via user-friendly statistics.
 
-Most notably, AIStore provides **[dSort](/docs/dsort.md)** - a MapReduce layer that performs a wide variety of user-defined merge/sort *transformations* on large datasets used for/by deep learning applications.
+Each dSort job (note that multiple jobs can execute in parallel) generates a massively-parallel intra-cluster workload where each AIS target communicates with all other targets and executes a proportional "piece" of a job. This ultimately results in a *transformed* dataset optimized for subsequent training and inference by deep learning apps.
 
-## dSort
+Initial Sharding (`ishard`) utility will generate WebDataset-formatted shards from the original file-based dataset without splitting computable samples. The ultimate goal is to allow users to treat AIStore as a vast data lake, where they can easily upload training data in its raw format, regardless of size and directory structure.
 
-Dsort “views” AIS objects as named shards that comprise archived key/value data. In its 1.0 realization, dSort supports tar, zip, and tar-gzip formats and a variety of built-in sorting algorithms; it is designed, though, to incorporate other popular archival formats including `tf.Record` and `tf.Example` ([TensorFlow](https://www.tensorflow.org/tutorials/load_data/tfrecord)) and [MessagePack](https://msgpack.org/index.html). The user runs dSort by specifying an input dataset, by-key or by-value (i.e., by content) sorting algorithm, and a desired size of the resulting shards. The rest is done automatically and in parallel by the AIS storage targets, with no part of the processing that’d involve a single-host centralization and with dSort stage and progress-within-stage that can be monitored via user-friendly statistics.
-
-By design, dSort tightly integrates with the AIS-object to take full advantage of the combined clustered CPU and IOPS. Each dSort job (note that multiple jobs can execute in parallel) generates a massively-parallel intra-cluster workload where each AIS target communicates with all other targets and executes a proportional "piece" of a job. This ultimately results in a *transformed* dataset optimized for subsequent training and inference by deep learning apps.
-
-## CLI
-
-AIStore includes an easy-to-use management-and-monitoring facility called [AIS CLI](/docs/cli.md). Once [installed](/docs/cli.md#getting-started), to start using it, simply execute:
-
- ```console
-$ export AIS_ENDPOINT=http://ais-gateway:port
-$ ais --help
- ```
-
-where `ais-gateway:port` (above) denotes a `hostname:port` address of any AIS gateway (for developers it'll often be `localhost:8080`). Needless to say, the "exporting" must be done only once.
-
-One salient feature of AIS CLI is its Bash style [auto-completions](/docs/cli.md#ais-cli-shell-auto-complete) that allow users to easily navigate supported operations and options by simply pressing the TAB key:
-
-![CLI-tab](images/cli-overview.gif)
-
-AIS CLI is currently quickly developing. For more information, please see the project's own [README](/docs/cli.md).
+For more details, see:
+* [dSort](/docs/dsort.md)
+* [ishard](https://github.com/NVIDIA/aistore/blob/main/cmd/ishard/README.md)
 
 ## ETL
 
@@ -401,7 +507,6 @@ For background and further references, see:
 * [Extract, Transform, Load with AIStore](etl.md)
 * [AIS-ETL introduction and a Jupyter notebook walk-through](https://www.youtube.com/watch?v=4PHkqTSE0ls)
 
-
 ## _No limitations_ principle
 
 There are **no** designed-in limitations on the:
@@ -410,5 +515,19 @@ There are **no** designed-in limitations on the:
 * total number of objects and buckets in AIS cluster
 * number of objects in a single AIS bucket
 * numbers of gateways (proxies) and storage targets in AIS cluster
+* object name lengths
 
-Ultimately, the limit on object size may be imposed by a local filesystem of choice and a physical disk capacity. While limit on the cluster size - by the capacity of the hosting AIStore Data Center. But as far as AIS itself, it does not impose any limitations whatsoever.
+Ultimately, the limit on object size may be imposed by a local filesystem of choice and a physical disk capacity. While limit on the cluster size - by the capacity of the hosting AIStore Data Center.
+
+In v3.26, AIStore has removed the basename and pathname limitations.
+
+> On a typical Linux system, you will find that the relevant header(s) define:
+
+```console
+#define NAME_MAX 255
+#define PATH_MAX 4096
+```
+
+Starting v3.26, AIStore supports object names of any length. See also:
+
+* [Examples using extremely long names](https://github.com/NVIDIA/aistore/blob/main/docs/long_names.md)

@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -38,7 +38,7 @@ import (
 // - bucketMD versioning is monotonic and incremental
 //
 // - bucketMD typical update transaction:
-// lock -- clone() -- modify the clone -- bmdOwner.put(clone) -- unlock
+//   lock -- clone() -- modify the clone -- bmdOwner.put(clone) -- unlock
 //
 // (*) for merges and conflict resolution, check the current version prior to put()
 //     (note that version check must be protected by the same critical section)
@@ -59,6 +59,7 @@ type (
 
 		init() bool // true when loaded previous version
 		get() (bmd *bucketMD)
+		put(bmd *bucketMD)
 		putPersist(bmd *bucketMD, payload msPayload) error
 		persist(clone *bucketMD, payload msPayload) error
 		modify(*bmdModifier) (*bucketMD, error)
@@ -77,13 +78,14 @@ type (
 		pre   func(*bmdModifier, *bucketMD) error
 		final func(*bmdModifier, *bucketMD)
 
-		msg   *apc.ActMsg
-		txnID string // transaction UUID
-		bcks  []*meta.Bck
+		msg *apc.ActMsg
 
 		propsToUpdate *cmn.BpropsToSet // update existing props
 		revertProps   *cmn.BpropsToSet // props to revert
 		setProps      *cmn.Bprops      // new props to set
+
+		txnID string // transaction UUID
+		bcks  []*meta.Bck
 
 		wait         bool
 		needReMirror bool
@@ -133,7 +135,7 @@ func (m *bucketMD) add(bck *meta.Bck, p *cmn.Bprops) bool {
 		m.Version = 1 // on-the-fly (e.g. via PUT remote) w/ brand-new cluster
 	}
 	p.SetProvider(bck.Provider)
-	p.BID = meta.NewBID(m.Version, bck.IsAIS())
+	p.BID = core.NewBID(uint64(m.Version), bck.IsAIS())
 	p.Created = time.Now().UnixNano()
 	bck.Props = p
 
@@ -155,7 +157,7 @@ func (m *bucketMD) set(bck *meta.Bck, p *cmn.Bprops) {
 	debug.Assert(apc.IsProvider(bck.Provider))
 	prevProps, present := m.Get(bck)
 	if !present {
-		debug.Assertf(false, "%s: not present", bck)
+		debug.Assertf(false, "%s: not present", bck.String())
 	}
 	debug.Assert(prevProps.BID != 0)
 
@@ -227,6 +229,7 @@ func (m *bucketMD) validateUUID(nbmd *bucketMD, si, nsi *meta.Snode, caller stri
 // as revs
 func (*bucketMD) tag() string       { return revsBMDTag }
 func (m *bucketMD) version() int64  { return m.Version }
+func (m *bucketMD) uuid() string    { return m.UUID }
 func (*bucketMD) jit(p *proxy) revs { return p.owner.bmd.get() }
 
 func (m *bucketMD) sgl() *memsys.SGL {
@@ -417,6 +420,7 @@ func (*bmdOwnerTgt) modify(_ *bmdModifier) (*bucketMD, error) {
 	return nil, nil
 }
 
+//nolint:dupl // BMD vs EtlMD: similar code, different types
 func loadBMD(mpaths fs.MPI, path string) (mainBMD *bucketMD) {
 	for _, mpath := range mpaths {
 		bmd := loadBMDFromMpath(mpath, path)
@@ -426,6 +430,9 @@ func loadBMD(mpaths fs.MPI, path string) (mainBMD *bucketMD) {
 		if mainBMD == nil {
 			mainBMD = bmd
 			continue
+		}
+		if mainBMD.cksum.IsEmpty() {
+			cos.ExitLogf("BMD is not checksummed (%q): %v", mpath, mainBMD)
 		}
 		if mainBMD.cksum.Equal(bmd.cksum) {
 			continue
@@ -507,7 +514,7 @@ func defaultBckProps(args bckPropsArgs) (props *cmn.Bprops) {
 	case args.bck.IsAIS():
 		debug.Assert(args.hdr == nil)
 	case args.bck.Backend() != nil:
-		debug.Assertf(args.hdr == nil, "%s, hdr=%+v", args.bck, args.hdr)
+		debug.Assertf(args.hdr == nil, "%s, hdr=%+v", args.bck.String(), args.hdr)
 	case args.bck.IsRemote():
 		debug.Assert(args.hdr != nil)
 		props.Versioning.Enabled = false

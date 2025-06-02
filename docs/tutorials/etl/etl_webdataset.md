@@ -23,12 +23,12 @@ This tutorial consists of couple steps:
 
 ## Prerequisites
 
-* AIStore cluster deployed on Kubernetes. We recommend following guide: [Deploy AIStore on local Kuberenetes cluster](https://github.com/NVIDIA/ais-k8s/blob/main/operator/README.md)
+* AIStore cluster deployed on Kubernetes. We recommend following guide: [Deploy AIStore on local Kubernetes cluster](https://github.com/NVIDIA/ais-k8s/blob/main/operator/README.md)
 
 ## Prepare dataset
 
 Before we start writing code, let's put an example tarball file with ImageNet images to the AIStore.
-The tarball we will be using is [imagenet-train-000999.tar](https://storage.googleapis.com/nvdata-imagenet/imagenet-train-000999.tar) which is already in WebDataset friendly format.
+The tarball we will be using is [imagenet-train-000999.tar](https://image-net.org/download.php) which is already in WebDataset friendly format.
 
 ```console
 $ tar -tvf imagenet-train-000999.tar | head -n 5

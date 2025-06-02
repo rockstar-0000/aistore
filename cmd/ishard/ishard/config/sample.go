@@ -5,6 +5,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -24,6 +25,11 @@ var (
 	CollapseAllDirPattern = SampleKeyPattern{Regex: `/`, CaptureGroup: ""}
 )
 
+const (
+	WarningPrefix = "[Warning]"
+	ErrorPrefix   = "[Error]"
+)
+
 // MissingExtManager contains the set of expected extensions for each sample, and corresponding reaction
 type MissingExtManager struct {
 	Name             string
@@ -36,11 +42,11 @@ type MissingExtManager struct {
 
 func NewMissingExtManager(name string, sampleExts []string) (*MissingExtManager, error) {
 	if len(sampleExts) == 0 {
-		return nil, fmt.Errorf("invalid extensions, should have at least one specified extension")
+		return nil, errors.New("invalid extensions, should have at least one specified extension")
 	}
 	for _, ext := range sampleExts {
 		if ext == "" {
-			return nil, fmt.Errorf("invalid extensions, extension can't be empty string \"\"")
+			return nil, errors.New("invalid extensions, extension can't be empty string \"\"")
 		}
 	}
 	mgr := &MissingExtManager{
@@ -77,10 +83,10 @@ func (mgr *MissingExtManager) warn(recs *shard.Records) (*shard.Records, error) 
 		mgr.EffectiveObjSize += record.TotalSize()
 		extra, missing := difference(mgr.extSet, record.Objects)
 		for ext := range extra {
-			fmt.Printf("[Warning] sample %s contains extension %s, not specified in `sample_ext` config\n", record.Name, ext)
+			fmt.Printf("%s sample %s contains extension %s, not specified in `sample_ext` config\n", WarningPrefix, record.Name, ext)
 		}
 		for ext := range missing {
-			fmt.Printf("[Warning] extension %s not found in sample %s\n", ext, record.Name)
+			fmt.Printf("%s extension %s not found in sample %s\n", WarningPrefix, ext, record.Name)
 		}
 	}
 
@@ -92,10 +98,10 @@ func (mgr *MissingExtManager) abort(recs *shard.Records) (*shard.Records, error)
 		mgr.EffectiveObjSize += record.TotalSize()
 		extra, missing := difference(mgr.extSet, record.Objects)
 		for ext := range extra {
-			return nil, fmt.Errorf("sample %s contains extension %s, not specified in `sample_ext` config", record.Name, ext)
+			return nil, fmt.Errorf("%s sample %s contains extension %s, not specified in `sample_ext` config", ErrorPrefix, record.Name, ext)
 		}
 		for ext := range missing {
-			return nil, fmt.Errorf("missing extension: extension %s not found in sample %s", ext, record.Name)
+			return nil, fmt.Errorf("%s missing extension: extension %s not found in sample %s", ErrorPrefix, ext, record.Name)
 		}
 	}
 
@@ -121,7 +127,7 @@ func (mgr *MissingExtManager) exclude(recs *shard.Records) (*shard.Records, erro
 
 // difference finds the differences between two sets: `want` and `have`.
 // returns `extra` (extensions in `have` but not in `want`) and `missing` (extensions in `want` but not in `have`).
-func difference(want cos.StrSet, have []*shard.RecordObj) (extra cos.StrSet, missing cos.StrSet) {
+func difference(want cos.StrSet, have []*shard.RecordObj) (extra, missing cos.StrSet) {
 	missing = want.Clone()
 	extra = cos.NewStrSet()
 	for _, obj := range have {

@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -39,7 +39,7 @@ type (
 		isDone() (done bool, err error)
 		set(nlps []core.NLP)
 		// triggers
-		commitAfter(caller string, msg *aisMsg, err error, args ...any) (bool, error)
+		commitAfter(caller string, msg *actMsgExt, err error, args ...any) (bool, error)
 		rsvp(err error)
 		// cleanup
 		abort(error)
@@ -48,13 +48,13 @@ type (
 		String() string
 	}
 	rndzvs struct { // rendezvous records
-		timestamp  int64
 		err        *txnError
 		callerName string
+		timestamp  int64
 	}
 	// two maps, two locks
-	transactions struct {
-		t          *target
+	txns struct {
+		t          *target        // parent
 		m          map[string]txn // by txn.uuid
 		rendezvous struct {
 			m   map[string]rndzvs // ditto
@@ -62,6 +62,9 @@ type (
 		}
 		mtx sync.Mutex
 	}
+)
+
+type (
 	txnError struct { // a wrapper which presence means: "done"
 		err error
 	}
@@ -112,7 +115,7 @@ type (
 		txnBckBase
 	}
 	txnTCObjs struct {
-		xtco *xs.XactTCObjs
+		xtco *xs.XactTCO
 		msg  *cmn.TCOMsg
 		txnBckBase
 	}
@@ -149,17 +152,17 @@ var (
 )
 
 //////////////////
-// transactions //
+// txns //
 //////////////////
 
-func (txns *transactions) init(t *target) {
+func (txns *txns) init(t *target) {
 	txns.t = t
 	txns.m = make(map[string]txn, 8)
 	txns.rendezvous.m = make(map[string]rndzvs, 8)
 	hk.Reg("txn"+hk.NameSuffix, txns.housekeep, hk.DelOldIval)
 }
 
-func (txns *transactions) begin(txn txn, nlps ...core.NLP) (err error) {
+func (txns *txns) begin(txn txn, nlps ...core.NLP) (err error) {
 	txns.mtx.Lock()
 	if x, ok := txns.m[txn.uuid()]; ok {
 		txns.mtx.Unlock()
@@ -181,22 +184,17 @@ func (txns *transactions) begin(txn txn, nlps ...core.NLP) (err error) {
 	return
 }
 
-func (txns *transactions) find(uuid, act string) (txn, error) {
+// find and term: [cleanup | Commit | Abort]
+func (txns *txns) term(uuid, act string) {
+	debug.Assert(act == actTxnCleanup || act == apc.ActCommit || act == apc.ActAbort, "invalid ", act)
+
 	txns.mtx.Lock()
 	txn, ok := txns.m[uuid]
 	if !ok {
-		// a) not found (benign in an unlikely event of failing to commit)
 		txns.mtx.Unlock()
-		return nil, cos.NewErrNotFound(txns.t, "txn "+uuid)
+		return
 	}
 
-	if act == "" {
-		// b) just find & return
-		txns.mtx.Unlock()
-		return txn, nil
-	}
-
-	// or c) cleanup
 	delete(txns.m, uuid)
 	txns.mtx.Unlock()
 
@@ -207,17 +205,24 @@ func (txns *transactions) find(uuid, act string) (txn, error) {
 	if act == apc.ActAbort {
 		txn.abort(errors.New("action: abort")) // NOTE: may call txn-specific abort, e.g. TxnAbort
 	} else {
-		debug.Assert(act == apc.ActCommit || act == ActCleanup, act)
 		txn.unlock()
 	}
-
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		nlog.Infof("%s %s: %s", txns.t, act, txn)
 	}
-	return txn, nil
 }
 
-func (txns *transactions) commitBefore(caller string, msg *aisMsg) error {
+func (txns *txns) find(uuid string) (_ txn, err error) {
+	txns.mtx.Lock()
+	found, ok := txns.m[uuid]
+	txns.mtx.Unlock()
+	if !ok {
+		err = cos.NewErrNotFound(txns.t, "txn["+uuid+"]")
+	}
+	return found, err
+}
+
+func (txns *txns) commitBefore(caller string, msg *actMsgExt) error {
 	var (
 		rndzvs rndzvs
 		ok     bool
@@ -233,7 +238,7 @@ func (txns *transactions) commitBefore(caller string, msg *aisMsg) error {
 	return fmt.Errorf("rendezvous record %s:%d already exists", msg.UUID, rndzvs.timestamp)
 }
 
-func (txns *transactions) commitAfter(caller string, msg *aisMsg, err error, args ...any) (errDone error) {
+func (txns *txns) commitAfter(caller string, msg *actMsgExt, err error, args ...any) (errDone error) {
 	txns.mtx.Lock()
 	txn, ok := txns.m[msg.UUID]
 	txns.mtx.Unlock()
@@ -266,7 +271,7 @@ func (txns *transactions) commitAfter(caller string, msg *aisMsg, err error, arg
 }
 
 // given txn, wait for its completion, handle timeout, and ultimately remove
-func (txns *transactions) wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err error) {
+func (txns *txns) wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err error) {
 	// timestamp
 	txn.started(apc.ActCommit, time.Now())
 
@@ -285,12 +290,12 @@ func (txns *transactions) wait(txn txn, timeoutNetw, timeoutHost time.Duration) 
 	if err != nil {
 		act = apc.ActAbort
 	}
-	txns.find(txn.uuid(), act)
+	txns.term(txn.uuid(), act)
 	return err
 }
 
 // poll for 'done'
-func (txns *transactions) _wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err error) {
+func (txns *txns) _wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err error) {
 	var (
 		sleep       = 100 * time.Millisecond
 		done, found bool
@@ -300,7 +305,7 @@ func (txns *transactions) _wait(txn txn, timeoutNetw, timeoutHost time.Duration)
 			return err
 		}
 		// aborted?
-		if _, err = txns.find(txn.uuid(), ""); err != nil {
+		if _, err = txns.find(txn.uuid()); err != nil {
 			return err
 		}
 
@@ -331,8 +336,8 @@ func (txns *transactions) _wait(txn txn, timeoutNetw, timeoutHost time.Duration)
 	return err
 }
 
-// GC orphaned transactions
-func (txns *transactions) housekeep(int64) (d time.Duration) {
+// GC orphaned txns
+func (txns *txns) housekeep(int64) (d time.Duration) {
 	var (
 		errs    []error
 		orphans []txn
@@ -343,7 +348,7 @@ func (txns *transactions) housekeep(int64) (d time.Duration) {
 	l := len(txns.m)
 	if l == 0 {
 		txns.mtx.Unlock()
-		return
+		return d
 	}
 	if l > max(gcTxnsNumKeep<<2, 32) {
 		d >>= 2
@@ -365,10 +370,10 @@ func (txns *transactions) housekeep(int64) (d time.Duration) {
 	if len(orphans) > 0 || len(errs) > 0 {
 		go txns.cleanup(orphans, errs)
 	}
-	return
+	return d
 }
 
-func (txns *transactions) cleanup(orphans []txn, errs []error) {
+func (txns *txns) cleanup(orphans []txn, errs []error) {
 	if len(orphans) > 0 {
 		txns.rendezvous.mtx.Lock()
 		for _, txn := range orphans {
@@ -489,7 +494,7 @@ func (txn *txnBckBase) String() string {
 	return fmt.Sprintf("txn-%s[%s]-%s%s%s]", txn.action, txn.uid, txn.bck.Bucket().String(), tm, res)
 }
 
-func (txn *txnBckBase) commitAfter(caller string, msg *aisMsg, err error, args ...any) (found bool, errDone error) {
+func (txn *txnBckBase) commitAfter(caller string, msg *actMsgExt, err error, args ...any) (found bool, errDone error) {
 	if txn.callerName != caller || msg.UUID != txn.uuid() {
 		return
 	}
@@ -581,7 +586,7 @@ func (txn *txnTCB) String() string {
 // txnTCObjs //
 ///////////////
 
-func newTxnTCObjs(c *txnSrv, bckFrom *meta.Bck, xtco *xs.XactTCObjs, msg *cmn.TCOMsg) (txn *txnTCObjs) {
+func newTxnTCObjs(c *txnSrv, bckFrom *meta.Bck, xtco *xs.XactTCO, msg *cmn.TCOMsg) (txn *txnTCObjs) {
 	txn = &txnTCObjs{xtco: xtco, msg: msg}
 	txn.init(bckFrom)
 	txn.fillFromCtx(c)

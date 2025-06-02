@@ -5,9 +5,8 @@ Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 """
 
 from unittest import TestCase
-from tests.integration import CLUSTER_ENDPOINT
-from tests.utils import destroy_bucket, random_string
-from aistore import Client
+from tests.integration.sdk import DEFAULT_TEST_CLIENT
+from tests.utils import random_string
 from random import randint
 from aistore.pytorch import AISMapDataset, DynamicBatchSampler
 from torch.utils.data import DataLoader
@@ -28,13 +27,13 @@ class TestAISSampler(TestCase):
 
     def setUp(self) -> None:
         self.bck_name = random_string()
-        self.client = Client(CLUSTER_ENDPOINT)
+        self.client = DEFAULT_TEST_CLIENT
         self.bck = self.client.bucket(self.bck_name)
         self.bck.create()
 
         for i in range(NUM_OBJECTS):
             content = b"\0" * (randint(0, (MAX_OBJ_SIZE - MIN_OBJ_SIZE)) + MIN_OBJ_SIZE)
-            self.bck.object(f"object-{i}").put_content(content)
+            self.bck.object(f"object-{i}").get_writer().put_content(content)
 
         self.dataset = AISMapDataset(ais_source_list=self.bck)
 
@@ -42,7 +41,7 @@ class TestAISSampler(TestCase):
         """
         Cleanup after each test, destroy the bucket if it exists
         """
-        destroy_bucket(self.client, self.bck_name)
+        self.bck.delete(missing_ok=True)
 
     def test_dynamic_sampler(self):
         # Create dataloader using dynamic batch sampler

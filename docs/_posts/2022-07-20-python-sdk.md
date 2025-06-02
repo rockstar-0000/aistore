@@ -12,7 +12,7 @@ Python has grounded itself as a popular language of choice among data scientists
 
 [AIStore Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore) is a project which includes a growing library of client-side APIs to easily access and utilize AIStore clusters, objects, and buckets, as well as a number of tools for AIStore usage/integration with PyTorch.
 
-The [AIStore Python API](https://aiatscale.org/docs/python-api) is essentially a Python port of AIStore's [Go APIs](https://github.com/NVIDIA/aistore/tree/main/api). In terms of functionality, the AIStore Python and Go APIs are quite similar, both of which essentially make simple [HTTP requests](https://aiatscale.org/docs/http-api#api-reference) to an AIStore endpoint. The HTTP requests allow the APIs to interact (reads and writes) with an AIStore instance's metadata. The API provides convenient and flexible ways (similar to those provided by the [CLI](https://aiatscale.org/docs/cli)) to move data (as objects) in and out of buckets on AIStore, manage AIStore clusters, and much more.
+The [AIStore Python API](https://aistore.nvidia.com/docs/python-sdk) is essentially a Python port of AIStore's [Go APIs](https://github.com/NVIDIA/aistore/tree/main/api). In terms of functionality, the AIStore Python and Go APIs are quite similar, both of which essentially make simple [HTTP requests](https://aiatscale.org/docs/http-api#api-reference) to an AIStore endpoint. The HTTP requests allow the APIs to interact (reads and writes) with an AIStore instance's metadata. The API provides convenient and flexible ways (similar to those provided by the [CLI](https://aiatscale.org/docs/cli)) to move data (as objects) in and out of buckets on AIStore, manage AIStore clusters, and much more.
 
 This technical blog will demonstrate a few potential ways the Python API provided in the [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore) could be used with a running AIStore instance to manage and utilize data.
 
@@ -111,7 +111,7 @@ OBJECT_NAME = "tinyimagenet-compressed.zip"
 client.bucket(BUCKET_NAME).object(OBJECT_NAME).get()
 ```
 
-If we want to get the *uncompressed* TinyImageNet from AIStore bucket `ais://tinyimagenet_uncompressed`, we can easily do that with [Bucket.list_objects()](https://aiatscale.org/docs/python-api#bucket.Bucket.list_objects) and [Object.get()](https://aiatscale.org/docs/python-api#object.Object.get).
+If we want to get the *uncompressed* TinyImageNet from AIStore bucket `ais://tinyimagenet_uncompressed`, we can easily do that with [Bucket.list_objects()](https://aistore.nvidia.com/docs/python-sdk#bucket.Bucket.list_objects) and [Object.get()](https://aistore.nvidia.com/docs/python-sdk#obj.object.Object.get).
 
 ```python
 BUCKET_NAME = "tinyimagenet_uncompressed"
@@ -124,7 +124,7 @@ for FILENAME in TINYIMAGENET_UNCOMPRESSED:
     client.bucket(BUCKET_NAME).object(FILENAME.name).get()
 ```
 
-We can also pick a *specific* section of the uncompressed dataset and only get those specific objects. By specifying a `prefix` to our [Bucket.list_objects()](https://aiatscale.org/docs/python-api#bucket.Bucket.list_objects) call, we can manipulate the *symbolic* file system and list only the contents in our desired directory.
+We can also pick a *specific* section of the uncompressed dataset and only get those specific objects. By specifying a `prefix` to our [Bucket.list_objects()](https://aistore.nvidia.com/docs/python-sdk#bucket.Bucket.list_objects) call, we can manipulate the *symbolic* file system and list only the contents in our desired directory.
 
 ```python
 BUCKET_NAME = "tinyimagenet_uncompressed"
@@ -161,7 +161,7 @@ docker run -d \
 
 > Deploying an AIStore cluster with third-party cloud backends simply *imports/copies the buckets and objects from the provided third-party backends to AIStore*. The client-side APIs themselves do **not** interact with the actual external backends at any point. The client-side APIs only interact with duplicate instances of those external cloud storage buckets residing in the AIStore cluster.
 
-The [Object.get()](https://aiatscale.org/docs/python-api#object.Object.get) works with external cloud storage buckets as well. We can use the method in a similar fashion as shown previously to easily get either a compressed or uncompressed version of the dataset from, for examples, `gcp://tinyimagenet_compressed` and `gcp://tinyimagenet_uncompressed`. 
+The [Object.get()](https://aistore.nvidia.com/docs/python-sdk#obj.object.Object.get) works with external cloud storage buckets as well. We can use the method in a similar fashion as shown previously to easily get either a compressed or uncompressed version of the dataset from, for examples, `gcp://tinyimagenet_compressed` and `gcp://tinyimagenet_uncompressed`. 
 
 ```python
 # Getting compressed TinyImageNet dataset from [gcp://tinyimagenet_compressed]
@@ -183,9 +183,9 @@ for FILENAME in TINYIMAGENET_UNCOMPRESSED_VAL:
     client.bucket(BUCKET_NAME).object(FILENAME.name).get()
 ```
 
-> Note the added argument `provider` supplied in [`Client.bucket()`](https://aiatscale.org/docs/python-api#api.Client.bucket) for the examples shown above.
+> Note the added argument `provider` supplied in [`Client.bucket()`](https://aistore.nvidia.com/docs/python-sdk#client.Client.bucket) for the examples shown above.
 
-We can instead choose to *copy* the contents of an external cloud storage bucket on AIStore to a native (AISProvider) AIStore bucket with [`Bucket.copy()`](https://aiatscale.org/docs/python-api#bucket.Bucket.copy) as well:
+We can instead choose to *copy* the contents of an external cloud storage bucket on AIStore to a native (AISProvider) AIStore bucket with [`Bucket.copy()`](https://aistore.nvidia.com/docs/python-sdk#bucket.Bucket.copy) as well:
 
 ```python
 # Copy bucket [gcp://tinyimagenet_uncompressed] and its objects to new bucket [ais://tinyimagetnet_validationset]
@@ -197,21 +197,23 @@ client.bucket(FROM_BUCKET, provider="gcp").copy(TO_BUCKET)
 client.bucket(FROM_BUCKET, provider="gcp").evict()
 ```
 
-Eviction of a cloud storage bucket destroys any instance of the cloud storage bucket (and its objects) from the AIStore cluster metadata. Eviction does **not** delete or affect the actual cloud storage bucket (in AWS S3, GCP, or Azure).
+Eviction of a cloud storage bucket destroys any instance of the cloud storage bucket (and its objects) from the AIStore cluster metadata. Eviction does **not** delete or affect the actual cloud storage bucket (in AWS S3, GCP, Azure, or OCI).
 
 
 ## PyTorch
 
-PyTorch provides built-in [tools](https://github.com/pytorch/data/tree/main/torchdata/datapipes/iter/load#aistore-io-datapipe) for AIStore integration, allowing machine learning developers to easily use AIStore as a viable storage system option with PyTorch. In fact, the dataloading classes [`AISFileLister`](https://pytorch.org/data/main/generated/torchdata.datapipes.iter.AISFileLister.html#aisfilelister) and [`AISFileLoader`](https://pytorch.org/data/main/generated/torchdata.datapipes.iter.AISFileLoader.html#torchdata.datapipes.iter.AISFileLoader) found in [`aisio.py`](https://github.com/pytorch/data/blob/main/torchdata/datapipes/iter/load/aisio.py) provided by PyTorch make use of several of the client-side APIs referenced in this article.
+> **Note:** The `torchdata.datapipes` module has been [deprecated and removed](https://github.com/pytorch/data?tab=readme-ov-file#torchdata-see-note-below-on-current-status) in recent versions of `torchdata`. Some information in this section may be outdated.
+
+PyTorch provides built-in [tools](https://github.com/NVIDIA/aistore/blob/main/python/aistore/pytorch/aisio.py) for AIStore integration, allowing machine learning developers to easily use AIStore as a viable storage system option with PyTorch. In fact, the dataloading classes [`AISFileLister`](https://pytorch.org/data/0.8/generated/torchdata.datapipes.iter.AISFileLister.html) and [`AISFileLoader`](https://pytorch.org/data/0.8/generated/torchdata.datapipes.iter.AISFileLoader.html) found in [`aisio.py`](https://github.com/NVIDIA/aistore/blob/main/python/aistore/pytorch/aisio.py) provided by PyTorch make use of several of the client-side APIs referenced in this article.
 
 For more information on dataloading from AIStore with PyTorch, please refer to this [article](https://aiatscale.org/blog/2022/07/12/aisio-pytorch).
 
 
 ## More Examples & Resources
 
-For more examples, please refer to additional documentation [AIStore Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore) and try out the [SDK tutorial (Jupyter Notebook)](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk-tutorial.ipynb).
+For more examples, please refer to additional documentation [AIStore Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore) and try out the [SDK tutorial (Jupyter Notebook)](https://github.com/NVIDIA/aistore/blob/main/python/examples/sdk/sdk-basics.ipynb).
 
-For information on specific API usage, please refer to the [API reference](https://aiatscale.org/docs/python-api).
+For information on specific API usage, please refer to the [API reference](https://aistore.nvidia.com/docs/python-sdk).
 
 
 ## References

@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -21,6 +21,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -108,7 +109,7 @@ begin:
 outer:
 	switch owner {
 	case "": // not owned
-		return
+		return false
 	case equalIC:
 		if selfIC {
 			owner = ic.p.SID()
@@ -134,7 +135,7 @@ outer:
 		debug.Assertf(smap.IsIC(psi), "%s, %s", psi, smap.StrIC(ic.p.si))
 	}
 	if owner == ic.p.SID() {
-		return
+		return false
 	}
 	// otherwise, hand it over
 	if msg != nil {
@@ -304,7 +305,7 @@ func (ic *ic) handleGet(w http.ResponseWriter, r *http.Request) {
 func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 	var (
 		smap = ic.p.owner.smap.get()
-		msg  = &aisMsg{}
+		msg  = &actMsgExt{}
 	)
 	if err := cmn.ReadJSON(w, r, msg); err != nil {
 		return
@@ -429,7 +430,7 @@ func (ic *ic) syncICBundle() error {
 			Query:  url.Values{apc.QparamWhat: []string{apc.WhatICBundle}},
 		}
 		cargs.timeout = cmn.Rom.CplaneOperation()
-		cargs.cresv = cresIC{} // -> icBundle
+		cargs.cresv = cresjGeneric[icBundle]{}
 	}
 	res := ic.p.call(cargs, smap)
 	freeCargs(cargs)

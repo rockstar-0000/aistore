@@ -15,10 +15,12 @@ The final pipeline will transform, decode, shuffle, and batch samples on demand 
 
 ## Datasets, DataPipes, DataLoaders
 
+> **Note:** The `torchdata.datapipes` module has been [deprecated and removed](https://github.com/pytorch/data?tab=readme-ov-file#torchdata-see-note-below-on-current-status) in recent versions of `torchdata`. Some information in this blog post may be outdated.
+
 First, it's important to understand the difference between each of the PyTorch types:
 
 - [Dataset](https://pytorch.org/docs/stable/data.html#dataset-types) -- Datasets provide access to the data and can either be a map-style or iterable-style. 
-- [TorchData DataPipes](https://pytorch.org/data/main/torchdata.datapipes.iter.html) -- The beta TorchData library provides DataPipes, which PyTorch calls "a renaming and repurposing of the PyTorch Dataset for composed usage" (see [TorchData Github - What are DataPipes?](https://github.com/pytorch/data#what-are-datapipes)). A subclass of Dataset, DataPipes are a newer implementation designed for more flexibility in designing pipelines and are compatible with the newer [DataLoader2](https://pytorch.org/data/main/dataloader2.html).
+- [TorchData DataPipes](https://pytorch.org/data/0.3/torchdata.datapipes.iter.html) -- The beta TorchData library provides DataPipes, which PyTorch calls "a renaming and repurposing of the PyTorch Dataset for composed usage" (see [TorchData Github - What are DataPipes?](https://github.com/pytorch/data#what-are-datapipes)). A subclass of Dataset, DataPipes are a newer implementation designed for more flexibility in designing pipelines and are compatible with the newer [DataLoader2](https://pytorch.org/data/0.5/dataloader2.html).
 - [DataLoader](https://pytorch.org/docs/stable/data.html#module-torch.utils.data) -- The DataLoader manages interactions with a Dataset, scheduling workers to fetch new samples as needed and performing cross-dataset operations such as shuffling and batching. It is the final step in the pipeline and ultimately provides the arrays of input data to the model for training. 
 
 Both WebDataset and AIStore provide their own implementations of these tools: 

@@ -1,6 +1,6 @@
 // Package mirror provides local mirroring and replica management
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mirror
 
@@ -84,12 +84,12 @@ func newMNC(p *mncFactory, slab *memsys.Slab) (r *mncXact) {
 		Throttle: true,
 	}
 	mpopts.Bck.Copy(p.Bck.Bucket())
-	r.BckJog.Init(p.UUID(), apc.ActMakeNCopies, p.Bck, mpopts, cmn.GCO.Get())
+	s := fmt.Sprintf("%s-copies-%d", r.p.args.Tag, r.p.args.Copies)
+	r.BckJog.Init(p.UUID(), apc.ActMakeNCopies, s /*ctlmsg*/, p.Bck, mpopts, cmn.GCO.Get())
 
 	// name
-	s := fmt.Sprintf("-%s-copies-%d", r.p.args.Tag, r.p.args.Copies)
-	r._nam = r.Base.Name() + s
-	r._str = r.Base.String() + s
+	r._nam = r.Base.Name() + "-" + s
+	r._str = r.Base.String() + "-" + s
 	return r
 }
 
@@ -143,7 +143,7 @@ func (r *mncXact) visitObj(lom *core.LOM, buf []byte) (err error) {
 				r.AddErr(err)
 			}
 		}
-		return
+		return err
 	}
 
 	if cmn.Rom.FastV(5, cos.SmoduleMirror) {
@@ -153,10 +153,11 @@ func (r *mncXact) visitObj(lom *core.LOM, buf []byte) (err error) {
 	if cnt := r.Objs(); cnt%128 == 0 { // TODO: configurable
 		cs := fs.Cap()
 		if errCap := cs.Err(); errCap != nil {
-			r.Abort(err)
+			r.Abort(errCap)
+			err = errCap
 		}
 	}
-	return
+	return err
 }
 
 func (r *mncXact) String() string { return r._str }

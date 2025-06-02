@@ -3,16 +3,14 @@ Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 """
 
 import os
-from typing import Optional
+from typing import Optional, Tuple, Union
 from multiprocessing import current_process
 
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 
-from aistore.sdk.const import AIS_CLIENT_CA
-
-DEFAULT_RETRY = Retry(total=6, connect=3, backoff_factor=1)
+from aistore.sdk.const import AIS_CLIENT_CA, AIS_CLIENT_KEY, AIS_CLIENT_CRT, HTTPS, HTTP
 
 
 class SessionManager:
@@ -20,21 +18,35 @@ class SessionManager:
     Class for storing and creating requests library sessions.
 
     Args:
-        retry (urllib3.Retry, optional): Retry configuration object from the urllib3 library.
-            Default: Retry(total=6, connect=3, backoff_factor=1).
+        retry (urllib3.Retry, optional): Defines the HTTP retry strategy using `urllib3.Retry`.
+            Defaults to `RetryConfig.default().http_retry`, which handles transient HTTP failures.
         skip_verify (bool, optional): If True, skip SSL certificate verification. Defaults to False.
         ca_cert (str, optional): Path to a CA certificate file for SSL verification. Defaults to None.
+        client_cert (Union[str, Tuple[str, str], None], optional): Path to a client certificate PEM file
+            or a path pair (cert, key) for mTLS. If not provided, 'AIS_CRT' and 'AIS_CRT_KEY' environment
+            variables will be used. Defaults to None.
+        max_pool_size (int, optional): Maximum number of connections per host in the connection pool.
+            Defaults to 10.
     """
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def __init__(
         self,
-        retry: Retry = DEFAULT_RETRY,
+        retry: Optional[Retry] = None,
         ca_cert: Optional[str] = None,
         skip_verify: bool = False,
+        client_cert: Optional[Union[str, Tuple[str, str]]] = None,
+        max_pool_size: int = 10,
     ):
         self._retry = retry
         self._ca_cert = ca_cert
         self._skip_verify = skip_verify
+        if not client_cert:
+            cert = os.getenv(AIS_CLIENT_CRT)
+            key = os.getenv(AIS_CLIENT_KEY)
+            client_cert = (cert, key) if cert and key else None
+        self._client_cert = client_cert
+        self._max_pool_size = max_pool_size
         self._session_pool = {current_process().pid: self._create_session()}
 
     @property
@@ -46,6 +58,11 @@ class SessionManager:
     def ca_cert(self) -> Optional[str]:
         """Returns CA certificate for this session, if any."""
         return self._ca_cert
+
+    @property
+    def client_cert(self) -> Optional[Union[str, Tuple[str, str]]]:
+        """Returns client certificate for this session, if any."""
+        return self._client_cert
 
     @property
     def skip_verify(self) -> bool:
@@ -88,7 +105,15 @@ class SessionManager:
             New HTTP request Session
         """
         request_session = Session()
+        request_session.cert = self._client_cert
         self._set_session_verification(request_session)
-        for protocol in ("http://", "https://"):
-            request_session.mount(protocol, HTTPAdapter(max_retries=self._retry))
+
+        adapter = HTTPAdapter(
+            max_retries=self._retry,
+            pool_connections=self._max_pool_size,
+            pool_maxsize=self._max_pool_size,
+        )
+
+        for protocol in (HTTP, HTTPS):
+            request_session.mount(protocol, adapter)
         return request_session

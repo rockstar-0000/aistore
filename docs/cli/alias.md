@@ -1,17 +1,33 @@
----
-layout: post
-title: ALIAS
-permalink: /docs/cli/alias
-redirect_from:
- - /cli/alias.md/
- - /docs/cli/alias.md/
----
-
 # CLI Reference for Aliases
 
 AIS CLI supports user-defined aliases, similar to the Unix `alias` command. Defining your own alias for an existing command can make the AIS CLI more intuitive and efficient to use.
 
 > [Auto-complete](/docs/cli.md) options also hold for the alias you create!
+
+The current set of default aliases (which you may also redefine or remove at any time) includes:
+
+```console
+$ ais alias
+ALIAS           COMMAND
+=====           =======
+cp              bucket cp
+create          bucket create
+evict           bucket evict
+ls              bucket ls
+rmb             bucket rm
+start           job start
+blob-download   job start blob-download
+download        job start download
+dsort           job start dsort
+stop            job stop
+wait            job wait
+get             object get
+prefetch        object prefetch
+put             object put
+rmo             object rm
+space-cleanup   storage cleanup
+scrub           storage validate
+```
 
 ## Table of Contents
 

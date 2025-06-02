@@ -3,7 +3,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -15,7 +15,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 const ua = "aisnode/streams"
@@ -29,23 +28,13 @@ func whichClient() string { return "net/http" }
 // intra-cluster networking: net/http client
 func NewIntraDataClient() (client *http.Client) {
 	config := cmn.GCO.Get()
+	httcfg := &config.Net.HTTP
 
-	// compare with ais/hcommon.go
-	wbuf, rbuf := config.Net.HTTP.WriteBufferSize, config.Net.HTTP.ReadBufferSize
-	if wbuf == 0 {
-		wbuf = cmn.DefaultWriteBufferSize
-	}
-	if rbuf == 0 {
-		rbuf = cmn.DefaultReadBufferSize
-	}
-	tcpbuf := config.Net.L4.SndRcvBufSize
-	if tcpbuf == 0 {
-		tcpbuf = cmn.DefaultSendRecvBufferSize
-	}
+	// (compare with cmn/client.go)
 	cargs := cmn.TransportArgs{
-		SndRcvBufSize:   tcpbuf,
-		WriteBufferSize: wbuf,
-		ReadBufferSize:  rbuf,
+		SndRcvBufSize:   cos.NonZero(config.Net.L4.SndRcvBufSize, int(cmn.DefaultSndRcvBufferSize)),
+		WriteBufferSize: cos.NonZero(httcfg.WriteBufferSize, int(cmn.DefaultWriteBufferSize)),
+		ReadBufferSize:  cos.NonZero(httcfg.ReadBufferSize, int(cmn.DefaultReadBufferSize)),
 	}
 	if config.Net.HTTP.UseHTTPS {
 		client = cmn.NewClientTLS(cargs, config.Net.HTTP.ToTLS(), true /*intra-cluster*/) // streams
@@ -55,31 +44,38 @@ func NewIntraDataClient() (client *http.Client) {
 	return
 }
 
-func (s *streamBase) do(body io.Reader) (err error) {
-	var (
-		request  *http.Request
-		response *http.Response
-	)
-	if request, err = http.NewRequest(http.MethodPut, s.dstURL, body); err != nil {
-		return
-	}
-	if s.streamer.compressed() {
-		request.Header.Set(apc.HdrCompress, apc.LZ4Compression)
-	}
-	request.Header.Set(apc.HdrSessID, strconv.FormatInt(s.sessID, 10))
-	request.Header.Set(cos.HdrUserAgent, ua)
-
-	response, err = s.client.Do(request)
+func (s *streamBase) doPlain(body io.Reader) error {
+	req, err := http.NewRequest(http.MethodPut, s.dstURL, body)
 	if err != nil {
-		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
-			nlog.Errorln(s.String(), "err:", err)
-		}
-		return
+		return err
 	}
-	cos.DrainReader(response.Body)
-	response.Body.Close()
-	if s.streamer.compressed() {
-		s.streamer.resetCompression()
+	return s._do(req)
+}
+
+func (s *streamBase) doCmpr(body io.Reader) error {
+	req, err := http.NewRequest(http.MethodPut, s.dstURL, body)
+	if err != nil {
+		return err
 	}
-	return
+	req.Header.Set(apc.HdrCompress, apc.LZ4Compression)
+	err = s._do(req)
+	s.streamer.resetCompression()
+	return err
+}
+
+func (s *streamBase) _do(req *http.Request) error {
+	req.Header.Set(apc.HdrSessID, strconv.FormatInt(s.sessID, 10))
+	req.Header.Set(cos.HdrUserAgent, ua)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		s.yelp(err)
+		return err
+	}
+	_, err = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		s.yelp(err)
+	}
+	return nil
 }

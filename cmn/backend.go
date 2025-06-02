@@ -1,13 +1,14 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -15,8 +16,12 @@ import (
 )
 
 type backendFuncs struct {
-	EncodeVersion func(v any) (version string, isSet bool)
-	EncodeCksum   func(v any) (cksumValue string, isSet bool)
+	EncodeVersion  func(v any) (version string, isSet bool)
+	EncodeETag     func(v any) (etag string, isSet bool)
+	EncodeCksum    func(v any) (cksumValue string, isSet bool)
+	EncodeMetadata func(metadata map[string]string) (header map[string]string)
+
+	DecodeMetadata func(header http.Header) (metadata map[string]string)
 }
 
 // from https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html
@@ -24,7 +29,13 @@ type backendFuncs struct {
 // not it is depends on how the object was created and how it is encrypted..."
 const AwsMultipartDelim = "-"
 
-func IsS3MultipartEtag(etag string) bool {
+// Due to import cycle we need to define "x-amz-meta" header here
+// See also:
+// - ais/s3/const.go
+// - https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html#UserMetadata
+const AwsHeaderMetaPrefix = "X-Amz-Meta-"
+
+func isS3MultipartEtag(etag string) bool {
 	return strings.Contains(etag, AwsMultipartDelim)
 }
 
@@ -40,6 +51,7 @@ var BackendHelpers = struct {
 	Amazon backendFuncs
 	Azure  backendFuncs
 	Google backendFuncs
+	OCI    backendFuncs
 	HTTP   backendFuncs
 }{
 	Amazon: backendFuncs{
@@ -60,19 +72,72 @@ var BackendHelpers = struct {
 				return "", false
 			}
 		},
-		EncodeCksum: func(v any) (string, bool) {
+		// ETag is set whenever it is non-empty. Store with quotes.
+		EncodeETag: func(v any) (string, bool) {
 			switch x := v.(type) {
 			case *string:
-				if IsS3MultipartEtag(*x) {
-					return *x, true // return as-is multipart
-				}
-				return UnquoteCEV(*x), true
+				return *x, *x != ""
 			case string:
-				return x, true
+				return x, x != ""
 			default:
 				debug.FailTypeCast(v)
 				return "", false
 			}
+		},
+		// Cksum is set whenever it is non-empty, and it is not a multipart etag,
+		// we just need to remove quotes.
+		// From https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html:
+		// - "The entity tag is a hash of the object. The ETag reflects changes only
+		//    to the contents of an object, not its metadata."
+		// - "The ETag may or may not be an MD5 digest of the object data. Whether or
+		//    not it is depends on how the object was created and how it is encrypted..."
+		EncodeCksum: func(v any) (string, bool) {
+			switch x := v.(type) {
+			case *string:
+				if x == nil || *x == "" {
+					return "", false
+				}
+				if isS3MultipartEtag(*x) {
+					return "", false
+				}
+				return UnquoteCEV(*x), true
+			case string:
+				if x == "" {
+					return "", false
+				}
+				if isS3MultipartEtag(x) {
+					return "", false
+				}
+				return UnquoteCEV(x), true
+			default:
+				debug.FailTypeCast(v)
+				return "", false
+			}
+		},
+		EncodeMetadata: func(metadata map[string]string) (header map[string]string) {
+			if len(metadata) == 0 {
+				return
+			}
+			header = make(map[string]string, len(metadata))
+			for k, v := range metadata {
+				key := http.CanonicalHeaderKey(AwsHeaderMetaPrefix + k)
+				header[key] = v
+			}
+			return
+		},
+
+		DecodeMetadata: func(header http.Header) (metadata map[string]string) {
+			for headerKey := range header {
+				if strings.HasPrefix(headerKey, AwsHeaderMetaPrefix) {
+					if metadata == nil {
+						metadata = make(map[string]string)
+					}
+					key := strings.TrimPrefix(headerKey, AwsHeaderMetaPrefix)
+					value := header.Get(headerKey)
+					metadata[key] = value
+				}
+			}
+			return
 		},
 	},
 	Google: backendFuncs{
@@ -82,6 +147,15 @@ var BackendHelpers = struct {
 				return x, x != ""
 			case int64:
 				return strconv.FormatInt(x, 10), true
+			default:
+				debug.FailTypeCast(v)
+				return "", false
+			}
+		},
+		EncodeETag: func(v any) (string, bool) {
+			switch x := v.(type) {
+			case string:
+				return x, x != ""
 			default:
 				debug.FailTypeCast(v)
 				return "", false
@@ -108,13 +182,40 @@ var BackendHelpers = struct {
 			}
 		},
 	},
+	OCI: backendFuncs{
+		EncodeVersion: func(_ any) (string, bool) {
+			return "", false
+		},
+		EncodeETag: func(v any) (string, bool) {
+			switch x := v.(type) {
+			case *string:
+				if x == nil || *x == "" {
+					return "", false
+				}
+				return UnquoteCEV(*x), true
+			default:
+				debug.FailTypeCast(v)
+				return "", false
+			}
+		},
+		EncodeCksum: func(v any) (string, bool) {
+			switch x := v.(type) {
+			case *string:
+				if x == nil || *x == "" {
+					return "", false
+				}
+				return UnquoteCEV(*x), true
+			default:
+				debug.FailTypeCast(v)
+				return "", false
+			}
+		},
+	},
 	HTTP: backendFuncs{
-		EncodeVersion: func(v any) (string, bool) {
+		EncodeETag: func(v any) (string, bool) {
 			switch x := v.(type) {
 			case string:
 				// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
-				x = strings.TrimPrefix(x, "W/")
-				x = UnquoteCEV(x)
 				return x, x != ""
 			default:
 				debug.FailTypeCast(v)

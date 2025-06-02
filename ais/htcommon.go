@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -31,9 +31,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/xact/xreg"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/tinylib/msgp/msgp"
 )
@@ -72,18 +72,11 @@ type (
 	}
 
 	// extend control msg: ActionMsg with an extra information for node <=> node control plane communications
-	aisMsg struct {
+	actMsgExt struct {
 		apc.ActMsg
 		UUID       string `json:"uuid"` // cluster-wide ID of this action (operation, transaction)
 		BMDVersion int64  `json:"bmdversion,string"`
 		RMDVersion int64  `json:"rmdversion,string"`
-	}
-
-	cleanmark struct {
-		OldVer      int64 `json:"oldver,string"`
-		NewVer      int64 `json:"newver,string"`
-		Interrupted bool  `json:"interrupted"`
-		Restarted   bool  `json:"restarted"`
 	}
 )
 
@@ -141,9 +134,9 @@ type (
 	}
 
 	networkHandler struct {
-		r   string           // resource
 		h   http.HandlerFunc // handler
-		net netAccess        // handler network access
+		r   string           // resource
+		net netAccess        // handler's network access
 	}
 
 	nodeRegPool []cluMeta
@@ -175,10 +168,11 @@ type (
 
 	// http server and http runner (common for proxy and target)
 	netServer struct {
-		sync.Mutex
 		s             *http.Server
 		muxers        httpMuxers
 		sndRcvBufSize int
+		sync.Mutex
+		lowLatencyToS bool
 	}
 
 	nlogWriter struct{}
@@ -191,10 +185,16 @@ type (
 	errBmdUUIDSplit     struct{ detail string }
 	errSmapUUIDDiffer   struct{ detail string } // ditto Smap
 	errNodeNotFound     struct {
+		si   *meta.Snode // self
+		smap *smapX
 		msg  string
 		id   string
+	}
+	errSelfNotFound struct {
 		si   *meta.Snode
 		smap *smapX
+		act  string
+		tag  string
 	}
 	errNotEnoughTargets struct {
 		si       *meta.Snode
@@ -223,8 +223,8 @@ var htverbs = [...]string{
 var (
 	errRebalanceDisabled = errors.New("rebalance is disabled")
 	errForwarded         = errors.New("forwarded")
-	errSendingResp       = errors.New("err-sending-resp")
 	errFastKalive        = errors.New("cannot fast-keepalive")
+	errIntraControl      = errors.New("expected intra-control request")
 )
 
 // BMD uuid errs
@@ -236,6 +236,9 @@ func (e *errPrxBmdUUIDDiffer) Error() string { return e.detail }
 func (e *errSmapUUIDDiffer) Error() string   { return e.detail }
 func (e *errNodeNotFound) Error() string {
 	return fmt.Sprintf("%s: %s node %s not present in the %s", e.si, e.msg, e.id, e.smap)
+}
+func (e *errSelfNotFound) Error() string {
+	return fmt.Sprintf("%s: %s failure: not finding self in the %s %s", e.si, e.act, e.tag, e.smap.StringEx())
 }
 
 /////////////////////
@@ -340,9 +343,19 @@ func freeCargs(a *callArgs) {
 	cargsPool.Put(a)
 }
 
-///////////////////////
-// call result pools //
-///////////////////////
+////////////////
+// call result: generics and pools
+////////////////
+
+type (
+	cresjGeneric[T any] struct{}
+	cresmGeneric[T any] struct{}
+)
+
+func (cresjGeneric[T]) newV() any                              { return new(T) }
+func (c cresjGeneric[T]) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
+func (cresmGeneric[T]) newV() any                              { return new(T) }
+func (c cresmGeneric[T]) read(res *callResult, body io.Reader) { res.v = c.newV(); res.mread(body) }
 
 var (
 	resultsPool sync.Pool
@@ -380,39 +393,9 @@ func freeBcastRes(results sliceResults) {
 	resultsPool.Put(&results)
 }
 
-//
-// all `cresv` implementations
-// and common read-body methods w/ optional value-unmarshaling
-//
-
-type (
-	cresCM struct{} // -> cluMeta; selectively and alternatively, via `recvCluMetaBytes`
-	cresSM struct{} // -> smapX
-	cresND struct{} // -> meta.Snode
-	cresBA struct{} // -> cmn.BackendInfoAIS
-	cresEI struct{} // -> etl.InfoList
-	cresEL struct{} // -> etl.Logs
-	cresEM struct{} // -> etl.CPUMemUsed
-	cresIC struct{} // -> icBundle
-	cresBM struct{} // -> bucketMD
-
-	cresLso   struct{} // -> cmn.LsoRes
-	cresBsumm struct{} // -> cmn.AllBsummResults
-)
-
-var (
-	_ cresv = cresCM{}
-	_ cresv = cresLso{}
-	_ cresv = cresSM{}
-	_ cresv = cresND{}
-	_ cresv = cresBA{}
-	_ cresv = cresEI{}
-	_ cresv = cresEL{}
-	_ cresv = cresEM{}
-	_ cresv = cresIC{}
-	_ cresv = cresBM{}
-	_ cresv = cresBsumm{}
-)
+////////////////
+// callResult //
+////////////////
 
 func (res *callResult) read(body io.Reader, size int64) {
 	res.bytes, res.err = cos.ReadAllN(body, size)
@@ -430,38 +413,71 @@ func (res *callResult) mread(body io.Reader) {
 	slab.Free(buf)
 }
 
-func (cresCM) newV() any                              { return &cluMeta{} }
-func (c cresCM) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
+//
+// error helpers for intra-cluster calls
+//
 
-func (cresLso) newV() any                              { return &cmn.LsoRes{} }
-func (c cresLso) read(res *callResult, body io.Reader) { res.v = c.newV(); res.mread(body) }
+func (res *callResult) unwrap() (err error) {
+	err = errors.Unwrap(res.err)
+	if err == nil {
+		err = res.err
+	}
+	return
+}
 
-func (cresSM) newV() any                              { return &smapX{} }
-func (c cresSM) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
+func (res *callResult) toErr() error {
+	if res.err == nil {
+		return nil
+	}
+	// is cmn.ErrHTTP
+	if herr := cmn.Err2HTTPErr(res.err); herr != nil {
+		// add status, details
+		if res.status >= http.StatusBadRequest {
+			herr.Status = res.status
+		}
+		if herr.Message == "" {
+			herr.Message = res.details
+		}
+		return herr
+	}
+	// res => cmn.ErrHTTP
+	if res.status >= http.StatusBadRequest {
+		var detail string
+		if res.details != "" {
+			detail = "[" + res.details + "]"
+		}
+		return res.herr(nil, fmt.Sprintf("%v%s", res.err, detail))
+	}
+	if res.details == "" {
+		return res.err
+	}
+	return cmn.NewErrFailedTo(nil, "call "+res.si.StringEx(), res.details, res.err)
+}
 
-func (cresND) newV() any                              { return &meta.Snode{} }
-func (c cresND) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
+func (res *callResult) herr(r *http.Request, msg string) *cmn.ErrHTTP {
+	orig := &cmn.ErrHTTP{}
+	if e := jsoniter.Unmarshal([]byte(msg), orig); e == nil {
+		return orig
+	}
+	nherr := cmn.NewErrHTTP(r, errors.New(msg), res.status)
+	if res.si != nil {
+		nherr.Node = res.si.StringEx()
+	}
+	return nherr
+}
 
-func (cresBA) newV() any                              { return &meta.RemAisVec{} }
-func (c cresBA) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
-
-func (cresEI) newV() any                              { return &etl.InfoList{} }
-func (c cresEI) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
-
-func (cresEL) newV() any                              { return &etl.Logs{} }
-func (c cresEL) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
-
-func (cresEM) newV() any                              { return &etl.CPUMemUsed{} }
-func (c cresEM) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
-
-func (cresIC) newV() any                              { return &icBundle{} }
-func (c cresIC) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
-
-func (cresBM) newV() any                              { return &bucketMD{} }
-func (c cresBM) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
-
-func (cresBsumm) newV() any                              { return &cmn.AllBsummResults{} }
-func (c cresBsumm) read(res *callResult, body io.Reader) { res.v = c.newV(); res.jread(body) }
+func (res *callResult) errorf(format string, a ...any) error {
+	debug.Assert(res.err != nil)
+	// add formatted
+	msg := fmt.Sprintf(format, a...)
+	if herr := cmn.Err2HTTPErr(res.err); herr != nil {
+		herr.Message = msg + ": " + herr.Message
+		res.err = herr
+	} else {
+		res.err = errors.New(msg + ": " + res.err.Error())
+	}
+	return res.toErr()
+}
 
 ////////////////
 // nlogWriter //
@@ -490,92 +506,95 @@ func (*nlogWriter) Write(p []byte) (int, error) {
 // Override muxer ServeHTTP to support proxying HTTPS requests. Clients
 // initiate all HTTPS requests with CONNECT method instead of GET/PUT etc.
 func (server *netServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// plain
 	if r.Method != http.MethodConnect {
 		server.muxers.ServeHTTP(w, r)
 		return
 	}
 
-	// TODO: add support for caching HTTPS requests
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	// HTTPS
+	destConn, err := net.DialTimeout("tcp", r.Host, cmn.DfltDialupTimeout)
 	if err != nil {
 		cmn.WriteErr(w, r, err, http.StatusServiceUnavailable)
 		return
 	}
 
-	// Second, hijack the connection. A kind of man-in-the-middle attack
-	// From this point on, this function is responsible for HTTP connection
+	// hijack the connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		cmn.WriteErr(w, r, errors.New("response writer does not support hijacking"),
-			http.StatusInternalServerError)
+		cmn.WriteErr(w, r, errors.New("response writer does not support hijacking"), http.StatusInternalServerError)
 		return
 	}
 
-	// First, send that everything is OK. Trying to write a header after
-	// hijacking generates a warning and nothing works
 	w.WriteHeader(http.StatusOK)
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		// NOTE: cannot send error because we have already written a header.
 		nlog.Errorln(err)
 		return
 	}
 
-	// Third, start transparently sending data between source and destination
-	// by creating a tunnel between them
-	transfer := func(destination io.WriteCloser, source io.ReadCloser) {
-		io.Copy(destination, source)
-		source.Close()
-		destination.Close()
-	}
-
-	// NOTE: it looks like double closing both connections.
-	// Need to check how the tunnel works
-	go transfer(destConn, clientConn)
-	go transfer(clientConn, destConn)
+	// send/receive both ways (bi-directional tunnel)
+	// (one of those close() calls will fail, the one that loses the race)
+	go _copy(destConn, clientConn)
+	go _copy(clientConn, destConn)
 }
 
-func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Config, config *cmn.Config) (err error) {
-	var (
-		httpHandler = server.muxers
-		tag         = "HTTP"
-		retried     bool
-	)
+func _copy(destination io.WriteCloser, source io.ReadCloser) {
+	io.Copy(destination, source)
+	source.Close()
+	destination.Close()
+}
+
+func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Config, config *cmn.Config) error {
 	server.Lock()
 	server.s = &http.Server{
 		Addr:              addr,
-		Handler:           httpHandler,
+		Handler:           server.muxers,
 		ErrorLog:          logger,
 		ReadHeaderTimeout: apc.ReadHeaderTimeout,
 	}
 	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
 		server.s.ReadHeaderTimeout = timeout
 	}
-	if server.sndRcvBufSize > 0 && !config.Net.HTTP.UseHTTPS {
-		server.s.ConnState = server.connStateListener // setsockopt; see also cmn.NewTransport
+
+	// set sock options on the server side; NOTE https exclusion
+	if (server.sndRcvBufSize > 0 || server.lowLatencyToS) && !config.Net.HTTP.UseHTTPS {
+		server.s.ConnState = server.connStateListener
 	}
 	server.s.TLSConfig = tlsConf
 	server.Unlock()
+
+	return server._listen(config)
+}
+
+func (server *netServer) _listen(config *cmn.Config) (err error) {
+	var (
+		tag     = "HTTP"
+		retried bool
+	)
 retry:
 	if config.Net.HTTP.UseHTTPS {
 		tag = "HTTPS"
-		// Listen and Serve TLS using certificates provided using the GetCertificate() instead of static files.
-		err = server.s.ListenAndServeTLS("", "")
+		// Listen and Serve TLS; certificates provided via tlsConf.GetCertificate()
+		// (ie., via certloader.GetCert())
+		err = server.s.ListenAndServeTLS("" /*certFile*/, "" /*keyFile*/)
 	} else {
 		err = server.s.ListenAndServe()
 	}
-	if err == http.ErrServerClosed {
+	if err == http.ErrServerClosed { // ref: "ListenAndServe always returns a non-nil error"
 		return nil
 	}
+
 	if errors.Is(err, syscall.EADDRINUSE) && !retried {
-		nlog.Warningf("%q - shutting-down-and-restarting or else? will retry once...", err)
+		nlog.Warningf("%q - shutting-down-and-restarting or else? retrying just once...", err)
 		time.Sleep(max(5*time.Second, config.Timeout.MaxKeepalive.D()))
 		retried = true
 		goto retry
 	}
+
 	nlog.Errorf("%s terminated with error: %v", tag, err)
-	return
+	return err
 }
 
 func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
@@ -591,7 +610,16 @@ func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
 		if caCert, err = os.ReadFile(conf.ClientCA); err != nil {
 			return nil, fmt.Errorf("new-tls: failed to read PEM %q, err: %w", conf.ClientCA, err)
 		}
-		pool = x509.NewCertPool()
+
+		// from https://github.com/golang/go/blob/master/src/crypto/x509/cert_pool.go:
+		// "On Unix systems other than macOS the environment variables SSL_CERT_FILE and
+		// SSL_CERT_DIR can be used to override the system default locations for the SSL
+		// certificate file and SSL certificate files directory, respectively. The
+		// latter can be a colon-separated list."
+		pool, err = x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("new-tls: failed to load system cert pool, err: %w", err)
+		}
 		if ok := pool.AppendCertsFromPEM(caCert); !ok {
 			return nil, fmt.Errorf("new-tls: failed to append CA certs from PEM %q", conf.ClientCA)
 		}
@@ -608,10 +636,14 @@ func (server *netServer) connStateListener(c net.Conn, cs http.ConnState) {
 		return
 	}
 	tcpconn, ok := c.(*net.TCPConn)
-	cos.Assert(ok)
-	rawconn, _ := tcpconn.SyscallConn()
-	args := cmn.TransportArgs{SndRcvBufSize: server.sndRcvBufSize}
-	rawconn.Control(args.ConnControl(rawconn))
+	debug.Assert(ok)
+	rawconn, err := tcpconn.SyscallConn()
+	if err != nil {
+		nlog.Errorln("FATAL tcpconn.SyscallConn err:", err) // (unlikely)
+		return
+	}
+	args := cmn.TransportArgs{SndRcvBufSize: server.sndRcvBufSize, LowLatencyToS: server.lowLatencyToS}
+	args.ServerControl(rawconn)
 }
 
 func (server *netServer) shutdown(config *cmn.Config) {
@@ -622,7 +654,7 @@ func (server *netServer) shutdown(config *cmn.Config) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout.MaxHostBusy.D())
 	if err := server.s.Shutdown(ctx); err != nil {
-		nlog.Infoln("http server shutdown err:", err)
+		nlog.Warningln("http server shutdown err:", err)
 	}
 	cancel()
 }
@@ -634,10 +666,10 @@ func (server *netServer) shutdown(config *cmn.Config) {
 // interface guard
 var _ http.Handler = (*httpMuxers)(nil)
 
-func newMuxers() httpMuxers {
+func newMuxers(enableTracing bool) httpMuxers {
 	m := make(httpMuxers, len(htverbs))
 	for _, v := range htverbs {
-		m[v] = mux.NewServeMux()
+		m[v] = mux.NewServeMux(enableTracing)
 	}
 	return m
 }
@@ -668,15 +700,19 @@ func (p *proxy) fillNsti(nsti *cos.NodeStateInfo) {
 func (t *target) fillNsti(nsti *cos.NodeStateInfo) {
 	t.htrun.fill(nsti)
 	marked := xreg.GetRebMarked()
-	if marked.Xact != nil {
+
+	// (running | interrupted | ok)
+	if xreb := marked.Xact; xreb != nil {
 		nsti.Flags = nsti.Flags.Set(cos.Rebalancing)
-	}
-	if marked.Interrupted {
+	} else if marked.Interrupted {
 		nsti.Flags = nsti.Flags.Set(cos.RebalanceInterrupted)
 	}
+
+	// node restarted
 	if marked.Restarted {
-		nsti.Flags = nsti.Flags.Set(cos.Restarted)
+		nsti.Flags = nsti.Flags.Set(cos.NodeRestarted)
 	}
+
 	marked = xreg.GetResilverMarked()
 	if marked.Xact != nil {
 		nsti.Flags = nsti.Flags.Set(cos.Resilvering)
@@ -851,7 +887,8 @@ func newBckFromQ(bckName string, query url.Values, dpq *dpq) (*meta.Bck, error) 
 
 func newQbckFromQ(bckName string, query url.Values, dpq *dpq) (*cmn.QueryBcks, error) {
 	qbck := (*cmn.QueryBcks)(_bckFromQ(bckName, query, dpq))
-	return qbck, qbck.Validate()
+	err := qbck.Validate()
+	return qbck, err
 }
 
 func _bckFromQ(bckName string, query url.Values, dpq *dpq) *meta.Bck {
@@ -880,7 +917,7 @@ func newBckFromQuname(query url.Values, required bool) (*meta.Bck, error) {
 	}
 	bck, objName := cmn.ParseUname(uname)
 	if objName != "" {
-		return nil, fmt.Errorf("bucket %s: unexpected non-empty object name %q", bck, objName)
+		return nil, fmt.Errorf("bucket %s: not expecting object name (got %q)", bck.String(), objName)
 	}
 	if err := bck.Validate(); err != nil {
 		return nil, err

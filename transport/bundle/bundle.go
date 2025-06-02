@@ -1,7 +1,7 @@
 // Package bundle provides multi-streaming transport with the functionality
 // to dynamically (un)register receive endpoints, establish long-lived flows, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package bundle
 
@@ -90,13 +90,10 @@ func New(cl transport.Client, args Args) (sb *Streams) {
 		network:      args.Net,
 		trname:       args.Trname,
 		rxNodeType:   args.Ntype,
-		multiplier:   args.Multiplier,
 		manualResync: args.ManualResync,
 	}
 	sb.extra = *args.Extra
-	if sb.multiplier == 0 {
-		sb.multiplier = 1
-	}
+	sb.multiplier = cos.NonZero(args.Multiplier, int(1))
 	if sb.extra.Config == nil {
 		sb.extra.Config = cmn.GCO.Get()
 	}
@@ -109,12 +106,12 @@ func New(cl transport.Client, args Args) (sb *Streams) {
 	sb._lid()
 	nlog.Infoln("open", sb.lid)
 
-	// register this stream-bundle as Smap listener
+	// for auto-resync, register this stream-bundle as Smap listener
 	if !sb.manualResync {
 		listeners := core.T.Sowner().Listeners()
 		listeners.Reg(sb)
 	}
-	return
+	return sb
 }
 
 func (sb *Streams) _lid() {
@@ -156,25 +153,19 @@ func (sb *Streams) Close(gracefully bool) {
 
 // when (nodes == nil) transmit via all established streams in a bundle
 // otherwise, restrict to the specified subset (nodes)
-func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*meta.Snode) (err error) {
+func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*meta.Snode) error {
 	debug.Assert(!transport.ReservedOpcode(obj.Hdr.Opcode))
 	streams := sb.get()
-	if len(streams) == 0 {
-		err = fmt.Errorf("no streams %s => .../%s", core.T.Snode(), sb.trname)
-	} else if nodes != nil && len(nodes) == 0 {
-		err = fmt.Errorf("no destinations %s => .../%s", core.T.Snode(), sb.trname)
-	} else if obj.IsUnsized() && sb.extra.SizePDU == 0 {
-		err = fmt.Errorf("[%s] sending unsized object supported only with PDUs", obj.Hdr.Cname())
-	}
 
-	if err != nil {
+	if err := sb._validate(obj, streams, nodes); err != nil {
 		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
 			nlog.Warningln(err)
 		}
 		// compare w/ transport doCmpl()
 		_doCmpl(obj, roc, err)
-		return
+		return err
 	}
+
 	if obj.Callback == nil {
 		obj.Callback = sb.extra.Callback
 	}
@@ -194,8 +185,8 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 			if core.T.SID() == sid {
 				continue
 			}
-			if err = sb.sendOne(obj, roc, robin, idx, cnt); err != nil {
-				return
+			if err := sb.sendOne(obj, roc, robin, idx, cnt); err != nil {
+				return err
 			}
 			idx++
 		}
@@ -205,21 +196,34 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 			if _, ok := streams[di.ID()]; ok {
 				continue
 			}
-			err = &ErrDestinationMissing{sb.String(), di.StringEx(), sb.smap.String()}
+			err := &ErrDestinationMissing{sb.String(), di.StringEx(), sb.smap.String()}
 			_doCmpl(obj, roc, err) // ditto
-			return
+			return err
 		}
 		// second, do send. Same comment wrt reopening.
 		cnt := len(nodes)
 		obj.SetPrc(cnt)
 		for idx, di := range nodes {
 			robin := streams[di.ID()]
-			if err = sb.sendOne(obj, roc, robin, idx, cnt); err != nil {
-				return
+			if err := sb.sendOne(obj, roc, robin, idx, cnt); err != nil {
+				return err
 			}
 		}
 	}
-	return
+
+	return nil
+}
+
+func (sb *Streams) _validate(obj *transport.Obj, bun bundle, nodes []*meta.Snode) error {
+	switch {
+	case len(bun) == 0:
+		return fmt.Errorf("no streams %s => .../%s", core.T.Snode(), sb.trname)
+	case nodes != nil && len(nodes) == 0:
+		return fmt.Errorf("no destinations %s => .../%s", core.T.Snode(), sb.trname)
+	case obj.IsUnsized() && sb.extra.SizePDU == 0:
+		return fmt.Errorf("[%s] sending unsized object supported only with PDUs", obj.Hdr.Cname())
+	}
+	return nil
 }
 
 func _doCmpl(obj *transport.Obj, roc cos.ReadOpenCloser, err error) {
@@ -307,7 +311,7 @@ func (sb *Streams) Abort() {
 }
 
 func (sb *Streams) apply(action int) {
-	cos.Assert(action == closeFin || action == closeStop)
+	debug.Assert(action == closeFin || action == closeStop)
 	var (
 		streams = sb.get()
 		wg      = &sync.WaitGroup{}

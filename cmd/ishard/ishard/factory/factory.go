@@ -1,6 +1,6 @@
 // Package factory provides functions to create shards and track their creation progress
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package factory
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
+
 	"github.com/vbauerster/mpb/v4"
 )
 
@@ -56,7 +57,9 @@ func NewShardFactory(baseParams api.BaseParams, fromBck, toBck cmn.Bck, ext, sha
 		ext:           ext,
 		OutShardNames: make([]string, 0),
 
-		// block when number of creating shards reaches to archive xacts's workCh size. otherwise xact commit may timeout. see xact/xs/archive.go
+		// TODO: The channel size is limited to manage concurrent xaction begin-phase requests,
+		// preventing potential blocks and timeouts during subsequent commit-phase requests.
+		// Refer to `maxNumInParallel` in `xact/xs/streaming.go` and `xact/xs/archive.go` for details.
 		pollCh:    make(chan *shard.Shard, 512),
 		dryRunCfg: dryRun,
 	}
@@ -67,7 +70,11 @@ func NewShardFactory(baseParams api.BaseParams, fromBck, toBck cmn.Bck, ext, sha
 	sf.shardIter.InitIter()
 
 	if dryRun.IsSet {
-		var sb strings.Builder
+		var (
+			sb strings.Builder
+			l  = 4096
+		)
+		sb.Grow(l)
 		sb.WriteString("{{$shard := .}}{{appendExt $shard.Name}}\t{{formatSize $shard.Size}}\n")
 		sb.WriteString("{{range $rec := .Records.All}}")
 		if dryRun.Mode == "show_keys" {
@@ -86,7 +93,8 @@ func NewShardFactory(baseParams api.BaseParams, fromBck, toBck cmn.Bck, ext, sha
 
 	sf.pollWg.Add(1)
 	go sf.poll()
-	return
+
+	return sf, nil
 }
 
 func (sf *ShardFactory) Create(recs *shard.Records, size int64, errCh chan error) {
@@ -164,7 +172,8 @@ func (sf *ShardFactory) poll() {
 			}
 
 			time.Sleep(backoff)
-			shardList, err := api.ListObjects(sf.baseParams, sf.toBck, &apc.LsoMsg{Prefix: sf.shardIter.Prefix, Flags: apc.LsNameSize}, api.ListArgs{})
+			shardList, err := api.ListObjects(sf.baseParams, sf.toBck,
+				&apc.LsoMsg{Prefix: sf.shardIter.Prefix, Flags: apc.LsNameSize}, api.ListArgs{})
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				continue
@@ -172,7 +181,7 @@ func (sf *ShardFactory) poll() {
 			for _, entry := range shardList.Entries {
 				pool[entry.Name] = struct{}{}
 			}
-			backoff = time.Duration(min(time.Second*10, backoff*2))
+			backoff = min(time.Second*10, backoff*2)
 		}
 	}
 	sf.pollWg.Done()

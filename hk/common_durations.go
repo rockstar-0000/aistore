@@ -1,7 +1,7 @@
 // Package hk provides mechanism for registering cleanup
 // functions which are invoked at specified intervals.
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package hk
 
@@ -10,8 +10,10 @@ import "time"
 // common cleanup-related durations
 
 const (
-	DelOldIval      = 24 * time.Minute // hk timer: cleanup old xactions; old transactions
-	PruneActiveIval = 2 * time.Minute  // hk timer: prune active xactions; cleanup notifs
+	// hk timers
+	DelOldIval        = 24 * time.Minute // cleanup old xactions; old transactions
+	PruneActiveIval   = 2 * time.Minute  // prune active xactions; cleanup notifs
+	PruneRateLimiters = 6 * time.Hour    // prune stale rate limiters on the front
 
 	//
 	// when things are considered _old_

@@ -10,18 +10,19 @@ jobs:
   test:
     strategy:
       matrix:
-        go-version: ['1.22.x']
-        os: [ubuntu-latest, macos-latest]
-        python-version: ['3.8','3.9','3.10','3.11']
+        go-version: ['1.24.x']
+        os: [ubuntu-latest]
+        # TODO: provide support for MacOS (revisit !7808)
+        python-version: ['3.8','3.9','3.10','3.11','3.12','3.13']
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: ${{ matrix.go-version }}
-
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
 
       - name: Remove unnecessary directories to free up space
         run: |
@@ -44,7 +45,7 @@ jobs:
           AIS_SPACE_LOWWM=90 AIS_SPACE_HIGHWM=96 AIS_SPACE_OOS=99 scripts/clean_deploy.sh --target-cnt 3 --proxy-cnt 1 --mountpath-cnt 3
 
       - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 

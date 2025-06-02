@@ -1,6 +1,6 @@
 // Package meta: cluster-level metadata
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package meta
 
@@ -12,7 +12,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/xoshiro256"
-	"github.com/OneOfOne/xxhash"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 // A variant of consistent hash based on rendezvous algorithm by Thaler and Ravishankar,
@@ -20,12 +21,14 @@ import (
 // See also: fs/hrw.go
 
 func (smap *Smap) HrwName2T(uname []byte) (*Snode, error) {
-	digest := xxhash.Checksum64S(uname, cos.MLCG32)
+	digest := onexxh.Checksum64S(uname, cos.MLCG32)
 	return smap.HrwHash2T(digest)
 }
 
+// TODO: control plane multihoming: return LRU data plane interface
+
 func (smap *Smap) HrwMultiHome(uname []byte) (si *Snode, netName string, err error) {
-	digest := xxhash.Checksum64S(uname, cos.MLCG32)
+	digest := onexxh.Checksum64S(uname, cos.MLCG32)
 	si, err = smap.HrwHash2T(digest)
 	if err != nil {
 		return nil, cmn.NetPublic, err
@@ -41,7 +44,7 @@ func (smap *Smap) HrwHash2T(digest uint64) (si *Snode, err error) {
 		if tsi.InMaintOrDecomm() { // always skipping targets 'in maintenance mode'
 			continue
 		}
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			si = tsi
@@ -57,7 +60,7 @@ func (smap *Smap) HrwHash2T(digest uint64) (si *Snode, err error) {
 func (smap *Smap) HrwHash2Tall(digest uint64) (si *Snode, err error) {
 	var maxH uint64
 	for _, tsi := range smap.Tmap {
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			si = tsi
@@ -81,7 +84,7 @@ func (smap *Smap) HrwProxy(idToSkip string) (pi *Snode, err error) {
 		if psi.InMaintOrDecomm() {
 			continue
 		}
-		if d := psi.Digest(); d >= maxH {
+		if d := psi.digest(); d >= maxH {
 			maxH = d
 			pi = psi
 		}
@@ -95,13 +98,13 @@ func (smap *Smap) HrwProxy(idToSkip string) (pi *Snode, err error) {
 func (smap *Smap) HrwIC(uuid string) (pi *Snode, err error) {
 	var (
 		maxH   uint64
-		digest = xxhash.Checksum64S(cos.UnsafeB(uuid), cos.MLCG32)
+		digest = onexxh.Checksum64S(cos.UnsafeB(uuid), cos.MLCG32)
 	)
 	for _, psi := range smap.Pmap {
 		if psi.InMaintOrDecomm() || !psi.IsIC() {
 			continue
 		}
-		cs := xoshiro256.Hash(psi.Digest() ^ digest)
+		cs := xoshiro256.Hash(psi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			pi = psi
@@ -118,14 +121,13 @@ func (smap *Smap) HrwIC(uuid string) (pi *Snode, err error) {
 func (smap *Smap) HrwTargetTask(uuid string) (si *Snode, err error) {
 	var (
 		maxH   uint64
-		digest = xxhash.Checksum64S(cos.UnsafeB(uuid), cos.MLCG32)
+		digest = onexxh.Checksum64S(cos.UnsafeB(uuid), cos.MLCG32)
 	)
 	for _, tsi := range smap.Tmap {
 		if tsi.InMaintOrDecomm() {
 			continue
 		}
-		// Assumes that sinfo.idDigest is initialized
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			si = tsi
@@ -160,11 +162,11 @@ func (smap *Smap) HrwTargetList(uname *string, count int) (sis Nodes, err error)
 		return
 	}
 	b := cos.UnsafeBptr(uname)
-	digest := xxhash.Checksum64S(*b, cos.MLCG32)
+	digest := onexxh.Checksum64S(*b, cos.MLCG32)
 	hlist := newHrwList(count)
 
 	for _, tsi := range smap.Tmap {
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if tsi.InMaintOrDecomm() {
 			continue
 		}

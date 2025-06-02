@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -18,6 +18,7 @@ import (
 
 	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/ais/s3"
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -55,6 +56,7 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 	var (
 		objName  = s3.ObjName(items)
 		lom      = &core.LOM{ObjName: objName}
+		metadata map[string]string
 		uploadID string
 		ecode    int
 	)
@@ -64,6 +66,7 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 		return
 	}
 	if bck.IsRemoteS3() {
+		metadata = cmn.BackendHelpers.Amazon.DecodeMetadata(r.Header)
 		uploadID, ecode, err = backend.StartMpt(lom, r, q)
 		if err != nil {
 			s3.WriteErr(w, r, err, ecode)
@@ -73,7 +76,7 @@ func (t *target) startMpt(w http.ResponseWriter, r *http.Request, items []string
 		uploadID = cos.GenUUID()
 	}
 
-	s3.InitUpload(uploadID, bck.Name, objName)
+	s3.InitUpload(uploadID, bck.Name, objName, metadata)
 	result := &s3.InitiateMptUploadResult{Bucket: bck.Name, Key: objName, UploadID: uploadID}
 
 	sgl := t.gmm.NewSGL(0)
@@ -208,16 +211,18 @@ func (t *target) putMptPart(w http.ResponseWriter, r *http.Request, items []stri
 	w.Header().Set(cos.S3CksumHeader, md5) // s3cmd checks this one
 
 	delta := mono.SinceNano(startTime)
-	t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.PutSize, Value: size},
-		cos.NamedVal64{Name: stats.PutLatencyTotal, Value: delta},
+	vlabs := map[string]string{stats.VlabBucket: bck.Cname(""), stats.VlabXkind: ""}
+	t.statsT.AddWith(
+		cos.NamedVal64{Name: stats.PutSize, Value: size, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.PutLatency, Value: delta, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.PutLatencyTotal, Value: delta, VarLabs: vlabs},
 	)
 	if remotePutLatency > 0 {
 		backendBck := t.Backend(bck)
-		t.statsT.AddMany(
-			cos.NamedVal64{Name: backendBck.MetricName(stats.PutSize), Value: size},
-			cos.NamedVal64{Name: backendBck.MetricName(stats.PutLatency), Value: remotePutLatency},
-			cos.NamedVal64{Name: backendBck.MetricName(stats.PutE2ELatencyTotal), Value: delta},
+		t.statsT.AddWith(
+			cos.NamedVal64{Name: backendBck.MetricName(stats.PutSize), Value: size, VarLabs: vlabs},
+			cos.NamedVal64{Name: backendBck.MetricName(stats.PutLatencyTotal), Value: remotePutLatency, VarLabs: vlabs},
+			cos.NamedVal64{Name: backendBck.MetricName(stats.PutE2ELatencyTotal), Value: delta, VarLabs: vlabs},
 		)
 	}
 }
@@ -236,12 +241,12 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 		return
 	}
 
-	output, err := cos.ReadAllN(r.Body, r.ContentLength)
+	body, err := cos.ReadAllN(r.Body, r.ContentLength)
 	if err != nil {
 		s3.WriteErr(w, r, err, http.StatusBadRequest)
 		return
 	}
-	partList, err := decodeXML[*s3.CompleteMptUpload](output)
+	partList, err := decodeXML[*s3.CompleteMptUpload](body)
 	if err != nil {
 		s3.WriteErr(w, r, err, http.StatusBadRequest)
 		return
@@ -264,28 +269,30 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 
 	// call s3
 	var (
+		version string
 		etag    string
 		started = time.Now()
 		remote  = bck.IsRemoteS3()
 	)
 	if remote {
-		v, ecode, err := backend.CompleteMpt(lom, r, q, uploadID, partList)
+		v, e, ecode, err := backend.CompleteMpt(lom, r, q, uploadID, body, partList)
 		if err != nil {
 			s3.WriteMptErr(w, r, err, ecode, lom, uploadID)
 			return
 		}
-		etag = v
+		version = v
+		etag = e
 	}
 
 	// append parts and finalize locally
 	var (
 		mw          io.Writer
 		concatMD5   string // => ETag
-		actualCksum = &cos.CksumHash{}
+		actualCksum *cos.CksumHash
 	)
 	// .1 sort and check parts
 	sort.Slice(partList.Parts, func(i, j int) bool {
-		return partList.Parts[i].PartNumber < partList.Parts[j].PartNumber
+		return *partList.Parts[i].PartNumber < *partList.Parts[j].PartNumber
 	})
 	nparts, err := s3.CheckParts(uploadID, partList.Parts)
 	if err != nil {
@@ -323,7 +330,7 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	}
 	if errA != nil {
 		if nerr := cos.RemoveFile(wfqn); nerr != nil && !os.IsNotExist(nerr) {
-			nlog.Errorf(fmtNested, t, err, "remove", wfqn, nerr)
+			nlog.Errorf(fmtNested, t, errA, "remove", wfqn, nerr)
 		}
 		s3.WriteMptErr(w, r, errA, 0, lom, uploadID)
 		return
@@ -337,15 +344,23 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	if etag == "" {
 		debug.Assert(!remote)
 		debug.Assert(concatMD5 != "")
-		resMD5 := cos.NewCksumHash(cos.ChecksumMD5)
-		_, err = resMD5.H.Write([]byte(concatMD5))
-		debug.AssertNoErr(err)
-		resMD5.Finalize()
-		etag = resMD5.Value() + cmn.AwsMultipartDelim + strconv.Itoa(len(partList.Parts))
+
+		resMD5Val := cos.ChecksumB2S(cos.UnsafeB(concatMD5), cos.ChecksumMD5)
+		etag = `"` + resMD5Val + cmn.AwsMultipartDelim + strconv.Itoa(len(partList.Parts)) + `"`
 	}
 
 	// .5 finalize
 	lom.SetSize(size)
+	if remote {
+		lom.SetCustomKey(cmn.SourceObjMD, apc.AWS)
+		if version != "" {
+			lom.SetCustomKey(cmn.VersionObjMD, version)
+		}
+		metadata := s3.GetUploadMetadata(uploadID)
+		for k, v := range cmn.BackendHelpers.Amazon.EncodeMetadata(metadata) {
+			lom.SetCustomKey(k, v)
+		}
+	}
 	lom.SetCustomKey(cmn.ETag, etag)
 
 	poi := allocPOI()
@@ -369,7 +384,7 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 			s3.WriteMptErr(w, r, errF, ecode, lom, uploadID)
 			return
 		}
-		nlog.Errorf("upload %q: failed to complete %s locally: %v(%d)", uploadID, lom.Cname(), err, ecode)
+		nlog.Errorf("upload %q: failed to complete %s locally: %v(%d)", uploadID, lom.Cname(), errF, ecode)
 	}
 
 	// .7 respond
@@ -377,14 +392,15 @@ func (t *target) completeMpt(w http.ResponseWriter, r *http.Request, items []str
 	sgl := t.gmm.NewSGL(0)
 	result.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	w.Header().Set(cos.S3CksumHeader, etag)
+	s3.SetS3Headers(w.Header(), lom)
 	sgl.WriteTo2(w)
 	sgl.Free()
 
 	// stats
-	t.statsT.Inc(stats.PutCount)
+	vlabs := map[string]string{stats.VlabBucket: bck.Cname(""), stats.VlabXkind: ""}
+	t.statsT.IncWith(stats.PutCount, vlabs)
 	if remote {
-		t.statsT.Inc(t.Backend(bck).MetricName(stats.PutCount))
+		t.statsT.IncWith(t.Backend(bck).MetricName(stats.PutCount), vlabs)
 	}
 }
 
@@ -415,7 +431,7 @@ func _appendMpt(nparts []*s3.MptPart, buf []byte, mw io.Writer) (concatMD5 strin
 // 3. Remove all info from in-memory structs
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html
 func (t *target) abortMpt(w http.ResponseWriter, r *http.Request, items []string, q url.Values) {
-	bck, err, ecode := meta.InitByNameOnly(items[0], t.owner.bmd)
+	bck, ecode, err := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, err, ecode)
 		return
@@ -531,9 +547,11 @@ func (t *target) getMptPart(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	}
 	cos.Close(fh)
 	slab.Free(buf)
-	t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetSize, Value: size},
-		cos.NamedVal64{Name: stats.GetLatencyTotal, Value: mono.SinceNano(startTime)},
+
+	vlabs := map[string]string{stats.VlabBucket: bck.Cname("")}
+	t.statsT.IncWith(stats.GetCount, vlabs)
+	t.statsT.AddWith(
+		cos.NamedVal64{Name: stats.GetSize, Value: size, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.GetLatencyTotal, Value: mono.SinceNano(startTime), VarLabs: vlabs},
 	)
 }

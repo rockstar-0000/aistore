@@ -1,6 +1,6 @@
 // Package meta: cluster-level metadata
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package meta
 
@@ -18,7 +18,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/OneOfOne/xxhash"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 // enum Snode.Flags
@@ -68,17 +69,17 @@ type (
 
 	// Snode - a node (gateway or target) in a cluster
 	Snode struct {
-		LocalNet   *net.IPNet   `json:"-"`
-		PubNet     NetInfo      `json:"public_net"` // cmn.NetPublic
+		nmr        NetNamer
+		LocalNet   *net.IPNet `json:"-"`
+		PubNet     NetInfo    `json:"public_net"`        // cmn.NetPublic
+		DataNet    NetInfo    `json:"intra_data_net"`    // cmn.NetIntraData
+		ControlNet NetInfo    `json:"intra_control_net"` // cmn.NetIntraControl
+		DaeType    string     `json:"daemon_type"`       // apc.Proxy | apc.Target
+		DaeID      string     `json:"daemon_id"`
+		name       string
 		PubExtra   []NetInfo    `json:"pub_extra,omitempty"`
-		DataNet    NetInfo      `json:"intra_data_net"`    // cmn.NetIntraData
-		ControlNet NetInfo      `json:"intra_control_net"` // cmn.NetIntraControl
-		DaeType    string       `json:"daemon_type"`       // "target" or "proxy"
-		DaeID      string       `json:"daemon_id"`
-		name       string       // cached
 		Flags      cos.BitFlags `json:"flags"` // enum { SnodeNonElectable, SnodeIC, ... }
-		idDigest   uint64       // cached
-		nmr        NetNamer     // (multihoming)
+		IDDigest   uint64       `json:"id_digest"`
 	}
 
 	Nodes   []*Snode          // slice of Snodes
@@ -109,11 +110,11 @@ func (d *Snode) Init(id, daeType string) {
 	d.setDigest()
 }
 
-func (d *Snode) Digest() uint64 { return d.idDigest }
+func (d *Snode) digest() uint64 { return d.IDDigest }
 
 func (d *Snode) setDigest() {
-	if d.idDigest == 0 {
-		d.idDigest = xxhash.Checksum64S(cos.UnsafeB(d.ID()), cos.MLCG32)
+	if d.IDDigest == 0 {
+		d.IDDigest = onexxh.Checksum64S(cos.UnsafeB(d.ID()), cos.MLCG32)
 	}
 }
 
@@ -403,10 +404,15 @@ func (m *Smap) String() string {
 }
 
 func (m *Smap) StringEx() string {
-	var sb strings.Builder
 	if m == nil {
 		return "Smap <nil>"
 	}
+
+	var (
+		sb strings.Builder
+		l  = 80
+	)
+	sb.Grow(l)
 	sb.WriteString("Smap v")
 	sb.WriteString(strconv.FormatInt(m.Version, 10))
 	sb.WriteByte('[')
@@ -422,6 +428,7 @@ func (m *Smap) StringEx() string {
 	sb.WriteString(", p=")
 	_counts(&sb, m.CountProxies(), m.CountActivePs())
 	sb.WriteByte(']')
+
 	return sb.String()
 }
 
@@ -626,8 +633,8 @@ func (m *Smap) NonElectable(psi *Snode) (ok bool) {
 
 // given Snode, check (usually, the current) Smap that it is present _and_ InMaintOrDecomm
 // (see also GetActiveNode)
-func (m *Smap) InMaintOrDecomm(si *Snode) bool {
-	node := m.GetNode(si.ID())
+func (m *Smap) InMaintOrDecomm(sid string) bool {
+	node := m.GetNode(sid)
 	return node != nil && node.InMaintOrDecomm()
 }
 

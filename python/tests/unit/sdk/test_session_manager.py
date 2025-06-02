@@ -1,13 +1,14 @@
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, call, Mock
 
 from requests.adapters import HTTPAdapter
 
 import urllib3
 
-from aistore.sdk.const import AIS_CLIENT_CA
-from aistore.sdk.session_manager import SessionManager, DEFAULT_RETRY
-from tests.utils import test_cases
+from aistore.sdk.const import AIS_CLIENT_CA, AIS_CLIENT_CRT, AIS_CLIENT_KEY
+from aistore.sdk.session_manager import SessionManager
+
+from tests.utils import cases
 
 
 class TestSessionManager(unittest.TestCase):  # pylint: disable=unused-variable
@@ -17,7 +18,6 @@ class TestSessionManager(unittest.TestCase):  # pylint: disable=unused-variable
 
     def test_init_default(self):
         session_manager = SessionManager()
-        self.assertEqual(DEFAULT_RETRY, session_manager.retry)
         self.assertIsNone(session_manager.ca_cert)
         self.assertFalse(session_manager.skip_verify)
 
@@ -55,7 +55,7 @@ class TestSessionManager(unittest.TestCase):  # pylint: disable=unused-variable
         self.assertIsInstance(adapter, HTTPAdapter)
         self.assertEqual(custom_retry, adapter.max_retries)
 
-    @test_cases(
+    @cases(
         (("env-cert", "arg-cert", False), "arg-cert"),
         (("env-cert", "arg-cert", True), False),
         (("env-cert", None, False), "env-cert"),
@@ -72,3 +72,27 @@ class TestSessionManager(unittest.TestCase):  # pylint: disable=unused-variable
             if not skip_verify and not arg_cert:
                 mock_getenv.assert_called_with(AIS_CLIENT_CA)
             self.assertEqual(test_case[1], session.verify)
+
+    @cases(
+        ((None, None, None), None),
+        (("env-cert", "env-key", None), ("env-cert", "env-key")),
+        ((None, None, ("client.crt", "client.key")), ("client.crt", "client.key")),
+        (
+            ("env-cert", "env-key", ("client.crt", "client.key")),
+            ("client.crt", "client.key"),
+        ),
+    )
+    def test_create_mtls(self, test_case):
+        env_cert, env_key, arg_cert = test_case[0]
+        with patch("aistore.sdk.session_manager.os.getenv") as mock_getenv:
+            mock_getenv.side_effect = lambda x: (
+                env_cert if x == AIS_CLIENT_CRT else env_key
+            )
+            session_manager = SessionManager(client_cert=arg_cert, skip_verify=True)
+            if arg_cert:
+                mock_getenv.assert_not_called()
+            else:
+                mock_getenv.assert_has_calls(
+                    [call(AIS_CLIENT_CRT), call(AIS_CLIENT_KEY)], any_order=True
+                )
+            self.assertEqual(test_case[1], session_manager.session.cert)

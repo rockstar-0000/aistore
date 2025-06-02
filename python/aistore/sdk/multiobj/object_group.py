@@ -1,8 +1,8 @@
 #
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
 #
 import logging
-from typing import List, Iterable
+from typing import Dict, List, Iterable, Optional
 
 from aistore.sdk.ais_source import AISSource
 from aistore.sdk.const import (
@@ -30,9 +30,9 @@ from aistore.sdk.types import (
     PrefetchMsg,
 )
 from aistore.sdk.request_client import RequestClient
+from aistore.sdk.etl import ETLConfig
 
 
-# pylint: disable=unused-variable
 class ObjectGroup(AISSource):
     """
     A class representing multiple objects within the same bucket. Only one of obj_names, obj_range, or obj_template
@@ -80,19 +80,22 @@ class ObjectGroup(AISSource):
         """Update the client bound to the bucket used by the ObjectGroup."""
         self.bck.client = client
 
-    def list_urls(self, prefix: str = "", etl_name: str = None) -> Iterable[str]:
+    def list_urls(
+        self, prefix: str = "", etl: Optional[ETLConfig] = None
+    ) -> Iterable[str]:
         """
         Implementation of the abstract method from AISSource that provides an iterator
         of full URLs to every object in this bucket matching the specified prefix
         Args:
             prefix (str, optional): Limit objects selected by a given string prefix
-            etl_name (str, optional): ETL to include in URLs
+            etl (Optional[ETLConfig], optional): An optional ETL configuration. If provided, the URLs
+                will include ETL processing parameters. Defaults to None.
 
         Returns:
             Iterator of all object URLs in the group
         """
         for obj_name in self._obj_collection:
-            yield self.bck.object(obj_name).get_url(etl_name=etl_name)
+            yield self.bck.object(obj_name).get_url(etl=etl)
 
     def list_all_objects_iter(
         self, prefix: str = "", props: str = "name,size"
@@ -217,7 +220,7 @@ class ObjectGroup(AISSource):
             value=value,
         ).text
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def copy(
         self,
         to_bck: "Bucket",
@@ -283,13 +286,14 @@ class ObjectGroup(AISSource):
             value=value,
         ).text
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments,too-many-positional-arguments, too-many-locals
     def transform(
         self,
         to_bck: "Bucket",
         etl_name: str,
         timeout: str = DEFAULT_ETL_TIMEOUT,
         prepend: str = "",
+        ext: Dict[str, str] = None,
         continue_on_error: bool = False,
         dry_run: bool = False,
         force: bool = False,
@@ -305,6 +309,8 @@ class ObjectGroup(AISSource):
             etl_name (str): Name of existing ETL to apply
             timeout (str): Timeout of the ETL job (e.g. 5m for 5 minutes)
             prepend (str, optional): Value to prepend to the name of resulting transformed objects
+            ext (Dict[str, str], optional): Dict mapping each extension to the extension that will replace it
+                (i.e. {"jpg": "txt"})
             continue_on_error (bool, optional): Whether to continue if there is an error transforming a single object
             dry_run (bool, optional): Skip performing the transform and just log the intended actions
             force (bool, optional): Force this job to run over others in case it conflicts
@@ -341,7 +347,7 @@ class ObjectGroup(AISSource):
         transform_msg = TransformBckMsg(etl_name=etl_name, timeout=timeout)
         value = TCMultiObj(
             to_bck=to_bck.as_model(),
-            tc_msg=TCBckMsg(transform_msg=transform_msg, copy_msg=copy_msg),
+            tc_msg=TCBckMsg(ext=ext, transform_msg=transform_msg, copy_msg=copy_msg),
             object_selection=self._obj_collection.get_value(),
             continue_on_err=continue_on_error,
             num_workers=num_workers,
@@ -350,6 +356,7 @@ class ObjectGroup(AISSource):
             HTTP_METHOD_POST, ACT_TRANSFORM_OBJECTS, value=value
         ).text
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def archive(
         self,
         archive_name: str,

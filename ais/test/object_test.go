@@ -1,12 +1,11 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
 	"bytes"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -175,11 +174,11 @@ func TestRemoteBucketObject(t *testing.T) {
 
 			if !test.exists {
 				if err == nil {
-					t.Errorf("expected error when doing %s on non existing %q bucket", test.ty, bck)
+					t.Errorf("expected error when doing %s on non existing %q bucket", test.ty, bck.String())
 				}
 			} else if err != nil {
 				t.Errorf("expected no error when executing %s on existing %q bucket(err = %v)",
-					test.ty, bck, err)
+					test.ty, bck.String(), err)
 			}
 		})
 	}
@@ -202,6 +201,11 @@ func TestHttpProviderObjectGet(t *testing.T) {
 	getArgs.Query = make(url.Values, 1)
 	getArgs.Query.Set(apc.QparamOrigURL, httpObjectURL)
 	_, err := api.GetObject(baseParams, hbo.Bck, httpObjectName, &getArgs)
+
+	if err != nil && strings.Contains(err.Error(), "backend is missing in the cluster configuration") {
+		t.Skipf("test %q requires 'ht://' backend ('aisnode' build with build tag 'ht')", t.Name())
+	}
+
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, strings.TrimSpace(w.String()) == httpObjectOutput, "bad content (expected:%s got:%s)",
 		httpObjectOutput, w.String())
@@ -227,7 +231,7 @@ func TestHttpProviderObjectGet(t *testing.T) {
 		}
 	}
 	tassert.Errorf(t, matchCount == 2, "objects %s and %s should be present in %s",
-		httpObjectName, httpAnotherObjectName, hbo.Bck)
+		httpObjectName, httpAnotherObjectName, hbo.Bck.String())
 }
 
 func TestAppendObject(t *testing.T) {
@@ -264,7 +268,7 @@ func TestAppendObject(t *testing.T) {
 					Bck:        bck,
 					Object:     objName,
 					Handle:     handle,
-					Reader:     cos.NewByteHandle([]byte(body)),
+					Reader:     cos.NewByteReader([]byte(body)),
 				}
 				handle, err = api.AppendObject(&args)
 				tassert.CheckFatal(t, err)
@@ -363,7 +367,7 @@ func TestSameBucketName(t *testing.T) {
 	{
 		var msg apc.PrefetchMsg
 		msg.ObjNames = files
-		prefetchListID, err := api.Prefetch(baseParams, bckRemote, msg)
+		prefetchListID, err := api.Prefetch(baseParams, bckRemote, &msg)
 		tassert.CheckFatal(t, err)
 		args := xact.ArgsMsg{ID: prefetchListID, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
 		_, err = api.WaitForXactionIC(baseParams, &args)
@@ -374,7 +378,7 @@ func TestSameBucketName(t *testing.T) {
 	{
 		var msg apc.PrefetchMsg
 		msg.Template = objRange
-		prefetchRangeID, err := api.Prefetch(baseParams, bckRemote, msg)
+		prefetchRangeID, err := api.Prefetch(baseParams, bckRemote, &msg)
 		tassert.CheckFatal(t, err)
 		args := xact.ArgsMsg{ID: prefetchRangeID, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
 		_, err = api.WaitForXactionIC(baseParams, &args)
@@ -386,7 +390,8 @@ func TestSameBucketName(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	tlog.Logf("EvictList %v\n", files)
-	evictListID, err := api.EvictMultiObj(baseParams, bckRemote, files, "" /*template*/)
+	evdListMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: files}}
+	evictListID, err := api.EvictMultiObj(baseParams, bckRemote, evdListMsg)
 	tassert.CheckFatal(t, err)
 	args := xact.ArgsMsg{ID: evictListID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
 	status, err := api.WaitForXactionIC(baseParams, &args)
@@ -394,7 +399,8 @@ func TestSameBucketName(t *testing.T) {
 	tassert.Errorf(t, status.ErrMsg != "", "expecting errors when not finding listed objects")
 
 	tlog.Logf("EvictRange\n")
-	evictRangeID, err := api.EvictMultiObj(baseParams, bckRemote, nil /*lst objnames*/, objRange)
+	evdRangeMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: objRange}}
+	evictRangeID, err := api.EvictMultiObj(baseParams, bckRemote, evdRangeMsg)
 	tassert.CheckFatal(t, err)
 	args = xact.ArgsMsg{ID: evictRangeID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, &args)
@@ -429,14 +435,14 @@ func TestSameBucketName(t *testing.T) {
 	{
 		var msg apc.PrefetchMsg
 		msg.ObjNames = files
-		prefetchListID, err := api.Prefetch(baseParams, bckRemote, msg)
+		prefetchListID, err := api.Prefetch(baseParams, bckRemote, &msg)
 		tassert.CheckFatal(t, err)
 		args = xact.ArgsMsg{ID: prefetchListID, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
 		_, err = api.WaitForXactionIC(baseParams, &args)
 		tassert.CheckFatal(t, err)
 	}
 
-	evictListID, err = api.EvictMultiObj(baseParams, bckRemote, files, "" /*template*/)
+	evictListID, err = api.EvictMultiObj(baseParams, bckRemote, evdListMsg)
 	tassert.CheckFatal(t, err)
 	args = xact.ArgsMsg{ID: evictListID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, &args)
@@ -444,7 +450,7 @@ func TestSameBucketName(t *testing.T) {
 
 	// Delete from cloud bucket
 	tlog.Logf("Deleting %s and %s from cloud bucket ...\n", fileName1, fileName2)
-	deleteID, err := api.DeleteMultiObj(baseParams, bckRemote, files, "" /*template*/)
+	deleteID, err := api.DeleteMultiObj(baseParams, bckRemote, evdListMsg)
 	tassert.CheckFatal(t, err)
 	args = xact.ArgsMsg{ID: deleteID, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, &args)
@@ -452,7 +458,7 @@ func TestSameBucketName(t *testing.T) {
 
 	// Delete from ais bucket
 	tlog.Logf("Deleting %s and %s from ais bucket ...\n", fileName1, fileName2)
-	deleteID, err = api.DeleteMultiObj(baseParams, bckLocal, files, "" /*template*/)
+	deleteID, err = api.DeleteMultiObj(baseParams, bckLocal, evdListMsg)
 	tassert.CheckFatal(t, err)
 	args = xact.ArgsMsg{ID: deleteID, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
 	_, err = api.WaitForXactionIC(baseParams, &args)
@@ -509,7 +515,7 @@ func Test_SameAISAndRemoteBucketName(t *testing.T) {
 	bucketPropsRemote := &cmn.BpropsToSet{}
 
 	// Put
-	tlog.Logf("PUT %s => %s\n", fileName, bckLocal)
+	tlog.Logf("PUT %s => %s\n", fileName, bckLocal.String())
 	putArgs := api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bckLocal,
@@ -522,7 +528,7 @@ func Test_SameAISAndRemoteBucketName(t *testing.T) {
 	resLocal, err := api.ListObjects(baseParams, bckLocal, msg, api.ListArgs{})
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("PUT %s => %s\n", fileName, bckRemote)
+	tlog.Logf("PUT %s => %s\n", fileName, bckRemote.String())
 	putArgs = api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bckRemote,
@@ -805,7 +811,7 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 	_ = mock.NewTarget(mock.NewBaseBownerMock(
 		meta.NewBck(
 			m.bck.Name, m.bck.Provider, cmn.NsGlobal,
-			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}, Extra: p.Extra, BID: 0xa73b9f11},
+			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumCesXxh}, Extra: p.Extra, BID: 0xa73b9f11},
 		),
 	))
 
@@ -856,7 +862,7 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 	oldFileInfo, _ = os.Stat(fqn)
 
 	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumXXHash, "01234"))
+	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234"))
 	tassert.CheckError(t, err)
 	validateGETUponFileChangeForChecksumValidation(t, proxyURL, objName, fqn, oldFileInfo)
 
@@ -875,7 +881,7 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 	}
 
 	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumXXHash, "01234abcde"))
+	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234abcde"))
 	tassert.CheckError(t, err)
 
 	_, err = api.GetObject(baseParams, m.bck, objName, nil)
@@ -909,7 +915,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 	tMock := mock.NewTarget(mock.NewBaseBownerMock(
 		meta.NewBck(
 			m.bck.Name, m.bck.Provider, cmn.NsGlobal,
-			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}, Extra: p.Extra, BID: 0xa73b9f11},
+			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumCesXxh}, Extra: p.Extra, BID: 0xa73b9f11},
 		),
 	))
 
@@ -917,11 +923,13 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 	var mockBackend core.Backend
 	switch m.bck.Provider {
 	case apc.AWS:
-		mockBackend, _ = backend.NewAWS(tMock, mock.NewStatsTracker())
+		mockBackend, _ = backend.NewAWS(tMock, mock.NewStatsTracker(), false /*starting up*/)
 	case apc.GCP:
-		mockBackend, _ = backend.NewGCP(tMock, mock.NewStatsTracker())
+		mockBackend, _ = backend.NewGCP(tMock, mock.NewStatsTracker(), false /*starting up*/)
 	case apc.Azure:
-		mockBackend, _ = backend.NewAzure(tMock, mock.NewStatsTracker())
+		mockBackend, _ = backend.NewAzure(tMock, mock.NewStatsTracker(), false /*starting up*/)
+	case apc.OCI:
+		mockBackend, _ = backend.NewOCI(tMock, mock.NewStatsTracker(), false /*starting up*/)
 	default:
 		t.Fatalf("unexpected backend provider %q", m.bck.Provider)
 	}
@@ -935,7 +943,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 		propsToSet := &cmn.BpropsToSet{
 			Versioning: &cmn.VersionConfToSet{ValidateWarmGet: apc.Ptr(true)},
 			Cksum: &cmn.CksumConfToSet{
-				Type:            apc.Ptr(cos.ChecksumXXHash),
+				Type:            apc.Ptr(cos.ChecksumCesXxh),
 				ValidateWarmGet: apc.Ptr(true),
 			},
 		}
@@ -974,7 +982,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 			modify     func(*testing.T, *core.LOM)
 		}{
 			"checksum": {modify: func(_ *testing.T, lom *core.LOM) {
-				lom.SetCksum(cos.NewCksum(cos.ChecksumXXHash, "01234"))
+				lom.SetCksum(cos.NewCksum(cos.ChecksumCesXxh, "01234"))
 			}},
 			"local_content": {modify: func(t *testing.T, lom *core.LOM) {
 				err := os.WriteFile(lom.FQN, []byte("modified"), cos.PermRWR)
@@ -987,7 +995,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 					}
 
 					r := io.NopCloser(bytes.NewReader([]byte("modified")))
-					_, err := tMock.Backend(lom.Bck()).PutObj(r, lom, nil)
+					_, err := tMock.Backend(lom.Bck()).PutObj(t.Context(), r, lom, nil)
 					tassert.CheckFatal(t, err)
 				},
 			},
@@ -1010,7 +1018,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 							"(try running this test with -tags=%q)\n\n", "debug,aws,gcp,azure")
 					}
 
-					_, err = backend.PutObj(r, lom, nil)
+					_, err = backend.PutObj(t.Context(), r, lom, nil)
 					tassert.CheckFatal(t, err)
 				},
 			},
@@ -1152,7 +1160,7 @@ func TestChecksumValidateOnWarmGetForBucket(t *testing.T) {
 		_          = mock.NewTarget(mock.NewBaseBownerMock(
 			meta.NewBck(
 				m.bck.Name, apc.AIS, cmn.NsGlobal,
-				&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}, BID: 1},
+				&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumCesXxh}, BID: 1},
 			),
 			meta.CloneBck(&m.bck),
 		))
@@ -1193,7 +1201,7 @@ func TestChecksumValidateOnWarmGetForBucket(t *testing.T) {
 	objName = m.objNames[1]
 	fqn = findObjOnDisk(m.bck, objName)
 	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumXXHash, "01234abcde"))
+	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234abcde"))
 	tassert.CheckError(t, err)
 	executeTwoGETsForChecksumValidation(proxyURL, m.bck, objName, t)
 
@@ -1212,7 +1220,7 @@ func TestChecksumValidateOnWarmGetForBucket(t *testing.T) {
 	}
 
 	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumXXHash, "01234abcde"))
+	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234abcde"))
 	tassert.CheckError(t, err)
 	_, err = api.GetObject(baseParams, m.bck, objName, nil)
 	tassert.CheckError(t, err)
@@ -1465,7 +1473,7 @@ func Test_checksum(t *testing.T) {
 
 	m.remotePuts(true /*evict*/)
 
-	// Disable checkum.
+	// Disable checksum.
 	if p.Cksum.Type != cos.ChecksumNone {
 		propsToSet := &cmn.BpropsToSet{
 			Cksum: &cmn.CksumConfToSet{
@@ -1495,7 +1503,7 @@ func Test_checksum(t *testing.T) {
 
 	propsToSet := &cmn.BpropsToSet{
 		Cksum: &cmn.CksumConfToSet{
-			Type:            apc.Ptr(cos.ChecksumXXHash),
+			Type:            apc.Ptr(cos.ChecksumCesXxh),
 			ValidateColdGet: apc.Ptr(true),
 		},
 	}
@@ -1598,9 +1606,8 @@ func TestPutObjectWithChecksum(t *testing.T) {
 			continue
 		}
 		fileName := basefileName + cksumType
-		hasher := cos.NewCksumHash(cksumType)
-		hasher.H.Write(objData)
-		cksumValue := hex.EncodeToString(hasher.H.Sum(nil))
+		cksumValue := cos.ChecksumB2S(objData, cksumType)
+
 		putArgs.Cksum = cos.NewCksum(cksumType, badCksumVal)
 		putArgs.ObjName = fileName
 
@@ -1715,17 +1722,18 @@ func TestOperationsWithRanges(t *testing.T) {
 					tlog.Logf("%d. %s; range: [%s]\n", idx+1, test.name, test.rangeStr)
 
 					var (
-						err  error
-						xid  string
-						kind string
-						msg  = &apc.LsoMsg{Prefix: "test/"}
+						err    error
+						xid    string
+						kind   string
+						lsmsg  = &apc.LsoMsg{Prefix: "test/"}
+						evdMsg = &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: test.rangeStr}}
 					)
 					if evict {
-						xid, err = api.EvictMultiObj(baseParams, b, nil /*lst objnames*/, test.rangeStr)
-						msg.Flags = apc.LsObjCached
+						xid, err = api.EvictMultiObj(baseParams, b, evdMsg)
+						lsmsg.Flags = apc.LsCached
 						kind = apc.ActEvictObjects
 					} else {
-						xid, err = api.DeleteMultiObj(baseParams, b, nil /*lst objnames*/, test.rangeStr)
+						xid, err = api.DeleteMultiObj(baseParams, b, evdMsg)
 						kind = apc.ActDeleteObjects
 					}
 					if err != nil {
@@ -1738,7 +1746,7 @@ func TestOperationsWithRanges(t *testing.T) {
 					tassert.CheckFatal(t, err)
 
 					totalFiles -= test.delta
-					objList, err := api.ListObjects(baseParams, b, msg, api.ListArgs{})
+					objList, err := api.ListObjects(baseParams, b, lsmsg, api.ListArgs{})
 					if err != nil {
 						t.Error(err)
 						continue

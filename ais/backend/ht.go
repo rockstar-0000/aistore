@@ -1,8 +1,8 @@
 //go:build ht
 
-// Package backend contains implementation of various backend providers.
+// Package backend contains core/backend interface implementations for supported backend providers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -34,13 +34,13 @@ type (
 // interface guard
 var _ core.Backend = (*htbp)(nil)
 
-func NewHT(t core.TargetPut, config *cmn.Config, tstats stats.Tracker) (core.Backend, error) {
+func NewHT(t core.TargetPut, config *cmn.Config, tstats stats.Tracker, startingUp bool) (core.Backend, error) {
 	bp := &htbp{
 		t:    t,
 		base: base{provider: apc.HT},
 	}
 	bp.cliH, bp.cliTLS = cmn.NewDefaultClients(config.Client.TimeoutLong.D())
-	bp.init(t.Snode(), tstats)
+	bp.init(t.Snode(), tstats, startingUp)
 	return bp, nil
 }
 
@@ -51,7 +51,7 @@ func (htbp *htbp) client(u string) *http.Client {
 	return htbp.cliH
 }
 
-func (htbp *htbp) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.StrKVs, ecode int, err error) {
+func (htbp *htbp) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, int, error) {
 	// TODO: we should use `bck.RemoteBck()`.
 
 	origURL, err := getOriginalURL(ctx, bck, "")
@@ -71,7 +71,7 @@ func (htbp *htbp) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.S
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		err = fmt.Errorf("HEAD(%s) failed, status %d", origURL, resp.StatusCode)
+		err := fmt.Errorf("HEAD(%s) failed, status %d", origURL, resp.StatusCode)
 		return nil, resp.StatusCode, err
 	}
 
@@ -80,9 +80,10 @@ func (htbp *htbp) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.S
 		nlog.Errorf("Warning: missing header %s (response header: %+v)", cos.HdrETag, resp.Header)
 	}
 
-	bckProps = make(cos.StrKVs)
+	bckProps := make(cos.StrKVs)
 	bckProps[apc.HdrBackendProvider] = apc.HT
-	return
+
+	return bckProps, 0, nil
 }
 
 func (*htbp) ListObjects(*meta.Bck, *apc.LsoMsg, *cmn.LsoRes) (ecode int, err error) {
@@ -99,7 +100,7 @@ func getOriginalURL(ctx context.Context, bck *meta.Bck, objName string) (string,
 	origURL, ok := ctx.Value(cos.CtxOriginalURL).(string)
 	if !ok || origURL == "" {
 		if bck.Props == nil {
-			return "", fmt.Errorf("failed to HEAD (%s): original_url is empty", bck)
+			return "", fmt.Errorf("failed to HEAD (%s): original_url is empty", bck.String())
 		}
 		origURL = bck.Props.Extra.HTTP.OrigURLBck
 		debug.Assert(origURL != "")
@@ -110,7 +111,7 @@ func getOriginalURL(ctx context.Context, bck *meta.Bck, objName string) (string,
 	return origURL, nil
 }
 
-func (htbp *htbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
+func (htbp *htbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (*cmn.ObjAttrs, int, error) {
 	var (
 		h   = cmn.BackendHelpers.HTTP
 		bck = lom.Bck() // TODO: This should be `cloudBck = lom.Bck().RemoteBck()`
@@ -129,18 +130,19 @@ func (htbp *htbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (
 	if resp.StatusCode != http.StatusOK {
 		return nil, resp.StatusCode, fmt.Errorf("error occurred: %v", resp.StatusCode)
 	}
-	oa = &cmn.ObjAttrs{}
+
+	oa := &cmn.ObjAttrs{}
 	oa.SetCustomKey(cmn.SourceObjMD, apc.HT)
 	if resp.ContentLength >= 0 {
 		oa.Size = resp.ContentLength
 	}
-	if v, ok := h.EncodeVersion(resp.Header.Get(cos.HdrETag)); ok {
+	if v, ok := h.EncodeETag(resp.Header.Get(cos.HdrETag)); ok {
 		oa.SetCustomKey(cmn.ETag, v)
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
 		nlog.Infof("[head_object] %s", lom)
 	}
-	return
+	return oa, 0, nil
 }
 
 func (htbp *htbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (int, error) {
@@ -200,7 +202,7 @@ func (htbp *htbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 
 	lom.SetCustomKey(cmn.SourceObjMD, apc.HT)
 	lom.SetCustomKey(cmn.OrigURLObjMD, origURL)
-	if v, ok := h.EncodeVersion(resp.Header.Get(cos.HdrETag)); ok {
+	if v, ok := h.EncodeETag(resp.Header.Get(cos.HdrETag)); ok {
 		lom.SetCustomKey(cmn.ETag, v)
 	}
 	res.Size = resp.ContentLength
@@ -208,10 +210,10 @@ func (htbp *htbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 	return res
 }
 
-func (*htbp) PutObj(io.ReadCloser, *core.LOM, *http.Request) (int, error) {
+func (*htbp) PutObj(context.Context, io.ReadCloser, *core.LOM, *http.Request) (int, error) {
 	return http.StatusBadRequest, cmn.NewErrUnsupp("PUT", " objects => HTTP backend")
 }
 
-func (*htbp) DeleteObj(*core.LOM) (int, error) {
+func (*htbp) DeleteObj(context.Context, *core.LOM) (int, error) {
 	return http.StatusBadRequest, cmn.NewErrUnsupp("DELETE", " objects from HTTP backend")
 }

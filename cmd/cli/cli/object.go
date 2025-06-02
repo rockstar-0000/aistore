@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles object operations.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/sys"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
@@ -57,18 +58,17 @@ func promote(c *cli.Context, bck cmn.Bck, objName, fqn string) error {
 	return nil
 }
 
-func setCustomProps(c *cli.Context, bck cmn.Bck, objName string) (err error) {
+func setCustomProps(c *cli.Context, bck cmn.Bck, objName string) error {
 	props := make(cos.StrKVs)
 	propArgs := c.Args().Tail()
 
 	if len(propArgs) == 1 && isJSON(propArgs[0]) {
-		if err = jsoniter.Unmarshal([]byte(propArgs[0]), &props); err != nil {
-			return
+		if err := jsoniter.Unmarshal([]byte(propArgs[0]), &props); err != nil {
+			return err
 		}
 	} else {
 		if len(propArgs) == 0 {
-			err = missingArgumentsError(c, "property key-value pairs")
-			return
+			return missingArgumentsError(c, "property key-value pairs")
 		}
 		for _, pair := range propArgs {
 			nv := strings.Split(pair, "=")
@@ -81,9 +81,10 @@ func setCustomProps(c *cli.Context, bck cmn.Bck, objName string) (err error) {
 		}
 	}
 	setNewCustom := flagIsSet(c, setNewCustomMDFlag)
-	if err = api.SetObjectCustomProps(apiBP, bck, objName, props, setNewCustom); err != nil {
-		return
+	if err := api.SetObjectCustomProps(apiBP, bck, objName, props, setNewCustom); err != nil {
+		return err
 	}
+
 	msg := fmt.Sprintf("Custom props successfully updated (to show updates, run 'ais show object %s --props=all').",
 		bck.Cname(objName))
 	actionDone(c, msg)
@@ -106,7 +107,7 @@ func verbList(c *cli.Context, wop wop, fnames []string, bck cmn.Bck, appendPref 
 		recurs   = flagIsSet(c, recursFlag)
 	)
 	for _, n := range fnames {
-		fobjs, err := lsFobj(c, n, "", appendPref, &ndir, recurs, incl)
+		fobjs, err := lsFobj(c, n, "", appendPref, &ndir, recurs, incl, false /*globbed*/)
 		if err != nil {
 			return err
 		}
@@ -123,7 +124,7 @@ func verbRange(c *cli.Context, wop wop, pt *cos.ParsedTemplate, bck cmn.Bck, tri
 	)
 	pt.InitIter()
 	for n, hasNext := pt.Next(); hasNext; n, hasNext = pt.Next() {
-		fobjs, err := lsFobj(c, n, trimPref, appendPref, &ndir, recurs, incl)
+		fobjs, err := lsFobj(c, n, trimPref, appendPref, &ndir, recurs, incl, false /*globbed*/)
 		if err != nil {
 			return err
 		}
@@ -147,7 +148,7 @@ func concatObject(c *cli.Context, bck cmn.Bck, objName string, fileNames []strin
 		recurs     = flagIsSet(c, recursFlag)
 	)
 	for i, fileName := range fileNames {
-		fobjs, err := lsFobj(c, fileName, "", "", &ndir, recurs, false /*incl src dir*/)
+		fobjs, err := lsFobj(c, fileName, "", "", &ndir, recurs, false /*incl src dir*/, false /*globbed*/)
 		if err != nil {
 			return err
 		}
@@ -230,7 +231,7 @@ func isObjPresent(c *cli.Context, bck cmn.Bck, objName string) error {
 	_, err := api.HeadObject(apiBP, bck, objName, hargs)
 	if err != nil {
 		if cmn.IsStatusNotFound(err) {
-			fmt.Fprintf(c.App.Writer, "%s is not present (\"not cached\")\n", name)
+			fmt.Fprintf(c.App.Writer, "%s is not present (\"not cached\") in cluster\n", name)
 			return nil
 		}
 		return V(err)
@@ -252,14 +253,16 @@ func calcPutRefresh(c *cli.Context) time.Duration {
 }
 
 // via `ais ls bucket/object` and `ais show bucket/object`
-func showObjProps(c *cli.Context, bck cmn.Bck, objName string) (notfound bool, _ error) {
+func showObjProps(c *cli.Context, bck cmn.Bck, objName string, silent bool) (notfound bool, _ error) {
 	var (
 		propsFlag     []string
 		selectedProps []string
 		hargs         = api.HeadArgs{
 			FltPresence: apc.FltPresentCluster,
-			Silent:      flagIsSet(c, silentFlag),
+			Silent:      flagIsSet(c, silentFlag) || silent,
 		}
+		isList      = actionIsHandler(c.Command.Action, listAnyHandler)
+		isRemote    = bck.IsRemote()
 		units, errU = parseUnitsFlag(c, unitsFlag)
 	)
 	if errU != nil {
@@ -268,21 +271,28 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) (notfound bool, _
 	if flagIsSet(c, objNotCachedPropsFlag) || flagIsSet(c, allObjsOrBcksFlag) {
 		hargs.FltPresence = apc.FltExists
 	}
+
+	// do
 	objProps, err := api.HeadObject(apiBP, bck, objName, hargs)
 	if err != nil {
 		notfound = cmn.IsStatusNotFound(err)
 		if !notfound {
 			return notfound, err
 		}
-		var hint string
-		if apc.IsFltPresent(hargs.FltPresence) && bck.IsRemote() {
-			if actionIsHandler(c.Command.Action, listAnyHandler) {
-				hint = fmt.Sprintf(" (tip: try %s option)", qflprn(allObjsOrBcksFlag))
+		var hint, tag string
+		if !isList {
+			tag = "object "
+		}
+		if apc.IsFltPresent(hargs.FltPresence) && isRemote {
+			if isList {
+				if flagIsSet(c, listCachedFlag) {
+					hint = fmt.Sprintf(" (tip: try 'ais ls' without %s option)", qflprn(listCachedFlag))
+				}
 			} else {
-				hint = fmt.Sprintf(" (tip: try %s option)", qflprn(objNotCachedPropsFlag))
+				hint = fmt.Sprintf(" (tip: try %s option or use 'ais ls' to lookup by prefix)", qflprn(objNotCachedPropsFlag))
 			}
 		}
-		return notfound, fmt.Errorf("%q not found in %s%s", objName, bck.Cname(""), hint)
+		return notfound, fmt.Errorf("%s%q not found in %s%s", tag, objName, bck.Cname(""), hint)
 	}
 
 	if flagIsSet(c, allPropsFlag) {
@@ -293,37 +303,43 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) (notfound bool, _
 	}
 
 	// NOTE: three different defaults; compare w/ `listObjects()`
-	if len(propsFlag) == 0 {
+	switch {
+	case len(propsFlag) == 0:
 		selectedProps = apc.GetPropsMinimal
 		if bck.IsAIS() {
 			selectedProps = apc.GetPropsDefaultAIS
 		} else if bck.IsCloud() {
 			selectedProps = apc.GetPropsDefaultCloud
 		}
-	} else if cos.StringInSlice("all", propsFlag) {
+	case cos.StringInSlice("all", propsFlag):
 		selectedProps = apc.GetPropsAll
-	} else {
+	default:
 		selectedProps = propsFlag
 	}
 
 	propNVs := make(nvpairList, 0, len(selectedProps))
 	for _, name := range selectedProps {
-		if v := propVal(objProps, name); v != "" {
-			if name == apc.GetPropsAtime && isUnsetTime(c, v) {
-				v = teb.NotSetVal
-			}
-			if name == apc.GetPropsSize && units != "" {
-				// reformat
-				size, err := cos.ParseSize(v, "")
-				if err != nil {
-					warn := fmt.Sprintf("failed to parse 'size': %v", err)
-					actionWarn(c, warn)
-				} else {
-					v = teb.FmtSize(size, units, 2)
-				}
-			}
-			propNVs = append(propNVs, nvpair{name, v})
+		v, err := propVal(objProps, name)
+		if err != nil {
+			return false, err
 		}
+		if v == "" {
+			continue
+		}
+		if name == apc.GetPropsAtime && isUnsetTime(c, v) {
+			v = teb.NotSetVal
+		}
+		if name == apc.GetPropsSize && units != "" {
+			// reformat
+			size, err := cos.ParseSize(v, "")
+			if err != nil {
+				warn := fmt.Sprintf("failed to parse 'size': %v", err)
+				actionWarn(c, warn)
+			} else {
+				v = teb.FmtSize(size, units, 2)
+			}
+		}
+		propNVs = append(propNVs, nvpair{name, v})
 	}
 	sort.Slice(propNVs, func(i, j int) bool {
 		return propNVs[i].Name < propNVs[j].Name
@@ -335,7 +351,7 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string) (notfound bool, _
 	return false, teb.Print(propNVs, teb.PropValTmpl)
 }
 
-func propVal(op *cmn.ObjectProps, name string) (v string) {
+func propVal(op *cmn.ObjectProps, name string) (v string, _ error) {
 	switch name {
 	case apc.GetPropsName:
 		v = op.Bck.Cname(op.Name)
@@ -350,7 +366,7 @@ func propVal(op *cmn.ObjectProps, name string) (v string) {
 	case apc.GetPropsCached:
 		if op.Bck.IsAIS() {
 			debug.Assert(op.Present)
-			return
+			return "", nil
 		}
 		v = teb.FmtBool(op.Present)
 	case apc.GetPropsCopies:
@@ -371,17 +387,18 @@ func propVal(op *cmn.ObjectProps, name string) (v string) {
 	case apc.GetPropsStatus:
 		// no "object status" in `cmn.ObjectProps` - nothing to do (see also: `cmn.LsoEnt`)
 	default:
-		debug.Assert(false, "obj prop name: \""+name+"\"")
+		return "", fmt.Errorf("invalid object property %q (expecting one of: %v)", name, apc.GetPropsAll)
 	}
-	return
+
+	return v, nil
 }
 
 func rmRfAllObjects(c *cli.Context, bck cmn.Bck) error {
-	objList, err := api.ListObjects(apiBP, bck, nil, api.ListArgs{})
+	lst, err := api.ListObjects(apiBP, bck, nil, api.ListArgs{})
 	if err != nil {
 		return err
 	}
-	l := len(objList.Entries)
+	l := len(lst.Entries)
 	if l == 0 {
 		fmt.Fprintln(c.App.Writer, bck.Cname(""), "is empty, nothing to do.")
 		return nil
@@ -399,7 +416,7 @@ func rmRfAllObjects(c *cli.Context, bck cmn.Bck) error {
 	if bck.IsCloud() {
 		period = 100
 	}
-	for _, entry := range objList.Entries {
+	for _, entry := range lst.Entries {
 		wg.Add(1)
 		// delete one
 		go func(objName string) {
@@ -413,7 +430,7 @@ func rmRfAllObjects(c *cli.Context, bck cmn.Bck) error {
 				if vrbs {
 					fmt.Fprintf(c.App.Writer, "deleted %s\n", bck.Cname(objName))
 				} else if n > 1 && n%period == 0 {
-					fmt.Fprintf(c.App.Writer, "\r%s", cos.FormatBigNum(int(n)))
+					fmt.Fprintf(c.App.Writer, "\r%s", cos.FormatBigI64(n))
 					ratomic.AddInt64(&progress, 1)
 				}
 			}
@@ -429,7 +446,7 @@ func rmRfAllObjects(c *cli.Context, bck cmn.Bck) error {
 	cnt := int(cnt64)
 	if cnt == l {
 		debug.Assert(errCnt64 == 0)
-		msg := fmt.Sprintf("Deleted %s object%s from %s\n", cos.FormatBigNum(cnt), cos.Plural(cnt), bck.Cname(""))
+		msg := fmt.Sprintf("Deleted %s object%s from %s\n", cos.FormatBigI64(cnt64), cos.Plural(cnt), bck.Cname(""))
 		actionDone(c, msg)
 		return nil
 	}
@@ -437,7 +454,7 @@ func rmRfAllObjects(c *cli.Context, bck cmn.Bck) error {
 	debug.Assert(errCnt64 > 0)
 	firstErr := <-errCh
 	warn := fmt.Sprintf("failed to delete %d object%s from %s: (%d deleted, %d error%s)\n", l-cnt, cos.Plural(l-cnt),
-		bck, cnt, errCnt64, cos.Plural(int(errCnt64)))
+		bck.String(), cnt, errCnt64, cos.Plural(int(errCnt64)))
 	actionWarn(c, warn)
 	return firstErr
 }

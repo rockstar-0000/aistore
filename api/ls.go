@@ -1,12 +1,10 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,9 +25,9 @@ const (
 
 type (
 	LsoCounter struct {
+		callback  LsoCB
 		startTime int64 // time operation started
 		callAfter int64 // callback after
-		callback  LsoCB
 		count     int
 		done      bool
 	}
@@ -38,8 +36,8 @@ type (
 	// additional and optional list-objects args (compare with: GetArgs, PutArgs)
 	ListArgs struct {
 		Callback  LsoCB
-		CallAfter time.Duration
 		Header    http.Header // to optimize listing very large buckets, e.g.: Header.Set(apc.HdrInventory, "true")
+		CallAfter time.Duration
 		Limit     int64
 	}
 )
@@ -108,7 +106,8 @@ func QueryBuckets(bp BaseParams, qbck cmn.QueryBcks, fltPresence int) (bool, err
 // - `apc.LsoMsg`
 // - `api.ListObjectsPage`
 func ListObjects(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (*cmn.LsoRes, error) {
-	reqParams := lsoReq(bp, bck, &args)
+	q := qalloc()
+	reqParams := lsoReq(bp, bck, &args, q)
 	if lsmsg == nil {
 		lsmsg = &apc.LsoMsg{}
 	} else {
@@ -118,10 +117,11 @@ func ListObjects(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (
 
 	freeMbuf(reqParams.buf)
 	FreeRp(reqParams)
+	qfree(q)
 	return lst, err
 }
 
-func lsoReq(bp BaseParams, bck cmn.Bck, args *ListArgs) *ReqParams {
+func lsoReq(bp BaseParams, bck cmn.Bck, args *ListArgs, q url.Values) *ReqParams {
 	hdr := args.Header
 	if hdr == nil {
 		hdr = make(http.Header, 2)
@@ -140,7 +140,8 @@ func lsoReq(bp BaseParams, bck cmn.Bck, args *ListArgs) *ReqParams {
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Header = hdr
-		reqParams.Query = bck.NewQuery()
+		bck.SetQuery(q)
+		reqParams.Query = q
 		reqParams.buf = allocMbuf() // msgpack
 	}
 	return reqParams
@@ -204,7 +205,7 @@ func lsoPage(reqParams *ReqParams) (_ *cmn.LsoRes, err error) {
 		if _, err = reqParams.DoReqAny(page); err == nil {
 			return page, nil
 		}
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if !cos.IsClientTimeout(err) {
 			break
 		}
 		client := *reqParams.BaseParams.Client
@@ -222,7 +223,8 @@ func lsoPage(reqParams *ReqParams) (_ *cmn.LsoRes, err error) {
 // - `apc.LsoMsg`
 // - `api.ListObjects`
 func ListObjectsPage(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArgs) (*cmn.LsoRes, error) {
-	reqParams := lsoReq(bp, bck, &args)
+	q := qalloc()
+	reqParams := lsoReq(bp, bck, &args, q)
 	if lsmsg == nil {
 		lsmsg = &apc.LsoMsg{}
 	}
@@ -232,34 +234,16 @@ func ListObjectsPage(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArg
 	// no need to preallocate bucket entries slice (msgpack does it)
 	page := &cmn.LsoRes{}
 	_, err := reqParams.DoReqAny(page)
+
 	freeMbuf(reqParams.buf)
 	FreeRp(reqParams)
+	qfree(q)
 	if err != nil {
 		return nil, err
 	}
 	lsmsg.UUID = page.UUID
 	lsmsg.ContinuationToken = page.ContinuationToken
 	return page, nil
-}
-
-// TODO: obsolete this function after introducing mechanism to detect remote bucket changes.
-func ListObjectsInvalidateCache(bp BaseParams, bck cmn.Bck) error {
-	var (
-		path = apc.URLPathBuckets.Join(bck.Name)
-		q    = url.Values{}
-	)
-	bp.Method = http.MethodPost
-	reqParams := AllocRp()
-	{
-		reqParams.Query = bck.AddToQuery(q)
-		reqParams.BaseParams = bp
-		reqParams.Path = path
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActInvalListCache})
-		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-	}
-	err := reqParams.DoRequest()
-	FreeRp(reqParams)
-	return err
 }
 
 ////////////////

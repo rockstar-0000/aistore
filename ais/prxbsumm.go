@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -47,17 +47,18 @@ func (p *proxy) bsummact(w http.ResponseWriter, r *http.Request, qbck *cmn.Query
 }
 
 func (p *proxy) bsummNew(qbck *cmn.QueryBcks, msg *apc.BsummCtrlMsg) (err error) {
-	q := qbck.NewQuery()
+	q := make(url.Values, 1)
+	qbck.SetQuery(q)
 
 	msg.UUID = cos.GenUUID()
-	aisMsg := p.newAmsgActVal(apc.ActSummaryBck, msg)
+	actMsgExt := p.newAmsgActVal(apc.ActSummaryBck, msg)
 
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{
 		Method: http.MethodGet,
 		Path:   apc.URLPathBuckets.Join(qbck.Name, apc.ActBegin), // compare w/ txn
 		Query:  q,
-		Body:   cos.MustMarshal(aisMsg),
+		Body:   cos.MustMarshal(actMsgExt),
 	}
 	// not using default control-plane timeout -
 	// returning only _after_ all targets start running this new job
@@ -84,14 +85,14 @@ func (p *proxy) bsummNew(qbck *cmn.QueryBcks, msg *apc.BsummCtrlMsg) (err error)
 
 func (p *proxy) bsummCollect(qbck *cmn.QueryBcks, msg *apc.BsummCtrlMsg) (_ cmn.AllBsummResults, status int, err error) {
 	var (
-		q      = make(url.Values, 4)
-		aisMsg = p.newAmsgActVal(apc.ActSummaryBck, msg)
-		args   = allocBcArgs()
+		q         = make(url.Values, 4)
+		actMsgExt = p.newAmsgActVal(apc.ActSummaryBck, msg)
+		args      = allocBcArgs()
 	)
 	args.req = cmn.HreqArgs{
 		Method: http.MethodGet,
 		Path:   apc.URLPathBuckets.Join(qbck.Name, apc.ActQuery),
-		Body:   cos.MustMarshal(aisMsg),
+		Body:   cos.MustMarshal(actMsgExt),
 	}
 	args.smap = p.owner.smap.get()
 	if cnt := args.smap.CountActiveTs(); cnt < 1 {
@@ -100,7 +101,7 @@ func (p *proxy) bsummCollect(qbck *cmn.QueryBcks, msg *apc.BsummCtrlMsg) (_ cmn.
 	qbck.AddToQuery(q)
 	q.Set(apc.QparamSilent, "true")
 	args.req.Query = q
-	args.cresv = cresBsumm{} // -> cmn.AllBsummResults
+	args.cresv = cresjGeneric[cmn.AllBsummResults]{}
 
 	results := p.bcastGroup(args)
 	freeBcArgs(args)

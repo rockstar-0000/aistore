@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -9,7 +9,7 @@ import "github.com/NVIDIA/aistore/cmn/jsp"
 
 const GitHubHome = "https://github.com/NVIDIA/aistore"
 
-// ========================== IMPORTANT NOTE ==============================
+// ========================== NOTE =====================================
 //
 // - (major.minor) version indicates the current version of AIS software
 //   and is updated manually prior to each release;
@@ -17,8 +17,8 @@ const GitHubHome = "https://github.com/NVIDIA/aistore"
 //   creating the corresponding git tag
 //
 // - MetaVer* constants, on the other hand, specify all current on-disk
-//   formatting versions (meta-versions) with the intent to support backward
-//   compatibility in the future
+//   formatting versions (meta-versions) with the intent to support
+//   backward compatibility in the future
 //
 // - Most of the enumerated types below utilize `jsp` package to serialize
 //   and format their (versioned) instances. In its turn, `jsp` itself
@@ -26,11 +26,13 @@ const GitHubHome = "https://github.com/NVIDIA/aistore"
 //   `jsp` formats its *signature* and other implementation details.
 
 const (
-	VersionAIStore = "3.24.rc4"
-	VersionCLI     = "1.13"
-	VersionLoader  = "1.12"
-	VersionAuthN   = "1.1"
+	VersionAIStore = "3.29"
+	VersionCLI     = "1.18"
+	VersionLoader  = "1.13"
+	VersionAuthN   = "1.2"
 )
+
+// NOTE: for (local) LOM meta-versions, see core/lom*
 
 const (
 	MetaverSmap  = 2 // Smap (cluster map) formatting version a.k.a. meta-version (see core/meta/jsp.go)
@@ -38,9 +40,6 @@ const (
 	MetaverRMD   = 1 // Rebalance MD (jsp)
 	MetaverVMD   = 2 // Volume MD (jsp)
 	MetaverEtlMD = 1 // ETL MD (jsp)
-
-	MetaverLOM   = 1 // LOM
-	MetaverChunk = 2 // LOM chunk
 
 	MetaverConfig      = 4 // Global Configuration (jsp)
 	MetaverAuthNConfig = 1 // Authn config (jsp) // ditto

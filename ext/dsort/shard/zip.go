@@ -1,7 +1,7 @@
 // Package shard provides Extract(shard), Create(shard), and associated methods
-// across all suppported archival formats (see cmn/archive/mime.go)
+// across all supported archival formats (see cmn/archive/mime.go)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package shard
 
@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/memsys"
+
 	jsoniter "github.com/json-iterator/go"
 )
 

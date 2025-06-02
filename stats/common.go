@@ -1,13 +1,13 @@
 // Package stats provides methods and functionality to register, track, log,
 // and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package stats
 
 import (
 	"encoding/json"
-	rfs "io/fs"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -23,13 +23,24 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/sys"
+
 	jsoniter "github.com/json-iterator/go"
 )
+
+// Naming conventions:
+// ========================================================
+// "*.n"    - KindCounter
+// "*.ns"   - KindLatency, KindTotal (nanoseconds)
+// "*.size" - KindSize (bytes)
+// "*.bps"  - KindThroughput, KindComputedThroughput
+//
+// all error counters must have "err_" prefix (see `errPrefix`)
 
 // Linkage:
 // - this source is common for both Prometheus (common_prom.go) and StatsD (common_statsd.go)
@@ -38,11 +49,11 @@ import (
 
 // defaults and tunables
 const (
-	dfltKaliveClearAlert  = 5 * time.Minute        // clear `cos.KeepAliveErrors` alert when `ErrKaliveCount` doesn't inc that much time
-	dfltPeriodicFlushTime = time.Minute            // when `config.Log.FlushTime` is 0 (zero)
-	dfltPeriodicTimeStamp = time.Hour              // extended date/time complementary to log timestamps (e.g., "11:29:11.644596")
-	maxStatsLogInterval   = int64(3 * time.Minute) // when idle; secondly, an upper limit on `config.Log.StatsTime`
-	maxCapLogInterval     = int64(4 * time.Hour)   // to see capacity at least few times a day (when idle)
+	dfltKaliveClearAlert  = 5 * time.Minute      // clear `cos.KeepAliveErrors` alert when `ErrKaliveCount` doesn't inc that much time
+	dfltPeriodicFlushTime = time.Minute          // when `config.Log.FlushTime` is 0 (zero)
+	dfltPeriodicTimeStamp = time.Hour            // extended date/time complementary to log timestamps (e.g., "11:29:11.644596")
+	dfltStatsLogInterval  = int64(time.Minute)   // stats logging interval when not idle; `config.Log.StatsTime` takes precedence if defined
+	dlftCapLogInterval    = int64(4 * time.Hour) // capacity logging interval
 )
 
 // periodic
@@ -57,19 +68,30 @@ const (
 	lshiftGorHigh  = 8                // max expressed as left shift of the num CPUs
 )
 
-// [naming convention] error counter prefixes
+// Naming conventions: error counters' prefixes
 const (
 	errPrefix   = "err."    // all error metric names (see `IsErrMetric` below)
 	ioErrPrefix = "err.io." // excluding connection-reset-by-peer and similar (see ioErrNames)
 )
 
-// metrics
+//
+// common metrics ---------------------------------------------------------------
+//
+
+// KindCounter:
+// all basic counters are accompanied by the corresponding (errPrefix + kind) error count:
+// e.g.: "get.n" => "err.get.n", "put.n" => "err.put.n", etc.
 const (
-	// KindCounter:
-	// all basic counters are accompanied by the corresponding (errPrefix + kind) error count:
-	// e.g.: "get.n" => "err.get.n", "put.n" => "err.put.n", etc.
-	GetCount    = "get.n" // GET(object) count = (cold + warm)
-	PutCount    = "put.n" // ditto PUT
+	// NOTE semantics:
+	// - counts all warm GETs
+	// - counts all cold GETs (when remote GET is followed by storing new object (or, new object version) locally)
+	// - does NOT count internal GetObjReader calls (e.g., by copy or transform jobs)
+	// - see also:
+	//   - ais/backend/common
+	//   - rgetstats
+	GetCount = "get.n"
+
+	PutCount    = "put.n" // ditto PUT(object) count = (all PUTs including remote)
 	HeadCount   = "head.n"
 	AppendCount = "append.n"
 	DeleteCount = "del.n"
@@ -77,7 +99,7 @@ const (
 	ListCount   = "lst.n" // list-objects
 
 	// error counters
-	// see also: `IncErr`, `regCommon`, `ioErrNames`
+	// see also: `Inc`, `regCommon`, `ioErrNames`
 	ErrGetCount    = errPrefix + GetCount
 	ErrPutCount    = errPrefix + PutCount
 	ErrHeadCount   = errPrefix + HeadCount
@@ -86,22 +108,20 @@ const (
 	ErrRenameCount = errPrefix + RenameCount
 	ErrListCount   = errPrefix + ListCount
 
-	ErrKaliveCount = errPrefix + "kalive.n"
-
-	// more errors
-	// (for even more errors, see target_stats)
+	ErrKaliveCount    = errPrefix + "kalive.n"
 	ErrHTTPWriteCount = errPrefix + "http.write.n"
-	ErrDownloadCount  = errPrefix + "dl.n"
-	ErrPutMirrorCount = errPrefix + "put.mirror.n"
 
-	// KindLatency
-	// latency stats have numSamples used to compute average latency
-	GetLatency         = "get.ns"
-	GetLatencyTotal    = "get.ns.total"
-	GetE2ELatencyTotal = "e2e.get.ns.total" // // e2e cold-GET latency
-	ListLatency        = "lst.ns"
-	KeepAliveLatency   = "kalive.ns"
+	// (for more errors, see target_stats)
+)
 
+// KindLatency (most latency metrics are target-only - see target_stats)
+// latency stats have numSamples used to compute average latency
+const (
+	ListLatency      = "lst.ns"
+	KeepAliveLatency = "kalive.ns"
+)
+
+const (
 	// KindSpecial
 	Uptime = "up.ns.time"
 
@@ -135,13 +155,23 @@ type (
 		ticker    *time.Ticker
 		core      *coreStats
 		ctracker  copyTracker // to avoid making it at runtime
-		sorted    []string    // sorted names
 		name      string      // this stats-runner's name
 		prev      string      // prev ctracker.write
-		next      int64       // mono.Nano
+		sorted    []string    // sorted names
 		mem       sys.MemStat
+		next      int64 // mono.Nano
 		startedUp atomic.Bool
 	}
+)
+
+var (
+	BckVlabs      = []string{VlabBucket}
+	EmptyBckVlabs = map[string]string{VlabBucket: ""}
+
+	BckXlabs      = []string{VlabBucket, VlabXkind}
+	EmptyBckXlabs = map[string]string{VlabBucket: "", VlabXkind: ""}
+
+	mpathVlabs = []string{VlabMountpath}
 )
 
 var ignoreIdle = [...]string{"kalive", Uptime, "disk."}
@@ -156,80 +186,93 @@ func (r *runner) RegExtMetric(snode *meta.Snode, name, kind string, extra *Extra
 
 // common (target, proxy) metrics
 func (r *runner) regCommon(snode *meta.Snode) {
-	// prometheus only
-	initDfltlabel(snode)
+	initProm(snode)
 
 	// basic counters
 	r.reg(snode, GetCount, KindCounter,
 		&Extra{
-			Help: "total number of executed GET(object) requests",
+			Help:    "total number of executed GET(object) requests",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, PutCount, KindCounter,
 		&Extra{
-			Help: "total number of executed PUT(object) requests",
+			Help:    "total number of executed PUT(object) requests",
+			VarLabs: BckXlabs,
 		},
 	)
 	r.reg(snode, HeadCount, KindCounter,
 		&Extra{
-			Help: "total number of executed HEAD(object) requests", // NOTE: currently, we only count remote ("cold") HEAD
+			Help:    "total number of executed HEAD(object) requests", // NOTE: currently, we only count remote ("cold") HEAD
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, AppendCount, KindCounter,
 		&Extra{
-			Help: "total number of executed APPEND(object) requests",
+			Help:    "total number of executed APPEND(object) requests",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, DeleteCount, KindCounter,
 		&Extra{
-			Help: "total number of executed DELETE(object) requests",
+			Help:    "total number of executed DELETE(object) requests",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, RenameCount, KindCounter,
 		&Extra{
-			Help: "total number of executed rename(object) requests",
+			Help:    "total number of executed rename(object) requests",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ListCount, KindCounter,
 		&Extra{
-			Help: "total number of executed list-objects requests",
+			Help:    "total number of executed list-objects requests",
+			VarLabs: BckVlabs,
 		},
 	)
 
 	// basic error counters, respectively
 	r.reg(snode, ErrGetCount, KindCounter,
 		&Extra{
-			Help: "total number of GET(object) errors",
+			Help:    "total number of GET(object) errors",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ErrPutCount, KindCounter,
 		&Extra{
-			Help: "total number of PUT(object) errors",
+			Help:    "total number of PUT(object) errors",
+			VarLabs: BckXlabs,
 		},
 	)
 	r.reg(snode, ErrHeadCount, KindCounter,
 		&Extra{
-			Help: "total number of HEAD(object) errors", // ditto (HeadCount above)
+			Help:    "total number of HEAD(object) errors", // ditto (HeadCount above)
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ErrAppendCount, KindCounter,
 		&Extra{
-			Help: "total number of APPEND(object) errors",
+			Help:    "total number of APPEND(object) errors",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ErrDeleteCount, KindCounter,
 		&Extra{
-			Help: "total number of DELETE(object) errors",
+			Help:    "total number of DELETE(object) errors",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ErrRenameCount, KindCounter,
 		&Extra{
-			Help: "total number of rename(object) errors",
+			Help:    "total number of rename(object) errors",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ErrListCount, KindCounter,
 		&Extra{
-			Help: "total number of list-objects errors",
+			Help:    "total number of list-objects errors",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ErrKaliveCount, KindCounter,
@@ -237,38 +280,29 @@ func (r *runner) regCommon(snode *meta.Snode) {
 			Help: "total number of keep-alive failures",
 		},
 	)
-
-	// even more error counters
 	r.reg(snode, ErrHTTPWriteCount, KindCounter,
 		&Extra{
 			Help: "total number of HTTP write-response errors",
-		},
-	)
-	r.reg(snode, ErrDownloadCount, KindCounter,
-		&Extra{
-			Help: "downloader: number of download errors",
-		},
-	)
-	r.reg(snode, ErrPutMirrorCount, KindCounter,
-		&Extra{
-			Help: "number of n-way mirroring errors",
 		},
 	)
 
 	// basic latencies
 	r.reg(snode, GetLatency, KindLatency,
 		&Extra{
-			Help: "GET: average time (milliseconds) over the last periodic.stats_time interval",
+			Help:    "GET: average time (milliseconds) over the last periodic.stats_time interval",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, GetLatencyTotal, KindTotal,
 		&Extra{
-			Help: "GET: total cumulative time (nanoseconds)",
+			Help:    "GET: total cumulative time (nanoseconds)",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, ListLatency, KindLatency,
 		&Extra{
-			Help: "list-objects: average time (milliseconds) over the last periodic.stats_time interval",
+			Help:    "list-objects: average time (milliseconds) over the last periodic.stats_time interval",
+			VarLabs: BckVlabs,
 		},
 	)
 	r.reg(snode, KeepAliveLatency, KindLatency,
@@ -289,7 +323,7 @@ func (r *runner) regCommon(snode *meta.Snode) {
 	r.reg(snode, NodeAlerts, KindGauge,
 		&Extra{
 			Help: "bitwise 64-bit value that carries enumerated node-state flags, including warnings and alerts; " +
-				"see https://github.com/NVIDIA/aistore/blob/main/cmn/cos/node_state.go for details", // TODO: must have a readme
+				"see https://github.com/NVIDIA/aistore/blob/main/cmn/cos/node_state.go for details",
 		},
 	)
 }
@@ -298,24 +332,24 @@ func (r *runner) regCommon(snode *meta.Snode) {
 // as cos.StatsUpdater
 //
 
-func (r *runner) Add(name string, val int64) {
-	r.core.update(cos.NamedVal64{Name: name, Value: val})
-}
+func (r *runner) Inc(name string)            { r.core.inc(name) }
+func (r *runner) Add(name string, val int64) { r.core.add(name, val) }
 
-func (r *runner) Inc(name string) {
-	r.core.update(cos.NamedVal64{Name: name, Value: 1})
-}
-
-// same as above (readability)
-func (r *runner) IncErr(metric string) {
-	debug.Assert(strings.HasPrefix(metric, errPrefix), metric)
-	r.core.update(cos.NamedVal64{Name: metric, Value: 1})
-}
-
-func (r *runner) AddMany(nvs ...cos.NamedVal64) {
+// (prometheus with variable labels)
+func (r *runner) AddWith(nvs ...cos.NamedVal64) {
 	for _, nv := range nvs {
-		r.core.update(nv)
+		r.core.addWith(nv)
 	}
+}
+
+// (ditto; for convenience)
+func (r *runner) IncWith(name string, vlabs map[string]string) {
+	r.core.incWith(cos.NamedVal64{Name: name, Value: 1, VarLabs: vlabs})
+}
+
+// (ditto)
+func (r *runner) IncBck(name string, bck *cmn.Bck) {
+	r.IncWith(name, map[string]string{VlabBucket: bck.Cname("")})
 }
 
 func (r *runner) SetFlag(name string, set cos.NodeStateFlags) {
@@ -356,7 +390,7 @@ func (r *runner) _next(config *cmn.Config, now int64) {
 	if config.Log.StatsTime >= config.Periodic.StatsTime {
 		r.next = now + int64(config.Log.StatsTime)
 	} else {
-		r.next = now + maxStatsLogInterval // default
+		r.next = now + dfltStatsLogInterval
 	}
 }
 
@@ -421,8 +455,8 @@ waitStartup:
 	r.ticker = time.NewTicker(statsTime)
 	r.startedUp.Store(true)
 
-	// one or the other, depending on the build tag
-	r.core.initStatsdOrProm(r.node.Snode(), r)
+	// one StatsD or Prometheus (depending on the build tag)
+	r.core.initStarted(r.node.Snode())
 
 	var (
 		lastNgr           int64
@@ -448,10 +482,7 @@ waitStartup:
 			}
 
 			// 2. flush logs (NOTE: stats runner is solely responsible)
-			flushTime := dfltPeriodicFlushTime
-			if config.Log.FlushTime != 0 {
-				flushTime = config.Log.FlushTime.D()
-			}
+			flushTime := cos.NonZero(config.Log.FlushTime.D(), dfltPeriodicFlushTime)
 			if nlog.Since(now) > flushTime || nlog.OOB() {
 				nlog.Flush(nlog.ActNone)
 			}
@@ -484,24 +515,86 @@ waitStartup:
 
 func (r *runner) StartedUp() bool { return r.startedUp.Load() }
 
-// - check OOM, and
+// - check OOM and OOCPU
 // - set NodeStateFlags with both capacity and memory flags
-func (r *runner) _mem(mm *memsys.MMSA, set, clr cos.NodeStateFlags) {
+func (r *runner) _memload(mm *memsys.MMSA, set, clr cos.NodeStateFlags) {
 	_ = r.mem.Get()
 	pressure := mm.Pressure(&r.mem)
 
+	flags := r.nodeStateFlags() // current/old
+
+	// memory, first
 	switch {
 	case pressure >= memsys.PressureExtreme:
-		set |= cos.OOM
-		nlog.Errorln(mm.Str(&r.mem))
+		if !flags.IsSet(cos.OOM) {
+			set |= cos.OOM
+			clr |= cos.LowMemory
+			nlog.Errorln(r.node.String(), mm.Str(&r.mem))
+		}
+		oom.FreeToOS(true)
 	case pressure >= memsys.PressureHigh:
-		set |= cos.LowMemory
 		clr |= cos.OOM
-		nlog.Warningln(mm.Str(&r.mem))
+		if !flags.IsSet(cos.LowMemory) {
+			set |= cos.LowMemory
+			nlog.Warningln(mm.Str(&r.mem))
+		}
 	default:
-		clr |= cos.OOM | cos.LowMemory
+		if flags.IsAnySet(cos.LowMemory | cos.OOM) {
+			clr |= cos.OOM | cos.LowMemory
+			nlog.Infoln(r.node.String(), mm.Name, "back to normal")
+		}
 	}
-	r.SetClrFlag(NodeAlerts, set, clr)
+
+	// load, second
+	nset, nclr := _load(r.node.String(), flags, set, clr)
+
+	r.SetClrFlag(NodeAlerts, nset, nclr)
+}
+
+// CPU utilization, load average
+// - for watermarks, using system defaults from sys/cpu.go
+// - compare with fs/throttle and memsys/gc
+
+func _load(sname string, flags, set, clr cos.NodeStateFlags) (cos.NodeStateFlags, cos.NodeStateFlags) {
+	const tag = "CPU utilization:"
+	var (
+		load = sys.MaxLoad()
+		ncpu = sys.NumCPU()
+	)
+	// 1. normal
+	if load < float64(ncpu>>1) { // 50%
+		if flags.IsAnySet(cos.LowCPU | cos.OOCPU) {
+			clr |= cos.OOCPU | cos.LowCPU
+			nlog.Infoln(sname, tag, "back to normal")
+		}
+		return set, clr
+	}
+	// 2. extreme
+	var (
+		fcpu  = float64(ncpu)
+		oocpu = max(fcpu*sys.ExtremeLoad/100, 1)
+	)
+	if load >= oocpu {
+		if !flags.IsSet(cos.OOCPU) {
+			set |= cos.OOCPU
+			clr |= cos.LowCPU
+			nlog.Errorln(sname, tag, "extremely high [", load, ncpu, "]")
+		}
+		return set, clr
+	}
+	// 3. high
+	highcpu := fcpu * sys.HighLoad / 100
+	if load >= highcpu {
+		clr |= cos.OOCPU
+		if !flags.IsSet(cos.LowCPU) {
+			set |= cos.LowCPU
+			nlog.Warningln(sname, tag, "high [", load, ncpu, "]")
+		}
+	}
+
+	// (50%, highLoad) is, effectively, hysteresis
+
+	return set, clr
 }
 
 func (r *runner) GetStats() *Node {
@@ -510,21 +603,13 @@ func (r *runner) GetStats() *Node {
 	return &Node{Tracker: ctracker}
 }
 
-func (r *runner) GetStatsV322() (out *NodeV322) {
-	ds := r.GetStats()
-
-	out = &NodeV322{}
-	out.Snode = ds.Snode
-	out.Tracker = ds.Tracker
-	return out
-}
-
+// TODO: reset prometheus as well (assuming, there's an API)
 func (r *runner) ResetStats(errorsOnly bool) {
 	r.core.reset(errorsOnly)
 }
 
 func (r *runner) GetMetricNames() cos.StrKVs {
-	out := make(cos.StrKVs, 32)
+	out := make(cos.StrKVs, 48)
 	for name, v := range r.core.Tracker {
 		out[name] = v.kind
 	}
@@ -553,62 +638,41 @@ func (r *runner) checkNgr(now, lastNgr int64, goMaxProcs int) int64 {
 	return lastNgr
 }
 
-////////////////
-// statsValue //
-////////////////
+func (r *runner) Stop(err error) {
+	nlog.Infoln("Stopping", r.Name(), "err:", err)
+	r.stopCh <- struct{}{}
+	close(r.stopCh)
 
-// interface guard
-var (
-	_ json.Marshaler   = (*statsValue)(nil)
-	_ json.Unmarshaler = (*statsValue)(nil)
-)
-
-func (v *statsValue) MarshalJSON() ([]byte, error) {
-	s := strconv.FormatInt(ratomic.LoadInt64(&v.Value), 10)
-	return cos.UnsafeB(s), nil
+	r.closeStatsD()
 }
 
-func (v *statsValue) UnmarshalJSON(b []byte) error { return jsoniter.Unmarshal(b, &v.Value) }
-
-///////////////
-// copyValue //
-///////////////
-
-// interface guard
-var (
-	_ json.Marshaler   = (*copyValue)(nil)
-	_ json.Unmarshaler = (*copyValue)(nil)
-)
-
-func (v copyValue) MarshalJSON() (b []byte, err error) { return jsoniter.Marshal(v.Value) }
-func (v *copyValue) UnmarshalJSON(b []byte) error      { return jsoniter.Unmarshal(b, &v.Value) }
-
-/////////////////
-// copyTracker //
-/////////////////
-
-// serialize itself (slightly more efficiently than JSON)
-func (ctracker copyTracker) write(sgl *memsys.SGL, sorted []string, target, idle bool) {
+// [log] serialize itself (slightly more efficiently than JSON)
+func (r *runner) write(sgl *memsys.SGL, target, idle bool) {
 	var (
 		next  bool
 		disks bool // whether to write target disk metrics
 	)
-	if len(sorted) == 0 {
-		for n := range ctracker {
-			sorted = append(sorted, n)
+	// sort names
+	if len(r.sorted) != len(r.ctracker) {
+		clear(r.sorted)
+		r.sorted = r.sorted[:0]
+		for n := range r.ctracker {
+			r.sorted = append(r.sorted, n)
 		}
-		sort.Strings(sorted)
+		sort.Strings(r.sorted)
 	}
+
+	// log pseudo-json: raw values
 	sgl.WriteByte('{')
-	for _, n := range sorted {
-		v := ctracker[n]
+	for _, n := range r.sorted {
+		v := r.ctracker[n]
 		// exclude
 		if v.Value == 0 || n == Uptime { // always skip zeros and uptime
 			continue
 		}
 		if isDiskMetric(n) {
 			if isDiskUtilMetric(n) && v.Value > minLogDiskUtil {
-				disks = true // not idle - all all
+				disks = true // not idle - all
 			}
 			continue
 		}
@@ -626,7 +690,7 @@ func (ctracker copyTracker) write(sgl *memsys.SGL, sorted []string, target, idle
 	}
 	if disks {
 		debug.Assert(target)
-		for n, v := range ctracker {
+		for n, v := range r.ctracker {
 			if v.Value == 0 || !isDiskMetric(n) {
 				continue
 			}
@@ -638,6 +702,34 @@ func (ctracker copyTracker) write(sgl *memsys.SGL, sorted []string, target, idle
 	}
 	sgl.WriteByte('}')
 }
+
+///////////////
+// coreStats //
+///////////////
+
+func (s *coreStats) init(size int) {
+	s.Tracker = make(map[string]*statsValue, size)
+
+	s.sgl = memsys.PageMM().NewSGL(memsys.DefaultBufSize)
+}
+
+func (s *coreStats) get(name string) int64 {
+	v := s.Tracker[name]
+	return ratomic.LoadInt64(&v.Value)
+}
+
+///////////////
+// copyValue //
+///////////////
+
+// interface guard
+var (
+	_ json.Marshaler   = (*copyValue)(nil)
+	_ json.Unmarshaler = (*copyValue)(nil)
+)
+
+func (v copyValue) MarshalJSON() (b []byte, err error) { return jsoniter.Marshal(v.Value) }
+func (v *copyValue) UnmarshalJSON(b []byte) error      { return jsoniter.Unmarshal(b, &v.Value) }
 
 //
 // log rotation and GC
@@ -663,7 +755,7 @@ func hkLogs(int64) time.Duration {
 		tot     int64
 		n       = len(dentries)
 		nn      = n - n>>2
-		finfos  = make([]rfs.FileInfo, 0, nn)
+		finfos  = make([]iofs.FileInfo, 0, nn)
 		verbose = cmn.Rom.FastV(4, cos.SmoduleStats)
 	)
 	for i, logtype := range []string{".INFO.", ".ERROR."} {
@@ -677,7 +769,7 @@ func hkLogs(int64) time.Duration {
 		case l > 1:
 			go _rmLogs(tot, maxtotal, logdir, logtype, finfos)
 			if i == 0 {
-				finfos = make([]rfs.FileInfo, 0, nn)
+				finfos = make([]iofs.FileInfo, 0, nn)
 			}
 		default:
 			nlog.Warningln(gcLogs, "cannot cleanup a single large", logtype, "size:", tot, "configured max:", maxtotal)
@@ -693,7 +785,7 @@ func hkLogs(int64) time.Duration {
 
 // e.g. name: ais.ip-10-0-2-19.root.log.INFO.20180404-031540.2249
 // see also: nlog.InfoLogName, nlog.ErrLogName
-func _sizeLogs(dentries []os.DirEntry, logtype string, finfos []rfs.FileInfo) (_ []rfs.FileInfo, tot int64) {
+func _sizeLogs(dentries []os.DirEntry, logtype string, finfos []iofs.FileInfo) (_ []iofs.FileInfo, tot int64) {
 	clear(finfos)
 	finfos = finfos[:0]
 	for _, dent := range dentries {
@@ -711,7 +803,7 @@ func _sizeLogs(dentries []os.DirEntry, logtype string, finfos []rfs.FileInfo) (_
 	return finfos, tot
 }
 
-func _rmLogs(tot, maxtotal int64, logdir, logtype string, finfos []rfs.FileInfo) {
+func _rmLogs(tot, maxtotal int64, logdir, logtype string, finfos []iofs.FileInfo) {
 	less := func(i, j int) bool {
 		return finfos[i].ModTime().Before(finfos[j].ModTime())
 	}
@@ -754,15 +846,4 @@ func ignore(s string) bool {
 		}
 	}
 	return false
-}
-
-// convert bytes to meGabytes with a fixed rounding precision = 2 digits
-// - KindThroughput and KindComputedThroughput only
-// - MB, not MiB
-// - math.Ceil wouldn't produce two decimals
-func roundMBs(val int64) (mbs float64) {
-	mbs = float64(val) / 1000 / 10
-	num := int(mbs + 0.5)
-	mbs = float64(num) / 100
-	return
 }

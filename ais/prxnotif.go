@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -26,6 +26,7 @@ import (
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -329,9 +330,10 @@ func (n *notifs) done(nl nl.Listener) {
 }
 
 func abortReq(nl nl.Listener) cmn.HreqArgs {
-	if nl.Kind() == apc.ActDownload {
-		// downloader implements abort via http.MethodDelete
-		// and different messaging
+	if _, ok := nl.(*dload.NotifDownloadListerner); ok {
+		// HACK
+		// - download _job_ vs download xaction - see dload.NewDownloadNL()
+		// - downloader implements abort via http.MethodDelete and uses different messaging
 		return dload.AbortReq(nl.UUID() /*job ID*/)
 	}
 	msg := apc.ActMsg{
@@ -421,7 +423,10 @@ func (n *notifs) bcastGetStats(nl nl.Listener, dur time.Duration) {
 			}
 			nl.SetStats(res.si.ID(), stats)
 			nl.Unlock()
-		} else if res.status == http.StatusNotFound {
+			continue
+		}
+		// err
+		if res.status == http.StatusNotFound {
 			if mono.Since(nl.AddedTime()) < progressInterval {
 				// likely didn't start yet - skipping
 				continue
@@ -496,7 +501,7 @@ repeat:
 			delete(remnl, uuid)
 			goto repeat
 		}
-		err := &errNodeNotFound{"abort " + nl.String() + " via 'smap-changed':", sid, n.p.si, smap}
+		err := &errNodeNotFound{n.p.si, smap, "abort " + nl.String() + " via 'smap-changed':", sid}
 		nl.Lock()
 		nl.AddErr(err)
 		nl.SetAborted()
@@ -659,14 +664,12 @@ func (l *listeners) add(nl nl.Listener, locked bool) (exists bool) {
 	if !locked {
 		l.mtx.Unlock()
 	}
-	return
+	return exists
 }
 
 func (l *listeners) del(nl nl.Listener, locked bool) (ok bool) {
 	if !locked {
 		l.mtx.Lock()
-	} else {
-		debug.AssertRWMutexLocked(&l.mtx)
 	}
 	if _, ok = l.m[nl.UUID()]; ok {
 		delete(l.m, nl.UUID())
@@ -676,13 +679,13 @@ func (l *listeners) del(nl nl.Listener, locked bool) (ok bool) {
 	if !locked {
 		l.mtx.Unlock()
 	}
-	return
+	return ok
 }
 
 // PRECONDITION: `l` should be under lock.
 func (l *listeners) exists(uuid string) (ok bool) {
 	_, ok = l.m[uuid]
-	return
+	return ok
 }
 
 // Returns a listener that matches the filter condition.

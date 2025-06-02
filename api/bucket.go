@@ -1,6 +1,6 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -29,19 +30,26 @@ func ResetBucketProps(bp BaseParams, bck cmn.Bck) (string, error) {
 }
 
 func patchBprops(bp BaseParams, bck cmn.Bck, body []byte) (xid string, err error) {
+	var (
+		path = apc.URLPathBuckets.Join(bck.Name)
+		q    = qalloc()
+	)
 	bp.Method = http.MethodPatch
-	path := apc.URLPathBuckets.Join(bck.Name)
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = path
 		reqParams.Body = body
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.NewQuery()
+
+		bck.SetQuery(q)
+		reqParams.Query = q
 	}
 	_, err = reqParams.doReqStr(&xid)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, err
 }
 
 // HEAD(bucket): apc.HdrBucketProps => cmn.Bprops{} and apc.HdrBucketInfo => BucketInfo{}
@@ -60,7 +68,7 @@ func HeadBucket(bp BaseParams, bck cmn.Bck, dontAddRemote bool) (p *cmn.Bprops, 
 	var (
 		hdr    http.Header
 		path   = apc.URLPathBuckets.Join(bck.Name)
-		q      = make(url.Values, 4)
+		q      = qalloc()
 		status int
 	)
 	if dontAddRemote {
@@ -81,8 +89,10 @@ func HeadBucket(bp BaseParams, bck cmn.Bck, dontAddRemote bool) (p *cmn.Bprops, 
 	} else {
 		err = hdr2msg(bck, status, err)
 	}
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return p, err
 }
 
 // fill-in herr message (HEAD response will never contain one)
@@ -95,9 +105,14 @@ func hdr2msg(bck cmn.Bck, status int, err error) error {
 		return err
 	}
 
-	quoted := "\"" + bck.Cname("") + "\""
 	if !bck.IsQuery() && status == http.StatusNotFound {
-		herr.Message = "bucket " + quoted + " does not exist"
+		// when message already resulted from (unwrap)
+		if herr2 := cmn.Str2HTTPErr(err.Error()); herr2 != nil {
+			herr.Message = herr2.Message
+		} else {
+			quoted := "\"" + bck.Cname("") + "\""
+			herr.Message = "bucket " + quoted + " does not exist"
+		}
 		return herr
 	}
 	// common
@@ -109,6 +124,7 @@ func hdr2msg(bck cmn.Bck, status int, err error) error {
 	if bck.IsQuery() {
 		herr.Message += "query "
 	}
+	quoted := "\"" + bck.Cname("") + "\""
 	herr.Message += quoted
 	return herr
 }
@@ -125,7 +141,7 @@ func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadRe
 	if err := bck.Validate(); err != nil {
 		return err
 	}
-	q := make(url.Values, 4)
+	q := qalloc()
 	if len(dontHeadRemote) > 0 && dontHeadRemote[0] {
 		q.Set(apc.QparamDontHeadRemote, "true")
 	}
@@ -139,12 +155,16 @@ func CreateBucket(bp BaseParams, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadRe
 		reqParams.Query = bck.AddToQuery(q)
 	}
 	err := reqParams.DoRequest()
+
 	FreeRp(reqParams)
+	qfree(q)
 	return err
 }
 
 // DestroyBucket sends request to remove an AIS bucket with the given name.
 func DestroyBucket(bp BaseParams, bck cmn.Bck) error {
+	q := qalloc()
+
 	bp.Method = http.MethodDelete
 	reqParams := AllocRp()
 	{
@@ -152,54 +172,78 @@ func DestroyBucket(bp BaseParams, bck cmn.Bck) error {
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActDestroyBck})
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.NewQuery()
+		bck.SetQuery(q)
+		reqParams.Query = q
 	}
 	err := reqParams.DoRequest()
+
 	FreeRp(reqParams)
+	qfree(q)
 	return err
 }
 
-// CopyBucket copies existing `bckFrom` bucket to the destination `bckTo` thus,
-// effectively, creating a copy of the `bckFrom`.
-//   - AIS will create `bckTo` on the fly but only if the destination bucket does not
-//     exist and _is_ provided by AIStore; 3rd party backend destination must exist -
-//     otherwise the copy operation won't be successful.
-//   - There are no limitations on copying buckets across Backend providers:
-//     you can copy AIS bucket to (or from) AWS bucket, and the latter to Google or Azure
-//     bucket, etc.
-//   - Copying multiple buckets to the same destination bucket is also permitted.
+// CopyBucket copies all or selected content of `bckFrom` into the destination `bckTo`.
 //
-// `fltPresence` applies exclusively to remote `bckFrom` and is ignored if the source is ais://
-// The value is enum { apc.FltExists, apc.FltPresent, ... } - for complete enum, see api/apc/query.go
-// Namely:
-// * apc.FltExists        - copy all objects, including those that are not (present) in AIS
-// * apc.FltPresent 	  - copy the current `bckFrom` content in the cluster (default)
-// * apc.FltExistsOutside - copy only those remote objects that are not (present) in AIS
+//   - AIS will create `bckTo` on the fly, but only if it’s an AIS bucket; for 3rd-party
+//     backends, the destination bucket must already exist.
+//   - Buckets can be copied across different backends, e.g., AIS to/from AWS, GCP, Azure, etc.
+//   - Copying into the same destination from multiple sources is allowed.
 //
-// msg.Prefix, if specified, applies always and regardless.
+// ETLBucket is similar, but applies a transformation to each object before writing it
+// to the destination bucket. Specifically:
+//   - Visits all (matching) source objects
+//   - Reads and transforms each using the specified ETL (by ID)
+//   - Writes the result to `bckTo`
 //
-// Returns xaction ID if successful, an error otherwise. See also closely related api.ETLBucket
-func CopyBucket(bp BaseParams, bckFrom, bckTo cmn.Bck, msg *apc.CopyBckMsg, fltPresence ...int) (xid string, err error) {
+// `fltPresence`, if provided, applies only when `bckFrom` is remote (not ais://):
+//   * apc.FltExists        - copy all objects, including those not cached locally
+//   * apc.FltPresent       - copy only locally available objects (default)
+//   * apc.FltExistsOutside - copy only remote objects missing locally
+//
+// `msg.Prefix`, if specified, filters source objects by prefix (applies to both operations).
+//
+// `msg.NumWorkers` controls parallelism:
+//   *  0 (default) - one worker per mountpath
+//   * -1           - serial (single-threaded) execution
+//   * >0           - total number of concurrent workers per target node
+//
+// Returns xaction ID if successful, error otherwise.
+
+func CopyBucket(bp BaseParams, bckFrom, bckTo cmn.Bck, msg *apc.TCBMsg, fltPresence ...int) (string, error) {
+	jbody := cos.MustMarshal(apc.ActMsg{Action: apc.ActCopyBck, Value: msg})
+	return tcb(bp, bckFrom, bckTo, jbody, fltPresence...)
+}
+
+func ETLBucket(bp BaseParams, bckFrom, bckTo cmn.Bck, msg *apc.TCBMsg, fltPresence ...int) (string, error) {
+	jbody := cos.MustMarshal(apc.ActMsg{Action: apc.ActETLBck, Value: msg})
+	return tcb(bp, bckFrom, bckTo, jbody, fltPresence...)
+}
+
+func tcb(bp BaseParams, bckFrom, bckTo cmn.Bck, jbody []byte, fltPresence ...int) (xid string, err error) {
 	if err = bckTo.Validate(); err != nil {
 		return
 	}
-	q := bckFrom.NewQuery()
+	q := qalloc()
+	bckFrom.SetQuery(q)
 	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo)
 	if len(fltPresence) > 0 {
 		q.Set(apc.QparamFltPresence, strconv.Itoa(fltPresence[0]))
 	}
+
 	bp.Method = http.MethodPost
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathBuckets.Join(bckFrom.Name)
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActCopyBck, Value: msg})
+		reqParams.Body = jbody
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 		reqParams.Query = q
 	}
 	_, err = reqParams.doReqStr(&xid)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, err
 }
 
 // RenameBucket renames bckFrom as bckTo.
@@ -208,9 +252,11 @@ func RenameBucket(bp BaseParams, bckFrom, bckTo cmn.Bck) (xid string, err error)
 	if err = bckTo.Validate(); err != nil {
 		return
 	}
-	bp.Method = http.MethodPost
-	q := bckFrom.NewQuery()
+	q := qalloc()
+	bckFrom.SetQuery(q)
 	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo)
+
+	bp.Method = http.MethodPost
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
@@ -220,8 +266,10 @@ func RenameBucket(bp BaseParams, bckFrom, bckTo cmn.Bck) (xid string, err error)
 		reqParams.Query = q
 	}
 	_, err = reqParams.doReqStr(&xid)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, err
 }
 
 // EvictRemoteBucket sends request to evict an entire remote bucket from the AIStore
@@ -250,6 +298,8 @@ func EvictRemoteBucket(bp BaseParams, bck cmn.Bck, keepMD bool) error {
 // certain redundancy level (num copies).
 // Returns xaction ID if successful, an error otherwise.
 func MakeNCopies(bp BaseParams, bck cmn.Bck, copies int) (xid string, err error) {
+	q := qalloc()
+
 	bp.Method = http.MethodPost
 	reqParams := AllocRp()
 	{
@@ -257,33 +307,45 @@ func MakeNCopies(bp BaseParams, bck cmn.Bck, copies int) (xid string, err error)
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
 		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActMakeNCopies, Value: copies})
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.NewQuery()
+		bck.SetQuery(q)
+		reqParams.Query = q
 	}
 	_, err = reqParams.doReqStr(&xid)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, err
 }
 
 // Erasure-code entire `bck` bucket at a given `data`:`parity` redundancy.
 // The operation requires at least (`data + `parity` + 1) storage targets in the cluster.
 // Returns xaction ID if successful, an error otherwise.
-func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int) (xid string, err error) {
-	bp.Method = http.MethodPost
+func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int, checkAndRecover bool) (xid string, err error) {
 	// Without `string` conversion it makes base64 from []byte in `Body`.
 	ecConf := string(cos.MustMarshal(&cmn.ECConfToSet{
 		DataSlices:   &data,
 		ParitySlices: &parity,
 		Enabled:      apc.Ptr(true),
 	}))
+	q := qalloc()
+
+	bp.Method = http.MethodPost
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActECEncode, Value: ecConf})
+		msg := apc.ActMsg{Action: apc.ActECEncode, Value: ecConf}
+		if checkAndRecover {
+			msg.Name = apc.ActEcRecover
+		}
+		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-		reqParams.Query = bck.NewQuery()
+		bck.SetQuery(q)
+		reqParams.Query = q
 	}
 	_, err = reqParams.doReqStr(&xid)
+
 	FreeRp(reqParams)
-	return
+	qfree(q)
+	return xid, err
 }

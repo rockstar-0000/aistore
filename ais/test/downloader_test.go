@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -531,7 +531,7 @@ func TestDownloadRemote(t *testing.T) {
 
 			tools.CleanupRemoteBucket(t, proxyURL, test.srcBck, prefix)
 
-			tlog.Logf("putting %d objects into remote bucket %s...\n", fileCnt, test.srcBck)
+			tlog.Logf("putting %d objects into remote bucket %s...\n", fileCnt, test.srcBck.String())
 
 			expectedObjs := make([]string, 0, fileCnt)
 			for i := range fileCnt {
@@ -550,8 +550,9 @@ func TestDownloadRemote(t *testing.T) {
 				expectedObjs = append(expectedObjs, objName)
 			}
 
-			tlog.Logf("(1) evicting a _list_ of objects from remote bucket %s...\n", test.srcBck)
-			xid, err := api.EvictMultiObj(baseParams, test.srcBck, expectedObjs, "" /*template*/)
+			tlog.Logf("(1) evicting a _list_ of objects from remote bucket %s...\n", test.srcBck.String())
+			evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: expectedObjs}}
+			xid, err := api.EvictMultiObj(baseParams, test.srcBck, evdMsg)
 			tassert.CheckFatal(t, err)
 			args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
 			_, err = api.WaitForXactionIC(baseParams, &args)
@@ -562,7 +563,7 @@ func TestDownloadRemote(t *testing.T) {
 				tools.SetBackendBck(t, baseParams, test.dstBck, test.srcBck)
 			}
 
-			tlog.Logf("starting remote download => %s...\n", test.dstBck)
+			tlog.Logf("starting remote download => %s...\n", test.dstBck.String())
 			id, err := api.DownloadWithParam(baseParams, dload.TypeBackend, dload.BackendBody{
 				Base: dload.Base{
 					Bck:         test.dstBck,
@@ -576,14 +577,14 @@ func TestDownloadRemote(t *testing.T) {
 			tlog.Logln("waiting for remote download...")
 			waitForDownload(t, id, time.Minute)
 
-			tlog.Logf("listing %s...\n", test.dstBck)
+			tlog.Logf("listing %s...\n", test.dstBck.String())
 			objs, err := tools.ListObjectNames(proxyURL, test.dstBck, prefix, 0, true /*cached*/)
 			tassert.CheckFatal(t, err)
 			tassert.Errorf(t, reflect.DeepEqual(objs, expectedObjs), "expected objs: %s, got: %s", expectedObjs, objs)
 
 			// Test cancellation
-			tlog.Logf("(2) evicting a _list_ of objects from remote bucket %s...\n", test.srcBck)
-			xid, err = api.EvictMultiObj(baseParams, test.srcBck, expectedObjs, "" /*template*/)
+			tlog.Logf("(2) evicting a _list_ of objects from remote bucket %s...\n", test.srcBck.String())
+			xid, err = api.EvictMultiObj(baseParams, test.srcBck, evdMsg)
 			tassert.CheckFatal(t, err)
 			args = xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
 			status, err := api.WaitForXactionIC(baseParams, &args)
@@ -592,7 +593,7 @@ func TestDownloadRemote(t *testing.T) {
 				tassert.CheckFatal(t, err)
 			} else {
 				// this time downloaded a different bucket - test.srcBck remained empty
-				tassert.Errorf(t, status.ErrMsg != "", "expecting errors when when not finding listed objects")
+				tassert.Errorf(t, status.ErrMsg != "", "expecting errors when not finding listed objects")
 			}
 
 			tlog.Logln("starting remote download...")
@@ -720,7 +721,7 @@ func TestDownloadStatusError(t *testing.T) {
 	invalidAddressCausedError := resp.Errs[0].Name == "invalidURL" || resp.Errs[1].Name == "invalidURL"
 	notFoundFileCausedError := resp.Errs[0].Name == "notFoundFile" || resp.Errs[1].Name == "notFoundFile"
 
-	if !(invalidAddressCausedError && notFoundFileCausedError) {
+	if !invalidAddressCausedError || !notFoundFileCausedError {
 		t.Errorf("expected objects that cause errors to be (%s, %s), but got: (%s, %s)",
 			"invalidURL", "notFoundFile", resp.Errs[0].Name, resp.Errs[1].Name)
 	}
@@ -921,7 +922,7 @@ func TestDownloadMountpath(t *testing.T) {
 	tlog.Logf("Aborting download job %s\n", id1)
 	abortDownload(t, id1)
 
-	tlog.Logf("Listing %s\n", bck)
+	tlog.Logf("Listing %s\n", bck.String())
 	objs, err := tools.ListObjectNames(proxyURL, bck, "", 0, true /*cached*/)
 	tassert.CheckError(t, err)
 	tassert.Fatalf(t, len(objs) == 0, "objects should not have been downloaded, download should have been aborted\n")
@@ -1197,7 +1198,7 @@ func TestDownloadSync(t *testing.T) {
 	dlBody.Sync = false
 	downloadObjectRemote(t, dlBody, m.num, m.num)
 
-	tlog.Logln("5. overridding the objects and deleting some of them...")
+	tlog.Logln("5. overriding the objects and deleting some of them...")
 	m.remotePuts(false /*evict*/, true /*override*/)
 	m.del(objsToDelete)
 

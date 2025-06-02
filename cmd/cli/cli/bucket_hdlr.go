@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles CLI commands that pertain to AIS buckets.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -14,10 +14,12 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
-	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+
+	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 )
 
@@ -32,47 +34,66 @@ Usage examples:
 `
 
 // ais cp
-const copyBucketUsage = "copy entire bucket or selected objects (to select, use '--list', '--template', or '--prefix'), e.g.:\n" +
+//
+//nolint:dupword // intentional
+const copyBucketUsage = "Copy entire bucket or selected objects (to select, use '--list', '--template', or '--prefix'),\n" +
+	indent1 + "\te.g.:\n" +
 	indent1 + "\t- 'ais cp gs://webdaset-coco ais://dst'\t- copy entire Cloud bucket;\n" +
-	indent1 + "\t- 'ais cp s3://abc ais://nnn --all'\t- copy entire Cloud bucket that may not be _present_ in the cluster;\n" +
+	indent1 + "\t- 'ais cp s3://abc ais://nnn --all'\t- copy Cloud bucket that may _not_ be present in cluster (and create destination if doesn't exist);\n" +
 	indent1 + "\t- 'ais cp s3://abc ais://nnn --all --num-workers 16'\t- same as above employing 16 concurrent workers;\n" +
 	indent1 + "\t- 'ais cp s3://abc ais://nnn --all --num-workers 16 --prefix dir/subdir/'\t- same as above, but limit copying to a given virtual subdirectory;\n" +
-	indent1 + "\t- 'ais cp s3://abc gs://xyz --all'\t- copy Cloud bucket to another Cloud;\n" +
-	indent1 + "\t- 'ais cp s3://abc ais://nnn --latest'\t- copy Cloud bucket, and make sure that already present in-cluster copies are updated to the latest (remote) versions;\n" +
-	indent1 + "\t- 'ais cp s3://abc ais://nnn --sync'\t- same as above, but in addition delete in-cluster copies that do not exist (any longer) in the remote source\n" +
-	indent1 + "with template, prefix, and/or progress bar:\n" +
-	indent1 + "\t- 'ais cp ais://nnn/111 ais://mmm'\t- copy a single object (assuming, prefix '111' corresponds to a single object);\n" +
+	indent1 + "\t- 'ais cp s3://abc gs://xyz --all'\t- copy Cloud bucket to another Cloud.\n" +
+	indent1 + "\tsimilar to prefetch:\n" +
+	indent1 + "\t- 'ais cp s3://data s3://data --all'\t- copy remote source (and create namesake destination in-cluster bucket if doesn't exist).\n" +
+	indent1 + "\tsynchronize with out-of-band updates:\n" +
+	indent1 + "\t- 'ais cp s3://abc ais://nnn --latest'\t- copy Cloud bucket; make sure that already present in-cluster copies are updated to the latest versions;\n" +
+	indent1 + "\t- 'ais cp s3://abc ais://nnn --sync'\t- same as above, but in addition delete in-cluster copies that do not exist (any longer) in the remote source.\n" +
+	indent1 + "\twith template, prefix, and progress:\n" +
+	indent1 + "\t- 'ais cp s3://abc ais://nnn --prepend backup/'\t- copy objects into 'backup/' virtual subdirectory in destination bucket;\n" +
+	indent1 + "\t- 'ais cp ais://nnn/111 ais://mmm'\t- copy all ais://nnn objects that match prefix '111';\n" +
 	indent1 + "\t- 'ais cp gs://webdataset-coco ais:/dst --template d-tokens/shard-{000000..000999}.tar.lz4'\t- copy up to 1000 objects that share the specified prefix;\n" +
-	indent1 + "\t- 'ais cp gs://webdataset-coco ais:/dst --prefix d-tokens/ --progress --all'\t- show progress while copying virtual subdirectory 'd-tokens'"
+	indent1 + "\t- 'ais cp gs://webdataset-coco ais:/dst --prefix d-tokens/ --progress --all'\t- show progress while copying virtual subdirectory 'd-tokens';\n" +
+	indent1 + "\t- 'ais cp gs://webdataset-coco/d-tokens/ ais:/dst --progress --all'\t- same as above;\n" +
+	indent1 + "\t- 'ais cp s3://abc/dir/ ais://dst --nr'\t- copy only immediate contents of 'dir/' (non-recursive)."
 
-// ais ls
-var listAnyUsage = "list buckets, objects in buckets, and files in " + archExts + "-formatted objects,\n" +
+// ais ls (note duplicated `archExts` constant)
+const listAnyUsage = "List buckets, objects in buckets, and files in (.tar, .tgz, .tar.gz, .zip, .tar.lz4)-formatted objects,\n" +
 	indent1 + "e.g.:\n" +
 	indent1 + "\t* ais ls \t- list all buckets in a cluster (all providers);\n" +
-	indent1 + "\t* ais ls ais://abc -props name,size,copies,location \t- list all objects from a given bucket, include only the (4) specified properties;\n" +
-	indent1 + "\t* ais ls ais://abc -props all \t- same as above but include all properties;\n" +
-	indent1 + "\t* ais ls ais://abc --page-size 20 --refresh 3s \t- list a very large bucket (20 items in each page), report progress every 3s;\n" +
+	indent1 + "\t* ais ls ais://abc -props name,size,copies,location \t- list objects with only these specific properties;\n" +
+	indent1 + "\t* ais ls ais://abc -props all \t- list objects with all available properties;\n" +
+	indent1 + "\t* ais ls ais://abc --page-size 20 --refresh 3s \t- list large bucket (20 items per page), progress every 3s;\n" +
+	indent1 + "\t* ais ls ais://abc --page-size 20 --refresh 3 \t- same as above;\n" +
 	indent1 + "\t* ais ls ais \t- list all ais buckets;\n" +
-	indent1 + "\t* ais ls s3 \t- list all s3 buckets that are present in the cluster;\n" +
-	indent1 + "\t* ais ls s3 --all \t- list all s3 buckets, both in-cluster and remote.\n" +
+	indent1 + "\t* ais ls s3 \t- list all s3 buckets present in the cluster;\n" +
+	indent1 + "\t* ais ls s3 --all \t- list all s3 buckets (both in-cluster and remote).\n" +
+	indent1 + "list archive contents:\n" +
+	indent1 + "\t* ais ls ais://abc/sample.tar --archive \t- list files inside a tar archive;\n" +
+	indent1 + "list in pages (continues until '--max-pages', '--limit', Ctrl-C, or end of bucket):\n" +
+	indent1 + "\t* ais ls s3://abc --paged --limit 1234000 \t- limited paged output (1234 pages), with default properties;\n" +
+	indent1 + "\t* ais ls s3://abc --paged --limit 1234000 --nr \t- same as above, non-recursively (skips nested directories);\n" +
 	indent1 + "with template, regex, and/or prefix:\n" +
 	indent1 + "\t* ais ls gs: --regex \"^abc\" --all \t- list all accessible GCP buckets with names starting with \"abc\";\n" +
-	indent1 + "\t* ais ls ais://abc --regex \".md\" --props size,checksum \t- list *.md objects with their respective sizes and checksums;\n" +
-	indent1 + "\t* ais ls gs://abc --template images/\t- list all objects from the virtual subdirectory called \"images\";\n" +
-	indent1 + "\t* ais ls gs://abc --prefix images/\t- same as above (for more examples, see '--template' below);\n" +
-	indent1 + "\t* ais ls gs://abc/images/\t- same as above.\n" +
+	indent1 + "\t* ais ls ais://abc --regex \"\\.md$\" --props size,checksum \t- list markdown files with size and checksum;\n" +
+	indent1 + "\t* ais ls gs://abc --template images/ \t- list all objects from virtual subdirectory \"images\";\n" +
+	indent1 + "\t* ais ls gs://abc --prefix images/ \t- same as above (for more examples, see '--template' below);\n" +
+	indent1 + "\t* ais ls gs://abc/images/ \t- same as above.\n" +
 	indent1 + "with in-cluster vs remote content comparison (diff):\n" +
-	indent1 + "\t* ais ls s3://abc --check-versions         \t- for each remote object in s3://abc: check whether it has identical in-cluster copy\n" +
-	indent1 + "\t                                           \t  and show missing objects;\n" +
-	indent1 + "\t* ais ls s3://abc --check-versions --cached\t- for each in-cluster object in s3://abc: check whether it has identical remote copy\n" +
-	indent1 + "\t                                           \t  and show deleted objects.\n" +
-	indent1 + "with summary (stats):\n" +
-	indent1 + "\t* ais ls s3 --summary \t- for each s3 bucket in the cluster: print object numbers and total size(s);\n" +
-	indent1 + "\t* ais ls s3 --summary --all \t- generate summary report for all s3 buckets; include remote objects and buckets that are _not present_;\n" +
-	indent1 + "\t* ais ls s3 --summary --all --dont-add\t- same as above but without adding _non-present_ remote buckets to cluster's BMD."
+	indent1 + "\t* ais ls s3://abc --check-versions         \t- for each remote object: check for identical in-cluster copy\n" +
+	indent1 + "\t  →                                        \t  and show missing objects;\n" +
+	indent1 + "\t* ais ls s3://abc --check-versions --cached \t- for each in-cluster object: check for identical remote copy\n" +
+	indent1 + "\t  →                                        \t  and show deleted objects.\n" +
+	indent1 + "with summary (bucket sizes and numbers of objects):\n" +
+	indent1 + "\t* ais ls ais://nnn --summary --prefix=aaa/bbb \t- summarize objects matching the given prefix;\n" +
+	indent1 + "\t* ais ls ais://nnn/aaa/bbb --summary \t- same as above;\n" +
+	indent1 + "\t* ais ls az://azure-bucket --count-only \t- fastest way to count objects in a bucket;\n" +
+	indent1 + "\t* ais ls s3 --summary \t- for each s3 bucket: print object count and total size;\n" +
+	indent1 + "\t* ais ls s3 --summary --all \t- summary report for all s3 buckets including remote/non-present;\n" +
+	indent1 + "\t* ais ls s3 --summary --all --dont-add \t- same, without adding non-present buckets to cluster metadata."
 
 // ais bucket ... props
-const setBpropsUsage = "update bucket properties; the command accepts both JSON-formatted input and plain Name=Value pairs, e.g.:\n" +
+const setBpropsUsage = "Update bucket properties; the command accepts both JSON-formatted input and plain Name=Value pairs,\n" +
+	indent1 + "\te.g.:\n" +
 	indent1 + "\t* ais bucket props set ais://nnn backend_bck=s3://mmm\n" +
 	indent1 + "\t* ais bucket props set ais://nnn backend_bck=none\n" +
 	indent1 + "\t* ais bucket props set gs://vvv versioning.validate_warm_get=false versioning.synchronize=true\n" +
@@ -83,17 +104,56 @@ const setBpropsUsage = "update bucket properties; the command accepts both JSON-
 	indent1 + "\t* to show bucket properties (names and current values), use 'ais bucket show'"
 
 // ais evict
-const evictUsage = "evict one remote bucket, multiple remote buckets, or\n" +
-	indent1 + "selected objects in a given remote bucket or buckets, e.g.:\n" +
-	indent1 + "\t- 'evict gs://abc'\t- evict entire bucket (all gs://abc objects in aistore);\n" +
-	indent1 + "\t- 'evict gs:'\t- evict all GCP buckets from the cluster;\n" +
-	indent1 + "\t- 'evict gs://abc --template images/'\t- evict all objects from the virtual subdirectory \"images\";\n" +
-	indent1 + "\t- 'evict gs://abc/images/'\t- same as above;\n" +
-	indent1 + "\t- 'evict gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- evict the matching range (prefix + brace expansion);\n" +
-	indent1 + "\t- 'evict \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)"
+const evictUsage = "Evict one remote bucket, multiple remote buckets, or\n" +
+	indent1 + "\tselected objects in a given remote bucket or buckets,\n" +
+	indent1 + "\te.g.:\n" +
+	indent1 + "\t- evict gs://abc\t- evict entire bucket from aistore: remove all \"cached\" gs://abc objects _and_ bucket metadata;\n" +
+	indent1 + "\t- evict gs://abc --keep-md\t- same as above but keep bucket metadata;\n" +
+	indent1 + "\t- evict gs:\t- evict all GCP buckets from the cluster;\n" +
+	indent1 + "\t- evict gs://abc --prefix images/\t- evict all gs://abc objects from the virtual subdirectory \"images\";\n" +
+	indent1 + "\t- evict gs://abc/images/\t- same as above;\n" +
+	indent1 + "\t- evict gs://abc/images/ --nr\t- same as above, but do not recurse into virtual subdirs;\n" +
+	indent1 + "\t- evict gs://abc --template images/\t- same as above;\n" +
+	indent1 + "\t- evict gs://abc --template \"shard-{0000..9999}.tar.lz4\"\t- evict the matching range (prefix + brace expansion);\n" +
+	indent1 + "\t- evict \"gs://abc/shard-{0000..9999}.tar.lz4\"\t- same as above (notice BUCKET/TEMPLATE argument in quotes)"
 
+// flags
 var (
-	// flags
+	lsCmdFlags = []cli.Flag{
+		allObjsOrBcksFlag,
+		listCachedFlag,
+		listNotCachedFlag,
+		nameOnlyFlag,
+		objPropsFlag,
+		regexLsAnyFlag,
+		templateFlag,
+		listObjPrefixFlag,
+		pageSizeFlag,
+		pagedFlag,
+		objLimitFlag,
+		refreshFlag,
+		showUnmatchedFlag,
+		noHeaderFlag,
+		noFooterFlag,
+		maxPagesFlag,
+		startAfterFlag,
+		bckSummaryFlag,
+		nonRecursFlag,
+		noDirsFlag,
+		dontHeadRemoteFlag,
+		dontAddRemoteFlag,
+		listArchFlag,
+		unitsFlag,
+		silentFlag,
+		dontWaitFlag,
+		diffFlag,
+		countAndTimeFlag,
+		// bucket inventory
+		useInventoryFlag,
+		invNameFlag,
+		invIDFlag,
+	}
+
 	bucketCmdsFlags = map[string][]cli.Flag{
 		commandCreate: {
 			ignoreErrorFlag,
@@ -108,7 +168,7 @@ var (
 		commandCopy: {
 			listFlag,
 			templateFlag,
-			numListRangeWorkersFlag,
+			numWorkersFlag,
 			verbObjPrefixFlag,
 			copyAllObjsFlag,
 			continueOnErrorFlag,
@@ -121,20 +181,24 @@ var (
 			waitJobXactFinishedFlag,
 			latestVerFlag,
 			syncFlag,
+			nonRecursFlag, // (embedded prefix dopOLTP)
 			nonverboseFlag,
 		},
 		commandRename: {
 			waitFlag,
 			waitJobXactFinishedFlag,
 			nonverboseFlag,
+			dontHeadRemoteFlag,
 		},
 		commandEvict: append(
 			listRangeProgressWaitFlags,
 			keepMDFlag,
 			verbObjPrefixFlag, // to disambiguate bucket/prefix vs bucket/objName
 			dryRunFlag,
-			verboseFlag, // not yet used
+			nonRecursFlag, // (embedded prefix dopOLTP)
+			verboseFlag,   // NIY
 			nonverboseFlag,
+			dontHeadRemoteFlag,
 		),
 		cmdSetBprops: {
 			forceFlag,
@@ -142,72 +206,29 @@ var (
 		},
 		cmdResetBprops: {},
 
-		commandList: {
-			allObjsOrBcksFlag,
-			listObjCachedFlag,
-			nameOnlyFlag,
-			objPropsFlag,
-			regexLsAnyFlag,
-			templateFlag,
-			listObjPrefixFlag,
-			pageSizeFlag,
-			pagedFlag,
-			objLimitFlag,
-			refreshFlag,
-			showUnmatchedFlag,
-			noHeaderFlag,
-			noFooterFlag,
-			maxPagesFlag,
-			startAfterFlag,
-			bckSummaryFlag,
-			noRecursFlag,
-			noDirsFlag,
-			dontHeadRemoteFlag,
-			dontAddRemoteFlag,
-			listArchFlag,
-			unitsFlag,
-			silentFlag,
-			dontWaitFlag,
-			verChangedFlag,
-			countAndTimeFlag,
-			// bucket inventory
-			useInventoryFlag,
-			invNameFlag,
-			invIDFlag,
-		},
-
 		cmdLRU: {
 			enableFlag,
 			disableFlag,
 		},
 	}
+)
 
-	bckSummaryFlags = append(storageSummFlags, validateSummaryFlag)
-
-	// commands
+// commands
+var (
 	bucketsObjectsCmdList = cli.Command{
 		Name:         commandList,
 		Usage:        listAnyUsage,
-		ArgsUsage:    listAnyCommandArgument,
-		Flags:        bucketCmdsFlags[commandList],
+		ArgsUsage:    lsAnyCommandArgument,
+		Flags:        sortFlags(lsCmdFlags),
 		Action:       listAnyHandler,
-		BashComplete: bucketCompletions(bcmplop{}),
-	}
-
-	bucketCmdSummary = cli.Command{
-		Name:         cmdSummary,
-		Usage:        "generate and display bucket summary",
-		ArgsUsage:    optionalBucketArgument,
-		Flags:        bckSummaryFlags,
-		Action:       summaryBucketHandler,
 		BashComplete: bucketCompletions(bcmplop{}),
 	}
 
 	bucketCmdLRU = cli.Command{
 		Name:         cmdLRU,
-		Usage:        "show bucket's LRU configuration; enable or disable LRU eviction",
+		Usage:        "Show bucket's LRU configuration; enable or disable LRU eviction",
 		ArgsUsage:    optionalBucketArgument,
-		Flags:        bucketCmdsFlags[cmdLRU],
+		Flags:        sortFlags(bucketCmdsFlags[cmdLRU]),
 		Action:       lruBucketHandler,
 		BashComplete: bucketCompletions(bcmplop{}),
 	}
@@ -215,7 +236,7 @@ var (
 		Name:         commandEvict,
 		Usage:        evictUsage,
 		ArgsUsage:    bucketObjectOrTemplateMultiArg,
-		Flags:        bucketCmdsFlags[commandEvict],
+		Flags:        sortFlags(bucketCmdsFlags[commandEvict]),
 		Action:       evictHandler,
 		BashComplete: bucketCompletions(bcmplop{multiple: true}),
 	}
@@ -223,15 +244,15 @@ var (
 		Name:         commandCopy,
 		Usage:        copyBucketUsage,
 		ArgsUsage:    bucketObjectSrcArgument + " " + bucketDstArgument,
-		Flags:        bucketCmdsFlags[commandCopy],
+		Flags:        sortFlags(bucketCmdsFlags[commandCopy]),
 		Action:       copyBucketHandler,
 		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{}, 0, 2),
 	}
 	bucketCmdRename = cli.Command{
 		Name:         commandRename,
-		Usage:        "rename/move ais bucket",
+		Usage:        "Rename (move) ais bucket",
 		ArgsUsage:    bucketArgument + " " + bucketNewArgument,
-		Flags:        bucketCmdsFlags[commandRename],
+		Flags:        sortFlags(bucketCmdsFlags[commandRename]),
 		Action:       mvBucketHandler,
 		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{}, 0, 2),
 	}
@@ -239,7 +260,7 @@ var (
 		Name:      cmdSetBprops,
 		Usage:     setBpropsUsage,
 		ArgsUsage: bucketPropsArgument,
-		Flags:     bucketCmdsFlags[cmdSetBprops],
+		Flags:     sortFlags(bucketCmdsFlags[cmdSetBprops]),
 		Action:    setPropsHandler,
 		BashComplete: bucketCompletions(
 			bcmplop{additionalCompletions: []cli.BashCompleteFunc{bpropCompletions}},
@@ -248,27 +269,28 @@ var (
 
 	bucketCmd = cli.Command{
 		Name:  commandBucket,
-		Usage: "create/destroy buckets, list bucket's content, show existing buckets and their properties",
+		Usage: "Create and destroy buckets, list bucket's content, show existing buckets and their properties",
 		Subcommands: []cli.Command{
 			bucketsObjectsCmdList,
-			bucketCmdSummary,
+			showCmdStgSummary,
+			scrubCmd,
 			bucketCmdLRU,
 			bucketObjCmdEvict,
 			makeAlias(showCmdBucket, "", true, commandShow), // alias for `ais show`
 			{
 				Name:      commandCreate,
-				Usage:     "create ais buckets",
+				Usage:     "Create ais buckets",
 				ArgsUsage: bucketsArgument,
-				Flags:     bucketCmdsFlags[commandCreate],
+				Flags:     sortFlags(bucketCmdsFlags[commandCreate]),
 				Action:    createBucketHandler,
 			},
 			bucketCmdCopy,
 			bucketCmdRename,
 			{
 				Name:      commandRemove,
-				Usage:     "remove ais buckets",
+				Usage:     "Remove ais buckets",
 				ArgsUsage: bucketsArgument,
-				Flags:     bucketCmdsFlags[commandRemove],
+				Flags:     sortFlags(bucketCmdsFlags[commandRemove]),
 				Action:    removeBucketHandler,
 				BashComplete: bucketCompletions(bcmplop{
 					multiple: true, provider: apc.AIS,
@@ -276,15 +298,15 @@ var (
 			},
 			{
 				Name:   cmdProps,
-				Usage:  "show, update or reset bucket properties",
+				Usage:  "Show, update or reset bucket properties",
 				Action: showBckPropsHandler,
 				Subcommands: []cli.Command{
 					bucketCmdSetProps,
 					{
 						Name:      cmdResetBprops,
-						Usage:     "reset bucket properties",
+						Usage:     "Reset bucket properties",
 						ArgsUsage: bucketPropsArgument,
-						Flags:     bucketCmdsFlags[cmdResetBprops],
+						Flags:     sortFlags(bucketCmdsFlags[cmdResetBprops]),
 						Action:    resetPropsHandler,
 						BashComplete: bucketCompletions(
 							bcmplop{additionalCompletions: []cli.BashCompleteFunc{bpropCompletions}},
@@ -297,10 +319,10 @@ var (
 	}
 )
 
-func createBucketHandler(c *cli.Context) (err error) {
+func createBucketHandler(c *cli.Context) error {
 	var props *cmn.BpropsToSet
 	if flagIsSet(c, bucketPropsFlag) {
-		propSingleBck, err := parseBpropsFromContext(c)
+		propSingleBck, _, err := _parseBprops(c)
 		if err != nil {
 			return err
 		}
@@ -320,99 +342,13 @@ func createBucketHandler(c *cli.Context) (err error) {
 	return nil
 }
 
-func checkObjectHealth(queryBcks cmn.QueryBcks) error {
-	type bucketHealth struct {
-		Bck           cmn.Bck
-		ObjectCnt     uint64
-		Misplaced     uint64
-		MissingCopies uint64
-	}
-	bcks, err := api.ListBuckets(apiBP, queryBcks, apc.FltPresent)
-	if err != nil {
-		return V(err)
-	}
-	bckSums := make([]*bucketHealth, 0)
-	msg := &apc.LsoMsg{Flags: apc.LsMissing}
-	msg.AddProps(apc.GetPropsCopies, apc.GetPropsCached)
-
-	for i := range bcks {
-		bck := bcks[i]
-		if queryBcks.Name != "" && !queryBcks.Equal(&bck) {
-			continue
-		}
-		var (
-			objList *cmn.LsoRes
-			obj     *cmn.LsoEnt
-		)
-		p, err := headBucket(bck, true /* don't add */)
-		if err != nil {
-			return err
-		}
-		copies := int16(p.Mirror.Copies)
-		stats := &bucketHealth{Bck: bck}
-		objList, err = api.ListObjects(apiBP, bck, msg, api.ListArgs{})
-		if err != nil {
-			return err
-		}
-
-		updateStats := func(obj *cmn.LsoEnt) {
-			if obj == nil {
-				return
-			}
-			stats.ObjectCnt++
-			if !obj.IsStatusOK() {
-				stats.Misplaced++
-			} else if obj.IsPresent() && p.Mirror.Enabled && obj.Copies < copies {
-				stats.MissingCopies++
-			}
-		}
-
-		for _, entry := range objList.Entries {
-			if obj == nil {
-				obj = entry
-				continue
-			}
-			if obj.Name == entry.Name {
-				if entry.IsStatusOK() {
-					obj = entry
-				}
-				continue
-			}
-			updateStats(obj)
-			obj = entry
-		}
-		updateStats(obj)
-
-		bckSums = append(bckSums, stats)
-	}
-	return teb.Print(bckSums, teb.BucketSummaryValidateTmpl)
-}
-
-func summaryBucketHandler(c *cli.Context) error {
-	if flagIsSet(c, validateSummaryFlag) {
-		return showMisplacedAndMore(c)
-	}
-	return summaryStorageHandler(c)
-}
-
-func showMisplacedAndMore(c *cli.Context) error {
-	queryBcks, err := parseQueryBckURI(c, c.Args().Get(0))
-	if err != nil {
-		return err
-	}
-	f := func() error {
-		return checkObjectHealth(queryBcks)
-	}
-	return waitForFunc(f, longClientTimeout)
-}
-
 func mvBucketHandler(c *cli.Context) error {
 	bckFrom, bckTo, _, err := parseBcks(c, bucketArgument, bucketNewArgument, 0 /*shift*/, false /*optionalSrcObjname*/)
 	if err != nil {
 		return err
 	}
 	if bckFrom.Equal(&bckTo) {
-		return incorrectUsageMsg(c, errFmtSameBucket, commandRename, bckTo)
+		return incorrectUsageMsg(c, errFmtSameBucket, commandRename, bckTo.Cname(""))
 	}
 	return mvBucket(c, bckFrom, bckTo)
 }
@@ -483,24 +419,38 @@ func toggleLRU(c *cli.Context, bck cmn.Bck, p *cmn.Bprops, toggle bool) (err err
 	return updateBckProps(c, bck, p, toggledProps)
 }
 
-func setPropsHandler(c *cli.Context) (err error) {
-	var currProps *cmn.Bprops
-	bck, err := parseBckURI(c, c.Args().Get(0), false)
+func setPropsHandler(c *cli.Context) error {
+	var (
+		currBprops *cmn.Bprops
+		nvs        cos.StrKVs       // user specified
+		newBprops  *cmn.BpropsToSet // API structure to set
+		bck, err   = parseBckURI(c, c.Args().Get(0), false)
+	)
 	if err != nil {
 		return err
 	}
+
 	dontHeadRemote := flagIsSet(c, dontHeadRemoteFlag)
 	if !dontHeadRemote {
-		if currProps, err = headBucket(bck, false /* don't add */); err != nil {
+		if currBprops, err = headBucket(bck, false /* don't add */); err != nil {
 			return err
 		}
 	}
-	newProps, err := parseBpropsFromContext(c)
-
+	newBprops, nvs, err = _parseBprops(c)
 	if err == nil {
-		newProps.Force = flagIsSet(c, forceFlag)
-		return updateBckProps(c, bck, currProps, newProps)
+		newBprops.Force = flagIsSet(c, forceFlag)
+		err = updateBckProps(c, bck, currBprops, newBprops)
+		if err != nil {
+			return err
+		}
+		// feature flags: show all w/ descriptions
+		if _, ok := nvs[featureFlagsJname]; ok && newBprops.Features != nil {
+			err = printFeatVerbose(c, *newBprops.Features, true /*bucket scope*/)
+		}
+		return err
 	}
+
+	// [usability] try to help
 	var (
 		section = c.Args().Get(1)
 		isValid bool
@@ -515,27 +465,26 @@ func setPropsHandler(c *cli.Context) (err error) {
 	}
 	if section == "" || isValid {
 		if errV := showBucketProps(c); errV == nil {
-			fmt.Fprint(c.App.ErrWriter, examplesBckSetProps)
 			return nil
 		}
 	}
+
 	return fmt.Errorf("%v%s", err, examplesBckSetProps)
 }
 
-// TODO: more validation; e.g. `validate_warm_get = true` is only supported for buckets with Cloud and remais backends
-func updateBckProps(c *cli.Context, bck cmn.Bck, currProps *cmn.Bprops, updateProps *cmn.BpropsToSet) (err error) {
+func updateBckProps(c *cli.Context, bck cmn.Bck, currBprops *cmn.Bprops, updateProps *cmn.BpropsToSet) error {
 	// apply updated props
-	allNewProps := currProps.Clone()
-	allNewProps.Apply(updateProps)
+	allNewBprops := currBprops.Clone()
+	allNewBprops.Apply(updateProps)
 
 	// check for changes
-	if allNewProps.Equal(currProps) {
+	if allNewBprops.Equal(currBprops) {
 		displayPropsEqMsg(c, bck)
 		return nil
 	}
 
 	// do
-	if _, err = api.SetBucketProps(apiBP, bck, updateProps); err != nil {
+	if _, err := api.SetBucketProps(apiBP, bck, updateProps); err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
 			return herr
 		}
@@ -543,9 +492,74 @@ func updateBckProps(c *cli.Context, bck cmn.Bck, currProps *cmn.Bprops, updatePr
 			cliName, commandShow, cmdBucket, bck.Cname(""))
 		return newAdditionalInfoError(err, helpMsg)
 	}
-	showDiff(c, currProps, allNewProps)
+
+	_showDiff(c, currBprops, allNewBprops)
+
 	actionDone(c, "\nBucket props successfully updated.")
 	return nil
+}
+
+func _showDiff(c *cli.Context, currBprops, newBprops *cmn.Bprops) {
+	var (
+		newPropList  = bckPropList(newBprops, true)
+		origPropList = bckPropList(currBprops, true)
+	)
+	for _, np := range newPropList {
+		var found bool
+		for _, op := range origPropList {
+			if np.Name != op.Name {
+				continue
+			}
+			found = true
+			if np.Value != op.Value {
+				fmt.Fprintf(c.App.Writer, "%q set to: %q (was: %q)\n", np.Name, _clearFmt(np.Value), _clearFmt(op.Value))
+			}
+		}
+		if !found && np.Value != "" {
+			fmt.Fprintf(c.App.Writer, "%q set to: %q (was: n/a)\n", np.Name, _clearFmt(np.Value))
+		}
+	}
+
+	// feature flags: show all w/ descriptions
+	if len(newPropList) == 1 && newPropList[0].Name == featureFlagsJname {
+		err := printFeatVerbose(c, newBprops.Features, true /*bucket scope*/)
+		debug.AssertNoErr(err)
+	}
+}
+
+func _parseBprops(c *cli.Context) (props *cmn.BpropsToSet, nvs cos.StrKVs, err error) {
+	propArgs := c.Args().Tail()
+
+	if c.Command.Name == commandCreate {
+		inputProps := parseStrFlag(c, bucketPropsFlag)
+		if isJSON(inputProps) {
+			err := jsoniter.Unmarshal([]byte(inputProps), &props)
+			return props, nil, err
+		}
+		propArgs = strings.Split(inputProps, " ")
+	}
+
+	if len(propArgs) == 1 && isJSON(propArgs[0]) {
+		err := jsoniter.Unmarshal([]byte(propArgs[0]), &props)
+		return props, nil, err
+	}
+
+	if len(propArgs) == 0 {
+		return nil, nil, missingArgumentsError(c, "property key-value pairs")
+	}
+
+	// command line => key/val pairs
+	nvs, err = makeBckPropPairs(propArgs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = reformatBackendProps(c, nvs); err != nil {
+		return nil, nvs, err
+	}
+
+	// key/val pairs => cmn.BpropsToSet
+	props, err = cmn.NewBpropsToSet(nvs)
+	return props, nvs, err
 }
 
 func displayPropsEqMsg(c *cli.Context, bck cmn.Bck) {
@@ -569,36 +583,6 @@ func _clearFmt(v string) string {
 	return strings.ReplaceAll(nv, "\t", "")
 }
 
-func showDiff(c *cli.Context, currProps, newProps *cmn.Bprops) {
-	var (
-		origKV = bckPropList(currProps, true)
-		newKV  = bckPropList(newProps, true)
-	)
-	for _, np := range newKV {
-		var found bool
-		for _, op := range origKV {
-			if np.Name != op.Name {
-				continue
-			}
-			found = true
-			if np.Value != op.Value {
-				fmt.Fprintf(c.App.Writer, "%q set to: %q (was: %q)\n", np.Name, _clearFmt(np.Value), _clearFmt(op.Value))
-			}
-		}
-		if !found && np.Value != "" {
-			fmt.Fprintf(c.App.Writer, "%q set to: %q (was: n/a)\n", np.Name, _clearFmt(np.Value))
-		}
-	}
-}
-
-type lsbCtx struct {
-	regexStr        string
-	regex           *regexp.Regexp
-	fltPresence     int
-	countRemoteObjs bool
-	all             bool
-}
-
 func listAnyHandler(c *cli.Context) error {
 	var (
 		opts = cmn.ParseURIOpts{IsQuery: true}
@@ -611,71 +595,141 @@ func listAnyHandler(c *cli.Context) error {
 		if errV := errBucketNameInvalid(c, uri, err); errV != nil {
 			return errV
 		}
+		// (e.g. 'ais ls object ais://blah ...')
+		if cmn.IsErrEmptyProvider(err) {
+			uri = c.Args().Get(1)
+			var (
+				err2 error
+				warn = fmt.Sprintf("word %q is misplaced, see 'ais ls --help' for details", c.Args().Get(0))
+			)
+			actionWarn(c, warn)
+			bck, objName, err2 = cmn.ParseBckObjectURI(uri, opts)
+			if err2 == nil {
+				goto proceed
+			}
+		}
 		return err
 	}
-
+proceed:
 	switch {
-	case objName != "": // list archive OR show specific obj (HEAD(obj))
+	case objName != "" && flagIsSet(c, diffFlag):
+		// --diff forces default case (see below)
+		prefix := objName
+		listArch := flagIsSet(c, listArchFlag)
+		return listObjects(c, bck, prefix, listArch, true /*print empty*/)
+
+	case objName != "":
+		// (1) list archive, or
+		// (2) show (as in: HEAD) specified object, or
+		// (3) show part of a bucket that matches prefix = objName, or
+		// (4) summarize part of a bucket that --/--
 		if flagIsSet(c, listArchFlag) {
+			// (1)
 			return listArchHandler(c)
 		}
 		if _, err := headBucket(bck, true /* don't add */); err != nil {
 			return err
 		}
-		notfound, err := showObjProps(c, bck, objName)
+		notfound, err := showObjProps(c, bck, objName, true /*silent*/)
 		if err == nil {
+			// (2)
 			if _, errV := archive.Mime("", objName); errV == nil {
 				fmt.Fprintf(c.App.Writer, "\n('ais ls %s %s' to list archived contents, %s for details)\n",
 					bck.Cname(objName), flprn(listArchFlag), qflprn(cli.HelpFlag))
 			}
 		} else if notfound {
-			prefix := objName
-			if errV := listObjects(c, bck, prefix, false /*list arch*/, false /*print empty*/); errV == nil {
-				return nil
-			}
-		}
-		return err
-	case bck.Name == "" || flagIsSet(c, bckSummaryFlag): // list or summarize bucket(s)
-		var lsb lsbCtx
-		if lsb.regexStr = parseStrFlag(c, regexLsAnyFlag); lsb.regexStr != "" {
-			regex, err := regexp.Compile(lsb.regexStr)
-			if err != nil {
-				return err
-			}
-			lsb.regex = regex
-		}
-		lsb.all = flagIsSet(c, allObjsOrBcksFlag)
-		lsb.fltPresence = apc.FltPresent
-		if lsb.all {
-			lsb.fltPresence = apc.FltExists
-		}
-		if flagIsSet(c, bckSummaryFlag) {
-			if lsb.all && (bck.Provider != apc.AIS || !bck.Ns.IsGlobal()) {
-				lsb.countRemoteObjs = true
-				const (
-					warn = "counting and sizing remote objects may take considerable time\n"
-					tip1 = "(tip: run 'ais storage summary' or use '--regex' to refine the selection)\n"
-					tip2 = "(tip: use '--refresh DURATION' to show progress, '--help' for details)\n"
-				)
-				switch {
-				case !flagIsSet(c, refreshFlag):
-					actionWarn(c, warn+tip2)
-				case lsb.regex == nil:
-					actionWarn(c, warn+tip1)
-				default:
-					actionWarn(c, warn)
+			if !flagIsSet(c, bckSummaryFlag) {
+				// (3)
+				prefix := objName
+				if errV := listObjects(c, bck, prefix, false /*list arch*/, false /*print empty*/); errV == nil {
+					return nil
 				}
-			}
-			if bck.Name != "" {
+			} else if !flagIsSet(c, listObjPrefixFlag) { // summarize buckets w/ prefix embedded; TODO: warn --all
+				// (4)
+				lsb, err := _newLsbCtx(c)
+				if err != nil {
+					return err
+				}
+				lsb.prefix = objName
+				if lsb.all && (bck.Provider != apc.AIS || !bck.Ns.IsGlobal()) {
+					lsb.countRemote(c)
+				}
 				_ = listBckTable(c, cmn.QueryBcks(bck), cmn.Bcks{bck}, lsb)
 				return nil
 			}
 		}
+		return err
 
+	case flagIsSet(c, bckSummaryFlag): // summarize buckets
+		lsb, err := _newLsbCtx(c)
+		if err != nil {
+			return err
+		}
+		if lsb.all && (bck.Provider != apc.AIS || !bck.Ns.IsGlobal()) {
+			lsb.countRemote(c)
+		}
+		if bck.Name != "" {
+			_ = listBckTable(c, cmn.QueryBcks(bck), cmn.Bcks{bck}, lsb)
+			return nil
+		}
 		return listOrSummBuckets(c, cmn.QueryBcks(bck), lsb)
+
+	case bck.Name == "": // list buckets
+		lsb, err := _newLsbCtx(c)
+		if err != nil {
+			return err
+		}
+		return listOrSummBuckets(c, cmn.QueryBcks(bck), lsb)
+
 	default: // list objects
 		prefix := parseStrFlag(c, listObjPrefixFlag)
 		listArch := flagIsSet(c, listArchFlag) // include archived content, if requested
 		return listObjects(c, bck, prefix, listArch, true /*print empty*/)
+	}
+}
+
+////////////
+// lsbCtx //
+////////////
+
+type lsbCtx struct {
+	regexStr        string
+	regex           *regexp.Regexp
+	prefix          string
+	fltPresence     int
+	countRemoteObjs bool
+	all             bool
+}
+
+func _newLsbCtx(c *cli.Context) (lsb lsbCtx, _ error) {
+	if lsb.regexStr = parseStrFlag(c, regexLsAnyFlag); lsb.regexStr != "" {
+		regex, err := regexp.Compile(lsb.regexStr)
+		if err != nil {
+			return lsb, err
+		}
+		lsb.regex = regex
+	}
+	lsb.all = flagIsSet(c, allObjsOrBcksFlag)
+	lsb.fltPresence = apc.FltPresent
+	if lsb.all {
+		lsb.fltPresence = apc.FltExists
+	}
+	return lsb, nil
+}
+
+func (lsb *lsbCtx) countRemote(c *cli.Context) {
+	lsb.countRemoteObjs = true
+	const (
+		warn = "counting and sizing remote objects may take considerable time\n"
+		tip1 = "(tip: run 'ais storage summary' or use '--regex' to refine the selection)\n"
+		tip2 = "(tip: use '--refresh DURATION' to show progress, '--help' for details)\n"
+	)
+	switch {
+	case !flagIsSet(c, refreshFlag):
+		actionWarn(c, warn+tip2)
+	case lsb.regex == nil:
+		actionWarn(c, warn+tip1)
+	default:
+		actionWarn(c, warn)
 	}
 }

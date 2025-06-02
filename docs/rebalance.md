@@ -1,12 +1,3 @@
----
-layout: post
-title: REBALANCE
-permalink: /docs/rebalance
-redirect_from:
- - /rebalance.md/
- - /docs/rebalance.md/
----
-
 ## Table of Contents
 
 - [Global Rebalance](#global-rebalance)
@@ -31,8 +22,7 @@ Further, cluster-wide rebalancing does not require any downtime.
 Incoming GET requests for the objects that haven't yet migrated (or are being moved) are handled internally via the mechanism that we call "get-from-neighbor".
 The (rebalancing) target that must (according to the new cluster map) have the object but doesn't, will locate its "neighbor", get the object, and satisfy the original GET request transparently from the user.
 
-Similar to all other AIS modules and sub-systems, global rebalance is controlled and monitored via the documented [RESTful API](http_api.md).
-It might be easier and faster, though, to use [AIS CLI](/docs/cli.md) - see next section.
+Similar to all other AIS modules and sub-systems, global rebalance is controlled and monitored via the native HTTP-based [Go](https://github.com/NVIDIA/aistore/tree/main/api) or [Python](https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk) APIs, or [CLI](/docs/cli.md).
 
 ## CLI: usage examples
 
@@ -114,15 +104,16 @@ $ ais start rebalance
 
 ## Automated Resilvering
 
-While rebalance (previous section) takes care of the cluster *grow* and *shrink* events, resilver, as the name implies, is responsible for the [mountpath](overview.md#terminology) *added* and [mountpath](overview.md#terminology) *removed* events handled locally within (and by) each storage target.
+While rebalance (previous section) takes care of the cluster *grow* and *shrink* events, resilver, as the name implies, is responsible for the [mountpath](overview.md#mountpath) *added* and [mountpath](overview.md#mountpath) *removed* events handled locally within (and by) each storage target.
 
 In other words, global rebalance handles scaling (up and down) of the entire AIS cluster while automated *resilvering* takes care of disk attachments and disk faults within a given storage node.
 
-* A [mountpath](overview.md#terminology) is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS utilizes to store user data and AIS metadata. A mountpath can be disabled and (re)enabled, automatically or administratively, at any point during runtime. In a given cluster, a total number of mountpaths would normally compute as a direct product of `(number of storage targets) x (number of disks in each target)`.
+> To reiterate, an AIS mountpath is a single disk **or** a volume (a RAID) formatted with a local filesystem of choice, **and** a local directory that AIS utilizes to store user data and AIS metadata. A mountpath can be disabled and (re)enabled, automatically or administratively, at any point during runtime. In a given cluster, a total number of mountpaths would normally compute as a direct product of `(number of storage targets) x (number of disks in each target)`.
 
-As stated, mountpath removal can be done administratively (via API) or be triggered by a disk fault (see [filesystem health checking](/health/fshc.md).
+As stated, mountpath removal can be done administratively (via API) or be triggered by a disk fault (see [filesystem health checking](https://github.com/NVIDIA/aistore/blob/main/fs/health/README.md).
+
 Irrespectively of the original cause, mountpath-level events activate resilver that in many ways performs the same set of steps as the rebalance.
-The one salient difference is that all object migrations are local (and, therefore, relatively fast(er)).
+The one notable difference is that all object migrations are local (and, therefore, relatively fast(er)).
 
 ### CLI Usage
 

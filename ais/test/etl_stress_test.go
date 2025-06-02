@@ -1,11 +1,10 @@
 // Package integration_test.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
-	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -61,9 +60,9 @@ def transform(input_bytes):
 	m.puts()
 
 	msg := etl.InitCodeMsg{
-		InitMsgBase: etl.InitMsgBase{IDX: "etl-build-conn-err", Timeout: etlBucketTimeout},
+		InitMsgBase: etl.InitMsgBase{EtlName: "etl-build-conn-err", InitTimeout: etlBucketTimeout},
 		Code:        []byte(timeoutFunc),
-		Runtime:     runtime.Py38,
+		Runtime:     runtime.Py39,
 		ChunkSize:   0,
 	}
 	msg.Funcs.Transform = "transform"
@@ -81,14 +80,12 @@ func TestETLBucketAbort(t *testing.T) {
 
 	m := &ioContext{
 		t:         t,
-		num:       1000,
+		num:       10000,
 		fileSize:  512,
 		fixedSize: true,
 	}
 
 	xid := etlPrepareAndStart(t, m, tetl.Echo, etl.Hpull)
-
-	time.Sleep(time.Duration(rand.IntN(5)) * time.Second)
 
 	tlog.Logf("Aborting etl[%s]\n", xid)
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActETLBck}
@@ -173,21 +170,21 @@ def transform(input_bytes):
 			etlSpecName string
 			etlCodeMsg  etl.InitCodeMsg
 		}{
-			{name: "spec-echo-python", ty: etl.Spec, etlSpecName: tetl.Echo},
-			{name: "spec-echo-golang", ty: etl.Spec, etlSpecName: tetl.EchoGolang},
+			{name: "spec-echo-python", ty: etl.SpecType, etlSpecName: tetl.Echo},
+			{name: "spec-echo-golang", ty: etl.SpecType, etlSpecName: tetl.EchoGolang},
 
 			{
-				name: "code-echo-py38",
-				ty:   etl.Code,
+				name: "code-echo-py313",
+				ty:   etl.CodeType,
 				etlCodeMsg: etl.InitCodeMsg{
 					Code:      []byte(echoPythonTransform),
-					Runtime:   runtime.Py38,
+					Runtime:   runtime.Py313,
 					ChunkSize: 0,
 				},
 			},
 			{
 				name: "code-echo-py310",
-				ty:   etl.Code,
+				ty:   etl.CodeType,
 				etlCodeMsg: etl.InitCodeMsg{
 					Code:      []byte(echoPythonTransform),
 					Runtime:   runtime.Py310,
@@ -214,14 +211,14 @@ def transform(input_bytes):
 				requestTimeout = 30 * time.Second
 			)
 			switch test.ty {
-			case etl.Spec:
+			case etl.SpecType:
 				etlName = test.etlSpecName
-				_ = tetl.InitSpec(t, baseParams, etlName, etl.Hpull)
-			case etl.Code:
+				_ = tetl.InitSpec(t, baseParams, etlName, etl.Hpull, etl.ArgTypeDefault)
+			case etl.CodeType:
 				etlName = test.name
 				{
-					test.etlCodeMsg.IDX = etlName
-					test.etlCodeMsg.Timeout = etlBucketTimeout
+					test.etlCodeMsg.EtlName = etlName
+					test.etlCodeMsg.InitTimeout = etlBucketTimeout
 					test.etlCodeMsg.Funcs.Transform = "transform"
 				}
 				_ = tetl.InitCode(t, baseParams, &test.etlCodeMsg)
@@ -255,12 +252,8 @@ def transform(input_bytes):
 			tassert.CheckFatal(t, err)
 			tlog.Logf("Transforming bucket %s took %v\n", bckFrom.Cname(""), total)
 
-			objList, err := api.ListObjects(baseParams, bckTo, nil, api.ListArgs{})
+			err = tetl.ListObjectsWithRetry(baseParams, bckTo, m.num, tools.WaitRetryOpts{MaxRetries: 5, Interval: time.Second * 3})
 			tassert.CheckFatal(t, err)
-			tassert.Fatalf(
-				t, len(objList.Entries) == m.num,
-				"expected %d objects to be transformed, got %d", m.num, len(objList.Entries),
-			)
 		})
 	}
 }
@@ -279,7 +272,7 @@ func etlPrepareAndStart(t *testing.T, m *ioContext, etlName, comm string) (xid s
 
 	m.puts()
 
-	_ = tetl.InitSpec(t, baseParams, etlName, comm)
+	_ = tetl.InitSpec(t, baseParams, etlName, comm, etl.ArgTypeDefault)
 	t.Cleanup(func() {
 		tetl.StopAndDeleteETL(t, baseParams, etlName)
 	})

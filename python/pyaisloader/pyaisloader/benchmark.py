@@ -2,8 +2,7 @@ import itertools
 import random
 import time
 
-from aistore.sdk.const import PROVIDER_AIS
-
+from pyaisloader.client_config import client
 from pyaisloader.utils.bucket_utils import (
     add_one_object,
     bucket_exists,
@@ -24,6 +23,9 @@ from pyaisloader.utils.concurrency_utils import multiworker_deploy
 from pyaisloader.utils.parse_utils import format_size, format_time
 from pyaisloader.utils.random_utils import generate_bytes, generate_random_str
 from pyaisloader.utils.stat_utils import combine_results, print_results
+
+from aistore.sdk.etl.etl_config import ETLConfig
+from aistore.sdk.provider import Provider
 
 
 class BenchmarkStats:
@@ -62,8 +64,8 @@ class BenchmarkStats:
 class Benchmark:
     """Abstract class for all benchmarks"""
 
-    def __init__(self, bucket, workers, cleanup):
-        self.bucket = bucket
+    def __init__(self, bucket_model, workers, cleanup):
+        self.bucket_model = bucket_model
         self.workers = workers
         self.cleanup = cleanup
         self.objs_created = []
@@ -73,11 +75,23 @@ class Benchmark:
 
         self.setup()
 
+    @property
+    def client(self):
+        return client
+
+    @property
+    def bucket(self):
+        return self.client.bucket(
+            self.bucket_model.name,
+            self.bucket_model.provider,
+            self.bucket_model.namespace,
+        )
+
     def run(self, *args, **kwargs):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
     def setup(self):
-        if self.bucket.provider != PROVIDER_AIS:  # Cloud Bucket
+        if self.bucket.provider != Provider.AIS:  # Cloud Bucket
             print_caution("You are currently operating on a cloud storage bucket.")
             confirm_continue()
             if not bucket_exists(
@@ -85,27 +99,27 @@ class Benchmark:
             ):  # Cloud buckets that don't exist are not permitted
                 terminate(
                     "Cloud bucket "
-                    + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                    + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                     + " does not exist and AIStore Python SDK does not yet support cloud bucket creation (re-run with existing cloud bucket)."
                 )
         else:
             if bucket_exists(self.bucket):
                 print_caution(
                     "The bucket "
-                    + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                    + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                     + " already exists."
                 )
                 confirm_continue()
             else:
                 print_in_progress(
                     "Creating bucket "
-                    + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                    + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                 )
                 self.bucket.create()
                 self.bck_created = True
                 print_success(
                     "Created bucket "
-                    + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                    + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                 )
 
     def prepopulate(self, type_list=False):
@@ -130,13 +144,13 @@ class Benchmark:
     def __prepopulate_h(self, objs_created, prefix, suffix):
         content, size = generate_bytes(self.minsize, self.maxsize)
         obj = self.bucket.object(prefix + (str(suffix)))
-        obj.put_content(content)
+        obj.get_writer().put_content(content)
         objs_created.append(obj.name)
         return size, objs_created
 
     def clean_up(self, new=True):
         if new:
-            print_in_progress("Cleaning up", "\U0001F9F9")
+            print_in_progress("Cleaning up", "\U0001f9f9")
 
         if not self.bck_created and not self.objs_created:
             print_caution("Nothing to delete! Skipping clean-up...")
@@ -144,13 +158,15 @@ class Benchmark:
 
         if self.bck_created:
             msg = (
-                "bucket " + bold(f"{self.bucket.provider}://{self.bucket.name}") + " ? "
+                "bucket "
+                + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
+                + " ? "
             )
         else:
             msg = (
                 bold(f"{len(self.objs_created)}")
                 + " objects created by the benchmark (and pre-population) in "
-                + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                 + " ? "
             )
 
@@ -183,7 +199,8 @@ class PutGetMixedBenchmark(Benchmark):
         maxsize=None,
         duration=None,
         totalsize=None,
-        etl=None,
+        etl_name=None,
+        etl_spec_type=None,
         *args,
         **kwargs,
     ):
@@ -193,7 +210,12 @@ class PutGetMixedBenchmark(Benchmark):
         self.totalsize = totalsize
         self.minsize = minsize
         self.maxsize = maxsize
-        self.etl = etl
+        self.etl_name = etl_name
+        self.etl_spec_type = etl_spec_type
+
+    @property
+    def etl_config(self):
+        return ETLConfig(self.etl_name) if self.etl_name else None
 
     def run(self):
         if self.put_pct == 100:
@@ -209,14 +231,14 @@ class PutGetMixedBenchmark(Benchmark):
         totalsize = None if self.totalsize is None else (self.totalsize // self.workers)
         print_in_progress(
             "Performing PUT benchmark"
-            + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+            + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
         )
         results = multiworker_deploy(
             self, self.put_benchmark, (self.duration, totalsize)
         )
         print_success(
             "Completed PUT benchmark"
-            + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+            + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
         )
         result = []
         for worker_result, worker_objs_created in results:
@@ -230,22 +252,21 @@ class PutGetMixedBenchmark(Benchmark):
             result,
             title=(
                 "Benchmark Results (100% PUT)"
-                + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+                + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
             ),
         )
 
     def __run_get(self):
         if bucket_obj_count(self.bucket) == 0:
             add_one_object(self)
-        self.get_objs_queue = self.bucket.list_all_objects()
         print_in_progress(
             "Performing GET benchmark"
-            + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+            + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
         )
         result = multiworker_deploy(self, self.get_benchmark, (self.duration,))
         print_success(
             "Completed GET benchmark"
-            + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+            + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
         )
         result = combine_results(result, self.workers)
         if self.cleanup:
@@ -255,7 +276,7 @@ class PutGetMixedBenchmark(Benchmark):
             result,
             title=(
                 "Benchmark Results (100% GET)"
-                + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+                + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
             ),
         )
 
@@ -264,12 +285,12 @@ class PutGetMixedBenchmark(Benchmark):
             add_one_object(self)
         print_in_progress(
             "Performing MIXED benchmark"
-            + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+            + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
         )
         result = multiworker_deploy(self, self.mixed_benchmark, (self.duration,))
         print_success(
             "Completed MIXED benchmark"
-            + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+            + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
         )
         workers_objs_created = [
             obj for worker_result in result for obj in worker_result[2]
@@ -286,14 +307,14 @@ class PutGetMixedBenchmark(Benchmark):
             result_put,
             title=(
                 "Benchmark Results for PUT operations"
-                + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+                + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
             ),
         )
         print_results(
             result_get,
             title=(
                 "Benchmark Results for GET operations"
-                + (f" with ETL {self.etl.spec_type}" if self.etl else "")
+                + (f" with ETL {self.etl_spec_type}" if self.etl_config else "")
             ),
         )
 
@@ -317,7 +338,7 @@ class PutGetMixedBenchmark(Benchmark):
         else:
             print(
                 "\nBucket "
-                + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                 + f" currently has a total size of "
                 + bold(f"{format_size(curr_bck_size)}")
                 + f", which already meets the specified total size of "
@@ -326,7 +347,7 @@ class PutGetMixedBenchmark(Benchmark):
             )
             print_success("Skipped Pre-Population")
 
-    def put_benchmark(self, duration, totalsize):  # Done
+    def put_benchmark(self, duration, totalsize):
         prefix = generate_random_str()  # Each worker with unique prefix
         pstats = BenchmarkStats()
 
@@ -348,11 +369,11 @@ class PutGetMixedBenchmark(Benchmark):
 
         return pstats.result, pstats.objs_created
 
-    def __put_benchmark_h(self, stats, prefix, suffix):  # Done
+    def __put_benchmark_h(self, stats, prefix, suffix):
         content, size = generate_bytes(self.minsize, self.maxsize)
         obj = self.bucket.object(prefix + str(suffix))
         op_start = time.time()
-        obj.put_content(content)
+        obj.get_writer().put_content(content)
         op_end = time.time()
         latency = op_end - op_start
         stats.objs_created.append(obj.name)
@@ -360,27 +381,29 @@ class PutGetMixedBenchmark(Benchmark):
 
         return obj
 
-    def get_benchmark(self, duration):  # Done
+    def get_benchmark(self, duration):
         gstats = BenchmarkStats()
 
+        objs = self.bucket.list_all_objects()
+
         while gstats.total_op_time < duration:
-            self.__get_benchmark_h(gstats, self.get_objs_queue)
+            self.__get_benchmark_h(gstats, objs)
 
         gstats.produce_stats()
 
         return gstats.result
 
-    def __get_benchmark_h(self, stats, objs):  # Done
+    def __get_benchmark_h(self, stats, objs):
         op_start = time.time()
-        content = self.bucket.object(random.choice(objs).name).get(
-            etl_name=(self.etl.name if self.etl else None)
+        content = self.bucket.object(random.choice(objs).name).get_reader(
+            etl=self.etl_config if self.etl_config else None
         )
         size = len(content.read_all())
         op_end = time.time()
         latency = op_end - op_start
         stats.update(size, latency)
 
-    def mixed_benchmark(self, duration):  # Done
+    def mixed_benchmark(self, duration):
         prefix = generate_random_str()  # Each worker with unique prefix
 
         gstats = BenchmarkStats()
@@ -429,7 +452,7 @@ class ListBenchmark(Benchmark):
             else:
                 print(
                     "\nBucket "
-                    + bold(f"{self.bucket.provider}://{self.bucket.name}")
+                    + bold(f"{self.bucket.provider.value}://{self.bucket.name}")
                     + f" currently has "
                     + bold(f"{curr_bck_count}")
                     + f" objects, which already meets the specified total count of "
@@ -458,7 +481,7 @@ class ListBenchmark(Benchmark):
             )
         else:
             terminate(
-                f"The bucket {self.bucket.provider}://{self.bucket.name} is empty. Please populate the bucket before running the benchmark or use the option --num-objects (or -n)."
+                f"The bucket {self.bucket.provider.value}://{self.bucket.name} is empty. Please populate the bucket before running the benchmark or use the option --num-objects (or -n)."
             )
 
     def run(self):

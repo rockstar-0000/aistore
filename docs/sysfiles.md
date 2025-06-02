@@ -1,12 +1,3 @@
----
-layout: post
-title: SYSFILES
-permalink: /docs/sysfiles
-redirect_from:
- - /sysfiles.md/
- - /docs/sysfiles.md/
----
-
 ## System Files
 
 AIStore stores, maintains, and utilizes a number of system files that serve a variety of different purposes.
@@ -18,7 +9,7 @@ This section tries to enumerate the *system files* and briefly describe their re
 First, there's a *node configuration* usually derived from a single configuration template and populated at deployment time.
 
 * Local Playground: a single [configuration template](/deploy/dev/local/aisnode_config.sh) and [the script](/deploy/dev/local/deploy.sh) we use to populate it when we run the cluster locally on our development machines;
-* [Production K8s deployment](https://github.com/NVIDIA/ais-k8s/tree/master): a set of [ansible playbooks](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/README.md) to automate creation of a node's configuration files via a [custom K8s operator](https://github.com/NVIDIA/ais-k8s/blob/main/operator/README.md) and to deploy multiple nodes across a K8s cluster.
+* [Production K8s deployment](https://github.com/NVIDIA/ais-k8s/tree/main): a set of [ansible playbooks](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/README.md) to automate creation of a node's configuration files via a [custom K8s operator](https://github.com/NVIDIA/ais-k8s/blob/main/operator/README.md) and to deploy multiple nodes across a K8s cluster.
 
 The second category of *system files and directories* includes:
 

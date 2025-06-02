@@ -1,9 +1,11 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 from typing import Optional, Tuple, Union
 from urllib3 import Retry
+
+from aistore.sdk.authn.response_handler import AuthNResponseHandler
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.session_manager import SessionManager
 from aistore.sdk.utils import get_logger
@@ -12,7 +14,6 @@ from aistore.sdk.authn.cluster_manager import ClusterManager
 from aistore.sdk.authn.role_manager import RoleManager
 from aistore.sdk.authn.token_manager import TokenManager
 from aistore.sdk.authn.user_manager import UserManager
-from aistore.sdk.authn.utils import raise_authn_error
 from aistore.sdk.const import (
     HTTP_METHOD_POST,
     URL_PATH_AUTHN_USERS,
@@ -21,7 +22,6 @@ from aistore.sdk.const import (
 logger = get_logger(__name__)
 
 
-# pylint: disable=too-many-arguments, too-few-public-methods
 class AuthNClient:
     """
     AuthN client for managing authentication.
@@ -40,6 +40,7 @@ class AuthNClient:
         token (str, optional): Authorization token.
     """
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def __init__(
         self,
         endpoint: str,
@@ -58,7 +59,7 @@ class AuthNClient:
             session_manager=session_manager,
             timeout=timeout,
             token=token,
-            error_handler=raise_authn_error,
+            response_handler=AuthNResponseHandler(),
         )
         logger.info("AuthNClient initialized with endpoint: %s", endpoint)
 

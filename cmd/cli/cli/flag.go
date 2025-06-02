@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains util functions and types.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -9,12 +9,15 @@ import (
 	"flag"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/sys"
+
 	"github.com/urfave/cli"
 )
 
@@ -28,6 +31,10 @@ var (
 	_ flag.Value = &DurationFlagVar{}
 	_ cli.Flag   = &DurationFlag{}
 )
+
+func argIsFlag(c *cli.Context, idx int) bool {
+	return c.NArg() > idx && strings.HasPrefix(c.Args().Get(idx), flagPrefix)
+}
 
 /////////////////////
 // DurationFlagVar //
@@ -172,6 +179,9 @@ func parseRetriesFlag(c *cli.Context, flag cli.IntFlag, warn bool) (retries int)
 		maxr = 5
 		efmt = "invalid option '%s=%d' (expecting 1..5 range)"
 	)
+	if !flagIsSet(c, flag) {
+		return 0
+	}
 	retries = parseIntFlag(c, flag)
 	if retries < 0 {
 		if warn {
@@ -188,6 +198,22 @@ func parseRetriesFlag(c *cli.Context, flag cli.IntFlag, warn bool) (retries int)
 	return retries
 }
 
+//nolint:gocritic // ignoring hugeParam - following the orig. github.com/urfave style
+func parseNumWorkersFlag(c *cli.Context, flag cli.IntFlag) (n int, err error) {
+	n = parseIntFlag(c, flag)
+	if n < 0 {
+		return n, fmt.Errorf("%s cannot be negative", qflprn(flag))
+	}
+	mp := 2 * sys.MaxParallelism() // NOTE: imposing (hard-coded) limit
+	if n > mp {
+		warn := fmt.Sprintf("%s exceeds allowed maximum (2 * CPU cores) = %d - proceeding with %d workers...",
+			qflprn(flag), mp, mp)
+		actionWarn(c, warn)
+		n = mp
+	}
+	return n, nil
+}
+
 func rmFlags(flags []cli.Flag, fs ...cli.Flag) (out []cli.Flag) {
 	out = make([]cli.Flag, 0, len(flags))
 loop:
@@ -200,4 +226,9 @@ loop:
 		out = append(out, flag)
 	}
 	return
+}
+
+func sortFlags(fls []cli.Flag) []cli.Flag {
+	sort.Slice(fls, func(i, j int) bool { return fls[i].GetName() < fls[j].GetName() })
+	return fls
 }

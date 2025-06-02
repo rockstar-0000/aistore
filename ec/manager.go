@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -197,7 +197,7 @@ func (mgr *Manager) recvRequest(hdr *transport.ObjHdr, objReader io.Reader, err 
 	bck := meta.CloneBck(&hdr.Bck)
 	if err = bck.Init(core.T.Bowner()); err != nil {
 		if _, ok := err.(*cmn.ErrRemoteBckNotFound); !ok { // is ais
-			nlog.Errorf("failed to init bucket %s: %v", bck, err)
+			nlog.Errorf("failed to init bucket %s: %v", bck.String(), err)
 			return err
 		}
 	}
@@ -254,7 +254,7 @@ func (mgr *Manager) recvResponse(hdr *transport.ObjHdr, objReader io.Reader, err
 //   - lom - object to encode
 //   - intra - if true, it is internal request and has low priority
 //   - cb - optional callback that is called after the object is encoded
-func (mgr *Manager) EncodeObject(lom *core.LOM, cb core.OnFinishObj) error {
+func (mgr *Manager) EncodeObject(lom *core.LOM, cb onFin) error {
 	if !lom.ECEnabled() {
 		return ErrorECDisabled
 	}
@@ -262,11 +262,6 @@ func (mgr *Manager) EncodeObject(lom *core.LOM, cb core.OnFinishObj) error {
 	if err := cs.Err(); err != nil {
 		return err
 	}
-	spec, _ := fs.CSM.FileSpec(lom.FQN)
-	if spec != nil && !spec.PermToProcess() {
-		return errSkipped
-	}
-
 	req := allocateReq(ActSplit, lom.LIF())
 	req.IsCopy = IsECCopy(lom.Lsize(), &lom.Bprops().EC)
 	if cb != nil {
@@ -286,25 +281,6 @@ func (mgr *Manager) CleanupObject(lom *core.LOM) {
 	debug.Assert(lom.FQN != "" && lom.Mountpath().Path != "")
 	req := allocateReq(ActDelete, lom.LIF())
 	mgr.RestoreBckPutXact(lom.Bck()).cleanup(req, lom)
-}
-
-func (mgr *Manager) RestoreObject(lom *core.LOM) error {
-	if !lom.ECEnabled() {
-		return ErrorECDisabled
-	}
-	cs := fs.Cap()
-	if err := cs.Err(); err != nil {
-		return err
-	}
-
-	debug.Assert(lom.Mountpath() != nil && lom.Mountpath().Path != "")
-	req := allocateReq(ActRestore, lom.LIF())
-	errCh := make(chan error) // unbuffered
-	req.ErrCh = errCh
-	mgr.RestoreBckGetXact(lom.Bck()).decode(req, lom)
-
-	// wait for EC completes restoring the object
-	return <-errCh
 }
 
 // disableBck starts to reject new EC requests, rejects pending ones
@@ -347,4 +323,23 @@ func (mgr *Manager) BMDChanged() error {
 		return false
 	})
 	return nil
+}
+
+func (mgr *Manager) Recover(lom *core.LOM) error {
+	if !lom.ECEnabled() {
+		return ErrorECDisabled
+	}
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return err
+	}
+
+	req := allocateReq(ActRestore, lom.LIF())
+	errCh := make(chan error) // unbuffered
+	req.ErrCh = errCh
+	xctn := mgr.RestoreBckGetXact(lom.Bck())
+	xctn.decode(req, lom)
+
+	// wait here
+	return <-errCh
 }

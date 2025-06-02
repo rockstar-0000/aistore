@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package ais
@@ -13,6 +13,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -28,7 +29,7 @@ func (atc aismsgTestConf) Name() string {
 
 func testAisMsgMarshal(t *testing.T, tc aismsgTestConf) {
 	t.Run(tc.Name(), func(t *testing.T) {
-		beforeMsg := &aisMsg{}
+		beforeMsg := &actMsgExt{}
 		if tc.actionMsgPresent {
 			actionMsg := apc.ActMsg{
 				Action: "test-action",
@@ -53,18 +54,18 @@ func testAisMsgMarshal(t *testing.T, tc aismsgTestConf) {
 		if err != nil {
 			t.Errorf("Failed to marshal beforeMsg: %v", err)
 		}
-		afterAisMsg := &aisMsg{}
+		afterAisMsg := &actMsgExt{}
 
 		err = jsoniter.Unmarshal(b, afterAisMsg)
 		if err != nil {
-			t.Errorf("Unmarshal failed for aisMsg, err: %v", err)
+			t.Errorf("Unmarshal failed for actMsgExt, err: %v", err)
 		}
 
 		if afterAisMsg.Value != nil {
 			bck := &cmn.Bck{}
 			err = cos.MorphMarshal(afterAisMsg.Value, bck)
 			if err != nil {
-				t.Errorf("Morph marshal failed for aisMsg.Value: %v, err: %v", afterAisMsg.Value, err)
+				t.Errorf("Morph marshal failed for actMsgExt.Value: %v, err: %v", afterAisMsg.Value, err)
 			}
 			afterAisMsg.Value = bck
 		}

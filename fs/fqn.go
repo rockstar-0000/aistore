@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -39,25 +39,42 @@ const (
 
 type ParsedFQN struct {
 	Mountpath   *Mountpath
+	Bck         cmn.Bck
 	ContentType string // enum: { ObjectType, WorkfileType, ECSliceType, ... }
 	ObjName     string
 	Digest      uint64
-	Bck         cmn.Bck
+}
+
+func LikelyCT(s string) bool { return len(s) == 1+contentTypeLen && s[0] == prefCT }
+
+func ContainsCT(fqn, bname string) bool {
+	i := strings.Index(fqn, cos.PathSeparator+bname+cos.PathSeparator)
+	if i < 0 {
+		return false
+	}
+	ct := fqn[i+2+len(bname):]
+	j := strings.IndexByte(ct, filepath.Separator)
+	if j < 0 {
+		return false
+	}
+	return LikelyCT(ct[:j])
 }
 
 ///////////////
 // ParsedFQN //
 ///////////////
 
-func (parsed *ParsedFQN) Init(fqn string) (err error) {
-	var (
-		rel           string
-		itemIdx, prev int
+func (parsed *ParsedFQN) Init(fqn string) error {
+	const (
+		tag = "invalid fqn"
 	)
-	parsed.Mountpath, rel, err = FQN2Mpath(fqn)
+	mi, rel, err := FQN2Mpath(fqn)
 	if err != nil {
-		return
+		return err
 	}
+	parsed.Mountpath = mi
+
+	var itemIdx, prev int
 	for i := range len(rel) {
 		if rel[i] != filepath.Separator {
 			continue
@@ -67,19 +84,16 @@ func (parsed *ParsedFQN) Init(fqn string) (err error) {
 		switch itemIdx {
 		case 0: // backend provider
 			if item[0] != prefProvider {
-				err = fmt.Errorf("invalid fqn %s: bad provider %q", fqn, item)
-				return
+				return fmt.Errorf("%s %s: bad provider %q", tag, fqn, item)
 			}
 			provider := item[1:]
 			parsed.Bck.Provider = provider
 			if !apc.IsProvider(provider) {
-				err = fmt.Errorf("invalid fqn %s: unknown provider %q", fqn, provider)
-				return
+				return fmt.Errorf("%s %s: unknown provider %q", tag, fqn, provider)
 			}
 		case 1: // namespace or bucket name
 			if item == "" {
-				err = fmt.Errorf("invalid fqn %s: bad bucket name (or namespace)", fqn)
-				return
+				return fmt.Errorf("%s %s: bad bucket name (or namespace)", tag, fqn)
 			}
 
 			switch item[0] {
@@ -92,43 +106,41 @@ func (parsed *ParsedFQN) Init(fqn string) (err error) {
 				ns := item[1:]
 				idx := strings.IndexRune(ns, prefNsName)
 				if idx == -1 {
-					err = fmt.Errorf("invalid fqn %s: bad namespace %q", fqn, ns)
+					return fmt.Errorf("%s %s: bad namespace %q", tag, fqn, ns)
 				}
 				parsed.Bck.Ns = cmn.Ns{
 					UUID: ns[:idx],
 					Name: ns[idx+1:],
 				}
-				itemIdx-- // we must visit this case again
+				itemIdx-- // revisit
 			default:
 				parsed.Bck.Name = item
 			}
 		case 2: // content type and object name
 			if item[0] != prefCT {
-				err = fmt.Errorf("invalid fqn %s: bad content type %q", fqn, item)
-				return
+				return fmt.Errorf("%s %s: bad content type %q", tag, fqn, item)
 			}
 
 			item = item[1:]
 			if _, ok := CSM.m[item]; !ok {
-				err = fmt.Errorf("invalid fqn %s: bad content type %q", fqn, item)
-				return
+				return fmt.Errorf("%s %s: bad content type %q", tag, fqn, item)
 			}
 			parsed.ContentType = item
 
-			// Object name
+			// object name
 			objName := rel[i+1:]
 			if objName == "" {
-				err = fmt.Errorf("invalid fqn %s: bad object name", fqn)
+				return fmt.Errorf("%s %s: bad object name", tag, fqn)
 			}
 			parsed.ObjName = objName
-			return
+			return nil
 		}
 
 		itemIdx++
 		prev = i + 1
 	}
 
-	return fmt.Errorf("fqn %s is invalid", fqn)
+	return fmt.Errorf("%s %s (idx %d, prev %d)", tag, fqn, itemIdx, prev)
 }
 
 //
@@ -181,16 +193,16 @@ func CleanPathErr(err error) {
 		var what string
 		switch parsed.ContentType {
 		case ObjectType:
-			what = "'object'"
+			what = "object"
 		case WorkfileType:
-			what = "'work file'"
+			what = "work file"
 		case ECSliceType:
-			what = "'ec slice'"
+			what = "ec slice"
 		case ECMetaType:
-			what = "'ec metadata'"
+			what = "ec metadata"
 		default:
-			what = fmt.Sprintf("'%s'(?)", parsed.ContentType)
+			what = fmt.Sprintf("content type '%s'(?)", parsed.ContentType)
 		}
-		pathErr.Err = cos.NewErrNotFound(nil, "content type "+what)
+		pathErr.Err = cos.NewErrNotFound(nil, what)
 	}
 }

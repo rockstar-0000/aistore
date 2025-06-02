@@ -16,20 +16,19 @@ import (
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
 )
 
 const vmdCopies = 3
 
 type (
 	fsMpathMD struct {
-		Ext     any       `json:"ext,omitempty"` // reserved for within-metaversion extensions
-		Path    string    `json:"mountpath"`
-		Label   ios.Label `json:"mountpath_label"`
-		Fs      string    `json:"fs"`
-		FsType  string    `json:"fs_type"`
-		FsID    cos.FsID  `json:"fs_id"`
-		Enabled bool      `json:"enabled"`
+		Ext     any                `json:"ext,omitempty"` // reserved for within-metaversion extensions
+		Path    string             `json:"mountpath"`
+		Label   cos.MountpathLabel `json:"mountpath_label"`
+		Fs      string             `json:"fs"`
+		FsType  string             `json:"fs_type"`
+		FsID    cos.FsID           `json:"fs_id"`
+		Enabled bool               `json:"enabled"`
 	}
 
 	// VMD is AIS target's volume metadata structure
@@ -45,13 +44,14 @@ type (
 func _mpathGreaterEq(curr, prev *VMD, mpath string) bool {
 	currMd, currOk := curr.Mountpaths[mpath]
 	prevMd, prevOk := prev.Mountpaths[mpath]
-	if !currOk {
+	switch {
+	case !currOk:
 		return false
-	} else if !prevOk {
+	case !prevOk:
 		return true
-	} else if currMd.Enabled {
+	case currMd.Enabled:
 		return true
-	} else if currMd.Enabled == prevMd.Enabled {
+	case currMd.Enabled == prevMd.Enabled:
 		return true
 	}
 	return false
@@ -110,7 +110,7 @@ func (vmd *VMD) equal(other *VMD) bool {
 	debug.Assert(other.cksum != nil)
 	return vmd.DaemonID == other.DaemonID &&
 		vmd.Version == other.Version &&
-		vmd.cksum.Equal(other.cksum)
+		!vmd.cksum.IsEmpty() && vmd.cksum.Equal(other.cksum)
 }
 
 func (vmd *VMD) String() string {

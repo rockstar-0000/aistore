@@ -1,10 +1,9 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
-
-# pylint: disable=too-many-arguments, duplicate-code
-
 from typing import List
+
+from aistore.sdk.provider import Provider
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.authn.access_attr import AccessAttr
 from aistore.sdk.authn.cluster_manager import ClusterManager
@@ -40,6 +39,7 @@ class RoleManager:
         client (RequestClient): The RequestClient used to make HTTP requests.
     """
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def __init__(self, client: RequestClient):
         self._client = client
 
@@ -122,7 +122,7 @@ class RoleManager:
                 BucketPermission(
                     bck=BucketModel(
                         name=bucket_name,
-                        provider="ais",
+                        provider=Provider.AIS.value,
                         namespace=Namespace(uuid=cluster_uuid),
                     ),
                     perm=perm_value,
@@ -184,10 +184,7 @@ class RoleManager:
                 "Permissions must be provided when cluster alias or bucket name is specified."
             )
 
-        try:
-            role_info = self.get(role_name=name)
-        except ErrRoleNotFound as error:
-            raise ValueError(f"Role {name} does not exist") from error
+        role_info = self.get(role_name=name)
 
         if desc:
             role_info.desc = desc
@@ -206,7 +203,7 @@ class RoleManager:
                     BucketPermission(
                         bck=BucketModel(
                             name=bucket_name,
-                            provider="ais",
+                            provider=Provider.AIS.value,
                             namespace=Namespace(uuid=cluster_uuid),
                         ),
                         perm=perm_value,

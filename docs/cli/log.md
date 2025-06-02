@@ -1,12 +1,3 @@
----
-layout: post
-title: LOG
-permalink: /docs/cli/log
-redirect_from:
- - /cli/log.md/
- - /docs/cli/log.md/
----
-
 # Table of Contents
 - [Download log or all logs (including history)](#ais-log-get-command)
 - [View current log](#ais-log-show-command)
@@ -17,17 +8,21 @@ redirect_from:
 ```console
 $ ais log get --help
 NAME:
-   ais log get - download log (or all logs including history) from selected node or all nodes in the cluster, e.g.:
-               - 'ais log get NODE_ID /tmp' - download the specified node's current log; save the result to the specified directory;
-               - 'ais log get NODE_ID /tmp/out --refresh 10' - download the current log as /tmp/out
-                  keep updating (ie., appending) the latter every 10s;
-               - 'ais log get cluster /tmp' - download TAR.GZ archived logs from _all_ nodes in the cluster
-                  ('cluster' implies '--all') and save the result to the specified destination;
-               - 'ais log get NODE_ID --all' - download the node's TAR.GZ log archive
-               - 'ais log get NODE_ID --all --severity e' - TAR.GZ archive of (only) logged errors and warnings
+   ais log get - Download logs from a selected node or the entire cluster;
+                 supports downloading current logs or TAR.GZ archives.
+   e.g.:
+     - 'ais log get NODE_ID /tmp'                    - download the current log from NODE_ID and save it in the specified directory;
+     - 'ais log get NODE_ID /tmp/out' --refresh 10   - download the current log from NODE_ID as /tmp/out
+                                                       and continuously update it every 10 seconds;
+     - 'ais log get cluster /tmp'                    - download TAR.GZ archives from all cluster nodes
+                                                       and save them in the specified directory ('get cluster' implies '--all');
+     - 'ais log get NODE_ID --all'                   - download the complete log archive (TAR.GZ) from NODE_ID;
+     - 'ais log get NODE_ID --all --severity error'  - download only errors and warnings from NODE_ID;
+     - 'ais log get NODE_ID --all --severity e'      - same as above.
+
 
 USAGE:
-   ais log get [command options] NODE_ID [OUT_FILE|OUT_DIR|-]
+   ais log get NODE_ID [OUT_FILE|OUT_DIR|-] [command options]
 
 OPTIONS:
    --refresh value   interval for continuous monitoring;
@@ -52,7 +47,7 @@ NAME:
    ais log show - for a given node: show its current log (use '--refresh' to update, '--help' for details)
 
 USAGE:
-   ais log show [command options] NODE_ID
+   ais log show NODE_ID [command options]
 
 OPTIONS:
    --refresh value    interval for continuous monitoring;
@@ -79,7 +74,7 @@ NAME:
                  (see related: 'ais log show', 'ais log get')
 
 USAGE:
-   ais cluster download-logs [command options] [OUT_DIR]
+   ais cluster download-logs [OUT_DIR] [command options]
 
 OPTIONS:
    --severity value  log severity is either 'i' or 'info' (default, can be omitted), or 'error', whereby error logs contain

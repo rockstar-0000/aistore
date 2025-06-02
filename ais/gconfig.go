@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -52,6 +52,7 @@ var _ revs = (*globalConfig)(nil)
 // as revs
 func (*globalConfig) tag() string           { return revsConfTag }
 func (config *globalConfig) version() int64 { return config.Version }
+func (config *globalConfig) uuid() string   { return config.UUID }
 func (*globalConfig) jit(p *proxy) revs     { g, _ := p.owner.config.get(); return g }
 
 func (config *globalConfig) sgl() *memsys.SGL {
@@ -109,7 +110,7 @@ func (*configOwner) version() int64 { return cmn.GCO.Get().Version }
 func (co *configOwner) _runPre(ctx *configModifier) (clone *globalConfig, err error) {
 	clone, err = co.get()
 	if err != nil {
-		return
+		return nil, err
 	}
 	if clone == nil {
 		// missing config - try to load initial plain-text
@@ -126,7 +127,7 @@ func (co *configOwner) _runPre(ctx *configModifier) (clone *globalConfig, err er
 	}
 
 	ctx.oldConfig = cmn.GCO.Get()
-	if err = cmn.GCO.Update(&clone.ClusterConfig); err != nil {
+	if err := cmn.GCO.Update(&clone.ClusterConfig); err != nil {
 		return nil, err
 	}
 
@@ -201,7 +202,7 @@ func setConfig(toUpdate *cmn.ConfigToSet, transient bool) (err error) {
 		override.Merge(toUpdate)
 	}
 	if !transient {
-		if err = cmn.SaveOverrideConfig(clone.ConfigDir, override); err != nil {
+		if err := cmn.SaveOverrideConfig(clone.ConfigDir, override); err != nil {
 			return err
 		}
 	}

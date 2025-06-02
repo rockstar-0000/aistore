@@ -6,13 +6,11 @@
 package memsys
 
 import (
-	"sort"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/sys"
 )
@@ -24,48 +22,26 @@ const (
 
 // hk tunables (via config.Memsys section)
 var (
-	sizeToGC      = int64(cos.GiB + cos.GiB>>1) // run GC when sum(`freed`) > sizeToGC
-	memCheckAbove = 90 * time.Second            // memory checking frequency when above low watermark
+	sizeToGC      = int64(cos.GiB << 2) // run GC when sum(`freed`) > sizeToGC
+	memCheckAbove = 3 * time.Minute     // default HK interval (gets modified up or down)
 )
 
 // API: on-demand memory freeing to the user-provided specification
 func (r *MMSA) FreeSpec(spec FreeSpec) {
 	var freed int64
-	if spec.Totally {
-		for _, s := range r.rings {
-			freed += s.cleanup()
-		}
-	} else {
-		if spec.IdleDuration == 0 {
-			spec.IdleDuration = freeIdleMinDur // using the default
-		}
-		stats := r.GetStats()
-		for _, s := range r.rings {
-			if idle := s.idleDur(stats); idle > spec.IdleDuration {
-				x := s.cleanup()
-				if x > 0 {
-					freed += x
-					if cmn.Rom.FastV(5, cos.SmoduleMemsys) {
-						nlog.Infof("%s: idle for %v - cleanup", s.tag, idle)
-					}
-				}
-			}
-		}
+	for _, s := range r.rings {
+		freed += s.cleanup()
 	}
 	if freed > 0 {
 		r.toGC.Add(freed)
 		if spec.MinSize == 0 {
 			spec.MinSize = sizeToGC // using default
 		}
-		r.freeMemToOS(spec.MinSize, spec.ToOS /* force */)
+		pressure := r.Pressure()
+		if pressure >= PressureModerate {
+			r.freeMemToOS(spec.MinSize, pressure, spec.ToOS /* force */)
+		}
 	}
-}
-
-// copies part of the internal stats into user-visible Stats
-func (r *MMSA) GetStats() (stats *Stats) {
-	stats = &Stats{}
-	r._snap(stats, mono.NanoTime())
-	return
 }
 
 //
@@ -73,26 +49,36 @@ func (r *MMSA) GetStats() (stats *Stats) {
 //
 
 func (r *MMSA) hkcb(now int64) time.Duration {
-	// 1. refresh and clone stats
-	r.refreshStats(now)
-
-	// 2. update swapping state and compute mem-pressure ranking
+	// update swapping state and compute mem-pressure ranking
 	err := r.mem.Get()
-	debug.AssertNoErr(err)
+	if err != nil {
+		// (unlikely)
+		nlog.Errorln(err)
+		return max(r.TimeIval, time.Minute)
+	}
 	r.updSwap(&r.mem)
 	pressure := r.Pressure(&r.mem)
 
-	// 3. memory is enough, free only those that are idle for a while
+	// memory is enough: update idle times and free idle slabs, unless out of cpu
 	if pressure == PressureLow {
+		var (
+			load     = sys.MaxLoad()
+			highLoad = sys.HighLoadWM()
+		)
+		// too busy and not too "pressured"
+		if load >= float64(highLoad) {
+			return r.hkIval(pressure)
+		}
+		r.refreshStats(now)
 		r.optDepth.Store(optDepth)
 		if freed := r.freeIdle(); freed > 0 {
 			r.toGC.Add(freed)
-			r.freeMemToOS(sizeToGC, false)
+			r.freeMemToOS(sizeToGC, pressure)
 		}
 		return r.hkIval(pressure)
 	}
 
-	// 4. calibrate and mem-free accordingly
+	// calibrate and mem-free accordingly
 	var (
 		mingc = sizeToGC // minimum accumulated size that triggers GC
 		depth int        // => current ring depth tbd
@@ -112,20 +98,14 @@ func (r *MMSA) hkcb(now int64) time.Duration {
 		depth = optDepth / 2
 	}
 
-	// 5.
-	// - sort (idle < less-idle < busy) taking into account durations and ring hits (in that order)
-	// - _reduce_
-	sort.Slice(r.sorted, r.idleLess)
-	for _, s := range r.sorted { // idle first
-		if idle := r.statsSnapshot.Idle[s.ringIdx()]; idle > freeIdleMinDur/2 {
-			depth = minDepth
-		}
+	// 5. reduce
+	for _, s := range r.rings {
 		freed := s.reduce(depth)
 		r.toGC.Add(freed)
 	}
 
 	// 6. GC and free mem to OS
-	r.freeMemToOS(mingc, pressure >= PressureHigh /*force*/)
+	r.freeMemToOS(mingc, pressure)
 	return r.hkIval(pressure)
 }
 
@@ -143,44 +123,27 @@ func (r *MMSA) hkIval(pressure int) time.Duration {
 // refresh and clone internal hits/idle stats
 func (r *MMSA) refreshStats(now int64) {
 	for i := range r.numSlabs {
-		hits, prev := r.slabStats.hits[i].Load(), r.slabStats.prev[i]
-		hinc := hits - prev
-		if hinc == 0 {
-			r.slabStats.idleTs[i].CAS(0, now)
+		hits := r.hits[i].Swap(0)
+		if hits == 0 {
+			if !r.idleTs[i].CAS(0, now) {
+				r.idleDur[i] = time.Duration(now - r.idleTs[i].Load())
+			}
 		} else {
-			r.slabStats.idleTs[i].Store(0)
+			r.idleTs[i].Store(0)
+			r.idleDur[i] = 0
 		}
-		r.slabStats.hinc[i], r.slabStats.prev[i] = hinc, hits
 	}
-
-	r._snap(r.statsSnapshot, now)
-}
-
-func (r *MMSA) idleLess(i, j int) bool {
-	var (
-		ii = r.sorted[i].ringIdx()
-		jj = r.sorted[j].ringIdx()
-	)
-	if r.statsSnapshot.Idle[ii] > 0 {
-		if r.statsSnapshot.Idle[jj] > 0 {
-			return r.statsSnapshot.Idle[ii] > r.statsSnapshot.Idle[jj]
-		}
-		return true
-	}
-	if r.slabStats.idleTs[jj].Load() != 0 {
-		return false
-	}
-	return r.slabStats.hinc[ii] < r.slabStats.hinc[jj]
 }
 
 // freeIdle traverses and deallocates idle slabs- those that were not used for at
 // least the specified duration; returns freed size
 func (r *MMSA) freeIdle() (total int64) {
-	for _, s := range r.rings {
+	for i, s := range r.rings {
 		var (
 			freed int64
-			idle  = r.statsSnapshot.Idle[s.ringIdx()]
+			idle  = r.idleDur[i]
 		)
+		debug.Assert(s.ringIdx() == i)
 		switch {
 		case idle > freeIdleZero:
 			freed = s.cleanup()
@@ -197,38 +160,4 @@ func (r *MMSA) freeIdle() (total int64) {
 		}
 	}
 	return
-}
-
-// check "minimum" and "load" conditions and calls (expensive, serialized) goroutine
-func (r *MMSA) freeMemToOS(mingc int64, force bool) {
-	avg, err := sys.LoadAverage()
-	if err != nil {
-		nlog.Errorf("Failed to load averages: %v", err) // (unlikely)
-		avg.One = 999
-	}
-	togc := r.toGC.Load()
-
-	// too little to bother?
-	if togc < mingc {
-		return
-	}
-	// too loaded w/ no urgency?
-	if avg.One > loadAvg /*idle*/ && !force {
-		return
-	}
-
-	if started := cos.FreeMemToOS(force); started {
-		nlog.Infof("%s: free mem to OS: %s, load %.2f, force %t", r, cos.ToSizeIEC(togc, 1), avg.One, force)
-		r.toGC.Store(0)
-	}
-}
-
-func (r *MMSA) _snap(stats *Stats, now int64) {
-	for i := range r.rings {
-		stats.Hits[i] = r.slabStats.hits[i].Load()
-		stats.Idle[i] = 0
-		if since := r.slabStats.idleTs[i].Load(); since != 0 {
-			stats.Idle[i] = time.Duration(now - since)
-		}
-	}
 }

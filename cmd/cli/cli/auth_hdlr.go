@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that create entities in the cluster.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/core/meta"
+
 	"github.com/fatih/color"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
@@ -57,33 +58,33 @@ var (
 	// define separately to allow for aliasing (see alias_hdlr.go)
 	authCmdShow = cli.Command{
 		Name:  cmdAuthShow,
-		Usage: "show entity in authn",
+		Usage: "Show entity in authn",
 		Subcommands: []cli.Command{
 			{
 				Name:      cmdAuthCluster,
-				Usage:     "show AIS clusters managed by this AuthN instance",
+				Usage:     "Show AIS clusters managed by this AuthN instance",
 				ArgsUsage: showAuthClusterArgument,
 				Action:    wrapAuthN(showAuthClusterHandler),
 			},
 			{
 				Name:         cmdAuthRole,
-				Usage:        "show existing AuthN roles",
+				Usage:        "Show existing AuthN roles",
 				ArgsUsage:    showAuthRoleArgument,
-				Flags:        authFlags[flagsAuthRoleShow],
+				Flags:        sortFlags(authFlags[flagsAuthRoleShow]),
 				Action:       wrapAuthN(showAuthRoleHandler),
 				BashComplete: oneRoleCompletions,
 			},
 			{
 				Name:      cmdAuthUser,
-				Usage:     "show user list and details",
-				Flags:     authFlags[flagsAuthUserShow],
+				Usage:     "Show user list and details",
+				Flags:     sortFlags(authFlags[flagsAuthUserShow]),
 				ArgsUsage: showAuthUserListArgument,
 				Action:    wrapAuthN(showAuthUserHandler),
 			},
 			{
 				Name:   cmdAuthConfig,
-				Usage:  "show AuthN server configuration",
-				Flags:  authFlags[flagsAuthConfShow],
+				Usage:  "Show AuthN server configuration",
+				Flags:  sortFlags(authFlags[flagsAuthConfShow]),
 				Action: wrapAuthN(showAuthConfigHandler),
 			},
 		},
@@ -91,34 +92,34 @@ var (
 
 	authCmd = cli.Command{
 		Name:  commandAuth,
-		Usage: "add/remove/show users, manage user roles, manage access to AIS clusters",
+		Usage: "Add/remove/show users, manage user roles, manage access to AIS clusters",
 		Subcommands: []cli.Command{
 			// show
 			authCmdShow,
 			// add
 			{
 				Name:  cmdAuthAdd,
-				Usage: "add AuthN entity: user, role, AIS cluster",
+				Usage: "Add AuthN entity: user, role, AIS cluster",
 				Subcommands: []cli.Command{
 					{
 						Name:         cmdAuthUser,
-						Usage:        "add a new user",
+						Usage:        "Add a new user",
 						ArgsUsage:    addAuthUserArgument,
-						Flags:        authFlags[cmdAuthUser],
+						Flags:        sortFlags(authFlags[cmdAuthUser]),
 						Action:       wrapAuthN(addAuthUserHandler),
 						BashComplete: oneRoleCompletions,
 					},
 					{
 						Name:      cmdAuthCluster,
-						Usage:     "add AIS cluster (to authenticate access to buckets and to the cluster)",
+						Usage:     "Add AIS cluster (to authenticate access to buckets and to the cluster)",
 						ArgsUsage: addAuthClusterArgument,
 						Action:    wrapAuthN(addAuthClusterHandler),
 					},
 					{
 						Name:         cmdAuthRole,
-						Usage:        "create a new role",
+						Usage:        "Create a new role",
 						ArgsUsage:    addSetAuthRoleArgument,
-						Flags:        authFlags[flagsAuthRoleAddSet],
+						Flags:        sortFlags(authFlags[flagsAuthRoleAddSet]),
 						Action:       wrapAuthN(addAuthRoleHandler),
 						BashComplete: addRoleCompletions,
 					},
@@ -127,33 +128,33 @@ var (
 			// rm
 			{
 				Name:  cmdAuthRemove,
-				Usage: "remove an entity from AuthN",
+				Usage: "Remove an entity from AuthN",
 				Subcommands: []cli.Command{
 					{
 						Name:         cmdAuthUser,
-						Usage:        "remove an existing user",
+						Usage:        "Remove an existing user",
 						ArgsUsage:    deleteAuthUserArgument,
 						Action:       wrapAuthN(deleteUserHandler),
 						BashComplete: oneUserCompletions,
 					},
 					{
 						Name:         cmdAuthCluster,
-						Usage:        "remove AIS cluster",
+						Usage:        "Remove AIS cluster",
 						ArgsUsage:    deleteAuthClusterArgument,
 						Action:       wrapAuthN(deleteAuthClusterHandler),
 						BashComplete: oneClusterCompletions,
 					},
 					{
 						Name:         cmdAuthRole,
-						Usage:        "remove an existing role",
+						Usage:        "Remove an existing role",
 						ArgsUsage:    deleteAuthRoleArgument,
 						Action:       wrapAuthN(deleteRoleHandler),
 						BashComplete: oneRoleCompletions,
 					},
 					{
 						Name:      cmdAuthToken,
-						Usage:     "revoke AuthN token",
-						Flags:     authFlags[flagsAuthRevokeToken],
+						Usage:     "Revoke AuthN token",
+						Flags:     sortFlags(authFlags[flagsAuthRevokeToken]),
 						ArgsUsage: deleteAuthTokenArgument,
 						Action:    wrapAuthN(revokeTokenHandler),
 					},
@@ -162,34 +163,34 @@ var (
 			// set
 			{
 				Name:  cmdAuthSet,
-				Usage: "update AuthN configuration and its entities: users, roles, and AIS clusters",
+				Usage: "Update AuthN configuration and its entities: users, roles, and AIS clusters",
 				Subcommands: []cli.Command{
 					{
 						Name:         cmdAuthConfig,
-						Usage:        "update AuthN server configuration",
+						Usage:        "Update AuthN server configuration",
 						Action:       wrapAuthN(setAuthConfigHandler),
 						BashComplete: suggestUpdatableAuthNConfig,
 					},
 					{
 						Name:         cmdAuthCluster,
-						Usage:        "update AIS cluster configuration (the cluster must be previously added to AuthN)",
+						Usage:        "Update AIS cluster configuration (the cluster must be previously added to AuthN)",
 						ArgsUsage:    addAuthClusterArgument,
 						Action:       wrapAuthN(updateAuthClusterHandler),
 						BashComplete: oneClusterCompletions,
 					},
 					{
 						Name:         cmdAuthUser,
-						Usage:        "update an existing user",
+						Usage:        "Update an existing user",
 						ArgsUsage:    addAuthUserArgument,
-						Flags:        authFlags[cmdAuthUser],
+						Flags:        sortFlags(authFlags[cmdAuthUser]),
 						Action:       wrapAuthN(updateAuthUserHandler),
 						BashComplete: oneUserCompletionsWithRoles,
 					},
 					{
 						Name:         cmdAuthRole,
-						Usage:        "update an existing role for all users that have it",
+						Usage:        "Update an existing role for all users that have it",
 						ArgsUsage:    addSetAuthRoleArgument,
-						Flags:        authFlags[flagsAuthRoleAddSet],
+						Flags:        sortFlags(authFlags[flagsAuthRoleAddSet]),
 						Action:       wrapAuthN(updateAuthRoleHandler),
 						BashComplete: setRoleCompletions,
 					},
@@ -198,15 +199,15 @@ var (
 			// login, logout
 			{
 				Name:      cmdAuthLogin,
-				Usage:     "log in with existing user ID and password",
-				Flags:     authFlags[flagsAuthUserLogin],
+				Usage:     "Log in with existing user ID and password",
+				Flags:     sortFlags(authFlags[flagsAuthUserLogin]),
 				ArgsUsage: userLoginArgument,
 				Action:    wrapAuthN(loginUserHandler),
 			},
 			{
 				Name:   cmdAuthLogout,
-				Usage:  "log out",
-				Flags:  authFlags[flagsAuthUserLogout],
+				Usage:  "Log out",
+				Flags:  sortFlags(authFlags[flagsAuthUserLogout]),
 				Action: wrapAuthN(logoutUserHandler),
 			},
 		},
@@ -219,13 +220,13 @@ var (
 func wrapAuthN(f cli.ActionFunc) cli.ActionFunc {
 	return func(c *cli.Context) error {
 		if authParams.Client == nil {
-			return errors.New(env.AuthN.URL + " is not set")
+			return errors.New(env.AisAuthURL + " is not set")
 		}
 		err := f(c)
 		if err != nil {
 			if msg, unreachable := isUnreachableError(err); unreachable {
 				err = fmt.Errorf(authnUnreachable, authParams.URL+" (detailed error: "+msg+")",
-					env.AuthN.URL)
+					env.AisAuthURL)
 			}
 		}
 		return err
@@ -242,7 +243,7 @@ func readMasked(c *cli.Context, prompt string) string {
 }
 
 func cliAuthnURL(cfg *config.Config) string {
-	return cos.Right(cfg.Auth.URL, os.Getenv(env.AuthN.URL))
+	return cos.Right(cfg.Auth.URL, os.Getenv(env.AisAuthURL))
 }
 
 func lookupClusterID(cluID string) (string, error) {
@@ -767,7 +768,7 @@ func setAuthConfigHandler(c *cli.Context) (err error) {
 func getTokenFilePath(c *cli.Context) (string, error) {
 	tokenFilePath := parseStrFlag(c, tokenFileFlag)
 	if tokenFilePath == "" {
-		tokenFilePath = os.Getenv(env.AuthN.TokenFile)
+		tokenFilePath = os.Getenv(env.AisAuthTokenFile)
 	}
 	if tokenFilePath == "" {
 		tokenFilePath = filepath.Join(config.ConfigDir, fname.Token)

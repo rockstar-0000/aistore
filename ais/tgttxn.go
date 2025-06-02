@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -20,7 +20,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
-	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -31,16 +30,17 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
+
 	jsoniter "github.com/json-iterator/go"
 )
 
-const ActCleanup = "cleanup" // in addition to (apc.ActBegin, ...)
+const actTxnCleanup = "cleanup" // in addition to (apc.ActBegin, ...)
 
 // context structure to gather all (or most) of the relevant state in one place
 // (compare with txnCln)
 type txnSrv struct {
 	t          *target
-	msg        *aisMsg
+	msg        *actMsgExt
 	bck        *meta.Bck // aka bckFrom
 	bckTo      *meta.Bck
 	query      url.Values
@@ -58,7 +58,6 @@ type txnSrv struct {
 
 // verb /v1/txn
 func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
-	var bucket, phase, xid string
 	if r.Method != http.MethodPost {
 		cmn.WriteErr405(w, r, http.MethodPost)
 		return
@@ -67,17 +66,17 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-
 	xactRecord := xact.Table[msg.Action]
 	onlyPrimary := xactRecord.Metasync
 	if !t.ensureIntraControl(w, r, onlyPrimary) {
 		return
 	}
-
 	apiItems, err := t.parseURL(w, r, apc.URLPathTxn.L, 0, true)
 	if err != nil {
 		return
 	}
+
+	var bucket, phase string
 	switch len(apiItems) {
 	case 1: // Global transaction.
 		phase = apiItems[0]
@@ -88,12 +87,27 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	switch phase {
+	case apc.ActBegin, apc.ActAbort, apc.ActCommit:
+	default:
+		debug.Assert(false, phase)
+		t.writeErrAct(w, r, phase+" (expecting begin|abort|commit)")
+		return
+	}
+
 	c := &txnSrv{t: t, msg: msg, phase: phase}
 	if err := c.init(r, bucket); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
 
+	/* DEBUG
+	if c.bck != nil {
+		_ = xreg.RenewBucketXact(apc.ActGetBatch, c.bck, xreg.Args{UUID: cos.GenUUID()})
+	}
+	*/
+
+	var xid string
 	switch msg.Action {
 	case apc.ActCreateBck, apc.ActAddRemoteBck:
 		err = t.createBucket(c)
@@ -104,44 +118,39 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	case apc.ActMoveBck:
 		xid, err = t.renameBucket(c)
 	case apc.ActCopyBck, apc.ActETLBck:
+		// TODO: remove redundant unmarshal and validateETL calls in both begin and commit phases.
+		// In the commit phase, messages should already be validated and ready for use.
 		var (
-			dp     core.DP
-			tcbmsg = &apc.TCBMsg{}
+			tcbmsg    = &apc.TCBMsg{}
+			disableDM bool
 		)
 		if err := cos.MorphMarshal(c.msg.Value, tcbmsg); err != nil {
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, c.msg.Value, err)
 			return
 		}
 		if msg.Action == apc.ActETLBck {
-			var err error
-			if dp, err = etlDP(tcbmsg); err != nil {
-				t.writeErr(w, r, err)
+			if disableDM, err = isDisableDM(tcbmsg); err != nil {
+				t.writeErr(w, r, err, http.StatusNotFound)
 				return
 			}
 		}
-		xid, err = t.tcb(c, tcbmsg, dp)
+		xid, err = t.tcb(c, tcbmsg, disableDM)
 	case apc.ActCopyObjects, apc.ActETLObjects:
 		var (
-			dp     core.DP
-			tcomsg = &cmn.TCOMsg{}
+			tcomsg    = &cmn.TCOMsg{}
+			disableDM bool
 		)
 		if err := cos.MorphMarshal(c.msg.Value, tcomsg); err != nil {
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, c.msg.Value, err)
 			return
 		}
 		if msg.Action == apc.ActETLObjects {
-			cs := fs.Cap()
-			if err := cs.Err(); err != nil {
-				t.writeErr(w, r, err, http.StatusInsufficientStorage)
-				return
-			}
-			var err error
-			if dp, err = etlDP(&tcomsg.TCBMsg); err != nil {
-				t.writeErr(w, r, err)
+			if disableDM, err = isDisableDM(&tcomsg.TCBMsg); err != nil {
+				t.writeErr(w, r, err, http.StatusNotFound)
 				return
 			}
 		}
-		xid, err = t.tcobjs(c, tcomsg, dp)
+		xid, err = t.tcobjs(c, tcomsg, disableDM)
 	case apc.ActECEncode:
 		xid, err = t.ecEncode(c)
 	case apc.ActArchive:
@@ -164,7 +173,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// cleanup on error
-	t.transactions.find(c.uuid, ActCleanup)
+	t.txns.term(c.uuid, actTxnCleanup)
 
 	if cmn.IsErrCapExceeded(err) {
 		cs := t.oos(cmn.GCO.Get())
@@ -182,7 +191,7 @@ func (t *target) createBucket(c *txnSrv) error {
 	switch c.phase {
 	case apc.ActBegin:
 		txn := newTxnCreateBucket(c)
-		if err := t.transactions.begin(txn); err != nil {
+		if err := t.txns.begin(txn); err != nil {
 			return err
 		}
 		if c.msg.Action == apc.ActCreateBck && c.bck.IsRemote() {
@@ -196,25 +205,35 @@ func (t *target) createBucket(c *txnSrv) error {
 			}
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
-		t._commitCreateDestroy(c)
-	default:
-		debug.Assert(false)
+		if err := t._commitCreateDestroy(c); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (t *target) _commitCreateDestroy(c *txnSrv) (err error) {
-	txn, err := t.transactions.find(c.uuid, "")
+	txn, err := t.txns.find(c.uuid)
 	if err != nil {
 		return err
 	}
 	// wait for newBMD w/timeout
-	if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
-		return cmn.NewErrFailedTo(t, "commit", txn, err)
+	if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+		err = cmn.NewErrFailedTo(t, "commit", txn, err)
 	}
-	return
+
+	// start and immdiately finish xaction with a singular purpose:
+	// to have a record in xreg (via `ais show job`): name and timestamp only
+	// (compare with httpbckdelete/ActEvictRemoteBck)
+	if c.msg.Action == apc.ActEvictRemoteBck {
+		xid := c.uuid
+		debug.Assert(strings.HasPrefix(xid, prefixEvictRmmdXid), xid)
+		_ = xreg.RenewEvictDelete(xid, apc.ActEvictRemoteBck, c.bck, nil)
+	}
+
+	return err
 }
 
 //
@@ -240,18 +259,18 @@ func (t *target) makeNCopies(c *txnSrv) (string, error) {
 			return "", cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnMakeNCopies(c, curCopies, newCopies)
-		if err := t.transactions.begin(txn, nlp); err != nil {
+		if err := t.txns.begin(txn, nlp); err != nil {
 			return "", err
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
 		copies, err := _parseNCopies(c.msg.Value)
 		debug.AssertNoErr(err)
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return "", err
 		}
@@ -259,7 +278,7 @@ func (t *target) makeNCopies(c *txnSrv) (string, error) {
 		debug.Assert(txnMnc.newCopies == copies)
 
 		// wait for newBMD w/timeout
-		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+		if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
 
@@ -275,13 +294,11 @@ func (t *target) makeNCopies(c *txnSrv) (string, error) {
 		xact.GoRunW(xctn)
 
 		return xctn.ID(), nil
-	default:
-		debug.Assert(false)
 	}
 	return "", nil
 }
 
-func (t *target) validateMakeNCopies(bck *meta.Bck, msg *aisMsg) (curCopies, newCopies int64, err error) {
+func (t *target) validateMakeNCopies(bck *meta.Bck, msg *actMsgExt) (curCopies, newCopies int64, err error) {
 	curCopies = bck.Props.Mirror.Copies
 	newCopies, err = _parseNCopies(msg.Value)
 	if err == nil {
@@ -324,24 +341,24 @@ func (t *target) setBprops(c *txnSrv) (string, error) {
 			return "", cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnSetBucketProps(c, nprops)
-		if err := t.transactions.begin(txn, nlp); err != nil {
+		if err := t.txns.begin(txn, nlp); err != nil {
 			return "", err
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
 		var xid string
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return "", err
 		}
 		txnSetBprops := txn.(*txnSetBucketProps)
 		bprops, nprops := txnSetBprops.bprops, txnSetBprops.nprops
 		// wait for newBMD w/timeout
-		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+		if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
 		if _reMirror(bprops, nprops) {
@@ -360,7 +377,9 @@ func (t *target) setBprops(c *txnSrv) (string, error) {
 		if _, reec := _reEC(bprops, nprops, c.bck, nil /*smap*/); reec {
 			flt := xreg.Flt{Kind: apc.ActECEncode, Bck: c.bck}
 			xreg.DoAbort(flt, errors.New("re-ec"))
-			rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit)
+
+			// checkAndRecover always false (compare w/ ecEncode below)
+			rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit, false /*check & recover missing/corrupted*/)
 			if rns.Err != nil {
 				return "", rns.Err
 			}
@@ -375,13 +394,11 @@ func (t *target) setBprops(c *txnSrv) (string, error) {
 			}
 		}
 		return xid, nil
-	default:
-		debug.Assert(false)
 	}
 	return "", nil
 }
 
-func (t *target) validateNprops(bck *meta.Bck, msg *aisMsg) (nprops *cmn.Bprops, err error) {
+func (t *target) validateNprops(bck *meta.Bck, msg *actMsgExt) (nprops *cmn.Bprops, err error) {
 	var (
 		body = cos.MustMarshal(msg.Value)
 		cs   = fs.Cap()
@@ -432,22 +449,22 @@ func (t *target) renameBucket(c *txnSrv) (string, error) {
 			return "", cmn.NewErrBusy("bucket", bckTo.Cname(""))
 		}
 		txn := newTxnRenameBucket(c, bckFrom, bckTo)
-		if err := t.transactions.begin(txn, nlpFrom, nlpTo); err != nil {
+		if err := t.txns.begin(txn, nlpFrom, nlpTo); err != nil {
 			return "", err
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return "", err
 		}
 		txnRenB := txn.(*txnRenameBucket)
 		// wait for newBMD w/timeout
-		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+		if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
 		rns := xreg.RenewBckRename(txnRenB.bckFrom, txnRenB.bckTo, c.uuid, c.msg.RMDVersion, apc.ActCommit)
@@ -466,13 +483,11 @@ func (t *target) renameBucket(c *txnSrv) (string, error) {
 		xact.GoRunW(xctn) // run and wait until it starts running
 
 		return xctn.ID(), nil
-	default:
-		debug.Assert(false)
 	}
 	return "", nil
 }
 
-func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *aisMsg) error {
+func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *actMsgExt) error {
 	cs := fs.Cap()
 	if err := cs.Err(); err != nil {
 		return err
@@ -505,29 +520,22 @@ func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *aisMsg) error 
 	return nil
 }
 
-func etlDP(msg *apc.TCBMsg) (core.DP, error) {
-	if !k8s.IsK8s() {
-		return nil, k8s.ErrK8sRequired
-	}
-	if err := msg.Validate(true); err != nil {
-		return nil, err
-	}
-	return etl.NewOfflineDP(msg, cmn.GCO.Get())
-}
-
 // common for both bucket copy and bucket transform - does the heavy lifting
-func (t *target) tcb(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (string, error) {
+func (t *target) tcb(c *txnSrv, msg *apc.TCBMsg, disableDM bool) (string, error) {
 	switch c.phase {
 	case apc.ActBegin:
-		if err := c.bck.Init(t.owner.bmd); err != nil {
+		var (
+			bckTo   = c.bckTo
+			bckFrom = c.bck // from
+		)
+		if err := bckFrom.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
-		bckTo, bckFrom := c.bckTo, c.bck
-		if err := bckTo.Validate(); err != nil {
-			return "", err
-		}
-		if err := bckFrom.Validate(); err != nil {
-			return "", err
+		// destination does not have to exist but must have a valid name
+		if err := bckTo.Init(t.owner.bmd); err != nil {
+			if err = bckTo.Validate(); err != nil {
+				return "", err
+			}
 		}
 		cs := fs.Cap()
 		if err := cs.Err(); err != nil {
@@ -543,28 +551,28 @@ func (t *target) tcb(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (string, error) {
 		if _, present := bmd.Get(bckFrom); !present {
 			return "", cmn.NewErrBckNotFound(bckFrom.Bucket())
 		}
-		if err := t._tcbBegin(c, msg, dp); err != nil {
+		if err := t._tcbBegin(c, msg, disableDM); err != nil {
 			return "", err
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return "", err
 		}
 		txnTcb := txn.(*txnTCB)
 
 		if c.query.Get(apc.QparamWaitMetasync) != "" {
-			if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+			if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 				txnTcb.xtcb.TxnAbort(err)
 				return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 			}
 		} else {
-			t.transactions.find(c.uuid, apc.ActCommit)
+			t.txns.term(c.uuid, apc.ActCommit)
 		}
 
 		custom := txnTcb.xtcb.Args()
@@ -588,13 +596,11 @@ func (t *target) tcb(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (string, error) {
 		c.addNotif(xctn) // notify upon completion
 		xact.GoRunW(xctn)
 		return xid, nil
-	default:
-		debug.Assert(false)
 	}
 	return "", nil
 }
 
-func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
+func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, disableDM bool) error {
 	var (
 		bckTo, bckFrom = c.bckTo, c.bck
 		nlpFrom        = newBckNLP(bckFrom)
@@ -610,11 +616,21 @@ func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
 			return cmn.NewErrBusy("bucket", bckTo.Cname(""))
 		}
 	}
-	custom := &xreg.TCBArgs{Phase: apc.ActBegin, BckFrom: bckFrom, BckTo: bckTo, DP: dp, Msg: msg}
+	custom := &xreg.TCBArgs{
+		Phase:     apc.ActBegin,
+		BckFrom:   bckFrom,
+		BckTo:     bckTo,
+		Msg:       msg,
+		DisableDM: disableDM, // for now, disable data mover only if the ETL doesn't support direct PUT
+	}
 	rns := xreg.RenewTCB(c.uuid, c.msg.Action /*kind*/, custom)
-	if err = rns.Err; err != nil {
+	if err := rns.Err; err != nil {
 		nlog.Errorf("%s: %q %+v %v", t, c.uuid, msg, rns.Err)
-		return
+		nlpFrom.Unlock()
+		if nlpTo != nil {
+			nlpTo.Unlock()
+		}
+		return err
 	}
 
 	var (
@@ -626,13 +642,13 @@ func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
 	if nlpTo != nil {
 		nlps = append(nlps, nlpTo)
 	}
-	return t.transactions.begin(txn, nlps...)
+	return t.txns.begin(txn, nlps...)
 }
 
 // Two IDs:
 // - TxnUUID: transaction (txn) ID
 // - xid: xaction ID (will have "tco-" prefix)
-func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, dp core.DP) (xid string, _ error) {
+func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, disableDM bool) (xid string, _ error) {
 	switch c.phase {
 	case apc.ActBegin:
 		var (
@@ -661,7 +677,7 @@ func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, dp core.DP) (xid string, _ e
 			return xid, cmn.NewErrBckNotFound(bckFrom.Bucket())
 		}
 		// begin
-		custom := &xreg.TCObjsArgs{BckFrom: bckFrom, BckTo: bckTo, DP: dp}
+		custom := &xreg.TCOArgs{BckFrom: bckFrom, BckTo: bckTo, Msg: &msg.TCOMsg, DisableDM: disableDM}
 		rns := xreg.RenewTCObjs(c.msg.Action /*kind*/, custom)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %q %+v %v", t, c.uuid, c.msg, rns.Err)
@@ -670,17 +686,17 @@ func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, dp core.DP) (xid string, _ e
 		xctn := rns.Entry.Get()
 		xid = xctn.ID()
 
-		xtco := xctn.(*xs.XactTCObjs)
+		xtco := xctn.(*xs.XactTCO)
 
 		debug.Assert(msg.TxnUUID == "" || msg.TxnUUID == c.uuid) // (ref050724)
 		msg.TxnUUID = c.uuid
 		txn := newTxnTCObjs(c, bckFrom, xtco, msg)
-		if err := t.transactions.begin(txn); err != nil {
+		if err := t.txns.begin(txn); err != nil {
 			return xid, err
 		}
-		xtco.Begin(msg)
+		xtco.BeginMsg(msg)
 	case apc.ActAbort:
-		txn, err := t.transactions.find(c.uuid, apc.ActAbort)
+		txn, err := t.txns.find(c.uuid)
 		if err == nil {
 			txnTco := txn.(*txnTCObjs)
 			// if _this_ transaction initiated _that_ on-demand
@@ -688,32 +704,31 @@ func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, dp core.DP) (xid string, _ e
 				xid = xtco.ID()
 				xtco.Abort(nil)
 			}
+			t.txns.term(c.uuid, apc.ActAbort)
 		}
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return xid, err
 		}
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return xid, err
 		}
 		txnTco := txn.(*txnTCObjs)
 		var done bool
 		if c.query.Get(apc.QparamWaitMetasync) != "" {
-			if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+			if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 				txnTco.xtco.TxnAbort(err)
 				return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 			}
 			done = true
 		}
 
-		txnTco.xtco.Do(txnTco.msg)
+		txnTco.xtco.ContMsg(txnTco.msg)
 		xid = txnTco.xtco.ID()
 		if !done {
-			t.transactions.find(c.uuid, apc.ActCommit)
+			t.txns.term(c.uuid, apc.ActCommit)
 		}
-	default:
-		debug.Assert(false)
 	}
 	return xid, nil
 }
@@ -741,24 +756,25 @@ func (t *target) ecEncode(c *txnSrv) (string, error) {
 			return "", cmn.NewErrBusy("bucket", c.bck.Cname(""))
 		}
 		txn := newTxnECEncode(c, c.bck)
-		if err := t.transactions.begin(txn, nlp); err != nil {
+		if err := t.txns.begin(txn, nlp); err != nil {
 			return "", err
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return "", err
 		}
 		// wait for newBMD w/timeout
-		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
+		if err = t.txns.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
-		rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit)
+		checkAndRecover := c.msg.Name == apc.ActEcRecover
+		rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit, checkAndRecover /*missing/corrupted slices, etc.*/)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %s %v", t, txn, rns.Err)
 			return "", rns.Err
@@ -768,13 +784,11 @@ func (t *target) ecEncode(c *txnSrv) (string, error) {
 		xact.GoRunW(xctn)
 
 		return xctn.ID(), rns.Err
-	default:
-		debug.Assert(false)
 	}
 	return "", nil
 }
 
-func (t *target) validateECEncode(bck *meta.Bck, msg *aisMsg) error {
+func (t *target) validateECEncode(bck *meta.Bck, msg *actMsgExt) error {
 	cs := fs.Cap()
 	if err := cs.Err(); err != nil {
 		return err
@@ -833,16 +847,18 @@ func (t *target) createArchMultiObj(c *txnSrv) (string /*xaction uuid*/, error) 
 		archMsg.TxnUUID = c.uuid
 		archMsg.FromBckName = bckFrom.Name
 		archlom := core.AllocLOM(archMsg.ArchName)
-		if err := xarch.Begin(archMsg, archlom); err != nil {
-			core.FreeLOM(archlom) // otherwise is freed by x-archive
-			return xid, err
+		if err := xarch.BeginMsg(archMsg, archlom); err != nil {
+			// NOTE: unexpected and unlikely - aborting
+			core.FreeLOM(archlom)
+			xarch.Abort(err)
+			return "", err
 		}
 		txn := newTxnArchMultiObj(c, bckFrom, xarch, archMsg)
-		if err := t.transactions.begin(txn); err != nil {
+		if err := t.txns.begin(txn); err != nil {
 			return xid, err
 		}
 	case apc.ActAbort:
-		txn, err := t.transactions.find(c.uuid, apc.ActAbort)
+		txn, err := t.txns.find(c.uuid)
 		if err == nil {
 			txnArch := txn.(*txnArchMultiObj)
 			// if _this_ transaction initiated _that_ on-demand
@@ -850,19 +866,20 @@ func (t *target) createArchMultiObj(c *txnSrv) (string /*xaction uuid*/, error) 
 				xid = xarch.ID()
 				xarch.Abort(nil)
 			}
+			t.txns.term(c.uuid, apc.ActAbort)
 		}
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return xid, err
 		}
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return xid, err
 		}
 		txnArch := txn.(*txnArchMultiObj)
-		txnArch.xarch.Do(txnArch.msg)
+		txnArch.xarch.DoMsg(txnArch.msg)
 		xid = txnArch.xarch.ID()
-		t.transactions.find(c.uuid, apc.ActCommit)
+		t.txns.term(c.uuid, apc.ActCommit)
 	}
 	return xid, nil
 }
@@ -883,7 +900,7 @@ func (t *target) beginRm(c *txnSrv) error {
 }
 
 //
-// destroy local bucket / evict cloud bucket
+// destroy ais:// bucket | _completely_ evict remote bucket
 //
 
 func (t *target) destroyBucket(c *txnSrv) error {
@@ -895,15 +912,15 @@ func (t *target) destroyBucket(c *txnSrv) error {
 		}
 		txn := newTxnBckBase(c.bck)
 		txn.fillFromCtx(c)
-		if err := t.transactions.begin(txn, nlp); err != nil {
+		if err := t.txns.begin(txn, nlp); err != nil {
 			return err
 		}
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
-		t._commitCreateDestroy(c)
-	default:
-		debug.Assert(false)
+		if err := t._commitCreateDestroy(c); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -933,7 +950,7 @@ func (t *target) promote(c *txnSrv, hdr http.Header) (string, error) {
 		}
 		if !finfo.IsDir() {
 			txn := newTxnPromote(c, prmMsg, []string{srcFQN}, "" /*dirFQN*/, 1)
-			if err := t.transactions.begin(txn); err != nil {
+			if err := t.txns.begin(txn); err != nil {
 				return "", err
 			}
 			hdr.Set(apc.HdrPromoteNamesNum, "1")
@@ -949,24 +966,24 @@ func (t *target) promote(c *txnSrv, hdr http.Header) (string, error) {
 			return "", fmt.Errorf("%s: directory %q is empty", t, srcFQN)
 		}
 		txn := newTxnPromote(c, prmMsg, fqns, srcFQN /*dir*/, totalN)
-		if err := t.transactions.begin(txn); err != nil {
+		if err := t.txns.begin(txn); err != nil {
 			return "", err
 		}
 		hdr.Set(apc.HdrPromoteNamesHash, cksumVal)
 		hdr.Set(apc.HdrPromoteNamesNum, strconv.Itoa(totalN))
 	case apc.ActAbort:
-		t.transactions.find(c.uuid, apc.ActAbort)
+		t.txns.term(c.uuid, apc.ActAbort)
 	case apc.ActCommit:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
 		}
-		txn, err := t.transactions.find(c.uuid, "")
+		txn, err := t.txns.find(c.uuid)
 		if err != nil {
 			return "", err
 		}
 		txnPrm, ok := txn.(*txnPromote)
 		debug.Assert(ok)
-		defer t.transactions.find(c.uuid, apc.ActCommit)
+		defer t.txns.term(c.uuid, apc.ActCommit)
 
 		if txnPrm.totalN == 0 {
 			nlog.Infof("%s: nothing to do (%s)", t, txnPrm)
@@ -995,21 +1012,19 @@ func (t *target) promote(c *txnSrv, hdr http.Header) (string, error) {
 		c.addNotif(xprm) // upon completion
 		xact.GoRunW(xprm)
 		return xprm.ID(), nil
-	default:
-		debug.Assert(false)
 	}
 	return "", nil
 }
 
 // scan and, optionally, auto-detect file-share
-func prmScan(dirFQN string, prmMsg *apc.PromoteArgs) (fqns []string, totalN int, cksumVal string, err error) {
+func prmScan(dirFQN string, prmMsg *apc.PromoteArgs) (fqns []string, totalN int, _ string, err error) {
 	var (
 		cksum      *cos.CksumHash
 		autoDetect = !prmMsg.SrcIsNotFshare || !cmn.Rom.Features().IsSet(feat.DontAutoDetectFshare)
 	)
-	cb := func(fqn string, de fs.DirEntry) (err error) {
+	cb := func(fqn string, de fs.DirEntry) error {
 		if de.IsDir() {
-			return
+			return nil
 		}
 		if len(fqns) == 0 {
 			fqns = make([]string, 0, promoteNumSync)
@@ -1021,10 +1036,10 @@ func prmScan(dirFQN string, prmMsg *apc.PromoteArgs) (fqns []string, totalN int,
 		if autoDetect {
 			cksum.H.Write([]byte(fqn))
 		}
-		return
+		return nil
 	}
 	if autoDetect {
-		cksum = cos.NewCksumHash(cos.ChecksumXXHash)
+		cksum = cos.NewCksumHash(cos.ChecksumCesXxh)
 	}
 	if prmMsg.Recursive {
 		opts := &fs.WalkOpts{Dir: dirFQN, Callback: cb, Sorted: true}
@@ -1034,11 +1049,11 @@ func prmScan(dirFQN string, prmMsg *apc.PromoteArgs) (fqns []string, totalN int,
 	}
 
 	if err != nil || totalN == 0 || !autoDetect {
-		return
+		return fqns, totalN, "", err
 	}
+
 	cksum.Finalize()
-	cksumVal = cksum.Value()
-	return
+	return fqns, totalN, cksum.Value(), nil
 }
 
 // synchronously wo/ xaction
@@ -1075,6 +1090,15 @@ func (t *target) prmNumFiles(c *txnSrv, txnPrm *txnPromote, confirmedFshare bool
 		}
 	}
 	return nil
+}
+
+func isDisableDM(msg *apc.TCBMsg) (bool, error) {
+	// ensure the communicator is active, and determine whether to disable data mover based on the ETL's init message
+	initMsg, err := etl.GetInitMsg(msg.Transform.Name)
+	if err != nil {
+		return false, err
+	}
+	return initMsg.IsDirectPut(), nil
 }
 
 ////////////

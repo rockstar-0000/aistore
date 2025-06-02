@@ -1,12 +1,3 @@
----
-layout: post
-title: SHOW
-permalink: /docs/cli/show
-redirect_from:
- - /cli/show.md/
- - /docs/cli/show.md/
----
-
 # `ais show` command
 
 AIS CLI `show` command can universally be used to view summaries and details on a cluster and its nodes, buckets and objects, running and finished jobs - in short, _all_ managed entities (see below).
@@ -94,7 +85,7 @@ NAME:
    ais show performance - show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
 
 USAGE:
-   ais show performance command [command options] [TARGET_ID]
+   ais show performance command [TARGET_ID] [command options]
 
 COMMANDS:
    counters    show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
@@ -147,10 +138,60 @@ Use `ais show performance` and its variations in combination with `ais show job`
 
 ### See also
 
-* [Observability](/docs/metrics.md)
-* [Prometheus](/docs/prometheus.md)
+* [Observability](/docs/monitoring-overview.md)
+* [Prometheus](/docs/monitoring-prometheus.md)
 
 ## `ais show job`
+
+```console
+$ ais show job --help
+NAME:
+   ais show job - Show running and/or finished jobs:
+     archive        blob-download  cleanup     copy-bucket       copy-objects   delete-objects
+     download       dsort          ec-bucket   ec-get            ec-put         ec-resp
+     elect-primary  etl-bucket     etl-inline  etl-objects       evict-objects  evict-remote-bucket
+     list           lru-eviction   mirror      prefetch-objects  promote-files  put-copies
+     rebalance      rename-bucket  resilver    summary           warm-up-metadata
+   (use any of these names with 'ais show job' command, or try shortcuts: "evict", "prefetch", "copy", "delete", "ec")
+   e.g.:
+     - show job prefetch-listrange         - show all running prefetch jobs;
+     - show job prefetch                   - same as above;
+     - show job tco-cysbohAGL              - show a given (multi-object copy/transform) job identified by its unique ID;
+     - show job copy-listrange             - show all running multi-object copies;
+     - show job copy-objects               - same as above (using display name);
+     - show job copy                       - show all copying jobs including both bucket-to-bucket and multi-object;
+     - show job copy-objects --all         - show both running and already finished (or stopped) multi-object copies;
+     - show job ec                         - show all erasure-coding;
+     - show job list                       - show all running list-objects jobs;
+     - show job ls                         - same as above;
+     - show job ls --refresh 10            - same as above with periodic _refreshing_ every 10 seconds;
+     - show job ls --refresh 10 --count 4  - same as above but only for the first four 10-seconds intervals;
+     - show job prefetch --refresh 1m      - show all running prefetch jobs at 1 minute intervals (until Ctrl-C);
+     - show job evict                      - all running bucket and/or data evicting jobs;
+     - show job --all                      - show absolutely all jobs, running and finished.
+
+USAGE:
+   ais show job [NAME] [JOB_ID] [NODE_ID] [BUCKET] [command options]
+
+OPTIONS:
+   all           Include all jobs: running, finished, and aborted
+   count         Used together with '--refresh' to limit the number of generated reports, e.g.:
+                  '--refresh 10 --count 5' - run 5 times with 10s interval
+   date-time     Override the default hh:mm:ss (hours, minutes, seconds) time format - include calendar date as well
+   json,j        JSON input/output
+   log           Filename to log metrics (statistics)
+   no-headers,H  Display tables without headers
+   progress      Show progress bar(s) and progress of execution in real time
+   refresh       Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                 valid time units: ns, us (or µs), ms, s (default), m, h
+   regex         Regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   units         Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                 iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                 si  - SI (metric) format, e.g.: KB, MB, GB
+                 raw - do not convert to (or from) human-readable format
+   verbose,v     Show extended statistics
+   help, h       Show help
+```
 
 The command has no statically defined subcommands. When you type `ais show job <TAB-TAB>`, the resulting set of shell completions will only include job names (aka "kinds") that are **currently running**. Example:
 
@@ -193,34 +234,58 @@ Here's at a glance:
 ```console
 $ ais show job --help
 NAME:
-   ais show job - show running and finished jobs ('--all' for all, or press <TAB-TAB> to select, '--help' for options)
+   ais show job - Show running and/or finished jobs:
+     archive        blob-download  cleanup     copy-bucket       copy-objects   delete-objects
+     download       dsort          ec-bucket   ec-get            ec-put         ec-resp
+     elect-primary  etl-bucket     etl-inline  etl-objects       evict-objects  evict-remote-bucket
+     list           lru-eviction   mirror      prefetch-objects  promote-files  put-copies
+     rebalance      rename-bucket  resilver    summary           warm-up-metadata
+   (use any of these names with 'ais show job' command, or try shortcuts: "evict", "prefetch", "copy", "delete", "ec")
+   e.g.:
+     - show job prefetch-listrange         - show all running prefetch jobs;
+     - show job prefetch                   - same as above;
+     - show job tco-cysbohAGL              - show a given (multi-object copy/transform) job identified by its unique ID;
+     - show job copy-listrange             - show all running multi-object copies;
+     - show job copy-objects               - same as above (using display name);
+     - show job copy                       - show all copying jobs including both bucket-to-bucket and multi-object;
+     - show job copy-objects --all         - show both running and already finished (or stopped) multi-object copies;
+     - show job ec                         - show all erasure-coding;
+     - show job list                       - show all running list-objects jobs;
+     - show job ls                         - same as above;
+     - show job ls --refresh 10            - same as above with periodic _refreshing_ every 10 seconds;
+     - show job ls --refresh 10 --count 4  - same as above but only for the first four 10-seconds intervals;
+     - show job prefetch --refresh 1m      - show all running prefetch jobs at 1 minute intervals (until Ctrl-C);
+     - show job evict                      - all running bucket and/or data evicting jobs;
+     - show job --all                      - show absolutely all jobs, running and finished.
 
 USAGE:
-   ais show job [command options] [NAME] [JOB_ID] [NODE_ID] [BUCKET]
+   ais show job [NAME] [JOB_ID] [NODE_ID] [BUCKET] [command options]
 
 OPTIONS:
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --count value     used together with '--refresh' to limit the number of generated reports (default: 0)
-   --json, -j        json input/output
-   --all             all jobs, including finished and aborted
-   --regex value     regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
-   --no-headers, -H  display tables without headers
-   --verbose, -v     verbose
-   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
-                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                     si  - SI (metric) format, e.g.: KB, MB, GB
-                     raw - do not convert to (or from) human-readable format
-   --progress        show progress bar(s) and progress of execution in real time
-   --log value       path to file where the metrics will be saved
-   --help, -h        show help
+   all           Include all jobs: running, finished, and aborted
+   count         Used together with '--refresh' to limit the number of generated reports, e.g.:
+                  '--refresh 10 --count 5' - run 5 times with 10s interval
+   date-time     Override the default hh:mm:ss (hours, minutes, seconds) time format - include calendar date as well
+   json,j        JSON input/output
+   log           Filename to log metrics (statistics)
+   no-headers,H  Display tables without headers
+   progress      Show progress bar(s) and progress of execution in real time
+   refresh       Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                 valid time units: ns, us (or µs), ms, s (default), m, h
+   regex         Regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   units         Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                 iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                 si  - SI (metric) format, e.g.: KB, MB, GB
+                 raw - do not convert to (or from) human-readable format
+   verbose,v     Show extended statistics
+   help, h       Show help
 ```
 
 ### Example: show all currently running jobs, and narrow the selection to a given target node:
 
 ```console
-
 $ ais show job t[ugoFtqUrrm]
+
 NODE          ID            KIND         BUCKET                     OBJECTS     BYTES        START           END             STATE
 ugoFtqUrrm    vOYSo5pHG     ec-get       mybucket-ec-rebalance      -           -            12-03 10:32:25  -               Running
 ugoFtqUrrm    b4Ks45pHv     ec-get       mybucket-obj-n-slice       9           42.36MiB     12-03 10:31:33  -               Running
@@ -237,6 +302,7 @@ ugoFtqUrrm    g5            rebalance    -                          6           
 
 ```console
 $ ais show job resilver --all
+
 resilver[G0p7yXYiUg]
 NODE             ID              KIND            OBJECTS         BYTES           START           END             STATE
 HAAt8090         G0p7yXYiUg      resilver        11              18.38KiB        13:04:51        13:04:51        Finished
@@ -245,6 +311,7 @@ LDgt8088         G0p7yXYiUg      resilver        14              20.81KiB       
 OBIt8089         G0p7yXYiUg      resilver        4               7.04KiB         13:04:51        13:04:51        Finished
 VUCt8091         G0p7yXYiUg      resilver        9               14.50KiB        13:04:51        13:04:51        Finished
 qVJt8087         G0p7yXYiUg      resilver        9               14.21KiB        13:04:51        13:04:51        Finished
+                                 Total:         57              89.80KiB ✓
 ```
 
 > Here and elsewhere in the documentation, CLI colors used to highlight certain (notable) items on screen - are not shown.
@@ -295,9 +362,12 @@ JVnt8086         n2O4CJxUg       list    ais://TESTAISBUCKET-ec-rebalance       
 LDgt8088         n2O4CJxUg       list    ais://TESTAISBUCKET-ec-rebalance        2               3.59MiB         13:36:55        -       Idle
 OBIt8089         n2O4CJxUg       list    ais://TESTAISBUCKET-ec-rebalance        6               11.72MiB        13:36:55        -       Idle
 VUCt8091         n2O4CJxUg       list    ais://TESTAISBUCKET-ec-rebalance        10              37.53MiB        13:36:55        -       Idle
+i                               Total:                                          44              138.31MiB ✓
+
 list[J-bfCJxVp]
 NODE             ID              KIND    BUCKET                                  OBJECTS         BYTES           START           END     STATE
 qVJt8087         J-bfCJxVp       list    ais://TESTAISBUCKET-ec-rebalance        22              60.91MiB        13:37:18        -       Idle
+
 rebalance[g8]
 NODE             ID      KIND            OBJECTS         BYTES           START           END     STATE
 HAAt8090         g8      rebalance       4               27.46MiB        13:37:18        -       Running
@@ -307,6 +377,7 @@ OBIt8089         g8      rebalance       4               23.49MiB        13:37:1
 VUCt8091         g8      rebalance       32              -               13:37:18        -       Running
 qVJt8087         g8      rebalance       6               39.38MiB        13:37:18        -       Running
 ^[^C$ ais show job --refresh 5
+
 rebalance[g15]
 NODE             ID      KIND            OBJECTS         BYTES           START           END     STATE
 HAAt8090         g15     rebalance       648             971.49KiB       13:40:54        -       Running
@@ -346,7 +417,7 @@ NAME:
    ais show cluster - main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
 
 USAGE:
-   ais show cluster command [command options] [NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]
+   ais show cluster command [NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]] [command options]
 
 COMMANDS:
    smap    show cluster map (Smap)
@@ -459,7 +530,7 @@ NAME:
    ais show storage - show storage usage and utilization, disks and mountpaths
 
 USAGE:
-   ais show storage command [command options] [TARGET_ID]
+   ais show storage command [TARGET_ID] [command options]
 
 COMMANDS:
    disk       show disk utilization and read/write statistics
@@ -567,3 +638,11 @@ ais show log OqlWpgwrY --severity=warning
 ais show log OqlWpgwrY --severity=w | less
 ```
 
+## Related Documentation
+
+- [Introduction to AIS observability](/docs/monitoring-overview.md)
+- [Configuring, accessing, and utilizing AIS logs](/docs/monitoring-logs.md)
+- [Prometheus integration](/docs/monitoring-prometheus.md)
+- [Metrics reference](/docs/monitoring-metrics.md)
+- [Visualizing AIS metrics with Grafana](/docs/monitoring-grafana.md)
+- [Working with Kubernetes monitoring stacks](/docs/monitoring-kubernetes.md)

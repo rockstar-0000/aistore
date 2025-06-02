@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -19,6 +19,8 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/nl"
+	"github.com/NVIDIA/aistore/xact"
 )
 
 // [METHOD] /v1/etl
@@ -27,14 +29,16 @@ func (t *target) etlHandler(w http.ResponseWriter, r *http.Request) {
 		t.writeErr(w, r, k8s.ErrK8sRequired, 0, Silent)
 		return
 	}
-	switch {
-	case r.Method == http.MethodPut:
+	switch r.Method {
+	case http.MethodPut:
 		t.handleETLPut(w, r)
-	case r.Method == http.MethodPost:
+	case http.MethodPost:
 		t.handleETLPost(w, r)
-	case r.Method == http.MethodGet:
+	case http.MethodDelete:
+		t.handleETLDelete(w, r)
+	case http.MethodGet:
 		t.handleETLGet(w, r)
-	case r.Method == http.MethodHead:
+	case http.MethodHead:
 		t.headObjectETL(w, r)
 	default:
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodHead, http.MethodPost)
@@ -42,46 +46,32 @@ func (t *target) etlHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // PUT /v1/etl
-// start ETL spec/code
+// init ETL spec/code
 func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.parseURL(w, r, apc.URLPathETL.L, 0, true)
+	if err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
 	// disallow to run when above high wm (let alone OOS)
 	cs := fs.Cap()
 	if err := cs.Err(); err != nil {
 		t.writeErr(w, r, err, http.StatusInsufficientStorage)
 		return
 	}
-	if _, err := t.parseURL(w, r, apc.URLPathETL.L, 0, false); err != nil {
+
+	// /v1/etl
+	if len(apiItems) == 0 {
+		if err := t.initETLFromMsg(r); err != nil {
+			t.writeErr(w, r, err)
+		}
 		return
 	}
 
-	b, err := cos.ReadAll(r.Body)
-	if err != nil {
-		t.writeErr(w, r, err)
+	// /v1/etl/_object/<secret>/<uname>
+	if apiItems[0] == apc.ETLObject {
+		t.putObjectETL(w, r)
 		return
-	}
-	r.Body.Close()
-
-	initMsg, err := etl.UnmarshalInitMsg(b)
-	if err != nil {
-		t.writeErr(w, r, err)
-		return
-	}
-	xid := r.URL.Query().Get(apc.QparamUUID)
-
-	switch msg := initMsg.(type) {
-	case *etl.InitSpecMsg:
-		err = etl.InitSpec(msg, xid, etl.StartOpts{})
-	case *etl.InitCodeMsg:
-		err = etl.InitCode(msg, xid)
-	default:
-		debug.Assert(false, initMsg.String())
-	}
-	if err != nil {
-		t.writeErr(w, r, err)
-		return
-	}
-	if cmn.Rom.FastV(4, cos.SmoduleETL) {
-		nlog.Infoln(t.String(), initMsg.String())
 	}
 }
 
@@ -97,7 +87,7 @@ func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/etl/_objects/<secret>/<uname>
+	// /v1/etl/_object/<secret>/<uname>
 	if apiItems[0] == apc.ETLObject {
 		t.getObjectETL(w, r)
 		return
@@ -123,7 +113,7 @@ func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /v1/etl/<etl-name>/stop (or) TODO: /v1/etl/<etl-name>/start
+// POST /v1/etl/<etl-name>/stop (or) /v1/etl/<etl-name>/start
 //
 // Handles starting/stopping ETL pods
 func (t *target) handleETLPost(w http.ResponseWriter, r *http.Request) {
@@ -131,49 +121,80 @@ func (t *target) handleETLPost(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if apiItems[1] == apc.ETLStop {
+	switch op := apiItems[1]; op {
+	case apc.ETLStop:
 		t.stopETL(w, r, apiItems[0])
+	case apc.ETLStart:
+		t.startETL(w, r)
+	default:
+		debug.Assert(false, "invalid operation: "+op)
+		t.writeErrAct(w, r, "invalid operation: "+op)
+	}
+}
+
+// DELETE /v1/etl/<etl-name>
+//
+// Handles deleting ETL pods
+func (t *target) handleETLDelete(w http.ResponseWriter, r *http.Request) {
+	apiItems, err := t.parseURL(w, r, apc.URLPathETL.L, 1, true)
+	if err != nil {
 		return
 	}
-	// TODO: Implement ETLStart to start inactive ETLs
-	t.writeErrURL(w, r)
+	if err := etl.Delete(apiItems[0]); err != nil {
+		t.writeErr(w, r, err)
+	}
+}
+
+func (t *target) startETL(w http.ResponseWriter, r *http.Request) {
+	if err := t.initETLFromMsg(r); err != nil {
+		t.writeErr(w, r, err)
+	}
 }
 
 func (t *target) stopETL(w http.ResponseWriter, r *http.Request, etlName string) {
 	if err := etl.Stop(etlName, cmn.ErrXactUserAbort); err != nil {
-		statusCode := http.StatusBadRequest
 		if cos.IsErrNotFound(err) {
-			statusCode = http.StatusNotFound
-		}
-		t.writeErr(w, r, err, statusCode)
-		return
-	}
-}
-
-func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, lom *core.LOM) {
-	var (
-		comm etl.Communicator
-		err  error
-	)
-	comm, err = etl.GetCommunicator(etlName)
-	if err != nil {
-		if cos.IsErrNotFound(err) {
-			smap := t.owner.smap.Get()
-			errV := fmt.Errorf("%v - try starting new ETL with \"%s/v1/etl/init\" endpoint",
-				err, smap.Primary.URL(cmn.NetPublic))
-			t.writeErr(w, r, errV, http.StatusNotFound)
+			nlog.Infof("ETL %q doesn't exist on target\n", etlName)
 			return
 		}
 		t.writeErr(w, r, err)
+	}
+}
+
+func (t *target) inlineETL(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM) {
+	comm, errN := etl.GetCommunicator(dpq.etl.name)
+	if errN != nil {
+		switch {
+		case cos.IsErrNotFound(errN):
+			smap := t.owner.smap.Get()
+			pub := smap.Primary.URL(cmn.NetPublic)
+			err := fmt.Errorf("%v - try starting new ETL with \"%s/v1/etl/init\" endpoint", errN, pub)
+			t.writeErr(w, r, err, http.StatusNotFound)
+		default:
+			t.writeErr(w, r, errN)
+		}
 		return
 	}
-	if err := comm.InlineTransform(w, r, lom); err != nil {
-		errV := cmn.NewErrETL(&cmn.ETLErrCtx{ETLName: etlName, PodName: comm.PodName(), SvcName: comm.SvcName()},
-			err.Error())
-		xetl := comm.Xact()
-		xetl.AddErr(errV)
-		t.writeErr(w, r, errV)
+
+	// do
+	xetl := comm.Xact()
+	ecode, err := comm.InlineTransform(w, r, lom, dpq.latestVer, dpq.etl.targs)
+
+	if err == nil {
+		xetl.ObjsAdd(1, lom.Lsize(true)) // _special_ as the transformed size could be `cos.ContentLengthUnknown` at this point
+		return                           // ok
 	}
+
+	// NOTE:
+	// - poll for a while here for a possible abort error (e.g., pod runtime error)
+	// - and notice hardcoded timeout
+	if abortErr := xetl.AbortedAfter(etl.DefaultAbortTimeout); abortErr != nil {
+		t.writeErr(w, r, abortErr, ecode)
+		return
+	}
+
+	xetl.AddErr(err)
+	t.writeErr(w, r, err, ecode)
 }
 
 func (t *target) logsETL(w http.ResponseWriter, r *http.Request, etlName string) {
@@ -211,16 +232,17 @@ func (t *target) metricsETL(w http.ResponseWriter, r *http.Request, etlName stri
 	t.writeJSON(w, r, metricMsg, "metrics-etl")
 }
 
-func etlParseObjectReq(_ http.ResponseWriter, r *http.Request) (secret string, bck *meta.Bck, objName string, err error) {
+func etlParseObjectReq(r *http.Request) (etlName, secret string, bck *meta.Bck, objName string, err error) {
 	var items []string
-	items, err = cmn.ParseURL(r.URL.EscapedPath(), apc.URLPathETLObject.L, 2, false)
+	items, err = cmn.ParseURL(r.URL.EscapedPath(), apc.URLPathETLObject.L, 3, false)
 	if err != nil {
 		return
 	}
-	secret = items[0]
+	etlName = items[0]
+	secret = items[1]
 	// Encoding is done in `transformerPath`.
 	var uname string
-	uname, err = url.PathUnescape(items[1])
+	uname, err = url.PathUnescape(items[2])
 	if err != nil {
 		return
 	}
@@ -231,27 +253,27 @@ func etlParseObjectReq(_ http.ResponseWriter, r *http.Request) (secret string, b
 		return
 	}
 	if objName == "" {
-		err = fmt.Errorf("object name is missing (bucket=%s, uname=%q)", b, uname)
+		err = fmt.Errorf("object name is missing (bucket=%s, uname=%q)", b.String(), uname)
 		return
 	}
 	bck = meta.CloneBck(&b)
 	return
 }
 
-// GET /v1/etl/_objects/<secret>/<uname>
+// GET /v1/etl/_object/<etl-name>/<secret>/<uname>
 // Handles GET requests from ETL containers (K8s Pods).
 // Validates the secret that was injected into a Pod during its initialization
 // (see boot.go `_setPodEnv`).
 //
-// NOTE: this is an internal URL with "_objects" in its path intended to avoid
-// conflicts with ETL name in `/v1/elts/<etl-name>/...`
+// NOTE: this is an internal URL with "_object" in its path intended to avoid
+// conflicts with ETL name in `/v1/elt/<etl-name>/...`
 func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
-	secret, bck, objName, err := etlParseObjectReq(w, r)
+	etlName, secret, bck, objName, err := etlParseObjectReq(r)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-	if err := etl.CheckSecret(secret); err != nil {
+	if err := etl.ValidateSecret(etlName, secret); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
@@ -271,17 +293,61 @@ func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 	dpqFree(dpq)
 }
 
-// HEAD /v1/etl/objects/<secret>/<uname>
-//
-// Handles HEAD requests from ETL containers (K8s Pods).
-// Validates the secret that was injected into a Pod during its initialization.
-func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
-	secret, bck, objName, err := etlParseObjectReq(w, r)
+// PUT /v1/etl/_object/<etl-name>/<secret>/<uname>?uuid=<xid>
+// Handles PUT requests from ETL containers (K8s Pods).
+// Validates the secret that was injected into a Pod during its initialization
+// (see boot.go `_setPodEnv`).
+func (t *target) putObjectETL(w http.ResponseWriter, r *http.Request) {
+	var config = cmn.GCO.Get()
+
+	etlName, secret, bck, objName, err := etlParseObjectReq(r)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-	if err := etl.CheckSecret(secret); err != nil {
+	if err := etl.ValidateSecret(etlName, secret); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+
+	lom := core.AllocLOM(objName)
+	if err := lom.InitBck(bck.Bucket()); err != nil {
+		if cmn.IsErrRemoteBckNotFound(err) {
+			t.BMDVersionFixup(r)
+			err = lom.InitBck(bck.Bucket())
+		}
+		if err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+	}
+
+	dpq := dpqAlloc() // xid should be included in the query
+	if err := dpq.parse(r.URL.RawQuery); err != nil {
+		dpqFree(dpq)
+		t.writeErr(w, r, err)
+		return
+	}
+	ecode, err := t.putObject(w, r, dpq, lom, true /*t2t*/, config)
+	core.FreeLOM(lom)
+	dpqFree(dpq)
+
+	if err != nil {
+		t.writeErr(w, r, err, ecode)
+	}
+}
+
+// HEAD /v1/etl/_object/<etl-name>/<secret>/<uname>
+//
+// Handles HEAD requests from ETL containers (K8s Pods).
+// Validates the secret that was injected into a Pod during its initialization.
+func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
+	etlName, secret, bck, objName, err := etlParseObjectReq(r)
+	if err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	if err := etl.ValidateSecret(etlName, secret); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
@@ -293,4 +359,34 @@ func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
 		// always silent (compare w/ httpobjhead)
 		t.writeErr(w, r, err, ecode, Silent)
 	}
+}
+
+func (t *target) initETLFromMsg(r *http.Request) error {
+	var xetl core.Xact
+	b, err := cos.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	r.Body.Close()
+
+	initMsg, err := etl.UnmarshalInitMsg(b)
+	if err != nil {
+		return err
+	}
+	xid := r.URL.Query().Get(apc.QparamUUID)
+	secret := r.URL.Query().Get(apc.QparamETLSecret)
+	xetl, err = etl.Init(initMsg, xid, secret)
+
+	if err != nil {
+		return err
+	}
+
+	// setup proxy notification on abort
+	notif := &xact.NotifXact{
+		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+		Xact: xetl,
+	}
+	xetl.AddNotif(notif)
+
+	return err
 }

@@ -1,6 +1,6 @@
 // Package xreg provides registry and (renew, find) functions for AIS eXtended Actions (xactions).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xreg
 
@@ -13,7 +13,7 @@ func RenewPutArchive(bckFrom, bckTo *meta.Bck) RenewRes {
 	return RenewBucketXact(apc.ActArchive, bckFrom, Args{Custom: bckTo}, bckFrom, bckTo)
 }
 
-func RenewEvictDelete(uuid, kind string, bck *meta.Bck, msg *apc.ListRange) RenewRes {
+func RenewEvictDelete(uuid, kind string, bck *meta.Bck, msg *apc.EvdMsg) RenewRes {
 	return RenewBucketXact(kind, bck, Args{UUID: uuid, Custom: msg})
 }
 
@@ -22,6 +22,6 @@ func RenewPrefetch(uuid string, bck *meta.Bck, msg *apc.PrefetchMsg) RenewRes {
 }
 
 // kind: (apc.ActCopyObjects | apc.ActETLObjects)
-func RenewTCObjs(kind string, custom *TCObjsArgs) RenewRes {
+func RenewTCObjs(kind string, custom *TCOArgs) RenewRes {
 	return RenewBucketXact(kind, custom.BckFrom, Args{Custom: custom}, custom.BckFrom, custom.BckTo)
 }
