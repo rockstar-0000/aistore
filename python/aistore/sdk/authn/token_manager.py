@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 from aistore.sdk.request_client import RequestClient
@@ -51,5 +51,5 @@ class TokenManager:  # pylint: disable=duplicate-code
         self.client.request(
             method=HTTP_METHOD_DELETE,
             path=f"{URL_PATH_AUTHN_TOKENS}",
-            json=TokenMsg(token=token).dict(),
+            json=TokenMsg(token=token).model_dump(),
         )

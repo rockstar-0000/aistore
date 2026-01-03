@@ -55,6 +55,7 @@ type (
 
 type (
 	// Snode's networking info
+	// swagger:model
 	NetInfo struct {
 		Hostname    string `json:"node_ip_addr"`
 		Port        string `json:"daemon_port"`
@@ -68,6 +69,7 @@ type (
 	}
 
 	// Snode - a node (gateway or target) in a cluster
+	// swagger:model
 	Snode struct {
 		nmr        NetNamer
 		LocalNet   *net.IPNet `json:"-"`
@@ -171,7 +173,7 @@ func (d *Snode) URL(network string) (u string) {
 	case cmn.NetIntraData:
 		u = d.DataNet.URL
 	default: // (exclusively via HrwMultiHome)
-		debug.Assert(strings.Contains(network, "://"), network) // "is URI" per rfc2396.txt
+		debug.Assert(strings.Contains(network, "://"), network, " node: ", d.String()) // "is URI" per rfc2396.txt
 		u = network
 	}
 	return u
@@ -292,13 +294,13 @@ func (d *Snode) HasURL(rawURL string) bool {
 	}
 
 	// slow path: locally resolve (hostname => IPv4) and compare
-	rip, err := cmn.ParseHost2IP(host)
+	rip, err := cmn.ParseHost2IP(host, true /*local*/)
 	if err != nil {
 		nlog.Warningln(host, err)
 		return false
 	}
 	for _, ni := range nis {
-		nip, err := cmn.ParseHost2IP(ni.Hostname)
+		nip, err := cmn.ParseHost2IP(ni.Hostname, true /*local*/)
 		if err != nil {
 			nlog.Warningln(ni.Hostname, err)
 			return false
@@ -466,6 +468,26 @@ func (m *Smap) HasActiveTs(except string) bool {
 		return true
 	}
 	return false
+}
+
+func (m *Smap) SameTargets(other *Smap) bool {
+	for tid, t := range m.Tmap {
+		if t.InMaintOrDecomm() {
+			continue
+		}
+		if !other.Tmap.Contains(tid) {
+			return false
+		}
+	}
+	for tid, t := range other.Tmap {
+		if t.InMaintOrDecomm() {
+			continue
+		}
+		if !m.Tmap.Contains(tid) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Smap) HasPeersToRebalance(except string) bool {
@@ -740,16 +762,18 @@ func mapsEq(a, b NodeMap) bool {
 // mem-pool of Nodes (slices)
 //
 
-var nodesPool sync.Pool
+var nodesPool = sync.Pool{
+	New: func() any { return new(Nodes) },
+}
 
+// note: ec is the only user
 func AllocNodes(capacity int) (nodes Nodes) {
-	if v := nodesPool.Get(); v != nil {
-		pnodes := v.(*Nodes)
-		nodes = *pnodes
-		debug.Assert(nodes != nil && len(nodes) == 0)
-	} else {
-		debug.Assert(capacity > 0)
+	p := nodesPool.Get().(*Nodes)
+	nodes = *p
+	if cap(nodes) < capacity {
 		nodes = make(Nodes, 0, capacity)
+	} else {
+		nodes = nodes[:0]
 	}
 	return
 }

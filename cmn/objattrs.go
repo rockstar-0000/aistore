@@ -36,16 +36,21 @@ const (
 
 	OrigURLObjMD = "orig_url"
 
-	// RFC3339; see also: cos.HdrLastModified formatted RFC1123GMT
+	// LsoLastModified: RFC3339 (list-objects)
+	// see also, and separately, cos.HdrLastModified: RFC1123GMT / (HTTP header semantics)
 	LsoLastModified = "LastModified"
 
 	// as the name implies
 	OrigFntl = "orig_fntl"
 )
 
+const (
+	maxSizeCustomKVs = 2 * cos.KiB
+)
+
 // object properties
-// NOTE: embeds system `ObjAttrs` that in turn includes custom user-defined
-// NOTE: compare with `apc.LsoMsg`
+// embeds system `ObjAttrs` that in turn includes custom user-defined
+// (compare with `apc.LsoMsg`)
 type ObjectProps struct {
 	Bck Bck `json:"bucket"`
 	ObjAttrs
@@ -111,7 +116,7 @@ func (oa *ObjAttrs) Checksum() *cos.Cksum    { return oa.Cksum }
 func (oa *ObjAttrs) SetCksum(ty, val string) { oa.Cksum = cos.NewCksum(ty, val) }
 
 func (oa *ObjAttrs) EqCksum(cksum *cos.Cksum) bool {
-	return !oa.Cksum.IsEmpty() && oa.Cksum.Equal(cksum)
+	return !cos.NoneC(oa.Cksum) && oa.Cksum.Equal(cksum)
 }
 
 func (oa *ObjAttrs) Version(_ ...bool) string {
@@ -150,6 +155,13 @@ func (oa *ObjAttrs) SetCustomKey(k, v string) {
 	if oa.CustomMD == nil {
 		oa.CustomMD = make(cos.StrKVs, 6)
 	}
+	// NOTE: custom MD stores unquoted ETag (see cmn/backend helpers and consistent quoting rules)
+	debug.Func(func() {
+		if k != ETag {
+			return
+		}
+		debug.Assertf(v != "" && v[0] != '"', "empty or quoted ETag %q", v)
+	})
 	oa.CustomMD[k] = v
 }
 
@@ -157,6 +169,10 @@ func (oa *ObjAttrs) DelStdCustom() {
 	for _, key := range stdCustomProps {
 		delete(oa.CustomMD, key)
 	}
+}
+
+func (oa *ObjAttrs) DelCustomKey(k string) {
+	delete(oa.CustomMD, k)
 }
 
 // clone OAH => ObjAttrs (see also lom.CopyAttrs)
@@ -180,6 +196,9 @@ func (oa *ObjAttrs) CopyFrom(oah cos.OAH, skipCksum bool) {
 // - standard cos.HdrContentLength ("Content-Length") & cos.HdrETag ("ETag")
 // - atime, version, etc. - all the rest "ais-" prefixed
 func ToHeader(oah cos.OAH, hdr http.Header, size int64, cksums ...*cos.Cksum) {
+	if hdr == nil {
+		return
+	}
 	var cksum *cos.Cksum
 	if len(cksums) > 0 {
 		// - range checksum, or
@@ -189,12 +208,12 @@ func ToHeader(oah cos.OAH, hdr http.Header, size int64, cksums ...*cos.Cksum) {
 	} else {
 		cksum = oah.Checksum()
 	}
-	if !cksum.IsEmpty() {
+	if !cos.NoneC(cksum) {
 		hdr.Set(apc.HdrObjCksumType, cksum.Ty())
 		hdr.Set(apc.HdrObjCksumVal, cksum.Val())
 	}
 	if at := oah.AtimeUnix(); at != 0 {
-		hdr.Set(apc.HdrObjAtime, cos.UnixNano2S(at))
+		hdr.Set(apc.HdrObjAtime, unixNano2S(at))
 	}
 	if size > 0 {
 		// "response to a HEAD method should not have a body", and so
@@ -216,15 +235,16 @@ func ToHeader(oah cos.OAH, hdr http.Header, size int64, cksums ...*cos.Cksum) {
 	}
 }
 
-// NOTE: returning checksum separately for subsequent validation
-func (oa *ObjAttrs) FromHeader(hdr http.Header) (cksum *cos.Cksum) {
+// return checksum separately for subsequent validation
+// parse and set custom metadata, if available
+func (oa *ObjAttrs) FromHeader(hdr http.Header) (cksum *cos.Cksum, err error) {
 	if ty := hdr.Get(apc.HdrObjCksumType); ty != "" {
 		val := hdr.Get(apc.HdrObjCksumVal)
 		cksum = cos.NewCksum(ty, val)
 	}
 
 	if at := hdr.Get(apc.HdrObjAtime); at != "" {
-		atime, err := cos.S2UnixNano(at)
+		atime, err := s2UnixNano(at)
 		debug.AssertNoErr(err)
 		oa.Atime = atime
 	}
@@ -236,13 +256,37 @@ func (oa *ObjAttrs) FromHeader(hdr http.Header) (cksum *cos.Cksum) {
 	if v := hdr.Get(apc.HdrObjVersion); v != "" {
 		oa.Ver = &v
 	}
-	custom := hdr[http.CanonicalHeaderKey(apc.HdrObjCustomMD)]
-	for _, v := range custom {
-		entry := strings.SplitN(v, "=", 2)
-		debug.Assert(len(entry) == 2)
-		oa.SetCustomKey(entry[0], entry[1])
+
+	// custom metadata: total size limited
+	if custom, ok := hdr[apc.HdrObjCustomMD]; ok {
+		var (
+			size int
+			keys = make([]string, 0, 10)
+		)
+		for _, kvs := range custom {
+			kv := strings.SplitN(kvs, "=", 2)
+			if len(kv) != 2 {
+				oa._undoCustom(keys)
+				return nil, fmt.Errorf("custom metadata: invalid format %q (expecting key=value)", kvs)
+			}
+			size += len(kv[0]) + len(kv[1])
+			if size > maxSizeCustomKVs {
+				oa._undoCustom(keys)
+				return nil, fmt.Errorf("custom metadata: total size exceeds %d bytes", maxSizeCustomKVs)
+			}
+			oa.SetCustomKey(kv[0], kv[1])
+			keys = append(keys, kv[0])
+		}
 	}
-	return
+	return cksum, nil
+}
+
+// by implication, prior to FromHeader call obj attrs are not supposed to contain any custom keys,
+// or at least not those that could've been overwritten
+func (oa *ObjAttrs) _undoCustom(keys []string) {
+	for i := len(keys) - 1; i >= 0; i-- {
+		oa.DelCustomKey(keys[i])
+	}
 }
 
 // local <=> remote equality in the context of cold-GET and download. This function
@@ -270,12 +314,12 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 		sameEtag  bool
 		sameCksum bool
 	)
-	// size check
+	// 1. size
 	if remSize := rem.Lsize(true); oa.Size != 0 && remSize != 0 && oa.Size != remSize {
 		return fmt.Errorf("size %d != %d remote", oa.Size, remSize)
 	}
 
-	// Cloud version check (NOTE: ais own version is currently a non-unique sequence number)
+	// 2. version (note that ais own version is a simple sequence number)
 	if remMeta, ok := rem.GetCustomKey(VersionObjMD); ok && remMeta != "" {
 		if locMeta, ok := oa.GetCustomKey(VersionObjMD); ok && locMeta != "" {
 			if remMeta != locMeta {
@@ -286,32 +330,28 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 		}
 	}
 
-	// checksum check
-	if a, b := rem.Checksum(), oa.Cksum; a != nil && b != nil {
-		cksumType := a.Ty()
-		if !a.IsEmpty() && !b.IsEmpty() && cksumType == b.Ty() {
+	// 3. checksum
+	if a := rem.Checksum(); !cos.NoneC(a) {
+		b := oa.Cksum
+		if !cos.NoneC(b) {
+			ty := a.Ty()
 			if !a.Equal(b) {
-				return fmt.Errorf("%s checksum %s != %s remote", cksumType, b, a)
+				return fmt.Errorf("%s checksum %s != %s remote", ty, b, a)
 			}
 			cksumVal = a.Val()
-
-			// [NOTE]
-			// unless overridden via feature flag
-			// trust two checksums, namely md5 and xxhash, that are _not_ cryptographically secure
-
 			switch {
 			case Rom.Features().IsSet(feat.TrustCryptoSafeChecksums):
-				sameCksum = (cksumType == cos.ChecksumSHA256 || cksumType == cos.ChecksumSHA512)
+				sameCksum = (ty == cos.ChecksumSHA256 || ty == cos.ChecksumSHA512)
 			default:
-				debug.Assert(cksumType != cos.ChecksumNone)
-				sameCksum = cksumType != cos.ChecksumCRC32C
+				// NOTE trust non-cryptographic checksums except crc (unless overridden by feature flag)
+				debug.Assert(ty != cos.ChecksumNone)
+				sameCksum = ty != cos.ChecksumCRC32C
 			}
-
 			count++
 		}
 	}
 
-	// custom MD: ETag check (ignoring enclosing quotes)
+	// 4. custom MD: ETag check (ignoring enclosing quotes)
 	if remMeta, ok := rem.GetCustomKey(ETag); ok && remMeta != "" {
 		if locMeta, ok := oa.GetCustomKey(ETag); ok && locMeta != "" {
 			if !_eqIgnoreQuotes(remMeta, locMeta) {
@@ -324,7 +364,7 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 			}
 		}
 	}
-	// custom MD: CRC check
+	// 4.1. custom MD: CRC
 	if remMeta, ok := rem.GetCustomKey(CRC32CObjMD); ok && remMeta != "" {
 		if locMeta, ok := oa.GetCustomKey(CRC32CObjMD); ok && locMeta != "" {
 			if remMeta != locMeta {
@@ -336,7 +376,7 @@ func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 		}
 	}
 
-	// custom MD: MD5 check iff count < 2
+	// 4.2. custom MD: MD5 iff count < 2
 	// (ETag ambiguity, see: https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.htm)
 	if !sameEtag {
 		if remMeta, ok := rem.GetCustomKey(MD5ObjMD); ok && remMeta != "" {
@@ -379,3 +419,10 @@ func _eqIgnoreQuotes(a, b string) bool {
 	}
 	return a == b
 }
+
+//
+// time utils (compare w/ ais/utils)
+//
+
+func unixNano2S(unixnano int64) string   { return strconv.FormatInt(unixnano, 10) }
+func s2UnixNano(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) }

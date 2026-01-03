@@ -3,11 +3,19 @@
 #
 import unittest
 from unittest.mock import Mock, patch, mock_open
+from urllib.parse import urlencode
 
+import requests
 from msgspec import msgpack
-from requests import Response
+from requests import Response, PreparedRequest
 
-from aistore.sdk.const import MSGPACK_CONTENT_TYPE, HEADER_CONTENT_TYPE, XX_HASH_SEED
+from aistore.sdk.const import (
+    MSGPACK_CONTENT_TYPE,
+    HEADER_CONTENT_TYPE,
+    XX_HASH_SEED,
+    QPARAM_PROVIDER,
+)
+from aistore.sdk.provider import Provider
 
 from aistore.sdk.utils import (
     decode_response,
@@ -19,6 +27,8 @@ from aistore.sdk.utils import (
     validate_file,
     xoshiro256_hash,
     get_digest,
+    get_provider_from_request,
+    extract_and_parse_url,
 )
 from tests.const import PREFIX_NAME
 from tests.utils import cases
@@ -97,19 +107,23 @@ class TestUtils(unittest.TestCase):
             with self.assertRaises(expected_error):
                 expand_braces(input_str)
 
-    @patch("aistore.sdk.utils.parse_raw_as")
-    def test_decode_response_json(self, mock_parse):
+    @patch("aistore.sdk.utils.TypeAdapter")
+    def test_decode_response_json(self, mock_adapter):
         response_content = "text content"
         parsed_content = "parsed content"
         mock_response = Mock(Response)
         mock_response.headers = {}
         mock_response.text = response_content
-        mock_parse.return_value = parsed_content
+
+        mock_validator = Mock()
+        mock_adapter.return_value = mock_validator
+        mock_validator.validate_json.return_value = parsed_content
 
         res = decode_response(str, mock_response)
 
         self.assertEqual(parsed_content, res)
-        mock_parse.assert_called_with(str, response_content)
+        mock_adapter.assert_called_with(str)
+        mock_validator.validate_json.assert_called_with(response_content)
 
     def test_decode_response_msgpack(self):
         unpacked_content = {"content key": "content value"}
@@ -144,3 +158,42 @@ class TestUtils(unittest.TestCase):
             seed=XX_HASH_SEED, input=name.encode("utf-8")
         )
         self.assertEqual(result, 987654321)
+
+    def test_get_provider_from_request(self):
+        for provider in list(Provider):
+            req = Mock(spec=requests.Request, params={QPARAM_PROVIDER: provider.value})
+            self.assertEqual(provider, get_provider_from_request(req))
+
+    def test_get_provider_from_request_prepared(self):
+        for provider in list(Provider):
+            query = urlencode({QPARAM_PROVIDER: provider.value})
+            req = PreparedRequest()
+            req.url = f"https://example.com/path?{query}"
+            self.assertEqual(provider, get_provider_from_request(req))
+
+    @cases(
+        Mock(spec=requests.Request, params={}),
+        Mock(spec=requests.PreparedRequest, url="https://example.com/path"),
+    )
+    def test_get_provider_from_request_invalid(self, req):
+        with self.assertRaises(ValueError):
+            get_provider_from_request(req)
+
+    @cases(
+        ("bucket 'ais://bucket' does not exist", ("ais", "bucket", False)),
+        ("object 'ais://bucket/object.txt' does not exist", ("ais", "bucket", True)),
+        ("bucket 'aws://bucket' does not exist", ("aws", "bucket", False)),
+        ("bucket 's3://bucket' does not exist", ("s3", "bucket", False)),
+        ("bucket 'gcp://bucket' does not exist", ("gcp", "bucket", False)),
+        ("object 'gs://bucket/obj' does not exist", ("gs", "bucket", True)),
+        ("bucket 'azure://b' does not exist", ("azure", "b", False)),
+        ("object 'ht://b/o' does not exist", ("ht", "b", True)),
+        ("object 'oci://bucket/obj' does not exist", ("oci", "bucket", True)),
+        ("bucket 'abc://bucket' does not exist", None),
+        ("object 'abc://bucket/obj' does not exist", None),
+        (f"bucket 'ais://{'a'*133}' does not exist", None),
+        (f"object 'ais://{'a'*133}/obj' does not exist", None),
+    )
+    def test_extract_and_parse_url(self, test_case):
+        url_or_msg, expected = test_case
+        self.assertEqual(expected, extract_and_parse_url(url_or_msg))

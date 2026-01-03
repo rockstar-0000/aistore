@@ -1,5 +1,17 @@
 #!/bin/bash
 
+# Optional environment variables used by the Go tests:
+#   NUM_TARGET   - number of targets in CI/local test cluster
+#   NUM_PROXY    - number of proxies in CI/local test cluster
+#   NUM_CHUNKS   - when >0, number of PUT chunks for io contexts
+#   SIGN_HMAC    - when "true", enables redirect HMAC signing
+#   RAND_NS      - when "true", generate buckets with random namespaces, e.g.: `ais://#ns123/bucket1`, `s3://#ns456/bucket2`, etc.
+# See also:
+# * api/env/README.md
+# * docs/environment-vars.md
+#
+# Note: only BUCKET is mandatory for test invocation.
+
 run_tests() {
   SECONDS=0
 
@@ -26,12 +38,19 @@ run_tests() {
   fi
 
   LOG_FILE=$(mktemp)
+  TEST_RACE=${TEST_RACE:-false}
+  TEST_CMD="go test"
+
+  if [[ "${TEST_RACE}" == "true" ]]; then
+    echo "Running with 'go test -race'"
+    TEST_CMD="go test -race"
+  fi
 
   # NOTE: cannot run tests in parallel (e.g. `-parallel 4`) because of ginkgo v2
   # ("Ginkgo detected configuration issues...")
   failed_tests=$(
-    BUCKET="${BUCKET}" AIS_ENDPOINT="${AIS_ENDPOINT}" \
-      go test -v -p 1 -tags debug -count 1 ${timeout} ${short} ${shuffle} ${re} "${tests_dir}" 2>&1 \
+    BUCKET="${BUCKET}" IOCTX_CHUNK_SIZE="${IOCTX_CHUNK_SIZE}" AIS_ENDPOINT="${AIS_ENDPOINT}" \
+      ${TEST_CMD} -v -p 1 -tags debug -count 1 ${timeout} ${short} ${shuffle} ${re} "${tests_dir}" 2>&1 \
     | tee "${LOG_FILE}" | tee -a /dev/stderr \
     | grep -ae "^---FAIL: Bench\|^--- FAIL: Test\|^FAIL[[:space:]]github.com/NVIDIA/.*$"; \
     exit ${PIPESTATUS[0]} # Exit with the status of the first command in the pipe(line).
@@ -55,11 +74,12 @@ run_tests() {
 
 AISTORE_PATH="$(cd "$(dirname "$0")/../"; pwd -P)" ## NOTE: this assumes `bootstrap.sh` itself is one level below
 SCRIPTS_DIR=${AISTORE_PATH}/scripts
-PYLINT_STYLE="$(dirname ${0})/config/.pylintrc"
 EXTERNAL_SRC_REGEX=".*\(venv\|build\|3rdparty\|dist\|.idea\|.vscode\)/.*"
-# This script is used by Makefile to run commands.
-source ${SCRIPTS_DIR}/utils.sh
 
+source ${SCRIPTS_DIR}/utils.sh
+source ${SCRIPTS_DIR}/python_utils.sh
+
+## NOTE: try `... run --fix` to auto-fix
 case $1 in
 lint)
   echo "Running lint..." >&2
@@ -72,9 +92,14 @@ lint)
   fi
   exit $?
   ;;
-
+lint-python)
+  echo "Running lint for Python files"
+      if ! lint_python_outside_sdk || ! lint_python_sdk; then
+        echo "Python linting failed: Please fix the above lint errors."
+        exit 1
+      fi
+  ;;
 fmt)
-  err_count=0
   case $2 in
   --fix)
     echo "Running style fixing..." >&2

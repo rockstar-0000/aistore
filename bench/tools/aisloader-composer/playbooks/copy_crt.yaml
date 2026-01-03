@@ -1,0 +1,9 @@
+---
+- name: Copy ca.crt to /tmp directory if it exists
+  hosts: aisloader_hosts
+  tasks:
+    - name: Copy ca.crt
+      copy:
+        src: "files/ca.crt"
+        dest: "/tmp/ca.crt"
+        mode: 0644

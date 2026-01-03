@@ -1,7 +1,5 @@
-//go:build !statsd
-
 // Package stats provides methods and functionality to register, track, log,
-// and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
+// and export metrics that, for the most part, include "counter" and "latency" kinds.
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -14,7 +12,6 @@ import (
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 
@@ -24,7 +21,7 @@ import (
 
 type (
 	statsValue struct {
-		iadd       iadd
+		iprom      iprom
 		kind       string // enum { KindCounter, ..., KindSpecial }
 		Value      int64  `json:"v,string"`
 		numSamples int64  // (average latency over stats_time)
@@ -54,8 +51,6 @@ func initProm(snode *meta.Snode) {
 
 	staticLabs[ConstlabNode] = strings.ReplaceAll(snode.ID(), ".", "_")
 }
-
-func (*coreStats) initStarted(*meta.Snode) { nlog.Infoln("Using Prometheus") }
 
 // usage: log resulting `copyValue` numbers:
 func (s *coreStats) copyT(out copyTracker, diskLowUtil ...int64) bool {
@@ -219,30 +214,30 @@ func (r *runner) reg(snode *meta.Snode, name, kind string, extra *Extra) {
 		opts := prometheus.CounterOpts{Namespace: "ais", Subsystem: snode.Type(), Name: metricName, Help: help, ConstLabels: constLabs}
 		if len(extra.VarLabs) > 0 {
 			metric := prometheus.NewCounterVec(opts, extra.VarLabs)
-			v.iadd = counterVec{metric}
+			v.iprom = counterVec{metric}
 			promRegistry.MustRegister(metric)
 		} else {
 			metric := prometheus.NewCounter(opts)
-			v.iadd = counter{metric}
+			v.iprom = counter{metric}
 			promRegistry.MustRegister(metric)
 		}
 
 	case KindLatency:
 		// computed over 'periodic.stats_time'; used for logs; hidden from prometheus (v3.26)
-		v.iadd = latency{}
+		v.iprom = latency{}
 	case KindThroughput:
 		// ditto (v3.26)
-		v.iadd = throughput{}
+		v.iprom = throughput{}
 
 	default:
 		opts := prometheus.GaugeOpts{Namespace: "ais", Subsystem: snode.Type(), Name: metricName, Help: help, ConstLabels: constLabs}
 		if len(extra.VarLabs) > 0 {
 			metric := prometheus.NewGaugeVec(opts, extra.VarLabs)
-			v.iadd = gaugeVec{metric}
+			v.iprom = gaugeVec{metric}
 			promRegistry.MustRegister(metric)
 		} else {
 			metric := prometheus.NewGauge(opts)
-			v.iadd = gauge{metric}
+			v.iprom = gauge{metric}
 			promRegistry.MustRegister(metric)
 		}
 	}
@@ -250,8 +245,28 @@ func (r *runner) reg(snode *meta.Snode, name, kind string, extra *Extra) {
 	r.core.Tracker[name] = v
 }
 
-func (*runner) PromHandler() http.Handler {
-	return promhttp.HandlerFor(promRegistry, promhttp.HandlerOpts{})
-}
+// PromHandler exposes AIS metrics at /metrics endpoint
+// and instruments the scrape itself.
+//
+// In addition to AIS metrics, Prometheus will now also see `promhttp_*` metrics:
+// - requests_in_flight   (current scrapes in progress)
+// - requests_total{code} (scrape outcomes by HTTP status)
+// - duration_seconds_*   (histogram of scrape latency)
+//
+// Note the default previously used code:
+//   - promhttp.HandlerFor(promRegistry, promhttp.HandlerOpts{})
+// Other non-default options are commented below.
 
-func (*runner) closeStatsD() {} // build tag "statsd" stub
+func (*runner) PromHandler() http.Handler {
+	opts := promhttp.HandlerOpts{
+		ErrorHandling: promhttp.ContinueOnError, // quote "Ignore errors and try to serve as many metrics as possible"
+		// --------------------------- other options to consider ------------------------
+		// EnableOpenMetrics: true,                  // see "OpenMetrics"
+		// MaxRequestsInFlight: 4,                   // consider a small cap
+		// Timeout: 5 * time.Second,                 // 5s must be generous but still, at the risk of spurious..
+		// DisableCompression: false,                // default: compress if client accepts
+		// ErrorLog:           logger,               // provide Println() method to route errors
+	}
+	handler := promhttp.HandlerFor(promRegistry, opts)
+	return promhttp.InstrumentMetricHandler(promRegistry, handler)
+}

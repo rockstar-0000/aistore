@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -11,13 +11,17 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
-const MLCG32 = 1103515245 // xxhash seed
+// xxhash seed
+// https://en.wikipedia.org/wiki/Linear_congruential_generator
+const MLCG32 = 1103515245
 
 // assorted common constants
 const (
 	SizeofI64 = int(unsafe.Sizeof(uint64(0)))
 	SizeofI32 = int(unsafe.Sizeof(uint32(0)))
 	SizeofI16 = int(unsafe.Sizeof(uint16(0)))
+
+	SizeXXHash64 = SizeofI64
 )
 
 // Unsafe cast (string => []byte) and ([]byte => string)
@@ -44,6 +48,7 @@ func UnsafeBptr(s *string) *[]byte {
 }
 
 // shallow copy
+// (see cmn/gco.Clone() for special handling)
 func CopyStruct(dst, src any) {
 	x := reflect.ValueOf(src)
 	debug.Assert(x.Kind() == reflect.Ptr)

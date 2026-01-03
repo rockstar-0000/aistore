@@ -10,12 +10,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 const (
@@ -129,6 +134,22 @@ type (
 	}
 )
 
+// Copy and Transform Object APIs
+type (
+	CopyArgs struct {
+		FromBck     cmn.Bck
+		FromObjName string
+		ToBck       cmn.Bck
+		ToObjName   string // if empty, defaults to FromObjName
+		LatestVer   bool   // see also: QparamLatestVer
+		Sync        bool   // see also: 'versioning.synchronize'
+	}
+	TransformArgs struct {
+		CopyArgs
+		ETL
+	}
+)
+
 // GET(object) =========================================================================================
 //
 // If GetArgs.Writer is specified GetObject will use it to write the response body;
@@ -156,7 +177,9 @@ func (oah *ObjAttrs) Size() int64 {
 }
 
 func (oah *ObjAttrs) Attrs() (out cmn.ObjAttrs) {
-	out.Cksum = out.FromHeader(oah.wrespHeader)
+	var err error
+	out.Cksum, err = out.FromHeader(oah.wrespHeader)
+	debug.AssertNoErr(err)
 	return out
 }
 
@@ -202,6 +225,14 @@ func GetObject(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) (oah O
 // Same as above with checksum validation.
 // Returns `cmn.ErrInvalidCksum` when the expected and actual checksum values
 // are different.
+//
+// NOTE:
+// - Do not use for Read Range requests (`cos.HdrRange`) unless the bucket's
+//   checksum config has EnableReadRange=true (`enable_read_range = true`).
+// - When EnableReadRange=false, the server returns the FULL-OBJECT checksum
+//   even for a ranged GET; validating the range payload against that will fail
+//   with `cmn.ErrInvalidCksum`.
+
 func GetObjectWithValidation(bp BaseParams, bck cmn.Bck, objName string, args *GetArgs) (oah ObjAttrs, err error) {
 	w, q, hdr := args.ret()
 	bp.Method = http.MethodGet
@@ -323,6 +354,61 @@ func PutObject(args *PutArgs) (oah ObjAttrs, err error) {
 	return
 }
 
+func copyOrTransformObject(bp BaseParams, args *CopyArgs, etl *ETL) error {
+	var (
+		q         = qalloc()
+		toObjName = cos.Left(args.ToObjName, args.FromObjName)
+	)
+	args.FromBck.SetQuery(q)
+	args.ToBck.AddUnameToQuery(q, apc.QparamObjTo, toObjName)
+	if etl != nil {
+		if etl.ETLName != "" {
+			q.Add(apc.QparamETLName, etl.ETLName)
+		}
+		if etl.TransformArgs != nil {
+			s, err := jsoniter.MarshalToString(etl.TransformArgs)
+			if err != nil {
+				return err
+			}
+			q.Add(apc.QparamETLTransformArgs, s)
+		}
+		if etl.pipeline != nil {
+			q.Add(apc.QparamETLPipeline, strings.Join(etl.pipeline, apc.ETLPipelineSeparator))
+		}
+	}
+	if args.LatestVer {
+		q.Set(apc.QparamLatestVer, "true")
+	}
+	if args.Sync {
+		q.Set(apc.QparamSync, "true")
+	}
+
+	bp.Method = http.MethodPut
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathObjects.Join(args.FromBck.Name, args.FromObjName)
+		reqParams.Query = q
+	}
+	err := reqParams.DoRequest()
+
+	FreeRp(reqParams)
+	qfree(q)
+	return err
+}
+
+// Copy an object from source bucket/object to destination bucket[/object].
+// This is a synchronous, blocking operation.
+// If ToObjName is empty, uses FromObjName as the destination.
+func CopyObject(bp BaseParams, args *CopyArgs) error {
+	return copyOrTransformObject(bp, args, nil /*etl*/)
+}
+
+// Same as CopyObject, but with an ETL transformation
+func TransformObject(bp BaseParams, args *TransformArgs) error {
+	return copyOrTransformObject(bp, &args.CopyArgs, &args.ETL)
+}
+
 // HEAD(object)  ==============================================================================================
 //
 // Returns object properties; can be conventionally used to establish in-cluster presence.
@@ -368,7 +454,11 @@ func headobj(reqParams *ReqParams, noprops bool) (*cmn.ObjectProps, error) {
 
 	// first, cnm.ObjAttrs (compare with `t.objHead`)
 	op := &cmn.ObjectProps{}
-	op.Cksum = op.ObjAttrs.FromHeader(hdr)
+	op.Cksum, err = op.ObjAttrs.FromHeader(hdr)
+	if err != nil {
+		debug.AssertNoErr(err)
+		return nil, err
+	}
 
 	// second, all the rest
 	err = cmn.IterFields(op, func(tag string, field cmn.IterField) (error, bool) {
@@ -441,7 +531,7 @@ func DeleteObject(bp BaseParams, bck cmn.Bck, objName string) error {
 func EvictObject(bp BaseParams, bck cmn.Bck, objName string) error {
 	var (
 		q      = qalloc()
-		actMsg = apc.ActMsg{Action: apc.ActEvictObjects, Name: cos.JoinWords(bck.Name, objName)}
+		actMsg = apc.ActMsg{Action: apc.ActEvictObjects, Name: cos.JoinW0(bck.Name, objName)}
 	)
 	bp.Method = http.MethodDelete
 	reqParams := AllocRp()
@@ -736,6 +826,7 @@ func DoWithRetry(client *http.Client, cb newRequestCB, reqArgs *cmn.HreqArgs) (r
 		if !_retry(doErr, resp) {
 			goto exit
 		}
+		runtime.Gosched() // poor man's jitter
 	}
 exit:
 	if err == nil {
@@ -758,5 +849,5 @@ func _retry(err error, resp *http.Response) bool {
 	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		return true
 	}
-	return err != nil && cos.IsRetriableConnErr(err)
+	return err != nil && cos.IsErrRetriableConn(err)
 }

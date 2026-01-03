@@ -23,9 +23,7 @@ Here's the current list, grouped by category.
 
 ## StatsD
 
-| build tag | comment |
-| --- | --- |
-| `statsd`| Build with StatsD support instead of Prometheus (default) |
+> StatsD was deprecated in v3.28 (Spring 2025) and completely removed in v4.0 (September 2025).
 
 ## Open telemetry
 
@@ -35,13 +33,20 @@ Here's the current list, grouped by category.
 
 ## Intra-cluster transport
 
+There are two alternative ways to build `transport` package for intra-cluster networking:
+
+1. using Go net/http, or
+2. with a 3rd party github.com/valyala/fasthttp aka "fasthttp"
+
+The second option is the current default.
+
 | build tag | comment |
 | --- | --- |
-| `nethttp`| Use [net/http](https://pkg.go.dev/net/http) for intra-cluster transport (the default is [fasthttp](github.com/valyala/fasthttp)) |
+| `nethttp`| Use [net/http](https://pkg.go.dev/net/http) for intra-cluster transport (the default is [fasthttp](https://github.com/valyala/fasthttp)) |
 
 ## fs.Walk from the standard library
 
 | build tag | comment |
 | --- | --- |
-| `stdlibwalk`| Instead of [godirwalk](github.com/karrick/godirwalk) use `filepath.WalkDir` from the standard library |
+| `stdlibwalk`| Instead of [godirwalk](https://github.com/karrick/godirwalk) use `filepath.WalkDir` from the standard library |
 

@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -41,7 +41,7 @@ func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType str
 		keyName := fmt.Sprintf("%s/%s", prefixDir, fileName)
 
 		// NOTE: Since this test is to test prefix fetch, the reader type is ignored, always use rand reader.
-		r, err := readers.NewRand(fileSize, cksumType)
+		r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: fileSize, CksumType: cksumType})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -49,7 +49,7 @@ func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType str
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tools.Put(proxyURL, bck, keyName, r, errCh)
+			tools.Put(proxyURL, bck, keyName, r, fileSize, 0 /*numChunks*/, errCh)
 		}()
 		fileNames = append(fileNames, fileName)
 	}
@@ -57,7 +57,7 @@ func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType str
 	for _, fName := range extraNames {
 		keyName := fmt.Sprintf("%s/%s", prefixDir, fName)
 		// NOTE: Since this test is to test prefix fetch, the reader type is ignored, always use rand reader.
-		r, err := readers.NewRand(fileSize, cksumType)
+		r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: fileSize, CksumType: cksumType})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,7 +65,7 @@ func prefixCreateFiles(t *testing.T, proxyURL string, bck cmn.Bck, cksumType str
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tools.Put(proxyURL, bck, keyName, r, errCh)
+			tools.Put(proxyURL, bck, keyName, r, fileSize, 0 /*numChunks*/, errCh)
 		}()
 		fileNames = append(fileNames, fName)
 	}
@@ -81,7 +81,7 @@ func prefixLookup(t *testing.T, proxyURL string, bck cmn.Bck, fileNames []string
 }
 
 func prefixLookupDefault(t *testing.T, proxyURL string, bck cmn.Bck, fileNames []string) {
-	tlog.Logf("Looking up for files in alphabetic order\n")
+	tlog.Logfln("Looking up for files in alphabetic order")
 
 	var (
 		letters    = "abcdefghijklmnopqrstuvwxyz"
@@ -102,13 +102,13 @@ func prefixLookupDefault(t *testing.T, proxyURL string, bck cmn.Bck, fileNames [
 
 		if numFiles == realNumFiles {
 			if numFiles != 0 {
-				tlog.Logf("Found %v files starting with %q\n", numFiles, key)
+				tlog.Logfln("Found %v files starting with %q", numFiles, key)
 			}
 		} else {
 			t.Errorf("Expected number of files with prefix %q is %v but found %v files", key, realNumFiles, numFiles)
-			tlog.Logf("Objects returned:\n")
+			tlog.Logfln("Objects returned:")
 			for id, oo := range lst.Entries {
-				tlog.Logf("    %d[%d]. %s\n", i, id, oo.Name)
+				tlog.Logfln("    %d[%d]. %s", i, id, oo.Name)
 			}
 		}
 	}
@@ -155,7 +155,7 @@ func prefixLookupCornerCases(t *testing.T, proxyURL string, bck cmn.Bck, objName
 			}
 		}
 
-		tlog.Logf("%d. Prefix: %s [%s]\n", idx, test.title, fullPrefix)
+		tlog.Logfln("%d. Prefix: %s [%s]", idx, test.title, fullPrefix)
 		msg := &apc.LsoMsg{Prefix: fullPrefix}
 		lst, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
 		if err != nil {
@@ -207,7 +207,7 @@ func prefixCleanup(t *testing.T, proxyURL string, bck cmn.Bck, fileNames []strin
 
 	select {
 	case e := <-errCh:
-		tlog.Logf("Failed to DEL: %s\n", e)
+		tlog.Logfln("Failed to DEL: %s", e)
 		t.Fail()
 	default:
 	}

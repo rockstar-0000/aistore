@@ -36,7 +36,7 @@ var (
 
 // [METHOD] /s3
 func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
+	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln("s3Handler", p.String(), r.Method, r.URL)
 	}
 
@@ -65,7 +65,7 @@ func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
 			// list all buckets; NOTE: compare with `p.easyURLHandler` and see
 			// "list buckets for a given provider" comment there
 			// perms: apc.AceListBuckets
-			if err := p.access(r.Header, nil, apc.AceListBuckets); err != nil {
+			if err := p.access(r.Context(), r.Header, nil, apc.AceListBuckets); err != nil {
 				s3.WriteErr(w, r, err, http.StatusForbidden)
 				return
 			}
@@ -156,8 +156,9 @@ func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GET /s3
 // NOTE: unlike native API, this one is limited to list only those that are currently present in the BMD.
+// +gen:endpoint GET /s3
+// List all buckets from the bucket metadata
 func (p *proxy) bckNamesFromBMD(w http.ResponseWriter) {
 	var (
 		bmd  = p.owner.bmd.get()
@@ -174,9 +175,10 @@ func (p *proxy) bckNamesFromBMD(w http.ResponseWriter) {
 	sgl.Free()
 }
 
-// PUT /s3/<bucket-name> (i.e., create bucket)
+// +gen:endpoint PUT /s3/{bucket-name}
+// Create a new S3 bucket
 func (p *proxy) putBckS3(w http.ResponseWriter, r *http.Request, bucket string) {
-	if err := p.access(r.Header, nil, apc.AceCreateBucket); err != nil {
+	if err := p.access(r.Context(), r.Header, nil, apc.AceCreateBucket); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -194,13 +196,15 @@ func (p *proxy) putBckS3(w http.ResponseWriter, r *http.Request, bucket string) 
 	}
 }
 
-// DELETE /s3/<bucket-name> (TODO: AWS allows to delete bucket only if it is empty)
+// TODO: AWS allows to delete bucket only if it is empty
+// +gen:endpoint DELETE /s3/{bucket-name}
+// Delete an S3 bucket
 func (p *proxy) delBckS3(w http.ResponseWriter, r *http.Request, bucket string) {
 	bck := p.initByNameOnly(w, r, bucket)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceDestroyBucket); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceDestroyBucket); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -219,44 +223,48 @@ func (p *proxy) delBckS3(w http.ResponseWriter, r *http.Request, bucket string) 
 	}
 }
 
-func (p *proxy) handleMptUpload(w http.ResponseWriter, r *http.Request, parts []string) {
-	if len(parts) < 2 {
+// +gen:endpoint POST /s3/{bucket-name}/{object-name} [s3.QparamMptUploads=string,s3.QparamMptUploadID=string]
+// Handle S3 multipart upload operations
+func (p *proxy) handleMptUpload(w http.ResponseWriter, r *http.Request, items []string) {
+	if len(items) < 2 {
 		s3.WriteErr(w, r, errS3BckObj, 0)
 		return
 	}
-	bck := p.initByNameOnly(w, r, parts[0] /*bucket*/)
+	bck := p.initByNameOnly(w, r, items[0] /*bucket*/)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AcePUT); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AcePUT); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
-	objName := s3.ObjName(parts)
-	if err := cmn.ValidOname(objName); err != nil {
+	objName := s3.ObjName(items)
+	if err := cos.ValidOname(objName); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
 
 	smap := p.owner.smap.get()
-	si, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
 	started := time.Now()
-	redirectURL := p.redirectURL(r, si, started, cmn.NetIntraData, netPub)
-	p.s3Redirect(w, r, si, redirectURL, bck.Name)
+	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, redurl, bck.Name)
 }
 
-// DELETE /s3/i<bucket-name>?delete
-// Delete a list of objects
+// DELETE /s3/<bucket-name>?delete
+// +gen:endpoint DELETE /s3/{bucket-name} [s3.QparamMultiDelete=string] payload=s3-delete-multiple
+// +gen:payload s3-delete-multiple=<?xml version="1.0" encoding="UTF-8"?><Delete><Object><Key>file1.txt</Key></Object><Object><Key>file2.txt</Key></Object></Delete>
+// Delete a list of objects from an S3 bucket
 func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket string) {
 	bck := p.initByNameOnly(w, r, bucket)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceObjDELETE); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceObjDELETE); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -314,13 +322,14 @@ func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket s
 	sgl.Free()
 }
 
-// HEAD /s3/<bucket-name>
+// +gen:endpoint HEAD /s3/{bucket-name}
+// Check if S3 bucket exists and retrieve metadata
 func (p *proxy) headBckS3(w http.ResponseWriter, r *http.Request, bucket string) {
 	bck := p.initByNameOnly(w, r, bucket)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceBckHEAD); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceBckHEAD); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -337,14 +346,14 @@ func (p *proxy) headBckS3(w http.ResponseWriter, r *http.Request, bucket string)
 	w.Header().Set(cos.S3HdrBckRegion, s3.AISRegion)
 }
 
-// GET /s3/<bucket-name>
-// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+// +gen:endpoint GET /s3/{bucket-name} [s3.QparamMaxKeys=string,s3.QparamPrefix=string,s3.QparamContinuationToken=string,s3.QparamStartAfter=string,s3.QparamDelimiter=string]
+// List objects in an S3 bucket
 func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
 	bck := p.initByNameOnly(w, r, bucket)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceObjLIST); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceObjLIST); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -356,7 +365,7 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	// e.g. <LastModified>2009-10-12T17:50:30.000Z</LastModified>
-	lsmsg := &apc.LsoMsg{TimeFormat: time.RFC3339}
+	lsmsg := &apc.LsoMsg{TimeFormat: time.RFC3339, Flags: apc.LsIsS3}
 
 	//
 	// NOTE (s3 api limitation): hard-coded props w/ apc.GetPropsCustom always included
@@ -376,7 +385,7 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 	s3.FillLsoMsg(q, lsmsg)
 
 	lst, err := p.lsAllPagesS3(bck, amsg, lsmsg, r.Header)
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
+	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln("lsoS3", bck.Cname(""), len(lst.Entries), err)
 	}
 	if err != nil {
@@ -394,7 +403,7 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 
 	resp := s3.NewListObjectResult(bucket)
 	resp.ContinuationToken = lsmsg.ContinuationToken
-	resp.FromLsoResult(lst, lsmsg)
+	resp.FromLsoResult(lst)
 	sgl := p.gmm.NewSGL(0)
 	resp.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
@@ -440,7 +449,8 @@ func (p *proxy) lsAllPagesS3(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg,
 	return lst, nil
 }
 
-// PUT /s3/<bucket-name>/<object-name>
+// +gen:endpoint PUT /s3/{bucket-name}/{object-name}
+// Upload or copy an S3 object
 func (p *proxy) putObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	if r.Header.Get(cos.S3HdrObjSrc) == "" {
 		p.directPutObjS3(w, r, items)
@@ -464,7 +474,7 @@ func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if bckSrc == nil {
 		return
 	}
-	if err := p.access(r.Header, bckSrc, apc.AceGET); err != nil {
+	if err := p.access(r.Context(), r.Header, bckSrc, apc.AceGET); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -480,17 +490,17 @@ func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string
 
 	objName := strings.Trim(parts[1], "/")
 	smap := p.owner.smap.get()
-	si, err := smap.HrwName2T(bckSrc.MakeUname(objName))
+	tsi, err := smap.HrwName2T(bckSrc.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
-		nlog.Infoln("COPY:", r.Method, bckSrc.Cname(objName), "=>", bckDst.Cname(""), items, si.StringEx())
+	if cmn.Rom.V(5, cos.ModS3) {
+		nlog.Infoln("COPY:", r.Method, bckSrc.Cname(objName), "=>", bckDst.Cname(""), items, tsi.StringEx())
 	}
 	started := time.Now()
-	redirectURL := p.redirectURL(r, si, started, cmn.NetIntraControl)
-	p.s3Redirect(w, r, si, redirectURL, bckDst.Name)
+	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	p.s3Redirect(w, r, tsi, redurl, bckDst.Name)
 }
 
 // PUT /s3/<bucket-name>/<object-name> - with empty `cos.S3HdrObjSrc`
@@ -500,7 +510,7 @@ func (p *proxy) directPutObjS3(w http.ResponseWriter, r *http.Request, items []s
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AcePUT); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AcePUT); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -509,33 +519,34 @@ func (p *proxy) directPutObjS3(w http.ResponseWriter, r *http.Request, items []s
 		return
 	}
 	objName := s3.ObjName(items)
-	if err := cmn.ValidOname(objName); err != nil {
+	if err := cos.ValidOname(objName); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
 
 	smap := p.owner.smap.get()
-	si, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
-		nlog.Infoln(r.Method, bck.Cname(objName), "=>", si.StringEx())
+	if cmn.Rom.V(5, cos.ModS3) {
+		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
-	started := time.Now()
 
-	redirectURL := p.redirectURL(r, si, started, cmn.NetIntraData, netPub)
-	p.s3Redirect(w, r, si, redirectURL, bck.Name)
+	started := time.Now()
+	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, redurl, bck.Name)
 }
 
-// GET /s3/<bucket-name>/<object-name>
+// +gen:endpoint GET /s3/{bucket-name}/{object-name}
+// Download an S3 object or list multipart uploads
 func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string, q url.Values, listMultipart bool) {
 	bck := p.initByNameOnly(w, r, items[0] /*bucket*/)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceGET); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceGET); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
@@ -548,24 +559,24 @@ func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string,
 		return
 	}
 	objName := s3.ObjName(items)
-	if err := cmn.ValidOname(objName); err != nil {
+	if err := cos.ValidOname(objName); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
 
 	smap := p.owner.smap.get()
-	si, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
-		nlog.Infoln(r.Method, bck.Cname(objName), "=>", si.StringEx())
+	if cmn.Rom.V(5, cos.ModS3) {
+		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
-	started := time.Now()
 
-	redirectURL := p.redirectURL(r, si, started, cmn.NetIntraData, netPub)
-	p.s3Redirect(w, r, si, redirectURL, bck.Name)
+	started := time.Now()
+	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, redurl, bck.Name)
 }
 
 // GET /s3/<bucket-name>/<object-name> with `s3.QparamMptUploads`
@@ -578,8 +589,8 @@ func (p *proxy) listMultipart(w http.ResponseWriter, r *http.Request, bck *meta.
 			return
 		}
 		started := time.Now()
-		redirectURL := p.redirectURL(r, si, started, cmn.NetIntraControl)
-		p.s3Redirect(w, r, si, redirectURL, bck.Name)
+		redurl := p.redurl(r, si, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+		p.s3Redirect(w, r, si, redurl, bck.Name)
 		return
 	}
 	// bcast & aggregate
@@ -615,7 +626,8 @@ func (p *proxy) listMultipart(w http.ResponseWriter, r *http.Request, bck *meta.
 	sgl.Free()
 }
 
-// HEAD /s3/<bucket-name>/<object-name>
+// +gen:endpoint HEAD /s3/{bucket-name}/{object-name}
+// Retrieve S3 object metadata and headers
 func (p *proxy) headObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	if len(items) < 2 {
 		s3.WriteErr(w, r, errS3BckObj, 0)
@@ -625,29 +637,36 @@ func (p *proxy) headObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceObjHEAD); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceObjHEAD); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
 	objName := s3.ObjName(items)
-	if err := cmn.ValidOname(objName); err != nil {
+	if err := cos.ValidOname(objName); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
 	smap := p.owner.smap.get()
-	si, err := smap.HrwName2T(bck.MakeUname(objName))
+	tsi, err := smap.HrwName2T(bck.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, err, http.StatusInternalServerError)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
-		nlog.Infoln(r.Method, bck.Cname(objName), "=>", si.StringEx())
+	if cmn.Rom.V(5, cos.ModS3) {
+		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
 
-	p.reverseNodeRequest(w, r, si)
+	// forward using data net (to reach target's /s3)
+	//
+	// TODO -- FIXME: eliminate reverse
+	// (make p.s3Redirect() work, otherwise - direct call)
+	parsedURL, err := url.Parse(tsi.URL(cmn.NetIntraData))
+	debug.AssertNoErr(err)
+	p.reverseRequest(w, r, tsi.ID(), parsedURL)
 }
 
-// DELETE /s3/<bucket-name>/<object-name>
+// +gen:endpoint DELETE /s3/{bucket-name}/{object-name}
+// Delete an S3 object
 func (p *proxy) delObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	if len(items) < 2 {
 		s3.WriteErr(w, r, errS3BckObj, 0)
@@ -657,31 +676,32 @@ func (p *proxy) delObjS3(w http.ResponseWriter, r *http.Request, items []string)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Header, bck, apc.AceObjDELETE); err != nil {
+	if err := p.access(r.Context(), r.Header, bck, apc.AceObjDELETE); err != nil {
 		s3.WriteErr(w, r, err, http.StatusForbidden)
 		return
 	}
 	objName := s3.ObjName(items)
-	if err := cmn.ValidOname(objName); err != nil {
+	if err := cos.ValidOname(objName); err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
 
 	smap := p.owner.smap.get()
-	si, err := smap.HrwName2T(bck.MakeUname(objName))
+	tsi, err := smap.HrwName2T(bck.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, err, 0)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleS3) {
-		nlog.Infoln(r.Method, bck.Cname(objName), "=>", si.StringEx())
+	if cmn.Rom.V(5, cos.ModS3) {
+		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
 	started := time.Now()
-	redirectURL := p.redirectURL(r, si, started, cmn.NetIntraControl)
-	p.s3Redirect(w, r, si, redirectURL, bck.Name)
+	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	p.s3Redirect(w, r, tsi, redurl, bck.Name)
 }
 
-// GET /s3/<bucket-name>?versioning
+// +gen:endpoint GET /s3/{bucket-name} [s3.QparamVersioning=string]
+// Get S3 bucket versioning configuration
 func (p *proxy) getBckVersioningS3(w http.ResponseWriter, r *http.Request, bucket string) {
 	bck := p.initByNameOnly(w, r, bucket)
 	if bck == nil {
@@ -704,7 +724,9 @@ func (p *proxy) unsupported(w http.ResponseWriter, r *http.Request, bucket strin
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// PUT /s3/<bucket-name>?versioning
+// +gen:endpoint PUT /s3/{bucket-name} [s3.QparamVersioning=string] payload=s3-versioning
+// +gen:payload s3-versioning=<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>
+// Configure S3 bucket versioning settings
 func (p *proxy) putBckVersioningS3(w http.ResponseWriter, r *http.Request, bucket string) {
 	msg := &apc.ActMsg{Action: apc.ActSetBprops}
 	if p.forwardCP(w, r, nil, msg.Action+"-"+bucket) {
@@ -751,21 +773,24 @@ func (p *proxy) initByNameOnly(w http.ResponseWriter, r *http.Request, bucket st
 
 // either reverse-proxy call _or_ HTTP-redirect to a designated node
 // see also: docs/s3compat.md
-func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snode, redirectURL, bucket string) {
+func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snode, redurl, bucket string) {
 	if cmn.Rom.Features().IsSet(feat.S3ReverseProxy) {
 		// [intra-cluster communications]
 		// instead of regular HTTP redirect (below) reverse-proxy S3 API call to a designated target
-		p.reverseNodeRequest(w, r, si)
+		// forward using pub net
+		parsedURL, err := url.Parse(si.URL(cmn.NetPublic))
+		debug.AssertNoErr(err)
+		p.reverseRequest(w, r, si.ID(), parsedURL)
 		return
 	}
 
 	h := w.Header()
-	h.Set(cos.HdrLocation, redirectURL)
+	h.Set(cos.HdrLocation, redurl)
 	h.Set(cos.HdrContentType, "text/xml; charset=utf-8")
 	h.Set(cos.HdrServer, s3.AISServer)
 
 	var (
-		ep = extractEndpoint(redirectURL)
+		ep = extractEndpoint(redurl)
 		ll = max(256, 175+len(ep)+len(bucket)-27)
 		bb = bytes.NewBuffer(make([]byte, ll)) // TODO: consider using smm (small-size allocator) - here and elsewhere
 	)

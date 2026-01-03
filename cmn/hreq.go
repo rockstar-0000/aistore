@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -33,30 +32,6 @@ type HreqArgs struct {
 	Body     []byte
 }
 
-var (
-	hraPool sync.Pool
-	hra0    HreqArgs
-)
-
-var (
-	hpool sync.Pool
-	hmap  sync.Map
-	req0  http.Request
-)
-
-func AllocHra() (a *HreqArgs) {
-	if v := hraPool.Get(); v != nil {
-		a = v.(*HreqArgs)
-		return
-	}
-	return &HreqArgs{}
-}
-
-func FreeHra(a *HreqArgs) {
-	*a = hra0
-	hraPool.Put(a)
-}
-
 func (u *HreqArgs) URL() string {
 	url := cos.JoinPath(u.Base, u.Path)
 	if u.RawQuery != "" {
@@ -74,12 +49,12 @@ func (u *HreqArgs) ReqDeprecated() (*http.Request, error) {
 	if r == nil && u.Body != nil {
 		r = cos.NewByteReader(u.Body)
 	}
-	req, err := http.NewRequest(u.Method, u.URL(), r)
+	req, err := http.NewRequestWithContext(context.Background(), u.Method, u.URL(), r)
 	if err != nil {
 		return nil, err
 	}
 	if u.Header != nil {
-		copyHeaders(u.Header, &req.Header)
+		CopyHeaders(req.Header, u.Header)
 	}
 	return req, nil
 }
@@ -109,7 +84,7 @@ func (u *HreqArgs) Req() (*http.Request, error) {
 	req.Body = rc
 	req.ContentLength = int64(l) // todo: preferably, with BodyR case as well
 	if u.Header != nil {
-		copyHeaders(u.Header, &req.Header)
+		CopyHeaders(req.Header, u.Header)
 	}
 	return req, nil
 }
@@ -193,20 +168,4 @@ func newRequest(method, surl string) (*http.Request, error) {
 	req.Host = u.Host
 
 	return req, nil
-}
-
-func hreqAlloc() *http.Request {
-	r := hpool.Get()
-	if r != nil {
-		return r.(*http.Request)
-	}
-	return &http.Request{}
-}
-
-func HreqFree(r *http.Request) {
-	hdr := r.Header
-	*r = req0
-	clear(hdr)
-	r.Header = hdr
-	hpool.Put(r)
 }

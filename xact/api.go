@@ -6,6 +6,7 @@ package xact
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 const (
@@ -50,8 +54,12 @@ const (
 )
 
 // ArgsMsg.Flags
+// note: for simplicity, keeping all custom x-flags in one place and one global enum for now
 const (
-	XrmZeroSize = 1 << iota // usage: x-cleanup (apc.ActStoreCleanup) to remove zero size objects
+	FlagZeroSize = 1 << iota // usage: x-cleanup (apc.ActStoreCleanup) to remove zero size objects
+	FlagLatestVer
+	FlagSync
+	FlagKeepMisplaced // usage: x-cleanup to _not_ remove (ie, keep) misplaced objects
 )
 
 type (
@@ -64,7 +72,7 @@ type (
 		Bck         cmn.Bck       // bucket
 		Buckets     []cmn.Bck     // list of buckets (e.g., copy-bucket, lru-evict, etc.)
 		Timeout     time.Duration // max time to wait
-		Flags       uint32        `json:"flags,omitempty"` // enum (XrmZeroSize, ...) bitwise
+		Flags       uint32        `json:"flags,omitempty"` // enum (FlagZeroSize, ...) bitwise
 		Force       bool          // force
 		OnlyRunning bool          // only for running xactions
 	}
@@ -105,6 +113,10 @@ type (
 		// xaction returns extended xaction-specific stats
 		// (see related: `Snap.Ext` in core/xaction.go)
 		ExtendedStats bool
+
+		// suppress verbose per-state log records and keep only hk.OldAgeXshort (1m)
+		// in registry history
+		QuietBrief bool
 	}
 )
 
@@ -137,6 +149,7 @@ var Table = map[string]Descriptor{
 
 	// single target (node)
 	apc.ActResilver: {Scope: ScopeT, Startable: true, Resilver: true},
+	apc.ActRechunk:  {Scope: ScopeB, Startable: true, RefreshCap: true, ConflictRebRes: true},
 
 	// on-demand EC and n-way replication
 	// (non-startable, triggered by PUT => erasure-coded or mirrored bucket)
@@ -266,9 +279,9 @@ var Table = map[string]Descriptor{
 		AbortRebRes: true,
 	},
 
-	apc.ActList: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false, Metasync: false, Idles: true},
+	apc.ActList: {Scope: ScopeB, Access: apc.AceObjLIST, Startable: false, Metasync: false, Idles: true, QuietBrief: true},
 
-	apc.ActGetBatch: {Scope: ScopeGB, Startable: false, Metasync: false, Idles: true},
+	apc.ActGetBatch: {Scope: ScopeGB, Startable: false, Metasync: false, ConflictRebRes: true, Idles: true}, // apc.Moss
 
 	// cache management, internal usage
 	apc.ActLoadLomCache: {DisplayName: "warm-up-metadata", Scope: ScopeB, Startable: true},
@@ -347,14 +360,12 @@ func ListDisplayNames(onlyStartable bool) (names []string) {
 		if onlyStartable && !dtor.Startable {
 			continue
 		}
-		if dtor.DisplayName != "" {
-			names = append(names, dtor.DisplayName)
-		} else {
-			names = append(names, kind)
-		}
+		name := cos.Ternary(dtor.DisplayName != "", dtor.DisplayName, kind)
+		debug.Assert(!slices.Contains(names, name), names, " vs ", name)
+		names = append(names, name)
 	}
 	sort.Strings(names)
-	return
+	return names
 }
 
 func IsSameScope(kindOrName string, scs ...int) bool {
@@ -481,7 +492,7 @@ func (xs MultiSnap) checkEmptyID(xid string) error {
 			} else if kind != xsnap.Kind {
 				return fmt.Errorf("invalid multi-snap Kind: %q vs %q", kind, xsnap.Kind)
 			}
-			if xsnap.Running() {
+			if xsnap.IsRunning() {
 				if uuid == "" {
 					uuid = xsnap.ID
 				} else if uuid != xsnap.ID {
@@ -509,7 +520,7 @@ func (xs MultiSnap) RunningTarget(xid string) (string /*tid*/, *core.Snap, error
 	}
 	for tid, snaps := range xs {
 		for _, xsnap := range snaps {
-			if (xid == xsnap.ID || xid == "") && xsnap.Running() {
+			if (xid == xsnap.ID || xid == "") && xsnap.IsRunning() {
 				return tid, xsnap, nil
 			}
 		}
@@ -607,7 +618,7 @@ func (xs MultiSnap) TotalRunningTime(xid string) (time.Duration, error) {
 		for _, xsnap := range snaps {
 			if xid == xsnap.ID {
 				found = true
-				running = running || xsnap.Running()
+				running = running || xsnap.IsRunning()
 				if !xsnap.StartTime.IsZero() {
 					if start.IsZero() || xsnap.StartTime.Before(start) {
 						start = xsnap.StartTime
@@ -626,4 +637,30 @@ func (xs MultiSnap) TotalRunningTime(xid string) (time.Duration, error) {
 		end = time.Now()
 	}
 	return end.Sub(start), nil
+}
+
+func (xs MultiSnap) ToJSON(tid string, indent bool) ([]byte, error) {
+	out := make(map[string][]string, len(xs))
+	for sid, snaps := range xs {
+		if tid != "" && sid != tid {
+			continue
+		}
+		l := len(snaps)
+		if l == 0 {
+			continue
+		}
+		xids := make([]string, 0, l)
+		for _, xsnap := range snaps {
+			debug.Assert(xsnap.ID != "")
+			xids = append(xids, xsnap.ID)
+		}
+		out[meta.Tname(sid)] = xids
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if indent {
+		return jsoniter.MarshalIndent(out, "", "    ")
+	}
+	return jsoniter.Marshal(out)
 }

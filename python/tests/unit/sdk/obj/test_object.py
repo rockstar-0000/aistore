@@ -8,6 +8,7 @@ network traffic or AIS cluster is required.
 
 import unittest
 from unittest.mock import Mock, patch, mock_open
+from json import dumps as json_dumps
 
 import warnings
 
@@ -26,6 +27,7 @@ from aistore.sdk.const import (
     QPARAM_ETL_ARGS,
     QPARAM_OBJ_APPEND,
     QPARAM_OBJ_APPEND_HANDLE,
+    QPARAM_OBJ_TO,
     QPARAM_NEW_CUSTOM,
     HTTP_METHOD_PUT,
     HTTP_METHOD_DELETE,
@@ -46,6 +48,7 @@ from aistore.sdk.const import (
     AIS_MIRROR_COPIES,
     AIS_PRESENT,
     QPARAM_LATEST,
+    QPARAM_SYNC,
 )
 from aistore.sdk.obj.object import (
     Object,
@@ -67,6 +70,7 @@ from tests.utils import cases
 
 BCK_NAME = "bucket_name"
 OBJ_NAME = "object_name"
+DEST_BCK_NAME = "dest-bucket"
 REQUEST_PATH = f"{URL_PATH_OBJECTS}/{BCK_NAME}/{OBJ_NAME}"
 
 
@@ -181,6 +185,7 @@ class TestObject(unittest.TestCase):
         mock_obj_reader.assert_called_with(
             object_client=mock_obj_client_instance,
             chunk_size=expected_chunk_size,
+            num_workers=None,
         )
         if "writer" in kwargs:
             self.mock_writer.writelines.assert_called_with(res)
@@ -285,7 +290,7 @@ class TestObject(unittest.TestCase):
 
     def test_set_custom_props(self):
         custom_metadata = {"key1": "value1", "key2": "value2"}
-        expected_json_val = ActionMsg(action="", value=custom_metadata).dict()
+        expected_json_val = ActionMsg(action="", value=custom_metadata).model_dump()
 
         self.object.get_writer().set_custom_props(custom_metadata)
 
@@ -299,7 +304,7 @@ class TestObject(unittest.TestCase):
     def test_set_custom_props_with_replace_existing(self):
         custom_metadata = {"key1": "value1", "key2": "value2"}
         self.expected_params[QPARAM_NEW_CUSTOM] = "true"
-        expected_json_val = ActionMsg(action="", value=custom_metadata).dict()
+        expected_json_val = ActionMsg(action="", value=custom_metadata).model_dump()
 
         self.object.get_writer().set_custom_props(
             custom_metadata, replace_existing=True
@@ -347,7 +352,7 @@ class TestObject(unittest.TestCase):
         request_path = f"{URL_PATH_OBJECTS}/{BCK_NAME}"
         expected_json = ActionMsg(
             action=ACT_PROMOTE, name=filename, value=expected_value.as_dict()
-        ).dict()
+        ).model_dump()
         self.object.promote(filename, **kwargs)
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_POST,
@@ -371,7 +376,7 @@ class TestObject(unittest.TestCase):
         ).as_dict()
         expected_json = ActionMsg(
             action=ACT_BLOB_DOWNLOAD, name=OBJ_NAME, value=expected_blob_msg
-        ).dict()
+        ).model_dump()
         self.object.blob_download()
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_POST,
@@ -392,7 +397,7 @@ class TestObject(unittest.TestCase):
         ).as_dict()
         expected_json = ActionMsg(
             action=ACT_BLOB_DOWNLOAD, name=OBJ_NAME, value=expected_blob_msg
-        ).dict()
+        ).model_dump()
         self.object.blob_download(
             num_workers=num_workers, chunk_size=chunk_size, latest=latest
         )
@@ -596,3 +601,113 @@ class TestObject(unittest.TestCase):
                 params_passed = kwargs.get("params", {})
                 self.assertIn(QPARAM_LATEST, params_passed)
                 self.assertEqual(params_passed[QPARAM_LATEST], "true")
+
+    def test_copy_same_name(self):
+        """Test copying object with same name to another bucket."""
+        dest_bucket_details = BucketDetails(
+            DEST_BCK_NAME, Provider.AIS, {"provider": "ais"}, f"ais/@#/{DEST_BCK_NAME}/"
+        )
+        dest_object = Object(self.mock_client, dest_bucket_details, OBJ_NAME)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        self.mock_client.request.return_value = mock_response
+
+        response = self.object.copy(dest_object)
+
+        self.assertEqual(response, mock_response)
+        expected_params = self.bck_qparams.copy()
+        expected_params[QPARAM_OBJ_TO] = f"ais/@#/{DEST_BCK_NAME}/{OBJ_NAME}"
+        expected_params[QPARAM_LATEST] = "false"
+        expected_params[QPARAM_SYNC] = "false"
+
+        self.mock_client.request.assert_called_once_with(
+            HTTP_METHOD_PUT,
+            path=REQUEST_PATH,
+            params=expected_params,
+        )
+
+    def test_copy_different_name(self):
+        """Test copying object with different name to another bucket."""
+        new_name = "copied-object.txt"
+        dest_bucket_details = BucketDetails(
+            DEST_BCK_NAME, Provider.AIS, {"provider": "ais"}, f"ais/@#/{DEST_BCK_NAME}/"
+        )
+        dest_object = Object(self.mock_client, dest_bucket_details, new_name)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        self.mock_client.request.return_value = mock_response
+
+        response = self.object.copy(dest_object)
+
+        self.assertEqual(response, mock_response)
+        expected_params = self.bck_qparams.copy()
+        expected_params[QPARAM_OBJ_TO] = f"ais/@#/{DEST_BCK_NAME}/{new_name}"
+        expected_params[QPARAM_LATEST] = "false"
+        expected_params[QPARAM_SYNC] = "false"
+
+        self.mock_client.request.assert_called_once_with(
+            HTTP_METHOD_PUT,
+            path=REQUEST_PATH,
+            params=expected_params,
+        )
+
+    def test_copy_with_etl(self):
+        """Test copying object with ETL transformation."""
+        dest_bucket_details = BucketDetails(
+            DEST_BCK_NAME, Provider.AIS, {"provider": "ais"}, f"ais/@#/{DEST_BCK_NAME}/"
+        )
+        dest_object = Object(self.mock_client, dest_bucket_details, OBJ_NAME)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        self.mock_client.request.return_value = mock_response
+
+        etl_config = ETLConfig(name=ETL_NAME)
+
+        response = self.object.copy(dest_object, etl=etl_config)
+
+        self.assertEqual(response, mock_response)
+        expected_params = self.bck_qparams.copy()
+        expected_params[QPARAM_OBJ_TO] = f"ais/@#/{DEST_BCK_NAME}/{OBJ_NAME}"
+        expected_params[QPARAM_ETL_NAME] = ETL_NAME
+        expected_params[QPARAM_LATEST] = "false"
+        expected_params[QPARAM_SYNC] = "false"
+
+        self.mock_client.request.assert_called_once_with(
+            HTTP_METHOD_PUT,
+            path=REQUEST_PATH,
+            params=expected_params,
+        )
+
+    def test_copy_with_etl_args(self):
+        """Test copying object with ETL transformation and etl_args."""
+        dest_bucket_details = BucketDetails(
+            DEST_BCK_NAME, Provider.AIS, {"provider": "ais"}, f"ais/@#/{DEST_BCK_NAME}/"
+        )
+        dest_object = Object(self.mock_client, dest_bucket_details, OBJ_NAME)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        self.mock_client.request.return_value = mock_response
+
+        etl_config = ETLConfig(name=ETL_NAME, args={"seed": "42", "mode": "test"})
+
+        response = self.object.copy(dest_object, etl=etl_config)
+
+        self.assertEqual(response, mock_response)
+        expected_params = self.bck_qparams.copy()
+        expected_params[QPARAM_OBJ_TO] = f"ais/@#/{DEST_BCK_NAME}/{OBJ_NAME}"
+        expected_params[QPARAM_ETL_NAME] = ETL_NAME
+        expected_params[QPARAM_ETL_ARGS] = json_dumps(
+            etl_config.args, separators=(",", ":")
+        )
+        expected_params[QPARAM_LATEST] = "false"
+        expected_params[QPARAM_SYNC] = "false"
+
+        self.mock_client.request.assert_called_once_with(
+            HTTP_METHOD_PUT,
+            path=REQUEST_PATH,
+            params=expected_params,
+        )

@@ -5,6 +5,7 @@
 package authn
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -125,7 +126,7 @@ func GetRegisteredClusters(bp api.BaseParams, spec CluACL) ([]*CluACL, error) {
 	bp.Method = http.MethodGet
 	path := apc.URLPathClusters.S
 	if spec.ID != "" {
-		path = cos.JoinWords(path, spec.ID)
+		path = cos.JoinWP(path, spec.ID)
 	}
 	reqParams := api.AllocRp()
 	defer api.FreeRp(reqParams)
@@ -154,7 +155,7 @@ func GetRole(bp api.BaseParams, roleID string) (*Role, error) {
 	defer api.FreeRp(reqParams)
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = cos.JoinWords(apc.URLPathRoles.S, roleID)
+		reqParams.Path = cos.JoinWP(apc.URLPathRoles.S, roleID)
 	}
 
 	rInfo := &Role{}
@@ -212,7 +213,7 @@ func GetUser(bp api.BaseParams, userID string) (*User, error) {
 	defer api.FreeRp(reqParams)
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = cos.JoinWords(apc.URLPathUsers.S, userID)
+		reqParams.Path = cos.JoinWP(apc.URLPathUsers.S, userID)
 	}
 
 	uInfo := &User{}
@@ -298,4 +299,33 @@ func SetConfig(bp api.BaseParams, conf *ConfigToUpdate) error {
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 	}
 	return reqParams.DoRequest()
+}
+
+func GetOIDCConfig(bp api.BaseParams) (*OIDCConfiguration, error) {
+	bp.Method = http.MethodGet
+	reqParams := api.AllocRp()
+	defer api.FreeRp(reqParams)
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathOIDC.S
+	}
+	oidcConf := &OIDCConfiguration{}
+	_, err := reqParams.DoReqAny(oidcConf)
+	return oidcConf, err
+}
+
+// GetJWKS returns the raw JSON from the JWKS endpoint
+// While it may be useful to return the parsed jwk.Set here,
+// this avoids requiring all clients (including CLI) to include the jwx library in dependencies
+func GetJWKS(bp api.BaseParams) (*json.RawMessage, error) {
+	bp.Method = http.MethodGet
+	reqParams := api.AllocRp()
+	defer api.FreeRp(reqParams)
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathJWKS.S
+	}
+	var raw json.RawMessage
+	_, err := reqParams.DoReqAny(&raw)
+	return &raw, err
 }

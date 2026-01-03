@@ -6,6 +6,7 @@ package fs
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -318,7 +319,7 @@ func (mi *Mountpath) createBckDirs(bck *cmn.Bck, nilbmd bool) (int, error) {
 			if !empty {
 				err = fmt.Errorf("bucket %s: directory %s already exists and is not empty (%v...)",
 					bck, dir, names)
-				if contentType != WorkfileType {
+				if contentType != WorkCT {
 					return num, err
 				}
 				nlog.Errorln(err)
@@ -486,7 +487,7 @@ func (mi *Mountpath) onDiskSize(bck *cmn.Bck, prefix string) (uint64, error) {
 	if prefix == "" {
 		dirPath = mi.MakePathBck(bck)
 	} else {
-		dirPath = filepath.Join(mi.MakePathCT(bck, ObjectType), prefix)
+		dirPath = filepath.Join(mi.MakePathCT(bck, ObjCT), prefix)
 		if cos.Stat(dirPath) != nil {
 			withNonDirPrefix = true // ok to fail matching
 		}
@@ -563,10 +564,14 @@ func (mi *Mountpath) _alert(config *cmn.Config, c Capacity) string {
 func New(fshc HC, num int) (blockDevs ios.BlockDevs) {
 	mfs = &MFS{hc: fshc, fsIDs: make(map[cos.FsID]string, 10)}
 	mfs.ios, blockDevs = ios.New(num)
+
+	// init content spec mgr: reg content types and resolvers
+	_once.Do(initCSM)
+
 	return blockDevs
 }
 
-// used only in tests
+// used only in tests (NOTE: mfs.hc remains nil)
 func TestNew(iostater ios.IOS) {
 	const num = 10
 	mfs = &MFS{fsIDs: make(map[cos.FsID]string, num)}
@@ -576,6 +581,9 @@ func TestNew(iostater ios.IOS) {
 		mfs.ios = iostater
 	}
 	PutMPI(make(MPI, num), make(MPI, num))
+
+	// ditto
+	_once.Do(initCSM)
 }
 
 //
@@ -637,13 +645,7 @@ func ToMPL() (mpl *apc.MountpathList) {
 }
 
 // NOTE: must be under mfs lock
-func _cloneOne(mpis MPI) (clone MPI) {
-	clone = make(MPI, len(mpis))
-	for mpath, mi := range mpis {
-		clone[mpath] = mi
-	}
-	return clone
-}
+func _cloneOne(mpis MPI) MPI { return maps.Clone(mpis) }
 
 // cloneMPI returns a shallow copy of the current (available, disabled) mountpaths
 func cloneMPI() (availableCopy, disabledCopy MPI) {
@@ -745,7 +747,7 @@ func enable(mpath, cleanMpath, tid string, config *cmn.Config) (enabledMi *Mount
 			cos.ClearfAtomic(&mi.flags, FlagWaitingDD)
 			enabledMi = mi
 			putAvailMPI(availableCopy)
-		} else if cmn.Rom.FastV(4, cos.SmoduleFS) {
+		} else if cmn.Rom.V(4, cos.ModFS) {
 			nlog.Infof("%s: %s is already available, nothing to do", tid, mi)
 		}
 		return enabledMi, nil
@@ -829,27 +831,27 @@ func Remove(mpath string, cb ...func()) (*Mountpath, error) {
 }
 
 // begin (disable | detach) transaction: CoW-mark the corresponding mountpath
-func BeginDD(action string, flags uint64, mpath string) (mi *Mountpath, numAvail int, noResil bool, err error) {
+func BeginDD(action string, flags uint64, mpath string) (mi *Mountpath, numAvail int, alreadyDD bool, err error) {
 	var cleanMpath string
 	debug.Assert(cos.BitFlags(flags).IsAnySet(cos.BitFlags(FlagWaitingDD)))
 	if cleanMpath, err = cmn.ValidateMpath(mpath); err != nil {
 		return
 	}
 	mfs.mu.Lock()
-	mi, numAvail, noResil, err = begdd(action, flags, cleanMpath)
+	mi, numAvail, alreadyDD, err = begdd(action, flags, cleanMpath)
 	mfs.mu.Unlock()
 	return
 }
 
 // under lock
-func begdd(action string, flags uint64, mpath string) (mi *Mountpath, numAvail int, noResil bool, err error) {
+func begdd(action string, flags uint64, mpath string) (mi *Mountpath, numAvail int, alreadyDD bool, err error) {
 	var (
 		avail, disabled = Get()
 		exists          bool
 	)
 	// dd inactive
 	if _, exists = avail[mpath]; !exists {
-		noResil = true
+		alreadyDD = true
 		if mi, exists = disabled[mpath]; !exists {
 			err = cmn.NewErrMpathNotFound(mpath, "" /*fqn*/, false /*disabled*/)
 			return
@@ -925,7 +927,7 @@ func _moveMarkers(avail MPI, from *Mountpath) {
 		finfos, err = os.ReadDir(fromPath)
 	)
 	if err != nil {
-		if !os.IsNotExist(err) {
+		if !cos.IsNotExist(err) {
 			nlog.Errorf("Failed to read markers' dir %q: %v", fromPath, err)
 		}
 		return
@@ -948,9 +950,9 @@ func _moveMarkers(avail MPI, from *Mountpath) {
 				toPath   = filepath.Join(mi.Path, fname.MarkersDir, fi.Name())
 			)
 			_, _, err := cos.CopyFile(fromPath, toPath, nil, cos.ChecksumNone)
-			if err != nil && os.IsNotExist(err) {
-				nlog.Errorf("Failed to move marker %q to %q: %v)", fromPath, toPath, err)
-				mfs.hc.FSHC(err, mi, "")
+			if err != nil && !cos.IsNotExist(err) {
+				nlog.Errorf("Failed to move marker %q to %q: %v", fromPath, toPath, err)
+				mfs.hc.FSHC(err, mi, fromPath)
 				ok = false
 			}
 		}
@@ -1030,7 +1032,7 @@ func DestroyBucket(op string, bck *cmn.Bck, bid uint64) error {
 		// thus, prior to going ahead with deletion:
 		if bid == 0 {
 			bdir := mi.MakePathBck(bck)
-			if finfo, erc := os.Stat(bdir); erc == nil {
+			if finfo, erc := os.Lstat(bdir); erc == nil {
 				mtime := finfo.ModTime()
 				if now.IsZero() {
 					now = time.Now()
@@ -1123,6 +1125,8 @@ func _loadXattrID(mpath string) (daeID string, err error) {
 	}
 	if cos.IsErrXattrNotFound(err) {
 		err = nil
+	} else {
+		err = fmt.Errorf("unexpected failure to access mountpath %q: %w", mpath, err)
 	}
 	return
 }
@@ -1151,7 +1155,7 @@ func OnDiskSize(bck *cmn.Bck, prefix string) (size uint64) {
 	for _, mi := range avail {
 		sz, err := mi.onDiskSize(bck, prefix)
 		if err != nil {
-			if cmn.Rom.FastV(4, cos.SmoduleFS) {
+			if cmn.Rom.V(4, cos.ModFS) {
 				nlog.Warningln("failed to calculate size on disk:", err, "["+mi.String(), bck.String(), prefix+"]")
 			}
 			return 0
@@ -1339,8 +1343,11 @@ func _either(cdf1, cdf2 *CDF) {
 func ExpireCapCache() { mfs.csExpires.Store(0) } // upon any change in config.space
 
 // called only and exclusively by `stats.Trunner` providing `config.Periodic.StatsTime` tick
-func CapPeriodic(now int64, config *cmn.Config, tcdf *Tcdf) (cs CapStatus, updated bool, err, errCap error) {
-	if now < mfs.csExpires.Load() {
+func CapPeriodic(now int64, config *cmn.Config, tcdf *Tcdf, flags cos.NodeStateFlags) (cs CapStatus, updated bool, err, errCap error) {
+	const (
+		mask = cos.DiskFault | cos.DiskOOS | cos.DiskLowCapacity | cos.OOS | cos.LowCapacity
+	)
+	if (flags&mask) == 0 && now < mfs.csExpires.Load() {
 		cs = Cap()
 		return
 	}
@@ -1378,8 +1385,8 @@ func (cs *CapStatus) IsNil() bool { return cs.TotalUsed == 0 && cs.TotalAvail ==
 func (cs *CapStatus) String() string {
 	var (
 		sb         strings.Builder
-		totalUsed  = cos.ToSizeIEC(int64(cs.TotalUsed), 1)
-		totalAvail = cos.ToSizeIEC(int64(cs.TotalAvail), 1)
+		totalUsed  = cos.IEC(int64(cs.TotalUsed), 1)
+		totalAvail = cos.IEC(int64(cs.TotalAvail), 1)
 	)
 	sb.Grow(80)
 	sb.WriteString("cap(used ")

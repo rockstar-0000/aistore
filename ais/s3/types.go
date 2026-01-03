@@ -32,13 +32,13 @@ type (
 		Name                  string          `xml:"Name"`
 		Ns                    string          `xml:"xmlns,attr"`
 		Prefix                string          `xml:"Prefix"`
-		ContinuationToken     string          `xml:"ContinuationToken"`        // original
-		NextContinuationToken string          `xml:"NextContinuationToken"`    // to read the next page
-		Contents              []*ObjInfo      `xml:"Contents"`                 // list of object
-		CommonPrefixes        []*CommonPrefix `xml:"CommonPrefixes,omitempty"` // list of dirs (used with `apc.LsNoRecursion`)
-		KeyCount              int             `xml:"KeyCount"`                 // number of object names in the response
-		MaxKeys               int             `xml:"MaxKeys"`                  // "The maximum number of keys returned ..."
-		IsTruncated           bool            `xml:"IsTruncated"`              // true if there are more pages to read
+		ContinuationToken     string          `xml:"ContinuationToken"`               // original
+		NextContinuationToken string          `xml:"NextContinuationToken,omitempty"` // to read the next page
+		Contents              []*ObjInfo      `xml:"Contents"`                        // list of object
+		CommonPrefixes        []*CommonPrefix `xml:"CommonPrefixes,omitempty"`        // list of dirs (used with `apc.LsNoRecursion`)
+		KeyCount              int             `xml:"KeyCount"`                        // number of object names in the response
+		MaxKeys               int             `xml:"MaxKeys"`                         // "The maximum number of keys returned ..."
+		IsTruncated           bool            `xml:"IsTruncated"`                     // true if there are more pages to read
 	}
 	ObjInfo struct {
 		Key          string `xml:"Key"`
@@ -150,9 +150,9 @@ func (r *ListObjectResult) MustMarshal(sgl *memsys.SGL) {
 	debug.AssertNoErr(err)
 }
 
-func (r *ListObjectResult) Add(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) {
+func (r *ListObjectResult) add(entry *cmn.LsoEnt) {
 	if entry.Flags&apc.EntryIsDir == 0 {
-		r.Contents = append(r.Contents, entryToS3(entry, lsmsg))
+		r.Contents = append(r.Contents, entryToS3(entry))
 	} else {
 		prefix := entry.Name
 		if !cos.IsLastB(entry.Name, '/') {
@@ -162,13 +162,11 @@ func (r *ListObjectResult) Add(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) {
 	}
 }
 
-func entryToS3(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) (oi *ObjInfo) {
-	// [NOTE]
-	// as we do not track mtime we choose to _prefer_ atime
-	// even when mtime (a.k.a. "LastModified") exists. Which is not always true (e.g.,
-	// when using S3 compatibility API to access non-S3 buckets)
-	// See related: `headObjS3`
-
+// Note: in S3 listings, xs/wanted_lso populates entry.Custom with ETag/LastModified
+// but only if the latter is (or are) missing
+// here, if Custom is empty, we fall back to Atime for LastModified and omit ETag
+// (see related: `apc.LsIsS3`)
+func entryToS3(entry *cmn.LsoEnt) (oi *ObjInfo) {
 	oi = &ObjInfo{Key: entry.Name, Size: entry.Size, LastModified: entry.Atime}
 
 	if entry.Custom != "" {
@@ -179,20 +177,15 @@ func entryToS3(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) (oi *ObjInfo) {
 		}
 		oi.ETag = md[cmn.ETag]
 	}
-
-	if oi.LastModified == "" && lsmsg.TimeFormat != "" {
-		oi.LastModified = cos.FormatNanoTime(0, lsmsg.TimeFormat) // 1970-01-01 epoch
-	}
-
 	return oi
 }
 
-func (r *ListObjectResult) FromLsoResult(lst *cmn.LsoRes, lsmsg *apc.LsoMsg) {
+func (r *ListObjectResult) FromLsoResult(lst *cmn.LsoRes) {
 	r.KeyCount = len(lst.Entries)
 	r.IsTruncated = lst.ContinuationToken != ""
 	r.NextContinuationToken = lst.ContinuationToken
 	for _, e := range lst.Entries {
-		r.Add(e, lsmsg)
+		r.add(e)
 	}
 }
 
@@ -202,24 +195,14 @@ func SetS3Headers(hdr http.Header, lom *core.LOM) {
 		debug.AssertFunc(func() bool {
 			return etag[0] == '"' && etag[len(etag)-1] == '"'
 		})
-	} else {
-		if v, exists := lom.GetCustomKey(cmn.ETag); exists {
-			hdr.Set(cos.HdrETag, v)
-		} else if cksum := lom.Checksum(); cksum.Type() == cos.ChecksumMD5 {
-			debug.Assert(cksum.Val()[0] != '"', cksum.Val())
-			// NOTE: could this object be multipart?
-			hdr.Set(cos.HdrETag, `"`+cksum.Value()+`"`)
-		}
+	} else if etag := lom.ETag(true /*allow to generate*/); etag != "" {
+		debug.Assert(etag[0] != '"', etag)
+		hdr.Set(cos.HdrETag, cmn.QuoteETag(etag))
 	}
 
 	// 2. Last-Modified
-	if v, ok := lom.GetCustomKey(cos.HdrLastModified); ok {
-		hdr.Set(cos.HdrLastModified, v)
-	} else {
-		// [NOTE]
-		// see "as we do not track mtime we choose to _prefer_ atime" comment above
-		atime := lom.Atime()
-		hdr.Set(cos.HdrLastModified, atime.Format(http.TimeFormat))
+	if s := lom.LastModifiedStr(); s != "" {
+		hdr.Set(cos.HdrLastModified, s)
 	}
 
 	// 3. x-amz-version-id
@@ -271,4 +254,11 @@ func (r *DeleteResult) MustMarshal(sgl *memsys.SGL) {
 	sgl.Write(cos.UnsafeB(xml.Header))
 	err := xml.NewEncoder(sgl).Encode(r)
 	debug.AssertNoErr(err)
+}
+
+func DecodeXML[T any](body []byte) (result T, _ error) {
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return result, err
+	}
+	return result, nil
 }

@@ -3,22 +3,23 @@
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
-// AIS loader (aisloader) is a tool to measure storage performance. It's a load
+// `aisloader` is a benchmarking tool to measure storage performance. It's a load
 // generator that can be used to benchmark and stress-test AIStore
 // or any S3-compatible backend.
+//
 // In fact, aisloader can list, write, and read S3(*) buckets _directly_, which
 // makes it quite useful, convenient, and easy to use benchmark tool to compare
-// storage performance with aistore in front of S3 vs _without_.
+// storage performance with AIStore in front of S3 vs _without_.
 //
 // (*) aisloader can be further easily extended to work directly with any
-// Cloud storage including, but not limited to, aistore-supported GCP, OCI, and Azure.
+// Cloud storage including, but not limited to, AIS-supported GCP, OCI, and Azure.
 //
 // In addition, `aisloader` generates synthetic workloads that mimic training and
 // inference workloads - the capability that allows to run benchmarks in isolation
 // avoiding compute-side bottlenecks and the associated complexity (to analyze those).
 //
 // For usage, run: `aisloader`, or `aisloader usage`, or `aisloader --help`,
-// or see examples.go.
+// or see examples.go in this package.
 
 package aisloader
 
@@ -31,9 +32,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -43,26 +42,21 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
-	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/bench/tools/aisloader/namegetter"
 	"github.com/NVIDIA/aistore/bench/tools/aisloader/stats"
+	"github.com/NVIDIA/aistore/bench/tools/aisloader/stats/statsd"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/stats/statsd"
 	"github.com/NVIDIA/aistore/tools/readers"
-	"github.com/NVIDIA/aistore/tools/tetl"
 	"github.com/NVIDIA/aistore/xact"
 
 	onexxh "github.com/OneOfOne/xxhash"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	jsoniter "github.com/json-iterator/go"
 )
 
 const (
@@ -79,71 +73,13 @@ const (
 )
 
 type (
-	params struct {
-		smap                 *meta.Smap
-		bp                   api.BaseParams
-		bck                  cmn.Bck
-		putSizeUpperBoundStr string // stop after writing that amount of data
-		statsdIP             string
-		subDir               string
-		readLenStr           string // read length (and see readLen below)
-		readOffStr           string // read offset (and see readOff below)
-		maxSizeStr           string
-		minSizeStr           string
-		proxyURL             string
-		bPropsStr            string
-		tokenFile            string
-		cksumType            string
-		statsOutput          string
-		tmpDir               string // when usingFile
-		readerType           string
-		loaderID             string // used with multiple loader instances generating objects in parallel
-		fileList             string // local file that contains object names (an alternative to running list-objects)
-		etlName              string // name of a ETL to apply to each object. Omitted when etlSpecPath specified.
-		etlSpecPath          string // ETL spec pathname to apply to each object.
-		bProps               cmn.Bprops
-		duration             DurationExt // stop after the run for at least that much
-		batchSize            int         // used for: bootstrap(list) and delete
-		numEpochs            uint
-		loaderIDHashLen      uint
-		seed                 int64 // random seed; UnixNano() if omitted
-		numWorkers           int
-		updateExistingPct    int // % of updates (GET, PUT over)combo
-		putPct               int // % of PUTs, rest are GETs
-		statsShowInterval    int
-		statsdPort           int
-		putShards            uint64
-		maxputs              uint64
-		loaderCnt            uint64
-		readLen              int64 // read length
-		readOff              int64 // read offset
-		maxSize              int64
-		minSize              int64
-		putSizeUpperBound    int64
-		cleanUp              BoolExt // cleanup i.e. remove and destroy everything created during bench
-		statsdProbe          bool
-		getLoaderID          bool
-		randomObjName        bool
-		randomProxy          bool
-		uniqueGETs           bool
-		skipList             bool // when true, skip listing objects before running 100% PUT workload (see also fileList)
-		verifyHash           bool // verify xxhash during get
-		getConfig            bool // when true, execute control plane requests (read cluster configuration)
-		jsonFormat           bool
-		stoppable            bool // when true, terminate by Ctrl-C
-		dryRun               bool // print configuration and parameters that aisloader will use at runtime
-		traceHTTP            bool // trace http latencies as per httpLatencies & https://golang.org/pkg/net/http/httptrace
-		latest               bool // check in-cluster metadata and possibly GET the latest object version from the associated remote bucket
-		cached               bool // list in-cluster objects - only those objects from a remote bucket that are present (\"cached\")
-		listDirs             bool // do list virtual subdirectories (applies to remote buckets only)
-	}
-
 	// sts records accumulated puts/gets information.
 	sts struct {
-		statsd    stats.Metrics
-		put       stats.HTTPReq
-		get       stats.HTTPReq
-		getConfig stats.HTTPReq
+		statsd   stats.Metrics
+		put      stats.HTTPReq
+		get      stats.HTTPReq
+		getBatch stats.HTTPReq
+		putMPU   stats.HTTPReq // multipart upload operations
 	}
 
 	jsonStats struct {
@@ -164,12 +100,21 @@ var (
 	rnd              *rand.Rand
 	intervalStats    sts
 	accumulatedStats sts
-	bucketObjsNames  namegetter.ObjectNameGetter
+	objnameGetter    namegetter.Basic
 	statsPrintHeader = "%-10s%-6s%-22s\t%-22s\t%-36s\t%-22s\t%-10s\n"
 	statsdC          *statsd.Client
-	getPending       int64
-	putPending       int64
-	traceHTTPSig     atomic.Bool
+
+	// ===========================================================
+	// NOTE: the following non-atomic counters are updated/read exclusively
+	// by the single-threaded producer (main) loop. Do NOT access from
+	// worker goroutines - or switch to atomics or refactor accordingly.
+	// ===========================================================
+	getPending      int64  // main-loop only
+	putPending      int64  // main-loop only
+	totalWOs        uint64 // main-loop only (used for deterministic hashing)
+	getBatchPending int64  // main-loop only
+
+	traceHTTPSig atomic.Bool
 
 	flagUsage   bool
 	flagVersion bool
@@ -224,7 +169,7 @@ func Start(version, buildtime string) (err error) {
 	addCmdLine(f, runParams)
 
 	// validate and finish initialization
-	if err = _init(runParams); err != nil {
+	if err = initParams(runParams); err != nil {
 		return err
 	}
 
@@ -236,7 +181,7 @@ func Start(version, buildtime string) (err error) {
 	if runParams.getLoaderID {
 		fmt.Printf("0x%x\n", suffixID)
 		if useRandomObjName {
-			fmt.Printf("Warning: loaderID 0x%x used only for StatsD, not for object names!\n", suffixID)
+			fmt.Fprintf(os.Stderr, "Warning: loaderID 0x%x used only for StatsD, not for object names!\n", suffixID)
 		}
 		return nil
 	}
@@ -255,14 +200,14 @@ func Start(version, buildtime string) (err error) {
 		runParams.duration.Val = time.Duration(math.MaxInt64)
 	}
 
-	if runParams.readerType == readers.TypeFile {
+	if runParams.readerType == readers.File && runParams.putPct > 0 {
 		if err := cos.CreateDir(runParams.tmpDir + "/" + myName); err != nil {
 			return fmt.Errorf("failed to create local test directory %q, err = %s", runParams.tmpDir, err.Error())
 		}
 	}
 
 	// usage is currently limited to selecting a random proxy (gateway)
-	// to access aistore (done for every I/O request)
+	// to access AIStore (done for every I/O request)
 	if runParams.randomProxy {
 		runParams.smap, err = api.GetClusterMap(runParams.bp)
 		if err != nil {
@@ -277,10 +222,8 @@ func Start(version, buildtime string) (err error) {
 	runParams.bp.UA = ua
 
 	var created bool
-	if !runParams.getConfig {
-		if err := setupBucket(runParams, &created); err != nil {
-			return err
-		}
+	if err := setupBucket(runParams, &created); err != nil {
+		return err
 	}
 
 	if isDirectS3() {
@@ -299,25 +242,55 @@ func Start(version, buildtime string) (err error) {
 		if runParams.putPct < 100 {
 			return errors.New("new bucket, expecting 100% PUT")
 		}
-		bucketObjsNames = &namegetter.RandomNameGetter{}
-		bucketObjsNames.Init([]string{}, rnd)
-	case !runParams.getConfig && !runParams.skipList:
-		if err := listObjects(); err != nil {
+		objnameGetter = &namegetter.Random{}
+		objnameGetter.Init([]string{}, rnd)
+
+		// note that "'-skiplist' option is ignored when '-filelist' is specified"
+	case !runParams.skipList:
+		names, fcnt, err := listObjects()
+		if err != nil {
 			return err
 		}
 
-		objsLen := bucketObjsNames.Len()
-		if runParams.putPct == 0 && objsLen == 0 {
+		// more validations:
+		var (
+			l               = len(names)
+			ng, isPermBased = newNameGetter(names)
+		)
+		if runParams.putPct < 100 && isPermBased && l < 2 {
+			mixed := cos.Ternary(runParams.putPct > 0, " mixed", " read-only")
+			return fmt.Errorf("need at least 2 existing objects for epochs-based%s workload (got %d)", mixed, l)
+		}
+		if runParams.putPct == 0 && l == 0 {
 			if runParams.subDir == "" {
 				return errors.New("the bucket is empty, cannot run 100% read benchmark")
 			}
 			return errors.New("no objects with prefix '" + runParams.subDir + "' in the bucket, cannot run 100% read benchmark")
 		}
+		if runParams.getBatchSize > l {
+			return fmt.Errorf("batch size (%d) exceeds dataset size (%d)", runParams.getBatchSize, l)
+		}
 
-		fmt.Printf("Found %s existing object%s\n\n", cos.FormatBigInt(objsLen), cos.Plural(objsLen))
+		// initialize global name-getter and announce
+		objnameGetter = ng
+		objnameGetter.Init(names, rnd)
+		switch fcnt {
+		case 0:
+			fmt.Printf("Found %s existing object%s\n\n", cos.FormatBigInt(l), cos.Plural(l))
+		case l:
+			fmt.Printf("Found %s archived file%s\n\n", cos.FormatBigInt(l), cos.Plural(l))
+		default:
+			plainCnt := l - fcnt
+			archPct := (fcnt * 100) / l
+			fmt.Printf("Found %s plain object%s and %s archived file%s (%d%% archived)\n\n",
+				cos.FormatBigInt(plainCnt), cos.Plural(plainCnt),
+				cos.FormatBigInt(fcnt), cos.Plural(fcnt),
+				archPct)
+		}
+
 	default:
-		bucketObjsNames = &namegetter.RandomNameGetter{}
-		bucketObjsNames.Init([]string{}, rnd)
+		objnameGetter = &namegetter.Random{}
+		objnameGetter.Init([]string{}, rnd)
 	}
 
 	printRunParams(runParams)
@@ -355,7 +328,7 @@ func Start(version, buildtime string) (err error) {
 
 	config := &cmn.Config{}
 	config.Log.Level = "3"
-	memsys.Init(prefixC, prefixC, config)
+	// memsys.Init(prefixC, prefixC, config) // TODO: revisit
 	gmm = memsys.PageMM()
 	gmm.RegWithHK()
 
@@ -406,7 +379,7 @@ func Start(version, buildtime string) (err error) {
 	if runParams.statsOutput != "" {
 		f, err := cos.CreateFile(runParams.statsOutput)
 		if err != nil {
-			fmt.Println("Failed to create stats out file")
+			fmt.Fprintf(os.Stderr, "Failed to create stats-out %q: %v\n", runParams.statsOutput, err)
 		}
 
 		statsWriter = f
@@ -434,7 +407,7 @@ func Start(version, buildtime string) (err error) {
 MainLoop:
 	for runParams.putSizeUpperBound == 0 || accumulatedStats.put.TotalBytes() < runParams.putSizeUpperBound {
 		if runParams.numEpochs > 0 { // if defined
-			if numGets.Load() > int64(runParams.numEpochs)*int64(bucketObjsNames.Len()) {
+			if numGets.Load() > int64(runParams.numEpochs)*int64(objnameGetter.Len()) {
 				break
 			}
 		}
@@ -447,7 +420,6 @@ MainLoop:
 			sendStatsdStats(&intervalStats)
 			intervalStats = newStats(time.Now())
 		default:
-			break
 		}
 
 		select {
@@ -455,6 +427,7 @@ MainLoop:
 			break MainLoop
 		case wo := <-resCh:
 			completeWorkOrder(wo, false)
+			freeWO(wo)
 			if runParams.statsShowInterval == 0 && runParams.putSizeUpperBound != 0 {
 				accumulatedStats.aggregate(&intervalStats)
 				intervalStats = newStats(time.Now())
@@ -500,6 +473,25 @@ Done:
 
 	finalizeStats(statsWriter)
 	fmt.Printf("Stats written to %s\n", statsWriter.Name())
+
+	// Verify chunked objects if multipart upload was used
+	if runParams.multipartChunks > 0 && runParams.putPct > 0 {
+		chunkedLs, err := api.ListObjects(runParams.bp, runParams.bck, &apc.LsoMsg{Props: apc.GetPropsChunked}, api.ListArgs{})
+		if err != nil {
+			fmt.Println("failed to list chunked objects: ", err)
+		} else {
+			var actualChunked int64
+			for _, entry := range chunkedLs.Entries {
+				if entry.Flags&apc.EntryIsChunked != 0 {
+					actualChunked++
+				}
+			}
+			if actualChunked != accumulatedStats.putMPU.Total() {
+				fmt.Fprintf(os.Stderr, "Warning: Expected %d chunked objects but found %d\n", accumulatedStats.putMPU.Total(), actualChunked)
+			}
+		}
+	}
+
 	if runParams.cleanUp.Val {
 		cleanup()
 	}
@@ -507,431 +499,6 @@ Done:
 	fmt.Printf("\nActual run duration: %v\n", time.Since(tsStart))
 
 	return err
-}
-
-func addCmdLine(f *flag.FlagSet, p *params) {
-	f.BoolVar(&flagUsage, "usage", false, "show command-line options, usage, and examples")
-	f.BoolVar(&flagVersion, "version", false, "show aisloader version")
-	f.BoolVar(&flagQuiet, "quiet", false, "when starting to run, do not print command line arguments, default settings, and usage examples")
-	f.DurationVar(&cargs.Timeout, "timeout", 10*time.Minute, "client HTTP timeout - used in LIST/GET/PUT/DELETE")
-	f.IntVar(&p.statsShowInterval, "statsinterval", 10, "interval in seconds to print performance counters; 0 - disabled")
-	f.StringVar(&p.bck.Name, "bucket", "", "bucket name or bucket URI. If empty, a bucket with random name will be created")
-	f.StringVar(&p.bck.Provider, "provider", apc.AIS,
-		"ais - for AIS bucket, \"aws\", \"azure\", \"gcp\", \"oci\" for Azure, Amazon, Google, and Oracle clouds, respectively")
-
-	f.StringVar(&ip, "ip", defaultClusterIP, "AIS proxy/gateway IP address or hostname")
-	f.StringVar(&port, "port", "8080", "AIS proxy/gateway port")
-
-	//
-	// s3 direct (NOTE: with no aistore in-between)
-	//
-	f.StringVar(&s3Endpoint, "s3endpoint", "", "S3 endpoint to read/write s3 bucket directly (with no aistore)")
-	f.StringVar(&s3Profile, "s3profile", "", "other then default S3 config profile referencing alternative credentials")
-	f.BoolVar(&s3UsePathStyle, "s3-use-path-style", false, "use older path-style addressing (as opposed to virtual-hosted style), e.g., https://s3.amazonaws.com/BUCKET/KEY. Should only be used with 's3endpoint' option")
-
-	DurationExtVar(f, &p.duration, "duration", time.Minute,
-		"Benchmark duration (0 - run forever or until Ctrl-C). \n"+
-			"If not specified and totalputsize > 0, aisloader runs until totalputsize reached. Otherwise aisloader runs until first of duration and "+
-			"totalputsize reached")
-
-	f.IntVar(&p.numWorkers, "numworkers", 10, "number of goroutine workers operating on AIS in parallel")
-	f.IntVar(&p.putPct, "pctput", 0, "percentage of PUTs in the aisloader-generated workload")
-
-	// see also: opUpdateExisting
-	f.IntVar(&p.updateExistingPct, "pctupdate", 0,
-		"percentage of GET requests that are followed by a PUT \"update\" (i.e., creation of a new version of the object)")
-
-	f.StringVar(&p.tmpDir, "tmpdir", "/tmp/ais", "local directory to store temporary files")
-	f.StringVar(&p.putSizeUpperBoundStr, "totalputsize", "0",
-		"stop PUT workload once cumulative PUT size reaches or exceeds this value (can contain standard multiplicative suffix K, MB, GiB, etc.; 0 - unlimited")
-	BoolExtVar(f, &p.cleanUp, "cleanup", "when true, remove bucket upon benchmark termination (must be specified for aistore buckets)")
-	f.BoolVar(&p.verifyHash, "verifyhash", false,
-		"when true, checksum-validate GET: recompute object checksums and validate it against the one received with the GET metadata")
-
-	f.StringVar(&p.minSizeStr, "minsize", "", "minimum object size (with or without multiplicative suffix K, MB, GiB, etc.)")
-	f.StringVar(&p.maxSizeStr, "maxsize", "", "maximum object size (with or without multiplicative suffix K, MB, GiB, etc.)")
-	f.StringVar(&p.readerType, "readertype", readers.TypeSG,
-		fmt.Sprintf("[advanced usage only] type of reader: %s(default) | %s | %s | %s", readers.TypeSG, readers.TypeFile, readers.TypeRand, readers.TypeTar))
-	f.StringVar(&p.loaderID, "loaderid", "0", "ID to identify a loader among multiple concurrent instances")
-	f.StringVar(&p.statsdIP, "statsdip", "localhost", "StatsD IP address or hostname")
-	f.StringVar(&p.tokenFile, "tokenfile", "", "authentication token (FQN)") // see also: AIS_AUTHN_TOKEN_FILE
-	f.IntVar(&p.statsdPort, "statsdport", 8125, "StatsD UDP port")
-	f.BoolVar(&p.statsdProbe, "test-probe StatsD server prior to benchmarks", false, "when enabled probes StatsD server prior to running")
-	f.IntVar(&p.batchSize, "batchsize", 100, "batch size to list and delete")
-	f.StringVar(&p.bPropsStr, "bprops", "", "JSON string formatted as per the SetBucketProps API and containing bucket properties to apply")
-	f.Int64Var(&p.seed, "seed", 0, "random seed to achieve deterministic reproducible results (0 - use current time in nanoseconds)")
-	f.BoolVar(&p.jsonFormat, "json", false, "when true, print output in JSON format")
-	f.StringVar(&p.readOffStr, "readoff", "", "read range offset (can contain multiplicative suffix K, MB, GiB, etc.)")
-	f.StringVar(&p.readLenStr, "readlen", "", "read range length (can contain multiplicative suffix; 0 - GET full object)")
-	f.Uint64Var(&p.maxputs, "maxputs", 0, "maximum number of objects to PUT")
-	f.UintVar(&p.numEpochs, "epochs", 0, "number of \"epochs\" to run whereby each epoch entails full pass through the entire listed bucket")
-	f.BoolVar(&p.skipList, "skiplist", false, "when true, skip listing objects in a bucket before running 100% PUT workload")
-	f.StringVar(&p.fileList, "filelist", "", "local or locally-accessible text file containing object names (for subsequent reading)")
-
-	//
-	// object naming
-	//
-	f.Uint64Var(&p.loaderCnt, "loadernum", 0,
-		"total number of aisloaders running concurrently and generating combined load. If defined, must be greater than the loaderid and cannot be used together with loaderidhashlen")
-	f.BoolVar(&p.getLoaderID, "getloaderid", false,
-		"when true, print stored/computed unique loaderID aka aisloader identifier and exit")
-	f.UintVar(&p.loaderIDHashLen, "loaderidhashlen", 0,
-		"Size (in bits) of the generated aisloader identifier. Cannot be used together with loadernum")
-	f.BoolVar(&p.randomObjName, "randomname", true,
-		"when true, generate object names of 32 random characters. This option is ignored when loadernum is defined")
-	f.BoolVar(&p.randomProxy, "randomproxy", false,
-		"when true, select random gateway (\"proxy\") to execute I/O request")
-	f.StringVar(&p.subDir, "subdir", "", "For GET requests, '-subdir' is a prefix that may or may not be an actual _virtual directory_;\n"+
-		"For PUTs, '-subdir' is a virtual destination directory for all aisloader-generated objects;\n"+
-		"See also:\n"+
-		"\t- closely related CLI '--prefix' option: "+cmn.GitHubHome+"/blob/main/docs/cli/object.md\n"+
-		"\t- virtual directories:                   "+cmn.GitHubHome+"/blob/main/docs/howto_virt_dirs.md")
-	f.Uint64Var(&p.putShards, "putshards", 0, "spread generated objects over this many subdirectories (max 100k)")
-	f.BoolVar(&p.uniqueGETs, "uniquegets", true,
-		"when true, GET objects randomly and equally. Meaning, make sure *not* to GET some objects more frequently than the others")
-
-	//
-	// advanced usage
-	//
-	f.BoolVar(&p.getConfig, "getconfig", false,
-		"when true, generate control plane load by reading AIS proxy configuration (that is, instead of reading/writing data exercise control path)")
-	f.StringVar(&p.statsOutput, "stats-output", "", "filename to log statistics (empty string translates as standard output (default))")
-	f.BoolVar(&p.stoppable, "stoppable", false, "when true, stop upon CTRL-C")
-	f.BoolVar(&p.dryRun, "dry-run", false, "when true, show the configuration and parameters that aisloader will use for benchmark")
-	f.BoolVar(&p.traceHTTP, "trace-http", false, "when true, trace HTTP latencies") // see httpLatencies
-	f.StringVar(&p.cksumType, "cksum-type", cos.ChecksumOneXxh, "cksum type to use for put object requests")
-	f.BoolVar(&p.latest, "latest", false, "when true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket")
-	f.BoolVar(&p.cached, "cached", false, "list in-cluster objects - only those objects from a remote bucket that are present (\"cached\")")
-	f.BoolVar(&p.listDirs, "list-dirs", false, "list virtual subdirectories (remote buckets only)")
-
-	// ETL
-	f.StringVar(&p.etlName, "etl", "", "name of an ETL applied to each object on GET request. One of '', 'tar2tf', 'md5', 'echo'")
-	f.StringVar(&p.etlSpecPath, "etl-spec", "", "path to an ETL spec to be applied to each object on GET request.")
-
-	// temp replace flags.Usage callback:
-	// too many flags with actual parsing error quickly disappearing from view
-	orig := f.Usage
-	f.Usage = func() {
-		fmt.Println("Run `aisloader` (for inline help), `aisloader version` (for version), or see 'docs/aisloader.md' for details and usage examples.")
-	}
-	f.Parse(os.Args[1:])
-	f.Usage = orig
-
-	if len(os.Args[1:]) == 0 {
-		printUsage(f)
-		os.Exit(0)
-	}
-
-	os.Args = []string{os.Args[0]}
-	flag.Parse() // Called so that imported packages don't complain
-
-	if flagUsage || (f.NArg() != 0 && (f.Arg(0) == "usage" || f.Arg(0) == "help")) {
-		printUsage(f)
-		os.Exit(0)
-	}
-	if flagVersion || (f.NArg() != 0 && f.Arg(0) == "version") {
-		fmt.Printf("version %s (build %s)\n", _version, _buildtime)
-		os.Exit(0)
-	}
-}
-
-// validate command line and finish initialization
-func _init(p *params) (err error) {
-	// '--s3endpoint' takes precedence
-	if s3Endpoint == "" {
-		if ep := os.Getenv(env.AWSEndpoint); ep != "" {
-			s3Endpoint = ep
-		}
-	}
-	if p.bck.Name != "" {
-		if p.cleanUp.Val && isDirectS3() {
-			return errors.New("direct S3 access via '-s3endpoint': option '-cleanup' is not supported yet")
-		}
-		if !p.cleanUp.IsSet && !isDirectS3() {
-			fmt.Println("\nNote: `-cleanup` is a required option. Beware! When -cleanup=true the bucket will be destroyed upon completion of the benchmark.")
-			fmt.Println("      The option must be specified in the command line, e.g.: `--cleanup=false`")
-			os.Exit(1)
-		}
-	}
-
-	if p.seed == 0 {
-		p.seed = mono.NanoTime()
-	}
-	rnd = rand.New(cos.NewRandSource(uint64(p.seed)))
-
-	if p.putSizeUpperBoundStr != "" {
-		if p.putSizeUpperBound, err = cos.ParseSize(p.putSizeUpperBoundStr, cos.UnitsIEC); err != nil {
-			return fmt.Errorf("failed to parse total PUT size %s: %v", p.putSizeUpperBoundStr, err)
-		}
-	}
-
-	if p.minSizeStr != "" {
-		if p.minSize, err = cos.ParseSize(p.minSizeStr, cos.UnitsIEC); err != nil {
-			return fmt.Errorf("failed to parse min size %s: %v", p.minSizeStr, err)
-		}
-	} else {
-		p.minSize = cos.MiB
-	}
-
-	if p.maxSizeStr != "" {
-		if p.maxSize, err = cos.ParseSize(p.maxSizeStr, cos.UnitsIEC); err != nil {
-			return fmt.Errorf("failed to parse max size %s: %v", p.maxSizeStr, err)
-		}
-	} else {
-		p.maxSize = cos.GiB
-	}
-
-	if !p.duration.IsSet {
-		if p.putSizeUpperBound != 0 || p.numEpochs != 0 {
-			// user specified putSizeUpperBound or numEpochs, but not duration, override default 1 minute
-			// and run aisloader until other threshold is reached
-			p.duration.Val = time.Duration(math.MaxInt64)
-		} else {
-			fmt.Printf("\nDuration not specified - running for %v\n\n", p.duration.Val)
-		}
-	}
-
-	// Sanity check
-	if p.maxSize < p.minSize {
-		return fmt.Errorf("invalid option: min and max size (%d, %d), respectively", p.minSize, p.maxSize)
-	}
-
-	if p.putPct < 0 || p.putPct > 100 {
-		return fmt.Errorf("invalid option: PUT percent %d", p.putPct)
-	}
-	if p.updateExistingPct < 0 || p.updateExistingPct > 100 {
-		return fmt.Errorf("invalid %d percentage of GET requests that are followed by a PUT \"update\"", p.putPct)
-	}
-
-	if p.skipList {
-		if p.fileList != "" {
-			fmt.Printf("Warning: '-skiplist' is redundant (implied) when '-filelist' is specified")
-		} else if p.putPct != 100 {
-			return errors.New("invalid option: '-skiplist' is only valid for 100% PUT workloads")
-		}
-	}
-
-	// direct s3 access vs other command line
-	if isDirectS3() {
-		if p.randomProxy {
-			return errors.New("command line options '-s3endpoint' and '-randomproxy' are mutually exclusive")
-		}
-		if ip != "" && ip != defaultClusterIP && ip != defaultClusterIPv4 {
-			return errors.New("command line options '-s3endpoint' and '-ip' are mutually exclusive")
-		}
-		if port != "" && port != "8080" { // TODO: ditto
-			return errors.New("command line options '-s3endpoint' and '-port' are mutually exclusive")
-		}
-		if p.traceHTTP {
-			return errors.New("direct S3 access via '-s3endpoint': HTTP tracing is not supported yet")
-		}
-		if p.cleanUp.Val {
-			return errors.New("direct S3 access via '-s3endpoint': '-cleanup' option is not supported yet")
-		}
-		if p.verifyHash {
-			return errors.New("direct S3 access via '-s3endpoint': '-verifyhash' option is not supported yet")
-		}
-		if p.readOffStr != "" || p.readLenStr != "" {
-			return errors.New("direct S3 access via '-s3endpoint': Read range is not supported yet")
-		}
-	}
-
-	if p.statsShowInterval < 0 {
-		return fmt.Errorf("invalid option: stats show interval %d", p.statsShowInterval)
-	}
-
-	if p.readOffStr != "" {
-		if p.readOff, err = cos.ParseSize(p.readOffStr, cos.UnitsIEC); err != nil {
-			return fmt.Errorf("failed to parse read offset %s: %v", p.readOffStr, err)
-		}
-	}
-	if p.readLenStr != "" {
-		if p.readLen, err = cos.ParseSize(p.readLenStr, cos.UnitsIEC); err != nil {
-			return fmt.Errorf("failed to parse read length %s: %v", p.readLenStr, err)
-		}
-	}
-
-	if p.loaderID == "" {
-		return errors.New("loaderID can't be empty")
-	}
-
-	loaderID, parseErr := strconv.ParseUint(p.loaderID, 10, 64)
-	if p.loaderCnt == 0 && p.loaderIDHashLen == 0 {
-		if p.randomObjName {
-			useRandomObjName = true
-			if parseErr != nil {
-				return errors.New("loaderID as string only allowed when using loaderIDHashLen")
-			}
-			// don't have to set suffixIDLen as userRandomObjName = true
-			suffixID = loaderID
-		} else {
-			// stats will be using loaderID
-			// but as suffixIDMaskLen = 0, object names will be just consecutive numbers
-			suffixID = loaderID
-			suffixIDMaskLen = 0
-		}
-	} else {
-		if p.loaderCnt > 0 && p.loaderIDHashLen > 0 {
-			return errors.New("loadernum and loaderIDHashLen can't be > 0 at the same time")
-		}
-
-		if p.loaderIDHashLen > 0 {
-			if p.loaderIDHashLen == 0 || p.loaderIDHashLen > 63 {
-				return errors.New("loaderIDHashLen has to be larger than 0 and smaller than 64")
-			}
-
-			suffixIDMaskLen = ceilAlign(p.loaderIDHashLen, 4)
-			suffixID = getIDFromString(p.loaderID, suffixIDMaskLen)
-		} else {
-			// p.loaderCnt > 0
-			if parseErr != nil {
-				return errors.New("loadername has to be a number when using loadernum")
-			}
-			if loaderID > p.loaderCnt {
-				return errors.New("loaderid has to be smaller than loadernum")
-			}
-
-			suffixIDMaskLen = loaderMaskFromTotalLoaders(p.loaderCnt)
-			suffixID = loaderID
-		}
-	}
-
-	if p.subDir != "" {
-		p.subDir = filepath.Clean(p.subDir)
-		if p.subDir[0] == '/' {
-			return errors.New("object name prefix can't start with /")
-		}
-	}
-
-	if p.putShards > 100000 {
-		return errors.New("putshards should not exceed 100000")
-	}
-
-	if err := cos.ValidateCksumType(p.cksumType); err != nil {
-		return err
-	}
-
-	if p.etlName != "" && p.etlSpecPath != "" {
-		return errors.New("etl and etl-spec flag can't be set both")
-	}
-
-	if p.etlSpecPath != "" {
-		fh, err := os.Open(p.etlSpecPath)
-		if err != nil {
-			return err
-		}
-		etlSpec, err := cos.ReadAll(fh)
-		fh.Close()
-		if err != nil {
-			return err
-		}
-		etlInitSpec, err = tetl.SpecToInitMsg(etlSpec)
-		if err != nil {
-			return err
-		}
-	}
-
-	if p.etlName != "" {
-		etlSpec, err := tetl.GetTransformYaml(p.etlName)
-		if err != nil {
-			return err
-		}
-		etlInitSpec, err = tetl.SpecToInitMsg(etlSpec)
-		if err != nil {
-			return err
-		}
-	}
-
-	if p.bPropsStr != "" {
-		var bprops cmn.Bprops
-		jsonStr := strings.TrimRight(p.bPropsStr, ",")
-		if !strings.HasPrefix(jsonStr, "{") {
-			jsonStr = "{" + strings.TrimRight(jsonStr, ",") + "}"
-		}
-
-		if err := jsoniter.Unmarshal([]byte(jsonStr), &bprops); err != nil {
-			return fmt.Errorf("failed to parse bucket properties: %v", err)
-		}
-
-		p.bProps = bprops
-		if p.bProps.EC.Enabled {
-			// fill EC defaults
-			if p.bProps.EC.ParitySlices == 0 {
-				p.bProps.EC.ParitySlices = 1
-			}
-			if p.bProps.EC.DataSlices == 0 {
-				p.bProps.EC.DataSlices = 1
-			}
-
-			if p.bProps.EC.ParitySlices < 1 || p.bProps.EC.ParitySlices > 32 {
-				return fmt.Errorf(
-					"invalid number of parity slices: %d, it must be between 1 and 32",
-					p.bProps.EC.ParitySlices)
-			}
-			if p.bProps.EC.DataSlices < 1 || p.bProps.EC.DataSlices > 32 {
-				return fmt.Errorf(
-					"invalid number of data slices: %d, it must be between 1 and 32",
-					p.bProps.EC.DataSlices)
-			}
-		}
-
-		if p.bProps.Mirror.Enabled {
-			// fill mirror default properties
-			if p.bProps.Mirror.Burst == 0 {
-				p.bProps.Mirror.Burst = 512
-			}
-			if p.bProps.Mirror.Copies == 0 {
-				p.bProps.Mirror.Copies = 2
-			}
-			if p.bProps.Mirror.Copies != 2 {
-				return fmt.Errorf(
-					"invalid number of mirror copies: %d, it must equal 2",
-					p.bProps.Mirror.Copies)
-			}
-		}
-	}
-
-	var useHTTPS bool
-	if !isDirectS3() {
-		// AIS endpoint: http://ip:port _or_ AIS_ENDPOINT env
-		aisEndpoint := "http://" + ip + ":" + port
-
-		// see also: tlsArgs
-		envEndpoint = os.Getenv(env.AisEndpoint)
-		if envEndpoint != "" {
-			if ip != "" && ip != defaultClusterIP && ip != defaultClusterIPv4 {
-				return fmt.Errorf("'%s=%s' environment and '--ip=%s' command-line are mutually exclusive",
-					env.AisEndpoint, envEndpoint, ip)
-			}
-			aisEndpoint = envEndpoint
-		}
-
-		traceHTTPSig.Store(p.traceHTTP)
-
-		scheme, address := cmn.ParseURLScheme(aisEndpoint)
-		if scheme == "" {
-			scheme = "http"
-		}
-		if scheme != "http" && scheme != "https" {
-			return fmt.Errorf("invalid aistore endpoint %q: unknown URI scheme %q", aisEndpoint, scheme)
-		}
-
-		// TODO: validate against cluster map (see api.GetClusterMap below)
-		p.proxyURL = scheme + "://" + address
-		useHTTPS = scheme == "https"
-	}
-
-	p.bp = api.BaseParams{URL: p.proxyURL}
-	if useHTTPS {
-		// environment to override client config
-		cmn.EnvToTLS(&sargs)
-		p.bp.Client = cmn.NewClientTLS(cargs, sargs, false /*intra-cluster*/)
-	} else {
-		p.bp.Client = cmn.NewClient(cargs)
-	}
-
-	// NOTE: auth token is assigned below when we execute the very first API call
-	return nil
 }
 
 func isDirectS3() bool {
@@ -948,31 +515,33 @@ func loaderMaskFromTotalLoaders(totalLoaders uint64) uint {
 func printArguments(set *flag.FlagSet) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
 
-	fmt.Fprintf(w, "==== COMMAND LINE ARGUMENTS ====\n")
-	fmt.Fprintf(w, "=========== DEFAULTS ===========\n")
+	fmt.Fprint(w, "==== COMMAND LINE ARGUMENTS ====\n")
+	fmt.Fprint(w, "=========== DEFAULTS ===========\n")
 	set.VisitAll(func(f *flag.Flag) {
 		if f.Value.String() == f.DefValue {
 			_, _ = fmt.Fprintf(w, "%s:\t%s\n", f.Name, f.Value.String())
 		}
 	})
-	fmt.Fprintf(w, "============ CUSTOM ============\n")
+	fmt.Fprint(w, "============ CUSTOM ============\n")
 	set.VisitAll(func(f *flag.Flag) {
 		if f.Value.String() != f.DefValue {
 			_, _ = fmt.Fprintf(w, "%s:\t%s\n", f.Name, f.Value.String())
 		}
 	})
 	fmt.Fprintf(w, "HTTP trace:\t%v\n", runParams.traceHTTP)
-	fmt.Fprintf(w, "=================================\n\n")
+	fmt.Fprint(w, "=================================\n\n")
 	w.Flush()
 }
 
 // newStats returns a new stats object with given time as the starting point
 func newStats(t time.Time) sts {
 	return sts{
-		put:       stats.NewHTTPReq(t),
-		get:       stats.NewHTTPReq(t),
-		getConfig: stats.NewHTTPReq(t),
-		statsd:    stats.NewStatsdMetrics(t),
+		put:      stats.NewHTTPReq(t),
+		get:      stats.NewHTTPReq(t),
+		putMPU:   stats.NewHTTPReq(t),
+		getBatch: stats.NewHTTPReq(t),
+		// StatsD is deprecated
+		statsd: stats.NewStatsdMetrics(t),
 	}
 }
 
@@ -980,7 +549,8 @@ func newStats(t time.Time) sts {
 func (s *sts) aggregate(other *sts) {
 	s.get.Aggregate(other.get)
 	s.put.Aggregate(other.put)
-	s.getConfig.Aggregate(other.getConfig)
+	s.putMPU.Aggregate(other.putMPU)
+	s.getBatch.Aggregate(other.getBatch)
 }
 
 func setupBucket(runParams *params, created *bool) error {
@@ -1091,21 +661,21 @@ func cleanup() {
 	stopping.Store(true)
 	time.Sleep(time.Second)
 	fmt.Println(now() + " Cleaning up...")
-	if bucketObjsNames != nil {
-		// `bucketObjsNames` has been actually assigned to/initialized.
+	if objnameGetter != nil {
+		// `objnameGetter` has been actually assigned to/initialized.
 		var (
 			w       = runParams.numWorkers
-			objsLen = bucketObjsNames.Len()
+			objsLen = objnameGetter.Len()
 			n       = objsLen / w
 			wg      = &sync.WaitGroup{}
 		)
 		for i := range w {
 			wg.Add(1)
-			go cleanupObjs(bucketObjsNames.Names()[i*n:(i+1)*n], wg)
+			go cleanupObjs(objnameGetter.Names()[i*n:(i+1)*n], wg)
 		}
 		if objsLen%w != 0 {
 			wg.Add(1)
-			go cleanupObjs(bucketObjsNames.Names()[n*w:], wg)
+			go cleanupObjs(objnameGetter.Names()[n*w:], wg)
 		}
 		wg.Wait()
 	}
@@ -1126,18 +696,18 @@ func cleanupObjs(objs []string, wg *sync.WaitGroup) {
 
 	// Only delete objects if it's not an AIS bucket (because otherwise we just go ahead
 	// and remove the bucket itself)
-	if !runParams.bck.IsAIS() {
-		b := min(t, runParams.batchSize)
+	if runParams.bck.IsRemote() {
+		b := min(t, runParams.evictBatchSize)
 		n := t / b
 		for i := range n {
 			evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs[i*b : (i+1)*b]}}
 			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, evdMsg)
 			if err != nil {
-				fmt.Println("delete err ", err)
+				fmt.Fprintln(os.Stderr, "delete multi-obj err:", err)
 			}
 			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
 			if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
-				fmt.Println("wait for xaction err ", err)
+				fmt.Fprintln(os.Stderr, "wait for xaction err:", err)
 			}
 		}
 
@@ -1145,19 +715,19 @@ func cleanupObjs(objs []string, wg *sync.WaitGroup) {
 			evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs[n*b:]}}
 			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, evdMsg)
 			if err != nil {
-				fmt.Println("delete err ", err)
+				fmt.Fprintln(os.Stderr, "delete err:", err)
 			}
 			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
 			if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
-				fmt.Println("wait for xaction err ", err)
+				fmt.Fprintln(os.Stderr, "wait for xaction err:", err)
 			}
 		}
 	}
 
-	if runParams.readerType == readers.TypeFile {
+	if runParams.readerType == readers.File && runParams.putPct > 0 {
 		for _, obj := range objs {
 			if err := os.Remove(runParams.tmpDir + "/" + obj); err != nil {
-				fmt.Println("delete local file err ", err)
+				fmt.Println("delete local file err:", err)
 			}
 		}
 	}
@@ -1182,41 +752,40 @@ func objNamesFromFile() (names []string, err error) {
 	return
 }
 
-func listObjects() error {
-	var (
-		names []string
-		err   error
-	)
+func listObjects() (names []string, fcnt int, err error) {
 	switch {
 	case runParams.fileList != "":
 		names, err = objNamesFromFile()
 	case isDirectS3():
 		names, err = s3ListObjects()
 	default:
-		names, err = listObjectNames(runParams)
+		names, fcnt, err = listObjectNames(runParams)
 	}
-	if err != nil {
-		return err
+	return names, fcnt, err
+}
+
+func newNameGetter(names []string) (ng namegetter.Basic, isPermBased bool) {
+	var (
+		readOnly  = runParams.putPct == 0
+		epoching  = runParams.numEpochs > 0
+		threshold = runParams.permShuffleMax
+		n         = len(names)
+	)
+	switch {
+	case !readOnly && !epoching:
+		ng = &namegetter.Random{}
+	case !readOnly && epoching:
+		ng = &namegetter.RandomUnique{}
+	case n > int(threshold) && n > namegetter.AffineMinN:
+		// O(1) memory, strict per-epoch
+		ng = &namegetter.PermAffinePrime{}
+		isPermBased = true
+	default:
+		// Fisher-Yates shuffle: https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle
+		ng = &namegetter.PermShuffle{}
+		isPermBased = true
 	}
-
-	if !runParams.uniqueGETs {
-		bucketObjsNames = &namegetter.RandomNameGetter{}
-	} else {
-		bucketObjsNames = &namegetter.RandomUniqueNameGetter{}
-
-		// Permutation strategies seem to be always better (they use more memory though)
-		if runParams.putPct == 0 {
-			bucketObjsNames = &namegetter.PermutationUniqueNameGetter{}
-
-			// Number from benchmarks: aisloader/tests/objnamegetter_test.go
-			// After 50k overhead on new goroutine and WaitGroup becomes smaller than benefits
-			if len(names) > 50000 {
-				bucketObjsNames = &namegetter.PermutationUniqueImprovedNameGetter{}
-			}
-		}
-	}
-	bucketObjsNames.Init(names, rnd)
-	return err
+	return
 }
 
 // returns smallest number divisible by `align` that is greater or equal `val`

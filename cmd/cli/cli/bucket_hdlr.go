@@ -6,6 +6,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -18,10 +19,31 @@ import (
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/xact"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 )
+
+// --------------------- Multi-object Rule of Convenience -----------------------------
+//
+// For user convenience, operations that can work on multiple objects
+// (prefixes, ranges, entire buckets)
+// should be discoverable from both bucket and object namespaces.
+//
+// Implementation pattern:
+// 1. Define the command in its primary namespace (usually bucket for multi-object ops)
+// 2. Copy cli.Command or - better - use makeAlias() to expose it in the secondary namespace
+// 3. Ensure help text is context-agnostic (avoid hardcoded command names in examples)
+//
+// Examples:
+// - cp: bucket-primary, available in object via bucketObjCmdCopy
+// - prefetch: object-primary, available in bucket via objectCmdPrefetch
+// - evict: shared as bucketObjCmdEvict in both namespaces
+// - archive: archive-primary, aliased in both bucket and object
+//
+// Motivation: help users to easily discover functionality.
+// ---------------------                                  -----------------------------
 
 const examplesBckSetProps = `
 Usage examples:
@@ -33,12 +55,39 @@ Usage examples:
   (see docs/cli for details)
 `
 
+// ais create
+const createBucketUsage = "" +
+	"Create AIS buckets or explicitly attach remote buckets with non-default credentials/properties.\n" +
+	"\tNormally, AIS auto-adds remote buckets on first access (ls/get/put): when a user references a new bucket,\n" +
+	"\tAIS looks it up behind the scenes, confirms its existence and accessibility, and \"on-the-fly\" updates its\n" +
+	"\tcluster-wide global (BMD) metadata containing bucket definitions, management policies, and properties.\n" +
+	"\tUse this command when you need to:\n" +
+	indent1 + "\t  1) create an ais:// bucket in this cluster;\n" +
+	indent1 + "\t  2) create a bucket in a remote AIS cluster (e.g., 'ais://@remais/BUCKET');\n" +
+	indent1 + "\t  3) set up a cloud bucket with a custom profile and/or endpoint/region;\n" +
+	indent1 + "\t  4) set bucket properties before first access;\n" +
+	indent1 + "\t  5) attach multiple same-name cloud buckets under different namespaces (e.g., 's3://#ns1/bucket', 's3://#ns2/bucket');\n" +
+	indent1 + "\t  6) and finally, register a cloud bucket that is not (yet) accessible (advanced-usage '--skip-lookup' option).\n" +
+	indent1 + "Examples:\n" +
+	indent1 + "\t- ais create ais://mybucket\t- create AIS bucket 'mybucket' (must be done explicitly);\n" +
+	indent1 + "\t- ais create ais://@remais/BUCKET\t- create a bucket in a remote AIS cluster referenced by the cluster's alias or UUID;\n" +
+	indent1 + "\t- ais create s3://mybucket\t- add existing cloud (S3) bucket; normally AIS would auto-add it on first access;\n" +
+	indent1 + "\t- ais create s3://mybucket --props='extra.aws.profile=prod extra.aws.multipart_size=333M'\t- add S3 bucket using a non-default cloud profile;\n" +
+	indent1 + "\t- ais create s3://#myaccount/mybucket --props='extra.aws.profile=swift extra.aws.endpoint=$S3_ENDPOINT'\t- attach S3-compatible bucket via namespace '#myaccount';\n" +
+	indent1 + "\t- ais create s3://mybucket --skip-lookup --props='extra.aws.profile=...'\t- advanced: register bucket without verifying its existence/accessibility (use with care).\n"
+
 // ais cp
 //
 //nolint:dupword // intentional
-const copyBucketUsage = "Copy entire bucket or selected objects (to select, use '--list', '--template', or '--prefix'),\n" +
+const copyBucketObjUsage = "Copy entire bucket, selected objects, or a single object (to select, use '--list', '--template', or '--prefix'),\n" +
 	indent1 + "\te.g.:\n" +
-	indent1 + "\t- 'ais cp gs://webdaset-coco ais://dst'\t- copy entire Cloud bucket;\n" +
+	indent1 + "\tsingle object examples:\n" +
+	indent1 + "\t- 'ais cp ais://src/obj1.tar ais://dst'\t- copy single object to the destination bucket with the same name;\n" +
+	indent1 + "\t- 'ais cp ais://src/obj1.tar gs://dst/obj2.tar'\t- copy single object with a new name;\n" +
+	indent1 + "\t- 'ais cp ais://src/obj1.tar gs://dst/hi%2?5ahs --encode-obj'\t- same as above with object-name encoding (to handle special symbols);\n" +
+	indent1 + "\t- 'ais cp s3://src/img.jpg ais://dst/'\t- copy single Cloud object to AIS bucket;\n" +
+	indent1 + "\tbucket to bucket examples:\n" +
+	indent1 + "\t- 'ais cp gs://webdataset-coco ais://dst'\t- copy entire Cloud bucket;\n" +
 	indent1 + "\t- 'ais cp s3://abc ais://nnn --all'\t- copy Cloud bucket that may _not_ be present in cluster (and create destination if doesn't exist);\n" +
 	indent1 + "\t- 'ais cp s3://abc ais://nnn --all --num-workers 16'\t- same as above employing 16 concurrent workers;\n" +
 	indent1 + "\t- 'ais cp s3://abc ais://nnn --all --num-workers 16 --prefix dir/subdir/'\t- same as above, but limit copying to a given virtual subdirectory;\n" +
@@ -91,6 +140,11 @@ const listAnyUsage = "List buckets, objects in buckets, and files in (.tar, .tgz
 	indent1 + "\t* ais ls s3 --summary --all \t- summary report for all s3 buckets including remote/non-present;\n" +
 	indent1 + "\t* ais ls s3 --summary --all --dont-add \t- same, without adding non-present buckets to cluster metadata."
 
+// ais rechunk
+const rechunkUsage = "Re-chunk bucket objects based on size threshold. " +
+	"Objects equal to or larger than objsize_limit will be split and stored as multiple chunk_size chunks. " +
+	"Use objsize_limit=0 to restore all objects to monolithic format."
+
 // ais bucket ... props
 const setBpropsUsage = "Update bucket properties; the command accepts both JSON-formatted input and plain Name=Value pairs,\n" +
 	indent1 + "\te.g.:\n" +
@@ -110,17 +164,21 @@ const evictUsage = "Evict one remote bucket, multiple remote buckets, or\n" +
 	indent1 + "\t- evict gs://abc\t- evict entire bucket from aistore: remove all \"cached\" gs://abc objects _and_ bucket metadata;\n" +
 	indent1 + "\t- evict gs://abc --keep-md\t- same as above but keep bucket metadata;\n" +
 	indent1 + "\t- evict gs:\t- evict all GCP buckets from the cluster;\n" +
+	indent1 + "\t- evict --all\t- evict all remote buckets from the cluster (prompts for confirmation);\n" +
+	indent1 + "\t- evict --all --keep-md\t- evict all remote buckets but keep their metadata (prompts for confirmation);\n" +
 	indent1 + "\t- evict gs://abc --prefix images/\t- evict all gs://abc objects from the virtual subdirectory \"images\";\n" +
 	indent1 + "\t- evict gs://abc/images/\t- same as above;\n" +
 	indent1 + "\t- evict gs://abc/images/ --nr\t- same as above, but do not recurse into virtual subdirs;\n" +
 	indent1 + "\t- evict gs://abc --template images/\t- same as above;\n" +
 	indent1 + "\t- evict gs://abc --template \"shard-{0000..9999}.tar.lz4\"\t- evict the matching range (prefix + brace expansion);\n" +
-	indent1 + "\t- evict \"gs://abc/shard-{0000..9999}.tar.lz4\"\t- same as above (notice BUCKET/TEMPLATE argument in quotes)"
+	indent1 + "\t- evict \"gs://abc/shard-{0000..9999}.tar.lz4\"\t- same as above (notice BUCKET/TEMPLATE argument in quotes)\n" +
+	indent1 + "\tNOTE: When evicting multiple buckets, --yes flag is ignored for safety reasons."
 
 // flags
 var (
 	lsCmdFlags = []cli.Flag{
 		allObjsOrBcksFlag,
+		headObjPresentFlag,
 		listCachedFlag,
 		listNotCachedFlag,
 		nameOnlyFlag,
@@ -152,6 +210,8 @@ var (
 		useInventoryFlag,
 		invNameFlag,
 		invIDFlag,
+		// 4.0
+		chunkedColumnFlag,
 	}
 
 	bucketCmdsFlags = map[string][]cli.Flag{
@@ -164,6 +224,7 @@ var (
 		commandRemove: {
 			ignoreErrorFlag,
 			yesFlag,
+			rmAllBucketsFlag,
 		},
 		commandCopy: {
 			listFlag,
@@ -199,6 +260,8 @@ var (
 			verboseFlag,   // NIY
 			nonverboseFlag,
 			dontHeadRemoteFlag,
+			evictAllBucketsFlag,
+			yesFlag,
 		),
 		cmdSetBprops: {
 			forceFlag,
@@ -209,6 +272,13 @@ var (
 		cmdLRU: {
 			enableFlag,
 			disableFlag,
+		},
+		commandRechunk: {
+			chunkSizeFlag,
+			objSizeLimitFlag,
+			verbObjPrefixFlag,
+			waitFlag,
+			waitJobXactFinishedFlag,
 		},
 	}
 )
@@ -235,18 +305,18 @@ var (
 	bucketObjCmdEvict = cli.Command{
 		Name:         commandEvict,
 		Usage:        evictUsage,
-		ArgsUsage:    bucketObjectOrTemplateMultiArg,
+		ArgsUsage:    "BUCKET[/OBJECT_NAME or /TEMPLATE] [BUCKET[/OBJECT_NAME or /TEMPLATE] ...] | --all",
 		Flags:        sortFlags(bucketCmdsFlags[commandEvict]),
 		Action:       evictHandler,
 		BashComplete: bucketCompletions(bcmplop{multiple: true}),
 	}
-	bucketCmdCopy = cli.Command{
+	bucketObjCmdCopy = cli.Command{
 		Name:         commandCopy,
-		Usage:        copyBucketUsage,
+		Usage:        copyBucketObjUsage,
 		ArgsUsage:    bucketObjectSrcArgument + " " + bucketDstArgument,
 		Flags:        sortFlags(bucketCmdsFlags[commandCopy]),
 		Action:       copyBucketHandler,
-		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{}, 0, 2),
+		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{}, 0),
 	}
 	bucketCmdRename = cli.Command{
 		Name:         commandRename,
@@ -254,7 +324,7 @@ var (
 		ArgsUsage:    bucketArgument + " " + bucketNewArgument,
 		Flags:        sortFlags(bucketCmdsFlags[commandRename]),
 		Action:       mvBucketHandler,
-		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{}, 0, 2),
+		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{}, 0),
 	}
 	bucketCmdSetProps = cli.Command{
 		Name:      cmdSetBprops,
@@ -276,20 +346,38 @@ var (
 			scrubCmd,
 			bucketCmdLRU,
 			bucketObjCmdEvict,
-			makeAlias(showCmdBucket, "", true, commandShow), // alias for `ais show`
+			objectCmdPrefetch,
+			{
+				Name:      apc.ActRechunk,
+				Usage:     rechunkUsage,
+				ArgsUsage: bucketArgument,
+				Flags:     sortFlags(bucketCmdsFlags[apc.ActRechunk]),
+				Action:    rechunkBucketHandler,
+			},
+			makeAlias(&showCmdBucket, &mkaliasOpts{newName: commandShow}),
 			{
 				Name:      commandCreate,
-				Usage:     "Create ais buckets",
+				Usage:     createBucketUsage,
 				ArgsUsage: bucketsArgument,
 				Flags:     sortFlags(bucketCmdsFlags[commandCreate]),
 				Action:    createBucketHandler,
 			},
-			bucketCmdCopy,
+			bucketObjCmdCopy,
+			makeAlias(&archBucketCmd, &mkaliasOpts{
+				newName:  commandArch,
+				aliasFor: joinCommandWords(commandArch, commandBucket),
+				replace:  cos.StrKVs{joinCommandWords(commandArch, commandBucket): joinCommandWords(commandBucket, commandArch)},
+			}),
+			makeAlias(&bckCmdETL, &mkaliasOpts{
+				newName:  commandETL,
+				aliasFor: joinCommandWords(commandETL, commandBucket),
+				replace:  cos.StrKVs{joinCommandWords(commandETL, commandBucket): joinCommandWords(commandBucket, commandETL)},
+			}),
 			bucketCmdRename,
 			{
 				Name:      commandRemove,
-				Usage:     "Remove ais buckets",
-				ArgsUsage: bucketsArgument,
+				Usage:     "Remove AIS buckets; use '--all' to remove all AIS buckets, '--yes' to skip confirmation",
+				ArgsUsage: "BUCKET [BUCKET...] | --all",
 				Flags:     sortFlags(bucketCmdsFlags[commandRemove]),
 				Action:    removeBucketHandler,
 				BashComplete: bucketCompletions(bcmplop{
@@ -312,7 +400,7 @@ var (
 							bcmplop{additionalCompletions: []cli.BashCompleteFunc{bpropCompletions}},
 						),
 					},
-					makeAlias(showCmdBucket, "", true, commandShow),
+					makeAlias(&showCmdBucket, &mkaliasOpts{newName: commandShow}),
 				},
 			},
 		},
@@ -343,7 +431,7 @@ func createBucketHandler(c *cli.Context) error {
 }
 
 func mvBucketHandler(c *cli.Context) error {
-	bckFrom, bckTo, _, err := parseBcks(c, bucketArgument, bucketNewArgument, 0 /*shift*/, false /*optionalSrcObjname*/)
+	bckFrom, bckTo, _, _, err := parseFromToURIs(c, bucketArgument, bucketNewArgument, 0 /*shift*/, false, false /*optional src, dst oname*/)
 	if err != nil {
 		return err
 	}
@@ -354,18 +442,197 @@ func mvBucketHandler(c *cli.Context) error {
 }
 
 func removeBucketHandler(c *cli.Context) error {
+	if flagIsSet(c, rmAllBucketsFlag) {
+		return removeAllBuckets(c)
+	}
+	return removeSpecificBuckets(c)
+}
+
+func parseRechunkConfig(c *cli.Context, bck cmn.Bck) (chunkSize, objSizeLimit int64, err error) {
+	// Parse chunk_size flag if provided
+	if flagIsSet(c, chunkSizeFlag) {
+		chunkSize, err = parseSizeFlag(c, chunkSizeFlag)
+		if err != nil {
+			return 0, 0, err
+		}
+		if chunkSize <= 0 {
+			return 0, 0, incorrectUsageMsg(c, "chunk size must be positive, got %s", cos.ToSizeIEC(chunkSize, 0))
+		}
+	}
+
+	// Parse objsize_limit flag if provided
+	if flagIsSet(c, objSizeLimitFlag) {
+		objSizeLimit, err = parseSizeFlag(c, objSizeLimitFlag)
+		if err != nil {
+			return 0, 0, err
+		}
+		if objSizeLimit < 0 {
+			return 0, 0, incorrectUsageMsg(c, "object size limit cannot be negative, got %s", cos.ToSizeIEC(objSizeLimit, 0))
+		}
+	}
+
+	// If either flag is missing, get from bucket and prompt for confirmation
+	if !flagIsSet(c, chunkSizeFlag) || !flagIsSet(c, objSizeLimitFlag) {
+		bckProps, err := api.HeadBucket(apiBP, bck, true /*don't add*/)
+		if err != nil {
+			return 0, 0, V(err)
+		}
+
+		// Fill in missing values from bucket
+		if !flagIsSet(c, chunkSizeFlag) {
+			chunkSize = int64(bckProps.Chunks.ChunkSize)
+		}
+		if !flagIsSet(c, objSizeLimitFlag) {
+			objSizeLimit = int64(bckProps.Chunks.ObjSizeLimit)
+		}
+
+		// Prompt user for confirmation (unless --yes is set)
+		if !flagIsSet(c, yesFlag) {
+			fmt.Fprint(c.App.Writer, "Rechunk configuration:\n")
+			fmt.Fprintf(c.App.Writer, "\tchunk_size:\t%s\n", cos.ToSizeIEC(chunkSize, 0))
+			fmt.Fprintf(c.App.Writer, "\tobjsize_limit:\t%s%s\n", cos.ToSizeIEC(objSizeLimit, 0), cos.Ternary(objSizeLimit == 0, " (chunking disabled)", ""))
+			if !confirm(c, "Proceed with these values?") {
+				return 0, 0, errors.New("operation canceled")
+			}
+		}
+	}
+
+	return chunkSize, objSizeLimit, nil
+}
+
+func rechunkBucketHandler(c *cli.Context) error {
+	if c.NArg() == 0 {
+		return incorrectUsageMsg(c, "missing bucket name")
+	}
+
+	bck, objName, err := parseBckObjURI(c, c.Args().Get(0), true /*optObjName*/)
+	if err != nil {
+		return err
+	}
+
+	// Parse/determine chunk configuration (may prompt user)
+	chunkSize, objSizeLimit, err := parseRechunkConfig(c, bck)
+	if err != nil {
+		return err
+	}
+
+	prefix := parseStrFlag(c, verbObjPrefixFlag)
+	if objName != "" && prefix != "" && !strings.HasPrefix(prefix, objName) {
+		return fmt.Errorf("cannot handle embedded prefix ('%s') and --prefix flag ('%s') simultaneously - prefix flag must start with embedded prefix",
+			objName, prefix)
+	}
+	if prefix == "" {
+		prefix = objName
+	}
+
+	// Start rechunk
+	xid, err := api.RechunkBucket(apiBP, bck, objSizeLimit, chunkSize, prefix)
+	if err != nil {
+		return V(err)
+	}
+
+	// Prepare message
+	_, xname := xact.GetKindName(apc.ActRechunk)
+	text := fmt.Sprintf("%s: %s", xact.Cname(xname, xid), bck.Cname(""))
+	if prefix != "" {
+		text += fmt.Sprintf(" (prefix: %q)", prefix)
+	}
+
+	// Check wait flags
+	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
+		actionDone(c, text+". "+toMonitorMsg(c, xid, ""))
+		return nil
+	}
+	return waitJob(c, xname, xid, bck)
+}
+
+func removeAllBuckets(c *cli.Context) error {
+	if c.NArg() > 0 {
+		return incorrectUsageMsg(c, "cannot specify bucket name(s) with --all flag")
+	}
+
+	// Only AIS buckets can be removed
+	qbck := cmn.QueryBcks{Provider: apc.AIS}
+	bcks, err := api.ListBuckets(apiBP, qbck, apc.FltExists)
+	if err != nil {
+		return V(err)
+	}
+
+	if len(bcks) == 0 {
+		fmt.Fprintln(c.App.Writer, "No AIS buckets to remove")
+		return nil
+	}
+
+	// --yes flag is ignored for safety reasons
+	if flagIsSet(c, yesFlag) {
+		actionWarn(c, "The --yes flag is ignored when removing all buckets for safety reasons")
+	}
+
+	// Always require phrase confirmation for --all operations, even with --yes flag
+	if !_confirmRemoval(c, bcks) {
+		return nil
+	}
+
+	return _destroyAllBuckets(c, bcks)
+}
+
+func removeSpecificBuckets(c *cli.Context) error {
 	buckets, err := bucketsFromArgsOrEnv(c)
 	if err != nil {
 		return err
 	}
+
 	bck, err := destroyBuckets(c, buckets)
 	if err == nil {
 		return nil
 	}
-	if herr, ok := err.(*cmn.ErrHTTP); ok && herr.TypeCode == "ErrUnsupp" {
+
+	if herr := cmn.AsErrHTTP(err); herr != nil && herr.TypeCode == "ErrUnsupp" {
 		return fmt.Errorf("%v\n(Tip: did you want to evict '%s' from aistore?)", err, bck.Cname(""))
 	}
 	return err
+}
+
+func _confirmRemoval(c *cli.Context, bcks cmn.Bcks) bool {
+	// Show bucket list
+	fmt.Fprintf(c.App.Writer, "Found %d AIS bucket(s) to remove:\n", len(bcks))
+
+	for _, bck := range bcks {
+		fmt.Fprintf(c.App.Writer, "  - %s\n", bck.Cname(""))
+	}
+
+	warning := "This action cannot be undone"
+	prompt := "This operation will PERMANENTLY DELETE all listed buckets and their data"
+	return confirmWithPhrase(c, "DELETE", prompt, warning)
+}
+
+// destroyBucket contains the core logic for destroying a single bucket
+func destroyBucket(c *cli.Context, bck cmn.Bck) error {
+	err := api.DestroyBucket(apiBP, bck)
+	if err == nil {
+		fmt.Fprintf(c.App.Writer, "%q destroyed\n", bck.Cname(""))
+		return nil
+	}
+	if cmn.IsStatusNotFound(err) {
+		err := &errDoesNotExist{what: "bucket", name: bck.Cname("")}
+		if !flagIsSet(c, ignoreErrorFlag) {
+			return err
+		}
+		fmt.Fprintln(c.App.ErrWriter, err)
+		return nil
+	}
+	return err
+}
+
+// _destroyAllBuckets removes all buckets without individual confirmations
+func _destroyAllBuckets(c *cli.Context, buckets []cmn.Bck) error {
+	for i := range buckets {
+		bck := buckets[i]
+		if err := destroyBucket(c, bck); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resetPropsHandler(c *cli.Context) error {
@@ -456,12 +723,13 @@ func setPropsHandler(c *cli.Context) error {
 		isValid bool
 	)
 	if section != "" {
+		opts := cmn.IterOpts{OnlyRead: true}
 		cmn.IterFields(&cmn.BpropsToSet{}, func(tag string, _ cmn.IterField) (e error, f bool) {
 			if strings.Contains(tag, section) {
 				isValid = true
 			}
 			return
-		})
+		}, opts)
 	}
 	if section == "" || isValid {
 		if errV := showBucketProps(c); errV == nil {

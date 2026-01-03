@@ -49,7 +49,7 @@ type (
 		// function: copy/transform
 		copier
 		// function: etl
-		transform etl.Session
+		transform etl.Session // used for aborting websocket connections
 		// args
 		args *xreg.TCBArgs
 		dm   *bundle.DM
@@ -59,10 +59,10 @@ type (
 		// copying parallelism
 		nwp struct {
 			workCh   chan core.LIF
-			chanFull cos.ChanFull
 			stopCh   *cos.StopCh
 			workers  []tcbworker
 			wg       sync.WaitGroup
+			chanFull cos.ChanFull
 		}
 		// function: coordinate finish, abort, progress
 		sntl sentinel
@@ -88,35 +88,46 @@ func (p *tcbFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 }
 
 func (p *tcbFactory) Start() error {
+	xctn, err := newXactTCB(p.UUID(), p.kind, p.Args.Custom.(*xreg.TCBArgs))
+	if err != nil {
+		return err
+	}
+	p.xctn = xctn
+	return nil
+}
+
+func newXactTCB(uuid, kind string, args *xreg.TCBArgs) (*XactTCB, error) {
 	var (
 		smap      = core.T.Sowner().Get()
 		nat       = smap.CountActiveTs()
 		config    = cmn.GCO.Get()
 		slab, err = core.T.PageMM().GetSlab(memsys.MaxPageSlabSize) // estimate
-		args      = p.Args.Custom.(*xreg.TCBArgs)
+		r         = &XactTCB{args: args}
 		msg       = args.Msg
 	)
 	debug.AssertNoErr(err)
 
-	r := &XactTCB{args: args}
-	r.init(p, slab, config, smap, nat)
+	r.init(uuid, kind, slab, config, smap, nat)
 
 	r.owt = cmn.OwtCopy
-	if p.kind == apc.ActETLBck {
+	if kind == apc.ActETLBck {
 		r.owt = cmn.OwtTransform
-		r.copier.getROC, r.transform, err = etl.GetOfflineTransform(args.Msg.Transform.Name, r)
+		r.copier.getROC, r.copier.xetl, r.transform, err = etl.GetOfflineTransform(args.Msg.Transform.Name, r)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if r.transform != nil {
+			r.putWOC = r.transform.OfflineWrite
 		}
 	}
 
 	if err := core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
-		return err
+		return nil, err
 	}
 
 	// single-node cluster
 	if nat <= 1 {
-		return nil // ---->
+		return r, nil // ---->
 	}
 
 	// - unlike tco and other lrit-based xactions,
@@ -126,11 +137,16 @@ func (p *tcbFactory) Start() error {
 	// - not using any workers - is the supported default.
 
 	if msg.NumWorkers > 0 {
-		// tune-up the specified number of workers
-		l := fs.NumAvail()
-		numWorkers, err := throttleNwp(r.Name(), max(msg.NumWorkers, l))
+		var (
+			l = fs.NumAvail()
+			n = max(msg.NumWorkers, l)
+		)
+		numWorkers, err := clampNumWorkers(r.Name(), n, l)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if n != numWorkers {
+			nlog.Warningln(r.Name(), "throttle num-workers:", numWorkers, "[ from", n, "]")
 		}
 		if numWorkers >= l {
 			// delegate intra-cluster copying/transforming to additional workers;
@@ -148,24 +164,23 @@ func (p *tcbFactory) Start() error {
 	// which also bypassed the multi-worker setup below.
 	// But now that sentinels requires the data mover to broadcast control messages, DM is always required.
 	if r.args.DisableDM {
-		return nil
+		return r, nil
 	}
 
 	// data mover and sentinel
 	// TODO: add ETL capability to provide Size(transformed-result)
 	var sizePDU int32
-	if p.kind == apc.ActETLBck {
+	if kind == apc.ActETLBck {
 		sizePDU = memsys.DefaultBufSize // `transport` to generate PDU-based traffic
 	}
 	if err := r.newDM(sizePDU); err != nil {
-		return err
+		return nil, err
 	}
 
 	// sentinels, to coordinate finishing, aborting, and progress;
-	// use DM to communicate sentinel opcodes (opDone, opAbort, ...)
+	// use DM to communicate sentinel opcodes (transport.OpcDone, transport.OpcAbort, ...)
 	r.sntl.init(r, smap, nat)
-
-	return nil
+	return r, nil
 }
 
 func (r *XactTCB) _iniNwp(numWorkers int) {
@@ -173,7 +188,8 @@ func (r *XactTCB) _iniNwp(numWorkers int) {
 	for range numWorkers {
 		r.nwp.workers = append(r.nwp.workers, tcbworker{r})
 	}
-	r.nwp.workCh = make(chan core.LIF, max(min(numWorkers*nwpBurstMult, nwpBurstMax), r.Config.TCB.Burst))
+	chsize := cos.ClampInt(numWorkers*nwpBurstMult, r.Config.TCB.Burst, nwpBurstMax)
+	r.nwp.workCh = make(chan core.LIF, chsize)
 	r.nwp.stopCh = cos.NewStopCh()
 	nlog.Infoln(r.Name(), "workers:", numWorkers)
 }
@@ -230,34 +246,27 @@ func (r *XactTCB) TxnAbort(err error) {
 	r.Base.Finish()
 }
 
-func (r *XactTCB) init(p *tcbFactory, slab *memsys.Slab, config *cmn.Config, smap *meta.Smap, nat int) {
+func (r *XactTCB) init(uuid, kind string, slab *memsys.Slab, config *cmn.Config, smap *meta.Smap, nat int) {
 	var (
 		args   = r.args
 		msg    = r.args.Msg
 		mpopts = &mpather.JgroupOpts{
-			CTs:      []string{fs.ObjectType},
+			CTs:      []string{fs.ObjCT},
 			VisitObj: r.do,
 			Prefix:   msg.Prefix,
 			Slab:     slab,
 			DoLoad:   mpather.Load,
-			Throttle: false, // superseded by destination rate-limiting (v3.28)
+			RW:       true,
 		}
 	)
 	mpopts.Bck.Copy(args.BckFrom.Bucket())
 
-	// ctlmsg
-	var (
-		sb        strings.Builder
-		fromCname = args.BckFrom.Cname(msg.Prefix)
-		toCname   = args.BckTo.Cname(msg.Prepend)
-	)
-	sb.Grow(80)
-	msg.Str(&sb, fromCname, toCname)
-
 	// init base
-	r.BckJog.Init(p.UUID(), p.kind, sb.String() /*ctlmsg*/, args.BckTo, mpopts, config)
+	r.BckJog.Init(uuid, kind, args.BckTo, mpopts, config)
 
 	// xname
+	fromCname := args.BckFrom.Cname(msg.Prefix)
+	toCname := args.BckTo.Cname(msg.Prepend)
 	r._name(fromCname, toCname, r.BckJog.NumJoggers())
 
 	r.rate.init(args.BckFrom, args.BckTo, nat)
@@ -280,16 +289,15 @@ func (r *XactTCB) init(p *tcbFactory, slab *memsys.Slab, config *cmn.Config, sma
 	// (rgetstats)
 	if bck := args.BckFrom; bck.IsRemote() {
 		r.bp = core.T.Backend(bck)
-		r.vlabs = map[string]string{
-			stats.VlabBucket: bck.Cname(""),
-			stats.VlabXkind:  r.Kind(),
-		}
 	}
-
-	p.xctn = r
+	r.vlabs = map[string]string{
+		stats.VlabBucket: args.BckFrom.Cname(""),
+		stats.VlabXkind:  r.Kind(),
+	}
 }
 
-func (r *XactTCB) Run(wg *sync.WaitGroup) {
+// sub-routine that does the core copy bucket logic; doesn't include the Finish() call and abort check
+func (r *XactTCB) run(wg *sync.WaitGroup) {
 	// make sure `nat` hasn't changed between Start and now (highly unlikely)
 	if r.dm != nil {
 		smap := core.T.Sowner().Get()
@@ -329,8 +337,9 @@ func (r *XactTCB) Run(wg *sync.WaitGroup) {
 	}
 
 	if r.dm != nil {
-		r.sntl.bcast("", r.dm, r.AbortErr()) // broadcast: done | abort
-		if !r.IsAborted() {
+		abortErr := r.AbortErr()
+		r.sntl.bcast("", r.dm, abortErr) // broadcast: done | abort
+		if abortErr == nil {             // done
 			r.sntl.initLast(mono.NanoTime())
 			qui := r.Base.Quiesce(r.qival(), r.qcb) // when done: wait for others
 			if qui == core.QuiAborted {
@@ -348,7 +357,16 @@ func (r *XactTCB) Run(wg *sync.WaitGroup) {
 		r.prune.wait()
 	}
 
+	// finish the ETL session, if any
+	if r.transform != nil {
+		r.transform.Finish(nil)
+	}
+
 	r.sntl.cleanup()
+}
+
+func (r *XactTCB) Run(wg *sync.WaitGroup) {
+	r.run(wg)
 	r.Finish()
 
 	if a := r.nwp.chanFull.Load(); a > 0 {
@@ -357,7 +375,7 @@ func (r *XactTCB) Run(wg *sync.WaitGroup) {
 }
 
 func (r *XactTCB) qival() time.Duration {
-	return min(max(r.Config.Timeout.MaxHostBusy.D(), 10*time.Second), time.Minute)
+	return cos.ClampDuration(r.Config.Timeout.MaxHostBusy.D(), 10*time.Second, time.Minute)
 }
 
 func (r *XactTCB) qcb(tot time.Duration) core.QuiRes {
@@ -373,9 +391,12 @@ func (r *XactTCB) qcb(tot time.Duration) core.QuiRes {
 func (r *XactTCB) do(lom *core.LOM, buf []byte) error {
 	if r.nwp.workers == nil {
 		args := r.args // TCBArgs
-		a := r.copier.prepare(lom, args.BckTo, args.Msg, r.Config, buf, r.owt)
+		a, err := r.copier.prepare(lom, args.BckTo, args.Msg, r.Config, buf, r.owt)
+		if err != nil {
+			return err
+		}
 
-		err := r.copier.do(a, lom, r.dm)
+		err = r.copier.do(a, lom, r.dm)
 		if err == nil && args.Msg.Sync {
 			r.prune.filter.Insert(cos.UnsafeB(lom.Uname()))
 		}
@@ -392,7 +413,7 @@ func (r *XactTCB) do(lom *core.LOM, buf []byte) error {
 
 // NOTE: strict(est) error handling: abort on any of the errors below
 func (r *XactTCB) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
-	if err != nil && !cos.IsEOF(err) {
+	if err != nil && !cos.IsOkEOF(err) {
 		nlog.Errorln(err)
 		return err
 	}
@@ -400,18 +421,18 @@ func (r *XactTCB) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) er
 	// control
 	if hdr.Opcode != 0 {
 		switch hdr.Opcode {
-		case opDone:
+		case transport.OpcDone:
 			r.sntl.rxDone(hdr)
-		case opAbort:
+		case transport.OpcAbort:
 			r.sntl.rxAbort(hdr)
-		case opRequest:
+		case transport.OpcRequest:
 			o := transport.AllocSend()
-			o.Hdr.Opcode = opResponse
+			o.Hdr.Opcode = transport.OpcResponse
 			b := make([]byte, cos.SizeofI64)
 			binary.BigEndian.PutUint64(b, uint64(r.BckJog.NumVisits())) // report progress
 			o.Hdr.Opaque = b
 			r.dm.Bcast(o, nil) // TODO: consider limiting this broadcast to only quiescing (waiting) targets
-		case opResponse:
+		case transport.OpcResponse:
 			r.sntl.rxProgress(hdr) // handle response: progress by others
 		default:
 			return abortOpcode(r, hdr.Opcode)
@@ -427,8 +448,9 @@ func (r *XactTCB) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) er
 	return err
 }
 
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (r *XactTCB) _recv(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LOM) error {
-	if err := lom.InitBck(&hdr.Bck); err != nil {
+	if err := lom.InitCmnBck(&hdr.Bck); err != nil {
 		r.AddErr(err, 0)
 		return err
 	}
@@ -437,7 +459,7 @@ func (r *XactTCB) _recv(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LO
 	{
 		params.WorkTag = fs.WorkfilePut
 		params.Reader = io.NopCloser(objReader)
-		params.Cksum = hdr.ObjAttrs.Cksum
+		params.Cksum = cos.NewCksum(lom.CksumType(), "") // respect the destination bucket checksum type
 		params.Xact = r
 		params.Size = hdr.ObjAttrs.Size
 		params.OWT = r.owt
@@ -492,13 +514,34 @@ func (r *XactTCB) FromTo() (*meta.Bck, *meta.Bck) {
 	return r.args.BckFrom, r.args.BckTo
 }
 
-func (r *XactTCB) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
+func (r *XactTCB) CtlMsg() string { return r.formatCtlMsg(false) }
 
+func (r *XactTCB) formatCtlMsg(rename bool) string {
+	var (
+		sb        strings.Builder
+		msg       = r.args.Msg
+		fromCname = r.args.BckFrom.Cname(msg.Prefix)
+		toCname   = r.args.BckTo.Cname(msg.Prepend)
+		tag       string
+	)
+	switch {
+	case rename:
+		tag = "mv: "
+	case r.Kind() == apc.ActETLBck:
+		tag = "etl: "
+	default:
+		tag = "cp: "
+	}
+
+	sb.Grow(80)
+	msg.Str(&sb, fromCname, toCname, tag)
+	return sb.String()
+}
+
+func (r *XactTCB) Snap() (snap *core.Snap) {
+	snap = r.Base.NewSnap(r)
 	snap.Pack(fs.NumAvail(), len(r.nwp.workers), r.nwp.chanFull.Load())
 
-	snap.IdleX = r.IsIdle()
 	f, t := r.FromTo()
 	snap.SrcBck, snap.DstBck = f.Clone(), t.Clone()
 	return
@@ -540,11 +583,19 @@ func (worker *tcbworker) do(lif core.LIF, buf []byte) bool {
 		return true
 	}
 
-	a := r.copier.prepare(lom, args.BckTo, args.Msg, r.Config, buf, r.owt)
+	a, err := r.copier.prepare(lom, args.BckTo, args.Msg, r.Config, buf, r.owt)
+	if err != nil {
+		return true
+	}
 	if err := r.copier.do(a, lom, r.dm); err != nil {
+		// Do not add to the filter if there was an error (e.g., "not found"),
+		// so that prune can recognize and delete destination objects whose sources have been removed.
 		return r.IsAborted()
 	}
 	if args.Msg.Sync {
+		// Only successfully copied objects are added to the filter.
+		// Objects NOT in the filter will be checked against the source
+		// if source doesn't exist, prune deletes them from the destination.
 		r.prune.filter.Insert(cos.UnsafeB(lom.Uname()))
 	}
 	return false

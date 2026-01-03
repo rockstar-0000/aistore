@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	ratomic "sync/atomic"
 
@@ -100,11 +101,12 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 	}
 
 	opts := &mpather.JgroupOpts{
-		CTs:         []string{fs.ObjectType},
+		CTs:         []string{fs.ObjCT},
 		Prefix:      p.msg.Prefix,
 		VisitObj:    r.visitObj,
-		DoLoad:      mpather.LoadUnsafe,
+		DoLoad:      mpather.Load,
 		IncludeCopy: true,
+		RW:          false,
 	}
 	if !p.Bck.IsQuery() {
 		r.initRes(&r.oneRes, p.Bck) // init single result-set
@@ -141,12 +143,19 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 		}
 	}
 
-	ctlmsg := p.msg.Str(p.Bck.Cname(p.msg.Prefix))
-	r.BckJog.Init(p.UUID(), p.Kind(), ctlmsg, p.Bck, opts, cmn.GCO.Get())
-
-	r._nam = r.Base.Name() + "-" + ctlmsg
-	r._str = r.Base.String() + "-" + ctlmsg
+	r.BckJog.Init(p.UUID(), p.Kind(), p.Bck, opts, cmn.GCO.Get())
+	s := r.CtlMsg()
+	r._nam = r.Base.Name() + "-" + s
+	r._str = r.Base.String() + "-" + s
 	return r, nil
+}
+
+func (r *XactNsumm) CtlMsg() string {
+	var sb strings.Builder
+	sb.Grow(96)
+	p, msg := r.p, r.p.msg
+	msg.Str(p.Bck.Cname(msg.Prefix), &sb)
+	return sb.String()
 }
 
 func (r *XactNsumm) Run(started *sync.WaitGroup) {
@@ -266,15 +275,9 @@ func (r *XactNsumm) initRes(res *cmn.BsummResult, bck *meta.Bck) {
 	res.ObjSize.Min = math.MaxInt64
 }
 
-func (r *XactNsumm) String() string { return r._str }
-func (r *XactNsumm) Name() string   { return r._nam }
-
-func (r *XactNsumm) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-	snap.IdleX = r.IsIdle()
-	return
-}
+func (r *XactNsumm) String() string   { return r._str }
+func (r *XactNsumm) Name() string     { return r._nam }
+func (r *XactNsumm) Snap() *core.Snap { return r.Base.NewSnap(r) }
 
 func (r *XactNsumm) Result() (cmn.AllBsummResults, error) {
 	if r.single {

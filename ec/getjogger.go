@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -77,8 +76,8 @@ func (c *getJogger) newCtx(req *request) (*restoreCtx, error) {
 	ctx := allocRestoreCtx()
 	ctx.toDisk = useDisk(0 /*size of the original object is unknown*/, c.parent.config)
 	ctx.lom = lom
-	err = lom.Load(true /*cache it*/, false /*locked*/)
-	if os.IsNotExist(err) {
+	err = lom.Load(false /*cache it*/, false /*locked*/)
+	if cos.IsNotExist(err) {
 		err = nil
 	}
 	return ctx, err
@@ -185,8 +184,8 @@ func (c *getJogger) copyMissingReplicas(ctx *restoreCtx, reader cos.ReadOpenClos
 	switch r := reader.(type) {
 	case *memsys.SGL:
 		srcReader = memsys.NewReader(r)
-	case *cos.FileHandle:
-		srcReader, err = cos.NewFileHandle(ctx.lom.FQN)
+	case *core.LomHandle:
+		srcReader, err = ctx.lom.NewHandle(true /*loaded*/)
 	default:
 		debug.FailTypeCast(reader)
 		err = fmt.Errorf("unsupported reader type: %T", reader)
@@ -240,7 +239,7 @@ func (c *getJogger) restoreReplicaFromMem(ctx *restoreCtx) error {
 		}
 		w.Free()
 	}
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Found meta -> obj get %s, writer found: %v", ctx.lom, writer != nil)
 	}
 
@@ -274,7 +273,7 @@ func (c *getJogger) restoreReplicaFromDsk(ctx *restoreCtx) error {
 		size   int64
 	)
 	// for each target: check for the ctx.lom replica, break loop if found
-	tmpFQN := fs.CSM.Gen(ctx.lom, fs.WorkfileType, "ec-restore-repl")
+	tmpFQN := ctx.lom.GenFQN(fs.WorkCT, "ec-restore-repl")
 
 loop: //nolint:gocritic // keeping label for readability
 	for node := range ctx.nodes {
@@ -316,13 +315,13 @@ loop: //nolint:gocritic // keeping label for readability
 
 	if writer == nil {
 		err := errors.New("failed to discover " + ctx.lom.Cname())
-		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Errorln(err)
 		}
 		return err
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infoln("found meta -> obj get", ctx.lom.Cname())
 	}
 	if err := ctx.lom.RenameFinalize(tmpFQN); err != nil {
@@ -333,7 +332,7 @@ loop: //nolint:gocritic // keeping label for readability
 	}
 
 	b := cos.MustMarshal(ctx.meta)
-	ctMeta := core.NewCTFromLOM(ctx.lom, fs.ECMetaType)
+	ctMeta := core.NewCTFromLOM(ctx.lom, fs.ECMetaCT)
 	if err := ctMeta.Write(bytes.NewReader(b), -1, "" /*work fqn*/); err != nil {
 		return err
 	}
@@ -344,11 +343,14 @@ loop: //nolint:gocritic // keeping label for readability
 		return fmt.Errorf("%s metafile saved while bucket %s was being destroyed", ctMeta.ObjectName(), ctMeta.Bucket())
 	}
 
-	reader, err := cos.NewFileHandle(ctx.lom.FQN)
+	ctx.lom.Lock(false)
+	reader, err := ctx.lom.NewHandle(false)
 	if err != nil {
+		ctx.lom.Unlock(false)
 		return err
 	}
 	err = c.copyMissingReplicas(ctx, reader)
+	ctx.lom.Unlock(false)
 	if err != nil {
 		freeObject(reader)
 	}
@@ -372,13 +374,13 @@ func (c *getJogger) requestSlices(ctx *restoreCtx) error {
 			continue
 		}
 
-		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Infof("Slice %s[%d] requesting from %s", ctx.lom, v.SliceID, k)
 		}
 		var writer *slice
 		if ctx.toDisk {
 			prefix := fmt.Sprintf("ec-restore-%d", v.SliceID)
-			fqn := fs.CSM.Gen(ctx.lom, fs.WorkfileType, prefix)
+			fqn := ctx.lom.GenFQN(fs.WorkCT, prefix)
 			fh, err := ctx.lom.CreateSlice(fqn)
 			if err != nil {
 				return err
@@ -417,7 +419,7 @@ func (c *getJogger) requestSlices(ctx *restoreCtx) error {
 	o.Hdr = hdr
 
 	// Broadcast slice request and wait for targets to respond
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Requesting daemons %v for slices of %s", daemons, ctx.lom)
 	}
 	if err := c.parent.sendByDaemonID(daemons, o, nil, true); err != nil {
@@ -436,7 +438,7 @@ func newSliceWriter(ctx *restoreCtx, writers []io.Writer, restored []*slice,
 	cksums []*cos.CksumHash, cksumType string, idx int, sliceSize int64) error {
 	if ctx.toDisk {
 		prefix := fmt.Sprintf("ec-rebuild-%d", idx)
-		fqn := fs.CSM.Gen(ctx.lom, fs.WorkfileType, prefix)
+		fqn := ctx.lom.GenFQN(fs.WorkCT, prefix)
 		file, err := ctx.lom.CreateSlice(fqn)
 		if err != nil {
 			return err
@@ -504,7 +506,7 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 	// Allocate resources for reconstructed(missing) slices.
 	for i, sl := range ctx.slices {
 		if sl != nil && sl.writer != nil {
-			if cmn.Rom.FastV(4, cos.SmoduleEC) {
+			if cmn.Rom.V(4, cos.ModEC) {
 				nlog.Infof("Got slice %d size %d (want %d) of %s", i+1, sl.n, sliceSize, ctx.lom)
 			}
 			if sl.n == 0 {
@@ -555,7 +557,7 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 		return restored, err
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Reconstructing %s", ctx.lom)
 	}
 	stream, err := reedsolomon.NewStreamC(ctx.meta.Data, ctx.meta.Parity, true, true)
@@ -629,7 +631,7 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 	}
 
 	src := newMultiReader(srcReaders...)
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Saving main object %s to %q", ctx.lom, ctx.lom.FQN)
 	}
 
@@ -689,7 +691,7 @@ func (*getJogger) emptyTargets(ctx *restoreCtx) ([]string, error) {
 		}
 		empty = append(empty, t.ID())
 	}
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Empty nodes for %s are %#v", ctx.lom, empty)
 	}
 	return empty, nil
@@ -754,12 +756,12 @@ func (c *getJogger) uploadRestoredSlices(ctx *restoreCtx, slices []*slice) error
 			reqType:  reqPut,
 		}
 
-		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Infof("Sending slice %s[%d] to %s", ctx.lom, sliceMeta.SliceID, tid)
 		}
 
 		// Every slice's SGL is freed upon transfer completion
-		cb := func(daemonID string, s *slice, rdr cos.ReadOpenCloser) transport.ObjSentCB {
+		cb := func(daemonID string, s *slice, rdr cos.ReadOpenCloser) transport.SentCB {
 			return func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 				if err != nil {
 					nlog.Errorf("%s failed to send %s to %v: %v", core.T, ctx.lom, daemonID, err)
@@ -794,7 +796,7 @@ func (c *getJogger) freeDownloaded(ctx *restoreCtx) {
 
 // Main function that starts restoring an object that was encoded
 func (c *getJogger) restoreEncoded(ctx *restoreCtx) error {
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infoln("Starting EC restore", ctx.lom.Cname())
 	}
 
@@ -819,7 +821,7 @@ func (c *getJogger) restoreEncoded(ctx *restoreCtx) error {
 	// main replica is ready to download by a client.
 	if err := c.uploadRestoredSlices(ctx, restored); err != nil {
 		nlog.Errorf("failed to upload restored slices of %s: %v", ctx.lom, err)
-	} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	} else if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("restored %s slices", ctx.lom)
 	}
 
@@ -833,11 +835,11 @@ func (c *getJogger) restore(ctx *restoreCtx) error {
 		return ErrorECDisabled
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Restoring %s", ctx.lom)
 	}
 	err := c.requestMeta(ctx)
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Found meta for %s: %d, err: %v", ctx.lom, len(ctx.nodes), err)
 	}
 	if err != nil {
@@ -867,7 +869,7 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 		wg     = cos.NewLimitedWaitGroup(sys.MaxParallelism(), 8)
 		mtx    = &sync.Mutex{}
 		tmap   = core.T.Sowner().Get().Tmap
-		ctMeta = core.NewCTFromLOM(ctx.lom, fs.ECMetaType)
+		ctMeta = core.NewCTFromLOM(ctx.lom, fs.ECMetaCT)
 
 		md, err  = LoadMetadata(ctMeta.FQN())
 		mdExists = err == nil && len(md.Daemons) != 0
@@ -932,7 +934,7 @@ func (ctx *restoreCtx) requestMeta(si *meta.Snode, c *getJogger, mtx *sync.Mutex
 		warn := fmt.Sprintf("%s: %s failed request-meta(%s) request: %v", core.T, ctx.lom.Cname(), si, err)
 		if mdExists {
 			nlog.Warningln(warn)
-		} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		} else if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Infoln(warn)
 		}
 		return

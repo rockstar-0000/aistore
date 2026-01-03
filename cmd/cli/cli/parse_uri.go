@@ -18,20 +18,21 @@ import (
 )
 
 // Return `bckFrom` and `bckTo` - the [shift] and the [shift+1] arguments, respectively
-func parseBcks(c *cli.Context, bckFromArg, bckToArg string, shift int, optionalSrcObjname bool) (bckFrom, bckTo cmn.Bck, objFrom string,
+// Optionally, return `objFrom` and/or `objTo`
+func parseFromToURIs(c *cli.Context, bckFromArg, bckToArg string, shift int, optSrcOname, optDstOname bool) (bckFrom, bckTo cmn.Bck, objFrom, objTo string,
 	err error) {
 	if c.NArg() == shift {
 		err = missingArgumentsError(c, bckFromArg, bckToArg)
-		return cmn.Bck{}, cmn.Bck{}, "", err
+		return cmn.Bck{}, cmn.Bck{}, "", "", err
 	}
 	if c.NArg() == shift+1 {
 		err = missingArgumentsError(c, bckToArg)
-		return cmn.Bck{}, cmn.Bck{}, "", err
+		return cmn.Bck{}, cmn.Bck{}, "", "", err
 	}
 
 	// src
 	var uri string
-	if optionalSrcObjname {
+	if optSrcOname {
 		uri = c.Args().Get(shift)
 		bckFrom, objFrom, err = parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
 	} else {
@@ -44,22 +45,26 @@ func parseBcks(c *cli.Context, bckFromArg, bckToArg string, shift int, optionalS
 		} else {
 			err = incorrectUsageMsg(c, "invalid %s argument '%s' - %v", bckFromArg, c.Args().Get(shift), err)
 		}
-		return cmn.Bck{}, cmn.Bck{}, "", err
+		return cmn.Bck{}, cmn.Bck{}, "", "", err
 	}
 
 	// dst
 	uri = c.Args().Get(shift + 1)
-	bckTo, err = parseBckURI(c, uri, true)
+	if optDstOname {
+		bckTo, objTo, err = parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
+	} else {
+		bckTo, err = parseBckURI(c, uri, true)
+	}
 	if err != nil {
 		if errV := errBucketNameInvalid(c, uri, err); errV != nil {
 			err = errV
 		} else {
 			err = incorrectUsageMsg(c, "invalid %s argument '%s' - %v", bckToArg, c.Args().Get(shift+1), err)
 		}
-		return cmn.Bck{}, cmn.Bck{}, "", err
+		return cmn.Bck{}, cmn.Bck{}, "", "", err
 	}
 
-	return bckFrom, bckTo, objFrom, err
+	return bckFrom, bckTo, objFrom, objTo, err
 }
 
 func parseBckURI(c *cli.Context, uri string, errorOnly bool) (cmn.Bck, error) {
@@ -71,7 +76,7 @@ func parseBckURI(c *cli.Context, uri string, errorOnly bool) (cmn.Bck, error) {
 
 	opts := cmn.ParseURIOpts{}
 	if !providerRequired {
-		opts.DefaultProvider = cfg.DefaultProvider
+		opts.DefaultProvider = gcfg.DefaultProvider
 	}
 	bck, objName, err := cmn.ParseBckObjectURI(uri, opts)
 	switch {
@@ -150,7 +155,7 @@ func parseBckObjURI(c *cli.Context, uri string, emptyObjnameOK bool) (bck cmn.Bc
 	} else {
 		var opts cmn.ParseURIOpts
 		if !providerRequired {
-			opts.DefaultProvider = cfg.DefaultProvider
+			opts.DefaultProvider = gcfg.DefaultProvider
 		}
 		bck, objName, err = cmn.ParseBckObjectURI(uri, opts)
 		if err != nil {
@@ -163,7 +168,7 @@ func parseBckObjURI(c *cli.Context, uri string, emptyObjnameOK bool) (bck cmn.Bc
 			} else {
 				msg = "Expecting " + objectArgument + ", e.g.: ais://mmm/obj1, s3://nnn/obj2, gs://ppp/obj3, etc."
 			}
-			return bck, objName, cannotExecuteError(c, err, msg)
+			return cmn.Bck{}, "", cannotExecuteError(c, err, msg)
 		}
 	}
 
@@ -178,7 +183,10 @@ func parseBckObjURI(c *cli.Context, uri string, emptyObjnameOK bool) (bck cmn.Bc
 	} else if objName == "" && !emptyObjnameOK {
 		err = incorrectUsageMsg(c, "%q: missing object name", uri)
 	}
-	return bck, objName, err
+	if err != nil {
+		return cmn.Bck{}, "", err
+	}
+	return bck, objName, nil
 }
 
 //

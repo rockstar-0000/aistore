@@ -8,6 +8,7 @@ package cli
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -82,8 +83,7 @@ func populateKeyMapInvIdx() {
 	invIndex = make(map[string][]int)
 	keywordMap = invertMap(similarWords)
 	for i := range cmdStrs {
-		keywords := strings.Split(cmdStrs[i], " ")
-		for _, word := range keywords {
+		for word := range strings.SplitSeq(cmdStrs[i], " ") {
 			keywordMap[word] = append(keywordMap[word], word)
 			invIndex[word] = append(invIndex[word], i)
 		}
@@ -157,6 +157,10 @@ func findCmdMatching(pattern string) []string {
 	return result
 }
 
+//
+// see also: actionIsHandler
+//
+
 func searchCmdHdlr(c *cli.Context) (err error) {
 	var commands []string
 	if !flagIsSet(c, regexFlag) && c.NArg() == 0 {
@@ -168,11 +172,11 @@ func searchCmdHdlr(c *cli.Context) (err error) {
 	} else {
 		if c.NArg() > 1 {
 			for word, similar := range similarWords {
-				if !cos.StringInSlice(word, c.Args()) {
+				if !slices.Contains(c.Args(), word) {
 					continue
 				}
 				for _, word2 := range similar {
-					if cos.StringInSlice(word2, c.Args()) {
+					if slices.Contains(c.Args(), word2) {
 						warn := fmt.Sprintf("%q and %q are \"similar\"", word, word2)
 						actionWarn(c, warn+" (search results may include either/or combinations)")
 					}

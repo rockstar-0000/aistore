@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,7 @@ type (
 			wi           *walkInfo        // walking context and state
 			bp           core.Backend     // t.Backend(bck)
 			wg           sync.WaitGroup   // wait until this walk finishes
+			lastDir      string           // last seen directory name (for dedup - heap output is sorted, so duplicates are adjacent)
 			done         bool             // done walking (indication)
 			wor          bool             // wantOnlyRemote
 			dontPopulate bool             // when listing remote obj-s: don't include local MD (in re: LsDonAddRemote)
@@ -111,7 +113,7 @@ func (*lsoFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 }
 
 func (p *lsoFactory) Start() error {
-	if err := cmn.ValidatePrefix("bad list-objects request", p.msg.Prefix); err != nil {
+	if err := cos.ValidatePrefix("bad list-objects request", p.msg.Prefix); err != nil {
 		return err
 	}
 	r := &LsoXact{
@@ -126,7 +128,7 @@ func (p *lsoFactory) Start() error {
 
 	// idle timeout vs delayed next-page request
 	// see also: resetIdle()
-	r.DemandBase.Init(p.UUID(), apc.ActList, p.msg.Str(p.Bck.Cname(p.msg.Prefix)) /*ctlmsg*/, p.Bck, r.config.Timeout.MaxHostBusy.D())
+	r.DemandBase.Init(p.UUID(), apc.ActList, p.Bck, r.config.Timeout.MaxHostBusy.D())
 
 	// is set by the first message, never changes
 	r.walk.wor = r.msg.WantOnlyRemoteProps()
@@ -190,6 +192,19 @@ func (p *lsoFactory) beginStreams(r *LsoXact) error {
 // LsoXact //
 /////////////
 
+func (r *LsoXact) CtlMsg() string {
+	var sb strings.Builder
+	sb.Grow(160)
+	r.msg.Str(r.p.Bck.Cname(r.msg.Prefix), &sb)
+	if r.nextToken != "" {
+		sb.WriteString(", paging")
+	}
+	if r.walk.remote {
+		sb.WriteString(", remote")
+	}
+	return sb.String()
+}
+
 func (r *LsoXact) Run(wg *sync.WaitGroup) {
 	wg.Done()
 
@@ -210,8 +225,8 @@ loop:
 
 			// cannot change
 			debug.Assert(r.msg.SID == msg.SID, r.msg.SID, " vs ", msg.SID)
-			debug.Assert(r.walk.wor == msg.WantOnlyRemoteProps(), msg.Str(r.p.Bck.Cname("")))
-			debug.Assert(r.walk.remote == lsoIsRemote(r.p.Bck, msg.IsFlagSet(apc.LsCached)), msg.Str(r.p.Bck.Cname("")))
+			debug.Assert(r.walk.wor == msg.WantOnlyRemoteProps(), r.CtlMsg())
+			debug.Assert(r.walk.remote == lsoIsRemote(r.p.Bck, msg.IsFlagSet(apc.LsCached)), r.CtlMsg())
 
 			r.IncPending()
 			resp := r.doPage()
@@ -237,7 +252,7 @@ loop:
 func (r *LsoXact) stop() {
 	r.stopCh.Close()
 	if lsoIsRemote(r.p.Bck, r.msg.IsFlagSet(apc.LsCached)) {
-		if r.DemandBase.Finished() {
+		if r.DemandBase.IsDone() {
 			// must be aborted
 			if !r.walk.wor {
 				r.p.dm.Close(r.Err())
@@ -253,7 +268,7 @@ func (r *LsoXact) stop() {
 
 				if r.walk.this {
 					debug.Assert(r.remtCh == nil)
-					close(r.msgCh)
+					cos.DrainAnyChan(r.msgCh)
 					r.p.dm.UnregRecv()
 				} else if r.p.dm != nil {
 					// postpone unreg
@@ -312,9 +327,9 @@ func (r *LsoXact) fcleanup(int64) (d time.Duration) {
 	} else {
 		d = hk.UnregInterval
 		if r.remtCh != nil {
-			close(r.remtCh)
+			cos.DrainAnyChan(r.remtCh)
 		}
-		close(r.msgCh)
+		cos.DrainAnyChan(r.msgCh)
 		r.p.dm.UnregRecv()
 	}
 	return d
@@ -333,6 +348,7 @@ func (r *LsoXact) initWalk() {
 	r.walk.pageCh = make(chan *cmn.LsoEnt, pageChSize)
 	r.walk.done = false
 	r.walk.stopCh = cos.NewStopCh()
+	r.walk.lastDir = "" // reset directory dedup state
 	r.walk.wg.Add(1)
 
 	go r.doWalk(r.msg.Clone())
@@ -389,24 +405,22 @@ func (r *LsoXact) doPage() *LsoRsp {
 	return &LsoRsp{Lst: page, Status: http.StatusOK}
 }
 
-// `ais show job` will report the sum of non-replicated obj numbers and
-// sum of obj sizes - for all visited objects
-// Returns the index of the first object in the page that follows the continuation `token`
+// return index of the first object in the page that follows the continuation `token`, as in:
+// - page[:idx] <= token
+// - page[idx:] > token
 func (r *LsoXact) findToken(token string) int {
 	if r.token == token && lsoIsRemote(r.p.Bck, r.msg.IsFlagSet(apc.LsCached)) {
 		return 0
 	}
-	return sort.Search(len(r.page), func(i int) bool { // TODO: revisit
+	return sort.Search(len(r.page), func(i int) bool {
 		return !cmn.TokenGreaterEQ(token, r.page[i].Name)
 	})
 }
 
 func (r *LsoXact) havePage(token string, cnt int64) bool {
-	if r.walk.done {
-		return true
-	}
-	idx := r.findToken(token)
-	return idx+int(cnt) < len(r.page)
+	debug.Assert(!r.walk.done)
+	idx := r.findToken(token) // corresponds to r.page[idx:]
+	return idx+int(cnt) <= len(r.page)
 }
 
 func (r *LsoXact) nextPageR() (err error) {
@@ -528,7 +542,7 @@ func (r *LsoXact) bcast(page *cmn.LsoRes) (err error) {
 		o.Hdr.Opaque = cos.UnsafeB(r.p.UUID())
 		o.Hdr.ObjAttrs.Size = sgl.Len()
 	}
-	o.Callback, o.CmplArg = r.sentCb, sgl // cleanup
+	o.SentCB, o.CmplArg = r.sentCb, sgl // cleanup
 	o.Reader = sgl
 	roc := memsys.NewReader(sgl)
 	r.p.dm.Bcast(o, roc)
@@ -539,7 +553,7 @@ func (r *LsoXact) sentCb(hdr *transport.ObjHdr, _ io.ReadCloser, arg any, err er
 	if err == nil {
 		// using generic out-counter to count broadcast pages
 		r.OutObjsAdd(1, hdr.ObjAttrs.Size)
-	} else if cmn.Rom.FastV(4, cos.SmoduleXs) || !cos.IsRetriableConnErr(err) {
+	} else if cmn.Rom.V(4, cos.ModXs) || !cos.IsErrRetriableConn(err) {
 		nlog.Infof("Warning: %s: failed to send [%+v]: %v", core.T, hdr, err)
 	}
 	sgl, ok := arg.(*memsys.SGL)
@@ -562,29 +576,37 @@ func (r *LsoXact) nextPageA() {
 		r._clrPage(0, len(r.page))
 		r.page = r.page[:0]
 	} else {
-		if r.walk.done {
-			return
-		}
+		// filter cached page by token first (regardless of walk.done)
 		r.shiftLastPage(r.msg.ContinuationToken)
 	}
+
 	r.token = r.msg.ContinuationToken
 
-	if r.havePage(r.token, r.msg.PageSize) {
+	// if (a) done walking or (b) already have enough, stop
+	if r.walk.done || r.havePage(r.token, r.msg.PageSize) {
 		return
 	}
+
 	for cnt := int64(0); cnt < r.msg.PageSize; {
-		obj, ok := <-r.walk.pageCh
+		entry, ok := <-r.walk.pageCh
 		if !ok {
 			r.walk.done = true
 			r.resetIdle()
 			break
 		}
-		// Skip until the requested continuation token (TODO: revisit)
-		if cmn.TokenGreaterEQ(r.token, obj.Name) {
+		// [convention] dirnames always have trailing slash, and vice versa
+		// see also: j.opts.IncludeDirs
+		debug.Func(func() {
+			ok := entry.IsAnyFlagSet(apc.EntryIsDir)
+			debug.Assert(ok == cos.IsLastB(entry.Name, '/'), entry.Name)
+		})
+
+		// skip until requested continuation token
+		if cmn.TokenGreaterEQ(r.token, entry.Name) {
 			continue
 		}
 		cnt++
-		r.page = append(r.page, obj)
+		r.page = append(r.page, entry)
 	}
 }
 
@@ -619,7 +641,13 @@ func (r *LsoXact) doWalk(msg *apc.LsoMsg) {
 	r.walk.wi = newWalkInfo(msg, r.LomAdd)
 	opts := &fs.WalkBckOpts{
 		ValidateCb: r.validateCb,
-		WalkOpts:   fs.WalkOpts{CTs: []string{fs.ObjectType}, Callback: r.cb, Prefix: msg.Prefix, Sorted: true},
+		WalkOpts: fs.WalkOpts{
+			CTs:         []string{fs.ObjCT},
+			Callback:    r.cb,
+			Prefix:      msg.Prefix,
+			Sorted:      true,
+			IncludeDirs: msg.IsFlagSet(apc.LsNoRecursion), // include directories in heap for non-recursive listing
+		},
 	}
 	opts.WalkOpts.Bck.Copy(r.Bck().Bucket())
 	if err := fs.WalkBck(opts); err != nil {
@@ -643,22 +671,48 @@ func (r *LsoXact) validateCb(fqn string, de fs.DirEntry) error {
 		return nil
 	}
 
-	// no recursion:
-	// - check the level of nesting
-	// - possibly add virt dir entry
-	addDirEntry, errN := cmn.CheckDirNoRecurs(r.walk.wi.msg.Prefix, ct.ObjectName())
-	if addDirEntry {
-		entry := &cmn.LsoEnt{Name: ct.ObjectName(), Flags: apc.EntryIsDir}
+	// no recursion: check nesting level to decide whether to skip walking into this directory
+	// (the directory entry itself will be filtered in r.cb using the same CheckDirNoRecurs logic)
+	_, errN := cmn.CheckDirNoRecurs(r.walk.wi.msg.Prefix, ct.ObjectName())
+	return errN
+}
+
+func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
+	// Handle directory entries (from non-recursive listing with IncludeDirs=true)
+	if de.IsDir() {
+		ct, err := core.NewCTFromFQN(fqn, nil)
+		if err != nil {
+			return nil // skip on error
+		}
+		dirName := ct.ObjectName()
+
+		// Filter: only add directories that should be listed as entries
+		addDirEntry, _ := cmn.CheckDirNoRecurs(r.walk.wi.msg.Prefix, dirName)
+		if !addDirEntry {
+			return nil // not a direct child of prefix, skip
+		}
+
+		// Use trailing slash for directory names to distinguish from files with same name
+		// This ensures lexicographical sorting works correctly: "aaa/bbb" < "aaa/bbb/"
+		debug.Assert(!cos.IsLastB(dirName, filepath.Separator))
+		dirName += cos.PathSeparator
+
+		// Deduplicate: heap output is sorted, so duplicates from different mountpaths are adjacent
+		if dirName == r.walk.lastDir {
+			return nil // skip duplicate
+		}
+		r.walk.lastDir = dirName
+
+		entry := &cmn.LsoEnt{Name: dirName, Flags: apc.EntryIsDir}
 		select {
 		case r.walk.pageCh <- entry:
 		case <-r.walk.stopCh.Listen():
 			return errStopped
 		}
+		return nil
 	}
-	return errN // filepath.SkipDir or nil
-}
 
-func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
+	// Handle file entries
 	entry, err := r.walk.wi.callback(fqn, de)
 	if err != nil || entry == nil {
 		return err
@@ -692,9 +746,11 @@ func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
 	entry.Flags |= apc.EntryIsArchive // the parent archive
 	for _, archEntry := range archList {
 		e := &cmn.LsoEnt{
-			Name:  path.Join(entry.Name, archEntry.Name),
-			Flags: entry.Flags | apc.EntryInArch,
-			Size:  archEntry.Size,
+			Name: path.Join(entry.Name, archEntry.Name),
+			Size: archEntry.Size,
+
+			// inherit parent's flags except apc.EntryIsArchive
+			Flags: (entry.Flags &^ apc.EntryIsArchive) | apc.EntryInArch,
 		}
 		select {
 		case r.walk.pageCh <- e:
@@ -706,27 +762,22 @@ func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
 	return nil
 }
 
-func (r *LsoXact) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return
-}
+func (r *LsoXact) Snap() *core.Snap { return r.Base.NewSnap(r) }
 
 //
 // streaming receive: remote pages
 //
 
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (r *LsoXact) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	debug.Assert(lsoIsRemote(r.p.Bck, r.msg.IsFlagSet(apc.LsCached)))
 
-	if hdr.Opcode == opAbort {
+	if hdr.Opcode == transport.OpcAbort {
 		// TODO: consider r.Abort(err); today it'll idle for a while
 		// see:  streamingX.sendTerm
-		err = errors.New(hdr.ObjName)
+		err = newErrRecvAbort(r, hdr)
 	}
-	if err != nil && !cos.IsEOF(err) {
+	if err != nil && !cos.IsOkEOF(err) {
 		nlog.Errorln(core.T.String(), r.String(), len(r.remtCh), err)
 		r.remtCh <- &LsoRsp{Status: http.StatusInternalServerError, Err: err}
 		return err

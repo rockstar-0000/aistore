@@ -12,6 +12,7 @@ redirect_from:
 - [Main README](/README.md)
 - [In-depth Overview](/docs/overview.md)
 - [Getting Started](/docs/getting_started.md)
+- [AIS Buckets: Design and Operations](/docs/bucket.md)
 - [CLI: overview](/docs/cli.md)
 - [CLI: reference guide](https://github.com/NVIDIA/aistore/blob/main/docs/cli.md#cli-reference)
 - [Technical Blog](https://aistore.nvidia.com/blog)
@@ -23,7 +24,8 @@ redirect_from:
 - [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore), and also:
   - [pip package](https://pypi.org/project/aistore/)
   - [reference guide](/docs/python_sdk.md)
-- [REST API](/docs/http_api.md)
+- [HTTP API Reference](https://aistore.nvidia.com/docs/http-api)
+  - [curl examples](/docs/http_api.md)
   - [Easy URL](https://github.com/NVIDIA/aistore/blob/main/docs/easy_url.md)
 - Amazon S3
   - [`s3cmd` client](/docs/s3compat.md#quick-start-with-s3cmd)
@@ -88,7 +90,9 @@ redirect_from:
 ## ETL - Extract, Transform, Load
 
 - [AIStore ETL Overview](/docs/etl.md)
-- [ETL Transformer Examples](https://github.com/NVIDIA/aistore/tree/main/python/examples/ais-etl)
+- [ETL CLI Docs](/docs/cli/etl.md)
+- [ETL Python SDK Examples](https://github.com/NVIDIA/aistore/tree/main/python/examples/ais-etl)
+- [Custom Transformers](https://github.com/NVIDIA/ais-etl/tree/main/transformers)
 - [ETL Python Webserver SDK](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl/webserver/README.md)
 - [ETL Golang Webserver Package](https://github.com/NVIDIA/aistore/blob/main/ext/etl/webserver/README.md)
 

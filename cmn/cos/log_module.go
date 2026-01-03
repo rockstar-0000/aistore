@@ -1,12 +1,13 @@
 // Package cos provides common low-level types and utilities for all aistore projects.
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/debug"
 )
@@ -16,24 +17,24 @@ import (
 const ferl = "invalid log.level %q (%d, %08b)"
 
 const (
-	SmoduleTransport = 1 << iota
-	SmoduleAIS
-	SmoduleMemsys
-	SmoduleCore
-	SmoduleFS
-	SmoduleReb
-	SmoduleEC
-	SmoduleStats
-	SmoduleIOS
-	SmoduleXs
-	SmoduleBackend
-	SmoduleSpace
-	SmoduleMirror
-	SmoduleDsort
-	SmoduleDload
-	SmoduleETL
-	SmoduleS3
-	SmoduleKalive
+	ModTransport = 1 << iota
+	ModAIS
+	ModMemsys
+	ModCore
+	ModFS
+	ModReb
+	ModEC
+	ModStats
+	ModIOS
+	ModXs
+	ModBackend
+	ModSpace
+	ModMirror
+	ModDsort
+	ModDload
+	ModETL
+	ModS3
+	ModKalive
 
 	// NOTE: the last
 	_smoduleLast
@@ -41,8 +42,8 @@ const (
 
 const maxLevel = 5
 
-// NOTE: keep in-sync with the above
-var Smodules = [...]string{
+// NOTE: keep in-sync with the above; used by CLI
+var Mods = [...]string{
 	"transport", "ais", "memsys", "cluster", "fs", "reb", "ec", "stats",
 	"ios", "xs", "backend", "space", "mirror", "dsort", "downloader", "etl",
 	"s3",
@@ -60,7 +61,7 @@ func (l LogLevel) Parse() (level, modules int) {
 
 func (l *LogLevel) Set(level int, sm []string) {
 	var modules int
-	for i, a := range Smodules {
+	for i, a := range Mods {
 		for _, b := range sm {
 			if a == b {
 				modules |= 1 << i
@@ -80,7 +81,6 @@ func (l LogLevel) Validate() (err error) {
 
 func (l LogLevel) String() (s string) {
 	var (
-		ms             string
 		n              int
 		level, modules = l.Parse()
 	)
@@ -88,13 +88,18 @@ func (l LogLevel) String() (s string) {
 	if modules == 0 {
 		return
 	}
-	for i, sm := range Smodules {
+
+	var sb strings.Builder
+	sb.Grow(len(Mods) * 16)
+	for i, sm := range Mods {
 		if modules&(1<<i) != 0 {
-			ms += "," + sm
+			sb.WriteByte(',')
+			sb.WriteString(sm)
 			n++
 		}
 	}
+
 	debug.Assert(n > 0, fmt.Sprintf(ferl, string(l), level, modules))
-	s += " (module" + Plural(n) + ": " + ms[1:] + ")"
+	s += " (module" + Plural(n) + ": " + sb.String()[1:] + ")"
 	return
 }

@@ -62,7 +62,8 @@ type (
 )
 
 func voteInProgress() (xele core.Xact) {
-	if e := xreg.GetRunning(xreg.Flt{Kind: apc.ActElection}); e != nil {
+	flt := xreg.Flt{Kind: apc.ActElection}
+	if e := xreg.GetRunning(&flt); e != nil {
 		xele = e.Get()
 	}
 	return
@@ -103,8 +104,8 @@ func (p *proxy) voteHandler(w http.ResponseWriter, r *http.Request) {
 	case apc.VoteInit:
 		p.httpelect(w, r)
 	case apc.PriStop:
-		callerID := r.Header.Get(apc.HdrCallerID)
-		p.onPrimaryDown(p, callerID)
+		senderID := r.Header.Get(apc.HdrSenderID)
+		p.onPrimaryDown(p, senderID)
 	default:
 		p.writeErrURL(w, r)
 	}
@@ -130,9 +131,9 @@ func (p *proxy) httpelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	smap := p.owner.smap.get()
-	caller := r.Header.Get(apc.HdrCallerName)
+	sender := r.Header.Get(apc.HdrSenderName)
 
-	nlog.Infoln(tag, pnameC, "receive", newSmap.StringEx(), "from", caller, "local [", smap.StringEx(), "]")
+	nlog.Infoln(tag, pnameC, "receive", newSmap.StringEx(), "from", sender, "local [", smap.StringEx(), "]")
 
 	if !newSmap.isPresent(p.si) {
 		p.writeErrf(w, r, "%s %s: not present in the Vote Request, %s", tag, pname, newSmap)
@@ -324,7 +325,7 @@ func (p *proxy) electPhase1(vr *VoteRecord) (winner bool, errors cos.StrSet) {
 			}
 			n++
 		} else {
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.V(4, cos.ModAIS) {
 				nlog.Infof("Node %s responded with (winner: %t)", res.daemonID, res.yes)
 			}
 			if res.yes {
@@ -435,18 +436,18 @@ func (t *target) voteHandler(w http.ResponseWriter, r *http.Request) {
 // voting: common methods
 //
 
-func (h *htrun) onPrimaryDown(self *proxy, callerID string) {
+func (h *htrun) onPrimaryDown(self *proxy, senderID string) {
 	smap := h.owner.smap.get()
 	if smap.validate() != nil {
 		return
 	}
 	clone := smap.clone()
 	s := "via keepalive"
-	if callerID != "" {
+	if senderID != "" {
 		s = "via direct call"
-		if callerID != clone.Primary.ID() {
-			nlog.Errorf("%s (%s): non-primary caller reporting primary down (%s, %s, %s)",
-				h, s, callerID, clone.Primary.StringEx(), smap)
+		if senderID != clone.Primary.ID() {
+			nlog.Errorf("%s (%s): non-primary sender reporting primary down (%s, %s, %s)",
+				h, s, senderID, clone.Primary.StringEx(), smap)
 			return
 		}
 	}
@@ -633,7 +634,7 @@ func (h *htrun) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *meta.S
 	if err == nil {
 		return nil
 	}
-	if !cos.IsRetriableConnErr(err) {
+	if !cos.IsErrRetriableConn(err) {
 		return err
 	}
 	// retry
@@ -646,7 +647,7 @@ func (h *htrun) sendElectionRequest(vr *VoteInitiation, nextPrimaryProxy *meta.S
 		if err == nil {
 			return nil
 		}
-		if !cos.IsRetriableConnErr(err) {
+		if !cos.IsErrRetriableConn(err) {
 			break
 		}
 		sleep += sleep / 2
@@ -662,7 +663,7 @@ func (h *htrun) voteOnProxy(daemonID, currPrimaryID string) (bool, error) {
 	// First: Check last keepalive timestamp. If the proxy was recently successfully reached,
 	// this will always vote no, as we believe the original proxy is still alive.
 	if !h.keepalive.timeToPing(currPrimaryID) {
-		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.V(4, cos.ModAIS) {
 			nlog.Warningf("Primary %s is still alive", currPrimaryID)
 		}
 		return false, nil
@@ -673,11 +674,12 @@ func (h *htrun) voteOnProxy(daemonID, currPrimaryID string) (bool, error) {
 	smap := h.owner.smap.get()
 	nextPrimaryProxy, err := smap.HrwProxy(currPrimaryID)
 	if err != nil {
-		return false, fmt.Errorf("error executing HRW: %v", err)
+		nlog.Errorln(err)
+		return false, err
 	}
 
 	vote := nextPrimaryProxy.ID() == daemonID
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.V(4, cos.ModAIS) {
 		nlog.Infof("%s: voting '%t' for %s", h, vote, daemonID)
 	}
 	return vote, nil

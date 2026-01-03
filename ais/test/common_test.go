@@ -5,12 +5,16 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,13 +22,16 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -35,13 +42,18 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-// more tools
-
-const rebalanceObjectDistributionTestCoef = 0.3
+const (
+	rootDir = "/tmp/ais"
+)
 
 const (
-	prefixDir     = "filter"
-	largeFileSize = 4 * cos.MiB
+	rebalanceObjectDistributionTestCoef = 0.3
+)
+
+const (
+	prefixDir        = "filter"
+	largeFileSize    = 4 * cos.MiB
+	cloudMinPartSize = 5 * cos.MiB // AWS and GCP minimum part size for multipart uploads
 
 	workerCnt = 10
 )
@@ -49,38 +61,53 @@ const (
 const testMpath = "/tmp/ais/mountpath"
 
 var (
-	cliBck         cmn.Bck
-	errObjectFound = errors.New("found") // to interrupt fs.Walk when object found
-	fsOnce         sync.Once
+	cliBck             cmn.Bck
+	cliIOCtxChunksConf *ioCtxChunksConf
+	errObjectFound     = errors.New("found") // to interrupt fs.Walk when object found
+	_onceInit          sync.Once
 )
 
-type ioContext struct {
-	t                   *testing.T
-	smap                *meta.Smap
-	controlCh           chan struct{}
-	stopCh              chan struct{}
-	objNames            []string
-	bck                 cmn.Bck
-	fileSize            uint64
-	proxyURL            string
-	prefix              string
-	otherTasksToTrigger int
-	originalTargetCount int
-	originalProxyCount  int
-	num                 int
-	numGetsEachFile     int
-	nameLen             int
-	getErrIsFatal       bool
-	silent              bool
-	fixedSize           bool
-	deleteRemoteBckObjs bool
-	ordered             bool // true - object names make sequence, false - names are random
+type (
+	ioContext struct {
+		t         *testing.T
+		smap      *meta.Smap
+		controlCh chan struct{}
+		stopCh    chan struct{}
+		objNames  []string
+		bck       cmn.Bck
 
-	numGetErrs atomic.Uint64
-	numPutErrs int
+		// Chunks configuration
+		chunksConf *ioCtxChunksConf
 
-	objIdx int // Used in `m.nextObjName`
-}
+		// File size configuration
+		fileSize      uint64
+		fixedSize     bool
+		fileSizeRange [2]uint64 // [min, max] size range; take precedence over `fileSize` and `fixedSize`
+
+		proxyURL            string
+		prefix              string
+		otherTasksToTrigger int
+		originalTargetCount int
+		originalProxyCount  int
+		num                 int
+		numGetsEachFile     int
+		nameLen             int
+		objIdx              int // Used in `m.nextObjName`
+		numPutErrs          int
+
+		numGetErrs atomic.Uint64
+
+		getErrIsFatal       bool
+		silent              bool
+		deleteRemoteBckObjs bool
+		ordered             bool // true - object names make sequence, false - names are random
+		skipVC              bool // skip loading existing object's metadata (see also: apc.QparamSkipVC and api.PutArgs.SkipVC)
+	}
+	ioCtxChunksConf struct {
+		numChunks int // desired number of chunks
+		multipart bool
+	}
+)
 
 func (m *ioContext) initAndSaveState(cleanup bool) {
 	m.init(cleanup)
@@ -91,7 +118,7 @@ func (m *ioContext) saveCluState(proxyURL string) {
 	m.smap = tools.GetClusterMap(m.t, proxyURL)
 	m.originalTargetCount = m.smap.CountActiveTs()
 	m.originalProxyCount = m.smap.CountActivePs()
-	tlog.Logf("targets: %d, proxies: %d\n", m.originalTargetCount, m.originalProxyCount)
+	tlog.Logfln("targets: %d, proxies: %d", m.originalTargetCount, m.originalProxyCount)
 }
 
 func (m *ioContext) waitAndCheckCluState() {
@@ -107,6 +134,7 @@ func (m *ioContext) waitAndCheckCluState() {
 }
 
 func (m *ioContext) checkCluState(smap *meta.Smap) {
+	m.t.Helper()
 	proxyCount := smap.CountActivePs()
 	targetCount := smap.CountActiveTs()
 	if targetCount != m.originalTargetCount ||
@@ -125,8 +153,8 @@ func (m *ioContext) init(cleanup bool) {
 		// if random selection failed, use RO url
 		m.proxyURL = tools.GetPrimaryURL()
 	}
-	if m.fileSize == 0 {
-		m.fileSize = cos.KiB
+	if m.fileSize == 0 && m.fileSizeRange[0] == 0 && m.fileSizeRange[1] == 0 {
+		m.fileSizeRange[0], m.fileSizeRange[1] = cos.KiB, 4*cos.KiB
 	}
 	if m.num > 0 {
 		m.objNames = make([]string, 0, m.num)
@@ -136,6 +164,7 @@ func (m *ioContext) init(cleanup bool) {
 	}
 	if m.bck.Name == "" {
 		m.bck.Name = trand.String(15)
+		m.bck.Ns = genBucketNs()
 	}
 	if m.bck.Provider == "" {
 		m.bck.Provider = apc.AIS
@@ -144,6 +173,9 @@ func (m *ioContext) init(cleanup bool) {
 		m.numGetsEachFile = 1
 	}
 	m.stopCh = make(chan struct{})
+
+	// NOTE: randomize skipVC (may need to assign explicitly in the future)
+	m.skipVC = mono.NanoTime()&1 == 0
 
 	if m.bck.IsRemote() {
 		if m.deleteRemoteBckObjs {
@@ -161,6 +193,10 @@ func (m *ioContext) init(cleanup bool) {
 			}
 		})
 	}
+	// If no chunks configuration is provided, use the default from the environment variable
+	if m.chunksConf == nil {
+		m.chunksConf = cliIOCtxChunksConf
+	}
 }
 
 func (m *ioContext) expectTargets(n int) {
@@ -176,11 +212,12 @@ func (m *ioContext) expectProxies(n int) {
 }
 
 func (m *ioContext) checkObjectDistribution(t *testing.T) {
+	m.t.Helper()
 	var (
 		requiredCount     = int64(rebalanceObjectDistributionTestCoef * (float64(m.num) / float64(m.originalTargetCount)))
 		targetObjectCount = make(map[string]int64)
 	)
-	tlog.Logf("Checking if each target has a required number of object in bucket %s...\n", m.bck.String())
+	tlog.Logfln("Checking if each target has a required number of object in bucket %s...", m.bck.String())
 	baseParams := tools.BaseAPIParams(m.proxyURL)
 	lst, err := api.ListObjects(baseParams, m.bck, &apc.LsoMsg{Props: apc.GetPropsLocation}, api.ListArgs{})
 	tassert.CheckFatal(t, err)
@@ -200,7 +237,25 @@ func (m *ioContext) checkObjectDistribution(t *testing.T) {
 	}
 }
 
+func (m *ioContext) sizesToString() (s string) {
+	siz0, siz1 := int64(m.fileSizeRange[0]), int64(m.fileSizeRange[1])
+	switch {
+	case siz0 >= 0 && siz1 > 0:
+		s = fmt.Sprintf(" (size %s - %s)", cos.IEC(siz0, 0), cos.IEC(siz1, 0))
+		debug.Assert(siz1 >= siz0, s)
+	case m.fixedSize:
+		s = fmt.Sprintf(" (size %d)", m.fileSize)
+	case m.fileSize > 0:
+		s = fmt.Sprintf(" (approx. size %d)", m.fileSize)
+	}
+	if m.chunksConf != nil && m.chunksConf.multipart {
+		s += fmt.Sprintf(" (%d chunks)", m.chunksConf.numChunks)
+	}
+	return s
+}
+
 func (m *ioContext) puts(ignoreErrs ...bool) {
+	m.t.Helper()
 	if !m.bck.IsAIS() {
 		m.remotePuts(false /*evict*/)
 		return
@@ -209,36 +264,107 @@ func (m *ioContext) puts(ignoreErrs ...bool) {
 	p, err := api.HeadBucket(baseParams, m.bck, false /* don't add */)
 	tassert.CheckFatal(m.t, err)
 
-	var ignoreErr bool
-	if len(ignoreErrs) > 0 {
-		ignoreErr = ignoreErrs[0]
-	}
 	if !m.silent {
-		var s, k string
-		if m.fixedSize {
-			s = fmt.Sprintf(" (size %d)", m.fileSize)
-		} else if m.fileSize > 0 {
-			s = fmt.Sprintf(" (approx. size %d)", m.fileSize)
-		}
-		if k = m.prefix; k != "" {
-			k = "/" + k + "*"
-		}
-		tlog.Logf("PUT %d objects%s => %s%s\n", m.num, s, m.bck.String(), k)
+		s := m.sizesToString()
+		tlog.Logfln("PUT %d objects%s => %s", m.num, s, m.bck.Cname(m.prefix))
 	}
-	m.objNames, m.numPutErrs, err = tools.PutRandObjs(tools.PutObjectsArgs{
-		ProxyURL:  m.proxyURL,
-		Bck:       m.bck,
-		ObjPath:   m.prefix,
-		ObjCnt:    m.num,
-		ObjNameLn: m.nameLen,
-		ObjSize:   m.fileSize,
-		FixedSize: m.fixedSize,
-		CksumType: p.Cksum.Type,
-		WorkerCnt: 0, // TODO: Should we set something custom?
-		IgnoreErr: ignoreErr,
-		Ordered:   m.ordered,
-	})
+	putArgs := tools.PutObjectsArgs{
+		ProxyURL:     m.proxyURL,
+		Bck:          m.bck,
+		ObjPath:      m.prefix,
+		ObjCnt:       m.num,
+		ObjNameLn:    m.nameLen,
+		ObjSizeRange: m.fileSizeRange, // take precedence over `ObjSize` and `FixedSize`
+		ObjSize:      m.fileSize,
+		FixedSize:    m.fixedSize,
+		CksumType:    p.Cksum.Type,
+		WorkerCnt:    0, // TODO: Should we set something custom?
+		IgnoreErr:    len(ignoreErrs) > 0 && ignoreErrs[0],
+		Ordered:      m.ordered,
+		SkipVC:       m.skipVC,
+	}
+	if m.chunksConf != nil && m.chunksConf.multipart {
+		putArgs.MultipartNumChunks = m.chunksConf.numChunks
+		m.objNames, m.numPutErrs, err = tools.PutRandObjs(putArgs)
+		tassert.CheckFatal(m.t, err)
+
+		// verify objects are chunked
+		ls, err := api.ListObjects(baseParams, m.bck, &apc.LsoMsg{Prefix: m.prefix, Props: apc.GetPropsChunked}, api.ListArgs{})
+		tassert.CheckFatal(m.t, err)
+		if len(ls.Entries) != m.num {
+			tlog.Logfln("warning: expected %d objects, got %d", m.num, len(ls.Entries))
+		}
+	} else {
+		m.objNames, m.numPutErrs, err = tools.PutRandObjs(putArgs)
+	}
 	tassert.CheckFatal(m.t, err)
+}
+
+// adjustFileSizeRange adjusts the file size range to avoid cloud backend [EntityTooSmall] errors
+// for AWS and GCP backends which require minimum 5MiB per part in multipart uploads
+func (m *ioContext) adjustFileSizeRange() {
+	m.t.Helper()
+
+	if m.chunksConf == nil || !m.chunksConf.multipart {
+		return
+	}
+
+	// Check if backend is AWS or GCP (both have 5MiB minimum part size)
+	provider := m.bck.Provider
+	if m.bck.Backend() != nil {
+		provider = m.bck.Backend().Provider
+	}
+	if provider != apc.AWS && provider != apc.GCP {
+		return
+	}
+
+	minTotalSize := cloudMinPartSize * uint64(m.chunksConf.numChunks)
+
+	if m.fileSizeRange[0] >= minTotalSize && m.fileSizeRange[1] >= minTotalSize {
+		return
+	}
+
+	m.fileSizeRange = [2]uint64{minTotalSize, minTotalSize * 2}
+	tlog.Logfln("%s backend detected, increase file size range to %s - %s to avoid [EntityTooSmall] errors",
+		provider, cos.IEC(int64(m.fileSizeRange[0]), 0), cos.IEC(int64(m.fileSizeRange[1]), 0))
+}
+
+// update updates the object with a new random reader and returns the reader and the size; reader is used to validate the object after the update
+func (m *ioContext) update(objName, cksumType string) (readers.Reader, uint64) {
+	m.adjustFileSizeRange()
+	var (
+		size      = tools.GetRandSize(m.fileSizeRange, m.fileSize, m.fixedSize)
+		errCh     = make(chan error, 1)
+		numChunks int
+	)
+	if m.chunksConf != nil && m.chunksConf.multipart {
+		numChunks = m.chunksConf.numChunks
+	}
+	r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: int64(size), CksumType: cksumType})
+	tassert.CheckFatal(m.t, err)
+	tools.Put(m.proxyURL, m.bck, objName, r, size, numChunks, errCh)
+	tassert.SelectErr(m.t, errCh, "put", true)
+
+	return r, size
+}
+
+func (m *ioContext) updateAndValidate(baseParams api.BaseParams, idx int, cksumType string) {
+	if idx < 0 || idx >= len(m.objNames) {
+		m.t.Fatalf("index out of range: %d, len(objNames): %d", idx, len(m.objNames))
+	}
+
+	r, size := m.update(m.objNames[idx], cksumType)
+
+	// GET and validate the object
+	w := bytes.NewBuffer(nil)
+	result, s, err := api.GetObjectReader(baseParams, m.bck, m.objNames[idx], &api.GetArgs{Writer: w})
+	tassert.CheckFatal(m.t, err)
+
+	// Compare retrieved content with original data
+	br, err := r.Open()
+	tassert.CheckFatal(m.t, err)
+	tassert.Fatalf(m.t, s == int64(size), "object %s size mismatch: expected %d, got %d", m.objNames[idx], size, s)
+	tassert.Fatalf(m.t, tools.ReaderEqual(br, result), "object %s content mismatch", m.objNames[idx])
 }
 
 // remotePuts by default empties remote bucket and puts new `m.num` objects
@@ -255,6 +381,8 @@ func (m *ioContext) remotePuts(evict bool, overrides ...bool) {
 		m.del()
 		m.objNames = m.objNames[:0]
 	}
+
+	m.adjustFileSizeRange()
 
 	m._remoteFill(m.num, evict, override)
 }
@@ -289,16 +417,18 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 		wg         = cos.NewLimitedWaitGroup(20, 0)
 	)
 	if !m.silent {
-		tlog.Logf("remote PUT %d objects (size %s) => %s\n", objCnt, cos.ToSizeIEC(int64(m.fileSize), 0), m.bck.String())
+		s := m.sizesToString()
+		tlog.Logfln("remote PUT %d objects%s => %s", objCnt, s, m.bck.Cname(m.prefix))
 	}
 	p, err := api.HeadBucket(baseParams, m.bck, false /* don't add */)
 	tassert.CheckFatal(m.t, err)
 
 	for i := range objCnt {
-		r, err := readers.NewRand(int64(m.fileSize), p.Cksum.Type)
-		tassert.CheckFatal(m.t, err)
-
-		var objName string
+		var (
+			objName   string
+			numChunks int
+			size      = tools.GetRandSize(m.fileSizeRange, m.fileSize, m.fixedSize)
+		)
 		switch {
 		case override:
 			objName = m.objNames[i]
@@ -308,18 +438,26 @@ func (m *ioContext) _remoteFill(objCnt int, evict, override bool) {
 			objName = fmt.Sprintf("%s%s-%d", m.prefix, trand.String(8), i)
 		}
 
+		if m.chunksConf != nil && m.chunksConf.multipart {
+			numChunks = m.chunksConf.numChunks
+		}
+
 		wg.Add(1)
-		go func() {
+		go func(size uint64, objName string, cksumType string) {
 			defer wg.Done()
-			tools.Put(m.proxyURL, m.bck, objName, r, errCh)
-		}()
+
+			r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: int64(size), CksumType: cksumType})
+			tassert.CheckFatal(m.t, err)
+			tools.Put(m.proxyURL, m.bck, objName, r, size, numChunks, errCh)
+		}(size, objName, p.Cksum.Type)
+
 		if !override {
 			m.objNames = append(m.objNames, objName)
 		}
 	}
 	wg.Wait()
 	tassert.SelectErr(m.t, errCh, "put", true)
-	tlog.Logf("remote bucket %s: %d cached objects\n", m.bck.String(), m.num)
+	tlog.Logfln("remote bucket %s: %d cached objects", m.bck.String(), m.num)
 
 	if evict {
 		m.evict()
@@ -338,9 +476,37 @@ func (m *ioContext) evict() {
 		m.t.Fatalf("list_objects err: %d != %d", len(lst.Entries), m.num)
 	}
 
-	tlog.Logf("evicting remote bucket %s...\n", m.bck.String())
+	tlog.Logfln("evicting remote bucket %s...", m.bck.String())
 	err = api.EvictRemoteBucket(baseParams, m.bck, false)
 	tassert.CheckFatal(m.t, err)
+}
+
+// TODO: optionally, filter by content type as well
+// NOTE: assuming 'RequiredDeployment == tools.ClusterTypeLocal'
+func (m *ioContext) backdateLocalObjs(age time.Duration) {
+	var (
+		sep     = string(filepath.Separator)
+		old     = time.Now().Add(-age)
+		touched int
+	)
+	err := filepath.WalkDir(rootDir, func(path string, de iofs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if de.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(de.Name(), m.prefix) && strings.Contains(path, sep+m.bck.Name+sep) {
+			touched++
+			return os.Chtimes(path, old, old)
+		}
+		return nil
+	})
+	tassert.CheckFatal(m.t, err)
+
+	if touched != len(m.objNames) {
+		tlog.Logfln("Warning: touched %d != %d objnames", touched, len(m.objNames))
+	}
 }
 
 func (m *ioContext) remotePrefetch(prefetchCnt int) {
@@ -352,7 +518,7 @@ func (m *ioContext) remotePrefetch(prefetchCnt int) {
 	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{})
 	tassert.CheckFatal(m.t, err)
 
-	tlog.Logf("remote PREFETCH %d objects...\n", prefetchCnt)
+	tlog.Logfln("remote PREFETCH %d objects...", prefetchCnt)
 
 	wg := &sync.WaitGroup{}
 	for idx, obj := range lst.Entries {
@@ -381,7 +547,12 @@ func isContextDeadline(err error) bool {
 // is called in a variety of ways including (post-test) t.Cleanup => _cleanup()
 // and (pre-test) via deleteRemoteBckObjs
 
-const maxDelObjErrCount = 100
+const (
+	maxDelObjErrCount = 10
+	sleepDelObj       = 2 * time.Second
+	maxSleepDelObj    = 10 * time.Second
+	limitDelObjGor    = 8
+)
 
 func (m *ioContext) del(opts ...int) {
 	var (
@@ -394,10 +565,10 @@ func (m *ioContext) del(opts ...int) {
 	if isContextDeadline(err) {
 		if m.bck.IsRemote() {
 			time.Sleep(time.Second)
-			tlog.Logf("Warning: 2nd attempt to query buckets %q\n", cmn.QueryBcks(m.bck))
+			tlog.Logfln("Warning: 2nd attempt to query buckets %q", cmn.QueryBcks(m.bck))
 			exists, err = api.QueryBuckets(baseParams, cmn.QueryBcks(m.bck), apc.FltExists)
 			if isContextDeadline(err) {
-				tlog.Logf("Error: failing to query buckets %q: %v - proceeding anyway...\n", cmn.QueryBcks(m.bck), err)
+				tlog.Logfln("Error: failing to query buckets %q: %v - proceeding anyway...", cmn.QueryBcks(m.bck), err)
 				exists, err = false, nil
 			}
 		}
@@ -419,8 +590,8 @@ func (m *ioContext) del(opts ...int) {
 			lsmsg.Flags = uint64(opts[1]) // do HEAD(remote-bucket)
 		}
 	}
-	if toRemoveCnt < 0 && m.prefix != "" {
-		lsmsg.Prefix = "" // all means all
+	if toRemoveCnt < 0 && m.prefix == "" {
+		lsmsg.Prefix = "" // all means all (when prefix is already empty)
 	}
 	lst, err := api.ListObjects(baseParams, m.bck, lsmsg, api.ListArgs{})
 	if err != nil {
@@ -438,16 +609,18 @@ func (m *ioContext) del(opts ...int) {
 	// delete
 	toRemove := lst.Entries
 	if toRemoveCnt >= 0 {
-		toRemove = toRemove[:toRemoveCnt]
+		n := min(toRemoveCnt, len(toRemove))
+		toRemove = toRemove[:n]
 	}
 	l := len(toRemove)
 	if l == 0 {
 		return
 	}
-	tlog.Logf("deleting %d object%s from %s\n", l, cos.Plural(l), m.bck.Cname(""))
+	tlog.Logfln("deleting %d object%s from %s", l, cos.Plural(l), m.bck.Cname(lsmsg.Prefix))
 	var (
 		errCnt atomic.Int64
-		wg     = cos.NewLimitedWaitGroup(16, l)
+		sleep  = atomic.NewInt64(int64(sleepDelObj))
+		wg     = cos.NewLimitedWaitGroup(min(limitDelObjGor, sys.MaxParallelism()), l)
 	)
 	for _, obj := range toRemove {
 		if errCnt.Load() > maxDelObjErrCount {
@@ -456,51 +629,67 @@ func (m *ioContext) del(opts ...int) {
 		}
 		wg.Add(1)
 		go func(obj *cmn.LsoEnt) {
-			m._delOne(baseParams, obj, &errCnt)
+			m._delOne(baseParams, obj, &errCnt, sleep)
 			wg.Done()
 		}(obj)
 	}
 	wg.Wait()
 }
 
-func (m *ioContext) _delOne(baseParams api.BaseParams, obj *cmn.LsoEnt, errCnt *atomic.Int64) {
+// TODO: rid of strings.Contains - use cmn.AsErrHTTP
+func (m *ioContext) _delOne(baseParams api.BaseParams, obj *cmn.LsoEnt, errCnt, sleep *atomic.Int64) {
 	err := api.DeleteObject(baseParams, m.bck, obj.Name)
 	if err == nil {
 		return
 	}
-	//
-	// excepting benign (TODO: rid of strings.Contains)
-	//
-	const sleepRetry = 2 * time.Second
-	e := strings.ToLower(err.Error())
+
+	var (
+		e = strings.ToLower(err.Error())
+		d = time.Duration(sleep.Load())
+		b bool
+	)
 	switch {
 	case cmn.IsErrObjNought(err):
 		return
 	case strings.Contains(e, "server closed idle connection"):
 		return // see (unexported) http.exportErrServerClosedIdle in the Go source
 	case cos.IsErrConnectionNotAvail(err):
-		errCnt.Add(maxDelObjErrCount/10 - 1)
-	// retry
-	case m.bck.IsCloud() && (cos.IsErrConnectionReset(err) || strings.Contains(e, "reset by peer")):
-		time.Sleep(sleepRetry)
-		err = api.DeleteObject(baseParams, m.bck, obj.Name)
-	case m.bck.IsCloud() && strings.Contains(e, "try again"):
-		// aws-error[InternalError: We encountered an internal error. Please try again.]
-		time.Sleep(sleepRetry)
-		err = api.DeleteObject(baseParams, m.bck, obj.Name)
-	case m.bck.IsCloud() && apc.ToScheme(m.bck.Provider) == apc.GSScheme &&
-		strings.Contains(e, "gateway") && strings.Contains(e, "timeout"):
-		// e.g:. "googleapi: Error 504: , gatewayTimeout" (where the gateway is in fact LB)
-		time.Sleep(sleepRetry)
-		err = api.DeleteObject(baseParams, m.bck, obj.Name)
+		errCnt.Add(max(2, maxDelObjErrCount/10-1))
+
+	// retry (cloud): transient network or well-known HTTP flaps
+	case m.bck.IsCloud():
+		// respectively:
+		// - timeout / reset / refused / aborted / pipe / url.Timeout
+		// - 429 Too Many Requests
+		// - 502 Bad Gateway
+		// - 503 Service Unavailable
+		// - AWS InternalError "Please try again"
+		// - GCS / LB 504 wording
+		retriable := cos.IsErrRetriableConn(err) ||
+			strings.Contains(e, "too many requests") ||
+			cmn.IsStatusBadGateway(err) || strings.Contains(e, "bad gateway") ||
+			cmn.IsStatusServiceUnavailable(err) || strings.Contains(e, "service unavailable") ||
+			strings.Contains(e, "try again") ||
+			(apc.ToScheme(m.bck.Provider) == apc.GSScheme && strings.Contains(e, "gateway") && strings.Contains(e, "timeout"))
+		if retriable {
+			time.Sleep(d)
+			err = api.DeleteObject(baseParams, m.bck, obj.Name)
+			b = true
+		}
 	}
 
 	if err == nil || cmn.IsErrObjNought(err) {
 		return
 	}
 	errCnt.Inc()
+	if b {
+		time.Sleep(d)
+		a := sleep.Load()
+		a += a >> 1
+		sleep.Store(min(int64(maxSleepDelObj), a))
+	}
 	if m.bck.IsCloud() && errCnt.Load() < 5 {
-		tlog.Logf("Warning: failed to cleanup %s: %v\n", m.bck.Cname(""), err)
+		tlog.Logfln("Warning: failed to cleanup %s: %v", m.bck.Cname(""), err)
 	}
 	tassert.CheckError(m.t, err)
 }
@@ -526,9 +715,9 @@ func (m *ioContext) get(baseParams api.BaseParams, idx, totalGets int, getArgs *
 	}
 	if idx > 0 && idx%5000 == 0 && !m.silent {
 		if totalGets > 0 {
-			tlog.Logf(" %d/%d GET requests completed...\n", idx, totalGets)
+			tlog.Logfln(" %d/%d GET requests completed...", idx, totalGets)
 		} else {
-			tlog.Logf(" %d GET requests completed...\n", idx)
+			tlog.Logfln(" %d GET requests completed...", idx)
 		}
 	}
 
@@ -547,9 +736,9 @@ func (m *ioContext) gets(getArgs *api.GetArgs, withValidation bool) {
 	)
 	if !m.silent {
 		if m.numGetsEachFile == 1 {
-			tlog.Logf("GET %d objects from %s\n", m.num, m.bck.String())
+			tlog.Logfln("GET %d objects from %s", m.num, m.bck.String())
 		} else {
-			tlog.Logf("GET %d objects %d times from %s\n", m.num, m.numGetsEachFile, m.bck.String())
+			tlog.Logfln("GET %d objects %d times from %s", m.num, m.numGetsEachFile, m.bck.String())
 		}
 	}
 	wg := cos.NewLimitedWaitGroup(20, 0)
@@ -597,6 +786,10 @@ func (m *ioContext) ensureNumCopies(baseParams api.BaseParams, expectedCopies in
 	time.Sleep(time.Second)
 	xargs := xact.ArgsMsg{Kind: apc.ActMakeNCopies, Bck: m.bck, Timeout: tools.RebalanceTimeout}
 	_, err := api.WaitForXactionIC(baseParams, &xargs)
+	if err != nil && strings.Contains(err.Error(), "not found") {
+		tlog.Logfln("Warning: (kind %s, bucket %s), err: %v", apc.ActMakeNCopies, m.bck.Cname(""), err)
+		err = nil
+	}
 	tassert.CheckFatal(m.t, err)
 
 	// List Bucket - primarily for the copies
@@ -618,7 +811,7 @@ func (m *ioContext) ensureNumCopies(baseParams api.BaseParams, expectedCopies in
 			copiesToNumObjects[int(entry.Copies)]++
 		}
 	}
-	tlog.Logf("objects (total, copies) = (%d, %v)\n", total, copiesToNumObjects)
+	tlog.Logfln("objects (total, copies) = (%d, %v)", total, copiesToNumObjects)
 	if total != m.num {
 		m.t.Errorf("list_objects: expecting %d objects, got %d", m.num, total)
 	}
@@ -700,12 +893,12 @@ func ensurePrevRebalanceIsFinished(baseParams api.BaseParams, err error) bool {
 	if !ok {
 		return false
 	}
-	// TODO: improve checking for cmn.ErrLimitedCoexistence
-	if !strings.Contains(herr.Message, "is currently running,") {
+	if herr.TypeCode != "ErrLimitedCoexistence" {
 		return false
 	}
-	tlog.Logln("Warning: wait for unfinished rebalance(?)")
-	time.Sleep(5 * time.Second)
+
+	tools.PromptWaitOnHerr(herr)
+
 	args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 	_, _ = api.WaitForXactionIC(baseParams, &args)
 	time.Sleep(5 * time.Second)
@@ -714,7 +907,7 @@ func ensurePrevRebalanceIsFinished(baseParams api.BaseParams, err error) bool {
 
 func (m *ioContext) startMaintenanceNoRebalance() *meta.Snode {
 	target, _ := m.smap.GetRandTarget()
-	tlog.Logf("Put %s in maintenance\n", target.StringEx())
+	tlog.Logfln("Put %s in maintenance", target.StringEx())
 	args := &apc.ActValRmNode{DaemonID: target.ID(), SkipRebalance: true}
 	_, err := api.StartMaintenance(tools.BaseAPIParams(m.proxyURL), args)
 	tassert.CheckFatal(m.t, err)
@@ -730,7 +923,7 @@ func (m *ioContext) startMaintenanceNoRebalance() *meta.Snode {
 }
 
 func (m *ioContext) stopMaintenance(target *meta.Snode) string {
-	tlog.Logf("Take %s out of maintenance mode...\n", target.StringEx())
+	tlog.Logfln("Take %s out of maintenance mode...", target.StringEx())
 	bp := tools.BaseAPIParams(m.proxyURL)
 	rebID, err := api.StopMaintenance(bp, &apc.ActValRmNode{DaemonID: target.ID()})
 	tassert.CheckFatal(m.t, err)
@@ -747,7 +940,7 @@ func (m *ioContext) stopMaintenance(target *meta.Snode) string {
 
 func (m *ioContext) setNonDefaultBucketProps() {
 	baseParams := tools.BaseAPIParams()
-	copies := int64(rand.IntN(2))
+	copies := int64(2)
 	props := &cmn.BpropsToSet{
 		Mirror: &cmn.MirrorConfToSet{
 			Enabled: apc.Ptr(copies > 0),
@@ -777,11 +970,11 @@ func runProviderTests(t *testing.T, f func(*testing.T, *meta.Bck)) {
 	}{
 		{
 			name: "local",
-			bck:  cmn.Bck{Name: trand.String(10), Provider: apc.AIS},
+			bck:  cmn.Bck{Name: trand.String(10), Provider: apc.AIS, Ns: genBucketNs()},
 		},
 		{
 			name: "remote",
-			bck:  cliBck,
+			bck:  cmn.Bck{Name: cliBck.Name, Provider: cliBck.Provider, Ns: genBucketNs()},
 			skipArgs: tools.SkipTestArgs{
 				Long:      true,
 				RemoteBck: true,
@@ -809,7 +1002,7 @@ func runProviderTests(t *testing.T, f func(*testing.T, *meta.Bck)) {
 		},
 		{
 			name: "local_3_copies",
-			bck:  cmn.Bck{Name: trand.String(10), Provider: apc.AIS},
+			bck:  cmn.Bck{Name: trand.String(10), Provider: apc.AIS, Ns: genBucketNs()},
 			props: &cmn.BpropsToSet{
 				Mirror: &cmn.MirrorConfToSet{
 					Enabled: apc.Ptr(true),
@@ -820,7 +1013,7 @@ func runProviderTests(t *testing.T, f func(*testing.T, *meta.Bck)) {
 		},
 		{
 			name: "local_ec_2_2",
-			bck:  cmn.Bck{Name: trand.String(10), Provider: apc.AIS},
+			bck:  cmn.Bck{Name: trand.String(10), Provider: apc.AIS, Ns: genBucketNs()},
 			props: &cmn.BpropsToSet{
 				EC: &cmn.ECConfToSet{
 					DataSlices:   apc.Ptr(2),
@@ -882,7 +1075,7 @@ func runProviderTests(t *testing.T, f func(*testing.T, *meta.Bck)) {
 	}
 }
 
-func initFS() {
+func initOnce() {
 	proxyURL := tools.GetPrimaryURL()
 	primary, err := tools.GetPrimaryProxy(proxyURL)
 	if err != nil {
@@ -898,18 +1091,22 @@ func initFS() {
 	config.TestFSP.Count = 1
 	config.Backend = cfg.Backend
 	cmn.GCO.CommitUpdate(config)
-
-	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
-	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
-	fs.CSM.Reg(fs.ECSliceType, &fs.ECSliceContentResolver{})
-	fs.CSM.Reg(fs.ECMetaType, &fs.ECMetaContentResolver{})
 }
 
 func initMountpaths(t *testing.T, proxyURL string) {
-	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
-	fsOnce.Do(initFS)
-	baseParams := tools.BaseAPIParams(proxyURL)
+	t.Helper()
+
+	isLocal, err := tools.IsClusterLocal()
+	tassert.CheckFatal(t, err)
+	if !isLocal {
+		tlog.Logfln("initMountpaths: skipping for non-local deployment")
+		return
+	}
+
 	fs.TestNew(nil)
+	_onceInit.Do(initOnce)
+
+	baseParams := tools.BaseAPIParams(proxyURL)
 	smap := tools.GetClusterMap(t, proxyURL)
 	for _, target := range smap.Tmap {
 		mpathList, err := api.GetMountpaths(baseParams, target)
@@ -922,7 +1119,17 @@ func initMountpaths(t *testing.T, proxyURL string) {
 	}
 }
 
-func findObjOnDisk(bck cmn.Bck, objName string) (fqn string) {
+// NOTE:
+// - do not fs.Walk if the bucket's content is chunked; instead GET to temp and return the latter
+// - this workaround won't work those tests that corrupt bits
+func (m *ioContext) findObjOnDisk(bck cmn.Bck, objName string) (fqn string) {
+	//
+	// TODO -- FIXME: this is _not_ the only condition indicating a chunked content
+	//
+	if m.chunksConf != nil && m.chunksConf.multipart {
+		return getObjToTemp(m.t, m.proxyURL, bck, objName)
+	}
+
 	fsWalkFunc := func(path string, de fs.DirEntry) error {
 		if fqn != "" {
 			return filepath.SkipDir
@@ -941,16 +1148,144 @@ func findObjOnDisk(bck cmn.Bck, objName string) (fqn string) {
 		}
 		return nil
 	}
-
 	fs.WalkBck(&fs.WalkBckOpts{
 		WalkOpts: fs.WalkOpts{
 			Bck:      bck,
-			CTs:      []string{fs.ObjectType},
+			CTs:      []string{fs.ObjCT},
 			Callback: fsWalkFunc,
 			Sorted:   true, // false is unsupported and asserts
 		},
 	})
 	return fqn
+}
+
+func (m *ioContext) findObjChunksOnDisk(bck cmn.Bck, objName string) (fqn []string) {
+	if m.chunksConf != nil {
+		fqn = make([]string, 0, m.chunksConf.numChunks)
+	} else {
+		fqn = make([]string, 0, 4)
+	}
+	fsWalkFunc := func(path string, de fs.DirEntry) error {
+		if de.IsDir() {
+			return nil
+		}
+
+		ct, err := core.NewCTFromFQN(path, nil)
+		if err != nil {
+			return nil
+		}
+		if strings.HasPrefix(ct.ObjectName(), objName) { // chunk files have the same prefix as the object
+			fqn = append(fqn, path)
+		}
+		return nil
+	}
+	fs.WalkBck(&fs.WalkBckOpts{
+		WalkOpts: fs.WalkOpts{
+			Bck:      bck,
+			CTs:      []string{fs.ChunkCT},
+			Callback: fsWalkFunc,
+			Sorted:   true, // false is unsupported and asserts
+		},
+	})
+	return fqn
+}
+
+// validateChunksOnDisk validates the number of chunks on disk for an object.
+// - expectedChunks: expected number of total chunks:
+//   - > 0: exactly this many chunks expected (including main object, i.e., len(chunks)+1 == expected)
+//   - = 0: no chunk files expected (len(chunks) == 0)
+//   - < 0: at least |expectedChunks| chunk files expected (len(chunks) >= |expected|)
+func (m *ioContext) validateChunksOnDisk(bck cmn.Bck, objName string, expectedChunks int) {
+	m.t.Helper()
+
+	isLocal, err := tools.IsClusterLocal()
+	tassert.CheckFatal(m.t, err)
+	if !isLocal {
+		tlog.Logfln("validateChunksOnDisk: skipping for non-local deployment")
+		return
+	}
+
+	chunks := m.findObjChunksOnDisk(bck, objName)
+	switch {
+	case expectedChunks > 0:
+		// Expect exact number of total chunks (including main object)
+		// len(chunks) returns extra chunk files, +1 for main object
+		tassert.Fatalf(m.t, len(chunks)+1 == expectedChunks,
+			"object %s: expected exactly %d total chunks, found %d (chunk files: %d)",
+			objName, expectedChunks, len(chunks)+1, len(chunks))
+	case expectedChunks == 0:
+		// Expect no chunk files
+		tassert.Fatalf(m.t, len(chunks) == 0,
+			"object %s: expected 0 chunk files, found %d",
+			objName, len(chunks))
+	default:
+		// expectedChunks < 0: expect at least |expectedChunks| chunk files
+		minExpected := -expectedChunks
+		tassert.Fatalf(m.t, len(chunks) >= minExpected,
+			"object %s: expected at least %d chunk files, found %d",
+			objName, minExpected, len(chunks))
+	}
+}
+
+func getObjToTemp(t *testing.T, proxyURL string, bck cmn.Bck, objName string) string {
+	t.Helper()
+	dir := t.TempDir() // is auto-removed by stdlib
+	tmp := filepath.Join(dir, objName)
+
+	err := cos.CreateDir(filepath.Dir(tmp))
+	tassert.CheckFatal(t, err)
+
+	f, err := os.Create(tmp)
+	tassert.CheckFatal(t, err)
+	defer f.Close()
+
+	bp := tools.BaseAPIParams(proxyURL)
+	_, err = api.GetObject(bp, bck, objName, &api.GetArgs{Writer: f})
+	tassert.CheckFatal(t, err)
+	return tmp
+}
+
+func corruptSingleBitInFile(m *ioContext, objName string, eced bool) {
+	m.t.Helper()
+
+	var (
+		fqn string
+		b   = []byte{0}
+	)
+
+	switch {
+	case eced:
+		fqn = m.findObjOnDisk(m.bck, objName)
+	case m.chunksConf != nil && m.chunksConf.multipart:
+		fqns := m.findObjChunksOnDisk(m.bck, objName)
+		tassert.Fatalf(m.t, len(fqns) > 0, "no chunks found for %s", objName)
+		fqn = fqns[rand.IntN(len(fqns))]
+	default:
+		fqn = m.findObjOnDisk(m.bck, objName)
+	}
+
+	fi, err := os.Stat(fqn)
+
+	tassert.CheckFatal(m.t, err)
+	off := rand.Int64N(fi.Size())
+	file, err := os.OpenFile(fqn, os.O_RDWR, cos.PermRWR)
+	tassert.CheckFatal(m.t, err)
+
+	_, err = file.Seek(off, 0)
+	tassert.CheckFatal(m.t, err)
+
+	_, err = file.Read(b)
+	tassert.CheckFatal(m.t, err)
+
+	bit := rand.IntN(8)
+	b[0] ^= 1 << bit
+	_, err = file.Seek(off, 0)
+	tassert.CheckFatal(m.t, err)
+
+	_, err = file.Write(b)
+	tassert.CheckFatal(m.t, err)
+
+	file.Close()
 }
 
 func detectNewBucket(oldList, newList cmn.Bcks) (cmn.Bck, error) {
@@ -982,4 +1317,18 @@ func xactSnapRunning(snaps xact.MultiSnap) (running, resetProbeFreq bool) {
 func xactSnapNotRunning(snaps xact.MultiSnap) (bool, bool) {
 	running, resetProbeFreq := xactSnapRunning(snaps)
 	return !running, resetProbeFreq
+}
+
+// randomize buckets' namespaces
+func genBucketNs() cmn.Ns {
+	s := os.Getenv(env.TestRandNs)
+	if s == "" {
+		return cmn.NsGlobal
+	}
+	gen, err := strconv.ParseBool(s)
+	debug.AssertNoErr(err)
+	if !gen {
+		return cmn.NsGlobal
+	}
+	return cmn.Ns{Name: cos.GenTie()}
 }

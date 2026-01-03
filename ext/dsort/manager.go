@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -20,9 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/ext/dsort/ct"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
-	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
@@ -83,14 +80,14 @@ type (
 		Metrics     *Metrics       `json:"metrics"`
 		Pars        *parsedReqSpec `json:"pars"`
 
-		mg                 *managerGroup // parent
-		mu                 sync.Mutex
-		smap               *meta.Smap
-		recm               *shard.RecordManager
-		shardRW            shard.RW
-		startShardCreation chan struct{}
-		client             *http.Client // Client for sending records metadata
-		compression        struct {
+		mg            *managerGroup // parent
+		mu            sync.Mutex
+		smap          *meta.Smap
+		recm          *shard.RecordManager
+		shardRW       shard.RW
+		createShardCh chan struct{}
+		client        *http.Client // Client for sending records metadata
+		compression   struct {
 			totalShardSize     atomic.Int64
 			totalExtractedSize atomic.Int64
 		}
@@ -152,9 +149,6 @@ func Tinit(db kvdb.Driver, config *cmn.Config) {
 	debug.Assert(g.mem == nil) // only once
 	g.mem = core.T.PageMM()
 
-	fs.CSM.Reg(ct.DsortFileType, &ct.DsortFile{})
-	fs.CSM.Reg(ct.DsortWorkfileType, &ct.DsortFile{})
-
 	newBcastClient(config)
 }
 
@@ -184,7 +178,7 @@ func (m *Manager) init(pars *parsedReqSpec) error {
 
 	m.Pars = pars
 	m.Metrics = newMetrics(pars.Description)
-	m.startShardCreation = make(chan struct{}, 1)
+	m.createShardCh = make(chan struct{}, 1)
 
 	if err := m.setDsorter(); err != nil {
 		return err
@@ -445,7 +439,7 @@ func (m *Manager) abort(err error) {
 	// If job has already finished we just free resources, otherwise we must wait
 	// for it to finish.
 	if inProgress {
-		if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+		if cmn.Rom.V(4, cos.ModDsort) {
 			nlog.Infof("[dsort] %s is in progress, waiting for finish", m.ManagerUUID)
 		}
 		// Wait for dsorter to initialize all the resources.
@@ -453,7 +447,7 @@ func (m *Manager) abort(err error) {
 
 		m.dsorter.onAbort()
 		m.waitForFinish()
-		if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+		if cmn.Rom.V(4, cos.ModDsort) {
 			nlog.Infof("[dsort] %s was in progress and finished", m.ManagerUUID)
 		}
 	}
@@ -639,6 +633,10 @@ func (m *Manager) setAbortedTo(aborted bool) {
 	m.Metrics.setAbortedTo(aborted)
 }
 
+const (
+	workfileRecvShard = "recv-shard"
+)
+
 func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	defer transport.DrainAndFreeReader(objReader)
 	if err != nil {
@@ -650,10 +648,10 @@ func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err erro
 	}
 	lom := core.AllocLOM(hdr.ObjName)
 	defer core.FreeLOM(lom)
-	if err = lom.InitBck(&hdr.Bck); err == nil {
+	if err = lom.InitCmnBck(&hdr.Bck); err == nil {
 		err = lom.Load(false /*cache it*/, false /*locked*/)
 	}
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !cos.IsNotExist(err) {
 		m.abort(err)
 		return err
 	}
@@ -662,7 +660,7 @@ func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err erro
 			//
 			// compare with: coi.isNOP, "PUT is a no-op", and reb/recv.go no-op
 			//
-			if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+			if cmn.Rom.V(4, cos.ModDsort) {
 				nlog.Infof("[dsort] %s shard (%s) already exists and checksums are equal, skipping",
 					m.ManagerUUID, lom)
 			}
@@ -676,7 +674,7 @@ func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err erro
 
 	params := core.AllocPutParams()
 	{
-		params.WorkTag = ct.WorkfileRecvShard
+		params.WorkTag = workfileRecvShard
 		params.Reader = rc
 		params.Cksum = nil
 		params.Atime = started

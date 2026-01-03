@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 import logging
@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Generator, Tuple
 from pathlib import Path
 
 from aistore.sdk.dataset.config_attribute import ConfigAttribute
-from aistore.sdk.const import DEFAULT_DATASET_MAX_COUNT
+from aistore.sdk.const import DEFAULT_DATASET_MAX_COUNT, EXT_TAR
 
 
 # pylint: disable=too-few-public-methods,import-outside-toplevel
@@ -51,7 +51,9 @@ class DatasetConfig:
         logger = logging.getLogger(f"{__name__}.write_shards")
         max_shard_items = kwargs.get("maxcount", DEFAULT_DATASET_MAX_COUNT)
         num_digits = len(str(max_shard_items))
-        kwargs["pattern"] = kwargs.get("pattern", "dataset") + f"-%0{num_digits}d.tar"
+        kwargs["pattern"] = (
+            kwargs.get("pattern", "dataset") + f"-%0{num_digits}d{EXT_TAR}"
+        )
         shard_writer = ShardWriter(**kwargs)
 
         dataset = self.generate_dataset(max_shard_items)
@@ -82,9 +84,8 @@ class DatasetConfig:
         Args:
             max_shard_items (int): The maximum number of items to include in a shard
 
-        Returns:
-            Generator (Tuple[Dict[str, Any], List[str]]): A generator that yields samples in webdataset format
-                and a list of missing attributes
+        Yields:
+            Tuple[Dict[str, Any], List[str]]: Samples in webdataset format and a list of missing attributes
         """
         all_attributes = [self.primary_attribute] + self.secondary_attributes
         # Generate the dataset

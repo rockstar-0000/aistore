@@ -21,6 +21,7 @@ import (
 )
 
 // in this file: operations on objects
+// see also bucket_hdlr.go for "Multi-object Rule of Convenience"
 
 // (compare with  archGetUsage)
 const objGetUsage = "Get an object, a shard, an archived file, or a range of bytes from all of the above;\n" +
@@ -29,6 +30,7 @@ const objGetUsage = "Get an object, a shard, an archived file, or a range of byt
 	indent4 + "\t- '--prefix' to get multiple objects in one shot (empty prefix for the entire bucket);\n" +
 	indent4 + "\t- '--extract' or '--archpath' to extract archived content;\n" +
 	indent4 + "\t- '--progress' and '--refresh' to watch progress bar;\n" +
+	indent4 + "\t- '--mpd' for client-side multipart download with progress bar;\n" +
 	indent4 + "\t- '-v' to produce verbose output when getting multiple objects."
 
 const objPutUsage = "PUT or append one file, one directory, or multiple files and/or directories.\n" +
@@ -72,6 +74,35 @@ const concatUsage = "Append a file, a directory, or multiple files and/or direct
 	indent1 + "as a new " + objectArgument + " if doesn't exists, and to an existing " + objectArgument + " otherwise, e.g.:\n" +
 	indent1 + "$ ais object concat docs ais://nnn/all-docs ### concatenate all files from docs/ directory."
 
+// Multipart upload usage strings
+
+const mptUsageFootnote = indent2 + "(for UPLOAD_ID use the value previously returned by 'mpu create' command)."
+
+const mptCreateUsage = "Create a multipart upload session for large objects.\n" +
+	indent2 + "Returns an UPLOAD_ID that must be used for subsequent part uploads and completion (or abort), e.g.:\n" +
+	indent2 + "\t- 'mpu create ais://bck/large.dat'\t- create MPU session for 'large.dat';\n" +
+	indent2 + "\t- 'mpu create ais://bck/video.mp4 --verbose'\t- create multipart upload with verbose output."
+
+const mptPutUsage = "Upload individual parts for a multipart upload session with a given UPLOAD_ID (returned by 'mpu create').\n" +
+	indent2 + "Parts can be uploaded in parallel and in any order, e.g.:\n" +
+	indent2 + "\t- 'mpu put-part ais://bck/large UPLOAD_ID 2 /path/part2.dat --verbose'\t- upload part 2 with progress;\n" +
+	indent2 + "\t- 'mpu put-part ais://bck/large UPLOAD_ID 1 /path/part1.dat'\t- upload part 1;\n" +
+	indent2 + "\t- 'mpu put-part ais://bck/large --upload-id UPLOAD_ID --part-number 3 /path/part3.dat'\t- using flags\n" +
+	mptUsageFootnote
+
+const mptCompleteUsage = "Complete a multipart upload by assembling all uploaded parts into the final object.\n" +
+	indent2 + "Parts are assembled in the order specified by part numbers, e.g.:\n" +
+	indent2 + "\t- 'mpu complete ais://bck/large UPLOAD_ID 1,2,3,4,5'\t- assemble 5 parts in order;\n" +
+	indent2 + "\t- 'mpu complete ais://bck/large --upload-id UPLOAD_ID --part-numbers 1,2,3'\t- using flags;\n" +
+	indent2 + "\t- 'mpu complete ais://bck/large UPLOAD_ID \"1,2,3\" --verbose'\t- with completion progress\n" +
+	mptUsageFootnote
+
+const mptAbortUsage = "Abort a multipart upload session and clean up any uploaded parts.\n" +
+	indent2 + "All uploaded parts are discarded and the object is not created, e.g.:\n" +
+	indent2 + "\t- 'mpu abort ais://bck/large UPLOAD_ID'\t- abort upload session;\n" +
+	indent2 + "\t- 'mpu abort ais://bck/large --upload-id UPLOAD_ID --verbose'\t- abort with verbose output\n" +
+	mptUsageFootnote
+
 const setCustomArgument = objectArgument + " " + jsonKeyValueArgument + " | " + keyValuePairsArgument + ", e.g.:\n" +
 	indent1 + "mykey1=value1 mykey2=value2 OR (same) '{\"mykey1\":\"value1\", \"mykey2\":\"value2\"}'"
 
@@ -86,8 +117,11 @@ var (
 			nonRecursFlag, // (embedded prefix dopOLTP dop)
 			yesFlag,
 			dontHeadRemoteFlag,
+			encodeObjnameFlag,
 		),
-		commandRename: {},
+		commandRename: {
+			encodeObjnameFlag,
+		},
 		commandGet: {
 			offsetFlag,
 			lengthFlag,
@@ -101,6 +135,8 @@ var (
 			blobDownloadFlag,
 			chunkSizeFlag,
 			numBlobWorkersFlag,
+			// multipart download (client-side)
+			mpdFlag,
 			// archive
 			archpathGetFlag,
 			archmimeFlag,
@@ -124,7 +160,6 @@ var (
 			dontHeadRemoteFlag,
 			encodeObjnameFlag,
 		},
-
 		commandPut: append(
 			listRangeProgressWaitFlags,
 			chunkSizeFlag,
@@ -169,6 +204,25 @@ var (
 			cksumFlag,
 			forceFlag,
 			encodeObjnameFlag,
+		},
+		cmdMptCreate: {
+			verboseFlag,
+		},
+		cmdMptPut: {
+			mptUploadIDFlag,
+			mptPartNumberFlag,
+			progressFlag,
+			verboseFlag,
+			encodeObjnameFlag,
+		},
+		cmdMptComplete: {
+			mptUploadIDFlag,
+			mptPartNumbersFlag,
+			verboseFlag,
+		},
+		cmdMptAbort: {
+			mptUploadIDFlag,
+			verboseFlag,
 		},
 	}
 
@@ -240,13 +294,30 @@ var (
 			bucketsObjectsCmdList,
 			objectCmdPut,
 			objectCmdPromote,
-			makeAlias(bucketCmdCopy, "", true, commandCopy), // alias for `ais [bucket] cp`
+
+			// for usage guidelines, see [make_alias.md](https://github.com/NVIDIA/aistore/blob/main/cmd/cli/cli/make_alias.md)
+			makeAlias(&bucketObjCmdCopy, &mkaliasOpts{
+				addFlags: []cli.Flag{encodeObjnameFlag},
+				delFlags: []cli.Flag{listFlag, templateFlag, numWorkersFlag, copyPrependFlag, progressFlag,
+					refreshFlag, verbObjPrefixFlag, waitFlag, waitJobXactFinishedFlag, continueOnErrorFlag},
+			}),
+			makeAlias(&archBucketCmd, &mkaliasOpts{
+				newName:  commandArch,
+				aliasFor: joinCommandWords(commandArch, commandBucket),
+				replace:  cos.StrKVs{joinCommandWords(commandArch, commandBucket): joinCommandWords(commandObject, commandArch)},
+			}),
+			makeAlias(&objCmdETL, &mkaliasOpts{
+				newName:  commandETL,
+				aliasFor: joinCommandWords(commandETL, commandObject),
+				replace:  cos.StrKVs{joinCommandWords(commandETL, commandObject): joinCommandWords(commandObject, commandETL)},
+			}),
+
 			objectCmdConcat,
 			objectCmdSetCustom,
 			objectCmdRemove,
 			objectCmdPrefetch,
 			bucketObjCmdEvict,
-			makeAlias(showCmdObject, "", true, commandShow), // alias for `ais show`
+			makeAlias(&showCmdObject, &mkaliasOpts{newName: commandShow}),
 			{
 				Name:         commandRename,
 				Usage:        "Move (rename) object",
@@ -262,6 +333,46 @@ var (
 				Flags:        sortFlags(objectCmdsFlags[commandCat]),
 				Action:       catHandler,
 				BashComplete: bucketCompletions(bcmplop{separator: true}),
+			},
+			// multipart upload commands
+			{
+				Name:    commandMptUpload,
+				Aliases: []string{"mpu"},
+				Usage:   "Multipart upload operations: create, put-part, complete, and abort",
+				Subcommands: []cli.Command{
+					{
+						Name:         cmdMptCreate,
+						Usage:        mptCreateUsage,
+						ArgsUsage:    mptCreateArgument,
+						Flags:        sortFlags(objectCmdsFlags[cmdMptCreate]),
+						Action:       mptCreateHandler,
+						BashComplete: bucketCompletions(bcmplop{separator: true}),
+					},
+					{
+						Name:         cmdMptPut,
+						Usage:        mptPutUsage,
+						ArgsUsage:    mptPutArgument,
+						Flags:        sortFlags(objectCmdsFlags[cmdMptPut]),
+						Action:       mptPutHandler,
+						BashComplete: bucketCompletions(bcmplop{separator: true}),
+					},
+					{
+						Name:         cmdMptComplete,
+						Usage:        mptCompleteUsage,
+						ArgsUsage:    mptCompleteArgument,
+						Flags:        sortFlags(objectCmdsFlags[cmdMptComplete]),
+						Action:       mptCompleteHandler,
+						BashComplete: bucketCompletions(bcmplop{separator: true}),
+					},
+					{
+						Name:         cmdMptAbort,
+						Usage:        mptAbortUsage,
+						ArgsUsage:    mptAbortArgument,
+						Flags:        sortFlags(objectCmdsFlags[cmdMptAbort]),
+						Action:       mptAbortHandler,
+						BashComplete: bucketCompletions(bcmplop{separator: true}),
+					},
+				},
 			},
 		},
 	}
@@ -306,7 +417,13 @@ func mvObjectHandler(c *cli.Context) (err error) {
 		return incorrectUsageMsg(c, "source and destination are the same object")
 	}
 
-	if err := api.RenameObject(apiBP, bck, oldObj, newObj); err != nil {
+	// encode special symbols if requested
+	var (
+		warned    bool
+		encOldObj = warnEscapeObjName(c, oldObj, &warned)
+		encNewObj = warnEscapeObjName(c, newObj, &warned)
+	)
+	if err := api.RenameObject(apiBP, bck, encOldObj, encNewObj); err != nil {
 		return err
 	}
 
@@ -338,7 +455,6 @@ func putHandler(c *cli.Context) error {
 			e := stripErr(err)
 			return fmt.Errorf("failed to %s %s => %s: %v", a.verb(), a.src.abspath, a.dst.bck.Cname(a.dst.oname), e)
 		}
-		actionDone(c, fmt.Sprintf("%s %q => %s\n", a.verb(), a.src.arg, a.dst.bck.Cname(a.dst.oname)))
 		return nil
 	}
 
@@ -354,7 +470,7 @@ func putHandler(c *cli.Context) error {
 		// a) csv of files and/or directories (names) embedded into the first arg, e.g. "f1[,f2...]" dst-bucket[/prefix]
 		// b) csv from '--list' flag
 		return verbList(c, &a, a.src.fdnames, a.dst.bck, a.dst.oname /*virt subdir*/, incl)
-	case a.pt != nil && len(a.pt.Ranges) > 0:
+	case a.pt != nil && a.pt.IsRange():
 		if ok := warnMultiSrcDstPrefix(c, &a, fmt.Sprintf("matching '%s'", a.src.tmpl)); !ok {
 			return nil
 		}
@@ -436,7 +552,12 @@ func putStdin(c *cli.Context, a *putargs) error {
 	if err != nil {
 		return err
 	}
-	if err := putAppendChunks(c, a.dst.bck, a.dst.oname, os.Stdin, cksum.Type(), chunkSize); err != nil {
+	// encode special symbols if requested; or warn
+	var (
+		warned     bool
+		encDstName = warnEscapeObjName(c, a.dst.oname, &warned)
+	)
+	if err := putAppendChunks(c, a.dst.bck, encDstName, os.Stdin, cksum.Type(), chunkSize); err != nil {
 		return err
 	}
 	actionDone(c, fmt.Sprintf("PUT (standard input) => %s\n", a.dst.bck.Cname(a.dst.oname)))

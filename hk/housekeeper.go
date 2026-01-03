@@ -18,7 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
-const workChanCap = 48
+const workChanCap = 128
 
 const NameSuffix = ".gc" // reg name suffix
 
@@ -28,25 +28,25 @@ const (
 )
 
 type (
-	hkcb func(now int64) time.Duration
+	HKCB func(now int64) time.Duration
 	op   struct {
-		f        hkcb
+		f        HKCB
 		name     string
 		interval time.Duration
 	}
 	timedAction struct {
-		f          hkcb
+		f          HKCB
 		name       string
 		updateTime int64
 	}
 	timedActions []timedAction
 
 	hk struct {
-		stopCh  cos.StopCh
 		sigCh   chan os.Signal
 		actions *timedActions
 		timer   *time.Timer
 		workCh  chan op
+		stopCh  cos.StopCh
 		running atomic.Bool
 	}
 )
@@ -74,7 +74,7 @@ func WaitStarted() {
 	}
 }
 
-func Reg(name string, f hkcb, interval time.Duration) {
+func Reg(name string, f HKCB, interval time.Duration) {
 	debug.Assert(nlog.Stopping() || HK.running.Load())
 	debug.Assert(interval != UnregInterval)
 
@@ -91,8 +91,15 @@ func Unreg(name string) {
 }
 
 // non-presence is fine
-func UnregIf(name string, f hkcb) {
+func UnregIf(name string, f HKCB) {
 	HK.workCh <- op{name: name, f: f, interval: UnregInterval}
+}
+
+// add +/-3% pseudo-random jitter to the housekeeping interval `d`
+func Jitter(d time.Duration, now int64) time.Duration {
+	step := int64(d >> 7)
+	n := (now & 0x7) - 4
+	return d + time.Duration(n*step)
 }
 
 ////////

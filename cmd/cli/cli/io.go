@@ -5,11 +5,19 @@
 package cli
 
 import (
+	"fmt"
 	"io"
 	"math"
+	"os"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+
+	"github.com/urfave/cli"
+)
+
+const (
+	stdInOut = "-" // STDIN (for `ais put`), STDOUT (for `ais put`)
 )
 
 type rocCb struct {
@@ -60,4 +68,47 @@ func (r *rocCb) Close() error { return r.roc.Close() }
 
 func (r *rocCb) Seek(offset int64, whence int) (int64, error) {
 	return r.roc.Seek(offset, whence)
+}
+
+//
+// handle destination path
+//
+
+func discardOutput(outf string) bool {
+	return outf == "/dev/null" || outf == "dev/null" || outf == "dev/nil"
+}
+
+// notice returned "variability":
+// - (error | errUserCancel)
+// - (io.Discard | os.Stdout | wfh)
+func createDstFile(c *cli.Context, outf string, allowStdout bool) (w io.Writer, wfh *os.File, err error) {
+	discard := discardOutput(outf)
+	switch {
+	case discard:
+		return io.Discard, nil, nil
+	case outf == stdInOut:
+		if !allowStdout {
+			return nil, nil, incorrectUsageMsg(c, "destination STDOUT is not permitted for this operation")
+		}
+		return os.Stdout, nil, nil
+	}
+
+	if finfo, err := os.Stat(outf); err == nil {
+		if finfo.IsDir() {
+			return nil, nil, fmt.Errorf("destination %q is a directory", outf)
+		}
+		if !flagIsSet(c, yesFlag) {
+			warn := fmt.Sprintf("destination %q already exists", outf)
+			if !confirm(c, "Proceed to overwrite?", warn) {
+				return nil, nil, errUserCancel
+			}
+		}
+	}
+	wfh, err = cos.CreateFile(outf)
+	if err != nil {
+		return nil, nil, err
+	}
+	w = wfh
+
+	return w, wfh, nil
 }

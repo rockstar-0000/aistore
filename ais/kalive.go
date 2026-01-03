@@ -32,7 +32,7 @@ const (
 )
 
 const (
-	waitSelfJoin = 300 * time.Millisecond
+	waitSelfJoin = cos.PollSleepMedium
 	waitStandby  = 5 * time.Second
 )
 
@@ -198,7 +198,8 @@ func (pkr *palive) sendKalive(smap *smapX, timeout time.Duration, now int64, fas
 	debug.Assert(!smap.isPrimary(pkr.p.si))
 
 	if fast {
-		pid, hdr, err := pkr.p.fastKalive(smap, timeout, false, false /*shared streams*/)
+		last, dmActive := pkr.p.dm.nonpResetActive()
+		pid, hdr, err := pkr.p.fastKalive(smap, timeout, false, dmActive /*shared streams*/)
 		if err == nil {
 			// (shared streams; EC streams)
 			if pkr.p.ec.isActive(hdr) {
@@ -207,6 +208,8 @@ func (pkr *palive) sendKalive(smap *smapX, timeout time.Duration, now int64, fas
 			if pkr.p.dm.isActive(hdr) {
 				pkr.p.dm.setActive(now)
 			}
+		} else if dmActive {
+			pkr.p.dm.nonpUndo(last) // (unlikely)
 		}
 		return pid, 0, err
 	}
@@ -329,7 +332,7 @@ func (pkr *palive) _pingRetry(si *meta.Snode, smap *smapX, config *cmn.Config) (
 		now := mono.NanoTime()
 		pkr.statsT.Add(stats.KeepAliveLatency, now-started)
 		pkr.hb.HeardFrom(si.ID(), now) // effectively, yes
-		if cmn.Rom.FastV(5, cos.SmoduleKalive) {
+		if cmn.Rom.V(5, cos.ModKalive) {
 			nlog.Infoln(pname, "slow-kalive", sname, "OK after the first attempt")
 		}
 		return true, false
@@ -631,7 +634,7 @@ func (k *keepalive) do(smap *smapX, si *meta.Snode, config *cmn.Config) (stopped
 			if nlog.Stopping() {
 				return true
 			}
-			err = fmt.Errorf("%s: unexpected response from %s: %v(%d)", sname, pname, err, status)
+			err = fmt.Errorf("%s: unexpected response from %s: %w(%d)", sname, pname, err, status)
 			debug.AssertNoErr(err)
 			nlog.Warningln(err)
 		case sig := <-k.controlCh:

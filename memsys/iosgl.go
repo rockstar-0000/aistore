@@ -1,7 +1,7 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
@@ -30,13 +30,14 @@ var (
 
 	_ cos.ReadOpenCloser = (*SGL)(nil)
 	_ cos.ReadOpenCloser = (*Reader)(nil)
+	_ io.ReadSeekCloser  = (*Reader)(nil)
 )
 
 type (
 	// implements io.ReadWriteCloser + Reset
 	SGL struct {
 		slab *Slab
-		sgl  [][]byte
+		sgl  [][]byte // (clipped when recycled via sync.Pool)
 		woff int64
 		roff int64
 	}
@@ -77,6 +78,10 @@ func _allocSGL(isPage bool) (z *SGL) {
 	return
 }
 
+const (
+	clipSGL = 1024
+)
+
 func _freeSGL(z *SGL, isPage bool) {
 	var pool *sync.Pool
 	if isPage {
@@ -87,6 +92,7 @@ func _freeSGL(z *SGL, isPage bool) {
 		pool = &smPools[idx]
 	}
 	sgl := z.sgl[:0]
+	sgl = cos.ResetSliceCap(sgl, clipSGL) // clip cap
 	*z = sgl0
 	z.sgl = sgl
 	pool.Put(z)
@@ -148,7 +154,7 @@ func (z *SGL) WriteTo2(dst io.Writer) error {
 		written, err := dst.Write(buf[:l])
 		rem -= l
 		if err != nil {
-			if cmn.Rom.FastV(5, cos.SmoduleMemsys) {
+			if cmn.Rom.V(5, cos.ModMemsys) {
 				nlog.Errorln(err)
 			}
 			return err
@@ -181,7 +187,7 @@ func (z *SGL) WriteTo(dst io.Writer) (n int64, _ error) {
 			err = io.ErrShortWrite
 		}
 		if err != nil {
-			if cmn.Rom.FastV(5, cos.SmoduleMemsys) {
+			if cmn.Rom.V(5, cos.ModMemsys) {
 				nlog.Errorln(err)
 			}
 			return n, err
@@ -376,7 +382,7 @@ func (z *SGL) Free() {
 		size := cap(buf)
 		debug.Assert(int64(size) == s.Size())
 		b := buf[:size] // always freeing original (fixed buffer) size
-		deadbeef(b)
+		debug.DeadBeefLarge(b)
 		s.put = append(s.put, b)
 	}
 	s.muput.Unlock()
@@ -386,7 +392,7 @@ func (z *SGL) Free() {
 // NOTE assert and use with caution: heap allocation (via ReadAll)
 // is intended for tests (and only tests)
 func (z *SGL) Bytes() (b []byte) {
-	cos.Assert(z.roff == 0)
+	debug.Assert(z.roff == 0)
 	if z.woff >= z.slab.Size() {
 		b = z.ReadAll()
 		return

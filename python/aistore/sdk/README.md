@@ -2,7 +2,7 @@
 
 AIS Python SDK provides a (growing) set of client-side APIs to access and utilize AIS clusters, buckets, and objects.
 
-The project is, essentially, a Python port of the [AIS Go APIs](https://aistore.nvidia.com/docs/http-api), with additional objectives that prioritize *utmost convenience for Python developers*.
+The project is, essentially, a Python port of the [AIS Go APIs](https://aistore.nvidia.com/docs/http_api), with additional objectives that prioritize *utmost convenience for Python developers*.
 
 The SDK also includes the `authn` sub-package for managing authentication, users, roles, clusters, and tokens. For more details, refer to the [AuthN sub-package README](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/authn/README.md).
 
@@ -79,7 +79,7 @@ client.bucket("my-gcp-bucket", provider="gcp").evict()
 
 ```python
 # Get object from Azure bucket
-client.bucket("my-azure-bucket", provider="azure").object("filename.ext").get()
+client.bucket("my-azure-bucket", provider="azure").object("filename.ext").get_reader()
 ```
 
 ```python
@@ -89,6 +89,52 @@ client.bucket("my-aws-bucket", provider="aws").list_objects()
 
 Please note that certain operations do **not** support external cloud storage buckets. Please refer to the [SDK reference documentation](https://aistore.nvidia.com/docs/python_sdk.md) for more information on which bucket/object operations support remote cloud buckets, as well as general information on class and method usage.
 
+---
+
+## Environment Variables
+
+The AIS Python SDK supports several environment variables that allow you to configure client behavior without explicitly passing parameters to the `Client` constructor. This is particularly useful for containerized environments or when you want to centralize configuration.
+
+### Available Environment Variables
+
+| Environment Variable | Description | Default Value |
+|---------------------|-------------|---------------|
+| `AIS_AUTHN_TOKEN` | Authentication token for accessing the AIS cluster | None |
+| `AIS_CLIENT_CA` | Path to CA certificate file for SSL verification | None |
+| `AIS_CRT` | Path to client certificate file for mTLS authentication | None |
+| `AIS_CRT_KEY` | Path to client certificate key file for mTLS authentication | None |
+| `AIS_CONNECT_TIMEOUT` | Connection timeout in seconds (set to `0` to disable) | `3` |
+| `AIS_READ_TIMEOUT` | Read timeout in seconds (set to `0` to disable) | `20` |
+| `AIS_MAX_CONN_POOL` | Maximum number of connections per host in the connection pool | `10` |
+
+### Configuration Precedence
+
+When the `Client` is initialized, configuration values are resolved in the following order (highest to lowest precedence):
+
+1. **Explicit parameters** passed to the `Client()` constructor
+2. **Environment variables** (listed above)
+3. **Default values** (built-in defaults)
+
+This means that if you provide a parameter directly to the `Client()` constructor, it will always take precedence over environment variables and defaults.
+
+### Examples
+
+#### Using Environment Variables
+
+```python
+import os
+from aistore.sdk import Client
+
+# Set environment variables
+os.environ["AIS_AUTHN_TOKEN"] = "your-auth-token"
+os.environ["AIS_CONNECT_TIMEOUT"] = "5"
+os.environ["AIS_READ_TIMEOUT"] = "30"
+os.environ["AIS_MAX_CONN_POOL"] = "20"
+os.environ["AIS_CLIENT_CA"] = "/path/to/client_ca.crt
+
+# Client will use the environment variables
+client = Client("https://localhost:8080")
+```
 ---
 ### HTTPS
 
@@ -118,9 +164,9 @@ The SDK supports HTTPS connectivity if the AIS cluster is configured to use HTTP
 
 AIStore also supports [ETLs](https://aistore.nvidia.com/docs/etl), short for Extract-Transform-Load. ETLs with AIS are beneficial given that the transformations occur *locally*, which largely contributes to the linear scalability of AIS.
 
-> Note: AIS-ETL requires [Kubernetes](https://kubernetes.io/). For more information on deploying AIStore with local Kubernetes, refer [here](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/kustomize/README.md).
+> Note: AIS-ETL requires [Kubernetes](https://kubernetes.io/). For more information on deploying AIStore with local Kubernetes, refer [here](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/README.md).
 
-To learn more about working with AIS ETL, check out [examples](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl).
+To learn more about working with AIS ETL, check out [examples](https://github.com/NVIDIA/aistore/tree/main/python/examples/ais-etl).
 
 ---
 

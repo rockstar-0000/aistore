@@ -6,6 +6,7 @@ package core
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"time"
 
@@ -29,19 +30,20 @@ type (
 		Remote bool
 	}
 	// GetROC defines a function that retrieves an object based on the given `lom` and flags.
-	// If `daddr` are provided, the implementation may choose to deliver the object directly,
+	// If `Pipeline` are provided, the implementation may choose to deliver the object directly,
 	// in which case the returned ReadResp will have R = nil and Ecode = 204.
 	//
 	// Implementations include:
 	// - `core.DefaultGetROC`: fetches from local or remote backend
 	// - `etl.HTTPCommunicator.OfflineTransform`: fetches transformed object from ETL pod through HTTP response
 	// - `etl.statefulCommnicator.Transform`: fetches transformed object from ETL pod through WebSocket message
-	GetROCArgs struct {
-		Daddr         string // destination target's address for direct put
-		TransformArgs string // optional and ETL-specific; can be used to indicate transformation on a per-object basis
-		Local         bool   // true when the destination is local; used by communicator to handle direct put
+	ETLArgs struct {
+		TransformArgs string          // optional and ETL-specific; can be used to indicate transformation on a per-object basis
+		Pipeline      apc.ETLPipeline // intermediate ETL pod's address or destination target's address for direct put
 	}
-	GetROC func(lom *LOM, latestVer, sync bool, args *GetROCArgs) ReadResp
+	GetROC func(lom *LOM, latestVer, sync bool, args *ETLArgs) ReadResp
+
+	PutWOC func(lom *LOM, latestVer, sync bool, woc io.WriteCloser, args *ETLArgs) (written int64, ecode int, err error)
 
 	// returned by lom.CheckRemoteMD
 	CRMD struct {
@@ -53,7 +55,6 @@ type (
 )
 
 type (
-	// compare with `deferROC` from cmn/cos/io.go
 	deferROC struct {
 		cos.ReadOpenCloser
 		lif LIF
@@ -67,10 +68,11 @@ func (r *deferROC) Close() (err error) {
 }
 
 // is called under rlock; unlocks on fail
-func (lom *LOM) NewDeferROC() (cos.ReadOpenCloser, error) {
-	fh, err := cos.NewFileHandle(lom.FQN)
+// NOTE: compare w/ lom.Open() returning cos.LomReader
+func (lom *LOM) NewDeferROC(loaded bool) (cos.ReadOpenCloser, error) {
+	lh, err := lom.NewHandle(loaded)
 	if err == nil {
-		return &deferROC{fh, lom.LIF()}, nil
+		return &deferROC{lh, lom.LIF()}, nil
 	}
 	lom.Unlock(false)
 	return nil, cmn.NewErrFailedTo(T, "open", lom.Cname(), err)
@@ -103,7 +105,7 @@ func (lom *LOM) GetROC(latestVer, sync bool) (resp ReadResp) {
 			}
 		}
 
-		resp.R, resp.Err = lom.NewDeferROC() // keeping lock, reading local
+		resp.R, resp.Err = lom.NewDeferROC(true) // keeping lock, reading local
 		resp.OAH = lom
 		return resp
 	}
@@ -145,7 +147,7 @@ remote:
 	return resp
 }
 
-func GetDefaultROC(lom *LOM, latestVer, sync bool, _ *GetROCArgs) ReadResp {
+func GetDefaultROC(lom *LOM, latestVer, sync bool, _ *ETLArgs) ReadResp {
 	return lom.GetROC(latestVer, sync)
 }
 

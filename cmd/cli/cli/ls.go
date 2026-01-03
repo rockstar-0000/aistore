@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -106,9 +107,10 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fl
 		}
 		data = append(data, teb.ListBucketsHelper{Bck: bck, Props: props, Info: &info})
 	}
-	if footer.nb == 0 {
+	if len(data) == 0 {
 		return 0
 	}
+
 	if hideHeader {
 		teb.Print(data, teb.ListBucketsBodyNoSummary)
 	} else {
@@ -196,11 +198,13 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 		if elapsed := time.Duration(now - prev); elapsed < maxwait && i < len(bcks)-1 {
 			continue
 		}
-		// print
-		if hideHeader {
-			teb.Print(data, teb.ListBucketsSummBody, opts)
-		} else {
-			teb.Print(data, teb.ListBucketsSummTmpl, opts)
+		// print only if there's data to display and at least one present bucket
+		if len(data) > 0 {
+			if hideHeader {
+				teb.Print(data, teb.ListBucketsSummBody, opts)
+			} else {
+				teb.Print(data, teb.ListBucketsSummTmpl, opts)
+			}
 		}
 		data = data[:0]
 		prev = now
@@ -261,7 +265,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 	}
 
 	// when prefix crosses shard boundary
-	if external, internal := splitPrefixShardBoundary(prefix); internal != "" {
+	if external, internal := splitArchivePath(prefix); internal != "" {
 		origPrefix := prefix
 		prefix = external
 		lstFilter._add(func(obj *cmn.LsoEnt) bool { return strings.HasPrefix(obj.Name, origPrefix) })
@@ -271,6 +275,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 	var (
 		msg          = &apc.LsoMsg{Prefix: prefix}
 		addCachedCol bool
+		allProps     bool
 	)
 	if bck.IsRemote() {
 		addCachedCol = true           // preliminary; may change below
@@ -392,8 +397,9 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 		msg.SetFlag(apc.LsNameSize)
 		msg.AddProps([]string{apc.GetPropsName, apc.GetPropsSize}...)
 	default:
-		if cos.StringInSlice(allPropsFlag.GetName(), props) {
+		if slices.Contains(props, allPropsFlag.GetName()) {
 			msg.AddProps(apc.GetPropsAll...)
+			allProps = true
 		} else {
 			msg.AddProps(apc.GetPropsName)
 			msg.AddProps(props...)
@@ -403,6 +409,10 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 	// addCachedCol: correction #2
 	if addCachedCol && (msg.IsFlagSet(apc.LsNameOnly) || msg.IsFlagSet(apc.LsNameSize)) {
 		addCachedCol = false
+	}
+
+	if flagIsSet(c, chunkedColumnFlag) && (msg.IsFlagSet(apc.LsNameOnly) || msg.IsFlagSet(apc.LsNameSize)) {
+		return fmt.Errorf("flag %s does not work when listing only names and/or sizes", qflprn(chunkedColumnFlag))
 	}
 
 	// when props are _not_ explicitly specified
@@ -471,8 +481,8 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 			} else {
 				toPrint = lst.Entries
 			}
-			err = printLso(c, toPrint, lstFilter, propsStr, nil /*_listed*/, now,
-				pageCounter+1, addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsDiff))
+			err = printLso(c, toPrint, lstFilter, propsStr, nil /*_listed*/, msg, now,
+				pageCounter+1, addCachedCol, bck.IsRemote(), allProps)
 			if err != nil {
 				return err
 			}
@@ -514,15 +524,19 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 	if err != nil {
 		return lsoErr(msg, err)
 	}
-	if len(lst.Entries) == 0 && !printEmpty {
-		return fmt.Errorf("%s/%s not found", bck.Cname(""), msg.Prefix)
+	if len(lst.Entries) == 0 {
+		if !printEmpty {
+			return fmt.Errorf("%s not found", bck.Cname(msg.Prefix))
+		}
+		fmt.Fprintln(c.App.Writer, "No objects in "+bck.Cname(""))
+		return nil
 	}
-	return printLso(c, lst.Entries, lstFilter, propsStr, _listed, now, 0, /*npage*/
-		addCachedCol, bck.IsRemote(), msg.IsFlagSet(apc.LsDiff))
+	return printLso(c, lst.Entries, lstFilter, propsStr, _listed, msg, now, 0, /*npage*/
+		addCachedCol, bck.IsRemote(), allProps)
 }
 
 func lsoErr(msg *apc.LsoMsg, err error) error {
-	if herr, ok := err.(*cmn.ErrHTTP); ok && msg.IsFlagSet(apc.LsBckPresent) {
+	if herr := cmn.AsErrHTTP(err); herr != nil && msg.IsFlagSet(apc.LsBckPresent) {
 		if herr.TypeCode == "ErrRemoteBckNotFound" {
 			err = V(err)
 			return fmt.Errorf("%v\nTip: use %s to list all objects including remote", V(err), qflprn(allObjsOrBcksFlag))
@@ -578,18 +592,26 @@ func setLsoPage(c *cli.Context, bck cmn.Bck) (pageSize, maxPages, limit int64, e
 }
 
 // NOTE: in addition to CACHED, may also dynamically add STATUS column
-func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, props string, _listed *_listed, now int64, npage int,
-	addCachedCol, isRemote, addStatusCol bool) error {
+func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, props string, _listed *_listed, lsmsg *apc.LsoMsg, now int64, npage int,
+	addCachedCol, isRemote, allProps bool) error {
 	var (
-		numCached      = -1
-		hideHeader     = flagIsSet(c, noHeaderFlag)
-		hideFooter     = flagIsSet(c, noFooterFlag)
-		matched, other = lstFilter.apply(entries)
-		units, errU    = parseUnitsFlag(c, unitsFlag)
+		numCached     = -1
+		hideHeader    = flagIsSet(c, noHeaderFlag)
+		hideFooter    = flagIsSet(c, noFooterFlag)
+		units, errU   = parseUnitsFlag(c, unitsFlag)
+		addChunkedCol = allProps || flagIsSet(c, chunkedColumnFlag)
+		addStatusCol  = lsmsg.IsFlagSet(apc.LsDiff)
+		dirsFirst     = lsmsg.IsFlagSet(apc.LsNoRecursion)
 	)
 	if errU != nil {
 		return errU
 	}
+
+	// optionally, filter and/or sort
+	if dirsFirst {
+		_sortDirsFirst(entries)
+	}
+	matched, other := lstFilter.apply(entries)
 
 	propsList := splitCsv(props)
 
@@ -632,7 +654,7 @@ func printLso(c *cli.Context, entries cmn.LsoEntries, lstFilter *lstFilter, prop
 	// * two related flags and semantics:
 	//   - https://github.com/NVIDIA/aistore/blob/main/docs/howto_virt_dirs.md
 
-	tmpl := teb.LsoTemplate(propsList, hideHeader, addCachedCol, addStatusCol)
+	tmpl := teb.LsoTemplate(propsList, hideHeader, addCachedCol, addStatusCol, addChunkedCol)
 	opts := teb.Opts{AltMap: teb.FuncMapUnits(units, false /*incl. calendar date*/)}
 	if err := teb.Print(matched, tmpl, opts); err != nil {
 		return err
@@ -698,10 +720,10 @@ func newLstFilter(c *cli.Context) (flt *lstFilter, prefix string, _ error) {
 		if err != nil && err != cos.ErrEmptyTemplate { // NOTE: empty template => entire bucket
 			return nil, "", err
 		}
-		if len(pt.Ranges) == 0 {
+		if pt.IsPrefixOnly() {
 			prefix, pt.Prefix = pt.Prefix, "" // NOTE: when template is a "pure" prefix
 		} else {
-			matchingObjectNames := make(cos.StrSet)
+			matchingObjectNames := make(cos.StrSet, min(1000, pt.Count()))
 			pt.InitIter()
 			for objName, hasNext := pt.Next(); hasNext; objName, hasNext = pt.Next() {
 				matchingObjectNames[objName] = struct{}{}
@@ -728,6 +750,8 @@ func (o *lstFilter) apply(entries cmn.LsoEntries) (matching, rest cmn.LsoEntries
 	if o._len() == 0 {
 		return entries, nil
 	}
+	matching = make(cmn.LsoEntries, 0, min(len(entries), 1000))
+	rest = make(cmn.LsoEntries, 0, min(len(entries), 1000))
 	for _, obj := range entries {
 		if o.and(obj) {
 			matching = append(matching, obj)
@@ -740,21 +764,8 @@ func (o *lstFilter) apply(entries cmn.LsoEntries) (matching, rest cmn.LsoEntries
 
 // prefix that crosses shard boundary, e.g.:
 // `ais ls bucket --prefix virt-subdir/A.tar.gz/dir-or-prefix-inside`
-func splitPrefixShardBoundary(prefix string) (external, internal string) {
-	if prefix == "" {
-		return
-	}
-	external = prefix
-	for _, ext := range archive.FileExtensions {
-		i := strings.Index(prefix, ext+"/")
-		if i <= 0 {
-			continue
-		}
-		internal = prefix[i+len(ext)+1:]
-		external = prefix[:i+len(ext)]
-		break
-	}
-	return
+func splitArchivePath(prefix string) (external, internal string) {
+	return archive.SplitAtExtension(prefix)
 }
 
 func splitObjnameShardBoundary(fullName string) (objName, fileName string) {
@@ -827,4 +838,24 @@ func (u *_listed) cb(lsoCounter *api.LsoCounter) {
 		sb.WriteByte(' ')
 	}
 	fmt.Fprintf(u.c.App.Writer, "\r%s", sb.String())
+}
+
+func _sortDirsFirst(lst cmn.LsoEntries) {
+	l := len(lst)
+	if l < 2 {
+		return
+	}
+	out := make(cmn.LsoEntries, 0, l)
+	for _, en := range lst {
+		if en.IsAnyFlagSet(apc.EntryIsDir) {
+			debug.Assert(cos.IsLastB(en.Name, '/'), en.Name)
+			out = append(out, en)
+		}
+	}
+	for _, en := range lst {
+		if !en.IsAnyFlagSet(apc.EntryIsDir) {
+			out = append(out, en)
+		}
+	}
+	copy(lst, out)
 }

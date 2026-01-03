@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -24,39 +25,61 @@ import (
 	onexxh "github.com/OneOfOne/xxhash"
 )
 
+// LOM
 const (
-	MetaverLOM   = 1 // LOM
-	MetaverChunk = 2 // LOM chunk // TODO: niy
+	// backward compat v3.31 and prior
+	MetaverLOM_V1 = 1 //nolint:revive // readability
+
+	// current
+	MetaverLOM = 2
 )
+
+// Metadata version 2 (v2)
+//
+// In addition to persisting LOM flags, v2 also serializes the bucket ID (BID)
+// into the `lomBID` field. This is a permanent, persistent association: every
+// on-disk object record carries not only its flags but also the full 50+ bits
+// of the BID assigned to its bucket at creation time.
+//
+// Consequences / rationale:
+//   * Flags survive eviction/reload cycles, restarts, rebalance, etc.
+//
+//   * BID provides a durable guard that ties the object to a specific bucket
+//     incarnation, protecting against subtle races or leftover files.
+//
+//   * On load, a mismatch between stored BID and current bucket's BID means the
+//     object belongs to a previous generation (e.g., bucket is being destroyed
+//     or evicted, mountpath replaced). The v1 code “adopted” the new BID from
+//     bucket props (effectively, BMD); v2 loading logic will now fail with
+//     cmn.NewErrObjDefunct (thus enforcing strict integrity).
+//
+//   * Under normal operation (destroy => trash) mismatches must be extremely
+//     unlikely.
+//
+// Effectively, v2 moves from “best-effort flags only” to a strong, persistent
+// identity: {flags, BID}. This makes objects self-describing and detectable
+// even if cached state is lost.
 
 // On-disk metadata layout - changing any of this must be done with respect
 // to backward compatibility (and with caution).
 //
-// | ------------------ PREAMBLE ----------------- | --- MD VALUES ---- |
-// | --- 1 --- | ----- 1 ----- | -- [CKSUM LEN] -- | - [METADATA LEN] - |
-// |  version  | checksum-type |   checksum-value  | ---- metadata ---- |
+// | -------------------- PREAMBLE -------------------- | --- MD VALUES ---- |
+// | ------ 1 ----- | ----- 1 ----- | -- [CKSUM LEN] -- | - [METADATA LEN] - |
+// |  meta-version  | checksum-type |   checksum-value  | ---- metadata ---- |
 //
-// * version - determines the layout version. Thanks to this we can be backward
-//   compatible and deprecate old versions if needed.
-// * checksum-type - determines the checksum algorithm used to compute checksum
-//   of the metadata.
-// * checksum-value - computed checksum of the metadata. The length of the checksum
-//   can vary depending on the checksum algorithm.
-// * metadata - the rest of the layout. The content of the metadata can vary depending
-//   on the version of the layout.
+// * meta-version - determines on-disk structure of the metadata.
+// * checksum-type - determines the metadata checksum type
+// * checksum-value - respectively, computed checksum
+// * metadata - object metadata payload
 
-// the one and only currently supported checksum type == xxhash;
-// adding more checksums will likely require a new MetaverLOM version
-const mdCksumTyXXHash = 1
+const mdCksumTyXXHash = 1 // metadata checksum type: xxhash
 
-// on-disk xattr names
+// on-disk xattr
 const (
-	XattrLOM   = "user.ais.lom"
-	xattrChunk = "user.ais.chunk"
-)
+	xattrLOM = "user.ais.lom"
 
-const (
-	xattrMaxSize = memsys.MaxSmallSlabSize // lom and chunk, both
+	// NOTE: 4K limit
+	xattrLomSize = memsys.MaxSmallSlabSize
 )
 
 // cmd/xmeta support
@@ -64,32 +87,46 @@ const (
 	DumpLomEnvVar = "AIS_DUMP_LOM"
 )
 
-const lomDirtyMask = uint64(1 << 63)
+const lomDirtyMask = cos.MSB64
 
 const (
 	badLmeta = "bad lmeta"
-	badChunk = "bad lchunk"
 )
 
 // packing format: enum internal attrs
 const (
-	packedCksumT = iota
+	packedCksumT = uint16(iota)
 	packedCksumV
 	packedVer
 	packedSize
 	packedCopies
 	packedCustom
-	packedNum
-	packedChunk
+	packedLid
+	packedFlags
+)
+
+const (
+	haveCksumT = 1 << iota
+	haveCksumV
+	haveVer
+	haveSize
+	haveCopies
+	haveCustom
+	haveLid
+	haveFlags
 )
 
 // packing format: separators
 const (
-	stringSepa = "\x00"
-	customSepa = "\x01"
+	stringSepa  = "\x00"
+	stringSepaB = '\x00'
+
+	customSepa  = "\x01"
+	customSepaB = '\x01'
+
 	recordSepa = "\xe3/\xbd"
 
-	lenStrSepa = len(stringSepa)
+	lenStrSepa = 1
 	lenRecSepa = len(recordSepa)
 )
 
@@ -126,11 +163,16 @@ func (lom *LOM) LoadMetaFromFS() error {
 	return nil
 }
 
-func whingeLmeta(cname string, err error) (*lmeta, error) {
-	if cos.IsErrXattrNotFound(err) {
-		return nil, cmn.NewErrLmetaNotFound(cname, err)
+func _errLmeta(cname string, err error) (e error) {
+	switch {
+	case os.IsNotExist(err) || errors.Is(err, syscall.ENOENT):
+		e = cos.NewErrNotFound(T, cname)
+	case cos.IsErrXattrNotFound(err):
+		e = cmn.NewErrLmetaNotFound(cname, err)
+	default:
+		e = os.NewSyscallError(getxattr, fmt.Errorf("%s: %w", cname, err))
 	}
-	return nil, os.NewSyscallError(getxattr, fmt.Errorf("%s, err: %w", cname, err))
+	return
 }
 
 func (lom *LOM) lmfsReload(populate bool) (md *lmeta, err error) {
@@ -148,19 +190,19 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 		mdSize    = g.maxLmeta.Load()
 		buf, slab = g.smm.AllocSize(mdSize)
 	)
-	b, err = fs.GetXattrBuf(lom.FQN, XattrLOM, buf)
+	b, err = lom.GetXattr(buf)
 	if err != nil {
 		slab.Free(buf)
 		if err != syscall.ERANGE {
-			return whingeLmeta(lom.Cname(), err)
+			return nil, _errLmeta(lom.Cname(), err)
 		}
-		debug.Assert(mdSize < xattrMaxSize)
+		debug.Assert(mdSize < xattrLomSize)
 		// 2nd attempt: max-size
-		buf, slab = g.smm.AllocSize(xattrMaxSize)
-		b, err = fs.GetXattrBuf(lom.FQN, XattrLOM, buf)
+		buf, slab = g.smm.AllocSize(xattrLomSize)
+		b, err = lom.GetXattr(buf)
 		if err != nil {
 			slab.Free(buf)
-			return whingeLmeta(lom.Cname(), err)
+			return nil, _errLmeta(lom.Cname(), err)
 		}
 	}
 	md, err = lom.unpack(b, mdSize, populate)
@@ -168,26 +210,53 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 	return md, err
 }
 
-func (lom *LOM) unpack(b []byte, mdSize int64, populate bool) (md *lmeta, err error) {
-	size := int64(len(b))
+func (lom *LOM) unpack(buf []byte, mdSize int64, populate bool) (md *lmeta, _ error) {
+	size := int64(len(buf))
 	if size == 0 {
 		nlog.Errorf("%s[%s]: ENOENT", lom, lom.FQN)
 		return nil, os.NewSyscallError(getxattr, syscall.ENOENT)
 	}
-	md = &lom.md
-	if !populate {
-		md = &lmeta{}
+	if size < prefLen {
+		return nil, cmn.NewErrLmetaCorrupted(fmt.Errorf("%s: too short (%d)", badLmeta, size))
 	}
-	err = md.unpack(b)
-	if err == nil {
-		_mdsize(size, mdSize)
-	} else {
-		err = cmn.NewErrLmetaCorrupted(err)
+
+	switch metaver := buf[0]; metaver {
+	case MetaverLOM_V1, MetaverLOM:
+		md = &lom.md
+		if !populate {
+			md = &lmeta{}
+		}
+		if err := md.unpack(buf); err != nil {
+			return nil, cmn.NewErrLmetaCorrupted(err)
+		}
+		// fixup v1 BID
+		// (affects either lom.md or scratch md depending on `populate`)
+		if metaver == MetaverLOM_V1 && lom.Bprops() != nil {
+			md.lid = md.lid.setbid(lom.Bprops().BID)
+		}
+	default:
+		return nil, cmn.NewErrLmetaCorrupted(fmt.Errorf("%s: unknown LOM meta-version %d", badLmeta, metaver))
 	}
-	return md, err
+
+	_mdsize(size, mdSize)
+	return md, nil
 }
 
-func (lom *LOM) PersistMain() (err error) {
+func (lom *LOM) PersistMain(isChunked bool) error {
+	debug.Assertf(lom.bid() == lom.Bprops().BID || lom.bid() == 0, "defunct %s: %x vs %x", lom, lom.bid(), lom.Bprops().BID)
+	debug.Assertf(lom.IsLocked() == apc.LockWrite, "%s must be wlocked (have %d)", lom.String(), lom.IsLocked())
+
+	// cleanup when transitioning from 'chunked' to 'monolithic'
+	if !isChunked && lom.IsChunked(true /*special: skipVC or not exist*/) {
+		lom.clrlmfl(lmflChunk)
+		u, err := NewUfest("", lom, true /*must-exist*/)
+		debug.AssertNoErr(err)
+		if err := u.removeCompleted(true /*except first*/); err != nil {
+			nlog.Errorln("failed to remove", u._utag(lom.Cname()), "err:", err) // proceeding anyway
+		}
+		debug.Assert(u.flags&flCompleted != 0, u._utag(lom.Cname()), " not marked 'completed'")
+	}
+
 	atime := lom.AtimeUnix()
 	debug.Assert(cos.IsValidAtime(atime))
 	if atime < 0 /*prefetch*/ || !lom.WritePolicy().IsImmediate() /*write-never, write-delayed*/ {
@@ -195,60 +264,69 @@ func (lom *LOM) PersistMain() (err error) {
 		lom.Recache()
 		return nil
 	}
+
 	// write-immediate (default)
 	buf := lom.pack()
-	if err = fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
-		lom.UncacheDel()
-		T.FSHC(err, lom.Mountpath(), lom.FQN)
-	} else {
+	err := lom.SetXattr(buf)
+	g.smm.Free(buf)
+
+	if err == nil {
 		lom.md.clearDirty()
 		lom.Recache()
+		return nil
 	}
-	g.smm.Free(buf)
+
+	lom.UncacheDel()
+	T.FSHC(err, lom.Mountpath(), lom.FQN)
 	return err
 }
 
 // (caller must set atime; compare with the above)
-func (lom *LOM) Persist() (err error) {
+func (lom *LOM) Persist() error {
 	atime := lom.AtimeUnix()
+	bprops := lom.Bprops()
 	debug.Assert(cos.IsValidAtime(atime), atime)
 
 	if atime < 0 || !lom.WritePolicy().IsImmediate() {
 		lom.md.makeDirty()
-		if lom.Bprops() != nil {
+		if bprops != nil {
 			if !lom.IsCopy() {
 				lom.Recache()
 			}
-			lom.setbid(lom.Bprops().BID)
+			lom.setbid(bprops.BID)
 		}
-		return
+		return nil
 	}
 
-	buf := lom.pack()
-	if err = fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
-		lom.UncacheDel()
-		T.FSHC(err, lom.Mountpath(), lom.FQN)
-	} else {
-		lom.md.clearDirty()
-		if lom.Bprops() != nil {
-			if !lom.IsCopy() {
-				lom.Recache()
-			}
-			lom.setbid(lom.Bprops().BID)
-		}
+	if bprops != nil {
+		lom.setbid(bprops.BID)
 	}
+	buf := lom.pack()
+	err := lom.SetXattr(buf)
 	g.smm.Free(buf)
-	return
+
+	if err == nil {
+		lom.md.clearDirty()
+		if bprops != nil && !lom.IsCopy() {
+			lom.Recache()
+		}
+		return nil
+	}
+
+	lom.UncacheDel()
+	T.FSHC(err, lom.Mountpath(), lom.FQN)
+	return err
 }
 
 func (lom *LOM) persistMdOnCopies() (copyFQN string, err error) {
+	debug.Assertf(lom.bid() == lom.Bprops().BID || lom.bid() == 0, "defunct %s: %x vs %x", lom, lom.bid(), lom.Bprops().BID)
 	buf := lom.pack()
 	// replicate across copies
 	for copyFQN = range lom.md.copies {
 		if copyFQN == lom.FQN {
 			continue
 		}
-		if err = fs.SetXattr(copyFQN, XattrLOM, buf); err != nil {
+		if err = fs.SetXattr(copyFQN, xattrLOM, buf); err != nil {
 			break
 		}
 	}
@@ -257,18 +335,14 @@ func (lom *LOM) persistMdOnCopies() (copyFQN string, err error) {
 }
 
 func (lom *LOM) flushAtime(atime time.Time) error {
-	_, _, mtime, err := lom.Fstat(false /*get-atime*/)
-	if err != nil {
-		return err
-	}
-	return os.Chtimes(lom.FQN, atime, mtime)
+	return fs.ChtimeOnly(lom.FQN, atime)
 }
 
 func (lom *LOM) pack() (buf []byte) {
 	lmsize := g.maxLmeta.Load()
 	buf = lom.md.pack(lmsize)
 	size := int64(len(buf))
-	debug.Assert(size <= xattrMaxSize)
+	debug.Assert(size <= xattrLomSize)
 	_mdsize(size, lmsize)
 	return
 }
@@ -277,10 +351,10 @@ func _mdsize(size, mdSize int64) {
 	const grow = memsys.SmallSlabIncStep
 	var nsize int64
 	if size > mdSize {
-		nsize = min(size+grow, xattrMaxSize)
+		nsize = min(size+grow, xattrLomSize)
 		g.maxLmeta.CAS(mdSize, nsize)
-	} else if mdSize == xattrMaxSize && size < xattrMaxSize-grow {
-		nsize = min(size+grow, (size+xattrMaxSize)/2)
+	} else if mdSize == xattrLomSize && size < xattrLomSize-grow {
+		nsize = min(size+grow, (size+xattrLomSize)/2)
 		g.maxLmeta.CAS(mdSize, nsize)
 	}
 }
@@ -303,18 +377,14 @@ func (md *lmeta) poprt(saved []uint64) {
 
 func (md *lmeta) unpack(buf []byte) error {
 	var (
-		payload                           []byte
-		expectedCksum, actualCksum        uint64
-		cksumType, cksumValue             string
-		haveSize, haveVersion, haveCopies bool
-		haveCksumType, haveCksumValue     bool
-		last                              bool
+		payload                    []byte
+		expectedCksum, actualCksum uint64
+		cksumType, cksumValue      string
+		seen                       uint32
+		last                       bool
 	)
 	if len(buf) < prefLen {
-		return fmt.Errorf("%s: too short (%d)", badLmeta, len(buf))
-	}
-	if buf[0] != MetaverLOM {
-		return fmt.Errorf("%s: unknown version %d", badLmeta, buf[0])
+		return errors.New(badLmeta + " short preamble")
 	}
 	if buf[1] != mdCksumTyXXHash {
 		return fmt.Errorf("%s: unknown checksum %d", badLmeta, buf[1])
@@ -337,40 +407,40 @@ func (md *lmeta) unpack(buf []byte) error {
 		} else {
 			record = payload[off : off+i]
 		}
-		key := int(binary.BigEndian.Uint16(record)) // the corresponding 'val' is at rec[cos.SizeofI16:]
+		key := binary.BigEndian.Uint16(record)
 		off += i + lenRecSepa
 		switch key {
 		case packedCksumV:
-			if haveCksumValue {
+			if seen&haveCksumV != 0 {
 				return errors.New(badLmeta + " #1")
 			}
 			cksumValue = string(record[cos.SizeofI16:])
-			haveCksumValue = true
+			seen |= haveCksumV
 		case packedCksumT:
-			if haveCksumType {
+			if seen&haveCksumT != 0 {
 				return errors.New(badLmeta + " #2")
 			}
 			cksumType = string(record[cos.SizeofI16:])
-			haveCksumType = true
+			seen |= haveCksumT
 		case packedVer:
-			if haveVersion {
+			if seen&haveVer != 0 {
 				return errors.New(badLmeta + " #3")
 			}
 			md.SetVersion(string(record[cos.SizeofI16:]))
-			haveVersion = true
+			seen |= haveVer
 		case packedSize:
-			if haveSize {
+			if seen&haveSize != 0 {
 				return errors.New(badLmeta + " #4")
 			}
 			md.Size = int64(binary.BigEndian.Uint64(record[cos.SizeofI16:]))
-			haveSize = true
+			seen |= haveSize
 		case packedCopies:
-			if haveCopies {
+			if seen&haveCopies != 0 {
 				return errors.New(badLmeta + " #5")
 			}
 			val := string(record[cos.SizeofI16:])
 			copyFQNs := strings.Split(val, stringSepa)
-			haveCopies = true
+			seen |= haveCopies
 			md.copies = make(fs.MPI, len(copyFQNs))
 			for _, copyFQN := range copyFQNs {
 				if copyFQN == "" {
@@ -380,7 +450,7 @@ func (md *lmeta) unpack(buf []byte) error {
 				mpathInfo, _, err := fs.FQN2Mpath(copyFQN)
 				if err != nil {
 					// Mountpath with the copy is missing.
-					if cmn.Rom.FastV(4, cos.SmoduleCore) {
+					if cmn.Rom.V(4, cos.ModCore) {
 						nlog.Warningln(err)
 					}
 					// For utilities and tests: fill the map with mpath names always
@@ -403,17 +473,35 @@ func (md *lmeta) unpack(buf []byte) error {
 				}
 			}
 			md.SetCustomMD(custom)
+		case packedLid:
+			if seen&haveLid != 0 {
+				return errors.New(badLmeta + " #6")
+			}
+			md.lid = lomBID(binary.BigEndian.Uint64(record[cos.SizeofI16:]))
+			seen |= haveLid
+		case packedFlags:
+			if seen&haveFlags != 0 {
+				return errors.New(badLmeta + " #7")
+			}
+			md.flags = binary.BigEndian.Uint64(record[cos.SizeofI16:])
+			seen |= haveFlags
 		default:
-			return errors.New(badLmeta + " #6")
+			return errors.New(badLmeta + " #101")
 		}
 	}
-	if haveCksumType != haveCksumValue {
-		return errors.New(badLmeta + " #7")
+
+	if seen&haveSize != haveSize {
+		return errors.New(badLmeta + " #103")
 	}
-	md.Cksum = cos.NewCksum(cksumType, cksumValue)
-	if !haveSize {
-		return errors.New(badLmeta + " #8")
+	return md._setCksum(cksumType, cksumValue, seen&haveCksumT != 0, seen&haveCksumV != 0)
+}
+
+func (md *lmeta) _setCksum(cksumT, cksumV string, haveT, haveV bool) error {
+	if haveV != haveT {
+		return fmt.Errorf("%s %s %q %q", badLmeta, "#102:", cksumT, cksumV)
 	}
+
+	md.Cksum = cos.NewCksum(cksumT, cksumV)
 	return nil
 }
 
@@ -422,32 +510,46 @@ func (md *lmeta) pack(mdSize int64) (buf []byte) {
 	buf = buf[:prefLen] // hold it for md-xattr checksum (below)
 
 	// checksum
-	cksumType, cksumValue := md.Cksum.Get()
-	buf = _packRecord(buf, packedCksumT, cksumType, true)
-	buf = _packRecord(buf, packedCksumV, cksumValue, true)
+	var (
+		cksumType  = cos.ChecksumNone
+		cksumValue string
+	)
+	if md.Cksum != nil { // compare w/ cos.NoneC
+		cksumType, cksumValue = md.Cksum.Get()
+	}
+	buf = _prsp(buf, cksumType, packedCksumT)
+	buf = _prsp(buf, cksumValue, packedCksumV)
 
 	// version
 	if v := md.Version(); v != "" {
-		buf = _packRecord(buf, packedVer, v, true)
+		buf = _prsp(buf, v, packedVer)
 	}
 
 	// size
 	var b8 [cos.SizeofI64]byte
 	binary.BigEndian.PutUint64(b8[:], uint64(md.Size))
-	buf = _packRecord(buf, packedSize, cos.UnsafeS(b8[:]), false)
+	buf = _prbp(buf, b8[:], packedSize)
+
+	// lid (v2)
+	binary.BigEndian.PutUint64(b8[:], uint64(md.lid))
+	buf = _prbp(buf, b8[:], packedLid)
+
+	// flags (v2)
+	binary.BigEndian.PutUint64(b8[:], md.flags)
+	buf = _prb(buf, b8[:], packedFlags)
 
 	// copies
 	if len(md.copies) > 0 {
-		buf = g.smm.Append(buf, recordSepa)
-		buf = _packRecord(buf, packedCopies, "", false)
-		buf = _packCopies(buf, md.copies)
+		buf = g.smm.AppendBytes(buf, recdupSepa[:])
+		buf = _prso(buf, packedCopies)
+		buf = _pcopies(buf, md.copies)
 	}
 
 	// custom md
 	if custom := md.GetCustomMD(); len(custom) > 0 {
-		buf = g.smm.Append(buf, recordSepa)
-		buf = _packRecord(buf, packedCustom, "", false)
-		buf = _packCustom(buf, custom)
+		buf = g.smm.AppendBytes(buf, recdupSepa[:])
+		buf = _prso(buf, packedCustom)
+		buf = _pcustom(buf, custom)
 	}
 
 	// checksum, prepend, and return
@@ -458,18 +560,41 @@ func (md *lmeta) pack(mdSize int64) (buf []byte) {
 	return buf
 }
 
-func _packRecord(buf []byte, key int, value string, sepa bool) []byte {
+// _prsp: pack record (string value) and append record separator
+// _prso: pack record (key only)
+// _prbp: pack record (binary value) and append record separator
+// _prb : pack record (binary value) without separator
+
+func _prb(buf, value []byte, key uint16) []byte {
 	var bkey [cos.SizeofI16]byte
-	binary.BigEndian.PutUint16(bkey[:], uint16(key))
-	buf = g.smm.Append(buf, cos.UnsafeS(bkey[:]))
-	buf = g.smm.Append(buf, value)
-	if sepa {
-		buf = g.smm.Append(buf, recordSepa)
-	}
-	return buf
+	binary.BigEndian.PutUint16(bkey[:], key)
+	return g.smm.AppendBytes2(buf, bkey[:], value)
 }
 
-func _packCopies(buf []byte, copies fs.MPI) []byte {
+func _prbp(buf, value []byte, key uint16) []byte {
+	var bkey [cos.SizeofI16]byte
+	binary.BigEndian.PutUint16(bkey[:], key)
+	buf = g.smm.AppendBytes2(buf, bkey[:], value)
+	return g.smm.AppendBytes(buf, recdupSepa[:])
+}
+
+func _prso(buf []byte, key uint16) []byte {
+	var bkey [cos.SizeofI16]byte
+	binary.BigEndian.PutUint16(bkey[:], key)
+	return g.smm.AppendBytes(buf, bkey[:])
+}
+
+func _prsp(buf []byte, value string, key uint16) []byte {
+	var bkey [cos.SizeofI16]byte
+	binary.BigEndian.PutUint16(bkey[:], key)
+	buf = g.smm.AppendBytes(buf, bkey[:])
+	if value != "" {
+		buf = g.smm.AppendString(buf, value)
+	}
+	return g.smm.AppendBytes(buf, recdupSepa[:])
+}
+
+func _pcopies(buf []byte, copies fs.MPI) []byte {
 	var (
 		i   int
 		num = len(copies)
@@ -477,15 +602,15 @@ func _packCopies(buf []byte, copies fs.MPI) []byte {
 	for copyFQN := range copies {
 		debug.Assert(copyFQN != "")
 		i++
-		buf = g.smm.Append(buf, copyFQN)
+		buf = g.smm.AppendString(buf, copyFQN)
 		if i < num {
-			buf = g.smm.Append(buf, stringSepa)
+			buf = g.smm.AppendB(buf, stringSepaB)
 		}
 	}
 	return buf
 }
 
-func _packCustom(buf []byte, md cos.StrKVs) []byte {
+func _pcustom(buf []byte, md cos.StrKVs) []byte {
 	var (
 		i   int
 		num = len(md)
@@ -493,11 +618,11 @@ func _packCustom(buf []byte, md cos.StrKVs) []byte {
 	for k, v := range md {
 		debug.Assert(k != "")
 		i++
-		buf = g.smm.Append(buf, k)
-		buf = g.smm.Append(buf, customSepa)
-		buf = g.smm.Append(buf, v)
+		buf = g.smm.AppendString(buf, k)
+		buf = g.smm.AppendB(buf, customSepaB)
+		buf = g.smm.AppendString(buf, v)
 		if i < num {
-			buf = g.smm.Append(buf, customSepa)
+			buf = g.smm.AppendB(buf, customSepaB)
 		}
 	}
 	return buf

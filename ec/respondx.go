@@ -61,7 +61,7 @@ func (p *rspFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 
 func (p *rspFactory) Start() error {
 	xec := ECM.NewRespondXact(p.Bck.Bucket())
-	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), "" /*ctlmsg*/, p.Bck, 0 /*use default*/)
+	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
 	p.xctn = xec
 
 	xact.GoRunW(xec)
@@ -107,11 +107,11 @@ func (r *XactRespond) Run(gowg *sync.WaitGroup) {
 // Utility function to cleanup both object/slice and its meta on the local node
 // Used when processing object deletion request
 func (*XactRespond) removeObjAndMeta(bck *meta.Bck, objName string) error {
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Delete request for %s", bck.Cname(objName))
 	}
 
-	ct, err := core.NewCTFromBO(bck.Bucket(), objName, core.T.Bowner(), fs.ECSliceType)
+	ct, err := core.NewCTFromBO(bck, objName, fs.ECSliceCT)
 	if err != nil {
 		return err
 	}
@@ -124,12 +124,12 @@ func (*XactRespond) removeObjAndMeta(bck *meta.Bck, objName string) error {
 	// responds that it has the object because it has metafile. We delete
 	// metafile that makes remained slices/replicas outdated and can be cleaned
 	// up later by LRU or other runner
-	for _, tp := range []string{fs.ECMetaType, fs.ObjectType, fs.ECSliceType} {
+	for _, tp := range []string{fs.ECMetaCT, fs.ObjCT, fs.ECSliceCT} {
 		fqnMeta, _, err := core.HrwFQN(bck.Bucket(), tp, objName)
 		if err != nil {
 			return err
 		}
-		if err := os.Remove(fqnMeta); err != nil && !os.IsNotExist(err) {
+		if err := os.Remove(fqnMeta); err != nil && !cos.IsNotExist(err) {
 			return fmt.Errorf("error removing %s %q: %w", tp, fqnMeta, err)
 		}
 	}
@@ -143,18 +143,18 @@ func (r *XactRespond) trySendCT(iReq intraReq, hdr *transport.ObjHdr, bck *meta.
 		md           *Metadata
 		objName      = hdr.ObjName
 	)
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Received request for slice %d of %s", iReq.meta.SliceID, objName)
 	}
 	if iReq.isSlice {
-		ct, err := core.NewCTFromBO(bck.Bucket(), objName, core.T.Bowner(), fs.ECSliceType)
+		ct, err := core.NewCTFromBO(bck, objName, fs.ECSliceCT)
 		if err != nil {
 			return err
 		}
 		ct.Lock(false)
 		defer ct.Unlock(false)
 		fqn = ct.FQN()
-		metaFQN = ct.Make(fs.ECMetaType)
+		metaFQN = ct.GenFQN(fs.ECMetaCT)
 		if md, err = LoadMetadata(metaFQN); err != nil {
 			return err
 		}
@@ -199,7 +199,7 @@ func (r *XactRespond) dispatchResp(iReq intraReq, hdr *transport.ObjHdr, object 
 			nlog.Errorln(core.T.String(), "no metadata for", hdr.Cname())
 			return
 		}
-		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Infof("Got slice=%t from %s (#%d of %s) v%s, cksum: %s", iReq.isSlice, hdr.SID,
 				iReq.meta.SliceID, hdr.Cname(), md.ObjVersion, md.CksumValue)
 		}
@@ -221,8 +221,8 @@ func (r *XactRespond) dispatchResp(iReq intraReq, hdr *transport.ObjHdr, object 
 					Xact:       r,
 				}
 				err = WriteReplicaAndMeta(lom, args)
+				core.FreeLOM(lom)
 			}
-			core.FreeLOM(lom)
 		}
 		if err != nil {
 			r.AddErr(err, 0)
@@ -242,5 +242,5 @@ func (r *XactRespond) stop() {
 	r.Finish()
 }
 
-// (compare w/ XactGet/Put)
-func (r *XactRespond) Snap() *core.Snap { return r.baseSnap() }
+func (*XactRespond) CtlMsg() string     { return "" }
+func (r *XactRespond) Snap() *core.Snap { return r.Base.NewSnap(r) }

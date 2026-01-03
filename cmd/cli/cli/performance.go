@@ -8,6 +8,7 @@ package cli
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,7 +56,7 @@ var (
 	))
 
 	// `show performance` command
-	showCmdPeformance = cli.Command{
+	showCmdPerformance = cli.Command{
 		Name:      commandPerf,
 		Usage:     showPerfArgument,
 		ArgsUsage: optionalTargetIDArgument,
@@ -66,7 +67,7 @@ var (
 			showThroughput,
 			showLatency,
 			showCmdMpathCapacity,
-			makeAlias(showCmdDisk, "", true /*silent*/, cmdShowDisk),
+			makeAlias(&showCmdDisk, &mkaliasOpts{newName: cmdShowDisk}),
 		},
 	}
 	showCounters = cli.Command{
@@ -163,7 +164,7 @@ func showCountersHandler(c *cli.Context) error {
 			// skip assorted internal counters and sizes, unless verbose or regex
 			//
 			if !verbose && regexStr == "" {
-				if cos.StringInSlice(name, verboseCounters[:]) {
+				if slices.Contains(verboseCounters[:], name) {
 					continue
 				}
 			}
@@ -450,7 +451,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		}
 		setLongRunParams(c, lfooter)
 
-		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units, AvgSize: avgSize, NoColor: cfg.NoColor}
+		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units, AvgSize: avgSize, NoColor: gcfg.NoColor}
 		table, num, err := ctx.MakeTab(tstatusMap)
 		if err != nil {
 			return err
@@ -517,7 +518,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		}
 
 		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units,
-			Totals: totals, TotalsHdr: totalsHdr, AvgSize: avgSize, Idle: idle, NoColor: cfg.NoColor}
+			Totals: totals, TotalsHdr: totalsHdr, AvgSize: avgSize, Idle: idle, NoColor: gcfg.NoColor}
 		table, _, err := ctx.MakeTab(mapBegin)
 		if err != nil {
 			return err
@@ -565,7 +566,7 @@ func showMpathCapHandler(c *cli.Context) error {
 		return err
 	}
 
-	ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Regex: regex, Units: units, NoColor: cfg.NoColor}
+	ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Regex: regex, Units: units, NoColor: gcfg.NoColor}
 	table := teb.NewMpathCapTab(tstatusMap, &ctx, showMpaths)
 
 	out := table.Template(hideHeader)

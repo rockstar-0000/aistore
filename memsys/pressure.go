@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/sys"
 )
 
@@ -73,6 +74,11 @@ const (
 
 const highLowThreshold = 40
 
+const (
+	FmtErrExtreme = "extreme memory pressure" // (to run or not to run)
+	fmtErrHigh    = "high memory pressure"
+)
+
 var memPressureText = map[int]string{
 	PressureLow:      "low",
 	PressureModerate: "moderate",
@@ -107,7 +113,7 @@ func (r *MMSA) updSwap(mem *sys.MemStat) {
 
 // returns an estimate for the current memory pressure expressed as enumerated values
 // also, tracks swapping stateful vars
-func (r *MMSA) Pressure(mems ...*sys.MemStat) (pressure int) {
+func (r *MMSA) Pressure(mems ...*sys.MemStat) int {
 	var mem *sys.MemStat
 	if len(mems) > 0 {
 		mem = mems[0]
@@ -119,10 +125,13 @@ func (r *MMSA) Pressure(mems ...*sys.MemStat) (pressure int) {
 	ncrit := r.swap.crit.Load()
 	switch {
 	case ncrit > 2:
+		nlog.ErrorDepth(1, FmtErrExtreme, "[ ncrit", ncrit, "]")
 		return OOM
 	case ncrit > 1 || mem.ActualFree <= r.MinFree:
+		nlog.ErrorDepth(1, FmtErrExtreme, "[ ncrit", ncrit, "actual", mem.ActualFree, "min", r.MinFree, "]")
 		return PressureExtreme
 	case ncrit > 0:
+		nlog.WarningDepth(1, fmtErrHigh, "[ ncrit", ncrit, "]")
 		return PressureHigh
 	case free <= r.MinFree:
 		return PressureHigh
@@ -130,15 +139,15 @@ func (r *MMSA) Pressure(mems ...*sys.MemStat) (pressure int) {
 		return PressureLow
 	}
 
-	pressure = PressureModerate
+	p := PressureModerate
 	x := (free - r.MinFree) * 100 / (r.lowWM - r.MinFree)
 	if x < highLowThreshold {
-		pressure = PressureHigh
+		p = PressureHigh
 	}
-	return
+	return p
 }
 
-func (r *MMSA) pressure2S(sb *strings.Builder, mem *sys.MemStat) {
+func (r *MMSA) _p2s(sb *strings.Builder, mem *sys.MemStat) {
 	sb.WriteString("pressure '")
 	p := r.Pressure(mem)
 	sb.WriteString(memPressureText[p])

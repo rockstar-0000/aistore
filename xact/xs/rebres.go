@@ -7,6 +7,8 @@ package xs
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -34,6 +36,7 @@ type (
 	}
 
 	Rebalance struct {
+		Args *xreg.RebArgs
 		xact.Base
 	}
 	Resilver struct {
@@ -96,10 +99,14 @@ func (p *rebFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, 
 
 func newRebalance(p *rebFactory) (xreb *Rebalance, err error) {
 	xreb = &Rebalance{}
-	ctlmsg, ok := p.Args.Custom.(string)
-	debug.Assert(ok)
-	xreb.InitBase(p.Args.UUID, p.Kind(), ctlmsg, nil)
 
+	xreb.Args = p.Args.Custom.(*xreg.RebArgs)
+	debug.Assert(xreb.Args != nil)
+
+	// init
+	xreb.InitBase(p.Args.UUID, p.Kind(), nil)
+
+	// ID
 	id, err := xact.S2RebID(p.Args.UUID)
 	if err != nil {
 		return nil, err
@@ -116,6 +123,41 @@ func newRebalance(p *rebFactory) (xreb *Rebalance, err error) {
 	return xreb, nil
 }
 
+func (xreb *Rebalance) CtlMsg() string {
+	var sb strings.Builder
+	sb.Grow(80)
+	if xreb.Args.Bck != nil {
+		sb.WriteString(xreb.Args.Bck.Cname(xreb.Args.Prefix))
+	}
+	fl := xreb.Args.Flags
+	if fl == 0 {
+		return sb.String()
+	}
+	sb.WriteString(", flags:")
+	first := true
+	if fl&xact.FlagLatestVer != 0 {
+		first = false
+		sb.WriteString("latest")
+		fl &^= xact.FlagLatestVer
+	}
+	if fl&xact.FlagSync != 0 {
+		if !first {
+			sb.WriteByte(',')
+		}
+		first = false
+		sb.WriteString("sync")
+		fl &^= xact.FlagSync
+	}
+	if fl != 0 {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("0x")
+		sb.WriteString(strconv.FormatUint(uint64(fl), 16))
+	}
+	return sb.String()
+}
+
 func (*Rebalance) Run(*sync.WaitGroup) { debug.Assert(false) }
 
 func (xreb *Rebalance) RebID() int64 {
@@ -125,10 +167,7 @@ func (xreb *Rebalance) RebID() int64 {
 }
 
 func (xreb *Rebalance) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	xreb.ToSnap(snap)
-
-	snap.IdleX = xreb.IsIdle()
+	snap = xreb.Base.NewSnap(xreb)
 
 	// the number of rebalanced objects _is_ the number of transmitted objects (definition)
 	// (TODO: revisit)
@@ -156,7 +195,7 @@ func (*resFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) { return 
 
 func newResilver(p *resFactory) (xres *Resilver) {
 	xres = &Resilver{}
-	xres.InitBase(p.UUID(), p.Kind(), "" /*ctlmsg*/, nil /*bck*/)
+	xres.InitBase(p.UUID(), p.Kind(), nil /*bck*/)
 
 	xres.Args = p.Args.Custom.(*xreg.ResArgs)
 	debug.Assert(xres.Args != nil)
@@ -173,10 +212,5 @@ func (xres *Resilver) String() string {
 	return xres.Base.String()
 }
 
-func (xres *Resilver) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	xres.ToSnap(snap)
-
-	snap.IdleX = xres.IsIdle()
-	return
-}
+func (*Resilver) CtlMsg() string        { return "" }
+func (xres *Resilver) Snap() *core.Snap { return xres.Base.NewSnap(xres) }

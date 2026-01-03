@@ -32,22 +32,27 @@ type (
 	}
 )
 
+// TODO:
+// consider adding Size() for the number of bytes already written to the underlying writer -
+// compressed bytes for compressed formats (note that cos.CksumHashSize has size)
 type (
 	Writer interface {
 		// Init specific writer
 		Write(nameInArch string, oah cos.OAH, reader io.Reader) error
 		// Close, cleanup
-		Fini()
+		Fini() error
 		// Copy arch, with potential subsequent APPEND
 		Copy(src io.Reader, size ...int64) error
+
+		Flush() error
 
 		// private
 		init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts)
 	}
 	baseW struct {
 		wmul io.Writer
-		lck  sync.Locker // serialize: (multi-object => single shard)
-		cb   HeaderCallback
+		lck  sync.Locker    // serialize: (multi-object => single shard)
+		cb   HeaderCallback // nopTarHeader (default) and SetTarHeader
 		slab *memsys.Slab
 		buf  []byte
 	}
@@ -119,10 +124,14 @@ func (bw *baseW) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
 
 // tarWriter
 
+// tar.FormatUnknown lets standard library choose USTAR (most compatible) or PAX (extended features) as needed.
+// Can be overridden via opts.TarFormat if specific format required (e.g., FormatGNU for GNU tar compatibility)
+
 func (tw *tarWriter) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
 	tw.baseW.init(w, cksum, opts)
 
-	tw.format = tar.FormatUnknown // default
+	tw.format = tar.FormatUnknown // default: auto-select most compatible format
+
 	if opts != nil {
 		tw.format = opts.TarFormat
 	}
@@ -132,9 +141,10 @@ func (tw *tarWriter) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
 	tw.tw = tar.NewWriter(tw.wmul)
 }
 
-func (tw *tarWriter) Fini() {
-	tw.slab.Free(tw.buf)
-	tw.tw.Close()
+func (tw *tarWriter) Fini() error {
+	defer tw.slab.Free(tw.buf)
+
+	return tw.tw.Close()
 }
 
 func (tw *tarWriter) Write(fullname string, oah cos.OAH, reader io.Reader) (err error) {
@@ -159,10 +169,12 @@ func (tw *tarWriter) Copy(src io.Reader, _ ...int64) error {
 	return cpTar(src, tw.tw, tw.buf)
 }
 
-// set Uid/Gid bits in TAR header
+func (tw *tarWriter) Flush() error { return tw.tw.Flush() }
+
+// HeaderCallback to set TAR header fields: Uid/Gid, ModTime, etc.
 // - note: cos.PermRWRR default
 // - not calling standard tar.FileInfoHeader
-
+// - nopTarHeader default; SetTarHeader is currently used only by CLI
 func nopTarHeader(any) {}
 
 func SetTarHeader(hdr any) {
@@ -176,14 +188,21 @@ func SetTarHeader(hdr any) {
 // tgzWriter
 
 func (tzw *tgzWriter) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
+	var err error
 	tzw.tw.baseW.init(w, cksum, opts)
-	tzw.gzw = gzip.NewWriter(tzw.tw.wmul)
+	tzw.gzw, err = gzip.NewWriterLevel(tzw.tw.wmul, gzip.BestSpeed)
+	debug.AssertNoErr(err)
 	tzw.tw.tw = tar.NewWriter(tzw.gzw)
 }
 
-func (tzw *tgzWriter) Fini() {
-	tzw.tw.Fini()
-	tzw.gzw.Close()
+func (tzw *tgzWriter) Fini() error {
+	// close (and note: tar.close flushes)
+	if err := tzw.tw.Fini(); err != nil {
+		tzw.gzw.Close() // Try to close gzip anyway
+		return err
+	}
+
+	return tzw.gzw.Close()
 }
 
 func (tzw *tgzWriter) Write(fullname string, oah cos.OAH, reader io.Reader) error {
@@ -200,16 +219,19 @@ func (tzw *tgzWriter) Copy(src io.Reader, _ ...int64) error {
 	return err
 }
 
+func (tzw *tgzWriter) Flush() error { return tzw.tw.Flush() }
+
 // zipWriter
+// in re streaming use case, note: ZIP writer doesn't have explicit flush
 
 func (zw *zipWriter) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
 	zw.baseW.init(w, cksum, opts)
 	zw.zw = zip.NewWriter(zw.wmul)
 }
 
-func (zw *zipWriter) Fini() {
-	zw.slab.Free(zw.buf)
-	zw.zw.Close()
+func (zw *zipWriter) Fini() error {
+	defer zw.slab.Free(zw.buf)
+	return zw.zw.Close()
 }
 
 func (zw *zipWriter) Write(fullname string, oah cos.OAH, reader io.Reader) error {
@@ -235,6 +257,8 @@ func (zw *zipWriter) Copy(src io.Reader, size ...int64) error {
 	return cpZip(r, size[0], zw.zw, zw.buf)
 }
 
+func (*zipWriter) Flush() error { return nil }
+
 // lz4Writer
 
 func (lzw *lz4Writer) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
@@ -257,9 +281,14 @@ func (lzw *lz4Writer) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
 	lzw.tw.tw = tar.NewWriter(lzw.lzw)
 }
 
-func (lzw *lz4Writer) Fini() {
-	lzw.tw.Fini()
-	lzw.lzw.Close()
+func (lzw *lz4Writer) Fini() error {
+	// close (and note: tar.close flushes)
+	if err := lzw.tw.Fini(); err != nil {
+		lzw.lzw.Close() // Try to close lz4 anyway
+		return err
+	}
+
+	return lzw.lzw.Close()
 }
 
 func (lzw *lz4Writer) Write(fullname string, oah cos.OAH, reader io.Reader) error {
@@ -270,3 +299,5 @@ func (lzw *lz4Writer) Copy(src io.Reader, _ ...int64) error {
 	lzr := lz4.NewReader(src)
 	return cpTar(lzr, lzw.tw.tw, lzw.tw.buf)
 }
+
+func (lzw *lz4Writer) Flush() error { return lzw.tw.Flush() }

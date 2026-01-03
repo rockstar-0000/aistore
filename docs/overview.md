@@ -8,9 +8,11 @@ The rest of this document is structured as follows:
 
 - [At a glance](#at-a-glance)
 - [Terminology](#terminology)
+  - [Bucket](#bucket)
   - [Backend Provider](#backend-provider)
   - [Mountpath](#mountpath)
   - [Proxy](#proxy)
+  - [Endpoint](#endpoint)
   - [Read-after-Write Consistency](#read-after-write-consistency)
   - [Xaction](#xaction)
   - [Shard](#shard)
@@ -20,7 +22,7 @@ The rest of this document is structured as follows:
 - [Design Philosophy](#design-philosophy)
 - [Original Diagrams](#original-diagrams)
 - [CLI](#cli)
-- [AIStore API](#aistore-api)
+- [AIStore APIs](#aistore-apis)
 - [Traffic Patterns](#traffic-patterns)
 - [Open Format](#open-format)
 - [Existing Datasets](#existing-datasets)
@@ -55,10 +57,28 @@ All user data is equally distributed (or [balanced](/docs/rebalance.md)) across 
 
 ---
 
-### Backend Provider
-Backend provider (or simply **backend**) is an abstraction, and simultaneously an API-supported option that differentiates between "remote" (e.g., `s3://`) and "local" (`ais://`) buckets with respect to a given AIS cluster. AIS [supports multiple storage backends](images/supported-backends.png) including its own.
+### Bucket
+A **bucket** is a named container for objects - monolithic files or chunked representations - with associated metadata. It is the fundamental unit of data organization and data management.
 
-> See [providers](providers.md) for the current list of supported clouds and instructions on chaining AIS clusters.
+AIS buckets are categorized by their [provider](/docs/bucket.md#provider) and origin. **Native** `ais://` buckets managed by [this cluster](#at-a-glance) are always created explicitly (via `ais create` or the respective Go and/or Python [APIs](#aistore-apis)).
+
+Remote buckets (including `s3://`, `gs://`, etc., and `ais://` buckets in remote AIS clusters) are [usually](/docs/bucket.md#creation) discovered and auto-added on-the-fly on first access.
+
+In a cluster, every bucket is assigned a unique, cluster-wide bucket ID (`BID`). Same-name remote buckets with different [namespaces](/docs/bucket.md#bucket-identity) get different IDs.
+Every object a) belongs to exactly one bucket and b) is identified by a unique name within that bucket.
+
+Bucket [properties](/docs/bucket.md#bucket-properties) define data protection (checksums, mirroring, erasure coding), chunked representation, versioning and synchronization with remote sources, access control, backend linkage, feature flags, rate-limit settings, and more.
+
+> See [AIS Buckets: Design and Operations](/docs/bucket.md) for complete description including: identity model, namespaces, lifecycle, and operations.
+
+---
+
+### Backend Provider
+Backend Provider is a designed-in backend interface [abstraction](https://github.com/NVIDIA/aistore/blob/main/core/backend.go) and, simultaneously, an API-supported option that allows to delineate between _remote_ and _local_ buckets with respect to a given AIS cluster.
+
+AIS [supports multiple storage backends](images/supported-backends.png) including its own (`ais://@uuid` or `ais://@alias` for remote clusters).
+
+> See [providers](/docs/providers.md) for the current list of supported clouds and instructions on chaining AIS clusters.
 
 ---
 
@@ -72,6 +92,23 @@ AIS target mountpath is a formatted disk (or RAID volume) **plus** a directory t
 
 > **Note on Kubernetes deployments**: While AIStore natively supports hot-plugging mountpaths at runtime, this capability is limited in Kubernetes environments. Kubernetes (as of v1.33) does not support attaching new Persistent Volumes to running pods. In production Kubernetes deployments, adding new storage typically requires a controlled pod restart (meaning, zero-downtime is not possible without specialized extensions).
 
+
+#### Mountpath Health Checking (FSHC)
+
+AIS targets continuously monitor the health of their mountpaths using a lightweight [Filesystem Health Checker](/docs/fshc.md).
+
+FSHC detects I/O-level failures early, classifies them as **FAULTED** or **DEGRADED**, and
+immediately disables affected (faulted or degraded) mountpaths to preserve data integrity and cluster availability.
+
+FSHC performs:
+
+* root-level filesystem checks (with a single retry for network-attached storage),
+* randomized read/write sampling under each mountpath,
+* two-pass error evaluation with configurable thresholds,
+* immediate disablement of mountpaths that exceed the allowed error limits.
+
+For a detailed description and configuration guidance, see: [Filesystem Health Checker](/docs/fshc.md)
+
 ---
 
 ### Proxy
@@ -81,6 +118,23 @@ A disk-less **gateway** that exposes the AIS REST and S3-compatible APIs.
 * Exactly one proxy is elected **primary** (leader); only the primary can update cluster-level metadata including the cluster map.
 * The terms *proxy* and *gateway* are interchangeable.
 * For symmetry we usually deploy one proxy per target, but that is not a requirement.
+
+---
+
+### Endpoint
+
+Cluster's endpoint: HTTPS or HTTP address of **any** AIS proxy (gateway) in [this cluster](/docs/overview.md#at-a-glance).
+
+The options to specify AIS cluster endpoint include (but are not limited to):
+
+* CLI configuration: `ais config cli` (and lookup `cluster.default_ais_host`)
+* `AIS_ENDPOINT` environment that, if present, overrides other defaults.
+
+In a multi-node cluster it is strongly recommended to deploy load balancer on the front, to take advantage of the fact that AIS proxies provide identical APIs and can all be used simultaneously.
+
+See also:
+
+* [Environment Variables](/docs/environment-vars.md)
 
 ---
 
@@ -142,7 +196,7 @@ If the remote `PUT` fails, the whole operation fails and AIS rolls back locally.
 ### Xaction
 Xaction (*eXtended action*) is a supported batch job that executes asynchronously.
 
-All xactions support uniform [API](#aistore-api) and [CLI](#cli) to start, stop, and wait for, as well as common (generic) and job-specific stats.
+All xactions support uniform [API](#aistore-apis) and [CLI](#cli) to start, stop, and wait for, as well as common (generic) and job-specific stats.
 
 Common jobs include erasure coding (EC), n-way mirroring, resharding, transforming a given virtual directory, archiving ([sharding](#shard)) multiple objects, copying remote bucket, and more:
 
@@ -228,11 +282,13 @@ At the time of this writing, AIS CLI is at version (ais version) v1.17 and is ac
 
 ## AIStore APIs
 
-In addition to industry-standard [S3](/docs/s3compat.md), AIS provides its own (value-added) native API that can be (conveniently) called directly from Go and Python programs:
+In addition to industry-standard [S3](/docs/s3compat.md), AIS provides its own (value-added) native API that can be called directly from Go and Python programs:
 
 - [Go API](https://github.com/NVIDIA/aistore/tree/main/api)
-- [Python API](https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk)
-- [HTTP REST](/docs/http_api.md)
+- [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk)
+- [HTTP API Reference](https://aistore.nvidia.com/docs/http-api)
+  - [curl examples](/docs/http_api.md)
+  - [Easy URL](https://github.com/NVIDIA/aistore/blob/main/docs/easy_url.md)
 
 For Amazon S3 compatibility and related topics, see also:
   - [`s3cmd` client](/docs/s3compat.md#quick-start-with-s3cmd)
@@ -302,7 +358,7 @@ Overall, some of the ways to _get_ an existing dataset _into_ an AIS cluster inc
 
 ### Existing Datasets: Cold GET
 
-If the dataset in question is accessible via S3-like object API, use one of the supported [APIs](#aistore-api) or CLI to read it. Just make sure to provision AIS with the corresponding credentials to access the dataset's bucket in the Cloud.
+If the dataset in question is accessible via S3-like object API, use one of the supported [APIs](#aistore-apis) or CLI to read it. Just make sure to provision AIS with the corresponding credentials to access the dataset's bucket in the Cloud.
 
 > As far as supported S3-like backends, AIS currently supports Amazon S3, Google Cloud, Microsoft Azure, and Oracle OCI.
 
@@ -380,10 +436,10 @@ AIS provides multiple _layers_ of observability:
 │  └───────────┘    └───────────┘ │
 ├─────────────────────────────────┤
 │       Collection Layer          │
-│  ┌───────────┐    ┌───────────┐ │
-│  │ Prometheus│    │  StatsD*  │ │
-│  │           │    │           │ │
-│  └───────────┘    └───────────┘ │
+│         ┌───────────┐           │
+│         │ Prometheus│           │
+│         │           │           │
+│         └───────────┘           │
 ├─────────────────────────────────┤
 │       Instrumentation Layer     │
 │  ┌───────────┐    ┌───────────┐ │
@@ -473,7 +529,7 @@ See also:
 
 ## HA
 
-AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](#aistore-api).
+AIS features a [highly-available control plane](ha.md) where all gateways are absolutely identical in terms of their (client-accessible) data and control plane [APIs](#aistore-apis).
 
 Gateways can be ad hoc added and removed, deployed remotely and/or locally to the compute clients (the latter option will eliminate one network roundtrip to resolve object locations).
 
@@ -517,17 +573,19 @@ There are **no** designed-in limitations on the:
 * numbers of gateways (proxies) and storage targets in AIS cluster
 * object name lengths
 
-Ultimately, the limit on object size may be imposed by a local filesystem of choice and a physical disk capacity. While limit on the cluster size - by the capacity of the hosting AIStore Data Center.
+In practice, limits may be imposed by the underlying storage hardware, local filesystem(s), and their respective semantics.
 
-In v3.26, AIStore has removed the basename and pathname limitations.
+### Long names and filesystem limitations
 
-> On a typical Linux system, you will find that the relevant header(s) define:
+Starting v3.26, AIStore removed the traditional `NAME_MAX`/`PATH_MAX` constraints.
+
+On a typical Linux system, you will find that the relevant header(s) define:
 
 ```console
 #define NAME_MAX 255
 #define PATH_MAX 4096
 ```
 
-Starting v3.26, AIStore supports object names of any length. See also:
-
 * [Examples using extremely long names](https://github.com/NVIDIA/aistore/blob/main/docs/long_names.md)
+
+> **Note**: Future releases may further decouple logical object names from on-disk layout.

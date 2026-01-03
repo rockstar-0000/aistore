@@ -93,7 +93,7 @@ func waitXact(args *xact.ArgsMsg) error {
 	if err != nil {
 		return V(err)
 	}
-	if status.Aborted() {
+	if status.IsAborted() {
 		return fmt.Errorf("%s aborted", xact.Cname(xname, status.UUID))
 	}
 	return nil
@@ -112,7 +112,7 @@ func waitXactBlob(xargs *xact.ArgsMsg) error {
 			return errors.New(snap.AbortErr)
 		}
 		debug.Assert(snap.ID == xargs.ID)
-		if snap.Finished() {
+		if snap.IsFinished() {
 			return nil
 		}
 		sleep = min(sleep+sleep/2, xact.MaxPollTime)
@@ -204,7 +204,7 @@ func flattenXactStats(snap *core.Snap, units string) nvpairList {
 			if strings.HasSuffix(k, ".size") {
 				val := v.(string)
 				if i, err := strconv.ParseInt(val, 10, 64); err == nil {
-					value = cos.ToSizeIEC(i, 2)
+					value = cos.IEC(i, 2)
 				}
 			}
 			if value == "" { // not ".size"
@@ -274,7 +274,7 @@ func queryXactions(xargs *xact.ArgsMsg, summarize bool) (xs xact.MultiSnap, cms 
 		for _, snap := range snaps {
 			if first {
 				cms.xid, cms.bck = snap.ID, snap.Bck
-				cms.aborted, cms.running = snap.IsAborted(), snap.Running()
+				cms.aborted, cms.running = snap.IsAborted(), snap.IsRunning()
 				if cms.bck.IsEmpty() {
 					notBck = true
 					debug.Assert(xargs.Bck.IsEmpty())
@@ -295,7 +295,7 @@ func queryXactions(xargs *xact.ArgsMsg, summarize bool) (xs xact.MultiSnap, cms 
 				notBck = true
 			}
 			cms.aborted = cms.aborted && snap.IsAborted()
-			cms.running = cms.running || snap.Running() // NOTE: also true when idle (as in: snap.IsIdle())
+			cms.running = cms.running || snap.IsRunning() // NOTE: also true when idle (as in: snap.IsIdle())
 		}
 	}
 
@@ -358,21 +358,8 @@ func extractXactIDsForKind(xs xact.MultiSnap, xactKind string) (xactIDs []string
 	return xactIDs
 }
 
-// [backward compatibility] added xargs.Flags in 44f77dfe56376e
-func xstart(c *cli.Context, xargs *xact.ArgsMsg, extra string) (xid string, err error) {
-	if xid, err = api.StartXaction(apiBP, xargs, extra); err == nil {
-		return xid, nil
-	}
-	if !strings.Contains(err.Error(), "marshal") {
-		return "", V(err)
-	}
-	debug.Assert(xargs.Flags != 0) // ditto
-	if smap, e1 := getClusterMap(c); e1 == nil {
-		if ds, e2 := api.GetStatsAndStatus(apiBP, smap.Primary); e2 == nil {
-			err = fmt.Errorf("CLI version %s is not compatible with (an older) AIS v%s", c.App.Version, ds.Version)
-		}
-	}
-	return "", err
+func xstart(xargs *xact.ArgsMsg, extra string) (xid string, err error) {
+	return api.StartXaction(apiBP, xargs, extra)
 }
 
 func xstop(xargs *xact.ArgsMsg) (err error) {

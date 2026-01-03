@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +23,7 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
+	"github.com/NVIDIA/aistore/cmd/cli/hf"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -39,6 +40,7 @@ import (
 
 const (
 	keyAndValueSeparator = "="
+	pemKeyIndicator      = "-----BEGIN"
 
 	// Error messages
 	dockerErrMsgFmt = "Failed to discover docker proxy URL: %v.\nUsing default %q.\n"
@@ -75,7 +77,21 @@ type (
 		Current string
 		Old     string
 	}
+
+	dlSourceBackend struct {
+		bck    cmn.Bck
+		prefix string
+	}
+	dlSource struct {
+		link    string
+		backend dlSourceBackend
+		headers http.Header // Custom headers for download
+	}
 )
+
+func joinCommandWords(subcommands ...string) string {
+	return strings.Join(subcommands, " ")
+}
 
 // TODO: unify, use instead of splitting handlers (that each have different flags)
 // reflection possibly can be used but requires way too many lines
@@ -143,7 +159,7 @@ func isConfigProp(s string) bool {
 			return true
 		}
 	}
-	return cos.StringInSlice(s, props)
+	return slices.Contains(props, s)
 }
 
 func getPrefixFromPrimary() string {
@@ -285,7 +301,7 @@ func parseFeatureFlags(values []string, idx int) (res feat.Flags, newIdx int, er
 	if len(values) == 0 {
 		return 0, idx, nil
 	}
-	if values[idx] == apc.NilValue {
+	if values[idx] == apc.ResetToken {
 		return 0, idx + 1, nil
 	}
 	// 1: parse (comma-separated) feat.Flags.String()
@@ -354,7 +370,7 @@ func makeBckPropPairs(values []string) (nvs cos.StrKVs, err error) {
 			idx++
 			continue
 		}
-		isCmd := cos.StringInSlice(values[idx], props)
+		isCmd := slices.Contains(props, values[idx])
 		if cmd != "" && isCmd {
 			return nil, fmt.Errorf("missing property %q value", cmd)
 		}
@@ -481,6 +497,11 @@ func limitedLineWriter(w io.Writer, maxLines int, fmtStr string, args ...[]strin
 		minLen = min(minLen, len(a))
 	}
 
+	// Handle empty arguments
+	if minLen == 0 {
+		return
+	}
+
 	i := 0
 	for {
 		for _, a := range args {
@@ -511,6 +532,7 @@ func bckPropList(props *cmn.Bprops, verbose bool) (propList nvpairList) {
 			{"checksum", props.Cksum.String()},
 			{"mirror", props.Mirror.String()},
 			{"ec", props.EC.String()},
+			{"chunks", props.Chunks.String()},
 			{"lru", props.LRU.String()},
 			{"versioning", props.Versioning.String()},
 		}
@@ -528,6 +550,12 @@ func bckPropList(props *cmn.Bprops, verbose bool) (propList nvpairList) {
 				value = fmtBucketCreatedTime(props.Created)
 			case cmn.PropBucketAccessAttrs:
 				value = props.Access.Describe(true /*incl. all*/)
+			case "chunks.objsize_limit": // TODO -- FIXME: export the two constants
+				v := field.Value()
+				value = _toStr(v)
+				if props.Chunks.ObjSizeLimit == 0 {
+					value += " (auto-chunking disabled)"
+				}
 			default:
 				v := field.Value()
 				value = _toStr(v)
@@ -582,19 +610,42 @@ func readValue(c *cli.Context, prompt string) string {
 	return strings.TrimSuffix(line, "\n")
 }
 
-func confirm(c *cli.Context, prompt string, warning ...string) (ok bool) {
-	var err error
-	prompt += " [Y/N]"
-	if len(warning) != 0 {
-		actionWarn(c, warning[0])
+func showWarnings(c *cli.Context, warnings []string) {
+	for _, w := range warnings {
+		actionWarn(c, w)
 	}
+}
+
+func confirm(c *cli.Context, prompt string, warnings ...string) bool {
+	showWarnings(c, warnings)
+	inputPrompt := prompt + " [Y/N]"
+
 	for {
-		response := strings.ToLower(readValue(c, prompt))
-		if ok, err = cos.ParseBool(response); err != nil {
-			fmt.Println("Invalid input! Choose 'Y' for 'Yes' or 'N' for 'No'")
-			continue
+		userInput := readValue(c, inputPrompt)
+		if ok, err := cos.ParseBool(strings.ToLower(userInput)); err == nil {
+			if !ok {
+				fmt.Println("Operation canceled.")
+			}
+			return ok
 		}
-		return
+		fmt.Fprintln(c.App.ErrWriter, "Invalid input! Choose 'Y' for 'Yes' or 'N' for 'No'")
+	}
+}
+
+func confirmWithPhrase(c *cli.Context, phrase string, warnings ...string) bool {
+	showWarnings(c, warnings)
+	inputPrompt := fmt.Sprintf("Type '%s' to confirm (or 'N' to cancel)", phrase)
+
+	for {
+		userInput := strings.TrimSpace(readValue(c, inputPrompt))
+		if userInput == phrase {
+			return true
+		}
+		if ok, err := cos.ParseBool(strings.ToLower(userInput)); err == nil && !ok {
+			fmt.Println("Operation canceled.")
+			return false
+		}
+		fmt.Fprintf(c.App.ErrWriter, "Invalid input! Type '%s' to confirm or 'N' to cancel\n", phrase)
 	}
 }
 
@@ -645,13 +696,14 @@ func parseURLtoBck(strURL string) (bck cmn.Bck) {
 // see also authNConfPairs
 func flattenJSON(jstruct any, section string) (flat nvpairList) {
 	flat = make(nvpairList, 0, 40)
+	opts := cmn.IterOpts{OnlyRead: true}
 	cmn.IterFields(jstruct, func(tag string, field cmn.IterField) (error, bool) {
 		if section == "" || strings.HasPrefix(tag, section) {
 			v := _toStr(field.Value())
 			flat = append(flat, nvpair{tag, v})
 		}
 		return nil, false
-	})
+	}, opts)
 	return flat
 }
 
@@ -677,10 +729,18 @@ func flattenBackends(backends []string) (flat nvpairList) {
 func _toStr(v any) (s string) {
 	m, ok := v.(map[string]any)
 	if !ok {
+		// handle string pointers
+		if strPtr, ok := v.(*string); ok {
+			if strPtr == nil {
+				return ""
+			}
+			val := *strPtr
+			return val
+		}
 		// feature flags: custom formatting
 		if f, ok := v.(feat.Flags); ok {
 			if f == 0 {
-				v = apc.NilValue
+				v = apc.ResetToken
 			} else {
 				v = strings.Join(f.Names(), "\n\t ")
 			}
@@ -727,76 +787,70 @@ func diffConfigs(actual, original nvpairList) []propDiff {
 	return diff
 }
 
-func printSectionJSON(c *cli.Context, in any, section string) (done bool) {
-	if i := strings.LastIndexByte(section, '.'); i > 0 {
-		section = section[:i]
-	}
-	if done = _printSection(c, in, section); !done {
-		// e.g. keepalivetracker.proxy.name
-		if i := strings.LastIndexByte(section, '.'); i > 0 {
-			section = section[:i]
-			done = _printSection(c, in, section)
-		}
-	}
-	if !done {
-		actionWarn(c, "config section (or section prefix) \""+section+"\" not found.")
-	}
-	return
+// showSectionNotFoundError displays error when a config section is not found
+func showSectionNotFoundError(c *cli.Context, section string, config any, helpCmd string) {
+	availableSections := extractAvailableSections(config)
+	actionWarn(c, fmt.Sprintf("config section %q not found. Available sections: %s",
+		section, strings.Join(availableSections, ", ")))
+	actionNote(c, helpCmd)
 }
 
-// return true if successfully parsed and printed
-func _printSection(c *cli.Context, in any, section string) bool {
-	var (
-		beg       = regexp.MustCompile(`\s+"` + section + `\S*": {`)
-		end       = regexp.MustCompile(`},\n`)
-		nst       = regexp.MustCompile(`\s+"\S+": {`)
-		nonstruct = regexp.MustCompile(`\s+"` + section + `\S*": ".+"[,\n\r]{1}`)
-	)
-	out, err := jsonMarshalIndent(in)
-	if err != nil {
-		return false
-	}
+// extractAvailableSections extracts root-level configuration sections from any config structure
+func extractAvailableSections(config any) []string {
+	var availableSections []string
+	seen := make(map[string]bool, 16)
+	opts := cmn.IterOpts{VisitAll: true, OnlyRead: true}
 
-	from := beg.FindIndex(out)
-	if from == nil {
-		loc := nonstruct.FindIndex(out)
-		if loc == nil {
-			return false
+	cmn.IterFields(config, func(tag string, _ cmn.IterField) (error, bool) {
+		root := strings.Split(tag, ".")[0]
+		if !seen[root] {
+			availableSections = append(availableSections, root)
+			seen[root] = true
 		}
-		res := out[loc[0] : loc[1]-1]
-		fmt.Fprintln(c.App.Writer, "{"+string(res)+"\n}")
-		return true
-	}
+		return nil, false
+	}, opts)
 
-	to := end.FindIndex(out[from[1]:])
-	if to == nil {
-		return false
-	}
-	res := out[from[0] : from[1]+to[1]-1]
+	sort.Strings(availableSections)
+	return availableSections
+}
 
-	if nst.FindIndex(res[from[1]-from[0]+1:]) != nil {
-		// resort to counting nested structures
-		var cnt, off int
-		res = out[from[0]:]
-		for off = range res {
-			switch res[off] {
-			case '{':
-				cnt++
-			case '}':
-				cnt--
-				if cnt == 0 {
-					res = out[from[0] : from[0]+off+1]
-					goto done
-				}
+func printSectionJSON(c *cli.Context, in any, section string) bool {
+	var result any
+	found := false
+
+	if section == "" {
+		// Show entire config
+		result = in
+		found = true
+	} else {
+		// Find specific section
+		opts := cmn.IterOpts{VisitAll: true, OnlyRead: true}
+		cmn.IterFields(in, func(tag string, field cmn.IterField) (error, bool) {
+			if tag == section {
+				found = true
+				result = field.Value()
+				return nil, true // Stop after finding exact match
 			}
+			return nil, false
+		}, opts)
+
+		// Wrap the result with the section name as the root key
+		if found {
+			result = map[string]any{section: result}
 		}
+	}
+
+	if !found {
 		return false
 	}
-done:
-	if l := len(res); res[l-1] == ',' {
-		res = res[:l-1]
+
+	data, err := jsonMarshalIndent(result)
+	if err != nil {
+		actionWarn(c, fmt.Sprintf("failed to marshal section %q: %v", section, err))
+		return false
 	}
-	fmt.Fprintln(c.App.Writer, string(res)+"\n")
+
+	fmt.Fprintln(c.App.Writer, string(data))
 	return true
 }
 
@@ -814,14 +868,19 @@ func defaultBckProps(bck cmn.Bck) (*cmn.Bprops, error) {
 // see also flattenJSON
 func authNConfPairs(conf *authn.Config, prefix string) (nvpairList, error) {
 	flat := make(nvpairList, 0, 8)
+	opts := cmn.IterOpts{OnlyRead: true}
 	err := cmn.IterFields(conf, func(tag string, field cmn.IterField) (error, bool) {
 		if prefix != "" && !strings.HasPrefix(tag, prefix) {
 			return nil, false
 		}
 		v := _toStr(field.Value())
+		// Format PEM keys with newline before content for better display
+		if v != "" && strings.Contains(v, pemKeyIndicator) {
+			v = "\n" + v
+		}
 		flat = append(flat, nvpair{Name: tag, Value: v})
 		return nil, false
-	})
+	}, opts)
 	sort.Slice(flat, func(i, j int) bool {
 		return flat[i].Name < flat[j].Name
 	})
@@ -834,10 +893,11 @@ func configPropList(scopes ...string) []string {
 		scope = scopes[0]
 	}
 	propList := make([]string, 0, 48)
+	opts := cmn.IterOpts{Allowed: scope, OnlyRead: true}
 	err := cmn.IterFields(cmn.Config{}, func(tag string, _ cmn.IterField) (err error, b bool) {
 		propList = append(propList, tag)
 		return
-	}, cmn.IterOpts{Allowed: scope})
+	}, opts)
 	debug.AssertNoErr(err)
 	return propList
 }
@@ -912,23 +972,82 @@ func dryRunCptn(c *cli.Context) {
 	fmt.Fprintln(c.App.Writer, dryRunHeader()+" with no modifications to the cluster")
 }
 
+//////////////////////////
+// HuggingFace wrappers //
+//////////////////////////
+
+// hasHuggingFaceRepoFlags checks if HF model or dataset flags are set
+func hasHuggingFaceRepoFlags(c *cli.Context) bool {
+	hasModel := flagIsSet(c, hfModelFlag)
+	hasDataset := flagIsSet(c, hfDatasetFlag)
+	return hf.HasHuggingFaceRepoFlags(hasModel, hasDataset)
+}
+
+// buildHuggingFaceURL extracts CLI flags and calls HF package
+func buildHuggingFaceURL(c *cli.Context) (string, error) {
+	model := parseStrFlag(c, hfModelFlag)
+	dataset := parseStrFlag(c, hfDatasetFlag)
+	file := parseStrFlag(c, hfFileFlag)
+	revision := parseStrFlag(c, hfRevisionFlag)
+	return hf.BuildHuggingFaceURL(model, dataset, file, revision)
+}
+
 //////////////
 // dlSource //
 //////////////
 
-type (
-	dlSourceBackend struct {
-		bck    cmn.Bck
-		prefix string
-	}
-	dlSource struct {
-		link    string
-		backend dlSourceBackend
-	}
-)
+func parseDlSource(c *cli.Context, rawURL string) (dlSource, error) {
+	var source dlSource
+	var err error
+	var needHFAuth bool // Check if HuggingFace auth should be added (if available)
 
-// Replace protocol (gs://, s3://, az://, oc://) with proper GCP/AWS/Azure/OCI URL
-func parseDlSource(rawURL string) (dlSource, error) {
+	switch {
+	case c != nil && hasHuggingFaceRepoFlags(c):
+		// Case 1: Using HF convenience flags (--hf-model or --hf-dataset)
+		// Example: ais download --hf-model bert-base-uncased --hf-file pytorch_model.bin ais://nnn
+
+		if hf.IsHuggingFaceURL(rawURL) {
+			return dlSource{}, fmt.Errorf("cannot use %s or %s flags with direct HuggingFace URL; use flags OR direct URL, not both",
+				qflprn(hfModelFlag), qflprn(hfDatasetFlag))
+		}
+
+		hfURL, err := buildHuggingFaceURL(c)
+		if err != nil {
+			return dlSource{}, err
+		}
+		source, err = parseURLToSource(hfURL)
+		if err != nil {
+			return dlSource{}, err
+		}
+		needHFAuth = true
+
+	default:
+		// Direct URL case
+		source, err = parseURLToSource(rawURL)
+		if err != nil {
+			return dlSource{}, err
+		}
+		needHFAuth = hf.IsHuggingFaceURL(rawURL) // Only HF-related if direct URL is HF
+	}
+
+	// Add HuggingFace auth header if this is HF-related AND auth is available
+	if needHFAuth {
+		if token := parseStrFlag(c, hfAuthFlag); token != "" {
+			source.headers = http.Header{apc.HdrAuthorization: []string{apc.AuthenticationTypeBearer + " " + token}}
+		}
+	}
+
+	return source, nil
+}
+
+// parseURLToSource handles the actual URL parsing logic
+func parseURLToSource(rawURL string) (dlSource, error) {
+	// Check for HuggingFace full repository download marker
+	if strings.HasPrefix(rawURL, hf.HfFullRepoMarker) {
+		// HuggingFace dataset download - pass marker to job handler
+		return dlSource{link: rawURL}, nil
+	}
+
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return dlSource{}, err
@@ -950,7 +1069,7 @@ func parseDlSource(rawURL string) (dlSource, error) {
 			prefix: strings.TrimPrefix(fullPath, "/"),
 		}
 
-		scheme = "https"
+		scheme = apc.DefaultScheme
 		host = gsHost
 		fullPath = path.Join(u.Host, fullPath)
 	case apc.S3Scheme, apc.AWS:
@@ -986,7 +1105,7 @@ func parseDlSource(rawURL string) (dlSource, error) {
 		fullPath = path.Join(apc.Version, apc.Objects, fullPath)
 	case "":
 		scheme = apc.DefaultScheme
-	case "https", "http":
+	case apc.DefaultScheme, "http":
 	default:
 		return dlSource{}, fmt.Errorf("invalid scheme: %s", scheme)
 	}
@@ -1011,3 +1130,77 @@ func parseDlSource(rawURL string) (dlSource, error) {
 //////////////////////
 
 func (e *errInvalidNVpair) Error() string { return fmt.Sprintf("invalid key=value pair %q", e.notpair) }
+
+func openFileOrURL(source string) (io.ReadCloser, error) {
+	if isWebURL(source) {
+		// Download from HTTP URL
+		resp, err := http.Get(source) //nolint:noctx // want to use http.NewRequest and default client
+		if err != nil {
+			return nil, fmt.Errorf("failed to download from %q: %v", source, err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d error downloading from %q", resp.StatusCode, source)
+		}
+
+		return resp.Body, nil
+	}
+
+	// Read from local file
+	return os.Open(source)
+}
+
+func parseETLNames(etlNameOrPipeline string) ([]string, error) {
+	etlNames := strings.Split(etlNameOrPipeline, etlPipelineSeparator)
+
+	// Trim whitespace from each ETL name
+	for i, name := range etlNames {
+		etlNames[i] = strings.TrimSpace(name)
+	}
+
+	if len(etlNames) == 0 || (len(etlNames) == 1 && etlNames[0] == "") {
+		return nil, errors.New("ETL name cannot be empty")
+	}
+
+	return etlNames, nil
+}
+
+//
+// usage: when AIS returns nanoseconds as base10 string
+//
+
+func s2UnixNano(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) }
+
+// encode special symbols in object name for HTTP path usage, or warn only once
+//
+// NOTE:
+// if '--encode-objname' is set, the name is treated as _raw_ and escaped
+// via url.PathEscape, no questions asked.
+//
+// translation: double-encoding is a risk;
+// do NOT give CLI already encoded names (e.g. containing "%2F") along with `--encode-objname`
+//
+// TODO feature: detect potential double-encoding: regex('%' followed by two hex digits)
+//
+// Warning control:
+//   - warned == nil --> no warning
+//   - warned != nil --> emit at most one
+
+const (
+	fmtWarnSpecial = "name %q contains special symbols; consider using '%s'"
+)
+
+func warnEscapeObjName(c *cli.Context, s string, warned *bool) string {
+	if flagIsSet(c, encodeObjnameFlag) {
+		return url.PathEscape(s)
+	}
+	if warned == nil || *warned {
+		return s
+	}
+	if cmn.HasSpecialSymbols(s) {
+		warn := fmt.Sprintf(fmtWarnSpecial, s, flprn(encodeObjnameFlag))
+		actionWarn(c, warn)
+		*warned = true
+	}
+	return s
+}

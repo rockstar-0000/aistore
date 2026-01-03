@@ -9,7 +9,6 @@ from io import BufferedWriter
 from pathlib import Path
 from typing import Dict, Optional
 import os
-from json import dumps as json_dumps
 from urllib.parse import quote
 
 from requests import Response
@@ -28,8 +27,11 @@ from aistore.sdk.const import (
     QPARAM_ETL_NAME,
     QPARAM_ETL_ARGS,
     QPARAM_LATEST,
+    QPARAM_SYNC,
+    QPARAM_OBJ_TO,
     ACT_PROMOTE,
     HTTP_METHOD_POST,
+    HTTP_METHOD_PUT,
     URL_PATH_OBJECTS,
     HEADER_RANGE,
     ACT_BLOB_DOWNLOAD,
@@ -41,6 +43,7 @@ from aistore.sdk.provider import Provider
 from aistore.sdk.obj.object_client import ObjectClient
 from aistore.sdk.obj.object_reader import ObjectReader
 from aistore.sdk.obj.object_writer import ObjectWriter
+from aistore.sdk.obj.multipart_upload import MultipartUpload
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.types import (
     ActionMsg,
@@ -62,6 +65,7 @@ class BucketDetails:
     path: str
 
 
+# pylint: disable=too-many-public-methods
 class Object:
     """
     Provides methods for interacting with an object in AIS.
@@ -78,7 +82,7 @@ class Object:
         client: RequestClient,
         bck_details: BucketDetails,
         name: str,
-        props: ObjectProps = None,
+        props: Optional[ObjectProps] = None,
     ):
         self._client = client
         self._bck_details = bck_details
@@ -108,6 +112,16 @@ class Object:
         return self._name
 
     @property
+    def uname(self) -> str:
+        """
+        Unified name (uname) of this object, which combines the bucket path and object name.
+
+        Returns:
+            str: The unified name in the format bucket_path/object_name
+        """
+        return os.path.join(self._bck_details.path, self.name)
+
+    @property
     def props(self) -> ObjectProps:
         """
         Get the latest properties of the object.
@@ -120,6 +134,8 @@ class Object:
             ObjectProps: The latest object properties from the server.
         """
         self.head()
+        # Head must always set _props
+        assert self._props is not None
         return self._props
 
     @property
@@ -169,6 +185,7 @@ class Object:
         latest: bool = False,
         byte_range: Optional[str] = None,
         direct: bool = False,
+        num_workers: Optional[int] = None,
     ) -> ObjectReader:
         """
         Creates and returns an ObjectReader with access to object contents
@@ -187,12 +204,14 @@ class Object:
                 See: https://www.rfc-editor.org/rfc/rfc7233#section-2.1.
             direct (bool, optional): If True, the object content is read directly from the target node,
                 bypassing the proxy.
+            num_workers (Optional[int]): If provided, use concurrent range-reads with this many
+                workers for faster downloads.
 
         Returns:
             ObjectReader: An iterator for streaming object content.
 
         Raises:
-            ValueError: If Byte Range is used with Blob Download.
+            ValueError: If `byte_range` is used with `blob_download_config`.
             requests.RequestException: If an error occurs during the request.
             requests.ConnectionError: If there is a connection error.
             requests.ConnectionTimeout: If the connection times out.
@@ -226,12 +245,7 @@ class Object:
 
         # ETL Configuration
         if etl:
-            params[QPARAM_ETL_NAME] = etl.name
-            params[QPARAM_ETL_ARGS] = (
-                json_dumps(etl.args, separators=(",", ":"))
-                if isinstance(etl.args, dict)
-                else etl.args
-            )
+            etl.update_qparams(params)
 
         # Latest Object Version
         if latest:
@@ -239,7 +253,21 @@ class Object:
 
         # Byte Range Validation
         if byte_range and blob_download_config:
-            raise ValueError("Cannot use Byte Range with Blob Download.")
+            raise ValueError("Cannot use `byte_range` with `blob_download_config`.")
+
+        # Parallel download validation
+        if num_workers is not None:
+            if num_workers < 2:
+                raise ValueError("`num_workers` must be at least 2.")
+            if byte_range:
+                raise ValueError(
+                    "Cannot use `num_workers` with `byte_range`. "
+                    "Parallel download is for full object retrieval."
+                )
+            if blob_download_config:
+                raise ValueError(
+                    "Cannot use `num_workers` with `blob_download_config`."
+                )
 
         if byte_range:
             # For range formatting, see the spec:
@@ -262,10 +290,14 @@ class Object:
             params=params,
             headers=headers,
             byte_range=byte_range_tuple,
-            uname=os.path.join(self._bck_details.path, self.name) if direct else None,
+            uname=self.uname if direct else None,
         )
 
-        obj_reader = ObjectReader(object_client=obj_client, chunk_size=chunk_size)
+        obj_reader = ObjectReader(
+            object_client=obj_client,
+            chunk_size=chunk_size,
+            num_workers=num_workers,
+        )
 
         if writer:
             writer.writelines(obj_reader)
@@ -275,13 +307,13 @@ class Object:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     def get(
         self,
-        archive_config: ArchiveConfig = None,
-        blob_download_config: BlobDownloadConfig = None,
+        archive_config: Optional[ArchiveConfig] = None,
+        blob_download_config: Optional[BlobDownloadConfig] = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
-        etl: ETLConfig = None,
-        writer: BufferedWriter = None,
+        etl: Optional[ETLConfig] = None,
+        writer: Optional[BufferedWriter] = None,
         latest: bool = False,
-        byte_range: str = None,
+        byte_range: Optional[str] = None,
     ) -> ObjectReader:
         """
         Deprecated: Use 'get_reader' instead.
@@ -305,15 +337,15 @@ class Object:
             or used to read all content directly.
 
         Raises:
-            ValueError: If Byte Range is used with Blob Download.
+            ValueError: If `byte_range` is used with `blob_download_config`.
             requests.RequestException: If an error occurs during the request.
             requests.ConnectionError: If there is a connection error.
             requests.ConnectionTimeout: If the connection times out.
             requests.ReadTimeout: If the read operation times out.
         """
         warnings.warn(
-            "The 'get' method is deprecated and will be removed in a future release. "
-            "Please use 'get_reader' instead.",
+            "The `Object.get(...)` method is deprecated and will be removed in a future release."
+            "Please replace it with `Object.get_reader()` using the new `ObjectReader` API.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -337,7 +369,7 @@ class Object:
 
         return f"{self.bucket_provider.value}://{self.bucket_name}/{self._name}"
 
-    def get_url(self, archpath: str = "", etl: ETLConfig = None) -> str:
+    def get_url(self, archpath: str = "", etl: Optional[ETLConfig] = None) -> str:
         """
         Get the full url to the object including base url and any query parameters
 
@@ -378,8 +410,8 @@ class Object:
             requests.ReadTimeout: Timed out waiting response from AIStore
         """
         warnings.warn(
-            "The 'put_content' method is deprecated and will be removed in a future release. "
-            "Please use 'ObjectWriter.put_content' instead.",
+            "The `Object.put_content(...)` method is deprecated and will be removed in a future release."
+            "Please replace it with `Object.get_writer().put_content(...)` using the new `ObjectWriter` API.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -402,8 +434,8 @@ class Object:
             ValueError: The path provided is not a valid file
         """
         warnings.warn(
-            "The 'put_file' method is deprecated and will be removed in a future release. "
-            "Please use 'ObjectWriter.put_file' instead.",
+            "The `Object.put_file(...)` method is deprecated and will be removed in a future release."
+            "Please replace it with `Object.get_writer().put_file(...)` using the new `ObjectWriter` API.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -417,6 +449,15 @@ class Object:
             An ObjectWriter which can be used to write to an object's contents and attributes.
         """
         return ObjectWriter(self._client, self._object_path, self.query_params)
+
+    def multipart_upload(self) -> MultipartUpload:
+        """
+        Create a multipart upload for this object.
+
+        Returns:
+            MultipartUpload: A multipart upload instance for this object.
+        """
+        return MultipartUpload(self._client, self._object_path, self.query_params)
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     def promote(
@@ -461,7 +502,7 @@ class Object:
             delete_source=delete_source,
             src_not_file_share=src_not_file_share,
         ).as_dict()
-        json_val = ActionMsg(action=ACT_PROMOTE, name=path, value=value).dict()
+        json_val = ActionMsg(action=ACT_PROMOTE, name=path, value=value).model_dump()
 
         return self._client.request(
             HTTP_METHOD_POST,
@@ -488,6 +529,52 @@ class Object:
             HTTP_METHOD_DELETE,
             path=self._object_path,
             params=self.query_params,
+        )
+
+    def copy(
+        self,
+        to_obj: "Object",
+        etl: Optional[ETLConfig] = None,
+        latest: bool = False,
+        sync: bool = False,
+    ) -> Response:
+        """
+        Copy this object to another object (which specifies the destination bucket and name),
+        optionally with ETL transformation.
+
+        Args:
+            to_obj (Object): Destination object specifying both the target bucket and object name
+            etl (ETLConfig, optional): ETL configuration for transforming the object during copy
+            latest (bool, optional): GET the latest object version from the associated remote bucket.
+            sync (bool, optional): In addition to the latest, also entails removing remotely deleted objects
+
+        Returns:
+            Response: The response from the copy operation
+
+        Raises:
+            requests.RequestException: "There's an ambiguous exception that occurred while handling..."
+            requests.ConnectionError: Connection error
+            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ReadTimeout: Timed out waiting response from AIStore
+            requests.exceptions.HTTPError: Service unavailable
+
+        """
+        # Create query parameters for the destination
+        query_params = self.query_params.copy()
+
+        # Use uname for destination bucket+object
+        query_params[QPARAM_OBJ_TO] = to_obj.uname
+        query_params[QPARAM_LATEST] = "true" if latest else "false"
+        query_params[QPARAM_SYNC] = "true" if sync else "false"
+
+        # Add ETL configuration if provided
+        if etl:
+            etl.update_qparams(query_params)
+
+        return self._client.request(
+            HTTP_METHOD_PUT,
+            path=self._object_path,
+            params=query_params,
         )
 
     def blob_download(
@@ -523,7 +610,7 @@ class Object:
         ).as_dict()
         json_val = ActionMsg(
             action=ACT_BLOB_DOWNLOAD, value=value, name=self.name
-        ).dict()
+        ).model_dump()
         return self._client.request(
             HTTP_METHOD_POST, path=self._bck_path, params=params, json=json_val
         ).text
@@ -552,8 +639,8 @@ class Object:
             requests.exceptions.HTTPError(404): The object does not exist
         """
         warnings.warn(
-            "The 'append_content' method is deprecated and will be removed in a future release. "
-            "Please use 'ObjectWriter.append_content' instead.",
+            "The `Object.append_content(...)` method is deprecated and will be removed in a future release."
+            "Please replace it with `Object.get_writer().append_content(...)` using the new `ObjectWriter` API.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -572,8 +659,8 @@ class Object:
             replace_existing (bool, optional): Whether to replace existing metadata. Defaults to False.
         """
         warnings.warn(
-            "The 'set_custom_props' method is deprecated and will be removed in a future release. "
-            "Please use 'ObjectWriter.set_custom_props' instead.",
+            "The `Object.set_custom_props(...)` method is deprecated and will be removed in a future release."
+            "Please replace it with `Object.get_writer().set_custom_props(...)` using the new `ObjectWriter` API.",
             DeprecationWarning,
             stacklevel=2,
         )

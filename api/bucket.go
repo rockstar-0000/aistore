@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/xact/xreg"
 
 	jsoniter "github.com/json-iterator/go"
 )
@@ -133,7 +134,7 @@ func hdr2msg(bck cmn.Bck, status int, err error) error {
 // optionally, specific non-default properties (via cmn.BpropsToSet).
 //
 // See also:
-//   - github.com/NVIDIA/aistore/blob/main/docs/bucket.md#default-bucket-properties
+//   - github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket-properties
 //   - cmn.BpropsToSet (cmn/api.go)
 //
 // Bucket properties can be also changed at any time via SetBucketProps (above).
@@ -225,7 +226,7 @@ func tcb(bp BaseParams, bckFrom, bckTo cmn.Bck, jbody []byte, fltPresence ...int
 	}
 	q := qalloc()
 	bckFrom.SetQuery(q)
-	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo)
+	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo, "" /*objName*/)
 	if len(fltPresence) > 0 {
 		q.Set(apc.QparamFltPresence, strconv.Itoa(fltPresence[0]))
 	}
@@ -254,7 +255,7 @@ func RenameBucket(bp BaseParams, bckFrom, bckTo cmn.Bck) (xid string, err error)
 	}
 	q := qalloc()
 	bckFrom.SetQuery(q)
-	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo)
+	_ = bckTo.AddUnameToQuery(q, apc.QparamBckTo, "" /*objName*/)
 
 	bp.Method = http.MethodPost
 	reqParams := AllocRp()
@@ -292,6 +293,28 @@ func EvictRemoteBucket(bp BaseParams, bck cmn.Bck, keepMD bool) error {
 	err := reqParams.DoRequest()
 	FreeRp(reqParams)
 	return err
+}
+
+func RechunkBucket(bp BaseParams, bck cmn.Bck, objSizeLimit, chunkSize int64, prefix string) (xid string, err error) {
+	q := qalloc()
+	bp.Method = http.MethodPost
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
+		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActRechunk, Value: &xreg.RechunkArgs{
+			Prefix:       prefix,
+			ObjSizeLimit: objSizeLimit,
+			ChunkSize:    chunkSize,
+		}})
+		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
+		reqParams.Query = bck.AddToQuery(q)
+	}
+	_, err = reqParams.doReqStr(&xid)
+
+	FreeRp(reqParams)
+	qfree(q)
+	return xid, err
 }
 
 // MakeNCopies starts an extended action (xaction) to bring a given bucket to a

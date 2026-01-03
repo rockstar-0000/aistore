@@ -6,6 +6,8 @@ author: Aaron Wilson
 categories: aistore etl pytorch python webdataset
 ---
 
+> **Note:** This blog post references `init_code` which has been removed and replaced with `init_class`. For the most up-to-date ETL initialization methods, please refer to the [init_class documentation](https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#using-init_class-python-sdk-only).
+
 In the [previous post](https://aiatscale.org/blog/2023/05/05/aisio-transforms-with-webdataset-pt-1) we converted a dataset to the WebDataset format and stored it in a bucket in AIStore. 
 
 This post will demonstrate AIStore's ability to efficiently apply custom transformations to the dataset on the storage cluster. We'll do this using [AIS ETL](https://github.com/NVIDIA/aistore/blob/main/docs/etl.md).
@@ -104,7 +106,7 @@ With the ETL created, we can use it to perform either an inline transformation t
 ```python
     single_object = client.bucket(bucket_name).object("samples-00.tar")
     # Get object contents with ETL applied
-    processed_shard = single_object.get(etl_name=etl_name).read_all()
+    processed_shard = single_object.get_reader(etl_name=etl_name).read_all()
 ```
 
 ![Inline Transform](/assets/aisio_inline_wdataset/inline_etl_sequence.jpg)
@@ -115,7 +117,7 @@ With the ETL created, we can use it to perform either an inline transformation t
     # Transform the entire bucket, placing the output in the destination bucket
     transform_job = client.bucket(bucket_name).transform(to_bck=dest_bucket, etl_name=etl_name)
     client.job(transform_job).wait(verbose=True)
-    processed_shard = dest_bucket.object("samples-00.tar").get().read_all()
+    processed_shard = dest_bucket.object("samples-00.tar").get_reader().read_all()
 ```
 
 ![Offline Transform](/assets/aisio_inline_wdataset/offline_etl_sequence.jpg)
@@ -135,7 +137,7 @@ In the next post, we'll show how to put ETL to use when training a dataset by pe
 
 1. GitHub:
     - [AIStore](https://github.com/NVIDIA/aistore)
-    - [Local Kubernetes Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/kustomize/README.md)
+    - [Local Kubernetes Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/README.md)
     - [AIS/Kubernetes Operator, AIS on bare-metal, Deployment Playbooks, Helm](https://github.com/NVIDIA/ais-k8s)
     - [AIS-ETL containers and specs](https://github.com/NVIDIA/ais-etl)
     - [WebDataset Library](https://github.com/webdataset/webdataset)

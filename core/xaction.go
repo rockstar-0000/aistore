@@ -29,6 +29,15 @@ const (
 type (
 	QuiCB func(elapsed time.Duration) QuiRes // see enum below
 
+	GetStats interface {
+		Objs() int64
+		ObjsAdd(int, int64)    // locally processed
+		OutObjsAdd(int, int64) // transmit
+		InObjsAdd(int, int64)  // receive
+		InBytes() int64
+		OutBytes() int64
+	}
+
 	Xact interface {
 		Run(*sync.WaitGroup)
 		ID() string
@@ -37,8 +46,9 @@ type (
 		FromTo() (*meta.Bck, *meta.Bck)
 		StartTime() time.Time
 		EndTime() time.Time
-		Finished() bool
-		Running() bool
+		IsDone() bool
+		IsRunning() bool
+		IsIdle() bool
 		Quiesce(time.Duration, QuiCB) QuiRes
 
 		// abrt
@@ -49,6 +59,8 @@ type (
 		// err (info)
 		AddErr(error, ...int)
 
+		// to support api.QueryXactionSnaps
+		CtlMsg() string
 		Snap() *Snap // (struct below)
 
 		// reporting: log, err
@@ -62,12 +74,7 @@ type (
 		AddNotif(n Notif)
 
 		// common stats
-		Objs() int64
-		ObjsAdd(int, int64)    // locally processed
-		OutObjsAdd(int, int64) // transmit
-		InObjsAdd(int, int64)  // receive
-		InBytes() int64
-		OutBytes() int64
+		GetStats
 	}
 )
 
@@ -121,11 +128,11 @@ func (xsnap *Snap) IsAborted() bool { return xsnap.AbortedX }
 func (xsnap *Snap) IsIdle() bool    { return xsnap.IdleX }
 func (xsnap *Snap) Started() bool   { return !xsnap.StartTime.IsZero() }
 
-func (xsnap *Snap) Running() bool {
+func (xsnap *Snap) IsRunning() bool {
 	return xsnap.Started() && !xsnap.IsAborted() && xsnap.EndTime.IsZero()
 }
 
-func (xsnap *Snap) Finished() bool { return xsnap.Started() && !xsnap.EndTime.IsZero() }
+func (xsnap *Snap) IsFinished() bool { return xsnap.Started() && !xsnap.EndTime.IsZero() }
 
 // snap.Packed layout:
 //

@@ -40,7 +40,7 @@ func (goi *getOI) _fini(revert string, fullSize, txSize int64) error {
 	if err := lom.Load(true /*cache it*/, true /*locked*/); err != nil {
 		goi.lom.Unlock(true)
 		nlog.InfoDepth(1, ftcg, "(load)", lom, err) // (unlikely)
-		return errGetTxBenign
+		return cmn.ErrGetTxBenign
 	}
 	debug.Assert(lom.Lsize() == fullSize)
 	goi.lom.Unlock(true)
@@ -81,8 +81,8 @@ func (goi *getOI) _cleanup(revert string, lmfh io.Closer, buf []byte, slab *mems
 	lom.Unlock(true)
 
 	s := err.Error()
-	if cos.IsErrBrokenPipe(err) {
-		s = "[broken pipe]" // EPIPE
+	if cos.IsClientGone(err) {
+		s = "[client gone]" // EPIPE, et al.
 	}
 	nlog.InfoDepth(1, ftcg, tag, cname, "err:", s)
 }
@@ -97,7 +97,7 @@ func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 		revert string
 	)
 	if goi.verchanged {
-		revert = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileColdget)
+		revert = lom.GenFQN(fs.WorkCT, fs.WorkfileColdget)
 		if err := lom.RenameMainTo(revert); err != nil {
 			nlog.Errorln("failed to rename prev. version - proceeding anyway", lom.FQN, "=>", revert)
 			revert = ""
@@ -114,7 +114,7 @@ func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 
 	var (
 		written   int64
-		buf, slab = t.gmm.AllocSize(min(res.Size, memsys.DefaultBuf2Size))
+		buf, slab = t.gmm.AllocSize(_txsize(res.Size))
 		cksum     = cos.NewCksumHash(lom.CksumConf().Type)
 		mw        = cos.NewWriterMulti(goi.w, lmfh, cksum.H)
 		whdr      = goi.w.Header()
@@ -133,7 +133,7 @@ func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 
 	if err != nil {
 		goi._cleanup(revert, lmfh, buf, slab, err, "(rr/wl)")
-		return errGetTxBenign
+		return cmn.ErrGetTxBenign
 	}
 	if written != res.Size {
 		errTx := goi._txerr(nil, lom.FQN, written, res.Size)
@@ -170,7 +170,7 @@ func (goi *getOI) coldStream(res *core.GetReaderResult) error {
 			nlog.Errorln(err)
 		}
 	}
-	if err = lom.PersistMain(); err != nil {
+	if err = lom.PersistMain(false /*isChunked*/); err != nil {
 		const act = "(persist)"
 		errTx := newErrGetTxSevere(err, lom, act)
 		goi._cleanup(revert, lmfh, buf, slab, errTx, act)

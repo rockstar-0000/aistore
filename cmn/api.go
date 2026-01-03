@@ -51,11 +51,12 @@ type (
 		BackendBck  Bck             `json:"backend_bck,omitempty"`            // makes a remote bucket out of a given ais://
 		WritePolicy WritePolicyConf `json:"write_policy"`                     // write object metadata (immediate | delayed | never)
 		Provider    string          `json:"provider" list:"readonly"`         // backend provider
-		Renamed     string          `list:"omit"`                             // non-empty iff the bucket has been renamed
+		Renamed     string          `list:"omit"`                             // DEPRECATED: non-empty iff the bucket has been renamed
 		Cksum       CksumConf       `json:"checksum"`                         // this bucket's checksum (for supported enum, see cmn/cos.cksum)
 		Extra       ExtraProps      `json:"extra,omitempty" list:"omitempty"` // e.g., AWS.Endpoint for this bucket
 		RateLimit   RateLimitConf   `json:"rate_limit"`                       // frontend and backend rate limiting - bursty and adaptive, respectively
 		EC          ECConf          `json:"ec"`                               // erasure coding
+		Chunks      ChunksConf      `json:"chunks"`                           // chunks and chunk manifests; multipart upload
 		Mirror      MirrorConf      `json:"mirror"`                           // n-way mirroring
 		LRU         LRUConf         `json:"lru"`                              // LRU watermarks and enable/disable
 		Access      apc.AccessAttrs `json:"access,string"`                    // access permissions
@@ -135,6 +136,7 @@ type (
 		Cksum       *CksumConfToSet       `json:"checksum,omitempty"`
 		LRU         *LRUConfToSet         `json:"lru,omitempty"`
 		Mirror      *MirrorConfToSet      `json:"mirror,omitempty"`
+		Chunks      *ChunksConfToSet      `json:"chunks,omitempty"`
 		EC          *ECConfToSet          `json:"ec,omitempty"`
 		Access      *apc.AccessAttrs      `json:"access,string,omitempty"`
 		RateLimit   *RateLimitConfToSet   `json:"rate_limit,omitempty"`
@@ -163,9 +165,9 @@ type (
 // * By default, LRU is disabled for AIS (`ais://`) buckets.
 //
 // See also:
-//   - github.com/NVIDIA/aistore/blob/main/docs/bucket.md#default-bucket-properties
+//   - github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket-properties
 //   - BpropsToSet (above)
-//   - ais.defaultBckProps()
+//   - bckPropsArgs.inheritMerge()
 func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
 	lru := c.LRU
 	if bck.IsAIS() {
@@ -191,6 +193,7 @@ func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
 		Versioning:  c.Versioning,
 		Access:      apc.AccessAll,
 		EC:          c.EC,
+		Chunks:      c.Chunks,
 		WritePolicy: wp,
 		RateLimit:   c.RateLimit,
 		Features:    c.Features,
@@ -236,7 +239,7 @@ func (bp *Bprops) Validate(targetCnt int) error {
 
 	// run assorted props validators
 	var softErr error
-	for _, pv := range []PropsValidator{&bp.Cksum, &bp.Mirror, &bp.EC, &bp.Extra, &bp.WritePolicy, &bp.RateLimit} {
+	for _, pv := range []propsValidator{&bp.Cksum, &bp.Mirror, &bp.EC, &bp.Extra, &bp.WritePolicy, &bp.RateLimit, &bp.Chunks, &bp.LRU, &bp.Features} {
 		var err error
 		switch {
 		case pv == &bp.EC:
@@ -253,8 +256,13 @@ func (bp *Bprops) Validate(targetCnt int) error {
 			softErr = err
 		}
 	}
+
+	// limitations
 	if bp.Mirror.Enabled && bp.EC.Enabled {
 		nlog.Warningln("n-way mirroring and EC are both enabled at the same time on the same bucket")
+	}
+	if bp.Mirror.Enabled && bp.Chunks.AutoEnabled() {
+		return errors.New("n-way mirroring and chunking cannot be enabled at the same time on the same bucket (MPU chunking is still allowed)")
 	}
 
 	// not inheriting cluster-scope features

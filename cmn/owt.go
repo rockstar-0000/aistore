@@ -25,6 +25,7 @@ const (
 	OwtArchive              // multi-obj arch
 	OwtTransform            // ETL
 	OwtCopy                 // copy and move objects within cluster
+	OwtChunks               // chunks
 	OwtRebalance            // NOTE: must be the last in PUT* group
 	//
 	// GET and friends
@@ -33,10 +34,6 @@ const (
 	OwtGetLock         // lock(exclusive); read from remote; ...
 	OwtGet             // GET (with upgrading read-lock in the local-write path)
 	OwtGetPrefetchLock // (used for maximum parallelism when prefetching)
-	//
-	// when remote-src == dst
-	//
-	OwtCopySameBucket
 	//
 	// None of the above
 	//

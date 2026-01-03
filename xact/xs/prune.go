@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -41,13 +41,14 @@ type prune struct {
 func (rp *prune) init(config *cmn.Config) {
 	debug.Assert(rp.bckFrom.IsAIS() || rp.bckFrom.HasVersioningMD(), rp.bckFrom.String())
 	rmopts := &mpather.JgroupOpts{
-		CTs:      []string{fs.ObjectType},
+		CTs:      []string{fs.ObjCT},
 		VisitObj: rp.do,
 		Prefix:   rp.prefix,
+		RW:       false,
 		// DoLoad:  noLoad
 	}
 	rmopts.Bck.Copy(rp.bckTo.Bucket())
-	rp.joggers = mpather.NewJoggerGroup(rmopts, config, nil)
+	rp.joggers = mpather.NewJgroup(rmopts, config, nil)
 	rp.filter = prob.NewDefaultFilter()
 	rp.same = rp.bckTo.Equal(rp.bckFrom, true, true)
 }
@@ -92,7 +93,7 @@ func (rp *prune) do(dst *core.LOM, _ []byte) error {
 	} else {
 		src = core.AllocLOM(dst.ObjName)
 		defer core.FreeLOM(src)
-		if src.InitBck(rp.bckFrom.Bucket()) != nil {
+		if src.InitBck(rp.bckFrom) != nil {
 			return nil
 		}
 	}
@@ -141,11 +142,11 @@ func (rp *prune) do(dst *core.LOM, _ []byte) error {
 	dst.Unlock(true)
 
 	if err == nil {
-		if cmn.Rom.FastV(5, cos.SmoduleXs) {
+		if cmn.Rom.V(5, cos.ModXs) {
 			nlog.Infoln(rp.r.Name(), dst.Cname())
 		}
 	} else if !cmn.IsErrObjNought(err) && !cmn.IsErrBucketNought(err) {
-		rp.r.AddErr(err, 4, cos.SmoduleXs)
+		rp.r.AddErr(err, 4, cos.ModXs)
 	}
 	return nil
 }

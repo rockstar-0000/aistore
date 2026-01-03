@@ -28,6 +28,12 @@ func Logf(f string, a ...any) {
 	}
 }
 
+func Logfln(f string, a ...any) {
+	if testing.Verbose() {
+		fmt.Fprintf(os.Stdout, prependTime(f)+"\n", a...)
+	}
+}
+
 func LogfCond(cond bool, f string, a ...any) {
 	if cond {
 		Logf(f, a...)

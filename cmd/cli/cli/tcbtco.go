@@ -31,10 +31,12 @@ import (
 //	(I) `ais cp from to --prefix abc" is the same as (II) `ais cp from to --template abc"
 //
 // Also, note [CONVENTIONS] below.
+//
+//	(III) `ais cp from-bucket/from-object to-bucket[/to-object]`
 func copyBucketHandler(c *cli.Context) (err error) {
 	var (
 		bckFrom, bckTo cmn.Bck
-		objFrom        string
+		objFrom, objTo string
 	)
 	switch {
 	case c.NArg() == 0:
@@ -42,7 +44,7 @@ func copyBucketHandler(c *cli.Context) (err error) {
 	case c.NArg() == 1:
 		bckFrom, objFrom, err = parseBckObjURI(c, c.Args().Get(0), true /*emptyObjnameOK*/)
 	default:
-		bckFrom, bckTo, objFrom, err = parseBcks(c, bucketSrcArgument, bucketDstArgument, 0 /*shift*/, true /*optionalSrcObjname*/)
+		bckFrom, bckTo, objFrom, objTo, err = parseFromToURIs(c, bucketSrcArgument, bucketDstArgument, 0 /*shift*/, true, true /*optional src, dst oname*/)
 	}
 	if err != nil {
 		return err
@@ -63,6 +65,19 @@ func copyBucketHandler(c *cli.Context) (err error) {
 			return incorrectUsageMsg(c, "missing destination bucket%s", hint)
 		}
 		bckTo = bckFrom
+	}
+
+	if objTo != "" {
+		if objFrom == "" {
+			return fmt.Errorf("missing source object name: cannot copy from bucket (%s) to object (%s)", bckFrom.Cname(""), bckTo.Cname(objTo))
+		}
+		err := copyObject(c, bckFrom, objFrom, bckTo, objTo)
+		if err != nil {
+			if cos.IsErrNotFound(err) && strings.Contains(err.Error(), bckFrom.Cname(objFrom)) {
+				err = fmt.Errorf("source object %q not found (did you mean to copy multiple objects with prefix %q?)", bckFrom.Cname(objFrom), objFrom)
+			}
+		}
+		return err
 	}
 
 	// NOTE: copyAllObjsFlag forces 'x-list' to list the remote one, and vice versa
@@ -104,20 +119,28 @@ func copyTransform(c *cli.Context, etlName, objNameOrTmpl string, bckFrom, bckTo
 		return err
 	}
 
+	//
+	// (0) single object (see related: lsObjVsPref)
+	//
+	if oltp.objName != "" {
+		debug.Assertf(oltp.list == "" && oltp.tmpl == "", "%+v", oltp)
+		return copyObject(c, bckFrom, oltp.objName, bckTo, "")
+	}
+
 	// bck-to exists?
 	if _, err = api.HeadBucket(apiBP, bckTo, true /* don't add */); err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); !ok || herr.Status != http.StatusNotFound {
 			return err
 		}
 		warn := fmt.Sprintf("destination %s doesn't exist and will be created with configuration copied from the source (%s))",
-			bckTo.String(), bckFrom.String())
+			bckTo.Cname(""), bckFrom.Cname(""))
 		actionWarn(c, warn)
 	}
 
 	dryRun := flagIsSet(c, copyDryRunFlag)
 
 	//
-	// either (1) copy/transform bucket (x-tcb)
+	// (1) copy/transform bucket (x-tcb)
 	//
 	if oltp.objName == "" && oltp.list == "" && oltp.tmpl == "" {
 		// NOTE: e.g. 'ais cp gs://abc gs:/abc' to sync remote bucket => aistore
@@ -136,7 +159,7 @@ func copyTransform(c *cli.Context, etlName, objNameOrTmpl string, bckFrom, bckTo
 	}
 
 	//
-	// or (2) multi-object x-tco
+	// (2) multi-object x-tco
 	//
 	if oltp.list == "" && oltp.tmpl == "" {
 		oltp.list = oltp.objName // (compare with `_prefetchOne`)
@@ -195,10 +218,7 @@ func copyBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 	}
 
 	// by default, copying in-cluster objects, with an option to copy remote as well (TODO: FltExistsOutside)
-	fltPresence := apc.FltPresent
-	if flagIsSet(c, copyAllObjsFlag) || flagIsSet(c, etlAllObjsFlag) {
-		fltPresence = apc.FltExists
-	}
+	fltPresence := cos.Ternary(flagIsSet(c, copyAllObjsFlag) || flagIsSet(c, etlAllObjsFlag), apc.FltExists, apc.FltPresent)
 
 	if showProgress {
 		var cpr cprCtx
@@ -267,17 +287,31 @@ func etlBucketHandler(c *cli.Context) error {
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
-	etlName := c.Args().Get(0)
-	bckFrom, bckTo, objFrom, err := parseBcks(c, bucketSrcArgument, bucketDstArgument, 1 /*shift*/, true /*optionalSrcObjname*/)
+	etlNameOrPipeline := c.Args().Get(0)
+	bckFrom, bckTo, objFrom, _, err := parseFromToURIs(c, bucketSrcArgument, bucketDstArgument, 1 /*shift*/, true, false /*optional src, dst oname*/)
+
 	if err != nil {
 		return err
 	}
-	return copyTransform(c, etlName, objFrom, bckFrom, bckTo)
+	return copyTransform(c, etlNameOrPipeline, objFrom, bckFrom, bckTo)
 }
 
-func etlBucket(c *cli.Context, etlName string, bckFrom, bckTo cmn.Bck) error {
+func etlBucket(c *cli.Context, etlNameOrPipeline string, bckFrom, bckTo cmn.Bck) error {
+	// Parse pipeline or single ETL name
+	var transform apc.Transform
+	etlNames, err := parseETLNames(etlNameOrPipeline)
+	if err != nil {
+		return err
+	}
+	transform = apc.Transform{
+		Name: etlNames[0], // First ETL in the pipeline
+	}
+	if len(etlNames) > 1 {
+		transform.Pipeline = etlNames[1:] // Only populate pipeline if more than one ETL
+	}
+
 	var msg = apc.TCBMsg{
-		Transform: apc.Transform{Name: etlName},
+		Transform: transform,
 	}
 	if err := _iniTCBMsg(c, &msg); err != nil {
 		return err
@@ -306,13 +340,10 @@ func etlBucket(c *cli.Context, etlName string, bckFrom, bckTo cmn.Bck) error {
 
 	// by default, copying objects in the cluster, with an option to override
 	// TODO: FltExistsOutside maybe later
-	fltPresence := apc.FltPresent
-	if flagIsSet(c, copyAllObjsFlag) || flagIsSet(c, etlAllObjsFlag) {
-		fltPresence = apc.FltExists
-	}
+	fltPresence := cos.Ternary(flagIsSet(c, copyAllObjsFlag) || flagIsSet(c, etlAllObjsFlag), apc.FltExists, apc.FltPresent)
 
 	xid, err := api.ETLBucket(apiBP, bckFrom, bckTo, &msg, fltPresence)
-	if errV := handleETLHTTPError(err, etlName); errV != nil {
+	if errV := handleETLHTTPError(err, transform.Name); errV != nil {
 		return errV
 	}
 
@@ -348,18 +379,4 @@ func etlBucket(c *cli.Context, etlName string, bckFrom, bckTo cmn.Bck) error {
 	locBytes, outBytes, inBytes := snaps.ByteCounts(xid)
 	fmt.Fprintf(c.App.Writer, "ETL byte stats:\t transformed=%d, sent=%d, received=%d", locBytes, outBytes, inBytes)
 	return nil
-}
-
-func handleETLHTTPError(err error, etlName string) error {
-	if err == nil {
-		return nil
-	}
-	if herr, ok := err.(*cmn.ErrHTTP); ok {
-		// TODO: How to find out if it's transformation not found, and not object not found?
-		if herr.Status == http.StatusNotFound && strings.Contains(herr.Error(), etlName) {
-			return fmt.Errorf("ETL[%s] not found; try starting new ETL with:\nais %s %s <spec>",
-				etlName, commandETL, cmdInit)
-		}
-	}
-	return V(err)
 }

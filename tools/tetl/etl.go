@@ -6,6 +6,7 @@ package tetl
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,18 +32,18 @@ import (
 )
 
 const (
-	EchoETLSpec         = "echo-etl-spec"
-	HashWithArgsETLSpec = "hash-with-args-etl-spec"
-	MD5ETLSpec          = "md5-etl-spec"
-	NonExistImage       = "non-exist-image"
-	InvalidYaml         = "invalid-yaml"
-	Tar2TF              = "tar2tf"
-	Echo                = "transformer-echo"
-	EchoGolang          = "echo-go"
-	MD5                 = "transformer-md5"
-	HashWithArgs        = "hash-with-args"
-	Tar2tfFilters       = "tar2tf-filters"
-	tar2tfFilter        = `
+	NonExistImage              = "non-exist-image"
+	InvalidYaml                = "invalid-yaml"
+	PodWithResourcesConstraint = "resources-constraint"
+
+	Tar2TF        = "tar2tf"
+	Echo          = "transformer-echo"
+	EchoGolang    = "echo-go"
+	MD5           = "transformer-md5"
+	HashWithArgs  = "hash-with-args"
+	Tar2tfFilters = "tar2tf-filters"
+	ParquetParser = "parquet-parser"
+	tar2tfFilter  = `
 {
   "conversions": [
     { "type": "Decode", "ext_name": "png"},
@@ -53,31 +54,6 @@ const (
     { "ext_name": "cls" }
   ]
 }
-`
-)
-
-// ETL specs
-const (
-	echoETLSpec = `
-name: echo-etl-spec
-runtime:
-  image: aistorage/transformer_echo:latest
-  command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
-`
-	hashWithArgsETLSpec = `
-name: hash-with-args-etl-spec
-runtime:
-  image: aistorage/transformer_hash_with_args:latest
-  command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
-  env:
-    - name: SEED_DEFAULT
-    - value: "0"
-`
-	md5ETLSpec = `
-name: md5-etl-spec
-runtime:
-  image: aistorage/transformer_md5:latest
-  command: ["uvicorn", "fastapi_server:fastapi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
 `
 )
 
@@ -118,24 +94,35 @@ spec:
         - name: default
           containerPort: 80
 `
+	podWithResourcesConstraintSpec = `
+name: md5-transformer-etl
+runtime:
+  image: aistorage/transformer_md5:latest
+resources:
+  requests:
+    memory: "%s"
+    cpu: "%s"
+  limits:
+    memory: "%s"
+    cpu: "%s"
+`
 )
 
 var (
 	links = map[string]string{
-		MD5:           "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/md5/pod.yaml",
-		HashWithArgs:  "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/hash_with_args/pod.yaml",
+		MD5:           "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/md5/etl_spec.yaml",
+		HashWithArgs:  "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/hash_with_args/etl_spec.yaml",
 		Tar2TF:        "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/tar2tf/pod.yaml",
 		Tar2tfFilters: "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/tar2tf/pod.yaml",
-		Echo:          "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/echo/pod.yaml",
+		Echo:          "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/echo/etl_spec.yaml",
 		EchoGolang:    "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/go_echo/pod.yaml",
+		ParquetParser: "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/parquet-parser/etl_spec.yaml",
 	}
 
 	testSpecs = map[string]string{
-		NonExistImage:       nonExistImageSpec,
-		InvalidYaml:         invalidYamlSpec,
-		EchoETLSpec:         echoETLSpec,
-		HashWithArgsETLSpec: hashWithArgsETLSpec,
-		MD5ETLSpec:          md5ETLSpec,
+		NonExistImage:              nonExistImageSpec,
+		InvalidYaml:                invalidYamlSpec,
+		PodWithResourcesConstraint: podWithResourcesConstraintSpec,
 	}
 
 	client = &http.Client{}
@@ -152,13 +139,20 @@ var (
 
 func validateETLName(name string) error {
 	if _, ok := links[name]; !ok {
-		return fmt.Errorf("%s is invalid etlName, expected predefined (%s, %s, %s)", name, Echo, Tar2TF, MD5)
+		return fmt.Errorf("%s is invalid etlName, expected predefined (%s, %s, %s, %s)", name, Echo, Tar2TF, MD5, ParquetParser)
 	}
 	return nil
 }
 
-func GetTransformYaml(etlName string) ([]byte, error) {
+func GetTransformYaml(etlName string, replaceArgs ...string) ([]byte, error) {
 	if spec, ok := testSpecs[etlName]; ok {
+		if len(replaceArgs) > 0 {
+			args := make([]any, len(replaceArgs))
+			for i, v := range replaceArgs {
+				args[i] = v
+			}
+			spec = fmt.Sprintf(spec, args...)
+		}
 		return []byte(spec), nil
 	}
 	if err := validateETLName(etlName); err != nil {
@@ -168,18 +162,26 @@ func GetTransformYaml(etlName string) ([]byte, error) {
 	var (
 		resp   *http.Response
 		action = "get transform yaml for ETL[" + etlName + "]"
+		args   = &cmn.RetryArgs{
+			Call: func() (_ int, err error) {
+				req, e := http.NewRequestWithContext(context.Background(), http.MethodGet, links[etlName], http.NoBody)
+				if e != nil {
+					return 0, err
+				}
+				resp, err = client.Do(req) //nolint:bodyclose // see defer close below
+				if resp != nil {
+					return resp.StatusCode, err
+				}
+				return 0, err
+			},
+			Action:   action,
+			SoftErr:  3,
+			HardErr:  1,
+			IsClient: true,
+		}
 	)
 	// with retry in case github in unavailable for a moment
-	_, err := cmn.NetworkCallWithRetry(&cmn.RetryArgs{
-		Call: func() (_ int, err error) {
-			resp, err = client.Get(links[etlName]) //nolint:bodyclose // see defer close below
-			return 0, err
-		},
-		Action:   action,
-		SoftErr:  3,
-		HardErr:  1,
-		IsClient: true,
-	})
+	_, err := args.Do()
 	if err != nil {
 		return nil, err
 	}
@@ -225,15 +227,15 @@ func StopAndDeleteETL(t *testing.T, bp api.BaseParams, etlName string) {
 				tlog.Logln(headETLLogs(etlLogs, 10*cos.KiB))
 			}
 		} else {
-			tlog.Logf("Error retrieving ETL[%s] logs: %v\n", etlName, err)
+			tlog.Logfln("Error retrieving ETL[%s] logs: %v", etlName, err)
 		}
 	}
-	tlog.Logf("Stopping ETL[%s]\n", etlName)
+	tlog.Logfln("Stopping ETL[%s]", etlName)
 
 	if err := api.ETLStop(bp, etlName); err != nil {
-		tlog.Logf("Stopping ETL[%s] failed; err %v\n", etlName, err)
+		tlog.Logfln("Stopping ETL[%s] failed; err %v", etlName, err)
 	} else {
-		tlog.Logf("ETL[%s] stopped\n", etlName)
+		tlog.Logfln("ETL[%s] stopped", etlName)
 	}
 	err := api.ETLDelete(bp, etlName)
 	tassert.CheckFatal(t, err)
@@ -251,11 +253,12 @@ func headETLLogs(etlLogs etl.Logs, maxLen int) string {
 	return str
 }
 
-func WaitForContainersStopped(t *testing.T, bp api.BaseParams) {
-	tlog.Logln("Waiting for ETL containers to stop...")
+func WaitForETLAborted(t *testing.T, bp api.BaseParams, etlNames ...string) {
+	tlog.Logln("Waiting for all ETLs to abort...")
 	var (
 		etls         etl.InfoList
 		stopDeadline = time.Now().Add(20 * time.Second)
+		watchlist    = cos.NewStrSet(etlNames...)
 		interval     = 2 * time.Second
 		err          error
 	)
@@ -263,14 +266,25 @@ func WaitForContainersStopped(t *testing.T, bp api.BaseParams) {
 	for {
 		etls, err = api.ETLList(bp)
 		tassert.CheckFatal(t, err)
-		if len(etls) == 0 {
-			tlog.Logln("ETL containers stopped successfully")
+
+		allAborted := true
+		for _, info := range etls {
+			if watchlist.Contains(info.Name) && info.Stage != etl.Aborted.String() {
+				allAborted = false
+				break
+			}
+		}
+
+		if allAborted {
+			tlog.Logln("All ETL containers aborted successfully")
 			return
 		}
+
 		if time.Now().After(stopDeadline) {
 			break
 		}
-		tlog.Logf("ETLs %+v still running, waiting %s... \n", etls, interval)
+
+		tlog.Logfln("ETLs %+v not fully aborted, waiting %s...", etls, interval)
 		time.Sleep(interval)
 	}
 
@@ -279,18 +293,18 @@ func WaitForContainersStopped(t *testing.T, bp api.BaseParams) {
 }
 
 func WaitForAborted(bp api.BaseParams, xid, kind string, timeout time.Duration) error {
-	tlog.Logf("Waiting for ETL x-%s[%s] to abort...\n", kind, xid)
+	tlog.Logfln("Waiting for ETL x-%s[%s] to abort...", kind, xid)
 	args := xact.ArgsMsg{ID: xid, Kind: kind, Timeout: timeout /* total timeout */}
 	status, err := api.WaitForXactionIC(bp, &args)
 	if err == nil {
-		if !status.Aborted() {
+		if !status.IsAborted() {
 			err = fmt.Errorf("expected ETL x-%s[%s] status to indicate 'abort', got: %+v", kind, xid, status)
 		}
 		return err
 	}
-	tlog.Logf("Aborting ETL x-%s[%s]\n", kind, xid)
+	tlog.Logfln("Aborting ETL x-%s[%s]", kind, xid)
 	if abortErr := api.AbortXaction(bp, &args); abortErr != nil {
-		tlog.Logf("Nested error: failed to abort upon api.wait failure: %v\n", abortErr)
+		tlog.Logfln("Nested error: failed to abort upon api.wait failure: %v", abortErr)
 	}
 	return err
 }
@@ -298,7 +312,7 @@ func WaitForAborted(bp api.BaseParams, xid, kind string, timeout time.Duration) 
 // NOTE: relies on x-kind to choose the waiting method
 // TODO -- FIXME: remove and simplify - here and everywhere
 func WaitForFinished(bp api.BaseParams, xid, kind string, timeout time.Duration) (err error) {
-	tlog.Logf("Waiting for ETL x-%s[%s] to finish...\n", kind, xid)
+	tlog.Logfln("Waiting for ETL x-%s[%s] to finish...", kind, xid)
 	args := xact.ArgsMsg{ID: xid, Kind: kind, Timeout: timeout /* total timeout */}
 	if xact.IdlesBeforeFinishing(kind) {
 		err = api.WaitForXactionIdle(bp, &args)
@@ -308,11 +322,12 @@ func WaitForFinished(bp api.BaseParams, xid, kind string, timeout time.Duration)
 	if err == nil {
 		return
 	}
-	tlog.Logf("Aborting ETL x-%s[%s]\n", kind, xid)
+	tlog.Logfln("error waiting for xaction to finish: %v", err)
+	tlog.Logfln("Aborting ETL x-%s[%s]", kind, xid)
 	if abortErr := api.AbortXaction(bp, &args); abortErr != nil {
-		tlog.Logf("Nested error: failed to abort upon api.wait failure: %v\n", abortErr)
+		tlog.Logfln("Nested error: failed to abort upon api.wait failure: %v", abortErr)
 	}
-	return err
+	return nil
 }
 
 func ReportXactionStatus(bp api.BaseParams, xid string, stopCh *cos.StopCh, interval time.Duration, totalObj int) {
@@ -328,16 +343,16 @@ func ReportXactionStatus(bp api.BaseParams, xid string, stopCh *cos.StopCh, inte
 				// Check number of objects transformed.
 				xs, err := api.QueryXactionSnaps(bp, &xact.ArgsMsg{ID: xid})
 				if err != nil {
-					tlog.Logf("Failed to get x-etl[%s] stats: %v\n", xid, err)
+					tlog.Logfln("Failed to get x-etl[%s] stats: %v", xid, err)
 					continue
 				}
 				locObjs, outObjs, inObjs := xs.ObjCounts(xid)
-				tlog.Logf("ETL[%s] progress: (objs=%d, outObjs=%d, inObjs=%d) out of %d objects\n",
+				tlog.Logfln("ETL[%s] progress: (objs=%d, outObjs=%d, inObjs=%d) out of %d objects",
 					xid, locObjs, outObjs, inObjs, totalObj)
 				locBytes, outBytes, inBytes := xs.ByteCounts(xid)
 				bps := float64(locBytes+outBytes) / time.Since(xactStart).Seconds()
-				bpsStr := cos.ToSizeIEC(int64(bps), 2) + "/s"
-				tlog.Logf("ETL[%s] progress: (bytes=%d, outBytes=%d, inBytes=%d), %sBps\n",
+				bpsStr := cos.IEC(int64(bps), 2) + "/s"
+				tlog.Logfln("ETL[%s] progress: (bytes=%d, outBytes=%d, inBytes=%d), %sBps",
 					xid, locBytes, outBytes, inBytes, bpsStr)
 			case <-stopCh.Listen():
 				return
@@ -346,26 +361,24 @@ func ReportXactionStatus(bp api.BaseParams, xid string, stopCh *cos.StopCh, inte
 	}()
 }
 
-func InitSpec(t *testing.T, bp api.BaseParams, etlName, commType, argType string) (xid string) {
+func InitSpec(t *testing.T, bp api.BaseParams, etlName, commType string, replaceArgs ...string) (msg etl.InitMsg) {
 	tlog.Logf("InitSpec ETL[%s], communicator %s\n", etlName, commType)
-	spec, err := GetTransformYaml(etlName)
+	spec, err := GetTransformYaml(etlName, replaceArgs...)
 	tassert.CheckFatal(t, err)
 
 	var (
 		etlSpec  etl.ETLSpecMsg
 		initSpec etl.InitSpecMsg
-		msg      etl.InitMsg
 	)
+	etlName += strings.ReplaceAll(strings.ToLower(cos.GenUUID()), "_", "-") // add random suffix to avoid conflicts
 	if err := yaml.Unmarshal(spec, &etlSpec); err == nil && etlSpec.Validate() == nil {
 		etlSpec.EtlName = etlName
 		etlSpec.CommTypeX = commType
-		etlSpec.ArgTypeX = argType
 		etlSpec.InitTimeout = cos.Duration(time.Minute * 2) // manually increase timeout in testing environment
 		msg = &etlSpec
 	} else {
 		initSpec.EtlName = etlName
 		initSpec.CommTypeX = commType
-		initSpec.ArgTypeX = argType
 		initSpec.InitTimeout = cos.Duration(time.Minute * 2) // manually increase timeout in testing environment
 		initSpec.Spec = spec
 		msg = &initSpec
@@ -373,47 +386,34 @@ func InitSpec(t *testing.T, bp api.BaseParams, etlName, commType, argType string
 
 	tassert.Fatalf(t, msg.Name() == etlName, "%q vs %q", msg.Name(), etlName) // assert
 
-	xid, err = api.ETLInit(bp, msg)
+	xid, err := api.ETLInit(bp, msg)
 	if herr, ok := err.(*cmn.ErrHTTP); ok && herr.TypeCode == "ErrUnsupp" && msg.CommType() == etl.WebSocket {
-		t.Skipf("skipping, WebSocket only work with direct put supported transformers")
+		t.Skip("skipping, WebSocket only work with direct put supported transformers")
 	}
 	tassert.CheckFatal(t, err)
 	tassert.Errorf(t, cos.IsValidUUID(xid), "expected valid xaction ID, got %q", xid)
 	// reread `InitMsg` and compare with the specified
-	etlMsg, err := api.ETLGetInitMsg(bp, etlName)
+	details, err := api.ETLGetDetail(bp, etlName, "")
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("ETL %q: running x-etl-spec[%s]\n", etlName, xid)
+	tlog.Logfln("ETL %q: running x-etl-spec[%s]", etlName, xid)
 
-	tassert.Errorf(t, etlMsg.Name() == etlName, "expected etlName %s, got %s", etlName, etlMsg.Name())
-	tassert.Errorf(t, etlMsg.CommType() == commType, "expected communicator type %s, got %s", commType, etlMsg.CommType())
+	tassert.Errorf(t, details.InitMsg.Name() == etlName, "expected etlName %s, got %s", etlName, details.InitMsg.Name())
+	tassert.Errorf(t, details.InitMsg.CommType() == commType, "expected communicator type %s, got %s", commType, details.InitMsg.CommType())
 
-	if initSpec, ok := etlMsg.(*etl.InitSpecMsg); ok {
+	if initSpec, ok := details.InitMsg.(*etl.InitSpecMsg); ok {
 		tassert.Errorf(t, bytes.Equal(spec, initSpec.Spec), "pod specs differ, expected %s, got %s", string(spec), string(initSpec.Spec))
 	}
 
-	return
+	return msg
 }
 
-func InitCode(t *testing.T, bp api.BaseParams, msg *etl.InitCodeMsg) (xid string) {
-	id, err := api.ETLInit(bp, msg)
+func InspectPod(t *testing.T, podName string) corev1.Pod {
+	client, err := k8s.InitTestClient(tools.DefaultNamespace)
 	tassert.CheckFatal(t, err)
-	tassert.Errorf(t, cos.IsValidUUID(id), "expected valid xaction ID, got %q", xid)
-	xid = id
-
-	// reread `InitMsg` and compare with the specified
-	etlMsg, err := api.ETLGetInitMsg(bp, msg.Name())
+	pod, err := client.Pod(podName)
 	tassert.CheckFatal(t, err)
-
-	initCode := etlMsg.(*etl.InitCodeMsg)
-	tassert.Errorf(t, initCode.Name() == msg.Name(), "expected etlName %q != %q", msg.Name(), initCode.Name())
-	tassert.Errorf(t, msg.CommType() == "" || initCode.CommType() == msg.CommType(),
-		"expected communicator type %s != %s", msg.CommType(), initCode.CommType())
-	tassert.Errorf(t, msg.Runtime == initCode.Runtime, "expected runtime %s != %s", msg.Runtime, initCode.Runtime)
-	tassert.Errorf(t, bytes.Equal(msg.Code, initCode.Code), "ETL codes differ")
-	tassert.Errorf(t, bytes.Equal(msg.Deps, initCode.Deps), "ETL dependencies differ")
-
-	return
+	return *pod
 }
 
 func ETLBucketWithCleanup(t *testing.T, bp api.BaseParams, bckFrom, bckTo cmn.Bck, msg *apc.TCBMsg) string {
@@ -424,7 +424,7 @@ func ETLBucketWithCleanup(t *testing.T, bp api.BaseParams, bckFrom, bckTo cmn.Bc
 		tools.DestroyBucket(t, bp.URL, bckTo)
 	})
 
-	tlog.Logf("ETL[%s]: running %s => %s xaction %q\n",
+	tlog.Logfln("ETL[%s]: running %s => %s xaction %q",
 		msg.Transform.Name, bckFrom.Cname(""), bckTo.Cname(""), xid)
 	return xid
 }
@@ -434,7 +434,7 @@ func ETLBucketWithCmp(t *testing.T, bp api.BaseParams, bckFrom, bckTo cmn.Bck, m
 	err := WaitForFinished(bp, xid, apc.ActETLBck, 3*time.Minute)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("ETL[%s]: comparing buckets, %s vs %s\n", msg.Transform.Name, bckFrom.Cname(""), bckTo.Cname(""))
+	tlog.Logfln("ETL[%s]: comparing buckets, %s vs %s", msg.Transform.Name, bckFrom.Cname(""), bckTo.Cname(""))
 
 	objeList, err := api.ListObjects(bp, bckFrom, &apc.LsoMsg{}, api.ListArgs{})
 	tassert.CheckFatal(t, err)
@@ -463,7 +463,9 @@ func ETLCheckStage(t *testing.T, params api.BaseParams, etlName string, stage et
 func CheckNoRunningETLContainers(t *testing.T, params api.BaseParams) {
 	etls, err := api.ETLList(params)
 	tassert.CheckFatal(t, err)
-	tassert.Fatalf(t, len(etls) == 0, "Expected no ETL running, got %+v", etls)
+	for _, info := range etls {
+		tassert.Fatalf(t, info.Stage == etl.Aborted.String(), "expected no running ETL containers, got %s in stage %s", info.Name, info.Stage)
+	}
 }
 
 func SpecToInitMsg(spec []byte /*yaml*/) (*etl.InitSpecMsg, error) {
@@ -509,18 +511,18 @@ func podTransformTimeout(errCtx *cmn.ETLErrCtx, pod *corev1.Pod) (cos.Duration, 
 	return cos.Duration(v), nil
 }
 
-func ListObjectsWithRetry(bp api.BaseParams, bckTo cmn.Bck, expectedCount int, opts tools.WaitRetryOpts) (err error) {
+func ListObjectsWithRetry(bp api.BaseParams, bckTo cmn.Bck, prefix string, expectedCount int, opts tools.WaitRetryOpts) (err error) {
 	var (
 		retries       = opts.MaxRetries
 		retryInterval = opts.Interval
 		i             int
 	)
 retry:
-	list, err := api.ListObjects(bp, bckTo, nil, api.ListArgs{})
+	list, err := api.ListObjects(bp, bckTo, &apc.LsoMsg{Prefix: prefix}, api.ListArgs{})
 	if err == nil && len(list.Entries) == expectedCount {
 		return nil
 	}
-	if !cmn.IsStatusServiceUnavailable(err) && !cos.IsRetriableConnErr(err) {
+	if !cmn.IsStatusServiceUnavailable(err) && !cos.IsErrRetriableConn(err) {
 		return
 	}
 	time.Sleep(retryInterval)

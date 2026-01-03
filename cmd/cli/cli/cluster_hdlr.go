@@ -109,7 +109,10 @@ var (
 		Name:  commandCluster,
 		Usage: "Monitor and manage AIS cluster: add/remove nodes, change primary gateway, etc.",
 		Subcommands: []cli.Command{
-			makeAlias(showCmdCluster, "", true, commandShow), // alias for `ais show`
+			makeAlias(&showCmdCluster, &mkaliasOpts{newName: commandShow}),
+			makeAlias(&showCmdDashboard, &mkaliasOpts{
+				aliasFor: joinCommandWords(commandShow, cmdDashboard),
+			}),
 			{
 				Name:      cmdCluAttach,
 				Usage:     "Attach remote ais cluster",
@@ -565,13 +568,24 @@ func setPrimaryHandler(c *cli.Context) error {
 }
 
 func startRebHandler(c *cli.Context) (err error) {
-	var (
-		extra, prefix string
-		xargs         = xact.ArgsMsg{Kind: apc.ActRebalance}
-	)
+	var prefix string
 	if flagIsSet(c, verbObjPrefixFlag) {
 		prefix = parseStrFlag(c, verbObjPrefixFlag)
 	}
+
+	xargs := xact.ArgsMsg{Kind: apc.ActRebalance}
+	if flagIsSet(c, latestVerFlag) {
+		xargs.Flags |= xact.FlagLatestVer
+	}
+	if flagIsSet(c, syncFlag) {
+		xargs.Flags |= xact.FlagSync
+		if xargs.Flags&xact.FlagLatestVer != 0 {
+			warn := fmt.Sprintf("%s implies %s (the latter is redundant)", qflprn(syncFlag), qflprn(latestVerFlag))
+			actionWarn(c, warn)
+		}
+	}
+
+	// limited-scope
 	if c.NArg() > 0 {
 		uri := preparseBckObjURI(c.Args().Get(0))
 		bck, pref, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
@@ -598,6 +612,8 @@ func startRebHandler(c *cli.Context) (err error) {
 	if xargs.Bck.IsEmpty() && prefix != "" {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
+
+	var extra string
 	if !xargs.Bck.IsEmpty() {
 		extra = prefix
 		actionWarn(c, "limiting the scope of rebalance to only '"+xargs.Bck.Cname(extra)+"' is not recommended!")

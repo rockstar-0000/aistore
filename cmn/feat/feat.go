@@ -6,8 +6,10 @@ package feat
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
@@ -24,26 +26,29 @@ const (
 
 const (
 	EnforceIntraClusterAccess = Flags(1 << iota)
-	SkipVC                    // (*) skip loading existing object's metadata, Version and Checksum (VC) in particular
+	SkipVC                    // skip loading existing object's metadata, Version and Checksum (VC) in particular (advanced usage only)
 	DontAutoDetectFshare      // do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 	S3APIviaRoot              // handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)
-	FsyncPUT                  // (*) when finalizing PUT(object): fflush prior to (close, rename) sequence
+	FsyncPUT                  // when finalizing PUT(object): fflush prior to (close, rename) sequence
 	LZ4Block1MB               // .tar.lz4 format, lz4 compression: max uncompressed block size=1MB (default: 256K)
 	LZ4FrameChecksum          // checksum lz4 frames (default: don't)
 	DontAllowPassingFQNtoETL  // do not allow passing fully-qualified name of a locally stored object to (local) ETL containers
 	IgnoreLimitedCoexistence  // run in presence of "limited coexistence" type conflicts (same as e.g. CopyBckMsg.Force but globally)
-	S3PresignedRequest        // (*) pass-through client-signed (presigned) S3 requests for subsequent authentication by S3
+	S3PresignedRequest        // pass-through client-signed (presigned) S3 requests for subsequent authentication by S3
 	DontOptimizeVirtualDir    // when prefix doesn't end with '/' and is a subdirectory: don't assume there are no _prefixed_ obj names
 	DisableColdGET            // disable cold-GET (from remote bucket)
 	StreamingColdGET          // write and transmit cold-GET content back to user in parallel, without _finalizing_ in-cluster object
 	S3ReverseProxy            // intra-cluster communications: instead of regular HTTP redirects reverse-proxy S3 API calls to designated targets
 	S3UsePathStyle            // use older path-style addressing (as opposed to virtual-hosted style), e.g., https://s3.amazonaws.com/BUCKET/KEY
 	DontDeleteWhenRebalancing // disable lazy deletion during global rebalance: do not delete misplaced sources of the migrated objects
-	DontSetControlPlaneToS    // intra-cluster control plane: do not set IPv4 ToS field (to low-latency)
+	DontSetControlPlaneToS    // intra-cluster control plane: use default network priority (do not set IPv4 ToS to low-latency)
 	TrustCryptoSafeChecksums  // when checking whether objects are identical trust only cryptographically secure checksums
 	S3ListObjectVersions      // when versioning info is requested, use ListObjectVersions API (beware: extremely slow, versioned S3 buckets only)
-	EnableDetailedPromMetrics // include (bucket, xaction) Prometheus variable labels with every GET and PUT transaction
+	EnableDetailedPromMetrics // include (bucket, xaction) Prometheus variable labels with every GET, PUT, and HEAD transaction
 	SystemReserved            // reserved; do not set: the flag may be redefined or removed at any time
+	ResumeInterruptedMPU      // resume interrupted multipart uploads from persisted partial manifests
+	KeepUnknownFQN            // do not delete unrecognized/invalid FQNs during space cleanup ('ais space-cleanup')
+	LoadBalanceGET            // when bucket is n-way mirrored read object replica from the least-utilized mountpath
 )
 
 var Cluster = [...]string{
@@ -68,8 +73,11 @@ var Cluster = [...]string{
 	"S3-ListObjectVersions",
 	"Enable-Detailed-Prom-Metrics",
 	"System-Reserved",
+	"Resume-Interrupted-MPU",
+	"Keep-Unknown-FQN",
+	"Load-Balance-GET",
 
-	// "none" ====================
+	// apc.ResetToken ("none") ===========
 }
 
 var Bucket = [...]string{
@@ -80,9 +88,20 @@ var Bucket = [...]string{
 	"Streaming-Cold-GET",
 	"S3-Use-Path-Style", // https://aws.amazon.com/blogs/aws/amazon-s3-path-deprecation-plan-the-rest-of-the-story
 	"S3-ListObjectVersions",
+	"Resume-Interrupted-MPU",
 
-	// "none" ====================
+	// apc.ResetToken ("none") ===========
 }
+
+// as cmn.Validator and cmn.PropsValidator
+func (f *Flags) Validate() error {
+	if f.IsSet(DisableColdGET) && f.IsSet(StreamingColdGET) {
+		return fmt.Errorf("feature flags %q and %q are mutually exclusive", DisableColdGET.name(), StreamingColdGET.name())
+	}
+	return nil
+}
+
+func (f *Flags) ValidateAsProps(...any) error { return f.Validate() }
 
 func (f Flags) IsSet(flag Flags) bool { return cos.BitFlags(f).IsSet(cos.BitFlags(flag)) }
 func (f Flags) Set(flags Flags) Flags { return Flags(cos.BitFlags(f).Set(cos.BitFlags(flags))) }
@@ -98,7 +117,7 @@ func IsBucketScope(name string) bool {
 }
 
 func CSV2Feat(s string) (Flags, error) {
-	if s == "" || s == "none" {
+	if s == "" || s == apc.ResetToken {
 		return 0, nil
 	}
 	for i, name := range Cluster {
@@ -107,6 +126,15 @@ func CSV2Feat(s string) (Flags, error) {
 		}
 	}
 	return 0, errors.New("unknown feature flag '" + s + "'")
+}
+
+func (f Flags) name() string {
+	for i, n := range Cluster {
+		if f&(1<<i) != 0 {
+			return n
+		}
+	}
+	return ""
 }
 
 func (f Flags) Names() (names []string) {

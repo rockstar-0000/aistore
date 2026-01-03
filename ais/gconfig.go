@@ -7,7 +7,6 @@ package ais
 import (
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -90,13 +89,13 @@ func newConfigOwner(config *cmn.Config) (co *configOwner) {
 // (with respect to those in-memory only updated values)
 // See also:
 // - api.SetClusterConfig
-// - apc.ActTransient
+// - apc.QparamTransient
 func (co *configOwner) get() (clone *globalConfig, err error) {
 	clone = &globalConfig{}
 	if _, err = jsp.LoadMeta(co.globalFpath, clone); err == nil {
 		return clone, nil
 	}
-	if os.IsNotExist(err) {
+	if cos.IsNotExist(err) {
 		err = nil
 	} else {
 		nlog.Errorf("failed to load global config from %s: %v", co.globalFpath, err)
@@ -188,11 +187,10 @@ func (*configOwner) persistBytes(payload msPayload, globalFpath string) (done bo
 	return
 }
 
-// NOTE: must be called under config-owner lock
-func setConfig(toUpdate *cmn.ConfigToSet, transient bool) (err error) {
+// must be called under config-owner lock
+func setConfig(toUpdate *cmn.ConfigToSet, transient bool) error {
 	clone := cmn.GCO.Clone()
-	err = setConfigInMem(toUpdate, clone, apc.Daemon)
-	if err != nil {
+	if err := setConfigInMem(toUpdate, clone, apc.Daemon, transient); err != nil {
 		return err
 	}
 	override := cmn.GCO.GetOverride()
@@ -212,9 +210,8 @@ func setConfig(toUpdate *cmn.ConfigToSet, transient bool) (err error) {
 	return nil
 }
 
-func setConfigInMem(toUpdate *cmn.ConfigToSet, config *cmn.Config, asType string) (err error) {
-	err = config.UpdateClusterConfig(toUpdate, asType)
-	return
+func setConfigInMem(toUpdate *cmn.ConfigToSet, config *cmn.Config, asType string, transient bool) error {
+	return config.UpdateClusterConfig(toUpdate, asType, cmn.CopyPropsOpts{Transient: transient})
 }
 
 func (co *configOwner) resetDaemonConfig() (err error) {

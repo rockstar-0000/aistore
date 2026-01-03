@@ -26,10 +26,10 @@ const GitHubHome = "https://github.com/NVIDIA/aistore"
 //   `jsp` formats its *signature* and other implementation details.
 
 const (
-	VersionAIStore = "3.29"
-	VersionCLI     = "1.18"
-	VersionLoader  = "1.13"
-	VersionAuthN   = "1.2"
+	VersionAIStore = "4.1"
+	VersionCLI     = "1.22"
+	VersionLoader  = "2.1"
+	VersionAuthN   = "1.4"
 )
 
 // NOTE: for (local) LOM meta-versions, see core/lom*
@@ -37,9 +37,9 @@ const (
 const (
 	MetaverSmap  = 2 // Smap (cluster map) formatting version a.k.a. meta-version (see core/meta/jsp.go)
 	MetaverBMD   = 2 // BMD (bucket metadata) --/--
-	MetaverRMD   = 1 // Rebalance MD (jsp)
+	MetaverRMD   = 2 // Rebalance MD (jsp)
 	MetaverVMD   = 2 // Volume MD (jsp)
-	MetaverEtlMD = 1 // ETL MD (jsp)
+	MetaverEtlMD = 2 // ETL MD (jsp)
 
 	MetaverConfig      = 4 // Global Configuration (jsp)
 	MetaverAuthNConfig = 1 // Authn config (jsp) // ditto

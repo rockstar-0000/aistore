@@ -1,7 +1,6 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -10,18 +9,20 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 // Rx demux -------------------------------
 
 const (
-	numHmaps = 16
+	numHmaps = 32
 	mskHmaps = numHmaps - 1
 
 	numOld = 32
 )
 
-type hmap map[string]handler
+type hmap map[string]*handler
 
 type (
 	errTrname struct {
@@ -34,24 +35,23 @@ type (
 )
 
 var (
-	hmaps [numHmaps]hmap // current (active) Rx endpoints
+	// current (active) Rx endpoints
+	// (static fixed-size map to reduce mutex contention)
+	hmaps [numHmaps]hmap
 	hmtxs [numHmaps]sync.Mutex
 
-	old    [numOld]string // a limited pool of the most recently closed Rx endpoints
+	// limited pool of the most recently closed Rx endpoints
+	old    [numOld]string
 	oldIdx int
 	oldMtx sync.Mutex
 )
 
 func _idx(trname string) byte {
-	l := len(trname)
-	b := trname[l-1]
-	if l >= cos.LenShortID {
-		return (-b ^ trname[l-2]) & mskHmaps
-	}
-	return (b ^ trname[0]) & mskHmaps
+	hash := onexxh.Checksum64S(cos.UnsafeB(trname), cos.MLCG32)
+	return byte(hash & mskHmaps)
 }
 
-func oget(trname string) (h handler, err error) {
+func oget(trname string) (h *handler, err error) {
 	i := _idx(trname)
 	hmtxs[i].Lock()
 	hmap := hmaps[i]
@@ -76,7 +76,7 @@ func _lookup(trname string) error {
 	return &errUnknownTrname{errTrname{trname}}
 }
 
-func oput(trname string, h handler) (err error) {
+func oput(trname string, h *handler) (err error) {
 	i := _idx(trname)
 	hmtxs[i].Lock()
 	hmap := hmaps[i]
@@ -94,7 +94,7 @@ func odel(trname string) (err error) {
 	i := _idx(trname)
 	hmtxs[i].Lock()
 	hmap := hmaps[i]
-	h, ok := hmap[trname]
+	_, ok := hmap[trname]
 	if !ok {
 		hmtxs[i].Unlock()
 		return &errAlreadyRemovedTrname{errTrname{trname}}
@@ -102,8 +102,6 @@ func odel(trname string) (err error) {
 
 	delete(hmap, trname)
 	hmtxs[i].Unlock()
-
-	h.unreg()
 
 	oldMtx.Lock()
 	old[oldIdx] = trname

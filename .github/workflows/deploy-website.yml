@@ -8,10 +8,42 @@ on:
 jobs:
   deploy_website:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.25.x']
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Install OpenAPI Generator CLI
+        run: |
+          mkdir -p ~/bin/openapitools
+          curl -L https://raw.githubusercontent.com/OpenAPITools/openapi-generator/master/bin/utils/openapi-generator-cli.sh > ~/bin/openapitools/openapi-generator-cli
+          chmod +x ~/bin/openapitools/openapi-generator-cli
+          echo "$HOME/bin/openapitools" >> $GITHUB_PATH
+
+      - name: Generate API Documentation
+        run: |
+          cd tools/gendocs
+          go run .
+          cd ../..
+          make restful-api-doc
+          OPENAPI_GENERATOR_VERSION=7.14.0 openapi-generator-cli generate -i .docs/swagger.yaml -g markdown -o ./docs-generated --template-dir ./markdown-template --skip-validate-spec
+          cp docs-generated/README.md docs/http-api.md
+          cp -r docs-generated/Apis docs/
+          cp -r docs-generated/Models docs/
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -32,5 +64,5 @@ jobs:
           bundle exec jekyll build
           # ── deploy from repo root ───────────────
           cd "$GITHUB_WORKSPACE"
-          npm install -g netlify-cli
+          npm install -g netlify-cli@23.7.3
           netlify deploy --dir=docs/_site --prod

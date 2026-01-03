@@ -19,7 +19,7 @@ import (
 
 func (t *target) Promote(params *core.PromoteParams) (ecode int, err error) {
 	lom := core.AllocLOM(params.ObjName)
-	if err = lom.InitBck(params.Bck.Bucket()); err == nil {
+	if err = lom.InitBck(params.Bck); err == nil {
 		ecode, err = t._promote(params, lom)
 	}
 	core.FreeLOM(lom)
@@ -77,7 +77,7 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 			buf, slab = t.gmm.Alloc()
 			err       error
 		)
-		workFQN = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfilePut)
+		workFQN = lom.GenFQN(fs.WorkCT, fs.WorkfilePut)
 		fileSize, cksum, err = cos.CopyFile(params.SrcFQN, workFQN, buf, lom.CksumType())
 		slab.Free(buf)
 		if err != nil {
@@ -88,7 +88,7 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 		// avoid extra copy: use the source as `workFQN`
 		fi, err := os.Stat(params.SrcFQN)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if cos.IsNotExist(err) {
 				err = nil
 			}
 			return -1, 0, err
@@ -99,8 +99,8 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 		if params.Cksum != nil {
 			lom.SetCksum(params.Cksum) // already computed somewhere else, use it
 		} else {
-			clone := lom.CloneMD(params.SrcFQN)
-			if cksum, err = clone.ComputeCksum(lom.CksumType()); err != nil {
+			clone := lom.CloneTo(params.SrcFQN)
+			if cksum, err = clone.ComputeCksum(lom.CksumType(), false); err != nil {
 				core.FreeLOM(clone)
 				return 0, 0, err
 			}
@@ -109,7 +109,7 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 		}
 	}
 
-	if params.Cksum != nil && cksum != nil && !cksum.IsEmpty() {
+	if params.Cksum != nil && !cos.NoneH(cksum) {
 		if !cksum.Equal(params.Cksum) {
 			return 0, 0, cos.NewErrDataCksum(
 				cksum.Clone(),
@@ -157,18 +157,18 @@ func (t *target) _promRemote(params *core.PromoteParams, lom *core.LOM, tsi *met
 	}
 	coi := (*coi)(coiParams)
 
-	// TODO: given we already have the lom, the following fstat might not be necessary
+	// not opening LOM here - opening params.SrcFQN source (to be promoted)
 	fh, err := cos.NewFileHandle(lom.FQN)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if cos.IsNotExist(err) {
 			return 0, err
 		}
-		return 0, cmn.NewErrFailedTo(t, "open", lom.Cname(), err)
+		return 0, cmn.NewErrFailedTo(t, "open", params.SrcFQN, err)
 	}
 	fi, err := fh.Stat()
 	if err != nil {
 		fh.Close()
-		return 0, cmn.NewErrFailedTo(t, "fstat", lom.Cname(), err)
+		return 0, cmn.NewErrFailedTo(t, "fstat", params.SrcFQN, err)
 	}
 
 	res := coi.send(t, nil /*DM*/, lom, fh, tsi)

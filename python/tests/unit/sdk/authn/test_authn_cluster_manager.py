@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 import unittest
@@ -111,7 +111,7 @@ class TestAuthNClusterManager(unittest.TestCase):
         self.mock_client.request.assert_called_once_with(
             HTTP_METHOD_PUT,
             path=f"{URL_PATH_AUTHN_CLUSTERS}/{cluster_id}",
-            json=mock_cluster_info.dict(),
+            json=mock_cluster_info.model_dump(),
         )
 
     def test_delete_cluster(self):

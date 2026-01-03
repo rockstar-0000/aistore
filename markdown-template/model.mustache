@@ -1,0 +1,23 @@
+{{#models}}
+{{#model}}
+# {{{classname}}}
+
+{{#vendorExtensions.x-supported-actions}}
+{{#-first}}**Supported actions:** {{/-first}}{{{.}}}{{^-last}}, {{/-last}}
+{{/vendorExtensions.x-supported-actions}}
+## Properties
+
+| Name | Type | Description |
+|------------ | ------------- | -------------|
+{{#parent}}
+{{#parentVars}}
+| **{{name}}** | {{#isPrimitiveType}}**{{dataType}}**{{/isPrimitiveType}}{{^isPrimitiveType}}[**{{dataType}}**]({{complexType}}.html){{/isPrimitiveType}} | {{description}}{{#readOnly}} [readonly]{{/readOnly}} |
+{{/parentVars}}
+{{/parent}}
+{{#vars}}| **{{name}}** | {{#isPrimitiveType}}**{{dataType}}**{{/isPrimitiveType}}{{^isPrimitiveType}}[**{{dataType}}**]({{complexType}}.html){{/isPrimitiveType}} | {{description}}{{#readOnly}} [readonly]{{/readOnly}} |
+{{/vars}}
+
+[[Back to Model list]](../http-api#documentation-for-models) [[Back to API list]](../http-api#documentation-for-api-endpoints)
+
+{{/model}}
+{{/models}}

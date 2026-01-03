@@ -73,6 +73,30 @@ func (b *Bck) IsRemoteS3() bool {
 	return backend != nil && backend.Provider == apc.AWS
 }
 
+func (b *Bck) IsRemoteOCI() bool {
+	if b.Provider == apc.OCI {
+		return true
+	}
+	backend := b.Backend()
+	return backend != nil && backend.Provider == apc.OCI
+}
+
+func (b *Bck) IsRemoteGCP() bool {
+	if b.Provider == apc.GCP {
+		return true
+	}
+	backend := b.Backend()
+	return backend != nil && backend.Provider == apc.GCP
+}
+
+func (b *Bck) IsRemoteAzure() bool {
+	if b.Provider == apc.Azure {
+		return true
+	}
+	backend := b.Backend()
+	return backend != nil && backend.Provider == apc.Azure
+}
+
 // TODO: mem-pool
 func (b *Bck) NewQuery() (q url.Values) {
 	q = make(url.Values, 4)
@@ -85,7 +109,7 @@ func (b *Bck) Backend() *Bck { backend := (*cmn.Bck)(b).Backend(); return (*Bck)
 
 func (b *Bck) AddUnameToQuery(q url.Values, uparam string) url.Values {
 	bck := (*cmn.Bck)(b)
-	return bck.AddUnameToQuery(q, uparam)
+	return bck.AddUnameToQuery(q, uparam, "")
 }
 
 func (b *Bck) String() string {
@@ -97,7 +121,7 @@ func (b *Bck) String() string {
 	// add BID
 	// for the mask to clear "ais" bit and/or other high bits reserved for LOM flags, see core/lombid
 	const (
-		aisBID = uint64(1 << 63)
+		aisBID = cos.MSB64
 	)
 	var sb strings.Builder
 	sb.Grow(64)
@@ -109,6 +133,13 @@ func (b *Bck) String() string {
 }
 
 func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
+	if b == nil || other == nil {
+		return false
+	}
+	if b == other {
+		return true
+	}
+
 	left, right := (*cmn.Bck)(b), (*cmn.Bck)(other)
 	if left.IsEmpty() || right.IsEmpty() {
 		return false
@@ -116,16 +147,21 @@ func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
 	if !left.Equal(right) {
 		return false
 	}
+
+	// only enforce BID when both are initialized
 	if sameID && b.Props != nil && other.Props != nil && b.Props.BID != other.Props.BID {
 		return false
 	}
 	if !sameBackend {
 		return true
 	}
-	if backleft, backright := left.Backend(), right.Backend(); backleft != nil && backright != nil {
-		return backleft.Equal(backright)
+
+	// for backends: (nil, nil) is fine; otherwise by (name, provider, namespace) only
+	bl, br := left.Backend(), right.Backend()
+	if bl == nil || br == nil {
+		return bl == br
 	}
-	return true
+	return bl.Equal(br)
 }
 
 func (b *Bck) Eq(other *cmn.Bck) bool { return other.Equal(b.Bucket()) }
@@ -152,7 +188,7 @@ func (b *Bck) Init(bowner Bowner) (err error) {
 				exists = p.BID == backend.Props.BID
 			}
 			if !exists {
-				err = cmn.NewErrRemoteBckNotFound(backend.Bucket())
+				err = cmn.NewErrRemBckNotFound(backend.Bucket())
 			} else if backend.Props != p {
 				backend.Props = p
 			}
@@ -180,19 +216,16 @@ func (b *Bck) init(bmd *BMD) error {
 	switch {
 	case b.Provider == "": // ais: is the default
 		b.Provider = apc.AIS
-		bmd.initBckGlobalNs(b)
-	case apc.IsRemoteProvider(b.Provider):
-		bmd.initBck(b)
+		fallthrough
+	case apc.IsRemoteProvider(b.Provider) && b.Ns.IsGlobal():
+		bmd.initBckGlob(b)
 	default:
 		b.Props, _ = bmd.Get(b)
 	}
 	if b.Props != nil {
 		return nil // ok
 	}
-	if b.IsAIS() {
-		return cmn.NewErrBckNotFound(b.Bucket())
-	}
-	return cmn.NewErrRemoteBckNotFound(b.Bucket())
+	return cmn.NewErrBckNotFound(b.Bucket())
 }
 
 // to support s3 clients:
@@ -203,12 +236,12 @@ func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, ecode int, err err
 	all := bmd.getAllByName(bckName)
 	switch {
 	case all == nil:
-		err = cmn.NewErrBckNotFound(&cmn.Bck{Name: bckName})
+		err = cmn.NewErrAisBckNotFound(&cmn.Bck{Name: bckName})
 		ecode = http.StatusNotFound
 	case len(all) == 1:
 		bck = &all[0]
 		if bck.Props == nil {
-			err = cmn.NewErrBckNotFound(bck.Bucket())
+			err = cmn.NewErrAisBckNotFound(bck.Bucket())
 			ecode = http.StatusNotFound
 		} else if backend := bck.Backend(); backend != nil && backend.Props == nil {
 			debug.Assert(apc.IsRemoteProvider(backend.Provider))
@@ -277,23 +310,33 @@ func (b *Bck) MaxPageSize() int64 {
 // rate limits: frontend, backend with respect to `nat` (number active targets)
 //
 
-func (b *Bck) NewFrontendRateLim(na int) *cos.BurstRateLim {
+func (b *Bck) NewFrontendRateLim(na int) (*cos.BurstRateLim, error) {
 	conf := b.Props.RateLimit.Frontend
 	if !conf.Enabled {
-		return nil
+		return nil, nil
+	}
+	if na <= 0 {
+		err := cmn.NewErrNoNodes(apc.Proxy, 0)
+		debug.Assert(false, err, " ", na)
+		return nil, err
 	}
 	maxTokens := cos.DivRound(conf.MaxTokens, na)
-	brl, err := cos.NewBurstRateLim(maxTokens, conf.Size, conf.Interval.D())
+	brl, err := cos.NewBurstRateLim(b.Cname(""), maxTokens, conf.Size, conf.Interval.D())
 	if err != nil {
-		nlog.ErrorDepth(1, err)
-		debug.AssertNoErr(err)
+		nlog.ErrorDepth(1, err, "[num active nodes:", na, "]")
+		return nil, err
 	}
-	return brl
+	return brl, nil
 }
 
 func (b *Bck) NewBackendRateLim(nat int) *cos.AdaptRateLim {
 	conf := b.Props.RateLimit.Backend
 	if !conf.Enabled {
+		return nil
+	}
+	if nat <= 0 {
+		err := cmn.NewErrNoNodes(apc.Target, 0)
+		debug.Assert(false, err, " ", nat)
 		return nil
 	}
 	if b.IsCloud() && conf.NumRetries < 3 {
@@ -309,4 +352,22 @@ func (b *Bck) NewBackendRateLim(nat int) *cos.AdaptRateLim {
 		debug.AssertNoErr(err)
 	}
 	return arl
+}
+
+// parse and validate
+func ParseUname(uname string, withObjname bool) (*Bck, string, error) {
+	bck, objName := cmn.ParseUname(uname)
+	if err := bck.Validate(); err != nil {
+		return nil, "", err
+	}
+
+	withoutObjname := !withObjname
+	switch {
+	case objName != "" && withoutObjname:
+		return nil, "", fmt.Errorf("parse-uname %q: not expecting object name (got %q)", uname, bck.Cname(objName))
+	case objName == "" && withObjname:
+		return nil, "", fmt.Errorf("parse-uname %q: missing object name in %q", uname, bck.Cname(""))
+	default:
+		return CloneBck(&bck), objName, nil
+	}
 }

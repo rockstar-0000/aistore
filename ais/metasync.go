@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -87,8 +88,9 @@ const (
 	revsConfTag  = "Conf"
 	revsTokenTag = "token"
 	revsEtlMDTag = "EtlMD"
+	revsCSKTag   = cskTag
 
-	revsMaxTags   = 6         // NOTE
+	revsMaxTags   = 7         // NOTE
 	revsActionTag = "-action" // prefix revs tag
 )
 
@@ -132,15 +134,15 @@ type (
 
 	// main
 	metasyncer struct {
-		p            *proxy            // parent
-		nodesRevs    map[string]ndRevs // cluster-wide node ID => ndRevs sync-ed
-		sgls         map[string]tagl   // tag => (version => SGL)
-		lastSynced   map[string]revs   // tag => revs last/current sync-ed
-		stopCh       chan struct{}     // stop channel
-		workCh       chan revsReq      // work channel
-		retryTimer   *time.Timer       // timer to sync pending
-		chanFull     cos.ChanFull      // as implied
-		timerStopped bool              // true if retryTimer has been stopped, false otherwise
+		p          *proxy            // parent
+		nodesRevs  map[string]ndRevs // cluster-wide node ID => ndRevs sync-ed
+		sgls       map[string]tagl   // tag => (version => SGL)
+		lastSynced map[string]revs   // tag => revs last/current sync-ed
+		stopCh     chan struct{}     // stop channel
+		workCh     chan revsReq      // work channel
+		retryTimer *time.Timer       // timer to sync pending
+		chanFull   cos.ChanFull      // as implied
+		timerOn    atomic.Bool       // true iff retryTimer is scheduled
 	}
 	// metasync Rx structured error
 	errMsync struct {
@@ -171,8 +173,20 @@ func newMetasyncer(p *proxy) (y *metasyncer) {
 
 	y.retryTimer = time.NewTimer(time.Hour)
 	y.retryTimer.Stop()
-	y.timerStopped = true
 	return
+}
+
+func (y *metasyncer) tmOff() {
+	if y.timerOn.CAS(true, false) {
+		y.retryTimer.Stop()
+	}
+}
+
+func (y *metasyncer) tmOn() {
+	if y.timerOn.CAS(false, true) {
+		config := cmn.GCO.Get()
+		y.retryTimer = time.NewTimer(config.Periodic.RetrySyncTime.D())
+	}
 }
 
 func (y *metasyncer) Run() error {
@@ -187,8 +201,7 @@ func (y *metasyncer) Run() error {
 				y.nodesRevs = make(map[string]ndRevs)
 				y.free()
 				y.lastSynced = make(map[string]revs)
-				y.retryTimer.Stop()
-				y.timerStopped = true
+				y.tmOff()
 				break
 			}
 			failedCnt := y.do(revsReq.pairs, revsReq.ty)
@@ -199,30 +212,24 @@ func (y *metasyncer) Run() error {
 				revsReq.wg.Done()
 			}
 
-			// timed retry, via handlePending()
-			if y.timerStopped && failedCnt > 0 && revsReq.ty != reqNotify {
-				config := cmn.GCO.Get()
-				y.retryTimer.Reset(config.Periodic.RetrySyncTime.D())
-				y.timerStopped = false
+			// schedule timed retry via handlePending()
+			if failedCnt > 0 && revsReq.ty != reqNotify {
+				y.tmOn()
 			}
 			for _, revs := range y.lastSynced {
 				y.delold(revs, 1)
 			}
 		case <-y.retryTimer.C:
+			y.timerOn.Store(false)
 			failedCnt := y.handlePending()
 			if failedCnt > 0 {
-				config := cmn.GCO.Get()
-				y.retryTimer.Reset(config.Periodic.RetrySyncTime.D())
-				y.timerStopped = false
-
+				y.tmOn()
 				if l, c := len(y.workCh), cap(y.workCh); y.chanFull.Check(l, c) {
 					nlog.Errorln("[hp full]:", y.chanFull.Load(), "failed", failedCnt)
 				}
-			} else {
-				y.timerStopped = true
 			}
 		case <-y.stopCh:
-			y.retryTimer.Stop()
+			y.tmOff()
 			return nil
 		}
 	}
@@ -381,7 +388,7 @@ func (y *metasyncer) do(pairs []revsPair, reqT int) (failedCnt int) {
 			continue
 		}
 		// - retrying, counting
-		if cos.IsRetriableConnErr(err) || cos.StringInSlice(res.si.ID(), newTIDs) { // always retry newTIDs (joining)
+		if cos.IsErrRetriableConn(err) || slices.Contains(newTIDs, res.si.ID()) { // always retry newTIDs (joining)
 			if refused == nil {
 				refused = make(meta.NodeMap, 2)
 			}

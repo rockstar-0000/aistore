@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch, call
 
 from tests.const import LARGE_FILE_SIZE, ETL_NAME, PREFIX_NAME
+from tests.utils import cases
 
 from aistore.sdk import Bucket
 from aistore.sdk.const import (
@@ -36,8 +37,11 @@ class TestObjectGroup(unittest.TestCase):
             name=self.mock_bck.name, provider=self.mock_bck.provider
         )
         self.mock_bck.as_model.return_value = self.mock_bck_model
+        self.mock_client = Mock()
         namespace = Namespace(name="ns-name", uuid="ns-id")
-        self.dest_bucket = Bucket(name="to-bucket", namespace=namespace)
+        self.dest_bucket = Bucket(
+            client=self.mock_client, name="to-bucket", namespace=namespace
+        )
 
         self.obj_names = ["obj-1", "obj-2"]
         self.object_group = ObjectGroup(self.mock_bck, obj_names=self.obj_names)
@@ -67,11 +71,23 @@ class TestObjectGroup(unittest.TestCase):
                 obj_template=obj_template,
             )
 
+    # pylint: disable=too-many-arguments, too-many-positional-arguments
     def object_group_test_helper(
-        self, object_group_function, http_method, action, expected_value, **kwargs
+        self,
+        object_group_function,
+        http_method,
+        action,
+        expected_value,
+        expect_list=False,
+        **kwargs
     ):
-        resp_text = object_group_function(**kwargs)
-        self.assertEqual(self.mock_response_text, resp_text)
+        resp = object_group_function(**kwargs)
+        if expect_list:
+            # For copy and archive operations that return List[str]
+            self.assertEqual([self.mock_response_text], resp)
+        else:
+            # For delete, evict, prefetch operations that return str
+            self.assertEqual(self.mock_response_text, resp)
         self.mock_bck.make_request.assert_called_with(
             http_method,
             action,
@@ -129,7 +145,7 @@ class TestObjectGroup(unittest.TestCase):
         self.expected_value["prepend"] = ""
         self.expected_value["dry_run"] = False
         self.expected_value["force"] = False
-        self.expected_value["tobck"] = self.dest_bucket.as_model()
+        self.expected_value["tobck"] = self.dest_bucket.as_model().model_dump()
         self.expected_value["coer"] = False
         self.expected_value["latest-ver"] = False
         self.expected_value["synchronize"] = False
@@ -139,6 +155,7 @@ class TestObjectGroup(unittest.TestCase):
             HTTP_METHOD_POST,
             ACT_COPY_OBJECTS,
             self.expected_value,
+            expect_list=True,
             to_bck=self.dest_bucket,
         )
         # Test provided optional args
@@ -156,6 +173,7 @@ class TestObjectGroup(unittest.TestCase):
             HTTP_METHOD_POST,
             ACT_COPY_OBJECTS,
             self.expected_value,
+            expect_list=True,
             to_bck=self.dest_bucket,
             prepend=prepend_val,
             force=True,
@@ -179,8 +197,9 @@ class TestObjectGroup(unittest.TestCase):
         self.expected_value["dry_run"] = False
         self.expected_value["force"] = False
         self.expected_value["id"] = ETL_NAME
+        self.expected_value["pipeline"] = None
         self.expected_value["request_timeout"] = DEFAULT_ETL_TIMEOUT
-        self.expected_value["tobck"] = self.dest_bucket.as_model()
+        self.expected_value["tobck"] = self.dest_bucket.as_model().model_dump()
         self.expected_value["coer"] = False
         self.expected_value["latest-ver"] = False
         self.expected_value["synchronize"] = False
@@ -193,6 +212,7 @@ class TestObjectGroup(unittest.TestCase):
             self.expected_value,
             to_bck=self.dest_bucket,
             etl_name=ETL_NAME,
+            etl_pipeline=None,
         )
         # Test provided optional args
         timeout = "30s"
@@ -246,6 +266,7 @@ class TestObjectGroup(unittest.TestCase):
             HTTP_METHOD_PUT,
             ACT_ARCHIVE_OBJECTS,
             expected_value=expected_value,
+            expect_list=True,
             archive_name=archive_name,
         )
 
@@ -253,7 +274,10 @@ class TestObjectGroup(unittest.TestCase):
         archive_name = "test-arch"
         namespace = Namespace(name="ns-name", uuid="ns-id")
         to_bck = Bucket(
-            name="dest-bck-name", namespace=namespace, provider=Provider.AMAZON
+            client=self.mock_client,
+            name="dest-bck-name",
+            namespace=namespace,
+            provider=Provider.AMAZON,
         )
         mime = "text"
         include_source = True
@@ -273,6 +297,7 @@ class TestObjectGroup(unittest.TestCase):
             HTTP_METHOD_PUT,
             ACT_ARCHIVE_OBJECTS,
             expected_value=expected_value,
+            expect_list=True,
             archive_name=archive_name,
             to_bck=to_bck,
             mime=mime,
@@ -303,3 +328,10 @@ class TestObjectGroup(unittest.TestCase):
 
         objs = list(self.object_group.list_all_objects_iter(prefix="obj-1"))
         self.assertEqual(len(objs), 1)
+
+    # pylint: disable=protected-access
+    @cases(("uuid-1", ["uuid-1"]), ("uuid-1,uuid-2", ["uuid-1", "uuid-2"]))
+    def test_parse_job_ids(self, case):
+        job_ids, expected_result = case
+        result = self.object_group._parse_job_ids(job_ids)
+        self.assertEqual(result, expected_result)

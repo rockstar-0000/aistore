@@ -35,13 +35,14 @@ type (
 	walkFunc func(fqn string, de DirEntry) error
 
 	WalkOpts struct {
-		Mi       *Mountpath
-		Callback walkFunc
-		Bck      cmn.Bck
-		Dir      string
-		Prefix   string
-		CTs      []string
-		Sorted   bool // Ignored when using stdlib implementation (always sorted).
+		Mi          *Mountpath
+		Callback    walkFunc
+		Bck         cmn.Bck
+		Dir         string
+		Prefix      string
+		CTs         []string
+		Sorted      bool // Ignored when using stdlib implementation (always sorted).
+		IncludeDirs bool // When true, directories are sent to workCh (for heap sorting) along with files.
 	}
 
 	errCallbackWrapper struct {
@@ -112,7 +113,7 @@ func _join(bdir, prefix string) string {
 		// (unless user says otherwise via feature flag)
 		// _not_ to have the names that contain it as a prefix substring
 		// (as in: "subdir/foo" and "subdir_bar")
-		if finfo, err := os.Stat(sub); err == nil && finfo.IsDir() {
+		if finfo, err := os.Lstat(sub); err == nil && finfo.IsDir() {
 			return sub
 		}
 	}

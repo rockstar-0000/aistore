@@ -1,5 +1,14 @@
 version: "2"
 
+# run  `golangci-lint run --config .golangci.yml` to check changes
+
+issues:
+  # maximum number of issues to print per linter (0 means unlimited)
+  max-issues-per-linter: 0
+
+  # maximum number of issues with the same text to print
+  max-same-issues: 0
+
 linters:
   default: standard  ## TODO: 'none|standard|all'; enable
   disable:
@@ -28,10 +37,12 @@ linters:
     - importas
     - ineffassign
     - intrange
+    - modernize
     - musttag
     - misspell
     - nakedret
     - nilnesserr
+    - noctx
     - nolintlint
     - perfsprint
     - prealloc
@@ -46,6 +57,9 @@ linters:
     - usetesting
     - wastedassign
     - whitespace
+    # containedctx ## (TODO: revisit this group)
+    # ginkgolinter
+    # recvcheck ## (config below)
 
 # See: https://golangci-lint.run/usage/linters/
   settings:
@@ -74,16 +88,19 @@ linters:
         - name: redefines-builtin-id
         - name: string-of-int
         - name: superfluous-else
-        - name: time-naming
+        # name: time-naming
+        - name: time-date
         - name: var-naming
         - name: var-declaration
         - name: unconditional-recursion
         - name: unexported-naming
         - name: unexported-return
+        - name: unnecessary-format
         - name: unnecessary-stmt
         - name: unreachable-code
         - name: unused-parameter
         - name: unused-receiver
+        - name: use-fmt-print
         - name: waitgroup-by-value
 
     errcheck:
@@ -127,6 +144,19 @@ linters:
       # Setting locale to US will correct the British spelling of 'colour' to 'color'.
       locale: US
 
+    recvcheck:
+      disable-builtin: true
+      # The format is `struct_name.method_name` (ex: `Foo.MethodName`).
+      # A wildcard `*` can use as a struct name (ex: `*.MethodName`).
+      exclusions:
+        - "*.UnmarshalJSON"
+        - "*.UnmarshalYAML"
+
+    modernize:
+      # By default, all analyzers are enabled.
+      disable:
+        - omitzero
+
     depguard:
       rules:
         main:
@@ -157,12 +187,20 @@ linters:
           - dupl
           - gosec
           - nakedret
+          - noctx
+          - govet
+          - modernize
       - path: bench/
         linters:
           - nakedret
+          - noctx
+          - modernize
       - path: tools/
         linters:
           - nakedret
+          - noctx
+          - govet
+          - modernize
 
       # Exclude some `staticcheck` messages.
       - linters:
@@ -171,6 +209,10 @@ linters:
       # linters:
       #   - staticcheck
       # text: "ST1005:"
+      - linters:
+          - revive
+        text: "avoid meaningless package names"
+        source: "package api"
 
 formatters:
   enable:
@@ -189,14 +231,14 @@ formatters:
       # test/testdata
 
 run:
-  go: '1.24'
+  go: '1.25'
   tests: true # Enable linting test files.
   concurrency: 8
   timeout: 8m
 
     # NOTE: these are the default build tags for the linter;
     # use `TAGS=... make lint` to check that the corresponding alternative sources do lint correctly;
-    # e.g. `TAGS=statsd make lint`
+    # e.g. `TAGS=aws make lint`
   build-tags:
     - hrw
     - aws
@@ -204,5 +246,3 @@ run:
     - gcp
     - oci
     # - nethttp
-    # - statsd
-

@@ -1,6 +1,6 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
@@ -16,8 +16,13 @@ const (
 	// Memory usage by a process
 	hostProcessStatMemPath = proc + "%d/statm"
 
-	// container stats
+	// Name, Umask, State, other process details
+	// Used to get FDSize
+	hostProcessInfo = proc + "self/status"
+)
 
+// container stats
+const (
 	// path to read all memory info for cgroup
 	contMemPath = "/sys/fs/cgroup/memory/"
 	// path to read all CPU info for cgroup

@@ -39,7 +39,7 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 			LowWM: 75, HighWM: 90, OOS: 95,
 		}
 		config.LRU = cmn.LRUConf{
-			DontEvictTime: cos.Duration(time.Second), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
+			DontEvictTime: cos.Duration(time.Hour), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
 		}
 		cmn.GCO.CommitUpdate(config)
 		cfg = cmn.GCO.Get()
@@ -54,7 +54,8 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 
 				var (
 					bck   = meta.NewBck(fmt.Sprintf("bucket_%d", i), provider, cmn.NsGlobal)
-					props = defaultBckProps(bckPropsArgs{bck: bck, hdr: hdr})
+					bargs = bckPropsArgs{bck: bck, hdr: hdr}
+					props = bargs.inheritMerge()
 				)
 				bmd.add(bck, props)
 			}
@@ -101,7 +102,9 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 							bck := meta.NewBck("abc"+cos.GenTie(), apc.AIS, cmn.NsGlobal)
 
 							// Add bucket and save.
-							clone.add(bck, defaultBckProps(bckPropsArgs{bck: bck}))
+							bargs := bckPropsArgs{bck: bck}
+							nprops := bargs.inheritMerge()
+							clone.add(bck, nprops)
 							err := jsp.Save(testpath, clone, opts, nil)
 							Expect(err).NotTo(HaveOccurred())
 

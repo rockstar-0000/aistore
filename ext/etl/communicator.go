@@ -6,8 +6,10 @@ package etl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,14 +17,14 @@ import (
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
-	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 type (
@@ -33,30 +35,30 @@ type (
 	}
 
 	// Communicator is responsible for managing communications with local ETL pod.
-	// It listens to cluster membership changes and terminates ETL pod, if need be.
 	Communicator interface {
-		meta.Slistener
-
 		ETLName() string
-		PodName() string
-		SvcName() string
 		getInitMsg() InitMsg
 
 		String() string
 
-		SetupConnection() error
-		Stop()
-		Restart(boot *etlBootstrapper)
-		GetPodWatcher() *podWatcher
+		setupConnection(schema, podAddr string) (ecode int, err error)
+		setupXaction(xid string) error
+		stop() error
 		GetSecret() string
-
-		Xact() core.Xact // underlying `apc.ActETLInline` xaction (see xact/xs/etl.go)
-		CommStats        // only stats for `apc.ActETLInline` inline transform
+		Xact() *XactETL // underlying `apc.ActETLInline` xaction (see xact/xs/etl.go)
+		CommStats       // only stats for `apc.ActETLInline` inline transform
 
 		// InlineTransform uses one of the two ETL container endpoints:
 		//  - Method "PUT", Path "/"
 		//  - Method "GET", Path "/bucket/object"
-		InlineTransform(w http.ResponseWriter, r *http.Request, lom *core.LOM, latestVer bool, targs string) (int, error)
+		//  - Returns:
+		//    - size: the size of transformed object
+		//    - ecode: error code
+		//    - err: error encountered during transformation
+		InlineTransform(w http.ResponseWriter, r *http.Request, lom *core.LOM, args *InlineTransArgs) (size int64, ecode int, err error)
+
+		// ProcessDownloadJob extracts objects from job and routes them to ETL pod
+		ProcessDownloadJob(ctx *ETLObjDownloadCtx) (cos.ReadCloseSizer, int, error)
 	}
 
 	// httpCommunicator manages stateless communication to ETL pod through HTTP requests
@@ -69,13 +71,24 @@ type (
 		// - redirectComm
 		// - revProxyComm
 		// See also, and separately: on-the-fly transformation as part of a user (e.g. training model) GET request handling
-		OfflineTransform(lom *core.LOM, latestVer, sync bool, gargs *core.GetROCArgs) core.ReadResp
+		OfflineTransform(lom *core.LOM, latestVer, sync bool, args *core.ETLArgs) core.ReadResp
+	}
+
+	InlineTransArgs struct {
+		TransformArgs string
+		Pipeline      apc.ETLPipeline
+		LatestVer     bool
+		// TODO: add sync option
 	}
 
 	baseComm struct {
-		listener meta.Slistener
-		boot     *etlBootstrapper
-		pw       *podWatcher
+		msg     InitMsg
+		config  *cmn.Config
+		xctn    *XactETL
+		secret  string
+		podAddr string
+		podURI  string
+		stopped atomic.Bool
 	}
 	pushComm struct {
 		baseComm
@@ -108,67 +121,146 @@ var (
 // baseComm //
 //////////////
 
-func newCommunicator(listener meta.Slistener, boot *etlBootstrapper, pw *podWatcher) Communicator {
-	switch boot.msg.CommType() {
+func newCommunicator(msg InitMsg, secret string, config *cmn.Config) (Communicator, error) {
+	switch msg.CommType() {
 	case Hpush, HpushStdin:
 		pc := &pushComm{}
-		pc.listener, pc.boot, pc.pw = listener, boot, pw
-		if boot.msg.CommType() == HpushStdin { // io://
-			pc.command = boot.originalCommand
-		}
-		return pc
+		pc.msg, pc.secret, pc.config = msg, secret, config
+		return pc, nil
 	case Hpull:
 		rc := &redirectComm{}
-		rc.listener, rc.boot, rc.pw = listener, boot, pw
-		return rc
+		rc.msg, rc.secret, rc.config = msg, secret, config
+		return rc, nil
 	case WebSocket:
-		ws := &webSocketComm{offlineSessions: make(map[string]Session, 4)}
+		ws := &webSocketComm{sessions: make(map[string]Session, 4)}
+		ws.msg, ws.secret, ws.config = msg, secret, config
 		ws.commCtx, ws.commCtxCancel = context.WithCancel(context.Background())
-		ws.listener, ws.boot, ws.pw = listener, boot, pw
-		return ws
+		return ws, nil
 	}
 
-	debug.Assert(false, "unknown comm-type '"+boot.msg.CommType()+"'")
+	debug.Assert(false, "unknown comm-type '"+msg.CommType()+"'")
+	return nil, fmt.Errorf("unknown comm-type %s", msg.CommType())
+}
+
+func (c *baseComm) ETLName() string     { return c.msg.Name() }
+func (c *baseComm) getInitMsg() InitMsg { return c.msg }
+func (c *baseComm) String() string      { return fmt.Sprintf("[%s]-%s", c.xctn.ID(), c.msg.CommType()) }
+func (c *baseComm) Xact() *XactETL      { return c.xctn }
+func (c *baseComm) ObjCount() int64     { return c.xctn.Objs() }
+func (c *baseComm) InBytes() int64      { return c.xctn.InBytes() }
+func (c *baseComm) OutBytes() int64     { return c.xctn.OutBytes() }
+func (c *baseComm) GetSecret() string   { return c.secret }
+
+func (c *baseComm) setupXaction(xid string) error {
+	rns := xreg.RenewETL(c.msg, xid)
+	if rns.Err != nil {
+		return rns.Err
+	}
+	xctn := rns.Entry.Get()
+	c.xctn = xctn.(*XactETL)
+	debug.Assertf(c.xctn.ID() == xid, "%s vs %s", c.xctn.ID(), xid)
 	return nil
 }
 
-func (c *baseComm) ETLName() string { return c.boot.msg.Name() }
-func (c *baseComm) PodName() string { return c.boot.pod.Name }
-func (c *baseComm) SvcName() string { return c.boot.pod.Name /*same as pod name*/ }
-
-func (c *baseComm) getInitMsg() InitMsg { return c.boot.msg }
-
-func (c *baseComm) ListenSmapChanged() { c.listener.ListenSmapChanged() }
-
-func (c *baseComm) String() string {
-	return fmt.Sprintf("%s[%s]-%s", c.boot.originalPodName, c.boot.xctn.ID(), c.boot.msg.CommType())
-}
-
-func (c *baseComm) Xact() core.Xact { return c.boot.xctn }
-func (c *baseComm) ObjCount() int64 { return c.boot.xctn.Objs() }
-func (c *baseComm) InBytes() int64  { return c.boot.xctn.InBytes() }
-func (c *baseComm) OutBytes() int64 { return c.boot.xctn.OutBytes() }
-
-func (c *baseComm) GetPodWatcher() *podWatcher { return c.pw }
-func (c *baseComm) GetSecret() string          { return c.boot.secret }
-func (c *baseComm) SetupConnection() error     { return c.boot.setupConnection("http://") }
-
-func (c *baseComm) Restart(updBoot *etlBootstrapper) {
-	c.boot.uri = updBoot.uri
-	if updBoot.secret != "" {
-		c.boot.secret = updBoot.secret
+func (c *baseComm) setupConnection(schema, podAddr string) (ecode int, err error) {
+	// the pod must be reachable via its tcp addr
+	c.podAddr = podAddr
+	if ecode, err = c.dial(); err != nil {
+		if cmn.Rom.V(4, cos.ModETL) {
+			nlog.Warningf("%s: failed to dial %s", c.msg.Cname(), c.podAddr)
+		}
+		return ecode, err
 	}
-	c.pw.boot = updBoot
+
+	c.podURI = schema + c.podAddr
+	if cmn.Rom.V(4, cos.ModETL) {
+		nlog.Infof("%s: setup connection to %s", c.msg.Cname(), c.podURI)
+	}
+	return 0, nil
 }
 
-func (c *baseComm) Stop() {
+func (c *baseComm) dial() (int, error) {
+	var (
+		action = "dial POD at " + c.podAddr
+		args   = &cmn.RetryArgs{
+			Call:      c.call,
+			SoftErr:   10,
+			HardErr:   2,
+			Sleep:     3 * time.Second,
+			Verbosity: cmn.RetryLogOff,
+			Action:    action,
+		}
+	)
+	ecode, err := args.Do()
+	if err != nil {
+		return ecode, fmt.Errorf("failed to wait for ETL Service/Pod at %q to respond: %v", c.podAddr, err)
+	}
+	return 0, nil
+}
+
+func (c *baseComm) call() (int, error) {
+	ctx := context.Background()
+	dialer := &net.Dialer{Timeout: cmn.Rom.MaxKeepalive()}
+	conn, err := dialer.DialContext(ctx, "tcp", c.podAddr)
+	if err != nil {
+		return 0, err
+	}
+	cos.Close(conn)
+	return 0, nil
+}
+
+func (c *baseComm) stop() error {
+	if !c.stopped.CAS(false, true) {
+		return nil // already stopped. do nothing
+	}
+
 	// Note: xctn might have already been aborted and finished by pod watcher
-	if !c.boot.xctn.Finished() && !c.boot.xctn.IsAborted() {
-		c.boot.xctn.Finish()
+	if !c.xctn.IsDone() && !c.xctn.IsAborted() {
+		c.xctn.Finish()
 	}
-	if c.pw != nil {
-		c.pw.stop(true)
+
+	return nil
+}
+
+// ProcessDownloadJob routes download job to ETL pod
+func (pc *pushComm) ProcessDownloadJob(ctx *ETLObjDownloadCtx) (cos.ReadCloseSizer, int, error) {
+	if ctx.ObjName == "" || ctx.Link == "" {
+		return nil, http.StatusBadRequest, errors.New("missing objName or link in ETL job context")
 	}
+
+	query := make(url.Values, 3)
+	query.Set(apc.QparamOrigURL, ctx.Link)
+	query.Set(apc.QparamObjTo, ctx.ObjName)
+	if ctx.ETLArgs != "" {
+		query.Set(apc.QparamETLTransformArgs, ctx.ETLArgs)
+	}
+
+	reqArgs := cmn.AllocHra()
+	defer cmn.FreeHra(reqArgs)
+	{
+		reqArgs.Method = http.MethodPost
+		reqArgs.Base = pc.podURI
+		reqArgs.Path = apc.ETLDownload
+		reqArgs.Query = query
+	}
+
+	_, objTimeout := pc.msg.Timeouts()
+	resp, ecode, err := doWithTimeout(reqArgs, nil, objTimeout.D())
+
+	if err != nil {
+		return nil, ecode, fmt.Errorf("failed to send object to ETL pod: %v", err)
+	}
+	if ecode >= http.StatusBadRequest {
+		if resp != nil {
+			resp.Close()
+		}
+		return nil, ecode, fmt.Errorf("ETL pod returned error status: %d", ecode)
+	}
+	if resp == nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("no response from ETL pod for %s", ctx.ObjName)
+	}
+
+	return resp, http.StatusOK, nil
 }
 
 func handleRespEcode(ecode int, oah cos.OAH, r cos.ReadOpenCloser, err error) core.ReadResp {
@@ -185,115 +277,123 @@ func handleRespEcode(ecode int, oah cos.OAH, r cos.ReadOpenCloser, err error) co
 		}
 		return core.ReadResp{R: nil, OAH: oah, Err: cmn.ErrSkip, Ecode: http.StatusNoContent}
 	default:
-		nlog.Errorln("unexpected ecode from etl:", ecode, oah, err)
+		if ecode >= 400 {
+			if cmn.Rom.V(5, cos.ModETL) {
+				nlog.Warningln("unexpected ecode from etl:", ecode, oah, err)
+			}
+			debug.Assert(r != nil)
+			// error from ETL, retrieve the error message from the response body
+			e, err := cos.ReadAll(r)
+			if err != nil {
+				err = fmt.Errorf("failed to read error message from ETL response: %v", err)
+			} else {
+				err = fmt.Errorf("ETL error: %s", e)
+			}
+			return core.ReadResp{R: r, OAH: oah, Err: err, Ecode: ecode}
+		}
 	}
 	return core.ReadResp{R: r, OAH: oah, Err: err, Ecode: ecode}
 }
 
-func doWithTimeout(reqArgs *cmn.HreqArgs, getBody getBodyFunc, timeout time.Duration, started int64) (r cos.ReadCloseSizer, ecode int, err error) {
+func doWithTimeout(reqArgs *cmn.HreqArgs, getBody getBodyFunc, timeout time.Duration) (r cos.ReadCloseSizer, ecode int, err error) {
 	if timeout == 0 {
 		timeout = DefaultObjTimeout
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	rtyr := &retryer{client: core.T.DataClient(), reqArgs: reqArgs, ctx: ctx, getBody: getBody}
-	ecode, err = cmn.NetworkCallWithRetry(&cmn.RetryArgs{
+	args := &cmn.RetryArgs{
 		Call:      rtyr.call,
 		SoftErr:   10,
 		Verbosity: cmn.RetryLogVerbose,
 		Sleep:     max(cmn.Rom.MaxKeepalive(), time.Second*5),
-	})
+	}
+	ecode, err = args.Do()
 	if err != nil {
 		cancel()
 		return nil, ecode, err
 	}
 
-	return cos.NewReaderWithArgs(cos.ReaderArgs{
-		R:    rtyr.resp.Body,
-		Size: rtyr.resp.ContentLength,
-		DeferCb: func() {
-			cancel()
-			st := core.T.StatsUpdater()
-			st.Inc(stats.ETLOfflineCount)
-			st.Add(stats.ETLOfflineLatencyTotal, int64(mono.Since(started)))
-		},
-	}), rtyr.resp.StatusCode, nil
+	return &cos.ReaderWithArgs{
+		R:       rtyr.resp.Body,
+		Rsize:   rtyr.resp.ContentLength,
+		DeferCb: cancel,
+	}, rtyr.resp.StatusCode, nil
 }
 
 //////////////
 // pushComm: implements (Hpush | HpushStdin)
 //////////////
 
-func (pc *pushComm) doRequest(lom *core.LOM, targs string, latestVer, sync bool, gargs *core.GetROCArgs) core.ReadResp {
-	if err := lom.InitBck(lom.Bucket()); err != nil {
+func (pc *pushComm) doRequest(lom *core.LOM, args *core.ETLArgs, latestVer, sync bool) core.ReadResp {
+	if err := lom.InitBck(lom.Bck()); err != nil {
 		return core.ReadResp{Err: err}
 	}
 	var (
-		path    string
 		getBody getBodyFunc
 
-		started = mono.NanoTime()
-		oah     = &cos.SimpleOAH{Atime: time.Now().UnixNano()}
-		query   = make(url.Values, 2)
+		path  = lom.Bck().Name + "/" + lom.ObjName
+		oah   = &cos.SimpleOAH{Atime: time.Now().UnixNano()}
+		query = make(url.Values, 3)
 	)
 
-	switch pc.boot.msg.ArgType() {
-	case ArgTypeDefault, ArgTypeURL:
+	switch {
+	case latestVer, sync, cmn.Rom.Features().IsSet(feat.DontAllowPassingFQNtoETL): // TODO -- FIXME: consider chunked case
 		// [TODO] to remove the following assert (and the corresponding limitation):
 		// - container must be ready to receive complete bucket name including namespace
 		// - see `bck.AddToQuery` and api/bucket.go for numerous examples
 		debug.Assert(lom.Bck().Ns.IsGlobal(), lom.Bck().Cname(""), " - bucket with namespace")
-		path = lom.Bck().Name + "/" + lom.ObjName
 		getBody = func() core.ReadResp { return lom.GetROC(latestVer, sync) }
-	case ArgTypeFQN:
-		if ecode, err := lomLoad(lom, pc.boot.xctn.Kind()); err != nil {
+	default:
+		// default to FQN
+		if ecode, err := lomLoad(lom, pc.xctn.Kind()); err != nil {
 			return core.ReadResp{Err: err, Ecode: ecode}
 		}
-
-		// body = http.NoBody
-		path = url.PathEscape(lom.FQN)
-	default:
-		e := fmt.Errorf("%s: unexpected argument type %q", pc.boot.msg, pc.boot.msg.ArgType())
-		debug.AssertNoErr(e) // is validated at construction time
-		nlog.Errorln(e)
+		query.Set(apc.QparamETLFQN, url.PathEscape(lom.FQN))
 	}
 
 	if len(pc.command) != 0 { // HpushStdin case
 		query = url.Values{"command": []string{"bash", "-c", strings.Join(pc.command, " ")}}
 	}
 
-	if targs != "" {
-		query.Set(apc.QparamETLTransformArgs, targs)
-	}
-
 	reqArgs := &cmn.HreqArgs{
 		Method: http.MethodPut,
-		Base:   pc.boot.uri,
+		Base:   pc.podURI,
 		Path:   path,
 		Header: http.Header{},
 		Query:  query,
 	}
 
-	if pc.boot.msg.IsDirectPut() && gargs != nil && !gargs.Local {
-		reqArgs.Header.Add(apc.HdrNodeURL, gargs.Daddr)
+	if args != nil {
+		if args.TransformArgs != "" {
+			query.Set(apc.QparamETLTransformArgs, args.TransformArgs)
+		}
+		if len(args.Pipeline) > 0 {
+			reqArgs.Header.Add(apc.HdrNodeURL, args.Pipeline.Pack())
+		}
 	}
 
 	// note: `Content-Length` header is set during `retryer.call()` below
-	_, objTimeout := pc.boot.msg.Timeouts()
-	r, ecode, err := doWithTimeout(reqArgs, getBody, objTimeout.D(), started)
+	_, objTimeout := pc.msg.Timeouts()
+	r, ecode, err := doWithTimeout(reqArgs, getBody, objTimeout.D())
 	if err != nil {
 		return core.ReadResp{Err: err, Ecode: ecode}
 	}
+
+	if cmn.Rom.V(5, cos.ModETL) {
+		nlog.Infoln(Hpush, lom.Cname(), args.Pipeline.String(), err, ecode)
+	}
+
 	oah.Size = r.Size()
 	return core.ReadResp{R: cos.NopOpener(r), OAH: oah, Err: err, Ecode: ecode}
 }
 
-func (pc *pushComm) InlineTransform(w http.ResponseWriter, _ *http.Request, lom *core.LOM, latestVer bool, targs string) (int, error) {
-	resp := pc.doRequest(lom, targs, latestVer, false, nil)
+func (pc *pushComm) InlineTransform(w http.ResponseWriter, _ *http.Request, lom *core.LOM, args *InlineTransArgs) (size int64, ecode int, err error) {
+	resp := pc.doRequest(lom, &core.ETLArgs{TransformArgs: args.TransformArgs, Pipeline: args.Pipeline}, args.LatestVer, false /* sync */) // TODO: support sync
 	if resp.Err != nil {
-		return resp.Ecode, resp.Err
+		return 0, resp.Ecode, resp.Err
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleETL) {
+	if cmn.Rom.V(5, cos.ModETL) {
 		nlog.Infoln(Hpush, lom.Cname(), resp.Err)
 	}
 
@@ -302,16 +402,17 @@ func (pc *pushComm) InlineTransform(w http.ResponseWriter, _ *http.Request, lom 
 		bufsz = memsys.DefaultBufSize // TODO: track an average
 	}
 	buf, slab := core.T.PageMM().AllocSize(bufsz)
-	_, err := io.CopyBuffer(w, resp.R, buf)
+	w.WriteHeader(resp.Ecode)
+	n, err := cos.CopyBuffer(w, resp.R, buf)
 
 	slab.Free(buf)
 	resp.R.Close()
-	return 0, err
+	return n, 0, err
 }
 
-func (pc *pushComm) OfflineTransform(lom *core.LOM, latestVer, sync bool, gargs *core.GetROCArgs) core.ReadResp {
-	resp := pc.doRequest(lom, "", latestVer, sync, gargs)
-	if cmn.Rom.FastV(5, cos.SmoduleETL) {
+func (pc *pushComm) OfflineTransform(lom *core.LOM, latestVer, sync bool, args *core.ETLArgs) core.ReadResp {
+	resp := pc.doRequest(lom, args, latestVer, sync)
+	if cmn.Rom.V(5, cos.ModETL) {
 		nlog.Infoln(Hpush, lom.Cname(), resp.Err, resp.Ecode)
 	}
 	return handleRespEcode(resp.Ecode, resp.OAH, resp.R, resp.Err)
@@ -321,83 +422,85 @@ func (pc *pushComm) OfflineTransform(lom *core.LOM, latestVer, sync bool, gargs 
 // redirectComm: implements Hpull
 //////////////////
 
-func (rc *redirectComm) InlineTransform(w http.ResponseWriter, r *http.Request, lom *core.LOM, latestVer bool, targs string) (int, error) {
-	if err := rc.boot.xctn.AbortErr(); err != nil {
-		return 0, err
+// NOTE: pipeline not implemented for hpull, since HTTP redirect doesn't preserve headers. Cannot use header to pass pipeline.
+func (rc *redirectComm) InlineTransform(w http.ResponseWriter, r *http.Request, lom *core.LOM, args *InlineTransArgs) (size int64, ecode int, err error) {
+	if args.Pipeline != nil {
+		return 0, http.StatusBadRequest, errors.New("inline transform pipeline not supported for " + rc.msg.CommType())
 	}
-	_, err := lomLoad(lom, rc.boot.xctn.Kind())
+	if err := rc.xctn.AbortErr(); err != nil {
+		return 0, 0, err
+	}
+	ecode, err = lomLoad(lom, rc.xctn.Kind())
 	if err != nil {
-		return 0, err
+		return 0, ecode, err
 	}
 
-	path, query := rc.redirectArgs(lom, latestVer)
-	if targs != "" {
-		query.Set(apc.QparamETLTransformArgs, targs)
+	path, query := rc.redirectArgs(lom, args.LatestVer)
+	if args.TransformArgs != "" {
+		query.Set(apc.QparamETLTransformArgs, args.TransformArgs)
 	}
-	url := cos.JoinQuery(cos.JoinPath(rc.boot.uri, path), query)
+	url := cos.JoinQuery(cos.JoinPath(rc.podURI, path), query)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 
-	if cmn.Rom.FastV(5, cos.SmoduleETL) {
+	if cmn.Rom.V(5, cos.ModETL) {
 		nlog.Infoln(Hpull, lom.Cname())
 	}
-	return 0, nil
+	return cos.ContentLengthUnknown, 0, nil // TODO: stats inline transform size for hpull
 }
 
 // TODO: support `sync` option as well
-func (rc *redirectComm) redirectArgs(lom *core.LOM, latestVer bool) (path string, query url.Values) {
-	query = make(url.Values)
-	switch rc.boot.msg.ArgType() {
-	case ArgTypeDefault, ArgTypeURL:
-		path = url.PathEscape(lom.Uname())
-	case ArgTypeFQN:
-		path = url.PathEscape(lom.FQN)
-	default:
-		err := fmt.Errorf("%s: unexpected argument type %q", rc.boot.msg, rc.boot.msg.ArgType())
-		debug.AssertNoErr(err)
-		nlog.Errorln(err)
+func (*redirectComm) redirectArgs(lom *core.LOM, latestVer bool) (string, url.Values) {
+	query := make(url.Values, 4)
+	if !cmn.Rom.Features().IsSet(feat.DontAllowPassingFQNtoETL) {
+		// TODO -- FIXME: consider chunked case
+		query.Set(apc.QparamETLFQN, url.PathEscape(lom.FQN))
 	}
-
 	if latestVer {
 		query.Set(apc.QparamLatestVer, "true")
 	}
-	return path, query
+	return url.PathEscape(lom.Uname()), query
 }
 
-func (rc *redirectComm) OfflineTransform(lom *core.LOM, latestVer, _ bool, gargs *core.GetROCArgs) core.ReadResp {
-	var (
-		started = mono.NanoTime()
-		clone   = *lom
-	)
-	_, err := lomLoad(&clone, rc.boot.xctn.Kind())
+func (rc *redirectComm) OfflineTransform(lom *core.LOM, latestVer, _ bool, args *core.ETLArgs) core.ReadResp {
+	clone := *lom
+	ecode, err := lomLoad(&clone, rc.xctn.Kind())
 	if err != nil {
-		return core.ReadResp{Err: err}
+		return core.ReadResp{Err: err, Ecode: ecode}
 	}
 	path, query := rc.redirectArgs(&clone, latestVer)
 
+	if args != nil && args.TransformArgs != "" {
+		query.Set(apc.QparamETLTransformArgs, args.TransformArgs)
+	}
+
 	reqArgs := &cmn.HreqArgs{
 		Method: http.MethodGet,
-		Base:   rc.boot.uri,
+		Base:   rc.podURI,
 		Path:   path,
 		BodyR:  http.NoBody,
 		Header: http.Header{},
 		Query:  query,
 	}
 
-	if rc.boot.msg.IsDirectPut() && gargs != nil && !gargs.Local {
-		reqArgs.Header.Add(apc.HdrNodeURL, gargs.Daddr)
+	if args != nil && len(args.Pipeline) > 0 {
+		reqArgs.Header.Add(apc.HdrNodeURL, args.Pipeline.Pack())
 	}
 
-	_, objTimeout := rc.boot.msg.Timeouts()
-	r, ecode, err := doWithTimeout(reqArgs, nil, objTimeout.D(), started)
+	_, objTimeout := rc.msg.Timeouts()
+	r, ecode, err := doWithTimeout(reqArgs, nil, objTimeout.D())
 	if err != nil {
 		return core.ReadResp{Err: err, Ecode: ecode}
 	}
 
-	if cmn.Rom.FastV(5, cos.SmoduleETL) {
-		nlog.Infoln(Hpull, clone.Cname(), err, ecode)
+	if cmn.Rom.V(5, cos.ModETL) {
+		nlog.Infoln(Hpull, clone.Cname(), args.Pipeline.String(), err, ecode)
 	}
 	clone.SetSize(r.Size())
 	return handleRespEcode(ecode, &clone, cos.NopOpener(r), err)
+}
+
+func (*redirectComm) ProcessDownloadJob(_ *ETLObjDownloadCtx) (cos.ReadCloseSizer, int, error) {
+	return nil, http.StatusNotImplemented, errors.New("ETL downloads not supported for hpull communication type")
 }
 
 //
@@ -405,8 +508,8 @@ func (rc *redirectComm) OfflineTransform(lom *core.LOM, latestVer, _ bool, gargs
 //
 
 func lomLoad(lom *core.LOM, xKind string) (ecode int, err error) {
-	if err = lom.Load(true /*cacheIt*/, false /*locked*/); err != nil {
-		if cos.IsNotExist(err, 0) && lom.Bucket().IsRemote() {
+	if err = lom.Load(false /*cacheIt*/, false /*locked*/); err != nil {
+		if cos.IsNotExist(err) && lom.Bucket().IsRemote() {
 			return core.T.GetCold(context.Background(), lom, xKind, cmn.OwtGetLock)
 		}
 	}

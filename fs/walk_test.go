@@ -1,4 +1,4 @@
-// Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
+// Package fs_test provides tests for fs package
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -37,7 +37,6 @@ func TestWalkBck(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fs.TestNew(mock.NewIOS())
-			fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
 
 			mpaths := make([]string, 0, test.mpathCnt)
 			defer func() {
@@ -61,7 +60,7 @@ func TestWalkBck(t *testing.T) {
 			avail, _ := fs.Get()
 			var fileNames []string
 			for _, mpath := range avail {
-				dir := mpath.MakePathCT(&bck, fs.ObjectType)
+				dir := mpath.MakePathCT(&bck, fs.ObjCT)
 				err := cos.CreateDir(dir)
 				tassert.CheckFatal(t, err)
 
@@ -82,7 +81,7 @@ func TestWalkBck(t *testing.T) {
 			err := fs.WalkBck(&fs.WalkBckOpts{
 				WalkOpts: fs.WalkOpts{
 					Bck: bck,
-					CTs: []string{fs.ObjectType},
+					CTs: []string{fs.ObjCT},
 					Callback: func(fqn string, _ fs.DirEntry) error {
 						var parsed fs.ParsedFQN
 						err := parsed.Init(fqn)
@@ -123,7 +122,6 @@ func TestWalkBckSkipDir(t *testing.T) {
 	)
 
 	fs.TestNew(mock.NewIOS())
-	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
 
 	defer func() {
 		for mpath := range mpaths {
@@ -144,7 +142,7 @@ func TestWalkBckSkipDir(t *testing.T) {
 
 	avail, _ := fs.Get()
 	for _, mpath := range avail {
-		dir := mpath.MakePathCT(&bck, fs.ObjectType)
+		dir := mpath.MakePathCT(&bck, fs.ObjCT)
 		err := cos.CreateDir(dir)
 		tassert.CheckFatal(t, err)
 
@@ -160,7 +158,7 @@ func TestWalkBckSkipDir(t *testing.T) {
 	err := fs.WalkBck(&fs.WalkBckOpts{
 		WalkOpts: fs.WalkOpts{
 			Bck: bck,
-			CTs: []string{fs.ObjectType},
+			CTs: []string{fs.ObjCT},
 			Callback: func(fqn string, _ fs.DirEntry) error {
 				fqns = append(fqns, fqn)
 				return nil

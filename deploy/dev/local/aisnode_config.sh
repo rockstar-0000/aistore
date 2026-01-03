@@ -26,10 +26,16 @@ cat > $AIS_CONF_FILE <<EOL
 		"enabled":		${AIS_EC_ENABLED:-false},
 		"disk_only":		false
 	},
+        "chunks": {
+                "objsize_limit":    "0",
+                "chunk_size":       "1GiB",
+                "checkpoint_every": 0,
+                "flags":            0
+        },
 	"log": {
-		"level":     "${AIS_LOG_LEVEL:-3}",
-		"max_size":  "4mb",
-		"max_total": "128mb",
+		"level":      "${AIS_LOG_LEVEL:-3}",
+		"max_size":   "10mb",
+		"max_total":  "256mb",
 		"flush_time": "60s",
 		"stats_time": "60s"
 	},
@@ -64,19 +70,23 @@ cat > $AIS_CONF_FILE <<EOL
 		"cleanupwm":         65,
 		"lowwm":             ${AIS_SPACE_LOWWM:-75},
 		"highwm":            ${AIS_SPACE_HIGHWM:-90},
-		"out_of_space":      ${AIS_SPACE_OOS:-95}
+		"out_of_space":      ${AIS_SPACE_OOS:-95},
+		"batch_size":        32768,
+		"dont_cleanup_time": "120m"
 	},
 	"lru": {
 		"dont_evict_time":   "120m",
 		"capacity_upd_time": "10m",
+		"batch_size":        32768,
 		"enabled":           true
 	},
 	"disk":{
-	    "iostat_time_long":  "${AIS_IOSTAT_TIME_LONG:-2s}",
-	    "iostat_time_short": "${AIS_IOSTAT_TIME_SHORT:-100ms}",
-	    "disk_util_low_wm":  20,
-	    "disk_util_high_wm": 80,
-	    "disk_util_max_wm":  95
+	    "iostat_time_long":   "${AIS_IOSTAT_TIME_LONG:-2s}",
+	    "iostat_time_short":  "${AIS_IOSTAT_TIME_SHORT:-100ms}",
+	    "iostat_time_smooth": "8s",
+	    "disk_util_low_wm":   20,
+	    "disk_util_high_wm":  80,
+	    "disk_util_max_wm":   95
 	},
 	"rebalance": {
 		"dest_retry_time":	"2m",
@@ -128,7 +138,7 @@ cat > $AIS_CONF_FILE <<EOL
 			"client_auth_tls":    ${AIS_CLIENT_AUTH_TLS:-0},
 			"idle_conn_time":     "6s",
 			"idle_conns_per_host":32,
-			"idle_conns":         0,
+			"idle_conns":         256,
 			"write_buffer_size":  ${HTTP_WRITE_BUFFER_SIZE:-0},
 			"read_buffer_size":   ${HTTP_READ_BUFFER_SIZE:-0},
 			"chunked_transfer":   ${AIS_HTTP_CHUNKED_TRANSFER:-true},
@@ -143,7 +153,10 @@ cat > $AIS_CONF_FILE <<EOL
 		"enabled":        true
 	},
 	"auth": {
-		"secret":      "$AIS_AUTHN_SECRET_KEY",
+	  "signature": {
+	    "key": "$AIS_AUTHN_SECRET_KEY",
+	    "method": "HMAC"
+	  },
 		"enabled":     ${AIS_AUTHN_ENABLED:-false}
 	},
 	"keepalivetracker": {
@@ -231,55 +244,4 @@ cat > $AIS_LOCAL_CONF_FILE <<EOL
 		"instance": ${INSTANCE:-0}
 	}
 }
-EOL
-
-cat > $STATSD_CONF_FILE <<EOL
-{
-	graphitePort: ${GRAPHITE_PORT:-2003},
-	graphiteHost: "${GRAPHITE_SERVER:-localhost}"
-}
-EOL
-
-cat > $COLLECTD_CONF_FILE <<EOL
-LoadPlugin df
-LoadPlugin cpu
-LoadPlugin disk
-LoadPlugin interface
-LoadPlugin load
-LoadPlugin memory
-LoadPlugin processes
-LoadPlugin write_graphite
-
-<Plugin syslog>
-	LogLevel info
-</Plugin>
-
-<Plugin df>
-	FSType rootfs
-	FSType sysfs
-	FSType proc
-	FSType devtmpfs
-	FSType devpts
-	FSType tmpfs
-	FSType fusectl
-	FSType cgroup
-	IgnoreSelected true
-	ValuesPercentage True
-</Plugin>
-
-<Plugin write_graphite>
-	<Node "graphiting">
-		Host "${GRAPHITE_SERVER:-localhost}"
-		Port "${GRAPHITE_PORT:-2003}"
-		Protocol "tcp"
-		LogSendErrors true
-		StoreRates true
-		AlwaysAppendDS false
-		EscapeCharacter "_"
-	</Node>
-</Plugin>
-
-<Include "/etc/collectd/collectd.conf.d">
-	Filter "*.conf"
-</Include>
 EOL

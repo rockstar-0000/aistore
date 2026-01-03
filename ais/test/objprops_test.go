@@ -21,6 +21,7 @@ import (
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tlog"
+	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact"
 )
 
@@ -40,7 +41,7 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 	msg *apc.LsoMsg, versionEnabled bool, cksumType string) (newVersions map[string]string) {
 	newVersions = make(map[string]string, len(oldVersions))
 	tlog.Logln("Updating...")
-	r, err := readers.NewRand(int64(fileSize), cksumType)
+	r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: int64(fileSize), CksumType: cksumType})
 	if err != nil {
 		t.Fatalf("Failed to create reader: %v", err)
 	}
@@ -85,7 +86,7 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 			t.Fatalf("%s: version is empty", bck.Cname(m.Name))
 		}
 	}
-	tlog.Logf("All %d object versions updated\n", len(reslist.Entries))
+	tlog.Logfln("All %d object versions updated", len(reslist.Entries))
 
 	return
 }
@@ -102,7 +103,7 @@ func propsReadObjects(t *testing.T, proxyURL string, bck cmn.Bck, lst map[string
 	}
 	versChangedFinal, bytesChangedFinal := propsStats(t, proxyURL)
 	if versChangedFinal-versChanged > 0 {
-		tlog.Logf("Versions changed: %d (%s)\n", versChangedFinal-versChanged, cos.ToSizeIEC(bytesChangedFinal-bytesChanged, 1))
+		tlog.Logfln("Versions changed: %d (%s)", versChangedFinal-versChanged, cos.IEC(bytesChangedFinal-bytesChanged, 1))
 	}
 	if versChanged != versChangedFinal || bytesChanged != bytesChangedFinal {
 		t.Fatalf("All objects must be retrieved from the cache but cold get happened: %d times (%d bytes)",
@@ -118,12 +119,12 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 	}
 	toEvictList := make([]string, 0, toEvict)
 	evictMap := make(map[string]bool, toEvict)
-	tlog.Logf("Evicting %v objects:\n", toEvict)
+	tlog.Logfln("Evicting %v objects:", toEvict)
 
 	for fname := range objMap {
 		evictMap[fname] = true
 		toEvictList = append(toEvictList, fname)
-		tlog.Logf("    %s\n", bck.Cname(fname))
+		tlog.Logfln("    %s", bck.Cname(fname))
 		if len(toEvictList) >= toEvict {
 			break
 		}
@@ -139,7 +140,7 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 	_, err = api.WaitForXactionIC(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("Reading object list...\n")
+	tlog.Logfln("Reading object list...")
 
 	// read a new object list and check that evicted objects do not have atime and cached==false
 	// version must be the same
@@ -153,7 +154,7 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 		if !ok {
 			continue
 		}
-		tlog.Logf("%s: fl [%d], cached [%t], atime [%v], version [%s]\n", bck.Cname(m.Name), m.Flags, m.IsPresent(), m.Atime, m.Version)
+		tlog.Logfln("%s: fl [%d], cached [%t], atime [%v], version [%s]", bck.Cname(m.Name), m.Flags, m.IsPresent(), m.Atime, m.Version)
 
 		// e.g. misplaced replica
 		if !m.IsStatusOK() {
@@ -182,10 +183,10 @@ func propsEvict(t *testing.T, proxyURL string, bck cmn.Bck, objMap map[string]st
 }
 
 func propsRecacheObjects(t *testing.T, proxyURL string, bck cmn.Bck, objs map[string]string, msg *apc.LsoMsg, versionEnabled bool) {
-	tlog.Logf("Reading...\n")
+	tlog.Logfln("Reading...")
 	propsReadObjects(t, proxyURL, bck, objs)
 
-	tlog.Logf("Listing objects...\n")
+	tlog.Logfln("Listing objects...")
 	reslist := testListObjects(t, proxyURL, bck, msg)
 	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck.String())
 
@@ -193,7 +194,7 @@ func propsRecacheObjects(t *testing.T, proxyURL string, bck cmn.Bck, objs map[st
 		version string
 		ok      bool
 	)
-	tlog.Logf("Checking object properties...\n")
+	tlog.Logfln("Checking object properties...")
 	for _, m := range reslist.Entries {
 		if version, ok = objs[m.Name]; !ok {
 			continue
@@ -256,7 +257,7 @@ func propsRebalance(t *testing.T, proxyURL string, bck cmn.Bck, objects map[stri
 	tassert.CheckFatal(t, err)
 	tools.WaitForRebalanceByID(t, baseParams, rebID)
 
-	tlog.Logf("Listing objects...\n")
+	tlog.Logfln("Listing objects...")
 	reslist := testListObjects(t, proxyURL, bck, msg)
 	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck.String())
 
@@ -265,7 +266,7 @@ func propsRebalance(t *testing.T, proxyURL string, bck cmn.Bck, objects map[stri
 		ok       bool
 		objFound int
 	)
-	tlog.Logf("Checking object properties...\n")
+	tlog.Logfln("Checking object properties...")
 	for _, m := range reslist.Entries {
 		if version, ok = newobjs[m.Name]; !ok {
 			continue
@@ -313,6 +314,104 @@ func TestObjPropsVersion(t *testing.T) {
 			propsVersionAllProviders(t, versioning)
 		})
 	}
+}
+
+func TestObjChunkedOverride(t *testing.T) {
+	// Test all 4 permutations of chunked vs monolithic uploads and overrides
+	testCases := []struct {
+		name              string
+		firstUploadChunks bool
+		overrideChunks    bool
+	}{
+		{"monolithic-to-monolithic", false, false},
+		{"chunked-to-monolithic", true, false},
+		{"monolithic-to-chunked", false, true},
+		{"chunked-to-chunked", true, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			runProviderTests(t, func(t *testing.T, bck *meta.Bck) {
+				testChunkedOverride(t, baseParams, bck.Clone(), tc.firstUploadChunks, tc.overrideChunks)
+			})
+		})
+	}
+}
+
+// testChunkedOverride tests object upload and override with different chunk configurations
+func testChunkedOverride(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, firstChunked, overrideChunked bool) {
+	const (
+		objPrefix = "test-chunked-override"
+		numObjs   = 100
+		numChunks = 4
+	)
+
+	// Create ioContext for first upload
+	m := ioContext{
+		t:             t,
+		bck:           bck,
+		num:           numObjs,
+		prefix:        objPrefix + trand.String(10),
+		fileSizeRange: [2]uint64{32 * cos.KiB, 8 * cos.MiB},
+		getErrIsFatal: true,
+	}
+
+	if testing.Short() {
+		m.num /= 10
+		m.fileSizeRange[1] /= 64
+	}
+
+	// Set chunking configuration for first upload
+	if firstChunked {
+		m.chunksConf = &ioCtxChunksConf{
+			numChunks: numChunks,
+			multipart: true,
+		}
+	} else {
+		m.chunksConf = &ioCtxChunksConf{multipart: false} // explicitly disable chunking
+	}
+
+	m.init(true /*cleanup*/)
+	initMountpaths(t, proxyURL)
+	tlog.Logfln("First upload...")
+	m.puts()
+
+	m.gets(nil, true)
+
+	if overrideChunked {
+		m.chunksConf = &ioCtxChunksConf{
+			numChunks: numChunks,
+			multipart: true,
+		}
+	} else {
+		m.chunksConf = &ioCtxChunksConf{multipart: false} // explicitly disable chunking
+	}
+
+	p, err := api.HeadBucket(baseParams, bck, true /* don't add */)
+	tassert.CheckFatal(t, err)
+
+	tlog.Logfln("Override upload...")
+	for i := range len(m.objNames) {
+		m.updateAndValidate(baseParams, i, p.Cksum.Type)
+
+		// verify that the object's version is incremented after being overridden
+		op, err := api.HeadObject(baseParams, bck, m.objNames[i], api.HeadArgs{FltPresence: apc.FltPresent})
+		tassert.CheckFatal(t, err)
+
+		// TODO: revisit versioning for remote buckets with multipart uploads
+		tassert.Fatalf(t, bck.IsRemote() || op.Version() == "2", "Expected version 2 for %s, got %s", m.objNames[i], op.Version())
+
+		// after update, we should have exactly `numChunks-1` number of chunks on disk; previous chunks associated with this object should be cleaned up
+		if overrideChunked {
+			fqns := m.findObjChunksOnDisk(bck, m.objNames[i])
+			tassert.Fatalf(t, len(fqns) == m.chunksConf.numChunks-1, "Expected %d chunks on disk for %s, got %d", m.chunksConf.numChunks-1, m.objNames[i], len(fqns))
+		}
+	}
+
+	m.gets(nil, true)
+	m.ensureNoGetErrors()
+
+	tlog.Logfln("Successfully completed test: first_chunked=%t, override_chunked=%t", firstChunked, overrideChunked)
 }
 
 func propsVersionAllProviders(t *testing.T, versioning bool) {
@@ -401,7 +500,7 @@ func propsVersion(t *testing.T, bck cmn.Bck, versionEnabled bool, cksumType stri
 	// PUT objects must have all properties set: atime, cached, version
 	filesList := make(map[string]string)
 	for _, m := range reslist.Entries {
-		tlog.Logf("%s initial version:\t%q\n", bck.Cname(m.Name), m.Version)
+		tlog.Logfln("%s initial version:\t%q", bck.Cname(m.Name), m.Version)
 
 		if !m.IsPresent() && bck.IsRemote() {
 			t.Errorf("%s: not marked as _cached_", bck.Cname(m.Name))
@@ -542,7 +641,7 @@ func TestObjProps(t *testing.T) {
 			tassert.CheckFatal(t, err)
 
 			for _, objName := range m.objNames {
-				tlog.Logf("checking %s props...\n", m.bck.Cname(objName))
+				tlog.Logfln("checking %s props...", m.bck.Cname(objName))
 
 				flt := apc.FltPresent
 				if test.checkPresent {
@@ -628,11 +727,11 @@ func TestObjProps(t *testing.T) {
 func testListObjects(t *testing.T, proxyURL string, bck cmn.Bck, msg *apc.LsoMsg) *cmn.LsoRes {
 	switch {
 	case msg == nil:
-		tlog.Logf("LIST %s []\n", bck.String())
+		tlog.Logfln("LIST %s []", bck.String())
 	case msg.Prefix == "" && msg.PageSize == 0 && msg.ContinuationToken == "":
-		tlog.Logf("LIST %s [cached: %t]\n", bck.String(), msg.IsFlagSet(apc.LsCached))
+		tlog.Logfln("LIST %s [cached: %t]", bck.String(), msg.IsFlagSet(apc.LsCached))
 	default:
-		tlog.Logf("LIST %s [prefix: %q, page_size: %d, cached: %t, token: %q]\n",
+		tlog.Logfln("LIST %s [prefix: %q, page_size: %d, cached: %t, token: %q]",
 			bck.String(), msg.Prefix, msg.PageSize, msg.IsFlagSet(apc.LsCached), msg.ContinuationToken)
 	}
 	baseParams := tools.BaseAPIParams(proxyURL)

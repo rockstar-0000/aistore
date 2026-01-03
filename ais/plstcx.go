@@ -77,7 +77,7 @@ func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	} else {
 		ok = p.writeJS(w, r, lst, lsotag)
 	}
-	if !ok && cmn.Rom.FastV(4, cos.SmoduleAIS) {
+	if !ok && cmn.Rom.V(4, cos.ModAIS) {
 		nlog.Errorln("failed to transmit list-objects page (TCP RST?)")
 	}
 
@@ -139,7 +139,7 @@ func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr h
 				lsotag, lsmsg.StartAfter, bck)
 		}
 		// verbose log
-		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.V(4, cos.ModAIS) {
 			var s string
 			if lsmsg.ContinuationToken != "" {
 				s = " cont=" + lsmsg.ContinuationToken
@@ -395,7 +395,15 @@ func concatLso(lists []*cmn.LsoRes, lsmsg *apc.LsoMsg) (objs *cmn.LsoRes) {
 	// For corner case: we have objects with replicas on page threshold
 	// we have to sort taking status into account. Otherwise wrong
 	// one(Status=moved) may get into the response
-	cmn.SortLso(objs.Entries)
+	//
+	// For non-recursive mode: use lexicographical sort to keep continuation token semantics.
+	// The "dirs-first" sort order breaks pagination because the token is lexicographical.
+	// See related: _sortDirsFirst() in CLI
+	if lsmsg.IsFlagSet(apc.LsNoRecursion) {
+		cmn.SortLsoLex(objs.Entries)
+	} else {
+		cmn.SortLso(objs.Entries)
+	}
 	return objs
 }
 
@@ -444,21 +452,21 @@ type (
 		mu sync.Mutex
 	}
 	lstcx struct {
-		p *proxy
+		hdr http.Header // arg
+		p   *proxy
 		// arg
 		bckFrom *meta.Bck
 		bckTo   *meta.Bck
 		amsg    *apc.ActMsg // orig
 		config  *cmn.Config
 		smap    *smapX
-		hdr     http.Header
 		// work
 		tsi     *meta.Snode
 		xid     string // x-tco
-		cnt     int
 		lsmsg   apc.LsoMsg
 		altmsg  apc.ActMsg
 		tcomsg  cmn.TCOMsg
+		cnt     int
 		stopped atomic.Bool
 	}
 )
@@ -610,6 +618,8 @@ func (c *lstcx) _page() (int, error) {
 	lr := &c.tcomsg.ListRange
 	clear(lr.ObjNames)
 	lr.ObjNames = lr.ObjNames[:0]
+	lr.ObjNames = cos.ResetSliceCap(lr.ObjNames, apc.MaxPageSizeAIS) // clip cap
+
 	for _, en := range lst.Entries {
 		if en.IsAnyFlagSet(apc.EntryIsDir) { // always skip virtual dirs
 			continue

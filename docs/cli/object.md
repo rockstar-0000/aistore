@@ -6,8 +6,8 @@ Namely:
 ```console
 $ ais object <TAB-TAB>
 
-get          put          cp           set-custom   show         rm
-ls           promote      concat       evict        mv           cat
+get     put        cp           etl          set-custom   prefetch     show      cat
+ls      promote    archive      concat       rm           evict        mv
 ```
 
 ## Table of Contents
@@ -17,6 +17,7 @@ ls           promote      concat       evict        mv           cat
   - [Get object and print it to standard output](#get-object-and-print-it-to-standard-output)
   - [Check if object is _cached_](#check-if-object-is-cached)
   - [Read range](#read-range)
+  - [Multipart Download](#multipart-download)
 - [GET multiple objects](#get-multiple-objects)
 - [GET archived content](#get-archived-content)
 - [Print object content](#print-object-content)
@@ -41,7 +42,12 @@ ls           promote      concat       evict        mv           cat
   - [Put multiple directories with the `--skip-vc` option](#put-multiple-directories-with-the-skip-vc-option)
 - [Tips for copying files from Lustre (NFS)](#tips-for-copying-files-from-lustre-nfs)
 - [Promote files and directories](#promote-files-and-directories)
-- [APPEND object](#append-object)
+- [Multipart upload](#multipart-upload)
+  - [Create multipart upload](#create-multipart-upload)
+  - [Upload parts](#upload-parts)
+  - [Complete multipart upload](#complete-multipart-upload)
+  - [Abort multipart upload](#abort-multipart-upload)
+- [Append object](#append-object)
 - [Delete object](#delete-object)
   - [Disambiguating multi-object operation](#disambiguating-multi-object-operation)
 - [Evict one remote bucket, multiple remote buckets, or selected objects in a given remote bucket or buckets](#evict-one-remote-bucket-multiple-remote-buckets-or-selected-objects-in-a-given-remote-bucket-or-buckets)
@@ -101,7 +107,9 @@ OPTIONS:
    --archregx value     Specifies prefix, suffix, substring, WebDataset key, _or_ a general-purpose regular expression
                         to select possibly multiple matching archived files from a given shard;
                         is used in combination with '--archmode' ("matching mode") option
-   --blob-download      Utilize built-in blob-downloader (and the corresponding alternative datapath) to read very large remote objects
+   --blob-download      Use blob-downloader to fetch large objects from remote backend into AIStore cluster (see docs/blob_downloader.md)
+   --mpd                Use multipart download to read large objects from AIStore cluster to the client-side;
+                        for single-object only; use '--chunk-size' and '--num-workers' to configure
    --cached             Only get in-cluster objects, i.e., objects from the respective remote bucket that are present ("cached") in the cluster
    --check-cached       Check whether a given named object is present in cluster
                         (applies only to buckets with remote backend)
@@ -131,13 +139,13 @@ OPTIONS:
                         - 'ais ls gs://abc/dir --limit 1234 --cached --props size,custom,atime'  - list no more than 1234 objects
                         - 'ais get gs://abc /dev/null --prefix dir --limit 1234'                 - get --/--
                         - 'ais scrub gs://abc/dir --limit 1234'                                  - scrub --/-- (default: 0)
-   --num-workers value  Number of concurrent blob-downloading workers (readers); system default when omitted or zero (default: 0)
+   --num-workers value  Number of concurrent workers for --blob-download or --mpd; system default when omitted or zero (default: 0)
    --offset value       Object read offset; must be used together with '--length'; default formatting: IEC (use '--units' to override)
    --prefix value       Get objects with names starting with the specified prefix, e.g.:
                         '--prefix a/b/c' - get objects from the virtual directory a/b/c and objects from the virtual directory
                         a/b that have their names (relative to this directory) starting with 'c';
                         '--prefix ""' - get entire bucket (all objects)
-   --progress           Show progress bar(s) and progress of execution in real time
+   --progress           Multi-object progress: show progress bar for number of objects processed (see 'GET multiple objects' below)
    --refresh value      Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
                         valid time units: ns, us (or µs), ms, s (default), m, h
    --silent             Server-side flag, an indication for aistore _not_ to log assorted errors (e.g., HEAD(object) failures)
@@ -247,9 +255,33 @@ $ ls -al /tmp/w | awk '{print $5,$9}'
 10 copy3.md
 ```
 
+## Multipart Download
+
+Use `--mpd` for client-side concurrent range-based download with **built-in** progress bar. This is useful for large objects where you want to see download progress and potentially benefit from parallel chunk downloads.
+
+> **`--mpd` vs `--blob-download`**: These are different mechanisms for different purposes:
+> - `--mpd` (multipart download): **Client-side** - downloads object from AIStore to client using concurrent range requests
+> - `--blob-download`: **Server-side** - fetches object from remote backend (e.g., S3, GCS) into AIStore cluster for caching; see [blob_downloader.md](/docs/blob_downloader.md)
+
+> Note: `--mpd` is for single-object download only and includes its own progress bar automatically. For multi-object downloads (using `--prefix`), use `--progress` instead to track the number of objects processed.
+
+```console
+# Basic multipart download with progress bar
+$ ais get ais://bucket/large-file.bin ./local-file.bin --mpd
+large-file.bin 4.00 GiB / 4.00 GiB [======================================] 00:00:15 1.2 GiB/s
+GET ais://bucket/large-file.bin
+
+# With custom chunk size and number of workers
+$ ais get s3://bucket/huge-object ./output --mpd --chunk-size 16mb --num-workers 32
+large-file.bin 4.00 GiB / 4.00 GiB [======================================] 00:00:15 1.2 GiB/s
+GET s3://bucket/huge-object
+```
+
 # GET multiple objects
 
-Note that destination in this case is a local directory and that (an empty) prefix indicates getting entire bucket; see `--help` for details.
+Use `--prefix` to download multiple objects at once. Note that destination in this case is a local directory and that (an empty) prefix indicates getting entire bucket; see `--help` for details.
+
+Use `--progress` to show multi-object progress (number of objects processed). This is different from `--mpd` which has its own built-in progress bar for single-object downloads.
 
 ```console
 $ ais get s3://abc /tmp/w --prefix "" --progress
@@ -1386,9 +1418,209 @@ $ ais object promote /target/1014646t8081/nonexistent/dir/ ais://testbucket --ta
 (...) Bad Request: stat /target/1014646t8081/nonexistent/dir: no such file or directory
 ```
 
-# APPEND object
+# Multipart upload
 
-APPEND operation (not to confuse with appending or [adding to existing archive](/docs/cli/archive.md)) can be executed in 3 different ways:
+`ais object multipart-upload` or, same, `ais object mpu` - Upload large objects in multiple parts for improved performance and reliability.
+
+Multipart upload allows you to upload large objects by breaking them into smaller, manageable parts. This provides several benefits:
+
+* **Improved performance**: Parts can be uploaded in parallel
+* **Reliability**: Failed part uploads can be retried without affecting other parts
+* **Flexibility**: Parts can be uploaded in any order
+* **Resume capability**: Ability to abort and restart uploads
+
+The multipart upload process consists of three main steps:
+1. **Create** a multipart upload session to get an upload ID
+2. **Upload parts** using the upload ID (parts can be uploaded in parallel)
+3. **Complete** the upload by assembling all parts into the final object
+
+## Options
+
+```console
+$ ais mpu --help
+
+NAME:
+   ais mpu - (alias for "object multipart-upload") Multipart upload operations: create, put-part, complete, and abort
+
+USAGE:
+   ais mpu command [arguments...]  [command options]
+
+COMMANDS:
+   create  Create a multipart upload session for large objects.
+      Returns an UPLOAD_ID that must be used for subsequent part uploads and completion, e.g.:
+             - 'mpu create ais://bck/large.dat'            - create MPU session for 'large.dat';
+             - 'mpu create ais://bck/video.mp4 --verbose'  - create multipart upload with verbose output.
+   put-part  Upload individual parts for a multipart upload session with a given UPLOAD_ID (returned by 'mpu create').
+      Parts can be uploaded in parallel and in any order, e.g.:
+        - 'mpu put-part ais://bck/large UPLOAD_ID 2 /path/part2.dat --verbose'                  - upload part 2 with progress;
+        - 'mpu put-part ais://bck/large UPLOAD_ID 1 /path/part1.dat'                            - upload part 1;
+        - 'mpu put-part ais://bck/large --upload-id UPLOAD_ID --part-number 3 /path/part3.dat'  - using flags
+      (for UPLOAD_ID use the value previously returned by 'mpu create' command).
+   complete  Complete a multipart upload by assembling all uploaded parts into the final object.
+      Parts are assembled in the order specified by part numbers, e.g.:
+        - 'mpu complete ais://bck/large UPLOAD_ID 1,2,3,4,5'                         - assemble 5 parts in order;
+        - 'mpu complete ais://bck/large --upload-id UPLOAD_ID --part-numbers 1,2,3'  - using flags;
+        - 'mpu complete ais://bck/large UPLOAD_ID "1,2,3" --verbose'                 - with completion progress
+      (for UPLOAD_ID use the value previously returned by 'mpu create' command).
+   abort  Abort a multipart upload session and clean up any uploaded parts.
+      All uploaded parts are discarded and the object is not created, e.g.:
+        - 'mpu abort ais://bck/large UPLOAD_ID'                        - abort upload session;
+        - 'mpu abort ais://bck/large --upload-id UPLOAD_ID --verbose'  - abort with verbose output
+      (for UPLOAD_ID use the value previously returned by 'mpu create' command).
+
+OPTIONS:
+   --help, -h  Show help
+```
+
+## Create multipart upload
+
+`ais object mpu create BUCKET/OBJECT_NAME`
+
+Creates a new multipart upload session and returns an upload ID that must be used for all subsequent operations on this upload.
+
+### Create a multipart upload session
+
+```console
+$ ais object mpu create ais://mybucket/large-video.mp4
+Upload ID: abc123def456
+
+$ ais object mpu create ais://mybucket/large-dataset.tar --verbose
+Created multipart upload for ais://mybucket/large-dataset.tar
+Upload ID: xyz789uvw012
+```
+
+## Upload parts
+
+`ais object mpu put-part BUCKET/OBJECT_NAME UPLOAD_ID PART_NUMBER FILE_PATH`
+
+Uploads individual parts for a multipart upload session. Parts can be uploaded in parallel and in any order.
+
+### Upload parts sequentially
+
+```console
+# Upload part 1
+$ ais object mpu put-part ais://mybucket/large-video.mp4 abc123def456 1 /tmp/video-part1.mp4 --verbose
+Uploading part 1 from /tmp/video-part1.mp4 (524.29MiB)...
+Uploaded part 1 for ais://mybucket/large-video.mp4 (upload ID: abc123def456)
+
+# Upload part 2
+$ ais object mpu put-part ais://mybucket/large-video.mp4 abc123def456 2 /tmp/video-part2.mp4 --verbose
+Uploading part 2 from /tmp/video-part2.mp4 (524.29MiB)...
+Uploaded part 2 for ais://mybucket/large-video.mp4 (upload ID: abc123def456)
+
+# Upload part 3
+$ ais object mpu put-part ais://mybucket/large-video.mp4 abc123def456 3 /tmp/video-part3.mp4 --verbose
+Uploading part 3 from /tmp/video-part3.mp4 (451.42MiB)...
+Uploaded part 3 for ais://mybucket/large-video.mp4 (upload ID: abc123def456)
+```
+
+### Upload parts in parallel
+
+Parts can be uploaded simultaneously from different terminals or scripts:
+
+```console
+# Terminal 1
+$ ais object mpu put-part ais://mybucket/large-file.dat uploadID 1 /tmp/part1.dat
+
+# Terminal 2 (running simultaneously)
+$ ais object mpu put-part ais://mybucket/large-file.dat uploadID 2 /tmp/part2.dat
+
+# Terminal 3 (running simultaneously)
+$ ais object mpu put-part ais://mybucket/large-file.dat uploadID 3 /tmp/part3.dat
+```
+
+All three commands can be executed at the same time, allowing for faster upload of large files.
+
+## Complete multipart upload
+
+`ais object mpu complete BUCKET/OBJECT_NAME UPLOAD_ID PART_NUMBERS`
+
+Completes a multipart upload by assembling all uploaded parts into the final object. Parts are assembled in the order specified by the part numbers.
+
+### Complete upload with all parts
+
+```console
+$ ais object mpu complete ais://mybucket/large-video.mp4 abc123def456 1,2,3 --verbose
+Completing multipart upload for ais://mybucket/large-video.mp4 with 3 parts...
+Successfully completed multipart upload for ais://mybucket/large-video.mp4
+
+# Verify the object was created
+$ ais object ls ais://mybucket --props size
+NAME                SIZE
+large-video.mp4     1.50GiB
+```
+
+### Complete upload using flags
+
+```console
+$ ais object mpu complete ais://mybucket/large-dataset.tar --upload-id xyz789uvw012 --part-numbers 1,2,3,4,5
+Successfully completed multipart upload for ais://mybucket/large-dataset.tar
+```
+
+### Complete upload with verbose progress
+
+```console
+$ ais object mpu complete ais://mybucket/large-file.dat uploadID "1,2,3,4,5,6,7,8" --verbose
+Completing multipart upload for ais://mybucket/large-file.dat with 8 parts...
+Successfully completed multipart upload for ais://mybucket/large-file.dat
+```
+
+## Abort multipart upload
+
+`ais object mpu abort BUCKET/OBJECT_NAME UPLOAD_ID`
+
+Aborts a multipart upload session and cleans up any uploaded parts. All uploaded parts are discarded and the object is not created.
+
+### Abort an upload session
+
+```console
+$ ais object mpu abort ais://mybucket/large-video.mp4 abc123def456 --verbose
+Aborting multipart upload for ais://mybucket/large-video.mp4 (upload ID: abc123def456)...
+Successfully aborted multipart upload for ais://mybucket/large-video.mp4
+
+# Verify the object was not created
+$ ais object ls ais://mybucket
+NAME                SIZE
+# (no large-video.mp4 object)
+```
+
+## Example: Complete multipart upload workflow
+
+Here's a complete example demonstrating the entire multipart upload process:
+
+```console
+# 1. Create bucket
+$ ais bucket create ais://mybucket
+"ais://mybucket" created
+
+# 2. Split a large file into parts (example using split command)
+$ split -b 100M /path/to/large-file.dat /tmp/part-
+$ ls /tmp/part-*
+/tmp/part-aa /tmp/part-ab /tmp/part-ac /tmp/part-ad
+
+# 3. Create multipart upload session
+$ ais object mpu create ais://mybucket/large-file.dat
+Upload ID: mpt123xyz789
+
+# 4. Upload all parts
+$ ais object mpu put-part ais://mybucket/large-file.dat mpt123xyz789 1 /tmp/part-aa --verbose
+$ ais object mpu put-part ais://mybucket/large-file.dat mpt123xyz789 2 /tmp/part-ab --verbose  
+$ ais object mpu put-part ais://mybucket/large-file.dat mpt123xyz789 3 /tmp/part-ac --verbose
+$ ais object mpu put-part ais://mybucket/large-file.dat mpt123xyz789 4 /tmp/part-ad --verbose
+
+# 5. Complete the upload
+$ ais object mpu complete ais://mybucket/large-file.dat mpt123xyz789 1,2,3,4 --verbose
+Successfully completed multipart upload for ais://mybucket/large-file.dat
+
+# 6. Verify the final object
+$ ais object show ais://mybucket/large-file.dat --props size
+PROPERTY    VALUE
+size        400.00MiB
+```
+
+# Append object
+
+Append operation (not to confuse with appending or [adding to existing archive](/docs/cli/archive.md)) can be executed in 3 different ways:
 
 * using `ais put` with `--append` option;
 * using `ais object concat`;
@@ -1623,7 +1855,7 @@ OPTIONS:
    help, h           Show help
 ```
 
-[Evict](/docs/bucket.md#prefetchevict-objects) object(s) from a bucket that has [remote backend](/docs/bucket.md).
+[Evict](/docs/bucket.md#prefetch-and-evict) object(s) from a bucket that has [remote backend](/docs/bucket.md).
 
 * NOTE: for each space-separated object name CLI sends a separate request.
 * For multi-object eviction that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
@@ -1725,7 +1957,7 @@ Generally, AIS objects have two kinds of properties: system and, optionally, cus
 
 Custom properties are not impacted by object updates (PUTs) -- a new version of an object simply inherits custom properties of the previous version as is with no changes.
 
-The command's syntax is similar to the one used to assign [bucket properties](bucket.md#set-bucket-properties):
+The command's syntax is similar to the one used to assign [bucket properties](/docs/cli/bucket.md#set-bucket-properties)
 
 `ais object set-custom BUCKET/OBJECT_NAME JSON_SPECIFICATION|KEY=VALUE [KEY=VALUE...]`, [command options]
 
@@ -1850,8 +2082,11 @@ OPTIONS:
 Note usage examples above. You can always run `--help` option to see the most recently updated inline help.
 
 ### See also
-* [Prefetch/Evict objects](/docs/bucket.md#prefetchevict-objects)
-* Similar to delete, evict and copy operations, `prefetch`also supports embedded prefix - see [disambiguating multi-object operation](#disambiguating-multi-object-operation)
+* [Prefetch and Evict](/docs/bucket.md#prefetch-and-evict)
+
+**Note:** Similar to delete, evict and copy operations, `prefetch` also supports embedded prefix - see:
+
+* [Disambiguating multi-object operation](#disambiguating-multi-object-operation)
 
 ## Example prefetching objects
 

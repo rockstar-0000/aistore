@@ -5,7 +5,7 @@
 package ais
 
 import (
-	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -19,15 +19,36 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+const mockPodSpec = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mock-pod-spec
+spec:
+  containers:
+  - name: main
+    image: busybox
+    command: ["sleep", "3600"]
+    ports:
+    - name: default
+      containerPort: 80
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: default
+`
+
 func TestEtlMDDeepCopy(t *testing.T) {
 	etlMD := newEtlMD()
-	etlMD.Add(&etl.InitCodeMsg{
+	etlMD.Add(&etl.ETLSpecMsg{
 		InitMsgBase: etl.InitMsgBase{
-			EtlName:   "init-code",
+			EtlName:   "test-spec",
 			CommTypeX: etl.Hpush,
 		},
-		Code: []byte("print('hello')"),
-	})
+		Runtime: etl.RuntimeSpec{
+			Image: "test-image",
+		},
+	}, etl.Initializing, nil)
 	clone := etlMD.clone()
 	s1 := string(cos.MustMarshal(etlMD))
 	s2 := string(cos.MustMarshal(clone))
@@ -58,33 +79,39 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 			LowWM: 75, HighWM: 90, OOS: 95,
 		}
 		config.LRU = cmn.LRUConf{
-			DontEvictTime: cos.Duration(time.Second), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
+			DontEvictTime: cos.Duration(time.Hour), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
 		}
 		cmn.GCO.CommitUpdate(config)
 		cfg = cmn.GCO.Get()
 
 		etlMD = newEtlMD()
-		for _, initType := range []string{etl.CodeType, etl.SpecType} {
-			for i := range 5 {
+		for _, initType := range []string{etl.ETLSpecType, etl.SpecType} {
+			for i := range 1 {
 				var msg etl.InitMsg
-				if initType == etl.CodeType {
-					msg = &etl.InitCodeMsg{
+				if initType == etl.ETLSpecType {
+					msg = &etl.ETLSpecMsg{
 						InitMsgBase: etl.InitMsgBase{
-							EtlName:   fmt.Sprintf("init-code-%d", i),
-							CommTypeX: etl.Hpush,
+							EtlName:     "runtime-spec" + strconv.Itoa(i),
+							CommTypeX:   etl.Hpush,
+							InitTimeout: cos.Duration(etl.DefaultInitTimeout),
+							ObjTimeout:  cos.Duration(etl.DefaultObjTimeout),
 						},
-						Code: []byte(fmt.Sprintf("print('hello-%d')", i)),
+						Runtime: etl.RuntimeSpec{
+							Image: "test-runtime-image",
+						},
 					}
 				} else {
 					msg = &etl.InitSpecMsg{
 						InitMsgBase: etl.InitMsgBase{
-							EtlName:   fmt.Sprintf("init-spec-%d", i),
-							CommTypeX: etl.Hpush,
+							EtlName:     "init-spec" + strconv.Itoa(i),
+							CommTypeX:   etl.Hpush,
+							InitTimeout: cos.Duration(etl.DefaultInitTimeout),
+							ObjTimeout:  cos.Duration(etl.DefaultObjTimeout),
 						},
-						Spec: []byte(fmt.Sprintf("test spec - %d", i)),
+						Spec: []byte(mockPodSpec),
 					}
 				}
-				etlMD.Add(msg)
+				etlMD.Add(msg, etl.Running, make(etl.PodMap, 4)) // Running stage expects no-nil pod map
 			}
 		}
 	})
@@ -126,16 +153,19 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 								Signature: signature,
 							}
 							clone := etlMD.clone()
-							msg := &etl.InitCodeMsg{
+							msg := &etl.ETLSpecMsg{
 								InitMsgBase: etl.InitMsgBase{
-									EtlName:   "init-code-" + cos.GenTie(),
+									EtlName:   "test-spec",
 									CommTypeX: etl.Hpush,
 								},
-								Code: []byte("print('hello')"),
+								Runtime: etl.RuntimeSpec{
+									Image: "test-image",
+								},
 							}
 
-							// Add bucket and save.
-							clone.Add(msg)
+							// Add and save.
+							preVersion := clone.version()
+							clone.add(msg, etl.Running, make(etl.PodMap, 4)) // Running stage expects no-nil pod map
 							err := jsp.Save(testpath, clone, opts, nil)
 							Expect(err).NotTo(HaveOccurred())
 
@@ -144,8 +174,24 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 							_, err = jsp.Load(testpath, loaded, opts)
 							Expect(err).NotTo(HaveOccurred())
 							Expect(loaded.Version).To(BeEquivalentTo(clone.Version))
+							Expect(loaded.Version - 1).To(BeEquivalentTo(preVersion)) // Version should be incremented
 							_, present := loaded.Get(msg.Name())
 							Expect(present).To(BeTrue())
+
+							// Delete and save.
+							preVersion = clone.version()
+							clone.del(msg.Name())
+							err = jsp.Save(testpath, clone, opts, nil)
+							Expect(err).NotTo(HaveOccurred())
+
+							// Load elsewhere and check.
+							loaded = newEtlMD()
+							_, err = jsp.Load(testpath, loaded, opts)
+							Expect(err).NotTo(HaveOccurred())
+							Expect(loaded.Version).To(BeEquivalentTo(clone.Version))
+							Expect(loaded.Version - 1).To(BeEquivalentTo(preVersion)) // Version should be incremented
+							_, present = loaded.Get(msg.Name())
+							Expect(present).To(BeFalse())
 						}
 					}
 				}

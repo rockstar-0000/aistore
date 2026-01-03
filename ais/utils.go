@@ -18,9 +18,11 @@ import (
 	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 const (
@@ -166,7 +168,7 @@ func _selectHost(locIPs []*localIPv4Info, hostnames []string) (string, error) {
 		if net.ParseIP(host) != nil { // parses as IP
 			ipv4 = host
 		} else {
-			ip, err := cmn.Host2IP(host)
+			ip, err := cmn.Host2IP(host, true /*local*/)
 			if err != nil {
 				nlog.Errorln("failed to resolve hostname(?)", host, "err:", err, "[idx:", i, len(hostnames))
 				continue
@@ -276,7 +278,7 @@ func _parseCIDR(name, name2 string) (*net.IPNet, error) {
 	}
 	_, network, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid '%s=%s': %v", name, cidr, err)
+		return nil, fmt.Errorf("invalid '%s=%s': %w", name, cidr, err)
 	}
 	return network, nil
 }
@@ -344,14 +346,15 @@ func parseMultiRange(s string, size int64) (ranges []htrange, err error) {
 		if ra == "" {
 			continue
 		}
-		i := strings.Index(ra, "-")
-		if i < 0 {
+		start, end, ok := strings.Cut(ra, "-")
+		if !ok {
 			return nil, fmt.Errorf("read range %q is invalid (-)", s)
 		}
+		start = strings.TrimSpace(start)
+		end = strings.TrimSpace(end)
+
 		var (
-			r     htrange
-			start = strings.TrimSpace(ra[:i])
-			end   = strings.TrimSpace(ra[i+1:])
+			r htrange
 		)
 		if start == "" {
 			// If no start is specified, end specifies the range start relative
@@ -449,3 +452,28 @@ func preParse(packedHdl string) (items []string, err error) {
 	}
 	return
 }
+
+//
+// conditionally empty vlabs
+//
+
+func bvlabs(bck *meta.Bck) map[string]string {
+	if cmn.Rom.Features().IsSet(feat.EnableDetailedPromMetrics) {
+		return map[string]string{stats.VlabBucket: bck.Cname("")}
+	}
+	return stats.EmptyBckVlabs
+}
+
+func xvlabs(bck *meta.Bck) map[string]string {
+	if cmn.Rom.Features().IsSet(feat.EnableDetailedPromMetrics) {
+		return map[string]string{stats.VlabBucket: bck.Cname(""), stats.VlabXkind: ""}
+	}
+	return stats.EmptyBckXlabs
+}
+
+//
+// intra-cluster times and durations (base36)
+//
+
+func unixNano2S(unixnano int64) string   { return strconv.FormatInt(unixnano, 36) }
+func s2UnixNano(s string) (int64, error) { return strconv.ParseInt(s, 36, 64) }

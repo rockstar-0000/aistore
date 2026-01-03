@@ -6,7 +6,7 @@ package ais
 
 import (
 	"fmt"
-	"os"
+	"maps"
 	"path/filepath"
 	"sync"
 	ratomic "sync/atomic"
@@ -28,8 +28,8 @@ var etlMDImmSize int64
 
 type (
 	etlMD struct {
-		etl.MD
 		cksum *cos.Cksum
+		etl.MD
 	}
 
 	etlOwner interface {
@@ -44,11 +44,14 @@ type (
 	}
 
 	etlMDModifier struct {
+		msg etl.InitMsg // interface
+
 		pre   func(ctx *etlMDModifier, clone *etlMD) (err error)
 		final func(ctx *etlMDModifier, clone *etlMD)
 
-		msg     etl.InitMsg
+		podMap  etl.PodMap
 		etlName string
+		stage   etl.Stage
 		wait    bool
 	}
 
@@ -99,24 +102,35 @@ func (e *etlMD) clone() *etlMD {
 	dst := &etlMD{}
 	*dst = *e
 	dst.Init(len(e.ETLs))
-	for id, etl := range e.ETLs {
-		dst.ETLs[id] = etl
-	}
+	maps.Copy(dst.ETLs, e.ETLs)
 	return dst
 }
 
-func (e *etlMD) add(spec etl.InitMsg) {
-	e.Add(spec)
+func (e *etlMD) add(msg etl.InitMsg, stage etl.Stage, podMap etl.PodMap) error {
+	if stage == etl.Running && podMap == nil {
+		return fmt.Errorf("podMap must be provided for stage %s", stage)
+	}
+	if stage != etl.Running && podMap != nil {
+		return fmt.Errorf("podMap must not be provided for stage %s", stage)
+	}
+	if err := e.Add(msg, stage, podMap); err != nil {
+		return err
+	}
 	e.Version++
+	return nil
 }
 
-func (e *etlMD) get(id string) (msg etl.InitMsg) {
-	return e.ETLs[id]
+func (e *etlMD) get(id string) (msg etl.InitMsg, stage etl.Stage) {
+	if en, ok := e.ETLs[id]; ok {
+		return en.InitMsg, en.Stage
+	}
+	return nil, etl.Unknown
 }
 
 func (e *etlMD) del(id string) (exists bool) {
 	_, exists = e.ETLs[id]
 	delete(e.ETLs, id)
+	e.Version++
 	return
 }
 
@@ -159,7 +173,7 @@ func (eo *etlMDOwnerPrx) init() {
 	etlMD := newEtlMD()
 	_, err := jsp.LoadMeta(eo.fpath, etlMD)
 	if err != nil {
-		if !os.IsNotExist(err) {
+		if !cos.IsNotExist(err) {
 			nlog.Errorf("failed to load %s from %s, err: %v", etlMD, eo.fpath, err)
 		} else {
 			nlog.Infof("%s does not exist at %s - initializing", etlMD, eo.fpath)
@@ -270,7 +284,7 @@ func loadEtlMD(mpaths fs.MPI, path string) (mainEtlMD *etlMD) {
 			mainEtlMD = etlMD
 			continue
 		}
-		if mainEtlMD.cksum.IsEmpty() {
+		if cos.NoneC(mainEtlMD.cksum) {
 			cos.ExitLogf("EtlMD is not checksummed (%q): %v", mpath, mainEtlMD)
 		}
 		if mainEtlMD.cksum.Equal(etlMD.cksum) {
@@ -297,7 +311,7 @@ func loadEtlMDFromMpath(mpath *fs.Mountpath, path string) (etlMD *etlMD) {
 	if err == nil {
 		return etlMD
 	}
-	if !os.IsNotExist(err) {
+	if !cos.IsNotExist(err) {
 		// Should never be NotExist error as mpi should include only mpaths with relevant etlMDs stored.
 		nlog.Errorf("failed to load %s from %s: %v", etlMD, fpath, err)
 	}

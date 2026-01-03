@@ -28,6 +28,7 @@ type (
 	}
 	evictDelete struct {
 		config *cmn.Config
+		msg    *apc.EvdMsg
 		lrit
 		xact.Base
 	}
@@ -67,9 +68,9 @@ func (*evdFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 }
 
 func newEvictDelete(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.EvdMsg) (*evictDelete, error) {
-	r := &evictDelete{config: cmn.GCO.Get()}
+	r := &evictDelete{config: cmn.GCO.Get(), msg: msg}
 	if kind == apc.ActEvictRemoteBck {
-		r.InitBase(xargs.UUID, kind, "" /*ctlmsg*/, bck)
+		r.InitBase(xargs.UUID, kind, bck)
 		r.Finish()
 		return r, nil
 	}
@@ -81,20 +82,26 @@ func newEvictDelete(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.EvdMs
 	if err := r.lrit.init(r, &msg.ListRange, bck, lsflags, msg.NumWorkers, 0 /*burst*/); err != nil {
 		return nil, err
 	}
-
-	var sb strings.Builder
-	sb.Grow(80)
-	msg.Str(&sb, r.lrp == lrpPrefix)
-	r.InitBase(xargs.UUID, kind, sb.String() /*ctlmsg*/, bck)
+	r.InitBase(xargs.UUID, kind, bck)
 
 	return r, nil
+}
+
+func (r *evictDelete) CtlMsg() string {
+	var sb strings.Builder
+	sb.Grow(80)
+	r.msg.Str(&sb, r.lrit.lrp == lrpPrefix)
+	if r.msg.NonRecurs {
+		sb.WriteString(", non-recurs")
+	}
+	return sb.String()
 }
 
 func (r *evictDelete) Run(wg *sync.WaitGroup) {
 	wg.Done()
 	err := r.lrit.run(r, core.T.Sowner().Get(), false /*prealloc buf*/)
 	if err != nil {
-		r.AddErr(err, 5, cos.SmoduleXs) // duplicated?
+		r.AddErr(err, 5, cos.ModXs) // duplicated?
 	}
 	r.lrit.wait()
 	r.Finish()
@@ -113,15 +120,11 @@ func (r *evictDelete) do(lom *core.LOM, lrit *lrit, _ []byte) {
 		return
 	}
 eret:
-	r.AddErr(err, 5, cos.SmoduleXs)
+	r.AddErr(err, 5, cos.ModXs)
 }
 
 func (r *evictDelete) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
+	snap = r.Base.NewSnap(r)
 	snap.Pack(0, len(r.lrit.nwp.workers), r.lrit.nwp.chanFull.Load())
-
-	snap.IdleX = r.IsIdle()
 	return
 }

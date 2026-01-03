@@ -8,6 +8,7 @@ package cli
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	ratomic "sync/atomic"
@@ -131,6 +132,22 @@ func verbRange(c *cli.Context, wop wop, pt *cos.ParsedTemplate, bck cmn.Bck, tri
 		allFobjs = append(allFobjs, fobjs...)
 	}
 	return verbFobjs(c, wop, allFobjs, bck, ndir, recurs)
+}
+
+func copyObject(c *cli.Context, bckFrom cmn.Bck, objFrom string, bckTo cmn.Bck, objTo string) (err error) {
+	err = api.CopyObject(apiBP, &api.CopyArgs{
+		FromBck:     bckFrom,
+		FromObjName: objFrom,
+		ToBck:       bckTo,
+		ToObjName:   objTo,
+	})
+	if err == nil {
+		if objTo == "" {
+			objTo = objFrom
+		}
+		actionDone(c, fmt.Sprintf("COPY %s => %s", bckFrom.Cname(objFrom), bckTo.Cname(objTo)))
+	}
+	return
 }
 
 func concatObject(c *cli.Context, bck cmn.Bck, objName string, fileNames []string) error {
@@ -258,8 +275,7 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string, silent bool) (not
 		propsFlag     []string
 		selectedProps []string
 		hargs         = api.HeadArgs{
-			FltPresence: apc.FltPresentCluster,
-			Silent:      flagIsSet(c, silentFlag) || silent,
+			Silent: flagIsSet(c, silentFlag) || silent,
 		}
 		isList      = actionIsHandler(c.Command.Action, listAnyHandler)
 		isRemote    = bck.IsRemote()
@@ -268,12 +284,23 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string, silent bool) (not
 	if errU != nil {
 		return false, errU
 	}
-	if flagIsSet(c, objNotCachedPropsFlag) || flagIsSet(c, allObjsOrBcksFlag) {
+	switch {
+	case flagIsSet(c, headObjPresentFlag):
+		hargs.FltPresence = apc.FltPresentCluster
+	case flagIsSet(c, objNotCachedPropsFlag) || flagIsSet(c, allObjsOrBcksFlag):
 		hargs.FltPresence = apc.FltExists
+	default:
+		hargs.FltPresence = apc.FltPresent
 	}
 
+	// TODO: consider moving this bit to callers
+	var (
+		warned     bool
+		encObjName = warnEscapeObjName(c, objName, &warned)
+	)
+
 	// do
-	objProps, err := api.HeadObject(apiBP, bck, objName, hargs)
+	objProps, err := api.HeadObject(apiBP, bck, encObjName, hargs)
 	if err != nil {
 		notfound = cmn.IsStatusNotFound(err)
 		if !notfound {
@@ -311,7 +338,7 @@ func showObjProps(c *cli.Context, bck cmn.Bck, objName string, silent bool) (not
 		} else if bck.IsCloud() {
 			selectedProps = apc.GetPropsDefaultCloud
 		}
-	case cos.StringInSlice("all", propsFlag):
+	case slices.Contains(propsFlag, "all"):
 		selectedProps = apc.GetPropsAll
 	default:
 		selectedProps = propsFlag
@@ -356,7 +383,7 @@ func propVal(op *cmn.ObjectProps, name string) (v string, _ error) {
 	case apc.GetPropsName:
 		v = op.Bck.Cname(op.Name)
 	case apc.GetPropsSize:
-		v = cos.ToSizeIEC(op.Size, 2)
+		v = cos.IEC(op.Size, 2)
 	case apc.GetPropsChecksum:
 		v = op.Cksum.String()
 	case apc.GetPropsAtime:

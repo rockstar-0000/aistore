@@ -13,10 +13,12 @@ const (
 	ContentMsgPack        = "application/msgpack"
 	ContentXML            = "application/xml"
 	ContentBinary         = "application/octet-stream"
+	ContentZip            = "application/zip"
 
 	// not present in IANA registry
 	// mozilla.org has it though, and also https://en.wikipedia.org/wiki/List_of_archive_formats
-	ContentTar = "application/x-tar"
+	ContentTar  = "application/x-tar"
+	ContentGzip = "application/gzip" // widely used for .tar.gz and .tgz
 )
 
 // Ref: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers
@@ -43,7 +45,9 @@ const (
 
 	HdrHSTS = "Strict-Transport-Security"
 
-	HdrLastModified = "Last-Modified" // RFC1123GMT or, same, http.TimeFormat ("Mon, 02 Jan 2006 15:04:05 GMT")
+	// RFC1123GMT or, same, http.TimeFormat ("Mon, 02 Jan 2006 15:04:05 GMT")
+	// see also, and separately, cmn.LsoLastModified (list-objects)
+	HdrLastModified = "Last-Modified"
 )
 
 //

@@ -24,7 +24,7 @@ import (
 // Creates new ais bucket
 func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadRemote bool) (err error) {
 	if err = api.CreateBucket(apiBP, bck, props, dontHeadRemote); err != nil {
-		if herr, ok := err.(*cmn.ErrHTTP); ok {
+		if herr := cmn.AsErrHTTP(err); herr != nil {
 			if herr.Status == http.StatusConflict {
 				desc := fmt.Sprintf("Bucket %q already exists", bck.String())
 				if flagIsSet(c, ignoreErrorFlag) {
@@ -40,7 +40,7 @@ func createBucket(c *cli.Context, bck cmn.Bck, props *cmn.BpropsToSet, dontHeadR
 		}
 		return fmt.Errorf("failed to create %q: %v", bck.String(), err)
 	}
-	// NOTE: see docs/bucket.md#default-bucket-properties
+	// see https://github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket-properties
 	fmt.Fprintf(c.App.Writer, "%q created\n", bck.Cname(""))
 	return
 }
@@ -58,20 +58,9 @@ func destroyBuckets(c *cli.Context, buckets []cmn.Bck) (cmn.Bck, error) {
 			}
 		}
 
-		err := api.DestroyBucket(apiBP, bck)
-		if err == nil {
-			fmt.Fprintf(c.App.Writer, "%q destroyed\n", bck.Cname(""))
-			continue
+		if err := destroyBucket(c, bck); err != nil {
+			return bck, err
 		}
-		if cmn.IsStatusNotFound(err) {
-			err := &errDoesNotExist{what: "bucket", name: bck.Cname("")}
-			if !flagIsSet(c, ignoreErrorFlag) {
-				return bck, err
-			}
-			fmt.Fprintln(c.App.ErrWriter, err)
-			continue
-		}
-		return bck, err
 	}
 	return cmn.Bck{}, nil
 }
@@ -144,7 +133,7 @@ func listOrSummBuckets(c *cli.Context, qbck cmn.QueryBcks, lsb lsbCtx) error {
 		}
 	}
 
-	if len(bcks) == 0 && apc.IsFltPresent(lsb.fltPresence) && !qbck.IsAIS() {
+	if len(bcks) == 0 {
 		_lsTip(c, qbck)
 		return nil
 	}
@@ -189,7 +178,12 @@ func listOrSummBuckets(c *cli.Context, qbck cmn.QueryBcks, lsb lsbCtx) error {
 	// finally, list remote ais buckets, if any
 	qbck = cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.NsAnyRemote}
 	cnt := listBckTable(c, qbck, nbcks, lsb)
-	if cnt > 0 || total == 0 {
+	total += cnt
+
+	if total == 0 {
+		// No buckets were actually displayed to users - show tip instead of blank line
+		_lsTip(c, cmn.QueryBcks{})
+	} else if cnt > 0 {
 		fmt.Fprintln(c.App.Writer)
 	}
 	return nil
@@ -197,24 +191,18 @@ func listOrSummBuckets(c *cli.Context, qbck cmn.QueryBcks, lsb lsbCtx) error {
 
 func _lsTip(c *cli.Context, qbck cmn.QueryBcks) {
 	const (
-		what1 = "No buckets in the cluster. "
-		what2 = "No %q buckets in the cluster. "
-
-		h1 = "Use %s option to list matching remote buckets, if any"
-		h4 = "\n(optionally, use %s as well _not_ to add them on the fly).\n"
+		what1 = "No buckets in the cluster."
+		what2 = "No %q buckets in the cluster."
+		h1    = "Use %s option to list matching remote buckets, if any."
 	)
+	if qbck.IsEmpty() {
+		fmt.Fprintln(c.App.Writer, what1)
+		return
+	}
 	if flagIsSet(c, bckSummaryFlag) {
-		if qbck.IsEmpty() {
-			fmt.Fprintf(c.App.Writer, what1+h1+h4, qflprn(allObjsOrBcksFlag), qflprn(dontAddRemoteFlag))
-		} else {
-			fmt.Fprintf(c.App.Writer, what2+h1+h4, qbck, qflprn(allObjsOrBcksFlag), qflprn(dontAddRemoteFlag))
-		}
+		fmt.Fprintf(c.App.Writer, what2+"\n", qbck)
 	} else {
-		if qbck.IsEmpty() {
-			fmt.Fprintf(c.App.Writer, what1+h1+".\n", qflprn(allObjsOrBcksFlag))
-		} else {
-			fmt.Fprintf(c.App.Writer, what2+h1+".\n", qbck, qflprn(allObjsOrBcksFlag))
-		}
+		fmt.Fprintf(c.App.Writer, what2+" "+h1+"\n", qbck, qflprn(allObjsOrBcksFlag))
 	}
 }
 
@@ -243,7 +231,7 @@ func reformatBackendProps(c *cli.Context, nvs cos.StrKVs) error {
 		goto validate
 	}
 
-	if v != apc.NilValue {
+	if v != apc.ResetToken {
 		var err error
 		if originBck, err = parseBckURI(c, v, true /*error only*/); err != nil {
 			return fmt.Errorf("invalid '%s=%s': expecting %q to be a valid bucket name",
@@ -307,6 +295,15 @@ func showBucketProps(c *cli.Context) error {
 	}
 
 	if flagIsSet(c, jsonFlag) {
+		if section != "" {
+			if printSectionJSON(c, p, section) {
+				return nil
+			}
+			// Section not found - show helpful error
+			showSectionNotFoundError(c, section, p,
+				"Try 'ais bucket props show "+bck.String()+" --json' to see all sections")
+			return nil
+		}
 		opts := teb.Jopts(true)
 		return teb.Print(p, "", opts)
 	}
@@ -323,7 +320,7 @@ func showBucketProps(c *cli.Context) error {
 func headBckTable(c *cli.Context, props, defProps *cmn.Bprops, section string) (err error) {
 	var (
 		defList nvpairList
-		colored = !cfg.NoColor
+		colored = !gcfg.NoColor
 		compact = flagIsSet(c, compactPropFlag)
 	)
 	// List instead of map to keep properties in the same order always.
@@ -355,7 +352,7 @@ func headBckTable(c *cli.Context, props, defProps *cmn.Bprops, section string) (
 					}
 				case def.Name == cmn.PropBucketCreated:
 					if p.Value != teb.NotSetVal {
-						created, err := cos.S2UnixNano(p.Value)
+						created, err := s2UnixNano(p.Value)
 						if err == nil {
 							p.Value = fmtBucketCreatedTime(created)
 						}

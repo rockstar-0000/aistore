@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -19,12 +19,21 @@ const (
 	DeploymentDev = "dev"
 )
 
-const NilValue = "none" // features (flags), log modules, et al.
+// [convention]
+// reset features flags, log modules, slices inside cluster config, and more
+// (see also: docs/cli.md "Special keywords")
+const ResetToken = "none"
 
 // in re: "Slowloris Attack"
 const (
 	ReadHeaderTimeout    = 16 * time.Second
 	EnvReadHeaderTimeout = "AIS_READ_HEADER_TIMEOUT"
+)
+
+// ulimits
+const (
+	UlimitProxy  = 16384
+	UlimitTarget = 262144
 )
 
 // timeouts for intra-cluster requests

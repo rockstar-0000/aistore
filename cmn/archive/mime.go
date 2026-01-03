@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -13,8 +13,6 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
@@ -29,6 +27,12 @@ const (
 	ExtTarGz  = ".tar.gz"
 	ExtZip    = ".zip"
 	ExtTarLz4 = ".tar.lz4"
+)
+
+// compression formats - not necessarily compressed TAR
+const (
+	ExtGz  = ".gz"
+	ExtLz4 = ".lz4"
 )
 
 const (
@@ -98,7 +102,7 @@ func normalize(mime string) (string, error) {
 			}
 		}
 	}
-	return "", NewErrUnknownMime(mime)
+	return "", newErrUnknownMime(mime)
 }
 
 // by filename extension
@@ -108,38 +112,25 @@ func byExt(filename string) (string, error) {
 			return ext, nil
 		}
 	}
-	return "", NewErrUnknownFileExt(filename, "")
+	return "", newErrUnknownFileExt(filename, "")
 }
 
-// NOTE convention: caller may pass nil `smm` _not_ to spend time (usage: listing and reading)
-func MimeFile(file cos.LomReader, smm *memsys.MMSA, mime, archname string) (m string, err error) {
+func MimeFile(lh cos.LomReader, smm *memsys.MMSA, mime, archname string) (m string, err error) {
 	m, err = Mime(mime, archname)
 	if err == nil || IsErrUnknownMime(err) {
 		return
 	}
+	// NOTE convention: caller may pass nil `smm` _not_ to spend time (usage: listing and reading)
 	if smm == nil {
-		err = NewErrUnknownFileExt(archname, "not reading file magic")
+		err = newErrUnknownFileExt(archname, "not reading file magic")
 		return
 	}
+
 	// by magic
-	var (
-		n         int
-		buf, slab = smm.AllocSize(sizeDetectMime)
-	)
-	m, n, err = _detect(file, archname, m, buf)
-	if n > 0 {
-		fh, ok := file.(*os.File)
-		cos.Assertf(ok, "expecting os.File, got %T", file)
-		_, errV := fh.Seek(0, io.SeekStart)
-		debug.AssertNoErr(errV)
-		if err == nil {
-			err = errV
-		}
-		if err == nil {
-			nlog.Infoln("archname", archname, "is in fact", m, "(via magic sign)")
-		}
-	}
+	buf, slab := smm.AllocSize(sizeDetectMime)
+	m, err = _detect(lh, archname, m, buf)
 	slab.Free(buf)
+
 	return
 }
 
@@ -152,7 +143,7 @@ func MimeFQN(smm *memsys.MMSA, mime, archname string) (m string, err error) {
 		return
 	}
 	if smm == nil {
-		err = NewErrUnknownFileExt(archname, "not reading file magic")
+		err = newErrUnknownFileExt(archname, "not reading file magic")
 		return
 	}
 	fh, err := os.Open(archname)
@@ -160,39 +151,64 @@ func MimeFQN(smm *memsys.MMSA, mime, archname string) (m string, err error) {
 		return "", err
 	}
 	buf, slab := smm.AllocSize(sizeDetectMime)
-	m, _, err = _detect(fh, archname, m, buf)
+	m, err = _detect(fh, archname, m, buf)
 	slab.Free(buf)
 	cos.Close(fh)
 	return
 }
 
-func _detect(file cos.LomReader, archname, mime string, buf []byte) (string, int, error) {
-	n, err := file.Read(buf)
-	if err != nil {
-		return "", 0, err
+func _detect(lh cos.LomReader, archname, mime string, buf []byte) (string, error) {
+	n, err := lh.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return "", err
 	}
 	switch mime {
 	case ExtTar:
 		if n < sizeDetectMime {
-			return "", n, NewErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTar, sizeDetectMime))
+			return "", newErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTar, sizeDetectMime))
 		}
 	case ExtTarGz:
 		if l := magicGzip.offset + len(magicGzip.sig) + 4; n < l {
-			return "", n, NewErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTarGz, l))
+			return "", newErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTarGz, l))
 		}
 	case ExtTarLz4:
 		if l := magicLz4.offset + len(magicLz4.sig) + 4; n < l {
-			return "", n, NewErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTarGz, l))
+			return "", newErrUnknownFileExt(archname, fmt.Sprintf(fmtErrTooShort, ExtTarLz4, l))
 		}
 	}
 	for _, magic := range allMagics {
-		if n > magic.offset && bytes.HasPrefix(buf[magic.offset:], magic.sig) {
-			return magic.mime, n, nil
+		if n > magic.offset && bytes.HasPrefix(buf[magic.offset:n], magic.sig) {
+			return magic.mime, nil
 		}
 	}
-	return "", n, fmt.Errorf("failed to detect supported file signatures in %q", archname)
+	return "", fmt.Errorf("unrecognized or unsupported file format: %q", archname)
 }
 
+// inspect the first bytes of r and return a compression
+// extension (ExtGz, ExtLz4);
+// an empty `ext` indicates plain-text (or rather: no compression)
+func DetectCompression(r io.ReaderAt) (string, error) {
+	// keep a bit of head-room
+	const hdrSize = 64
+
+	var hdr [hdrSize]byte
+	n, err := r.ReadAt(hdr[:], 0)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	if n >= magicGzip.offset+len(magicGzip.sig) &&
+		bytes.HasPrefix(hdr[magicGzip.offset:], magicGzip.sig) {
+		return ExtGz, nil
+	}
+	if n >= magicLz4.offset+len(magicLz4.sig) &&
+		bytes.HasPrefix(hdr[magicLz4.offset:], magicLz4.sig) {
+		return ExtLz4, nil
+	}
+	// plain-text or unknown
+	return "", nil
+}
+
+// (currently, dsort only usage)
 func EqExt(ext1, ext2 string) bool {
 	switch {
 	case ext1 == ext2:
@@ -203,4 +219,42 @@ func EqExt(ext1, ext2 string) bool {
 		return true
 	}
 	return false
+}
+
+//
+// to/from HTTP ContentType (while trying to respect IANA and de-facto conventions)
+//
+
+func ExtFromContentType(ct string) string {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if idx := strings.IndexByte(ct, ';'); idx > 0 {
+		ct = ct[:idx] // strip params
+	}
+	switch {
+	case strings.HasPrefix(ct, "application/tar") || strings.HasPrefix(ct, cos.ContentTar):
+		return ExtTar
+	case strings.HasPrefix(ct, cos.ContentGzip) || strings.HasPrefix(ct, "application/x-gzip"):
+		return ExtTgz
+	case strings.HasPrefix(ct, "application/x-lz4") || strings.HasPrefix(ct, "application/lz4"):
+		return ExtTarLz4
+	case strings.HasPrefix(ct, cos.ContentZip):
+		return ExtZip
+	default:
+		return "" // unknown or missing
+	}
+}
+
+func ContentTypeFromExt(ext string) string {
+	switch ext {
+	case "", ExtTar:
+		return cos.ContentTar // not IANA-registered
+	case ExtTgz, ExtTarGz:
+		return cos.ContentGzip // widely used for .tar.gz / .tgz
+	case ExtTarLz4:
+		return "application/x-lz4" // unofficial but conventional
+	case ExtZip:
+		return cos.ContentZip // IANA-registered
+	default:
+		return cos.ContentBinary
+	}
 }

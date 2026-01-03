@@ -1,12 +1,13 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"strings"
 	"time"
@@ -51,6 +52,7 @@ type (
 		String() string
 		Notif() core.Notif // notifications
 		AddNotif(n core.Notif, job jobif)
+		Headers() http.Header
 
 		// If total length (size) of download job is not known, -1 should be returned.
 		Len() int
@@ -70,6 +72,10 @@ type (
 
 		// job cleanup
 		cleanup()
+
+		// ETL methods
+		etlName() string
+		etlArgs() string
 	}
 
 	baseDlJob struct {
@@ -79,7 +85,10 @@ type (
 		id          string
 		description string
 		timeout     time.Duration
+		headers     http.Header
 		throt       throttler
+		_etlName    string
+		_etlArgs    string
 	}
 
 	sliceDlJob struct {
@@ -133,7 +142,7 @@ type (
 // baseDlJob //
 ///////////////
 
-func (j *baseDlJob) init(id string, bck *meta.Bck, timeout, desc string, limits Limits, xdl *Xact) {
+func (j *baseDlJob) init(id string, bck *meta.Bck, timeout, desc string, limits Limits, headers http.Header, xdl *Xact, etlName, etlArgs string) {
 	// TODO: this might be inaccurate if we download 1 or 2 objects because then
 	//  other targets will have limits but will not use them.
 	if limits.BytesPerHour > 0 {
@@ -145,8 +154,11 @@ func (j *baseDlJob) init(id string, bck *meta.Bck, timeout, desc string, limits 
 		j.bck = bck
 		j.timeout = td
 		j.description = desc
+		j.headers = headers
 		j.throt.init(limits)
 		j.xdl = xdl
+		j._etlName = etlName
+		j._etlArgs = etlArgs
 	}
 }
 
@@ -155,6 +167,9 @@ func (j *baseDlJob) XactID() string         { return j.xdl.ID() }
 func (j *baseDlJob) Bck() *cmn.Bck          { return j.bck.Bucket() }
 func (j *baseDlJob) Timeout() time.Duration { return j.timeout }
 func (j *baseDlJob) Description() string    { return j.description }
+func (j *baseDlJob) Headers() http.Header   { return j.headers }
+func (j *baseDlJob) etlName() string        { return j._etlName }
+func (j *baseDlJob) etlArgs() string        { return j._etlArgs }
 func (*baseDlJob) Sync() bool               { return false }
 
 func (j *baseDlJob) String() (s string) {
@@ -235,7 +250,7 @@ func newMultiDlJob(id string, bck *meta.Bck, payload *MultiBody, xdl *Xact) (mj 
 	var objs cos.StrKVs
 
 	mj = &multiDlJob{}
-	mj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, xdl)
+	mj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, payload.Headers, xdl, payload.ETLName, payload.ETLArgs)
 
 	if objs, err = payload.ExtractPayload(); err != nil {
 		return nil, err
@@ -250,7 +265,7 @@ func newSingleDlJob(id string, bck *meta.Bck, payload *SingleBody, xdl *Xact) (s
 	var objs cos.StrKVs
 
 	sj = &singleDlJob{}
-	sj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, xdl)
+	sj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, payload.Headers, xdl, payload.ETLName, payload.ETLArgs)
 
 	if objs, err = payload.ExtractPayload(); err != nil {
 		return nil, err
@@ -273,7 +288,7 @@ func newRangeDlJob(id string, bck *meta.Bck, payload *RangeBody, xdl *Xact) (rj 
 	if rj.pt, err = cos.ParseBashTemplate(payload.Template); err != nil {
 		return nil, err
 	}
-	rj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, xdl)
+	rj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, payload.Headers, xdl, payload.ETLName, payload.ETLArgs)
 
 	if rj.count, err = countObjects(rj.pt, payload.Subdir, rj.bck); err != nil {
 		return nil, err
@@ -336,7 +351,7 @@ func newBackendDlJob(id string, bck *meta.Bck, payload *BackendBody, xdl *Xact) 
 		return nil, errors.New("bucket download does not support HTTP buckets")
 	}
 	bj = &backendDlJob{}
-	bj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, xdl)
+	bj.baseDlJob.init(id, bck, payload.Timeout, payload.Describe(), payload.Limits, nil, xdl, payload.ETLName, payload.ETLArgs)
 	{
 		bj.sync = payload.Sync
 		bj.prefix = payload.Prefix

@@ -60,14 +60,6 @@ type (
 		io.Reader
 		io.ReaderAt
 	}
-	LomReader interface {
-		io.ReadCloser
-		io.ReaderAt
-	}
-	LomWriter interface {
-		io.WriteCloser
-		Sync() error
-	}
 )
 
 // readers: implementations
@@ -81,18 +73,11 @@ type (
 		size   int
 		offset int
 	}
-	deferRCS struct {
-		ReadCloseSizer
-		cb func()
-	}
-	ReaderArgs struct {
+	ReaderWithArgs struct {
 		R       io.Reader
 		ReadCb  func(int, error)
 		DeferCb func()
-		Size    int64
-	}
-	ReaderWithArgs struct {
-		args ReaderArgs
+		Rsize   int64
 	}
 	nopOpener struct{ io.ReadCloser }
 )
@@ -138,7 +123,19 @@ type (
 		Size() int64
 	}
 
-	WriterMulti struct{ writers []io.Writer }
+	nopWriteCloser struct {
+		io.Writer
+	}
+
+	WriterMulti struct {
+		writers []io.Writer
+		size    int64
+	}
+
+	SectionWriter struct {
+		w      io.WriterAt
+		offset int64
+	}
 
 	// WriterOnly is a helper struct to hide `io.ReaderFrom` interface implementation
 	// As far as http.ResponseWriter (and its underlying tcp conn.), the following are tradeoffs:
@@ -156,6 +153,22 @@ type (
 	}
 )
 
+// core.LOM: reader and writer
+type (
+	LomReader interface {
+		io.ReadCloser
+		io.ReaderAt
+	}
+	LomReaderOpener interface {
+		LomReader
+		Open() (ReadOpenCloser, error)
+	}
+	LomWriter interface {
+		io.WriteCloser
+		Sync() error
+	}
+)
+
 // interface guard
 var (
 	_ io.Reader = (*nopReader)(nil)
@@ -168,6 +181,9 @@ var (
 	_ ReadOpenCloser = (*SectionHandle)(nil)
 	_ ReadOpenCloser = (*FileSectionHandle)(nil)
 	_ ReadOpenCloser = (*nopOpener)(nil)
+
+	_ io.WriteCloser = (*nopWriteCloser)(nil)
+	_ io.Writer      = (*SectionWriter)(nil)
 )
 
 ///////////////
@@ -190,6 +206,19 @@ func (r *nopReader) Read(b []byte) (int, error) {
 	toRead := min(len(b), left)
 	r.offset += toRead
 	return toRead, nil
+}
+
+////////////////////
+// nopWriteCloser //
+////////////////////
+
+func (*nopWriteCloser) Close() error {
+	return nil
+}
+
+// Helper function
+func NopWriteCloser(w io.Writer) io.WriteCloser {
+	return &nopWriteCloser{Writer: w}
 }
 
 ////////////////
@@ -230,37 +259,16 @@ func (f *FileHandle) OpenDup() (ROCS, error)        { return NewFileHandle(f.fqn
 func NewSizedReader(r io.Reader, size int64) ReadSizer { return &sizedReader{r, size} }
 func (f *sizedReader) Size() int64                     { return f.size }
 
-//////////////
-// deferRCS //
-//////////////
-
-func NewDeferRCS(r ReadCloseSizer, cb func()) ReadCloseSizer {
-	if cb == nil {
-		return r
-	}
-	return &deferRCS{r, cb}
-}
-
-func (r *deferRCS) Close() (err error) {
-	err = r.ReadCloseSizer.Close()
-	r.cb()
-	return
-}
-
 ////////////////////
 // ReaderWithArgs //
 ////////////////////
 
-func NewReaderWithArgs(args ReaderArgs) *ReaderWithArgs {
-	return &ReaderWithArgs{args: args}
-}
-
-func (r *ReaderWithArgs) Size() int64 { return r.args.Size }
+func (r *ReaderWithArgs) Size() int64 { return r.Rsize }
 
 func (r *ReaderWithArgs) Read(p []byte) (n int, err error) {
-	n, err = r.args.R.Read(p)
-	if r.args.ReadCb != nil {
-		r.args.ReadCb(n, err)
+	n, err = r.R.Read(p)
+	if r.ReadCb != nil {
+		r.ReadCb(n, err)
 	}
 	return n, err
 }
@@ -268,11 +276,11 @@ func (r *ReaderWithArgs) Read(p []byte) (n int, err error) {
 func (*ReaderWithArgs) Open() (ReadOpenCloser, error) { panic("not supported") }
 
 func (r *ReaderWithArgs) Close() (err error) {
-	if rc, ok := r.args.R.(io.ReadCloser); ok {
+	if rc, ok := r.R.(io.ReadCloser); ok {
 		err = rc.Close()
 	}
-	if r.args.DeferCb != nil {
-		r.args.DeferCb()
+	if r.DeferCb != nil {
+		r.DeferCb()
 	}
 	return err
 }
@@ -362,21 +370,53 @@ func (f *FileSectionHandle) Close() error                 { return f.fh.Close() 
 // WriterMulti //
 /////////////////
 
-func NewWriterMulti(w ...io.Writer) *WriterMulti { return &WriterMulti{w} }
+func NewWriterMulti(ws ...io.Writer) *WriterMulti { return &WriterMulti{ws, 0} }
 
-func (mw *WriterMulti) Write(b []byte) (n int, err error) {
+func IniWriterMulti(ws ...io.Writer) *WriterMulti {
+	mw := &WriterMulti{
+		writers: make([]io.Writer, 0, 4),
+	}
+	for _, w := range ws {
+		if w != nil {
+			mw.writers = append(mw.writers, w)
+		}
+	}
+	return mw
+}
+
+func (mw *WriterMulti) Append(w io.Writer) { mw.writers = append(mw.writers, w) }
+
+func (mw *WriterMulti) Write(b []byte) (int, error) {
 	l := len(b)
 	for _, w := range mw.writers {
-		n, err = w.Write(b)
-		if err == nil && n == l {
-			continue
+		debug.Assert(w != nil, "must use IniWriterMulti")
+		n, err := w.Write(b)
+		if err != nil {
+			return n, err
 		}
-		if err == nil {
-			err = io.ErrShortWrite
+		if n != l {
+			return n, io.ErrShortWrite
 		}
-		return
 	}
-	n = l
+	mw.size += int64(l)
+	return l, nil
+}
+
+func (mw *WriterMulti) Size() int64 { return mw.size }
+
+///////////////////
+// SectionWriter //
+///////////////////
+
+// NewSectionWriter returns a SectionWriter that writes to w starting at offset.
+// This is the write equivalent of `cos.NewSectionReader`
+func NewSectionWriter(w io.WriterAt, offset int64) *SectionWriter {
+	return &SectionWriter{w: w, offset: offset}
+}
+
+func (sw *SectionWriter) Write(p []byte) (n int, err error) {
+	n, err = sw.w.WriteAt(p, sw.offset)
+	sw.offset += int64(n)
 	return
 }
 

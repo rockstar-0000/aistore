@@ -1,4 +1,4 @@
-// Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
+// Package fs_test provides tests for fs package
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -37,7 +37,7 @@ func TestMarkers(t *testing.T) {
 		markerEntry{marker: fname.ResilverMarker, exists: false},
 	)
 
-	fatalErr, writeErr := fs.PersistMarker(fname.RebalanceMarker)
+	fatalErr, writeErr := fs.PersistMarker(fname.RebalanceMarker, false /*quiet*/)
 	tassert.CheckFatal(t, fatalErr)
 	tassert.CheckFatal(t, writeErr)
 
@@ -46,7 +46,7 @@ func TestMarkers(t *testing.T) {
 		markerEntry{marker: fname.ResilverMarker, exists: false},
 	)
 
-	fatalErr, writeErr = fs.PersistMarker(fname.ResilverMarker)
+	fatalErr, writeErr = fs.PersistMarker(fname.ResilverMarker, false /*quiet*/)
 	tassert.CheckFatal(t, fatalErr)
 	tassert.CheckFatal(t, writeErr)
 
@@ -55,14 +55,14 @@ func TestMarkers(t *testing.T) {
 		markerEntry{marker: fname.ResilverMarker, exists: true},
 	)
 
-	fs.RemoveMarker(fname.RebalanceMarker, mockst)
+	fs.RemoveMarker(fname.RebalanceMarker, mockst, false)
 
 	checkMarkersExist(t,
 		markerEntry{marker: fname.RebalanceMarker, exists: false},
 		markerEntry{marker: fname.ResilverMarker, exists: true},
 	)
 
-	fs.RemoveMarker(fname.ResilverMarker, mockst)
+	fs.RemoveMarker(fname.ResilverMarker, mockst, false)
 
 	checkMarkersExist(t,
 		markerEntry{marker: fname.RebalanceMarker, exists: false},

@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,7 +67,7 @@ type (
 var js = jsoniter.ConfigFastest
 
 func (m *Manager) finish() {
-	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+	if cmn.Rom.V(4, cos.ModDsort) {
 		nlog.Infof("%s: %s finished", core.T, m.ManagerUUID)
 	}
 	m.lock()
@@ -95,7 +95,7 @@ func (m *Manager) start() (err error) {
 
 	s := binary.BigEndian.Uint64(m.Pars.TargetOrderSalt)
 	targetOrder := _torder(s, m.smap.Tmap)
-	if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+	if cmn.Rom.V(4, cos.ModDsort) {
 		nlog.Infof("%s: %s final target in targetOrder => URL: %s, tid %s", core.T, m.ManagerUUID,
 			targetOrder[len(targetOrder)-1].PubNet.URL, targetOrder[len(targetOrder)-1].ID())
 	}
@@ -111,7 +111,7 @@ func (m *Manager) start() (err error) {
 	if curTargetIsFinal {
 		// assuming uniform distribution estimate avg. output shard size
 		ratio := m.compressionRatio()
-		if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+		if cmn.Rom.V(4, cos.ModDsort) {
 			nlog.Infof("%s [dsort] %s phase3: ratio=%f", core.T, m.ManagerUUID, ratio)
 		}
 		debug.Assertf(shard.IsCompressed(m.Pars.InputExtension) || ratio == 1, "tar ratio=%f, ext=%q",
@@ -129,7 +129,7 @@ func (m *Manager) start() (err error) {
 	// Wait for signal to start shard creations. This will happen when manager
 	// notice that the specification for shards to be created locally was received.
 	select {
-	case <-m.startShardCreation:
+	case <-m.createShardCh:
 		break
 	case <-m.listenAborted():
 		return m.newErrAborted()
@@ -160,7 +160,7 @@ func _torder(salt uint64, tmap meta.NodeMap) []*meta.Snode {
 		targets[c] = d
 		keys = append(keys, c)
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	slices.Sort(keys)
 
 	t := make(meta.Nodes, len(keys))
 	for i, k := range keys {
@@ -185,7 +185,7 @@ func (m *Manager) extractLocalShards() (err error) {
 	// compare with xact/xs/multiobj.go
 	group, ctx := errgroup.WithContext(context.Background())
 	switch {
-	case m.Pars.Pit.isRange():
+	case m.Pars.Pit.Template.IsRange():
 		err = m.iterRange(ctx, group)
 	case m.Pars.Pit.isList():
 		err = m.iterList(ctx, group)
@@ -259,7 +259,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 		shardName = s.Name
 		errCh     = make(chan error, 2)
 	)
-	if err := lom.InitBck(&m.Pars.OutputBck); err != nil {
+	if err := lom.InitCmnBck(&m.Pars.OutputBck); err != nil {
 		return err
 	}
 	lom.SetAtimeUnix(time.Now().UnixNano())
@@ -285,8 +285,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 		wg   = &sync.WaitGroup{}
 		r, w = io.Pipe()
 	)
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		var err error
 		if !m.Pars.DryRun {
 			params := core.AllocPutParams()
@@ -310,8 +309,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 			_, err = io.Copy(io.Discard, r)
 		}
 		errCh <- err
-		wg.Done()
-	}()
+	})
 
 	// may reshard into a different format
 	shardRW := m.shardRW
@@ -355,7 +353,7 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 		return errH
 	}
 
-	// If the newly created shard belongs on a different target
+	// If the newly created shard belongs to a different target
 	// according to HRW, send it there. Since it doesn't really matter
 	// if we have an extra copy of the object local to this target, we
 	// optimize for performance by not removing the object now.
@@ -363,18 +361,12 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 		lom.Lock(false)
 		defer lom.Unlock(false)
 
-		// Need to make sure that the object is still there.
-		if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
-			return err
-		}
-
-		if lom.Lsize() <= 0 {
-			goto exit
-		}
-
-		file, errO := cos.NewFileHandle(lom.FQN)
+		reader, errO := lom.NewHandle(false /*loaded*/)
 		if errO != nil {
 			return errO
+		}
+		if lom.Lsize() <= 0 {
+			goto exit
 		}
 
 		o := transport.AllocSend()
@@ -387,12 +379,12 @@ func (m *Manager) createShard(s *shard.Shard, lom *core.LOM) error {
 		// Make send synchronous.
 		streamWg := &sync.WaitGroup{}
 		errCh := make(chan error, 1)
-		o.Callback = func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+		o.SentCB = func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 			errCh <- err
 			streamWg.Done()
 		}
 		streamWg.Add(1)
-		if err := m.streams.shards.Send(o, file, si); err != nil {
+		if err := m.streams.shards.Send(o, reader, si); err != nil {
 			return err
 		}
 		streamWg.Wait()
@@ -612,14 +604,14 @@ func (m *Manager) parseEKMFile() (shard.ExternalKeyMap, error) {
 		return nil, fmt.Errorf(fmtErrOrderURL, m.Pars.EKMFileURL, err)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, m.Pars.EKMFileURL, http.NoBody)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, m.Pars.EKMFileURL, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
 	// is intra-call
 	tsi := core.T.Snode()
-	req.Header.Set(apc.HdrCallerID, tsi.ID())
-	req.Header.Set(apc.HdrCallerName, tsi.String())
+	req.Header.Set(apc.HdrSenderID, tsi.ID())
+	req.Header.Set(apc.HdrSenderName, tsi.String())
 
 	resp, err := m.client.Do(req) //nolint:bodyclose // closed by cos.Close below
 	if err != nil {
@@ -714,8 +706,8 @@ func (m *Manager) generateShardsWithOrderingFile(maxSize int64) ([]*shard.Shard,
 		if err != nil {
 			return nil, err
 		}
-		if len(tmpl.Ranges) == 0 {
-			return nil, fmt.Errorf("invalid output template %q: no ranges (prefix-only output is not supported)", shardNameFmt)
+		if err := tmpl.CheckIsRange(); err != nil {
+			return nil, err
 		}
 		shardTemplates[shardNameFmt] = &tmpl
 		shardTemplates[shardNameFmt].InitIter()
@@ -937,7 +929,7 @@ func (es *extractShard) do() (err error) {
 		ext, errV := archive.Mime("", es.name) // from filename
 		if errV == nil {
 			if !archive.EqExt(ext, m.Pars.InputExtension) {
-				if cmn.Rom.FastV(4, cos.SmoduleDsort) {
+				if cmn.Rom.V(4, cos.ModDsort) {
 					nlog.Infof("%s: %s skipping %s: %q vs %q", core.T, m.ManagerUUID,
 						es.name, ext, m.Pars.InputExtension)
 				}
@@ -963,7 +955,7 @@ func (es *extractShard) _do(lom *core.LOM) error {
 		estimateTotalRecordsSize uint64
 		warnOOM                  bool
 	)
-	if err := lom.InitBck(&m.Pars.InputBck); err != nil {
+	if err := lom.InitCmnBck(&m.Pars.InputBck); err != nil {
 		return err
 	}
 	if _, local, err := lom.HrwTarget(m.smap); err != nil || !local {

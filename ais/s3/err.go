@@ -1,11 +1,12 @@
 // Package s3 provides Amazon S3 compatibility layer
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package s3
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -43,17 +44,26 @@ func (e *Error) mustMarshal(sgl *memsys.SGL) {
 
 // with user-friendly tip
 func WriteMptErr(w http.ResponseWriter, r *http.Request, err error, ecode int, lom *core.LOM, uploadID string) {
-	// specifically, for s3cmd example
-	name := strings.Replace(lom.Cname(), apc.AISScheme+apc.BckProviderSeparator, apc.S3Scheme+apc.BckProviderSeparator, 1)
-	s3cmd := "s3cmd abortmp " + name + " " + uploadID
-	if len(s3cmd) > 50 {
-		s3cmd = "\n  " + s3cmd
-	}
-	e := fmt.Errorf("%v\nUse upload ID %q to cleanup, e.g.: %s", err, uploadID, s3cmd)
 	if ecode == 0 {
-		ecode = http.StatusInternalServerError
+		ecode = http.StatusBadRequest
 	}
-	WriteErr(w, r, e, ecode)
+
+	if isErrNoSuchUpload(err) {
+		// For NoSuchUpload, suggest listing uploads in bucket
+		bucketCname := aisToS3Path(lom.Bck().Cname(""))
+		err = fmt.Errorf("%w\nList uploads in %s to see available upload IDs", err, bucketCname)
+	} else {
+		// For other errors, provide abort information
+		objectPath := aisToS3Path(lom.Cname())
+		err = fmt.Errorf("%w (Use upload ID %q on %s to abort)", err, uploadID, objectPath)
+	}
+
+	WriteErr(w, r, err, ecode)
+}
+
+// aisToS3Path converts ais:// scheme to s3:// scheme
+func aisToS3Path(path string) string {
+	return strings.Replace(path, apc.AISScheme+apc.BckProviderSeparator, apc.S3Scheme+apc.BckProviderSeparator, 1)
 }
 
 func WriteErr(w http.ResponseWriter, r *http.Request, err error, ecode int) {
@@ -73,6 +83,8 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, ecode int) {
 		out.Code = "BucketAlreadyExists"
 	case cmn.IsErrBckNotFound(err):
 		out.Code = "NoSuchBucket"
+	case isErrNoSuchUpload(err):
+		out.Code = "NoSuchUpload"
 	case in.TypeCode != "":
 		out.Code = in.TypeCode
 	default:
@@ -99,4 +111,28 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, ecode int) {
 	if allocated {
 		cmn.FreeHterr(in)
 	}
+}
+
+type errNoSuchUpload struct {
+	err      error
+	uploadID string
+}
+
+func NewErrNoSuchUpload(uploadID string, err error) error {
+	return &errNoSuchUpload{uploadID: uploadID, err: err}
+}
+
+func (e *errNoSuchUpload) Error() string {
+	if e.err == nil {
+		return fmt.Sprintf("upload %q not found", e.uploadID)
+	}
+	return fmt.Sprintf("upload %q not found [err: %v]", e.uploadID, e.err)
+}
+
+func isErrNoSuchUpload(err error) bool {
+	if _, ok := err.(*errNoSuchUpload); ok {
+		return true
+	}
+	var errMpt *errNoSuchUpload
+	return errors.As(err, &errMpt)
 }

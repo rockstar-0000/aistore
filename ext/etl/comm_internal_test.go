@@ -5,8 +5,10 @@
 package etl
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,7 +26,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 )
 
 var _ = Describe("CommunicatorTest", func() {
@@ -71,7 +72,7 @@ var _ = Describe("CommunicatorTest", func() {
 
 		// Create an object.
 		lom := &core.LOM{ObjName: objName}
-		err = lom.InitBck(clusterBck.Bucket())
+		err = lom.InitBck(clusterBck)
 		Expect(err).NotTo(HaveOccurred())
 		err = createRandomFile(lom.FQN, dataSize)
 		Expect(err).NotTo(HaveOccurred())
@@ -107,7 +108,11 @@ var _ = Describe("CommunicatorTest", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(val).To(BeFalse())
 
-			ecode, err := comm.InlineTransform(w, r, lom, val, receivedEtlTransformArgs)
+			_, ecode, err := comm.InlineTransform(w, r, lom, &InlineTransArgs{
+				LatestVer:     val,
+				TransformArgs: receivedEtlTransformArgs,
+				Pipeline:      nil,
+			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ecode).To(Equal(0))
 		}))
@@ -132,22 +137,26 @@ var _ = Describe("CommunicatorTest", func() {
 	for _, testType := range []string{"inline", "offline"} {
 		for _, commType := range tests {
 			It("should perform "+testType+" transformation "+commType, func() {
-				pod := &corev1.Pod{}
-				pod.SetName("somename")
-
-				xctn := mock.NewXact(apc.ActETLInline)
-				boot := &etlBootstrapper{
-					msg: &InitSpecMsg{
-						InitMsgBase: InitMsgBase{
-							CommTypeX:   commType,
-							InitTimeout: cos.Duration(DefaultInitTimeout),
-						},
+				msg := &InitSpecMsg{
+					InitMsgBase: InitMsgBase{
+						CommTypeX:   commType,
+						InitTimeout: cos.Duration(DefaultInitTimeout),
 					},
-					pod:  pod,
-					uri:  transformerServer.URL,
-					xctn: xctn,
 				}
-				comm = newCommunicator(nil, boot, nil).(httpCommunicator)
+				xetl := &XactETL{}
+				xid := cos.GenUUID()
+				xetl.InitBase(xid, apc.ActETLInline, nil)
+
+				switch msg.CommType() {
+				case Hpush, HpushStdin:
+					pc := &pushComm{}
+					pc.msg, pc.podURI, pc.xctn = msg, transformerServer.URL, xetl
+					comm = pc
+				case Hpull:
+					rc := &redirectComm{}
+					rc.msg, rc.podURI, rc.xctn = msg, transformerServer.URL, xetl
+					comm = rc
+				}
 
 				switch testType {
 				case "inline":
@@ -166,7 +175,7 @@ var _ = Describe("CommunicatorTest", func() {
 					Expect(b).To(Equal(transformData))
 				case "offline":
 					lom := &core.LOM{ObjName: objName}
-					err := lom.InitBck(clusterBck.Bucket())
+					err := lom.InitBck(clusterBck)
 					Expect(err).NotTo(HaveOccurred())
 
 					expectedEtlTransformArgs = ""
@@ -181,6 +190,72 @@ var _ = Describe("CommunicatorTest", func() {
 			})
 		}
 	}
+
+	It("Process download job", func() {
+		realURL := "https://storage.googleapis.com/minikube/iso/minikube-v0.23.0.iso.sha256"
+
+		// Create an ETL server that downloads and returns data
+		etlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			Expect(r.Method).To(Equal(http.MethodPost))
+			Expect(r.URL.Path).To(Equal("/" + apc.ETLDownload))
+
+			origURL := r.URL.Query().Get(apc.QparamOrigURL)
+			Expect(origURL).To(Equal(realURL))
+
+			resp, err := http.Get(origURL)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+
+			// Stream the data back
+			w.WriteHeader(http.StatusOK)
+
+			// buffsize based on content length
+			bufSize := int64(4096)
+			if resp.ContentLength > 0 && resp.ContentLength < 1024*1024 {
+				bufSize = resp.ContentLength
+			}
+			cos.CopyBuffer(w, resp.Body, make([]byte, bufSize))
+		}))
+		defer etlServer.Close()
+
+		msg := &InitSpecMsg{
+			InitMsgBase: InitMsgBase{
+				CommTypeX:   Hpush,
+				InitTimeout: cos.Duration(DefaultInitTimeout),
+			},
+		}
+		pc := &pushComm{}
+		pc.msg = msg
+		pc.podURI = etlServer.URL
+
+		// Test ProcessDownloadJob
+		ctx := &ETLObjDownloadCtx{
+			ObjName: "minikube.sha256",
+			Link:    realURL,
+			ETLArgs: "",
+		}
+
+		// Get data via ETL webserver download endpoint
+		etlReader, ecode, err := pc.ProcessDownloadJob(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ecode).To(Equal(http.StatusOK))
+		Expect(etlReader).NotTo(BeNil())
+		defer etlReader.Close()
+
+		// Get same data using normal HTTP client
+		directResp, err := http.Get(realURL)
+		Expect(err).NotTo(HaveOccurred())
+		defer directResp.Body.Close()
+
+		// compare both paths
+		etlData, err := io.ReadAll(etlReader)
+		Expect(err).NotTo(HaveOccurred())
+
+		directData, err := io.ReadAll(directResp.Body)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(bytes.Equal(etlData, directData)).To(BeTrue())
+	})
 })
 
 // Creates a file with random content.

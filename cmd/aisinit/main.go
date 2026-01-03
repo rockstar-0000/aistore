@@ -1,6 +1,6 @@
 // Package main contains logic for the aisinit container
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -129,16 +129,52 @@ func main() {
 	podName := getRequiredEnv(env.AisK8sPod)
 	clusterDomain := getOrDefaultEnv(env.AisK8sClusterDomain, defaultClusterDomain)
 	publicHostName := getOrDefaultEnv(env.AisK8sPublicHostname, "")
+	publicDNSMode := getOrDefaultEnv(env.AisK8sPublicDNSMode, env.PubNetDNSModeIP)
 	podDNS := fmt.Sprintf("%s.%s.%s.svc.%s", podName, serviceName, namespace, clusterDomain)
 
 	localConf.HostNet.HostnameIntraControl = podDNS
 	localConf.HostNet.HostnameIntraData = podDNS
-	localConf.HostNet.Hostname = publicHostName
+
+	// publicDNSMode controls how the public hostname is determined for external client access.
+	// This affects TLS certificate validation since clients connect using this hostname.
+	//
+	// Modes:
+	//   "IP" (default) - Use host IP address. Simple but requires IP SANs in TLS certs.
+	//                    With hostNetwork, hostname is cleared and discovered at runtime.
+	//                    For clusters which use auto scaling, consider using Node or Pod
+	//                    modes instead since the host IP will change.
+	//
+	//   "Node" - Use Kubernetes node name (spec.nodeName). Useful when node names are
+	//            resolvable DNS names (e.g., AWS EC2 private DNS like ip-10-0-1-5.ec2.internal).
+	//            but using "Pod" DNS + host networking in environments that support it may be
+	//            preferable to allow more specificity.
+	//
+	//   "Pod" - Use pod DNS name (pod.service.namespace.svc.cluster.local). With hostNetwork,
+	//           pod DNS resolves to the host IP, enabling TLS with wildcard certs matching
+	//           *.service.namespace.svc.cluster.local. Recommended for hostNetwork + TLS.
+	//
+	// When using the ais-operator, it sets the publicHostName to the node name for Node mode
+	// and the host IP for IP mode via the downward API based on the provided publicNetDNSMode in the
+	// AIStore spec.
+	switch publicDNSMode {
+	case env.PubNetDNSModePod:
+		localConf.HostNet.Hostname = podDNS
+	case env.PubNetDNSModeNode, env.PubNetDNSModeIP:
+		localConf.HostNet.Hostname = publicHostName
+	default:
+		nlog.Warningf("unknown AIS_PUBLIC_DNS_MODE %q, defaulting to '%s' for Hostname", publicDNSMode, publicHostName)
+		// Fall back to publicHostName; if it is empty then aisnode will discover IP at startup.
+		// We do not error here to preserve backwards compatibility for deployments that are using
+		// ais-init:latest without a newer version of the ais-operator.
+		localConf.HostNet.Hostname = publicHostName
+	}
 
 	if role == aisapc.Target {
 		useHostNetwork, err := cos.ParseBool(getOrDefaultEnv(env.AisK8sHostNetwork, "false"))
 		failOnError(err)
-		if useHostNetwork {
+
+		// For IP mode with host networking, clear hostnames to let ais node discover IP at startup
+		if useHostNetwork && publicDNSMode == env.PubNetDNSModeIP {
 			localConf.HostNet.HostnameIntraData = ""
 			localConf.HostNet.Hostname = ""
 		}
@@ -166,7 +202,7 @@ func populateClusterConfig(aisClusterConfigOverride, outputClusterConfig string)
 	if outputClusterConfig == "" || aisClusterConfigOverride == "" {
 		return
 	}
-	defaultConfig := newDefaultConfig()
+	confToWrite := newDefaultConfig()
 	data, err := os.ReadFile(aisClusterConfigOverride)
 	failOnError(err)
 
@@ -174,10 +210,14 @@ func populateClusterConfig(aisClusterConfigOverride, outputClusterConfig string)
 	err = json.Unmarshal(data, &configOverride)
 	failOnError(err)
 
-	err = aiscmn.CopyProps(configOverride, defaultConfig, aisapc.Cluster)
+	err = aiscmn.CopyProps(configOverride, confToWrite, aisapc.Cluster)
 	failOnError(err)
 
-	data, err = jsoniter.Marshal(defaultConfig)
+	// Only write the public version of any auth config
+	// Any private secrets should be loaded through env variables
+	confToWrite.Auth = confToWrite.Auth.PublicClone()
+
+	data, err = jsoniter.Marshal(confToWrite)
 	failOnError(err)
 
 	err = os.WriteFile(outputClusterConfig, data, 0o644) //nolint:gosec // For now we don't want to change this.

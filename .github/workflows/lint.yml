@@ -13,31 +13,29 @@ jobs:
   lint:
     strategy:
       matrix:
-        go-version: ['1.24.x']
+        go-version: ['1.25.x']
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
 
       - name: Install `golangci-lint`
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           # NOTE: See `lint-update-ci` target in Makefile.
-          version: v2.1.2
+          version: v2.6.2
           args: --timeout=30m
 
-      - name: Lint
+      - name: Lint go
         run: |
           export GOPATH="$(go env GOPATH)"
           make lint
-          TAGS=statsd make lint
-          TAGS="statsd nethttp ht debug" make lint
-          TAGS="aws gcp azure" make lint
+          TAGS="nethttp debug oteltracing oci aws gcp azure" make lint
           make fmt-check
           make spell-check

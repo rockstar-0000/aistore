@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -230,13 +229,6 @@ type (
 		reason string
 		detail string
 	}
-	ErrInvalidObjName struct {
-		name string
-	}
-	ErrInvalidPrefix struct {
-		tag    string
-		prefix string
-	}
 	ErrNotRemoteBck struct {
 		bck *Bck
 		act string
@@ -272,6 +264,8 @@ var (
 	ErrXactRenewAbort   = errors.New("renewal abort")
 	ErrXactUserAbort    = errors.New("user abort")              // via apc.ActXactStop
 	ErrXactICNotifAbort = errors.New("IC(notifications) abort") // ditto
+
+	ErrGetTxBenign = errors.New("Warning: failed to transmit GET response") //nolint:staticcheck // making an exception for Warning
 )
 
 // ErrFailedTo
@@ -366,10 +360,17 @@ func IsErrBucketAlreadyExists(err error) bool {
 	return ok
 }
 
-// remote ErrRemoteBckNotFound (compare with ErrBckNotFound)
+// bucket--not--found -------------------------------
 
-func NewErrRemoteBckNotFound(bck *Bck) *ErrRemoteBckNotFound {
-	return &ErrRemoteBckNotFound{bck: *bck}
+func NewErrRemBckNotFound(bck *Bck) *ErrRemoteBckNotFound { return &ErrRemoteBckNotFound{bck: *bck} }
+func NewErrAisBckNotFound(bck *Bck) *ErrBckNotFound       { return &ErrBckNotFound{bck: *bck} }
+
+// [for convenience]
+func NewErrBckNotFound(bck *Bck) error {
+	if bck.IsRemote() {
+		return NewErrRemBckNotFound(bck)
+	}
+	return NewErrAisBckNotFound(bck)
 }
 
 func (e *ErrRemoteBckNotFound) Set(ctx string) { e.ctx = ctx }
@@ -385,13 +386,6 @@ func (e *ErrRemoteBckNotFound) Error() string {
 func IsErrRemoteBckNotFound(err error) bool {
 	_, ok := err.(*ErrRemoteBckNotFound)
 	return ok
-}
-
-// ErrBckNotFound - applies to ais buckets exclusively
-// (compare with ErrRemoteBckNotFound)
-
-func NewErrBckNotFound(bck *Bck) *ErrBckNotFound {
-	return &ErrBckNotFound{bck: *bck}
 }
 
 func (e *ErrBckNotFound) Error() string {
@@ -498,8 +492,8 @@ func NewErrCapExceeded(totalBytesUsed, totalBytes uint64, highWM, cleanupWM int6
 }
 
 func (e *ErrCapExceeded) Error() string {
-	suffix := fmt.Sprintf("total used %s out of %s", cos.ToSizeIEC(int64(e.totalBytesUsed), 2),
-		cos.ToSizeIEC(int64(e.totalBytes), 2))
+	suffix := fmt.Sprintf("total used %s out of %s", cos.IEC(int64(e.totalBytesUsed), 2),
+		cos.IEC(int64(e.totalBytes), 2))
 	if e.oos {
 		return fmt.Sprintf("out of space: used %d%% of total capacity on at least one of the mountpaths (%s)",
 			e.usedPct, suffix)
@@ -690,16 +684,16 @@ func IsErrXactNotFound(err error) bool {
 // ErrObjDefunct
 
 func (e *ErrObjDefunct) Error() string {
-	return fmt.Sprintf("%s is defunct (%x != %x)", e.name, e.d1, e.d2)
+	return fmt.Sprintf("%s is defunct (lom '%x' != '%x' bmd)", e.name, e.d1, e.d2)
 }
 
 func NewErrObjDefunct(name string, d1, d2 uint64) *ErrObjDefunct {
 	return &ErrObjDefunct{name, d1, d2}
 }
 
-func isErrObjDefunct(err error) bool {
-	_, ok := err.(*ErrObjDefunct)
-	return ok
+func IsErrObjDefunct(err error) bool {
+	var wrapped *ErrObjDefunct
+	return errors.As(err, &wrapped)
 }
 
 // ErrAborted
@@ -731,7 +725,7 @@ func AsErrAborted(err error) (errAborted *ErrAborted) {
 	if errAborted, ok = err.(*ErrAborted); ok {
 		return
 	}
-	wrapped := &ErrAborted{}
+	var wrapped *ErrAborted
 	if errors.As(err, &wrapped) {
 		errAborted = wrapped
 	}
@@ -859,10 +853,7 @@ func (e *ErrWarning) Error() string {
 }
 
 func IsErrWarning(err error) bool {
-	if _, ok := err.(*ErrWarning); ok {
-		return true
-	}
-	wrapped := &ErrWarning{}
+	var wrapped *ErrWarning
 	return errors.As(err, &wrapped)
 }
 
@@ -885,8 +876,8 @@ func (e *ErrLmetaNotFound) Error() string       { return e.name + ", err: " + e.
 func (e *ErrLmetaNotFound) Unwrap() (err error) { return e.err }
 
 func IsErrLmetaNotFound(err error) bool {
-	_, ok := err.(*ErrLmetaNotFound)
-	return ok
+	var wrapped *ErrLmetaNotFound
+	return errors.As(err, &wrapped)
 }
 
 // ErrLimitedCoexistence
@@ -913,54 +904,6 @@ func (e *ErrXactUsePrev) Error() string {
 func IsErrXactUsePrev(err error) bool {
 	_, ok := err.(*ErrXactUsePrev)
 	return ok
-}
-
-// ErrInvalidObjName, ErrInvalidPrefix
-
-const (
-	inv1 = "../"
-	inv2 = "~/"
-)
-
-func ValidateOname(name string) (err *ErrInvalidObjName) {
-	if name == "" {
-		return &ErrInvalidObjName{name}
-	}
-	return ValidOname(name)
-}
-
-func ValidOname(name string) *ErrInvalidObjName {
-	if cos.IsLastB(name, filepath.Separator) {
-		return &ErrInvalidObjName{name}
-	}
-	if strings.IndexByte(name, inv1[0]) < 0 && strings.IndexByte(name, inv2[0]) < 0 { // most of the time
-		return nil
-	}
-	if strings.Contains(name, inv1) || strings.Contains(name, inv2) {
-		return &ErrInvalidObjName{name}
-	}
-	return nil
-}
-
-func (e *ErrInvalidObjName) Error() string {
-	return fmt.Sprintf("invalid object name %q", e.name)
-}
-
-func ValidatePrefix(tag, prefix string) *ErrInvalidPrefix {
-	if prefix == "" {
-		return nil
-	}
-	if strings.IndexByte(prefix, inv1[0]) < 0 && strings.IndexByte(prefix, inv2[0]) < 0 { // ditto
-		return nil
-	}
-	if strings.Contains(prefix, inv1) || strings.Contains(prefix, inv2) {
-		return &ErrInvalidPrefix{tag, prefix}
-	}
-	return nil
-}
-
-func (e *ErrInvalidPrefix) Error() string {
-	return fmt.Sprintf("%s: invalid prefix %q", e.tag, e.prefix)
 }
 
 // ErrNotRemoteBck
@@ -1064,14 +1007,15 @@ func IsErrBucketNought(err error) bool {
 
 // lom.Load
 func IsErrObjNought(err error) bool {
-	return cos.IsNotExist(err, 0) || IsStatusNotFound(err) || isErrObjDefunct(err) || IsErrLmetaNotFound(err)
+	return cos.IsNotExist(err) || IsStatusNotFound(err) || IsErrObjDefunct(err) || IsErrLmetaNotFound(err)
 }
 
 // used internally to report http.StatusNotFound _iff_ status is not set (is zero)
 func isErrNotFoundExtended(err error, status int) bool {
 	return IsErrBckNotFound(err) || IsErrRemoteBckNotFound(err) ||
 		IsErrMpathNotFound(err) || IsErrXactNotFound(err) ||
-		cos.IsNotExist(err, status)
+		cos.IsNotExist(err, status) ||
+		IsErrObjDefunct(err) || IsErrLmetaNotFound(err)
 }
 
 func IsFileAlreadyClosed(err error) bool {
@@ -1093,15 +1037,15 @@ func Str2HTTPErr(msg string) *ErrHTTP {
 	return nil
 }
 
-func Err2HTTPErr(err error) *ErrHTTP {
-	e, ok := err.(*ErrHTTP)
-	if !ok {
-		e = &ErrHTTP{}
-		if !errors.As(err, &e) {
-			return nil
-		}
+func AsErrHTTP(err error) *ErrHTTP {
+	if e, ok := err.(*ErrHTTP); ok {
+		return e
 	}
-	return e
+	var e *ErrHTTP
+	if errors.As(err, &e) {
+		return e
+	}
+	return nil
 }
 
 const maxTypeCodeLen = 30
@@ -1153,7 +1097,7 @@ func (e *ErrHTTP) init(r *http.Request, err error, ecode int) {
 	if r != nil {
 		e.Method, e.URLPath = r.Method, r.URL.Path
 		e.RemoteAddr = r.RemoteAddr
-		e.Caller = r.Header.Get(apc.HdrCallerName)
+		e.Caller = r.Header.Get(apc.HdrSenderName)
 	}
 	e.Node = thisNodeName
 }
@@ -1327,6 +1271,8 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, opts ...int /*[
 			status = http.StatusNotImplemented
 		case IsErrBusy(err):
 			status = http.StatusConflict
+		case IsErrTooManyRequests(err):
+			status = http.StatusTooManyRequests
 		}
 	}
 
@@ -1368,52 +1314,4 @@ func WriteErr405(w http.ResponseWriter, r *http.Request, methods ...string) {
 	} else {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 	}
-}
-
-//
-// 1) ErrHTTP struct pool
-// 2) bytes.Buffer pool
-//
-
-const maxBuffer = 4 * cos.KiB
-
-var (
-	errPool sync.Pool
-	bufPool sync.Pool
-
-	err0 ErrHTTP
-)
-
-func allocHterr() (a *ErrHTTP) {
-	if v := errPool.Get(); v != nil {
-		a = v.(*ErrHTTP)
-		return
-	}
-	return &ErrHTTP{}
-}
-
-func FreeHterr(a *ErrHTTP) {
-	trace := a.trace
-	*a = err0
-	if trace != nil {
-		a.trace = trace[:0]
-	}
-	errPool.Put(a)
-}
-
-func NewBuffer() (buf *bytes.Buffer) {
-	if v := bufPool.Get(); v != nil {
-		buf = v.(*bytes.Buffer)
-	} else {
-		buf = bytes.NewBuffer(nil)
-	}
-	return
-}
-
-func FreeBuffer(buf *bytes.Buffer) {
-	if buf.Cap() > maxBuffer {
-		return
-	}
-	buf.Reset()
-	bufPool.Put(buf)
 }

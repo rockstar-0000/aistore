@@ -1,7 +1,7 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/sys"
 )
 
@@ -37,9 +38,9 @@ func (r *MMSA) FreeSpec(spec FreeSpec) {
 		if spec.MinSize == 0 {
 			spec.MinSize = sizeToGC // using default
 		}
-		pressure := r.Pressure()
-		if pressure >= PressureModerate {
-			r.freeMemToOS(spec.MinSize, pressure, spec.ToOS /* force */)
+		p := r.Pressure()
+		if p >= PressureModerate {
+			r.freeMemToOS(spec.MinSize, p, spec.ToOS /* force */)
 		}
 	}
 }
@@ -57,25 +58,25 @@ func (r *MMSA) hkcb(now int64) time.Duration {
 		return max(r.TimeIval, time.Minute)
 	}
 	r.updSwap(&r.mem)
-	pressure := r.Pressure(&r.mem)
+	p := r.Pressure(&r.mem)
 
 	// memory is enough: update idle times and free idle slabs, unless out of cpu
-	if pressure == PressureLow {
+	if p == PressureLow {
 		var (
 			load     = sys.MaxLoad()
 			highLoad = sys.HighLoadWM()
 		)
 		// too busy and not too "pressured"
 		if load >= float64(highLoad) {
-			return r.hkIval(pressure)
+			return r.hkIval(p, now)
 		}
 		r.refreshStats(now)
 		r.optDepth.Store(optDepth)
 		if freed := r.freeIdle(); freed > 0 {
 			r.toGC.Add(freed)
-			r.freeMemToOS(sizeToGC, pressure)
+			r.freeMemToOS(sizeToGC, p)
 		}
-		return r.hkIval(pressure)
+		return r.hkIval(p, now)
 	}
 
 	// calibrate and mem-free accordingly
@@ -83,7 +84,7 @@ func (r *MMSA) hkcb(now int64) time.Duration {
 		mingc = sizeToGC // minimum accumulated size that triggers GC
 		depth int        // => current ring depth tbd
 	)
-	switch pressure {
+	switch p {
 	case OOM, PressureExtreme:
 		r.optDepth.Store(minDepth)
 		depth = minDepth
@@ -105,19 +106,20 @@ func (r *MMSA) hkcb(now int64) time.Duration {
 	}
 
 	// 6. GC and free mem to OS
-	r.freeMemToOS(mingc, pressure)
-	return r.hkIval(pressure)
+	r.freeMemToOS(mingc, p)
+	return r.hkIval(p, now)
 }
 
-func (r *MMSA) hkIval(pressure int) time.Duration {
+func (r *MMSA) hkIval(pressure int, now int64) (d time.Duration) {
 	switch pressure {
 	case PressureLow:
-		return r.TimeIval * 2
+		d = r.TimeIval * 2
 	case PressureModerate:
-		return r.TimeIval
+		d = r.TimeIval
 	default:
-		return r.TimeIval / 2
+		d = r.TimeIval / 2
 	}
+	return hk.Jitter(d, now)
 }
 
 // refresh and clone internal hits/idle stats
@@ -155,8 +157,8 @@ func (r *MMSA) freeIdle() (total int64) {
 			continue
 		}
 		total += freed
-		if freed > 0 && cmn.Rom.FastV(5, cos.SmoduleMemsys) {
-			nlog.Infof("%s idle for %v: freed %s", s.tag, idle, cos.ToSizeIEC(freed, 1))
+		if freed > 0 && cmn.Rom.V(5, cos.ModMemsys) {
+			nlog.Infof("%s idle for %v: freed %s", s.tag, idle, cos.IEC(freed, 1))
 		}
 	}
 	return

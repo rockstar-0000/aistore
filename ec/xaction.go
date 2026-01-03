@@ -130,14 +130,11 @@ func newSliceResponse(md *Metadata, attrs *cmn.ObjAttrs, fqn string) (reader cos
 func newReplicaResponse(attrs *cmn.ObjAttrs, bck *meta.Bck, objName string) (cos.ReadOpenCloser, error) {
 	lom := core.AllocLOM(objName)
 	defer core.FreeLOM(lom)
-	if err := lom.InitBck(bck.Bucket()); err != nil {
+	if err := lom.InitBck(bck); err != nil {
 		return nil, err
 	}
-	if err := lom.Load(true /*cache it*/, false /*locked*/); err != nil {
-		nlog.Warningln(err)
-		return nil, err
-	}
-	reader, err := cos.NewFileHandle(lom.FQN)
+	lom.Lock(false)
+	reader, err := lom.NewDeferROC(false /*loaded*/)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +175,7 @@ func (r *xactECBase) dataResponse(act intraReqType, hdr *transport.ObjHdr, fqn s
 	rHdr.Opaque = ireq.NewPack(g.smm)
 
 	o := transport.AllocSend()
-	o.Hdr, o.Callback = rHdr, r.sendCb
+	o.Hdr, o.SentCB = rHdr, r.sendCb
 
 	r.ObjsAdd(1, objAttrs.Size)
 	r.IncPending()
@@ -248,7 +245,7 @@ func (r *xactECBase) readRemote(lom *core.LOM, daemonID, uname string, request [
 	sw.twg.Add(1)
 	r.regWriter(uname, sw)
 
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Requesting object %s from %s", lom, daemonID)
 	}
 	if err := r.sendByDaemonID([]string{daemonID}, o, nil, true); err != nil {
@@ -264,7 +261,7 @@ func (r *xactECBase) readRemote(lom *core.LOM, daemonID, uname string, request [
 	}
 	r.unregWriter(uname)
 
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Received object %s from %s", lom, daemonID)
 	}
 	if sw.version != "" {
@@ -315,7 +312,7 @@ func (r *xactECBase) unregWriter(uname string) {
 //     The counter is used for sending slices of one big SGL to a few nodes. In
 //     this case every slice must be sent to only one target, and transport bundle
 //     cannot help to track automatically when SGL should be freed.
-func (r *xactECBase) writeRemote(daemonIDs []string, lom *core.LOM, src *dataSource, cb transport.ObjSentCB) error {
+func (r *xactECBase) writeRemote(daemonIDs []string, lom *core.LOM, src *dataSource, cb transport.SentCB) error {
 	if src.metadata != nil && src.metadata.ObjVersion == "" {
 		src.metadata.ObjVersion = lom.Version()
 	}
@@ -354,7 +351,7 @@ func (r *xactECBase) writeRemote(daemonIDs []string, lom *core.LOM, src *dataSou
 	}
 
 	o := transport.AllocSend()
-	o.Hdr, o.Callback = hdr, cb
+	o.Hdr, o.SentCB = hdr, cb
 
 	r.IncPending()
 	return r.sendByDaemonID(daemonIDs, o, src.reader, false)
@@ -386,11 +383,3 @@ func _writerReceive(writer *slice, exists bool, objAttrs cmn.ObjAttrs, reader io
 }
 
 func (r *xactECBase) ECStats() *Stats { return r.stats.stats() }
-
-func (r *xactECBase) baseSnap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return
-}

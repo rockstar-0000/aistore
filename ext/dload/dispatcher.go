@@ -171,7 +171,7 @@ func (d *dispatcher) cleanupJob(jobID string) {
 }
 
 func (d *dispatcher) finish(job jobif) {
-	verbose := cmn.Rom.FastV(4, cos.SmoduleDload)
+	verbose := cmn.Rom.V(4, cos.ModDload)
 	if verbose {
 		nlog.Infof("Waiting for job %q", job.ID())
 	}
@@ -350,7 +350,7 @@ func (d *dispatcher) doSingle(task *singleTask) (ok bool, err error) {
 }
 
 func (d *dispatcher) adminReq(req *request) (resp any, statusCode int, err error) {
-	if cmn.Rom.FastV(4, cos.SmoduleDload) {
+	if cmn.Rom.V(4, cos.ModDload) {
 		nlog.Infof("Admin request (id: %q, action: %q, onlyActive: %t)", req.id, req.action, req.onlyActive)
 	}
 	// Need to make sure that the dispatcher has fully initialized and started,
@@ -472,8 +472,8 @@ func (ss *startupSema) markStarted() { ss.started.Store(true) }
 
 func (ss *startupSema) waitForStartup() {
 	const (
-		sleep   = 500 * time.Millisecond
-		timeout = 10 * time.Second
+		sleep   = cos.PollSleepLong
+		timeout = max(10*time.Second, 10*cos.PollSleepLong)
 		errmsg  = "FATAL: dispatcher takes too much time to start"
 	)
 	if ss.started.Load() {

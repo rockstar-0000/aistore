@@ -32,15 +32,16 @@ const (
 
 	//
 	// Cluster
-	// TODO: consider showing `err.io.get.n` counters - generally, all metrics that are stats.IsIOErrMetric()
 	//
 	indent1 = "   "
 
-	ClusterSummary = indent1 + "Proxies:\t{{FormatProxiesSumm .Smap}}\n" +
+	ClusterSummary = indent1 + "Endpoint:\t{{.Endpoint}}\n" +
+		indent1 + "Proxies:\t{{FormatProxiesSumm .Smap}}\n" +
 		indent1 + "Targets:\t{{FormatTargetsSumm .Smap .NumDisks}}\n" +
 		indent1 + "Capacity:\t{{.Capacity}}\n" +
 		indent1 + "Cluster Map:\t{{FormatSmap .Smap}}\n" +
 		indent1 + "Software:\t{{FormatCluSoft .Version .BuildTime}}\n" +
+		indent1 + "Backend:\t{{.Backend}}\n" +
 		indent1 + "Deployment:\t{{ ( Deployments .Stst) }}\n" +
 		indent1 + "Status:\t{{ ( OnlineStatus .Stst) }}\n" +
 		indent1 + "Rebalance:\t{{FormatRebalance .Stst .CluConfig}}\n" +
@@ -49,13 +50,16 @@ const (
 		indent1 + "Build:\t{{ ( BuildTimes .Stst) }}\n"
 
 	// Config
-	DaemonConfigTmpl = "{{ if .ClusterConfigDiff }}PROPERTY\t VALUE\t DEFAULT\n{{range $item := .ClusterConfigDiff }}" +
+	daemonConfigHdr = "{{ if .ClusterConfigDiff }}PROPERTY\t VALUE\t DEFAULT\n{{end}}" +
+		"{{ if .LocalConfigPairs }}PROPERTY\t VALUE\n{{end}}"
+	daemonConfigBody = "{{ if .ClusterConfigDiff }}{{range $item := .ClusterConfigDiff }}" +
 		"{{ $item.Name }}\t {{ $item.Current }}\t {{ $item.Old }}\n" +
 		"{{end}}\n{{end}}" +
-		"{{ if .LocalConfigPairs }}PROPERTY\t VALUE\n" +
-		"{{range $item := .LocalConfigPairs }}" +
+		"{{ if .LocalConfigPairs }}{{range $item := .LocalConfigPairs }}" +
 		"{{ $item.Name }}\t {{ $item.Value }}\n" +
 		"{{end}}\n{{end}}"
+	DaemonConfigTmpl      = daemonConfigHdr + daemonConfigBody
+	DaemonConfigTmplNoHdr = daemonConfigBody
 
 	// generic prop/val (name/val, key/val)
 	propValTmplHdr   = "PROPERTY\t VALUE\n"
@@ -66,8 +70,8 @@ const (
 	ObjLockTmpl      = objLockTmplHdr + ObjLockTmplNoHdr
 	ObjLockTmplNoHdr = "{{range $o := . }}" + "{{$o.Name}}\t {{$o.Status}}\n" + "{{end}}"
 
-	// w/ special arrangement for feature flags
-	FeatDescTmplHdr = "FEATURE\t DESCRIPTION\n"
+	// 3-column: FEATURE | TAGS | DESCRIPTION
+	FeatTagsDescTmplHdr = "FEATURE\t TAGS\t DESCRIPTION\n"
 
 	//
 	// special xactions & dsort
@@ -102,11 +106,20 @@ const (
 		indent1 + "Description:\t{{$value.Metrics.Description}}\n" +
 		"{{end}}"
 
-	transformListHdr  = "NAME\t STAGE\t XACTION\t OBJECTS\n"
-	transformListBody = "{{$value.Name}}\t {{$value.Stage}}\t {{$value.XactID}}\t " +
+	//
+	// ETL
+	//
+
+	ETLListHdr  = "NAME\t STAGE\t XACTION\t OBJECTS\n"
+	ETLListBody = "{{$value.Name}}\t {{$value.Stage}}\t {{$value.XactID}}\t " +
 		"{{if (eq $value.ObjCount 0) }}-{{else}}{{$value.ObjCount}}{{end}}\n"
-	TransformListNoHdrTmpl = "{{ range $value := . }}" + transformListBody + "{{end}}"
-	TransformListTmpl      = transformListHdr + TransformListNoHdrTmpl
+	ETLListNoHdrTmpl = "{{ range $value := . }}" + ETLListBody + "{{end}}"
+	ETLListTmpl      = ETLListHdr + ETLListNoHdrTmpl
+
+	ETLObjErrorsHdr       = "OBJECT\t ECODE\t ERROR\n"
+	ETLObjErrorsBody      = "{{$value.ObjName}}\t {{$value.Ecode}}\t {{$value.Message}}\n"
+	ETLObjErrorsNoHdrTmpl = "{{ range $value := . }}" + ETLObjErrorsBody + "{{end}}"
+	ETLObjErrorsTmpl      = ETLObjErrorsHdr + ETLObjErrorsNoHdrTmpl
 
 	//
 	// BEGIN: xactions as `nodeSnaps` ------------------------------------------------------------------------------

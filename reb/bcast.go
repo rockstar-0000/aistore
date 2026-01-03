@@ -111,7 +111,9 @@ func (reb *Reb) rxReady(tsi *meta.Snode, rargs *rebArgs) bool /*ready*/ {
 		}
 		status, ok := reb.checkStage(tsi, rargs, rebStageTraverse)
 		if ok {
-			debug.Assert(status.Running, "running: ", status.Running)
+			debug.Assertf(status.Running, "%s: not running: [ tid=%s abrted=%t stage=%d reb-id=%d vs my %s ]",
+				core.T.String(), tsi.ID(), status.Aborted, status.Stage, status.RebID, xreb.ID())
+
 			debug.Assert(xact.RebID2S(status.RebID) == xreb.ID(), "xid: ", status.RebID, " vs ", xreb.ID())
 			return true
 		}
@@ -140,7 +142,7 @@ func (reb *Reb) waitAcksExtended(tsi *meta.Snode, rargs *rebArgs) (ok bool) {
 		sleepRetry = cmn.KeepaliveRetryDuration(rargs.config)
 		xreb       = rargs.xreb
 	)
-	debug.Assertf(reb.RebID() == xreb.RebID(), "%s (rebID=%d) vs %s", rargs.logHdr, reb.RebID(), xreb)
+	debug.Assertf(reb.rebID() == xreb.RebID(), "%s (rebID=%d) vs %s", rargs.logHdr, reb.rebID(), xreb)
 
 	for curwt < maxwt {
 		if err := xreb.AbortedAfter(sleep); err != nil {
@@ -196,7 +198,7 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 	if xreb == nil || xreb.IsAborted() {
 		return nil, false
 	}
-	debug.Assertf(reb.RebID() == xreb.RebID(), "%s (rebID=%d) vs %s", rargs.logHdr, reb.RebID(), xreb)
+	debug.Assertf(reb.rebID() == xreb.RebID(), "%s (rebID=%d) vs %s", rargs.logHdr, reb.rebID(), xreb)
 	body, code, err := core.T.Health(tsi, apc.DefaultTimeout, query)
 	if err != nil {
 		if errAborted := xreb.AbortedAfter(sleepRetry); errAborted != nil {
@@ -208,7 +210,7 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 	if err != nil {
 		ctx := fmt.Sprintf("health(%s) failure: %v(%d)", tname, err, code)
 		err = cmn.NewErrAborted(xreb.Name(), ctx, err)
-		reb.abortAll(err)
+		reb.abortAll(err, rargs.xreb)
 		return nil, false
 	}
 
@@ -216,23 +218,23 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 	err = jsoniter.Unmarshal(body, status)
 	if err != nil {
 		err = fmt.Errorf(cmn.FmtErrUnmarshal, rargs.logHdr, "reb status from "+tname, cos.BHead(body), err)
-		reb.abortAll(err)
+		reb.abortAll(err, rargs.xreb)
 		return nil, false
 	}
 	//
 	// enforce global RebID
 	//
 	otherXid := xact.RebID2S(status.RebID)
-	if status.RebID > reb.rebID.Load() {
+	if status.RebID > reb.rebID() {
 		err := cmn.NewErrAborted(xreb.Name(), rargs.logHdr, errors.New(tname+" runs newer "+otherXid))
-		reb.abortAll(err)
+		reb.abortAll(err, rargs.xreb)
 		return status, false
 	}
 	if xreb.IsAborted() {
 		return status, false
 	}
 	// keep waiting
-	if status.RebID < reb.RebID() {
+	if status.RebID < reb.rebID() {
 		var what = "runs"
 		if !status.Running {
 			what = "transitioning(?) from"
@@ -241,7 +243,7 @@ func (reb *Reb) checkStage(tsi *meta.Snode, rargs *rebArgs, desiredStage uint32)
 		return status, false
 	}
 	// other target aborted same ID (do not call `reb.abortAll` - no need)
-	if status.RebID == reb.RebID() && status.Aborted {
+	if status.RebID == reb.rebID() && status.Aborted {
 		err := cmn.NewErrAborted(xreb.Name(), rargs.logHdr, fmt.Errorf("status 'aborted' from %s", tname))
 		xreb.Abort(err)
 		reb.lazydel.stop()

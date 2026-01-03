@@ -68,6 +68,7 @@ type (
 		skipEC     bool          // do not erasure-encode when finalizing
 		skipVC     bool          // skip loading existing Version and skip comparing Checksums (skip VC)
 		coldGET    bool          // (one implication: proceed to write)
+		locked     bool          // true if the LOM is already locked by the caller
 		remoteErr  bool          // to exclude `putRemote` errors when counting soft IO errors
 	}
 
@@ -144,21 +145,24 @@ type (
 //
 
 // poi.restful entry point
-func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (int, error) {
-	{
-		poi.oreq = r
-		poi.r = r.Body
-		poi.resphdr = resphdr
-		poi.workFQN = fs.CSM.Gen(poi.lom, fs.WorkfileType, fs.WorkfilePut)
-		poi.cksumToUse = poi.lom.ObjAttrs().FromHeader(r.Header)
-		poi.owt = cmn.OwtPut // default
+func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (_ int, err error) {
+	poi.oreq = r
+	poi.r = r.Body
+	poi.resphdr = resphdr
+	poi.workFQN = poi.lom.GenFQN(fs.WorkCT, fs.WorkfilePut)
+	poi.owt = cmn.OwtPut // default
+
+	oah := poi.lom.ObjAttrs()
+	if poi.cksumToUse, err = oah.FromHeader(r.Header); err != nil {
+		return 0, err
 	}
-	if dpq.owt != "" {
-		poi.owt.FromS(dpq.owt)
+
+	if dpq.sys.owt != "" {
+		poi.owt.FromS(dpq.sys.owt)
 	}
-	if dpq.uuid != "" {
+	if dpq.sys.uuid != "" {
 		// resolve cluster-wide xact "behind" this PUT (promote via a single target won't show up)
-		xctn, err := xreg.GetXact(dpq.uuid)
+		xctn, err := xreg.GetXact(dpq.sys.uuid)
 		if err != nil {
 			nlog.Errorln(err)
 			return 0, err
@@ -175,23 +179,92 @@ func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (int, error
 	return poi.putObject()
 }
 
-func (poi *putOI) putObject() (ecode int, err error) {
-	if lom := poi.lom; lom.IsFntl() {
-		// fixup fntl
-		var (
-			short = lom.ShortenFntl()
-			saved = lom.PushFntl(short)
-		)
-		lom.SetCustomKey(cmn.OrigFntl, saved[0])
-		poi.workFQN = fs.CSM.Gen(lom, fs.WorkfileType, "fntl-0x24")
+func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
+	var (
+		lom      = poi.lom
+		uploadID string
+	)
+	debug.Assertf(!poi.coldGET || poi.locked, "expecting locked LOM for cold-GET")
+
+	debug.Assertf(poi.size > 0, "poi.size is required in chunk, object name: %s", poi.lom.Cname())
+	if uploadID, err = poi.t.ups.start(poi.oreq, lom, poi.coldGET); err != nil {
+		poi.t.ups.abort(poi.oreq, lom, uploadID)
+		return http.StatusInternalServerError, err
 	}
 
+	// Loop through poi.r and divide it into chunks
+	var (
+		total          int64
+		partNum        = 1
+		completedParts = make(apc.MptCompletedParts, 0, poi.size/chunkSize)
+	)
+	for total < poi.size {
+		// Determine how many bytes to read for this part
+		remainingBytes := poi.size - total
+		thisChunkSize := min(chunkSize, remainingBytes)
+
+		// Create a limited reader for this chunk
+		limitedReader := &io.LimitedReader{
+			R: poi.r,
+			N: thisChunkSize,
+		}
+		chunkReader := io.NopCloser(limitedReader)
+
+		args := partArgs{
+			reader:   chunkReader,
+			size:     thisChunkSize,
+			lom:      lom,
+			uploadID: uploadID,
+			partNum:  partNum,
+			coldGET:  poi.coldGET,
+		}
+		etag, ec, er := poi.t.ups.putPart(&args)
+		if er != nil {
+			poi.t.ups.abort(poi.oreq, lom, uploadID)
+			return ec, er
+		}
+
+		// Calculate actual bytes read
+		total += thisChunkSize
+
+		// Track completed part
+		completedParts = append(completedParts, apc.MptCompletedPart{
+			ETag:       etag,
+			PartNumber: partNum,
+		})
+
+		partNum++
+	}
+
+	_, ecode, err = poi.t.ups.complete(&completeArgs{
+		r:        poi.oreq,
+		lom:      lom,
+		uploadID: uploadID,
+		body:     nil,
+		parts:    completedParts,
+		isS3:     false,
+		coldGET:  poi.coldGET,
+		locked:   poi.locked,
+	})
+	return ecode, err
+}
+
+func (poi *putOI) putObject() (ecode int, err error) {
+	maxMonoSize := int64(poi.lom.Bprops().Chunks.MaxMonolithicSize)
+	// protect the bucket: if the object size exceeds the max monolithic size, MUST chunk
+	// NOTE: if `poi.size` is not set, don't trigger chunking
+	if maxMonoSize > 0 && poi.size > maxMonoSize {
+		if cmn.Rom.V(5, cos.ModAIS) {
+			nlog.Infoln("PUT", poi.lom.Cname(), "size", poi.size, "exceeds object size limit, PUT as chunks")
+		}
+		return poi.chunk(int64(poi.lom.Bprops().Chunks.ChunkSize))
+	}
 	poi.ltime = mono.NanoTime()
 
 	// if checksums match PUT is a no-op
 	if !poi.skipVC && !poi.coldGET {
 		if poi.lom.EqCksum(poi.cksumToUse) {
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.V(4, cos.ModAIS) {
 				nlog.Infoln(poi.lom.String(), "has identical", poi.cksumToUse.String(), "- PUT is a no-op")
 			}
 			cos.DrainReader(poi.r)
@@ -230,7 +303,7 @@ func (poi *putOI) putObject() (ecode int, err error) {
 		}
 	}
 
-	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+	if cmn.Rom.V(5, cos.ModAIS) {
 		nlog.Infoln(poi.loghdr())
 	}
 	return 0, nil
@@ -239,9 +312,9 @@ rerr:
 		vlabs := poi._vlabs(true /*detailed*/)
 		poi.t.statsT.IncWith(stats.ErrPutCount, vlabs)
 
-		if err != cmn.ErrSkip && !poi.remoteErr && err != io.ErrUnexpectedEOF && !cos.IsRetriableConnErr(err) && !cos.IsErrMv(err) {
+		if err != cmn.ErrSkip && !poi.remoteErr && err != io.ErrUnexpectedEOF && !cos.IsErrRetriableConn(err) && !cos.IsErrMv(err) {
 			poi.t.statsT.IncWith(stats.IOErrPutCount, vlabs)
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.V(4, cos.ModAIS) {
 				nlog.Warningln("io-error [", err, "]", poi.loghdr())
 			}
 		}
@@ -317,12 +390,12 @@ func (poi *putOI) loghdr() string {
 
 func (poi *putOI) finalize() (ecode int, err error) {
 	if ecode, err = poi.fini(); err != nil {
-		if err1 := cos.Stat(poi.workFQN); err1 == nil || !os.IsNotExist(err1) {
+		if err1 := cos.Stat(poi.workFQN); err1 == nil || !cos.IsNotExist(err1) {
 			// cleanup: rm work-fqn
 			if err1 == nil {
 				err1 = err
 			}
-			if err2 := cos.RemoveFile(poi.workFQN); err2 != nil && !os.IsNotExist(err2) {
+			if err2 := cos.RemoveFile(poi.workFQN); err2 != nil && !cos.IsNotExist(err2) {
 				nlog.Errorf(fmtNested, poi.t, err1, "remove", poi.workFQN, err2)
 			}
 		}
@@ -369,7 +442,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 	if bck.IsRemote() && poi.owt < cmn.OwtRebalance {
 		ecode, err = poi.putRemote()
 		if err != nil {
-			if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+			if cmn.Rom.V(5, cos.ModAIS) {
 				loghdr := poi.loghdr()
 				nlog.Errorln("PUT [", loghdr, err, ecode, "]")
 			}
@@ -387,8 +460,9 @@ func (poi *putOI) fini() (ecode int, err error) {
 	// locking strategies: optimistic and otherwise
 	// (see GetCold() implementation and cmn.OWT enum)
 	switch poi.owt {
-	case cmn.OwtGetTryLock, cmn.OwtGetLock, cmn.OwtGet:
+	case cmn.OwtGetTryLock, cmn.OwtGetLock, cmn.OwtGet, cmn.OwtChunks:
 		// do nothing: lom is already wlocked
+		debug.Assertf(lom.IsLocked() == apc.LockWrite, "lom %s is not write-locked", lom.Cname())
 	case cmn.OwtGetPrefetchLock:
 		if !lom.TryLock(true) {
 			nlog.Warningln(poi.loghdr(), "is busy")
@@ -429,7 +503,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 	if lom.AtimeUnix() == 0 { // (is set when migrating within cluster; prefetch special case)
 		lom.SetAtimeUnix(poi.atime)
 	}
-	return 0, lom.PersistMain()
+	return 0, lom.PersistMain(false /*isChunked*/)
 }
 
 // via backend.PutObj()
@@ -489,7 +563,7 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, er
 		// not using `ReadFrom` of the `*os.File` -
 		// ultimately, https://github.com/golang/go/blob/master/src/internal/poll/copy_file_range_linux.go#L100
 		written, err = cos.CopyBuffer(lmfh, poi.r, buf)
-	case !poi.cksumToUse.IsEmpty() && !poi.validateCksum(ckconf):
+	case !cos.NoneC(poi.cksumToUse) && !poi.validateCksum(ckconf):
 		// if the corresponding validation is not configured/enabled we just go ahead
 		// and use the checksum that has arrived with the object
 		poi.lom.SetCksum(poi.cksumToUse)
@@ -497,9 +571,10 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, er
 		written, err = cos.CopyBuffer(lmfh, poi.r, buf)
 	default:
 		writers := make([]io.Writer, 0, 3)
+		writers = append(writers, lmfh)
 		cksums.store = cos.NewCksumHash(ckconf.Type) // always according to the bucket
 		writers = append(writers, cksums.store.H)
-		if !poi.skipVC && !poi.cksumToUse.IsEmpty() && poi.validateCksum(ckconf) {
+		if !poi.skipVC && !cos.NoneC(poi.cksumToUse) && poi.validateCksum(ckconf) {
 			cksums.expct = poi.cksumToUse
 			if poi.cksumToUse.Type() == cksums.store.Type() {
 				cksums.compt = cksums.store
@@ -509,7 +584,6 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, er
 				writers = append(writers, cksums.compt.H)
 			}
 		}
-		writers = append(writers, lmfh)
 		written, err = cos.CopyBuffer(cos.NewWriterMulti(writers...), poi.r, buf) // (ditto)
 	}
 	if err != nil {
@@ -556,20 +630,21 @@ func (poi *putOI) _cleanup(buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, er
 	}
 
 	// not ok
+	cos.DrainReader(poi.r)
 	poi.r.Close()
 	if lmfh != nil {
 		if nerr := lmfh.Close(); nerr != nil {
 			nlog.Errorf(fmtNested, poi.t, err, "close", poi.workFQN, nerr)
 		}
 	}
-	if nerr := cos.RemoveFile(poi.workFQN); nerr != nil && !os.IsNotExist(nerr) {
+	if nerr := cos.RemoveFile(poi.workFQN); nerr != nil && !cos.IsNotExist(nerr) {
 		nlog.Errorf(fmtNested, poi.t, err, "remove", poi.workFQN, nerr)
 	}
 }
 
 func (poi *putOI) validateCksum(c *cmn.CksumConf) (v bool) {
 	switch poi.owt {
-	case cmn.OwtRebalance, cmn.OwtCopy, cmn.OwtCopySameBucket:
+	case cmn.OwtRebalance, cmn.OwtCopy:
 		v = c.ValidateObjMove
 	case cmn.OwtPut:
 		v = true
@@ -609,7 +684,7 @@ do: // retry uplock or ec-recovery, the latter only once
 
 	err = goi.lom.Load(true /*cache it*/, true /*locked*/)
 	if err != nil {
-		cold = cos.IsNotExist(err, 0)
+		cold = cos.IsNotExist(err)
 		if !cold {
 			goi.isIOErr = true
 			return http.StatusInternalServerError, err
@@ -630,7 +705,7 @@ do: // retry uplock or ec-recovery, the latter only once
 		doubleCheck, ecode, err = goi.restoreFromAny(false /*skipLomRestore*/)
 		if doubleCheck && err != nil {
 			lom2 := core.AllocLOM(goi.lom.ObjName)
-			er2 := lom2.InitBck(goi.lom.Bucket())
+			er2 := lom2.InitBck(goi.lom.Bck())
 			if er2 == nil {
 				er2 = lom2.Load(true /*cache it*/, false /*locked*/)
 				goi.isIOErr = true
@@ -668,7 +743,7 @@ do: // retry uplock or ec-recovery, the latter only once
 	}
 
 	// validate checksums and recover (a.k.a. self-heal) if corrupted
-	if !cold && goi.lom.CksumConf().ValidateWarmGet {
+	if !cold && goi.lom.ValidateWarmGet() {
 		cold, ecode, err = goi.validateRecover()
 		if err != nil {
 			if !cold {
@@ -735,11 +810,11 @@ do: // retry uplock or ec-recovery, the latter only once
 
 	// read locally and stream back
 fin:
-	ecode, err = goi.txfini()
+	var fqn string
+	fqn, ecode, err = goi.txfini()
 	if err == nil {
-		return 0, nil
-	}
-	if goi.retry {
+		err = goi.expostfacto(fqn)
+	} else if goi.retry {
 		goi.retry = false
 		if !retried {
 			goi.lom.UncacheDel()
@@ -752,13 +827,48 @@ fin:
 	return ecode, err
 }
 
+func (goi *getOI) expostfacto(fqn string) error {
+	lom := goi.lom
+
+	// apc.QparamIsGFNRequest: update GFN filter to skip _rebalancing_ this one
+	if goi.dpq.isGFN {
+		bname := cos.UnsafeBptr(lom.UnamePtr())
+		goi.t.reb.FilterAdd(*bname)
+		return nil
+	}
+	if goi.cold || goi.rget { // GFN & cold-GET: must be already loaded w/ atime set
+		return nil
+	}
+	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
+		if !cmn.IsErrObjNought(err) {
+			fs.CleanPathErr(err)
+			goi.isIOErr = true
+			goi.t.FSHC(err, lom.Mountpath(), fqn)
+		}
+		return cmn.ErrGetTxBenign
+	}
+	lom.SetAtimeUnix(goi.atime)
+	lom.Recache()
+	return nil
+}
+
 func (goi *getOI) isStreamingColdGet() bool {
 	if !goi.lom.IsFeatureSet(feat.StreamingColdGET) {
 		return false
 	}
-	ckconf := goi.lom.CksumConf()
-	return goi.dpq.arch.path == "" && goi.dpq.arch.regx == "" && goi.ranges.Range == "" &&
-		(ckconf.Type == cos.ChecksumNone || !ckconf.ValidateColdGet)
+
+	// assorted limitations each of which (or all together) can be lifted if need be
+	switch {
+	case goi.dpq.arch.path != "" || goi.dpq.arch.regx != "":
+		return false
+	case goi.ranges.Range != "":
+		return false
+	case goi.lom.ValidateColdGet():
+		return false
+	case goi.lom.Bprops().Chunks.AutoEnabled():
+		return false
+	}
+	return true
 }
 
 func (goi *getOI) coldPut(res *core.GetReaderResult) (int, error) {
@@ -772,11 +882,12 @@ func (goi *getOI) coldPut(res *core.GetReaderResult) (int, error) {
 		poi.config = cmn.GCO.Get()
 		poi.r = res.R
 		poi.size = res.Size
-		poi.workFQN = fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileColdget)
+		poi.workFQN = lom.GenFQN(fs.WorkCT, fs.WorkfileColdget)
 		poi.atime = goi.atime
 		poi.owt = cmn.OwtGet
 		poi.cksumToUse = res.ExpCksum // expected checksum (to validate if the bucket's `validate_cold_get == true`)
 		poi.coldGET = true
+		poi.locked = true
 	}
 	code, err := poi.putObject()
 	freePOI(poi)
@@ -812,7 +923,7 @@ func (goi *getOI) validateRecover() (coldGet bool, ecode int, err error) {
 validate:
 	err = lom.ValidateMetaChecksum()
 	if err == nil {
-		err = lom.ValidateContentChecksum()
+		err = lom.ValidateContentChecksum(true /*locked*/)
 	}
 	if err == nil {
 		return false, 0, nil
@@ -964,37 +1075,27 @@ gfn:
 }
 
 func (goi *getOI) getFromNeighbor(lom *core.LOM, tsi *meta.Snode) bool {
-	query := lom.Bck().NewQuery()
-	query.Set(apc.QparamIsGFNRequest, "true")
-	reqArgs := cmn.AllocHra()
-	{
-		reqArgs.Method = http.MethodGet
-		reqArgs.Base = tsi.URL(cmn.NetIntraData)
-		reqArgs.Header = http.Header{
-			apc.HdrCallerID:   []string{goi.t.SID()},
-			apc.HdrCallerName: []string{goi.t.callerName()},
-		}
-		reqArgs.Path = apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName)
-		reqArgs.Query = query
-	}
 	config := cmn.GCO.Get()
-	req, _, cancel, err := reqArgs.ReqWith(config.Timeout.SendFile.D())
-	if err != nil {
-		debug.AssertNoErr(err)
-		return false
+	params := &core.GfnParams{
+		Lom:    lom,
+		Tsi:    tsi,
+		Config: config,
+		Size:   lom.Lsize(true),
 	}
-	defer cancel()
-	defer cmn.HreqFree(req)
-
-	resp, err := g.client.data.Do(req) //nolint:bodyclose // closed by `poi.putObject`
-	cmn.FreeHra(reqArgs)
+	resp, err := goi.t.GetFromNeighbor(params) //nolint:bodyclose // closed by poi.put()
 	if err != nil {
 		nlog.Errorf("%s: gfn failure, %s %q, err: %v", goi.t, tsi, lom, err)
 		return false
 	}
 
-	cksumToUse := lom.ObjAttrs().FromHeader(resp.Header)
-	workFQN := fs.CSM.Gen(lom, fs.WorkfileType, fs.WorkfileRemote)
+	oah := lom.ObjAttrs()
+	cksumToUse, err := oah.FromHeader(resp.Header)
+	if err != nil { // unlikely
+		debug.AssertNoErr(err)
+		nlog.Errorln("invalid obj attrs from neighbor:", err)
+	}
+	workFQN := lom.GenFQN(fs.WorkCT, fs.WorkfileRemote)
+
 	poi := allocPOI()
 	{
 		poi.t = goi.t
@@ -1006,10 +1107,13 @@ func (goi *getOI) getFromNeighbor(lom *core.LOM, tsi *meta.Snode) bool {
 		poi.atime = lom.ObjAttrs().Atime
 		poi.cksumToUse = cksumToUse
 	}
+	if poi.atime == 0 {
+		poi.atime = time.Now().UnixNano()
+	}
 	ecode, erp := poi.putObject()
 	freePOI(poi)
 	if erp == nil {
-		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+		if cmn.Rom.V(5, cos.ModAIS) {
 			nlog.Infoln(goi.t.String(), "gfn", goi.lom.String(), "<=", tsi.StringEx())
 		}
 		return true
@@ -1018,29 +1122,36 @@ func (goi *getOI) getFromNeighbor(lom *core.LOM, tsi *meta.Snode) bool {
 	return false
 }
 
-func (goi *getOI) txfini() (ecode int, err error) {
+func (goi *getOI) txfini() (fqn string, ecode int, err error) {
 	var (
-		lmfh *os.File
+		lmfh cos.LomReader
 		hrng *htrange
-		fqn  = goi.lom.FQN
 		dpq  = goi.dpq
+		lom  = goi.lom
 	)
-	if !goi.cold && !dpq.isGFN && !goi.lom.IsChunked() {
-		fqn = goi.lom.LBGet() // best-effort GET load balancing (see also mirror.findLeastUtilized())
-	}
 	// open
-	lmfh, err = goi.lom.OpenFile()
+	if cmn.Rom.Features().IsSet(feat.LoadBalanceGET) && !goi.cold && !dpq.isGFN && !lom.IsChunked() {
+		// [feat] best-effort GET load balancing across mirrored copies
+		if lmfh, fqn = lom.OpenCopy(); lmfh == nil {
+			fqn = lom.FQN
+			lmfh, err = lom.Open()
+		}
+	} else {
+		fqn = lom.FQN
+		lmfh, err = lom.Open()
+	}
+
 	if err != nil {
-		if os.IsNotExist(err) {
+		if cos.IsNotExist(err) {
 			// NOTE: retry only once and only when ec-enabled - see goi.restoreFromAny()
 			ecode = http.StatusNotFound
-			goi.retry = goi.lom.ECEnabled()
+			goi.retry = lom.ECEnabled()
 		} else {
-			goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
+			goi.t.FSHC(err, lom.Mountpath(), fqn)
 			ecode = http.StatusInternalServerError
-			err = cmn.NewErrFailedTo(goi.t, "goi-finalize", goi.lom.Cname(), err, ecode)
+			err = cmn.NewErrFailedTo(goi.t, "goi-finalize", lom.Cname(), err, ecode)
 		}
-		return ecode, err
+		return fqn, ecode, err
 	}
 
 	whdr := goi.w.Header()
@@ -1049,7 +1160,7 @@ func (goi *getOI) txfini() (ecode int, err error) {
 	switch {
 	case goi.ranges.Range != "":
 		debug.Assert(!dpq.isArch())
-		rsize := goi.lom.Lsize()
+		rsize := lom.Lsize()
 		if goi.ranges.Size > 0 {
 			rsize = goi.ranges.Size
 		}
@@ -1064,45 +1175,81 @@ func (goi *getOI) txfini() (ecode int, err error) {
 	}
 
 	cos.Close(lmfh)
-	return ecode, err
+	return fqn, ecode, err
 }
 
-func (goi *getOI) _txrng(fqn string, lmfh *os.File, whdr http.Header, hrng *htrange) (err error) {
-	var (
-		r          io.Reader
-		sgl        *memsys.SGL
-		cksum      = goi.lom.Checksum()
-		ckconf     = goi.lom.CksumConf()
-		size       = hrng.Length
-		cksumRange = ckconf.Type != cos.ChecksumNone && ckconf.EnableReadRange
-	)
-	r = io.NewSectionReader(lmfh, hrng.Start, hrng.Length)
+const (
+	checksumRangeSizeThreshold = 4 * cos.MiB // see goi._txrng
+)
 
-	// compute range checksum
-	if cksumRange {
-		sgl = goi.t.gmm.NewSGL(size)
-		_, cksumH, err := cos.CopyAndChecksum(sgl /*as ReaderFrom*/, r, nil, ckconf.Type)
-		if err != nil {
-			sgl.Free()
-			goi.isIOErr = true
-			return err
-		}
-		r = sgl
-		if cksumH != nil {
+func (goi *getOI) _ckrange(hrng *htrange) bool {
+	// S3 GetObject does not support or define "range checksum"
+	if goi.dpq.isS3 || goi.lom.CksumType() == cos.ChecksumNone {
+		return false
+	}
+	return goi.lom.CksumConf().EnableReadRange && (hrng.Start > 0 || hrng.Length < goi.lom.Lsize())
+}
+
+func (goi *getOI) _txrng(fqn string, lmfh cos.LomReader, whdr http.Header, hrng *htrange) error {
+	var (
+		r      io.Reader
+		sgl    *memsys.SGL
+		cksum  = goi.lom.Checksum()
+		size   = hrng.Length
+		ra, ok = lmfh.(io.ReaderAt)
+	)
+	debug.Assertf(ok, "expecting ReaderAt, got (%T)", lmfh) // m.b. fh or UfestReader
+
+	r = io.NewSectionReader(ra, hrng.Start, size)
+
+	if goi._ckrange(hrng) {
+		if !goi.lom.IsChunked() && size <= checksumRangeSizeThreshold {
+			// non-chunked object & relatively small range -- pagecache
+			_, cksumH, err := cos.CopyAndChecksum(io.Discard, r, nil, goi.lom.CksumType())
+			if err != nil {
+				goi.isIOErr = true
+				return err
+			}
 			cksum = &cksumH.Cksum
+			r = io.NewSectionReader(ra, hrng.Start, size)
+		} else {
+			// large (+ sgl)
+			sgl = goi.t.gmm.NewSGL(size)
+			_, cksumH, err := cos.CopyAndChecksum(sgl /*as ReaderFrom*/, r, nil, goi.lom.CksumType())
+			if err != nil {
+				sgl.Free()
+				goi.isIOErr = true
+				return err
+			}
+			cksum = &cksumH.Cksum
+			r = sgl
 		}
 	}
 
-	// set response header
 	goi.setwhdr(whdr, cksum, size)
 
-	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.DefaultBuf2Size))
-	err = goi.transmit(r, buf, fqn, size)
+	// RFC 9110: "server SHOULD send 206 (Partial Content) for satisfied range requests"
+	goi.w.WriteHeader(http.StatusPartialContent)
+
+	// transmit
+	buf, slab := goi.t.gmm.AllocSize(_txsize(size))
+	err := goi.transmit(r, buf, fqn, size)
 	slab.Free(buf)
 	if sgl != nil {
 		sgl.Free()
 	}
 	return err
+}
+
+// buffer sizing for range and arch reads (compare w/ txreg)
+func _txsize(size int64) int64 {
+	if size <= 0 {
+		return memsys.PageSize
+	}
+	if size >= 256*cos.KiB {
+		return memsys.MaxPageSlabSize
+	}
+	return min(size, memsys.DefaultBuf2Size)
 }
 
 func (goi *getOI) setwhdr(whdr http.Header, cksum *cos.Cksum, size int64) {
@@ -1116,50 +1263,41 @@ func (goi *getOI) setwhdr(whdr http.Header, cksum *cos.Cksum, size int64) {
 }
 
 // in particular, setup reader and writer and set headers
-func (goi *getOI) _txreg(fqn string, lmfh *os.File, whdr http.Header) (err error) {
+func (goi *getOI) _txreg(fqn string, lmfh cos.LomReader, whdr http.Header) (err error) {
 	// set response header
 	size := goi.lom.Lsize()
 	goi.setwhdr(whdr, goi.lom.Checksum(), size)
 
 	// Tx
-	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.DefaultBuf2Size))
+	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.MaxPageSlabSize))
 	err = goi.transmit(lmfh, buf, fqn, size)
 	slab.Free(buf)
 	return err
 }
 
 // TODO: checksum
-func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
+func (goi *getOI) _txarch(fqn string, lmfh cos.LomReader, whdr http.Header) error {
 	var (
-		ar  archive.Reader
 		dpq = goi.dpq
 		lom = goi.lom
 	)
-	mime, err := archive.MimeFile(lmfh, goi.t.smm, dpq.arch.mime, lom.ObjName)
-	if err != nil {
-		return err
-	}
-	ar, err = archive.NewReader(mime, lmfh, lom.Lsize())
-	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", lom.Cname(), err)
-	}
-
-	// single
+	// read single
 	if dpq.arch.path != "" {
-		debug.Assert(dpq.arch.mmode == "", dpq.arch.mmode)
-		var csl cos.ReadCloseSizer
-		csl, err = ar.ReadOne(dpq.arch.path)
+		csl, err := lom.NewArchpathReader(lmfh, dpq.arch.path, dpq.arch.mime)
 		if err != nil {
-			goi.isIOErr = true
-			return cmn.NewErrFailedTo(goi.t, "extract "+dpq._archstr()+" from", lom.Cname(), err)
-		}
-		if csl == nil {
-			return cos.NewErrNotFound(goi.t, dpq._archstr()+" in "+lom.Cname())
+			return err
 		}
 		// found
+		var (
+			size = csl.Size()
+		)
+		debug.Assert(size >= 0, "negative archive entry size for", lom.Cname(), "/", dpq.arch.path)
+		// (compare w/ goi.setwhdr)
 		whdr.Set(cos.HdrContentType, cos.ContentBinary)
-		buf, slab := goi.t.gmm.AllocSize(min(csl.Size(), memsys.DefaultBuf2Size))
-		err = goi.transmit(csl, buf, fqn, csl.Size())
+		whdr.Set(cos.HdrContentLength, strconv.FormatInt(size, 10))
+
+		buf, slab := goi.t.gmm.AllocSize(_txsize(size))
+		err = goi.transmit(csl, buf, fqn, size)
 		slab.Free(buf)
 		csl.Close()
 		return err
@@ -1167,6 +1305,17 @@ func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
 
 	// multi match; writing & streaming tar =>(directly)=> response writer
 	debug.Assert(dpq.arch.mmode != "")
+	mime, err := archive.MimeFile(lmfh, goi.t.smm, dpq.arch.mime, lom.ObjName)
+	if err != nil {
+		return err
+	}
+
+	var ar archive.Reader
+	ar, err = archive.NewReader(mime, lmfh, lom.Lsize())
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", lom.Cname(), err)
+	}
+
 	rcb := _newRcb(goi.w)
 	whdr.Set(cos.HdrContentType, cos.ContentTar)
 	err = ar.ReadUntil(rcb, dpq.arch.regx, dpq.arch.mmode)
@@ -1185,47 +1334,32 @@ func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
 func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string, size int64) error {
 	var (
 		errTx error
-		lom   = goi.lom
 	)
 	written, err := cos.CopyBuffer(goi.w, r, buf)
 	if err != nil || written != size {
 		errTx = goi._txerr(err, fqn /*lbget*/, written, size)
 	}
-	if errTx != nil && errTx != errGetTxBenign {
-		debug.Assert(isErrGetTxSevere(errTx), errTx)
-		lom.UncacheDel()
+	if errTx != nil {
 		return errTx
 	}
 
-	// apc.QparamIsGFNRequest: update GFN filter to skip _rebalancing_ this one
-	if goi.dpq.isGFN {
-		bname := cos.UnsafeBptr(lom.UnamePtr())
-		goi.t.reb.FilterAdd(*bname)
-	} else if !goi.cold { // GFN & cold-GET: must be already loaded w/ atime set
-		if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
-			fs.CleanPathErr(err)
-			goi.isIOErr = true
-			goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
-			return err
-		}
-		lom.SetAtimeUnix(goi.atime)
-		lom.Recache()
-	}
 	//
 	// stats
 	//
 	goi.stats(written)
-	return errTx
+	return nil
 }
 
 func (goi *getOI) _txerr(err error, fqn string, written, size int64) error {
 	const act = "(transmit)"
-	cname := goi.lom.Cname()
+	lom := goi.lom
+	cname := lom.Cname()
 
 	// enforce transmit size
 	if err == nil && written != size {
 		// [corruption?]
 		goi.isIOErr = true
+		lom.UncacheDel()
 		errTx := &errGetTxSevere{
 			msg: fmt.Sprintf("%s %s: invalid size %d != %d", act, cname, written, size),
 		}
@@ -1233,32 +1367,32 @@ func (goi *getOI) _txerr(err error, fqn string, written, size int64) error {
 		return errTx
 	}
 
-	// [failure to transmit] return errGetTxBenign and keep the object
+	// [failure to transmit] return cmn.ErrGetTxBenign
 	switch {
-	case cos.IsRetriableConnErr(err):
-		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+	case cos.IsErrRetriableConn(err):
+		if cmn.Rom.V(5, cos.ModAIS) {
+			nlog.WarningDepth(1, act, cname, "err:", err)
+		}
+	case cmn.IsErrObjNought(err):
+		lom.UncacheDel()
+		if cmn.Rom.V(4, cos.ModAIS) {
 			nlog.WarningDepth(1, act, cname, "err:", err)
 		}
 	default: // notwithstanding
-		goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
+		goi.t.FSHC(err, lom.Mountpath(), fqn)
+		lom.UncacheDel()
 		nlog.ErrorDepth(1, act, cname, "err:", err)
 	}
 
-	return errGetTxBenign
+	return cmn.ErrGetTxBenign
 }
 
 func (goi *getOI) stats(written int64) {
 	var (
 		bck   = goi.lom.Bck()
 		delta = mono.SinceNano(goi.ltime)
-		vlabs = stats.EmptyBckVlabs
-		fl    = cmn.Rom.Features()
-		cname string
+		vlabs = bvlabs(bck)
 	)
-	if fl.IsSet(feat.EnableDetailedPromMetrics) {
-		cname = bck.Cname("")
-		vlabs = map[string]string{stats.VlabBucket: cname}
-	}
 	goi.t.statsT.IncWith(stats.GetCount, vlabs)
 	goi.t.statsT.AddWith(
 		cos.NamedVal64{Name: stats.GetSize, Value: written, VarLabs: vlabs},
@@ -1272,12 +1406,12 @@ func (goi *getOI) stats(written int64) {
 		return
 	}
 
-	backend := goi.t.Backend(bck)
-	if !fl.IsSet(feat.EnableDetailedPromMetrics) {
-		// always provide for backend stats
-		cname = bck.Cname("")
+	// always provide non-empty vlabs for backend stats
+	cname := bck.Cname("")
+	if vlabs[stats.VlabBucket] == "" { // i.e. stats.EmptyBckVlabs
 		vlabs = map[string]string{stats.VlabBucket: cname}
 	}
+	backend := goi.t.Backend(bck)
 	goi.t.rgetstats(backend, cname, "" /*xkind*/, written, delta)
 
 	if !goi.verchanged {
@@ -1350,10 +1484,6 @@ func newErrGetTxSevere(err error, lom *core.LOM, tag string) error {
 	return &errGetTxSevere{fmt.Sprintf("failed to finalize GET response: %s %s [%v]", tag, lom.Cname(), err)}
 }
 
-var (
-	errGetTxBenign = errors.New("Warning: failed to transmit GET response") //nolint:staticcheck // making an exception for Warning
-)
-
 //
 // APPEND a file or multiple files:
 // - as a new object, if doesn't exist
@@ -1372,7 +1502,11 @@ func (a *apndOI) do(r *http.Request) (packedHdl string, ecode int, err error) {
 		}
 	}
 	if cksumValue != "" {
+		cksumType = strings.ToLower(cksumType)
 		a.cksum = cos.NewCksum(cksumType, cksumValue)
+		if err := a.cksum.Validate(); err != nil {
+			return "", 0, err
+		}
 	}
 
 	switch a.op {
@@ -1396,7 +1530,7 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, err error) {
 		workFQN = a.hdl.workFQN
 	)
 	if workFQN == "" {
-		workFQN = fs.CSM.Gen(a.lom, fs.WorkfileType, fs.WorkfileAppend)
+		workFQN = a.lom.GenFQN(fs.WorkCT, fs.WorkfileAppend)
 		a.lom.Lock(false)
 		if a.lom.Load(false /*cache it*/, false /*locked*/) == nil {
 			_, a.hdl.partialCksum, err = cos.CopyFile(a.lom.FQN, workFQN, buf, a.lom.CksumType())
@@ -1434,7 +1568,7 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, err error) {
 	a.t.statsT.AddWith(
 		cos.NamedVal64{Name: stats.AppendLatency, Value: lat, VarLabs: vlabs},
 	)
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.V(4, cos.ModAIS) {
 		nlog.Infoln("APPEND", a.lom.String(), time.Duration(lat))
 	}
 	return packedHdl, nil
@@ -1449,7 +1583,7 @@ func (a *apndOI) flush() (int, error) {
 	debug.Assert(a.hdl.partialCksum != nil)
 	a.hdl.partialCksum.Finalize()
 	partialCksum := a.hdl.partialCksum.Clone()
-	if !a.cksum.IsEmpty() && !partialCksum.Equal(a.cksum) {
+	if !cos.NoneC(a.cksum) && !partialCksum.Equal(a.cksum) {
 		return http.StatusInternalServerError, cos.NewErrDataCksum(partialCksum, a.cksum)
 	}
 
@@ -1503,8 +1637,12 @@ func (a *apndOI) pack(workFQN string) string {
 
 // main method
 func (coi *coi) do(t *target, dm *bundle.DM, lom *core.LOM) (res xs.CoiRes) {
+	if coi.ETLArgs == nil {
+		coi.ETLArgs = &core.ETLArgs{}
+	}
+
 	if coi.DryRun {
-		return coi._dryRun(lom, coi.ObjnameTo)
+		return coi._dryRun(lom, coi.ObjnameTo, coi.ETLArgs)
 	}
 
 	// (no-op transform) and (remote source) => same flow as actual transform but with default reader
@@ -1519,9 +1657,9 @@ func (coi *coi) do(t *target, dm *bundle.DM, lom *core.LOM) (res xs.CoiRes) {
 	if err != nil {
 		return xs.CoiRes{Err: err}
 	}
-	local := tsi.ID() == t.SID()
 
-	daddr, err := url.Parse(cos.JoinPath(tsi.URL(cmn.NetIntraData), url.PathEscape(cos.UnsafeS(uname)))) // use escaped URL to simplify parsing on the ETL side)
+	// use escaped URL to simplify parsing on the ETL side)
+	daddr, err := url.Parse(cos.JoinPath(tsi.URL(cmn.NetIntraData), url.PathEscape(cos.UnsafeS(uname))))
 	if err != nil {
 		return xs.CoiRes{Err: err}
 	}
@@ -1532,19 +1670,26 @@ func (coi *coi) do(t *target, dm *bundle.DM, lom *core.LOM) (res xs.CoiRes) {
 		q.Set(apc.QparamOWT, coi.OWT.ToS())
 		daddr.RawQuery = q.Encode()
 	}
-	gargs := &core.GetROCArgs{Daddr: daddr.String(), Local: local}
-	if !local {
+
+	if tsi.ID() != t.SID() {
+		if coi.ETLArgs.Pipeline == nil {
+			coi.ETLArgs.Pipeline = make(apc.ETLPipeline, 0, 1)
+		}
+		coi.ETLArgs.Pipeline.Join(daddr.String()) // attach direct put destination target to the pipeline
 		var r cos.ReadOpenCloser
-		if coi.GetROC != nil {
-			resp := coi.GetROC(lom, coi.LatestVer, coi.Sync, gargs)
-			// skip t2t send if encounter error during GetROC, or returns empty reader (etl delivered case)
+		if coi.PutWOC != nil {
+			_, ecode, err := coi.PutWOC(lom, coi.LatestVer, coi.Sync, nil, coi.ETLArgs)
+			return xs.CoiRes{Err: err, Ecode: ecode}
+		} else if coi.GetROC != nil {
+			resp := coi.GetROC(lom, coi.LatestVer, coi.Sync, coi.ETLArgs)
+			// skip t2t send if encounter error during GetROC, (etl direct put will return ErrSkip in this case)
 			if resp.Err != nil {
 				return xs.CoiRes{Err: resp.Err, Ecode: resp.Ecode}
 			}
 			coi.OAH = resp.OAH
 			r = resp.R
 		}
-		return coi.send(t, dm, lom, r, tsi)
+		return coi.send(t, dm, lom, r, tsi) // lom is the source of reader if no reader specified
 	}
 
 	// dst is this target
@@ -1552,26 +1697,35 @@ func (coi *coi) do(t *target, dm *bundle.DM, lom *core.LOM) (res xs.CoiRes) {
 	dst := core.AllocLOM(coi.ObjnameTo)
 	defer core.FreeLOM(dst)
 
-	if err := dst.InitBck(coi.BckTo.Bucket()); err != nil {
+	if err := dst.InitBck(coi.BckTo); err != nil {
 		return xs.CoiRes{Err: err}
 	}
+	dstMaxMonoSize := dst.Bprops().Chunks.MaxMonolithicSize
 
 	switch {
 	// no-op
 	case coi.isNOP(lom, dst, dm):
-		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+		if cmn.Rom.V(5, cos.ModAIS) {
 			nlog.Infoln("copying", lom.String(), "=>", dst.String(), "is a no-op: destination exists and is identical")
 		}
+	case coi.PutWOC != nil: // take precedence over GetROC, if any
+		res = coi._writer(t, lom, dst, coi.ETLArgs)
+		if res.Ecode == http.StatusNotFound && !cos.IsNotExist(err) {
+			res.Err = cos.NewErrNotFound(t, res.Err.Error())
+		}
 	case coi.GetROC != nil:
-		res = coi._reader(t, dm, lom, dst, gargs)
-		if res.Ecode == http.StatusNotFound && !cos.IsNotExist(err, 0) {
+		res = coi._reader(t, dm, lom, dst, coi.ETLArgs)
+		if res.Ecode == http.StatusNotFound && !cos.IsNotExist(err) {
 			// to keep not-found
 			res.Err = cos.NewErrNotFound(t, res.Err.Error())
 		}
 	case lom.FQN == dst.FQN:
-		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+		if cmn.Rom.V(5, cos.ModAIS) {
 			nlog.Infoln("copying", lom.String(), "=>", dst.String(), "is a no-op (resilvering with a single mountpath?)")
 		}
+	case lom.Bprops().Chunks.MaxMonolithicSize != dstMaxMonoSize && lom.Lsize() > int64(dstMaxMonoSize):
+		// source and destination buckets have different chunks config => rechunk if the source exceeds the destination's limit
+		res = coi._chunk(t, lom, dst, int64(dst.Bprops().Chunks.ChunkSize))
 	default:
 		// fast path: destination is _this_ target
 		// (note coi.send(=> another target) above)
@@ -1608,7 +1762,7 @@ func (coi *coi) isNOP(lom, dst *core.LOM, dm *bundle.DM) bool {
 	return res.Eq
 }
 
-func (coi *coi) _dryRun(lom *core.LOM, objnameTo string) (res xs.CoiRes) {
+func (coi *coi) _dryRun(lom *core.LOM, objnameTo string, args *core.ETLArgs) (res xs.CoiRes) {
 	if coi.GetROC == nil {
 		uname := coi.BckTo.MakeUname(objnameTo)
 		if lom.Uname() != cos.UnsafeS(uname) {
@@ -1617,7 +1771,7 @@ func (coi *coi) _dryRun(lom *core.LOM, objnameTo string) (res xs.CoiRes) {
 		return res
 	}
 
-	resp := coi.GetROC(lom, false /*latestVer*/, false /*sync*/, nil /*GetROCArgs*/)
+	resp := coi.GetROC(lom, false /*latestVer*/, false /*sync*/, args)
 	if resp.Err != nil {
 		return xs.CoiRes{Err: resp.Err}
 	}
@@ -1625,6 +1779,29 @@ func (coi *coi) _dryRun(lom *core.LOM, objnameTo string) (res xs.CoiRes) {
 	size, err := io.Copy(io.Discard, resp.R)
 	resp.R.Close()
 	return xs.CoiRes{Lsize: size, Err: err}
+}
+
+func (coi *coi) _writer(t *target, lom, dst *core.LOM, args *core.ETLArgs) (res xs.CoiRes) {
+	workFQN := dst.GenFQN(fs.WorkCT, fs.WorkfileTransform)
+	lomWriter, err := dst.CreateWork(workFQN) // closed in the `coi.PutWOC` call
+	if err != nil {
+		return xs.CoiRes{Err: err}
+	}
+	size, ecode, err := coi.PutWOC(lom, coi.LatestVer, coi.Sync, lomWriter, args)
+	if err != nil {
+		cos.RemoveFile(workFQN)
+		return xs.CoiRes{Err: err, Ecode: ecode}
+	}
+
+	// finalize
+	dst.SetSize(size)
+	ecode, err = t.FinalizeObj(dst, workFQN, coi.Xact, coi.OWT)
+	if err != nil {
+		cos.RemoveFile(workFQN)
+		return xs.CoiRes{Err: err, Ecode: ecode}
+	}
+	res.Lsize = size
+	return res
 }
 
 // PUT lom => dst
@@ -1638,21 +1815,21 @@ func (coi *coi) _dryRun(lom *core.LOM, objnameTo string) (res xs.CoiRes) {
 //
 // An option for _not_ storing the object _in_ the cluster would be a _feature_ that can be
 // further debated.
-//
-//nolint:dupword // intentional
-func (coi *coi) _reader(t *target, dm *bundle.DM, lom, dst *core.LOM, gargs *core.GetROCArgs) (res xs.CoiRes) {
-	resp := coi.GetROC(lom, coi.LatestVer, coi.Sync, gargs)
+func (coi *coi) _reader(t *target, dm *bundle.DM, lom, dst *core.LOM, args *core.ETLArgs) (res xs.CoiRes) {
+	debug.Assertf(coi.GetROC != nil, "coi.GetROC is nil in _reader, object name: %s", coi.ObjnameTo)
+	resp := coi.GetROC(lom, coi.LatestVer, coi.Sync, args)
 	if resp.Err != nil {
 		return xs.CoiRes{Ecode: resp.Ecode, Err: resp.Err}
 	}
 	poi := allocPOI()
+	defer freePOI(poi)
 	{
 		poi.t = t
 		poi.lom = dst
 		poi.config = coi.Config
 		poi.r = resp.R
 		poi.xctn = coi.Xact // on behalf of
-		poi.workFQN = fs.CSM.Gen(dst, fs.WorkfileType, "copy-dp")
+		poi.workFQN = dst.GenFQN(fs.WorkCT, "copy-dp")
 		poi.atime = resp.OAH.AtimeUnix()
 		poi.cksumToUse = resp.OAH.Checksum()
 
@@ -1665,26 +1842,20 @@ func (coi *coi) _reader(t *target, dm *bundle.DM, lom, dst *core.LOM, gargs *cor
 		// preserve src metadata when copying (vs. transforming)
 		dst.CopyVersion(lom)
 		dst.SetCustomMD(lom.GetCustomMD())
-
-		// [special] when src == dst (`ais cp s3://data s3://data --all`)
-		if backend := lom.Bck().RemoteBck(); backend != nil && backend.Equal(coi.BckTo.Bucket()) {
-			poi.owt = cmn.OwtCopySameBucket
-		}
 	}
 
 	ecode, err := poi.putObject()
-	res.Lsize = poi.lom.Lsize()
-	freePOI(poi)
 	if err != nil {
 		return xs.CoiRes{Ecode: ecode, Err: err}
 	}
+	res.Lsize = poi.lom.Lsize()
 
 	return res
 }
 
 func (coi *coi) _regular(t *target, lom, dst *core.LOM, lcopy bool) (res xs.CoiRes) {
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
-		if !cos.IsNotExist(err, 0) {
+		if !cos.IsNotExist(err) {
 			err = cmn.NewErrFailedTo(t, "coi-load", lom.Cname(), err)
 		}
 		return xs.CoiRes{Err: err}
@@ -1717,6 +1888,31 @@ func (coi *coi) _regular(t *target, lom, dst *core.LOM, lcopy bool) (res xs.CoiR
 	return res
 }
 
+func (coi *coi) _chunk(t *target, lom, dst *core.LOM, dstChunkSize int64) (res xs.CoiRes) {
+	resp := lom.GetROC(coi.LatestVer, coi.Sync)
+	if resp.Err != nil {
+		return xs.CoiRes{Ecode: resp.Ecode, Err: resp.Err}
+	}
+	poi := allocPOI()
+	defer freePOI(poi)
+	{
+		poi.t = t
+		poi.lom = dst
+		poi.r = resp.R
+		poi.size = lom.Lsize()
+		poi.xctn = coi.Xact // on behalf of
+		poi.owt = coi.OWT
+		poi.config = coi.Config
+	}
+	ecode, err := poi.chunk(dstChunkSize)
+	if err != nil {
+		return xs.CoiRes{Ecode: ecode, Err: err}
+	}
+	res.Lsize = poi.lom.Lsize()
+
+	return res
+}
+
 // send object => designated target
 // * source is a LOM or a reader (that may be reading from remote)
 // * one of the two equivalent transmission mechanisms: PUT or transport Send
@@ -1744,7 +1940,7 @@ func (coi *coi) send(t *target, dm *bundle.DM, lom *core.LOM, reader cos.ReadOpe
 func (coi *coi) _send(t *target, lom *core.LOM, sargs *sendArgs) (res xs.CoiRes) {
 	if sargs.dm != nil {
 		// clone the `lom` to use it in the async operation (free it via `_sendObjDM` callback)
-		lom = lom.CloneMD(lom.FQN)
+		lom = lom.Clone()
 	}
 
 	if sargs.reader == nil {
@@ -1752,9 +1948,9 @@ func (coi *coi) _send(t *target, lom *core.LOM, sargs *sendArgs) (res xs.CoiRes)
 		lom.Lock(false)
 		if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
 			lom.Unlock(false)
-			return xs.CoiRes{}
+			return xs.CoiRes{Err: err}
 		}
-		reader, err := lom.NewDeferROC()
+		reader, err := lom.NewDeferROC(true /*loaded*/)
 		if err != nil {
 			return xs.CoiRes{Err: err}
 		}
@@ -1773,9 +1969,8 @@ func (coi *coi) _send(t *target, lom *core.LOM, sargs *sendArgs) (res xs.CoiRes)
 
 // use data mover to transmit objects to other targets
 // (compare with coi.put())
-func (coi *coi) _dm(lom *core.LOM, sargs *sendArgs) error {
+func (*coi) _dm(lom *core.LOM, sargs *sendArgs) error {
 	debug.Assert(sargs.dm.OWT() == sargs.owt)
-	debug.Assert(sargs.dm.GetXact() == coi.Xact || sargs.dm.GetXact().ID() == coi.Xact.ID())
 	o := transport.AllocSend()
 	hdr, oa := &o.Hdr, sargs.objAttrs
 	{
@@ -1783,7 +1978,7 @@ func (coi *coi) _dm(lom *core.LOM, sargs *sendArgs) error {
 		hdr.ObjName = sargs.objNameTo
 		hdr.ObjAttrs.CopyFrom(oa, false /*skip cksum*/)
 	}
-	o.Callback = func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
+	o.SentCB = func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, _ error) {
 		core.FreeLOM(lom)
 	}
 	return sargs.dm.Send(o, sargs.reader, sargs.tsi)
@@ -1795,8 +1990,9 @@ func (coi *coi) put(t *target, sargs *sendArgs) error {
 	var (
 		hdr   = make(http.Header, 8)
 		query = sargs.bckTo.NewQuery()
+		size  = sargs.objAttrs.Lsize(true)
 	)
-	cmn.ToHeader(sargs.objAttrs, hdr, sargs.objAttrs.Lsize(true))
+	cmn.ToHeader(sargs.objAttrs, hdr, size)
 	hdr.Set(apc.HdrT2TPutterID, t.SID())
 	query.Set(apc.QparamOWT, sargs.owt.ToS())
 	if coi.Xact != nil {
@@ -1833,6 +2029,7 @@ func (coi *coi) put(t *target, sargs *sendArgs) error {
 // PUT a new shard _or_ APPEND to an existing one (w/ read/write/list via cmn/archive)
 //
 
+// TODO -- FIXME: add support for chunks (lom.Open below)
 func (a *putA2I) do() (int, error) {
 	if a.filename == "" {
 		return 0, errors.New("archive path is not defined")
@@ -1846,7 +2043,7 @@ func (a *putA2I) do() (int, error) {
 			offset    int64
 			size      int64
 			tarFormat tar.Format
-			workFQN   = fs.CSM.Gen(a.lom, fs.WorkfileType, fs.WorkfileAppendToArch)
+			workFQN   = a.lom.GenFQN(fs.WorkCT, fs.WorkfileAppendToArch)
 		)
 		if err = a.lom.RenameMainTo(workFQN); err != nil {
 			return http.StatusInternalServerError, err
@@ -1876,14 +2073,14 @@ func (a *putA2I) do() (int, error) {
 
 cpap: // copy + append
 	var (
-		err     error
-		wfh     *os.File
-		lmfh    cos.LomReader
-		workFQN string
-		cksum   cos.CksumHashSize
-		aw      archive.Writer
+		err, erc error
+		wfh      *os.File
+		lmfh     cos.LomReader
+		workFQN  string
+		cksum    cos.CksumHashSize
+		aw       archive.Writer
 	)
-	workFQN = fs.CSM.Gen(a.lom, fs.WorkfileType, fs.WorkfileAppendToArch)
+	workFQN = a.lom.GenFQN(fs.WorkCT, fs.WorkfileAppendToArch)
 	wfh, err = os.OpenFile(workFQN, os.O_CREATE|os.O_WRONLY, cos.PermRWR)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -1895,7 +2092,7 @@ cpap: // copy + append
 		cksum.Init(cos.ChecksumCesXxh)
 		aw = archive.NewWriter(a.mime, wfh, &cksum, nil /*opts*/)
 		err = aw.Write(a.filename, oah, a.r)
-		aw.Fini()
+		erc = aw.Fini()
 	} else {
 		// copy + append
 		lmfh, err = a.lom.Open()
@@ -1909,12 +2106,15 @@ cpap: // copy + append
 		if err == nil {
 			err = aw.Write(a.filename, oah, a.r)
 		}
-		aw.Fini() // in that order
+		erc = aw.Fini() // in that order
 		cos.Close(lmfh)
 	}
 
 	// finalize
 	cos.Close(wfh)
+	if err == nil {
+		err = erc
+	}
 	if err == nil {
 		cksum.Finalize()
 		err = a.finalize(cksum.Size, cksum.Clone(), workFQN)
@@ -1951,10 +2151,7 @@ func (a *putA2I) fast(rwfh *os.File, tarFormat tar.Format, offset int64) (size i
 }
 
 func (*putA2I) reterr(err error) (int, error) {
-	ecode := http.StatusInternalServerError
-	if cmn.IsErrCapExceeded(err) {
-		ecode = http.StatusInsufficientStorage
-	}
+	ecode := cos.Ternary(cmn.IsErrCapExceeded(err), http.StatusInsufficientStorage, http.StatusInternalServerError)
 	return ecode, err
 }
 
@@ -2023,17 +2220,12 @@ const uplockWarn = "conflict getting remote"
 
 func (goi *getOI) uplock(c *cmn.Config) (u *_uplock) {
 	u = &_uplock{sleep: cmn.ColdGetConflictMin}
+
 	// jitter
-	switch goi.ltime & 0x3 {
-	case 0:
-		u.sleep += 3 * time.Millisecond
-	case 0x1:
-		u.sleep += 7 * time.Millisecond
-	case 0x2:
-		u.sleep -= 7 * time.Millisecond
-	case 0x3:
-		u.sleep -= 3 * time.Millisecond
-	}
+	j := (goi.ltime & 0x7) - 3
+	jitter := time.Millisecond * time.Duration(j<<1)
+	u.sleep += jitter
+
 	u.timeout = cos.NonZero(c.Timeout.ColdGetConflict.D(), cmn.ColdGetConflictDflt)
 	return u
 }
@@ -2100,19 +2292,17 @@ func (c *rcbCtx) fini() {
 //
 
 var (
-	goiPool, poiPool, sndPool sync.Pool
+	goiPool = sync.Pool{New: func() any { return new(getOI) }}
+	poiPool = sync.Pool{New: func() any { return new(putOI) }}
+	sndPool = sync.Pool{New: func() any { return new(sendArgs) }}
 
 	goi0 getOI
 	poi0 putOI
 	snd0 sendArgs
 )
 
-func allocGOI() (a *getOI) {
-	if v := goiPool.Get(); v != nil {
-		a = v.(*getOI)
-		return
-	}
-	return &getOI{}
+func allocGOI() *getOI {
+	return goiPool.Get().(*getOI)
 }
 
 func freeGOI(a *getOI) {
@@ -2120,12 +2310,8 @@ func freeGOI(a *getOI) {
 	goiPool.Put(a)
 }
 
-func allocPOI() (a *putOI) {
-	if v := poiPool.Get(); v != nil {
-		a = v.(*putOI)
-		return
-	}
-	return &putOI{}
+func allocPOI() *putOI {
+	return poiPool.Get().(*putOI)
 }
 
 func freePOI(a *putOI) {
@@ -2133,12 +2319,8 @@ func freePOI(a *putOI) {
 	poiPool.Put(a)
 }
 
-func allocSnda() (a *sendArgs) {
-	if v := sndPool.Get(); v != nil {
-		a = v.(*sendArgs)
-		return
-	}
-	return &sendArgs{}
+func allocSnda() *sendArgs {
+	return sndPool.Get().(*sendArgs)
 }
 
 func freeSnda(a *sendArgs) {

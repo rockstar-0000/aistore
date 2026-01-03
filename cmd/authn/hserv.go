@@ -1,4 +1,4 @@
-// Package authn is authentication server for AIStore.
+// Package main contains the independent authentication server for AIStore.
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -8,21 +8,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
-	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/lestrrat-go/jwx/v2/jwk"
 )
-
-const svcName = "AuthN"
 
 type hserv struct {
 	mux *http.ServeMux
@@ -54,20 +52,11 @@ func (h *hserv) failAction(w http.ResponseWriter, r *http.Request, action, what 
 // Run public server to manage users and generate tokens
 func (h *hserv) Run() error {
 	var (
-		portStr    string
-		err        error
-		useHTTPS   bool
-		serverCert string
-		serverKey  string
+		portStr string
+		err     error
 	)
 
-	// Retrieve and set the port
-	portStr = os.Getenv(env.AisAuthPort)
-	if portStr == "" {
-		portStr = fmt.Sprintf(":%d", Conf.Net.HTTP.Port)
-	} else {
-		portStr = ":" + portStr
-	}
+	portStr = h.mgr.cm.GetPort()
 	nlog.Infof("Listening on %s", portStr)
 
 	h.registerPublicHandlers()
@@ -80,16 +69,11 @@ func (h *hserv) Run() error {
 		h.s.ReadHeaderTimeout = timeout
 	}
 
-	// Retrieve and set HTTPS configuration with environment variables taking precedence
-	useHTTPS, err = cos.IsParseEnvBoolOrDefault(env.AisAuthUseHTTPS, Conf.Net.HTTP.UseHTTPS)
-	if err != nil {
-		nlog.Errorf("Failed to parse %s: %v. Defaulting to false", env.AisAuthUseHTTPS, err)
-	}
-	serverCert = cos.GetEnvOrDefault(env.AisAuthServerCrt, Conf.Net.HTTP.Certificate)
-	serverKey = cos.GetEnvOrDefault(env.AisAuthServerKey, Conf.Net.HTTP.Key)
-
 	// Start the appropriate server based on the configuration
-	if useHTTPS {
+	if h.mgr.cm.IsHTTPS() {
+		// Retrieve and set HTTPS configuration with environment variables taking precedence
+		serverCert := h.mgr.cm.GetServerCert()
+		serverKey := h.mgr.cm.GetServerKey()
 		nlog.Infof("Starting HTTPS server on port%s", portStr)
 		nlog.Infof("Certificate: %s", serverCert)
 		nlog.Infof("Key: %s", serverKey)
@@ -118,7 +102,9 @@ func (h *hserv) registerPublicHandlers() {
 	h.registerHandler(apc.URLPathTokens.S, h.tokenHandler)
 	h.registerHandler(apc.URLPathClusters.S, h.clusterHandler)
 	h.registerHandler(apc.URLPathRoles.S, h.roleHandler)
-	h.registerHandler(apc.URLPathDae.S, configHandler)
+	h.registerHandler(apc.URLPathDae.S, h.configHandler)
+	h.registerHandler(apc.URLPathOIDC.S, h.oidcConfigHandler)
+	h.registerHandler(apc.URLPathJWKS.S, h.pubKeyHandler)
 }
 
 func (h *hserv) userHandler(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +146,32 @@ func (h *hserv) clusterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *hserv) roleHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.httpRolePost(w, r)
+	case http.MethodPut:
+		h.httpRolePut(w, r)
+	case http.MethodDelete:
+		h.httpRoleDel(w, r)
+	case http.MethodGet:
+		h.httpRoleGet(w, r)
+	default:
+		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut)
+	}
+}
+
+func (h *hserv) configHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.httpConfigGet(w, r)
+	case http.MethodPut:
+		h.httpConfigPut(w, r)
+	default:
+		cmn.WriteErr405(w, r, http.MethodPut, http.MethodGet)
+	}
+}
+
 // Deletes existing token, h.k.h log out
 func (h *hserv) httpRevokeToken(w http.ResponseWriter, r *http.Request) {
 	if _, err := parseURL(w, r, 0, apc.URLPathTokens.L); err != nil {
@@ -173,12 +185,14 @@ func (h *hserv) httpRevokeToken(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErrMsg(w, r, "empty token")
 		return
 	}
-	secret := Conf.Secret()
-	if _, err := tok.DecryptToken(msg.Token, secret); err != nil {
+	if _, err := h.mgr.tkParser.ValidateToken(r.Context(), msg.Token); err != nil {
 		cmn.WriteErr(w, r, err)
 		return
 	}
-	h.mgr.revokeToken(msg.Token)
+	code, err := h.mgr.revokeToken(msg.Token)
+	if err != nil {
+		h.failAction(w, r, "revoke token", msg.Token, err, code)
+	}
 }
 
 func (h *hserv) httpUserDel(w http.ResponseWriter, r *http.Request) {
@@ -186,7 +200,7 @@ func (h *hserv) httpUserDel(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err = validateAdminPerms(w, r); err != nil {
+	if err = h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 	userID := apiItems[0]
@@ -222,10 +236,10 @@ func (h *hserv) httpUserPut(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErrMsg(w, r, "Invalid request")
 		return
 	}
-	if err = validateUpdatePerms(w, r, userID, updateReq); err != nil {
+	if err = h.validateUpdatePerms(w, r, userID, updateReq); err != nil {
 		return
 	}
-	if Conf.Verbose() {
+	if h.mgr.cm.IsVerbose() {
 		nlog.Infof("PUT user %q", userID)
 	}
 	if code, err := h.mgr.updateUser(userID, updateReq); err != nil {
@@ -235,7 +249,7 @@ func (h *hserv) httpUserPut(w http.ResponseWriter, r *http.Request) {
 
 // Adds h new user to user list
 func (h *hserv) userAdd(w http.ResponseWriter, r *http.Request) {
-	if err := validateAdminPerms(w, r); err != nil {
+	if err := h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 	info := &authn.User{}
@@ -246,7 +260,7 @@ func (h *hserv) userAdd(w http.ResponseWriter, r *http.Request) {
 		h.failAction(w, r, "add user", info.ID, err, code)
 		return
 	}
-	if Conf.Verbose() {
+	if h.mgr.cm.IsVerbose() {
 		nlog.Infof("Add user %q", info.ID)
 	}
 }
@@ -266,6 +280,9 @@ func (h *hserv) httpUserGet(w http.ResponseWriter, r *http.Request) {
 		code  int
 	)
 	if len(items) == 0 {
+		if err := h.validateAdminPerms(w, r); err != nil {
+			return
+		}
 		if users, code, err = h.mgr.userList(); err != nil {
 			cmn.WriteErr(w, r, err, code)
 			return
@@ -274,6 +291,17 @@ func (h *hserv) httpUserGet(w http.ResponseWriter, r *http.Request) {
 			uInfo.Password = ""
 		}
 		writeJSON(w, users, "list users")
+		return
+	}
+	tk, err := h.getToken(r)
+	if err != nil {
+		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
+		return
+	}
+	reqUser := items[0]
+	if !tk.IsAdmin && !tk.IsUser(reqUser) {
+		err := errors.New("not authorized: requires admin or self")
+		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
 		return
 	}
 	uInfo, code, err := h.mgr.lookupUser(items[0])
@@ -285,26 +313,25 @@ func (h *hserv) httpUserGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, uInfo, "get user")
 }
 
-func getToken(r *http.Request) (*tok.Token, error) {
-	tokenStr, err := tok.ExtractToken(r.Header)
+func (h *hserv) getToken(r *http.Request) (*tok.AISClaims, error) {
+	tokenHdr, err := tok.ExtractToken(r.Header)
 	if err != nil {
 		return nil, err
 	}
-	secret := Conf.Secret()
-	tk, err := tok.DecryptToken(tokenStr, secret)
+	claims, err := h.mgr.tkParser.ValidateToken(r.Context(), tokenHdr.Token)
 	if err != nil {
+		if errors.Is(err, tok.ErrInvalidToken) {
+			return nil, fmt.Errorf("not authorized (token expired): %q", tokenHdr.Token)
+		}
 		return nil, err
 	}
-	if tk.Expires.Before(time.Now()) {
-		return nil, fmt.Errorf("not authorized (token expired): %s", tk)
-	}
-	return tk, nil
+	return claims, nil
 }
 
 // Checks if the request header contains valid admin credentials.
 // (admin is created at deployment time and cannot be modified via API)
-func validateAdminPerms(w http.ResponseWriter, r *http.Request) error {
-	tk, err := getToken(r)
+func (h *hserv) validateAdminPerms(w http.ResponseWriter, r *http.Request) error {
+	tk, err := h.getToken(r)
 	if err != nil {
 		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
 		return err
@@ -317,8 +344,8 @@ func validateAdminPerms(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func validateUpdatePerms(w http.ResponseWriter, r *http.Request, userID string, updateReq *authn.User) error {
-	tk, err := getToken(r)
+func (h *hserv) validateUpdatePerms(w http.ResponseWriter, r *http.Request, userID string, updateReq *authn.User) error {
+	tk, err := h.getToken(r)
 	if err != nil {
 		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
 		return err
@@ -326,7 +353,7 @@ func validateUpdatePerms(w http.ResponseWriter, r *http.Request, userID string, 
 	if tk.IsAdmin {
 		return nil
 	}
-	if tk.UserID == userID && len(updateReq.Roles) == 0 {
+	if tk.IsUser(userID) && len(updateReq.Roles) == 0 {
 		return nil
 	}
 	err = fmt.Errorf("not authorized: (%s)", tk)
@@ -383,14 +410,14 @@ func (h *hserv) httpSrvPost(w http.ResponseWriter, r *http.Request) {
 	if _, err := parseURL(w, r, 0, apc.URLPathClusters.L); err != nil {
 		return
 	}
-	if err := validateAdminPerms(w, r); err != nil {
+	if err := h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 	cluConf := &authn.CluACL{}
 	if err := cmn.ReadJSON(w, r, cluConf); err != nil {
 		return
 	}
-	if code, err := h.mgr.addCluster(cluConf); err != nil {
+	if code, err := h.mgr.addCluster(r.Context(), cluConf); err != nil {
 		h.failAction(w, r, "add cluster", cluConf.ID, err, code)
 	}
 }
@@ -400,7 +427,7 @@ func (h *hserv) httpSrvPut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err := validateAdminPerms(w, r); err != nil {
+	if err := h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 	cluConf := &authn.CluACL{}
@@ -418,7 +445,7 @@ func (h *hserv) httpSrvDelete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err = validateAdminPerms(w, r); err != nil {
+	if err = h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 	cluID := apiItems[0]
@@ -457,21 +484,6 @@ func (h *hserv) httpSrvGet(w http.ResponseWriter, r *http.Request) {
 		cluList = &authn.RegisteredClusters{Clusters: clus}
 	}
 	writeJSON(w, cluList, "get cluster")
-}
-
-func (h *hserv) roleHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodPost:
-		h.httpRolePost(w, r)
-	case http.MethodPut:
-		h.httpRolePut(w, r)
-	case http.MethodDelete:
-		h.httpRoleDel(w, r)
-	case http.MethodGet:
-		h.httpRoleGet(w, r)
-	default:
-		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut)
-	}
 }
 
 func (h *hserv) httpRoleGet(w http.ResponseWriter, r *http.Request) {
@@ -517,7 +529,7 @@ func (h *hserv) httpRoleDel(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err = validateAdminPerms(w, r); err != nil {
+	if err = h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 
@@ -532,7 +544,7 @@ func (h *hserv) httpRolePost(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err = validateAdminPerms(w, r); err != nil {
+	if err = h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 	info := &authn.Role{}
@@ -549,7 +561,7 @@ func (h *hserv) httpRolePut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err = validateAdminPerms(w, r); err != nil {
+	if err = h.validateAdminPerms(w, r); err != nil {
 		return
 	}
 
@@ -560,10 +572,86 @@ func (h *hserv) httpRolePut(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErrMsg(w, r, "Invalid request")
 		return
 	}
-	if Conf.Verbose() {
+	if h.mgr.cm.IsVerbose() {
 		nlog.Infof("PUT role %q\n", role)
 	}
 	if code, err := h.mgr.updateRole(role, updateReq); err != nil {
 		h.failAction(w, r, "update role", role, err, code)
 	}
+}
+
+func (h *hserv) httpConfigGet(w http.ResponseWriter, r *http.Request) {
+	if err := h.validateAdminPerms(w, r); err != nil {
+		return
+	}
+	writeJSON(w, h.mgr.cm.GetConf(), "get config")
+}
+
+func (h *hserv) httpConfigPut(w http.ResponseWriter, r *http.Request) {
+	if err := h.validateAdminPerms(w, r); err != nil {
+		return
+	}
+	updateCfg := &authn.ConfigToUpdate{}
+	if err := jsoniter.NewDecoder(r.Body).Decode(updateCfg); err != nil {
+		cmn.WriteErrMsg(w, r, "Invalid request")
+		return
+	}
+
+	err := h.mgr.cm.UpdateConf(updateCfg)
+	if err != nil {
+		cmn.WriteErr(w, r, err)
+		return
+	}
+}
+
+// Handles requests for OIDC config
+//
+//	https://openid.net/specs/openid-connect-discovery-1_0.html
+//	"OpenID Providers supporting Discovery MUST make a JSON document available at the path formed by concatenating
+//	the string /.well-known/openid-configuration to the Issuer"
+func (h *hserv) oidcConfigHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		cmn.WriteErr405(w, r, http.MethodGet)
+		return
+	}
+	// Parse the URL configured for an external client to access this service
+	// Note this is most likely different from what we serve, because of port mappings, tls termination, etc.
+	base, err := h.mgr.cm.ParseExternalURL()
+	if err != nil {
+		cmn.WriteErr(w, r, fmt.Errorf("error parsing configured external URL: %v", err))
+		return
+	}
+	debug.Assert(base != nil)
+	writeJSON(w, authn.NewOIDCConfiguration(base), "get oidc configuration")
+}
+
+func (h *hserv) pubKeyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		cmn.WriteErr405(w, r, http.MethodGet)
+		return
+	}
+	var set jwk.Set
+	if h.mgr.cm.GetPublicKeyString() == nil {
+		set = jwk.NewSet()
+	} else {
+		set = h.mgr.cm.GetKeySet()
+	}
+	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d, public", h.getJWKSMaxAge()))
+	writeJSON(w, set, "get public JWKS")
+}
+
+func (h *hserv) getJWKSMaxAge() int {
+	const (
+		cacheMinRefresh = 5 * time.Minute
+		cacheMaxRefresh = 720 * time.Hour
+		cacheWindow     = 10 * time.Minute
+	)
+	exp := h.mgr.cm.GetExpiry()
+	if exp == 0 {
+		return int(cacheMaxRefresh.Seconds())
+	}
+	// Client should refresh "cacheWindow" before the key expiry, bounded by the reasonable age constants
+	ttr := h.mgr.cm.GetExpiry() - cacheWindow
+	maxAge := max(cacheMinRefresh, min(ttr, cacheMaxRefresh))
+	return int(maxAge.Seconds())
 }

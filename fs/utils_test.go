@@ -1,6 +1,6 @@
-// Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
+// Package fs_test provides tests for fs package
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs_test
 
@@ -74,8 +74,7 @@ func BenchmarkIsDirEmpty(b *testing.B) {
 			topDirName, _ := tools.PrepareDirTree(b, bench)
 			defer os.RemoveAll(topDirName)
 
-			b.ResetTimer()
-			for range b.N {
+			for b.Loop() {
 				_, empty, err := fs.IsDirEmpty(topDirName)
 				tassert.CheckFatal(b, err)
 				tassert.Errorf(

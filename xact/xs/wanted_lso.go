@@ -75,11 +75,46 @@ func (wi *walkInfo) setWanted(en *cmn.LsoEnt, lom *core.LOM) {
 			// en.Custom is set via one of the two alternative flows:
 			// - checkRemoteMD => HEAD(obj)
 			// - backend.List* api call
+			var md cos.StrKVs
 			if en.Custom == "" {
-				if md := lom.GetCustomMD(); len(md) > 0 {
+				if md = lom.GetCustomMD(); len(md) > 0 {
 					en.Custom = cmn.CustomMD2S(md)
 					checkVchanged = false
 				}
+			}
+
+			if !wi.msg.IsFlagSet(apc.LsIsS3) {
+				break
+			}
+
+			// NOTE:
+			// For S3 list-objects, AIS does NOT issue per-object mtime/stat syscalls.
+			// This is a deliberate scalability choice. List responses use best-effort
+			// metadata only. S3 clients requiring exact values can use HEAD(object) API.
+			// A future feature flag may relax this, but the default favors performance.
+
+			var added bool
+			if md == nil {
+				md = make(cos.StrKVs, 4)
+				if en.Custom != "" {
+					cmn.S2CustomMD(md, en.Custom, en.Version)
+				}
+			}
+			if _, ok := md[cmn.ETag]; !ok {
+				if s := lom.ETag(false /*allow to generate*/); s != "" {
+					md[cmn.ETag] = s
+					added = true
+				}
+			}
+			if _, ok := md[cmn.LsoLastModified]; !ok {
+				// best-effort; may fall back to atime
+				if s := lom.LastModifiedLso(); s != "" {
+					md[cmn.LsoLastModified] = s
+					added = true
+				}
+			}
+			if added {
+				en.Custom = cmn.CustomMD2S(md)
 			}
 		default:
 			debug.Assert(false, name)

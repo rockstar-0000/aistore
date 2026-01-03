@@ -1,0 +1,70 @@
+{{#generateApiDocs}}
+<a name="documentation-for-api-endpoints"></a>
+## Documentation for API Endpoints
+
+{{#apiInfo}}{{#apis}}{{#operations}}
+### {{classname}}
+
+| Method | HTTP request | Parameters | Description |
+|------------- | ------------- | ------------- | -------------|
+{{#operation}}| [**{{operationId}}**](Apis/{{apiDocPath}}{{classname}}.md#{{operationIdLowerCase}}) | **{{httpMethod}}** {{path}} | {{#hasQueryParams}}{{#queryParams}}`{{paramName}}`{{^-last}}, {{/-last}}{{/queryParams}}{{/hasQueryParams}}{{^hasQueryParams}}None{{/hasQueryParams}} | {{{summary}}}{{^summary}}{{{notes}}}{{/summary}} |
+{{/operation}}
+
+{{/operations}}{{/apis}}{{/apiInfo}}
+{{/generateApiDocs}}
+
+{{#generateModelDocs}}
+<a name="documentation-for-models"></a>
+## Documentation for Models
+
+<div class="models-structure-notice" style="background: #f8f9fa; border-left: 4px solid #28a745; padding: 12px; margin: 15px 0; border-radius: 4px;">
+    💡 <strong>Note:</strong> All models only represent the expected value field in the final body payload for the corresponding action. The complete JSON body should look like:
+    <pre style="background: #f1f3f4; padding: 8px; margin: 8px 0; border-radius: 4px; font-family: monospace;">
+{
+  "action": "selected action",
+  "value": "the model",
+  "name": "specify if needed for the selected action"
+}</pre>
+</div>
+
+{{#modelPackage}}
+| Model | Description |
+|------------ | -------------|
+{{#models}}{{#model}}| [{{{classname}}}]({{{modelPackage}}}/{{{classFilename}}}.html) | Model definition for {{{classname}}} |
+{{/model}}{{/models}}
+{{/modelPackage}}
+{{^modelPackage}}
+No model defined in this package
+{{/modelPackage}}
+{{/generateModelDocs}}
+
+{{^authMethods}}
+{{/authMethods}}
+{{#authMethods}}
+{{#last}}
+    Authentication schemes defined for the API:
+{{/last}}
+{{/authMethods}}
+{{#authMethods}}
+<a name="{{name}}"></a>
+### {{name}}
+
+{{#isApiKey}}- **Type**: API key
+- **API key parameter name**: {{keyParamName}}
+- **Location**: {{#isKeyInQuery}}URL query string{{/isKeyInQuery}}{{#isKeyInHeader}}HTTP header{{/isKeyInHeader}}
+{{/isApiKey}}
+{{#isBasicBasic}}- **Type**: HTTP basic authentication
+{{/isBasicBasic}}
+{{#isBasicBearer}}- **Type**: HTTP Bearer Token authentication{{#bearerFormat}} ({{{.}}}){{/bearerFormat}}
+{{/isBasicBearer}}
+{{#isHttpSignature}}- **Type**: HTTP signature authentication
+{{/isHttpSignature}}
+{{#isOAuth}}- **Type**: OAuth
+- **Flow**: {{flow}}
+- **Authorization URL**: {{authorizationUrl}}
+- **Scopes**: {{^scopes}}N/A{{/scopes}}
+{{#scopes}}  - {{scope}}: {{description}}
+{{/scopes}}
+{{/isOAuth}}
+
+{{/authMethods}}

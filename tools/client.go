@@ -7,6 +7,7 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strconv"
@@ -59,17 +60,41 @@ const (
 )
 
 type PutObjectsArgs struct {
-	ProxyURL  string
-	Bck       cmn.Bck
-	ObjPath   string
-	CksumType string
-	ObjSize   uint64
-	ObjCnt    int
-	ObjNameLn int
-	WorkerCnt int
-	FixedSize bool
-	Ordered   bool // true - object names make sequence, false - names are random
-	IgnoreErr bool
+	ProxyURL           string
+	Bck                cmn.Bck
+	ObjPath            string
+	CksumType          string
+	ObjSize            uint64
+	ObjSizeRange       [2]uint64
+	MultipartNumChunks int
+	ObjCnt             int
+	ObjNameLn          int
+	WorkerCnt          int
+	FixedSize          bool
+	Ordered            bool // true - object names make sequence, false - names are random
+	IgnoreErr          bool
+	SkipVC             bool           // skip loading existing object's metadata (see also: apc.QparamSkipVC and api.PutArgs.SkipVC)
+	Reader             readers.Reader // optional reader for multipart uploads - when provided, uploads sequentially
+}
+
+// TODO: need to be replaced with a global syncPool of random objects:
+// - the `cos.NowRand()` might not be thread-safe, but is currently used across goroutines in several tests
+// - performance-wise, syncPool is much faster than creating a new random object for each call
+var fileSizeRnd = cos.NowRand()
+
+func GetRandSize(objSizeRange [2]uint64, objSize uint64, fixedSize bool) (size uint64) {
+	switch {
+	case objSizeRange[0] > 0 && objSizeRange[1] > 0:
+		// randomly sample a size within [args.ObjSizeRange[0], args.ObjSizeRange[1]]
+		size = objSizeRange[0] + fileSizeRnd.Uint64N(objSizeRange[1]-objSizeRange[0]+1)
+	case objSize == 0:
+		size = (fileSizeRnd.Uint64N(cos.KiB) + 1) * cos.KiB
+	case !fixedSize:
+		size = objSize + fileSizeRnd.Uint64N(cos.KiB)
+	default:
+		size = objSize
+	}
+	return size
 }
 
 func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh chan error, silent bool) error {
@@ -77,7 +102,7 @@ func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh 
 		defer wg.Done()
 	}
 	if !silent {
-		tlog.Logf("DEL: %s\n", object)
+		tlog.Logfln("DEL: %s", object)
 	}
 	bp := BaseAPIParams(proxyURL)
 	err := api.DeleteObject(bp, bck, object)
@@ -95,33 +120,40 @@ func CheckObjIsPresent(proxyURL string, bck cmn.Bck, objName string) bool {
 }
 
 // Put sends a PUT request to the given URL
-func Put(proxyURL string, bck cmn.Bck, objName string, reader readers.Reader, errCh chan error) {
-	bp := BaseAPIParams(proxyURL)
-	putArgs := api.PutArgs{
-		BaseParams: bp,
-		Bck:        bck,
-		ObjName:    objName,
-		Cksum:      reader.Cksum(),
-		Reader:     reader,
+func Put(proxyURL string, bck cmn.Bck, objName string, reader readers.Reader, size uint64, numChunks int, errCh chan error) {
+	var err error
+	if numChunks > 0 {
+		err = PutMultipartObject(BaseAPIParams(proxyURL), bck, objName, size, &PutObjectsArgs{Reader: reader, MultipartNumChunks: numChunks})
+	} else {
+		bp := BaseAPIParams(proxyURL)
+		putArgs := api.PutArgs{
+			BaseParams: bp,
+			Bck:        bck,
+			ObjName:    objName,
+			Cksum:      reader.Cksum(),
+			Reader:     reader,
+			Size:       size,
+		}
+		_, err = api.PutObject(&putArgs)
 	}
-	_, err := api.PutObject(&putArgs)
+
 	if err == nil {
 		return
 	}
 	if errCh == nil {
-		tlog.Logf("Failed to PUT %s: %v (nil error channel)\n", bck.Cname(objName), err)
+		tlog.Logfln("Failed to PUT %s: %v (nil error channel)", bck.Cname(objName), err)
 	} else {
 		errCh <- err
 	}
 }
 
 // PutObject sends a PUT request to the given URL.
-func PutObject(t *testing.T, bck cmn.Bck, objName string, reader readers.Reader) {
+func PutObject(t *testing.T, bck cmn.Bck, objName string, reader readers.Reader, size uint64) {
 	var (
 		proxyURL = RandomProxyURL()
 		errCh    = make(chan error, 1)
 	)
-	Put(proxyURL, bck, objName, reader, errCh)
+	Put(proxyURL, bck, objName, reader, size, 0 /*numChunks*/, errCh)
 	tassert.SelectErr(t, errCh, "put", true)
 }
 
@@ -151,7 +183,7 @@ func GetPrimaryURL() string {
 	if err == nil {
 		return primary.URL(cmn.NetPublic)
 	}
-	tlog.Logf("Warning: GetPrimaryProxy [%v] - retrying once...\n", err)
+	tlog.Logfln("Warning: GetPrimaryProxy [%v] - retrying once...", err)
 	if currSmap == nil {
 		time.Sleep(time.Second)
 		primary, err = GetPrimaryProxy(proxyURLReadOnly)
@@ -164,7 +196,7 @@ func GetPrimaryURL() string {
 		}
 	}
 	if err != nil {
-		tlog.Logf("Warning: GetPrimaryProxy [%v] - returning global %q\n", err, proxyURLReadOnly)
+		tlog.Logfln("Warning: GetPrimaryProxy [%v] - returning global %q", err, proxyURLReadOnly)
 		return proxyURLReadOnly
 	}
 	return primary.URL(cmn.NetPublic)
@@ -189,8 +221,9 @@ func GetProxyReadiness(proxyURL string) error {
 
 func CreateBucket(tb testing.TB, proxyURL string, bck cmn.Bck, props *cmn.BpropsToSet, cleanup bool) {
 	bp := BaseAPIParams(proxyURL)
-	err := api.CreateBucket(bp, bck, props)
-	tassert.CheckFatal(tb, err)
+	if err := api.CreateBucket(bp, bck, props); err != nil {
+		tb.Fatalf("%v: %q", err, bck.String())
+	}
 	if cleanup {
 		tb.Cleanup(func() {
 			DestroyBucket(tb, proxyURL, bck)
@@ -208,7 +241,7 @@ func DestroyBucket(tb testing.TB, proxyURL string, bck cmn.Bck) {
 		if err == nil {
 			return
 		}
-		herr := cmn.Err2HTTPErr(err)
+		herr := cmn.AsErrHTTP(err)
 		if herr == nil || herr.Status != http.StatusNotFound {
 			tassert.CheckFatal(tb, err)
 		}
@@ -316,6 +349,150 @@ func EnsureObjectsExist(t *testing.T, params api.BaseParams, bck cmn.Bck, object
 	}
 }
 
+func putMultipartObjectSequential(bp api.BaseParams, bck cmn.Bck, objName, uploadID string, size uint64, args *PutObjectsArgs) error {
+	partNumbers := make([]int, args.MultipartNumChunks)
+
+	for i := range args.MultipartNumChunks {
+		var (
+			partNum    = i + 1
+			offset     = uint64(partNum-1) * size / uint64(args.MultipartNumChunks)
+			nextOffset = uint64(partNum) * size / uint64(args.MultipartNumChunks)
+			partSize   = nextOffset - offset
+		)
+
+		// Read chunk from input reader
+		buf := make([]byte, partSize)
+		n, err := args.Reader.Read(buf)
+		if err != nil && err != io.EOF {
+			if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+				return fmt.Errorf("failed to read part %d and failed to abort %s: read error: %w, abort error: %v", partNum, objName, err, abortErr)
+			}
+			return fmt.Errorf("failed to read part %d of %s: %w", partNum, objName, err)
+		}
+
+		// Create reader for this part
+		partReader := readers.NewBytes(buf[:n])
+
+		putPartArgs := &api.PutPartArgs{
+			PutArgs: api.PutArgs{
+				BaseParams: bp,
+				Bck:        bck,
+				ObjName:    objName,
+				Cksum:      partReader.Cksum(),
+				Reader:     partReader,
+				Size:       uint64(n),
+				SkipVC:     args.SkipVC,
+			},
+			UploadID:   uploadID,
+			PartNumber: partNum,
+		}
+
+		if err := api.UploadPart(putPartArgs); err != nil {
+			if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+				return fmt.Errorf("failed to upload part %d and failed to abort %s: upload err: %w, abort err: %v",
+					partNum, objName, err, abortErr)
+			}
+			return fmt.Errorf("failed to upload part %d of %s: %w", partNum, objName, err)
+		}
+		partNumbers[partNum-1] = partNum
+	}
+
+	if err := api.CompleteMultipartUpload(bp, bck, objName, uploadID, partNumbers); err != nil {
+		if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+			return fmt.Errorf("failed to complete multipart upload and failed to abort %s: complete err: %w, abort err: %v",
+				objName, err, abortErr)
+		}
+		return fmt.Errorf("failed to complete multipart upload for %s: %w", objName, err)
+	}
+	return nil
+}
+
+func uploadPart(bp api.BaseParams, bck cmn.Bck, objName, uploadID string,
+	partNum int, partSize uint64, args *PutObjectsArgs,
+	mu *sync.Mutex, partNumbers []int) error {
+	partReader, err := readers.New(&readers.Arg{
+		Type:      readers.Rand,
+		Size:      int64(partSize),
+		CksumType: args.CksumType,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create reader for part %d of %s: %w", partNum, objName, err)
+	}
+	defer partReader.Close()
+
+	putPartArgs := &api.PutPartArgs{
+		PutArgs: api.PutArgs{
+			BaseParams: bp,
+			Bck:        bck,
+			ObjName:    objName,
+			Cksum:      partReader.Cksum(),
+			Reader:     partReader,
+			Size:       partSize,
+			SkipVC:     args.SkipVC,
+		},
+		UploadID:   uploadID,
+		PartNumber: partNum,
+	}
+
+	if err := api.UploadPart(putPartArgs); err != nil {
+		return fmt.Errorf("failed to upload part %d of %s: %w", partNum, objName, err)
+	}
+
+	mu.Lock()
+	partNumbers[partNum-1] = partNum
+	mu.Unlock()
+
+	return nil
+}
+
+func PutMultipartObject(bp api.BaseParams, bck cmn.Bck, objName string, size uint64, args *PutObjectsArgs) error {
+	uploadID, err := api.CreateMultipartUpload(bp, bck, objName)
+	if err != nil {
+		return fmt.Errorf("failed to create multipart upload for %s: %w", objName, err)
+	}
+
+	// If reader is provided in args, upload parts sequentially
+	if args.Reader != nil {
+		return putMultipartObjectSequential(bp, bck, objName, uploadID, size, args)
+	}
+
+	// Otherwise, upload parts in parallel
+	var (
+		partNumbers = make([]int, args.MultipartNumChunks)
+		mu          = &sync.Mutex{}
+		group       = &errgroup.Group{}
+	)
+
+	for i := range args.MultipartNumChunks {
+		var (
+			partNum    = i + 1
+			offset     = uint64(partNum-1) * size / uint64(args.MultipartNumChunks)
+			nextOffset = uint64(partNum) * size / uint64(args.MultipartNumChunks)
+			partSize   = nextOffset - offset
+		)
+		group.Go(func() error {
+			return uploadPart(bp, bck, objName, uploadID, partNum, partSize, args, mu, partNumbers)
+		})
+	}
+
+	// Wait for all parts to complete
+	if err := group.Wait(); err != nil {
+		if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+			return fmt.Errorf("failed to upload parts and failed to abort upload %s: upload error: %w, abort error: %v", objName, err, abortErr)
+		}
+		return fmt.Errorf("failed to upload parts of %s: %w", objName, err)
+	}
+
+	// Complete multipart upload
+	if err := api.CompleteMultipartUpload(bp, bck, objName, uploadID, partNumbers); err != nil {
+		if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+			return fmt.Errorf("failed to complete multipart upload and failed to abort %s: complete error: %w, abort error: %v", objName, err, abortErr)
+		}
+		return fmt.Errorf("failed to complete multipart upload for %s: %w", objName, err)
+	}
+	return nil
+}
+
 //nolint:gocritic // need a copy of PutObjectsArgs
 func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 	var (
@@ -343,55 +520,80 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 	}
 	chunkSize := (len(objNames) + workerCnt - 1) / workerCnt
 	for i := 0; i < len(objNames); i += chunkSize {
-		group.Go(func(start, end int) func() error {
-			return func() error {
-				rnd := cos.NowRand()
-				for _, objName := range objNames[start:end] {
-					size := args.ObjSize
-
-					// size not specified | size not fixed
-					if size == 0 {
-						size = (rnd.Uint64N(cos.KiB) + 1) * cos.KiB
-					} else if !args.FixedSize {
-						size += rnd.Uint64N(cos.KiB)
-					}
-
-					if args.CksumType == "" {
-						args.CksumType = cos.ChecksumNone
-					}
-
-					reader, err := readers.NewRand(int64(size), args.CksumType)
-					cos.AssertNoErr(err)
-
-					// We could PUT while creating files, but that makes it
-					// begin all the puts immediately (because creating random files is fast
-					// compared to the list objects call that getRandomFiles does)
-					_, err = api.PutObject(&api.PutArgs{
-						BaseParams: bp,
-						Bck:        args.Bck,
-						ObjName:    objName,
-						Cksum:      reader.Cksum(),
-						Reader:     reader,
-						Size:       size,
-						SkipVC:     true,
-					})
-					putCnt.Inc()
-					if err != nil {
-						if args.IgnoreErr {
-							errCnt.Inc()
-							return nil
-						}
-						return err
-					}
-				}
-				return nil
-			}
-		}(i, min(i+chunkSize, len(objNames))))
+		end := min(i+chunkSize, len(objNames))
+		group.Go(func() error {
+			return putObjectBatch(bp, objNames, i, end, &args, putCnt, errCnt)
+		})
 	}
 
 	err := group.Wait()
 	cos.Assert(err != nil || len(objNames) == int(putCnt.Load()))
 	return objNames, int(errCnt.Load()), err
+}
+
+func putSingleObject(bp api.BaseParams, objName string, size uint64, args *PutObjectsArgs,
+	putCnt, errCnt *atomic.Int32) error {
+	reader, err := readers.New(&readers.Arg{
+		Type:      readers.Rand,
+		Size:      int64(size),
+		CksumType: args.CksumType,
+	})
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	// We could PUT while creating files, but that makes it
+	// begin all the puts immediately (because creating random files is fast
+	// compared to the list objects call that getRandomFiles does)
+	_, err = api.PutObject(&api.PutArgs{
+		BaseParams: bp,
+		Bck:        args.Bck,
+		ObjName:    objName,
+		Cksum:      reader.Cksum(),
+		Reader:     reader,
+		Size:       size,
+		SkipVC:     args.SkipVC,
+	})
+
+	putCnt.Inc()
+	if err != nil {
+		if args.IgnoreErr {
+			errCnt.Inc()
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func putObjectBatch(bp api.BaseParams, objNames []string, start, end int,
+	args *PutObjectsArgs, putCnt, errCnt *atomic.Int32) error {
+	for _, objName := range objNames[start:end] {
+		size := GetRandSize(args.ObjSizeRange, args.ObjSize, args.FixedSize)
+
+		if args.CksumType == "" {
+			args.CksumType = cos.ChecksumNone
+		}
+
+		var err error
+		if args.MultipartNumChunks > 0 {
+			err = PutMultipartObject(bp, args.Bck, objName, size, args)
+			putCnt.Inc()
+			if err != nil {
+				if args.IgnoreErr {
+					errCnt.Inc()
+					continue
+				}
+				return err
+			}
+		} else {
+			if err := putSingleObject(bp, objName, size, args, putCnt, errCnt); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Put an object into a cloud bucket and evict it afterwards - can be used to test cold GET
@@ -430,7 +632,7 @@ func GetObjectAtime(t *testing.T, bp api.BaseParams, bck cmn.Bck, object, timeFo
 // WaitForDsortToFinish waits until all dSorts jobs finished without failure or
 // all jobs abort.
 func WaitForDsortToFinish(proxyURL, managerUUID string) (allAborted bool, err error) {
-	tlog.Logf("waiting for dsort[%s]\n", managerUUID)
+	tlog.Logfln("waiting for dsort[%s]", managerUUID)
 
 	bp := BaseAPIParams(proxyURL)
 	deadline := time.Now().Add(DsortFinishTimeout)
@@ -472,9 +674,10 @@ func BaseAPIParams(urls ...string) api.BaseParams {
 	return api.BaseParams{Client: gctx.Client, URL: u, Token: LoggedUserToken, UA: "tools/test"}
 }
 
-func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, lst []string) {
+func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, prefix string) {
 	bp := BaseAPIParams(proxyURL)
-	msg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: lst}}
+	msg := &apc.EvdMsg{ListRange: apc.ListRange{Template: prefix}}
+	tlog.Logfln("evicting %s", bck.Cname(prefix))
 	xid, err := api.EvictMultiObj(bp, bck, msg)
 	if err != nil {
 		t.Errorf("Evict bucket %s failed: %v", bck.String(), err)
@@ -503,7 +706,7 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 	if nat := smap.CountActiveTs(); nat < 1 {
 		// NOTE in re nat == 1: single remaining target vs. graceful shutdown and such
 		s := "No targets"
-		tlog.Logf("%s, %s - cannot rebalance\n", s, smap)
+		tlog.Logfln("%s, %s - cannot rebalance", s, smap)
 		_waitResil(t, bp, controlPlaneSleep)
 		return
 	}
@@ -513,7 +716,7 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 	if len(timeouts) > 0 {
 		timeout = timeouts[0]
 	}
-	tlog.Logf("Waiting for rebalance and resilver to complete (timeout %v)\n", timeout)
+	tlog.Logfln("Waiting for rebalance and resilver to complete (timeout %v)", timeout)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -578,7 +781,7 @@ func WaitForRebalanceByID(t *testing.T, bp api.BaseParams, rebID string, timeout
 	if len(timeouts) > 0 {
 		timeout = timeouts[0]
 	}
-	tlog.Logf("Wait for rebalance %s\n", rebID)
+	tlog.Logfln("Wait for rebalance %s", rebID)
 	xargs := xact.ArgsMsg{ID: rebID, Kind: apc.ActRebalance, OnlyRunning: true, Timeout: timeout}
 	_, err := api.WaitForXactionIC(bp, &xargs)
 	tassert.CheckFatal(t, err)
@@ -595,14 +798,14 @@ func _waitReToStart(bp api.BaseParams) {
 			args := xact.ArgsMsg{Timeout: xactPollSleep, OnlyRunning: true, Kind: kind}
 			status, err := api.GetOneXactionStatus(bp, &args)
 			if err == nil {
-				if !status.Finished() {
+				if !status.IsFinished() {
 					return
 				}
 			}
 		}
 		time.Sleep(xactPollSleep)
 	}
-	tlog.Logf("Warning: timed out (%v) waiting for rebalance or resilver to start\n", timeout)
+	tlog.Logfln("Warning: timed out (%v) waiting for rebalance or resilver to start", timeout)
 }
 
 func GetClusterStats(t *testing.T, proxyURL string) stats.Cluster {
@@ -686,7 +889,7 @@ func SetRemAisConfig(t *testing.T, nvs cos.StrKVs) {
 
 func CheckErrIsNotFound(t *testing.T, err error) {
 	if err == nil {
-		t.Fatalf("expected error")
+		t.Fatal("expected error")
 		return
 	}
 	herr, ok := err.(*cmn.ErrHTTP)
@@ -707,7 +910,7 @@ func waitForStartup(bp api.BaseParams, ts ...testing.TB) (*meta.Smap, error) {
 				continue
 			}
 
-			tlog.Logf("Unable to get usable cluster map: %v\n", err)
+			tlog.Logfln("Unable to get usable cluster map: %v", err)
 			if len(ts) > 0 {
 				tassert.CheckFatal(ts[0], err)
 			}

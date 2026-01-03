@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -58,5 +58,5 @@ func IsIOError(err error) bool {
 }
 
 func IsErrXattrNotFound(err error) bool {
-	return os.IsNotExist(err) || errors.Is(err, syscall.ENODATA)
+	return errors.Is(err, syscall.ENODATA)
 }

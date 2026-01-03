@@ -21,14 +21,6 @@ import (
 	"github.com/NVIDIA/aistore/transport/bundle"
 )
 
-// sentinel values
-const (
-	opDone = iota + 27182
-	opAbort
-	opRequest
-	opResponse
-)
-
 const apairDeleted int64 = -1
 
 type (
@@ -69,15 +61,15 @@ func (s *sentinel) cleanup() {
 
 func (s *sentinel) bcast(uuid string, dm *bundle.DM, abortErr error) {
 	o := transport.AllocSend()
-	o.Hdr.Opcode = opDone
+	o.Hdr.Opcode = transport.OpcDone
 	if uuid != "" {
 		o.Hdr.Opaque = cos.UnsafeB(uuid)
 	}
 	if abortErr != nil {
-		if _, ok := abortErr.(*recvAbortErr); ok {
+		if isErrRecvAbort(abortErr) {
 			return // do nothing
 		}
-		o.Hdr.Opcode = opAbort
+		o.Hdr.Opcode = transport.OpcAbort
 		o.Hdr.ObjName = abortErr.Error() // (compare w/ sendTerm)
 	}
 
@@ -89,7 +81,7 @@ func (s *sentinel) bcast(uuid string, dm *bundle.DM, abortErr error) {
 	case err != nil:
 		nlog.WarningDepth(1, s.r.Name(), err)
 	default:
-		if cmn.Rom.FastV(4, cos.SmoduleXs) {
+		if cmn.Rom.V(4, cos.ModXs) {
 			nlog.Infoln(s.r.Name(), "done")
 		}
 	}
@@ -141,7 +133,7 @@ func (s *sentinel) qcb(dm *bundle.DM, tot, ival, progressTimeout time.Duration, 
 
 	// 4. request progress
 	o := transport.AllocSend()
-	o.Hdr.Opcode = opRequest
+	o.Hdr.Opcode = transport.OpcRequest
 
 	if err := dm.Bcast(o, nil); err != nil {
 		// (is it too harsh?)
@@ -184,7 +176,7 @@ func (s *sentinel) pending() {
 //
 
 func (s *sentinel) rxDone(hdr *transport.ObjHdr) {
-	if s.r.IsAborted() || s.r.Finished() {
+	if s.r.IsAborted() || s.r.IsDone() {
 		return
 	}
 	apair := s.pend.m[hdr.SID]
@@ -196,22 +188,19 @@ func (s *sentinel) rxDone(hdr *transport.ObjHdr) {
 		s.pend.n.Dec()
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleXs) {
+	if cmn.Rom.V(4, cos.ModXs) {
 		nlog.InfoDepth(1, s.r.Name(), "recv 'done' from:", meta.Tname(hdr.SID), s.pend.n.Load())
 	}
 }
 
 func (s *sentinel) rxAbort(hdr *transport.ObjHdr) {
 	r := s.r
-	if r.IsAborted() || r.Finished() {
+	if r.IsAborted() || r.IsDone() {
 		return
 	}
-	msg := hdr.ObjName
-	err := &recvAbortErr{
-		err: fmt.Errorf("%s: %s aborted, err: %s", r.Name(), meta.Tname(hdr.SID), msg),
-	}
+	err := newErrRecvAbort(r, hdr)
 	r.Abort(err)
-	nlog.WarningDepth(1, "recv 'abort':", err)
+	nlog.WarningDepth(1, err)
 }
 
 func (s *sentinel) rxProgress(hdr *transport.ObjHdr) {
@@ -229,7 +218,7 @@ func (s *sentinel) rxProgress(hdr *transport.ObjHdr) {
 		apair.last.Store(mono.NanoTime())
 	}
 
-	if cmn.Rom.FastV(5, cos.SmoduleXs) {
+	if cmn.Rom.V(5, cos.ModXs) {
 		nlog.InfoDepth(1, s.r.Name(), "recv 'progress'", numvis, "from:", meta.Tname(hdr.SID), "pending:", s.pend.n.Load())
 	}
 }

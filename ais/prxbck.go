@@ -55,16 +55,14 @@ type bctx struct {
 ////////////////
 
 var (
-	ibargsPool sync.Pool
-	ib0        bctx
+	ibargsPool = sync.Pool{
+		New: func() any { return new(bctx) },
+	}
+	ib0 bctx
 )
 
-func allocBctx() (a *bctx) {
-	if v := ibargsPool.Get(); v != nil {
-		a = v.(*bctx)
-		return
-	}
-	return &bctx{}
+func allocBctx() *bctx {
+	return ibargsPool.Get().(*bctx)
 }
 
 func freeBctx(a *bctx) {
@@ -178,7 +176,7 @@ rerr:
 
 // (compare w/ accessSupported)
 func (bctx *bctx) accessAllowed(bck *meta.Bck) (ecode int, err error) {
-	err = bctx.p.access(bctx.r.Header, bck, bctx.perms)
+	err = bctx.p.access(bctx.r.Context(), bctx.r.Header, bck, bctx.perms)
 	ecode = aceErrToCode(err)
 	return ecode, err
 }
@@ -288,7 +286,7 @@ func (bctx *bctx) _try() (*meta.Bck, int, error) {
 		bck = backend // NOTE: from here on backend
 	}
 	if bck.IsAIS() {
-		if err := p.access(bctx.r.Header, nil /*bck*/, apc.AceCreateBucket); err != nil {
+		if err := p.access(bctx.r.Context(), bctx.r.Header, nil /*bck*/, apc.AceCreateBucket); err != nil {
 			return bck, aceErrToCode(err), err
 		}
 		nlog.Warningf("%s: %q doesn't exist, proceeding to create", p, bctx.bck.String())
@@ -300,7 +298,7 @@ func (bctx *bctx) _try() (*meta.Bck, int, error) {
 	remoteHdr, ecode, err := bctx.lookup(bck)
 	if err == nil && ecode != http.StatusOK && bck.IsCloud() {
 		debug.Assert(ecode == http.StatusNotFound, ecode)
-		e := cmn.NewErrRemoteBckNotFound(bck.Bucket())
+		e := cmn.NewErrRemBckNotFound(bck.Bucket())
 		e.Set(" (cannot create cloud bucket on the fly)")
 		err = e
 	}
@@ -332,7 +330,8 @@ func (bctx *bctx) _try() (*meta.Bck, int, error) {
 	if bctx.dontAddRemote {
 		var err error
 		if bck.IsRemoteAIS() {
-			bck.Props, err = remoteBckProps(bckPropsArgs{bck: bck, hdr: remoteHdr})
+			bargs := bckPropsArgs{bck: bck, hdr: remoteHdr}
+			bck.Props, err = bargs.makeRemote()
 		} else {
 			// Background (#18995):
 			//
@@ -345,7 +344,8 @@ func (bctx *bctx) _try() (*meta.Bck, int, error) {
 			// The returned bucket props will have its BID == 0 (zero), which also means:
 			// this bucket is not initialized and/or not present in BMD.
 
-			bck.Props = defaultBckProps(bckPropsArgs{bck: bck, hdr: remoteHdr})
+			bargs := bckPropsArgs{bck: bck, hdr: remoteHdr}
+			bck.Props = bargs.inheritMerge()
 		}
 		return bck, 0, err
 	}
@@ -376,7 +376,7 @@ func (bctx *bctx) getOrigURL() (ourl string) {
 		debug.Assert(bctx.dpq == nil)
 		ourl = bctx.query.Get(apc.QparamOrigURL)
 	} else {
-		ourl = bctx.dpq.origURL
+		ourl = bctx.dpq.sys.origURL
 	}
 	return
 }

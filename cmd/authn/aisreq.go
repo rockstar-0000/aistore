@@ -1,4 +1,4 @@
-// Package authn is authentication server for AIStore.
+// Package main contains the independent authentication server for AIStore.
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -6,6 +6,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -26,13 +28,23 @@ const (
 	retry503   = time.Minute
 )
 
-func (m *mgr) validateSecret(clu *authn.CluACL) (err error) {
-	const tag = "validate-secret"
+// Send request to the defined cluster to validate that the cluster will allow tokens issued by this AuthN service
+func (m *mgr) validateCluster(clu *authn.CluACL) (err error) {
 	var (
-		secret   = Conf.Secret()
-		cksumVal = cos.ChecksumB2S(cos.UnsafeB(secret), cos.ChecksumSHA256)
-		body     = cos.MustMarshal(&authn.ServerConf{Secret: cksumVal})
+		tag  string
+		body []byte
 	)
+	switch {
+	case m.cm.HasHMACSecret():
+		tag = "validate-secret"
+		body = cos.MustMarshal(&authn.ServerConf{Secret: m.cm.GetSecretChecksum()})
+	case m.cm.GetPublicKeyString() != nil:
+		tag = "validate-key"
+		body = cos.MustMarshal(&authn.ServerConf{PubKey: m.cm.GetPublicKeyString()})
+	default:
+		return errors.New("invalid cluster configuration, no signing key configured")
+	}
+
 	for _, u := range clu.URLs {
 		if err = m.call(http.MethodPost, u, apc.Tokens, body, tag); err == nil {
 			return
@@ -77,9 +89,9 @@ func (m *mgr) broadcast(method, path string, body []byte, tag string) {
 }
 
 // Send valid and non-expired revoked token list to a cluster.
-func (m *mgr) syncTokenList(clu *authn.CluACL) {
+func (m *mgr) syncTokenList(ctx context.Context, clu *authn.CluACL) {
 	const tag = "sync-tokens"
-	tokenList, code, err := m.generateRevokedTokenList()
+	tokenList, code, err := m.generateRevokedTokenList(ctx)
 	if err != nil {
 		nlog.Errorf("failed to sync token list with %q(%q): %v (%d)", clu.ID, clu.Alias, err, code)
 		return
@@ -106,15 +118,16 @@ func (m *mgr) call(method, proxyURL, path string, injson []byte, tag string) err
 		msg     []byte
 		retries = retryCount
 		sleep   = retrySleep
-		url     = proxyURL + cos.JoinWords(apc.Version, path)
+		url     = proxyURL + cos.JoinW0(apc.Version, path)
 		client  = m.clientH
 	)
 	if cos.IsHTTPS(proxyURL) {
 		client = m.clientTLS
 	}
-	// while cos.IsRetriableConnErr()
+
+	// while cos.IsErrRetriableConn()
 	for i := 1; i <= retries; i++ {
-		req, nerr := http.NewRequest(method, url, bytes.NewBuffer(injson))
+		req, nerr := http.NewRequestWithContext(context.Background(), method, url, bytes.NewBuffer(injson))
 		if nerr != nil {
 			return nerr
 		}
@@ -133,7 +146,7 @@ func (m *mgr) call(method, proxyURL, path string, injson []byte, tag string) err
 				return nil
 			}
 		} else {
-			if cos.IsRetriableConnErr(err) {
+			if cos.IsErrRetriableConn(err) {
 				continue
 			}
 			if resp == nil {

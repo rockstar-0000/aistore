@@ -1,6 +1,6 @@
 // Package main for the `ishard` executable.
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ishard_test
 
@@ -591,7 +591,7 @@ func TestIshardEKM(t *testing.T) {
 	_, err := generateNestedStructure(baseParams, cfg.SrcBck, numRecords, "", extensions, int64(fileSize), false, false)
 	tassert.CheckFatal(t, err)
 
-	fmt.Printf("building and configuring EKM as JSON string")
+	fmt.Println("building and configuring EKM as JSON string")
 	var builder strings.Builder
 	builder.WriteString("{")
 	for i, letter := range "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" {
@@ -809,7 +809,7 @@ func generateNestedStructure(baseParams api.BaseParams, bucket cmn.Bck, numRecor
 			randomizeQueue = randomizeQueue[1:]
 			size := rand.Int64N(fileSize)
 			totalSize += size
-			r, _ := readers.NewRand(size, cos.ChecksumNone)
+			r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: size, CksumType: cos.ChecksumNone})
 			if _, err := api.PutObject(&api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        bucket,
@@ -844,7 +844,7 @@ func generateNestedStructure(baseParams api.BaseParams, bucket cmn.Bck, numRecor
 			objectName := filepath.Join(basePath, baseName+ext)
 			size := rand.Int64N(fileSize)
 			totalSize += size
-			r, _ := readers.NewRand(size, cos.ChecksumNone)
+			r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: size, CksumType: cos.ChecksumNone})
 			if _, err := api.PutObject(&api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        bucket,
@@ -861,7 +861,7 @@ func generateNestedStructure(baseParams api.BaseParams, bucket cmn.Bck, numRecor
 	for _, objectName := range randomizeQueue {
 		size := rand.Int64N(fileSize)
 		totalSize += size
-		r, _ := readers.NewRand(size, cos.ChecksumNone)
+		r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: size, CksumType: cos.ChecksumNone})
 		if _, err := api.PutObject(&api.PutArgs{
 			BaseParams: baseParams,
 			Bck:        bucket,
@@ -903,7 +903,7 @@ func checkOutputShards(t *testing.T, baseParams api.BaseParams, bucket cmn.Bck, 
 	if !dropout {
 		tassert.Fatalf(t, totalFileNum == expectedNumFiles, "The total number of files in output shards (%d) doesn't match to the initially generated amount (%d)", totalFileNum, expectedNumFiles)
 	}
-	fmt.Printf("finished ishard, archived %d files with total size %s\n", expectedNumFiles, cos.ToSizeIEC(totalSize, 2))
+	fmt.Printf("finished ishard, archived %d files with total size %s\n", expectedNumFiles, cos.IEC(totalSize, 2))
 }
 
 func getShardContents(baseParams api.BaseParams, bucket cmn.Bck) (map[string][]string, error) {

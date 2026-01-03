@@ -224,9 +224,11 @@ func WaitForXactionIdle(bp BaseParams, args *xact.ArgsMsg) (err error) {
 	return err
 }
 
-// WaitForXactionIC waits for a given xaction to complete.
-// Use it only for global xactions
-// (those that execute on all targets and report their status to IC, e.g. rebalance).
+// WaitForXactionIC:
+// - applies xact.ArgsMsg to query xactions, then
+// - waits for those selected xactions to complete.
+// Use it only for global xactions that execute on all targets and report status back to IC
+// (e.g. rebalance).
 func WaitForXactionIC(bp BaseParams, args *xact.ArgsMsg) (status *nl.Status, err error) {
 	return _waitx(bp, args, nil)
 }
@@ -267,7 +269,7 @@ func _waitx(bp BaseParams, args *xact.ArgsMsg, fn func(xact.MultiSnap) (bool, bo
 		var done bool
 		if fn == nil {
 			status, err = GetOneXactionStatus(bp, args)
-			done = err == nil && status.Finished() && elapsed >= xact.MinPollTime
+			done = err == nil && status.IsFinished() && elapsed >= xact.MinPollTime
 		} else {
 			var (
 				snaps          xact.MultiSnap
@@ -281,7 +283,7 @@ func _waitx(bp BaseParams, args *xact.ArgsMsg, fn func(xact.MultiSnap) (bool, bo
 				}
 			}
 		}
-		canRetry := err == nil || cos.IsRetriableConnErr(err) || cmn.IsStatusServiceUnavailable(err)
+		canRetry := err == nil || cos.IsErrRetriableConn(err) || cmn.IsStatusServiceUnavailable(err)
 		if done || !canRetry /*fail*/ {
 			return status, err
 		}

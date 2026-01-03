@@ -1,0 +1,9 @@
+---
+- name: Copy auth.token to /tmp directory if it exists
+  hosts: aisloader_hosts
+  tasks:
+    - name: Copy auth token
+      copy:
+        src: "files/auth.token"
+        dest: "/tmp/auth.token"
+        mode: 0644

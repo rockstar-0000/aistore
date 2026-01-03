@@ -6,55 +6,66 @@ package apc
 
 import "github.com/NVIDIA/aistore/cmn/cos"
 
-// RESTful URL path: l1/l2/l3
+// -------------------------------------------------------------
+// RESTful URL path: levels l1/l2/l3
+// -------------------------------------------------------------
+
+// API version (l1)
+const Version = "v1"
+
+// API endpoints (l2)
 const (
-	// l1
-	Version = "v1"
-	// l2
-	Buckets   = "buckets"
-	Objects   = "objects"
-	EC        = "ec"
-	Download  = "download"
-	Daemon    = "daemon"
-	Cluster   = "cluster"
-	Tokens    = "tokens"
-	Metasync  = "metasync"
-	Health    = "health"
-	Vote      = "vote"
-	ObjStream = "objstream"
-	MsgStream = "msgstream"
-	Reverse   = "reverse"
-	Xactions  = "xactions"
-	S3        = "s3"
-	Txn       = "txn"      // 2PC
-	Notifs    = "notifs"   // intra-cluster notifications
-	Users     = "users"    // AuthN
-	Clusters  = "clusters" // AuthN
-	Roles     = "roles"    // AuthN
-	IC        = "ic"       // information center
+	Buckets  = "buckets"
+	Objects  = "objects"
+	EC       = "ec"
+	Daemon   = "daemon"
+	Metasync = "metasync"
+	Health   = "health"
+	Vote     = "vote"
+	S3       = "s3"
+	ML       = "ml"
 
-	// l3 ---
+	// extensions
+	Download = "download" // downloader
+	Sort     = "sort"     // dsort
+	ETL      = "etl"
 
+	// proxy only
+	Cluster = "cluster" // primary
+	Tokens  = "tokens"  // auth & access
+	Reverse = "reverse" // as in: reverse proxy
+	IC      = "ic"      // information center
+	Notifs  = "notifs"  // intra-cluster notifications
+
+	// target only
+	ObjStream = "objstream" // transport streams
+	Xactions  = "xactions"  // jobs
+	Txn       = "txn"       // 2PC transactions
+)
+
+// AuthN server endpoints (l2)
+const (
+	Users      = "users"
+	Clusters   = "clusters"
+	Roles      = "roles"
+	OIDCPrefix = ".well-known"
+	OIDCConfig = "openid-configuration"
+	JWKS       = "jwks.json"
+)
+
+// l3 ---
+const (
 	Voteres  = "result"
 	VoteInit = "init"
 	PriStop  = "primary-stopping"
 
 	// (see the corresponding action messages above)
 	Keepalive = "keepalive"
-	AdminJoin = "join-by-admin" // when node is joined by admin ("manual join")
-	SelfJoin  = "autoreg"       // auto-join cluster at startup
+	AdminJoin = "join-by-admin" // when node is added by admin
+	SelfJoin  = "autoreg"       // self-joining cluster at node startup
 
 	// target
 	Mountpaths = "mountpaths"
-
-	// common
-	Init     = "init"
-	Start    = "start"
-	Stop     = "stop"
-	Abort    = "abort"
-	Sort     = "sort"
-	Finished = "finished"
-	Progress = "progress"
 
 	// Prometheus metrics
 	Metrics = "metrics"
@@ -65,29 +76,50 @@ const (
 	FinishedAck = "finished_ack"
 	UList       = "list"
 	Remove      = "remove"
-	Next        = "next"
-	Peek        = "peek"
-	Discard     = "discard"
-	WorkerOwner = "worker" // TODO: it should be removed once get-next-bytes endpoint is ready
 
 	LoadX509 = "load-x509"
 
 	// ETL
-	ETL        = "etl"
-	ETLInfo    = "info"
-	ETLList    = UList
 	ETLLogs    = "logs"
 	ETLObject  = "_object"
-	ETLStop    = Stop
-	ETLStart   = Start
 	ETLHealth  = "health"
 	ETLMetrics = "metrics"
+
+	// ETL webserver
+	ETLDownload = "download"
+
+	// ETL proxy only
+	ETLStart = Start
+	ETLStop  = Stop
+
+	// ETL target only
+	ETLDetails = "details"
+
+	// ML
+	Moss = "moss"
 )
 
-// RESTful l3, internal use
+// common
 const (
-	SyncSmap = "syncsmap"
+	Init  = "init"
+	Start = "start"
+	Stop  = "stop"
+	Abort = "abort"
+
+	Finished = "finished"
+	Progress = "progress"
 )
+
+// 2PC
+const (
+	Begin2PC  = "begin"
+	Commit2PC = "commit"
+	Abort2PC  = Abort
+
+	Query2PC = "query"
+)
+
+const SyncSmap = "syncsmap" // obsolete (keeping it)
 
 type URLPath struct {
 	S string
@@ -95,7 +127,7 @@ type URLPath struct {
 }
 
 func urlpath(words ...string) URLPath {
-	return URLPath{L: words, S: cos.JoinWords(words[0], words[1:]...)}
+	return URLPath{L: words, S: cos.JoinW0(words[0], words[1:]...)}
 }
 
 var (
@@ -168,8 +200,12 @@ var (
 	URLPathUsers    = urlpath(Version, Users)
 	URLPathClusters = urlpath(Version, Clusters)
 	URLPathRoles    = urlpath(Version, Roles)
+	URLPathOIDC     = urlpath(OIDCPrefix, OIDCConfig)
+	URLPathJWKS     = urlpath(OIDCPrefix, JWKS)
+
+	URLPathML = urlpath(Version, ML)
 )
 
 func (u URLPath) Join(words ...string) string {
-	return cos.JoinWords(u.S, words...)
+	return cos.JoinWP(u.S, words...)
 }

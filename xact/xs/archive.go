@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ import (
 )
 
 // TODO:
+// - fix test_archive_objects_without_copy (see comment in the source)
 // - multi-worker list-range iter (see lrit.init)
 // - one source multiple destination buckets (feature)
 
@@ -54,6 +56,7 @@ type (
 		cksum     cos.CksumHashSize
 		appendPos int64 // append to existing (tar only)
 		tarFormat tar.Format
+		lrp       int
 		cnt       atomic.Int32 // num archived
 		refc      atomic.Int32 // finishing
 	}
@@ -129,8 +132,7 @@ func (p *archFactory) Start() (err error) {
 	r.smap = core.T.Sowner().Get()
 	p.xctn = r
 
-	// delay ctlmsg until DoMsg()
-	r.DemandBase.Init(p.UUID(), p.kind, "" /*ctlmsg*/, p.Bck /*from*/, xact.IdleDefault)
+	r.DemandBase.Init(p.UUID(), p.kind, p.Bck /*from*/, xact.IdleDefault)
 
 	dmxtra := bundle.Extra{
 		RecvAck:     nil, // no ACKs
@@ -152,14 +154,14 @@ func (p *archFactory) Start() (err error) {
 //////////////
 
 func (r *XactArch) BeginMsg(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err error) {
-	if err := archlom.InitBck(&msg.ToBck); err != nil {
-		r.AddErr(err, 4, cos.SmoduleXs)
+	if err := archlom.InitCmnBck(&msg.ToBck); err != nil {
+		r.AddErr(err, 4, cos.ModXs)
 		return err
 	}
 	debug.Assert(archlom.Cname() == msg.Cname()) // relying on it
 
 	wi := &archwi{r: r, msg: msg, archlom: archlom, tarFormat: tar.FormatUnknown}
-	wi.fqn = fs.CSM.Gen(wi.archlom, fs.WorkfileType, fs.WorkfileCreateArch)
+	wi.fqn = wi.archlom.GenFQN(fs.WorkCT, fs.WorkfileCreateArch)
 	wi.cksum.Init(archlom.CksumType())
 
 	// here and elsewhere: an extra check to make sure this target is active (ref: ignoreMaintenance)
@@ -171,7 +173,7 @@ func (r *XactArch) BeginMsg(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err erro
 
 	wi.tsi, err = r.smap.HrwName2T(msg.ToBck.MakeUname(msg.ArchName))
 	if err != nil {
-		r.AddErr(err, 4, cos.SmoduleXs)
+		r.AddErr(err, 4, cos.ModXs)
 		return err
 	}
 
@@ -208,22 +210,19 @@ func (r *XactArch) BeginMsg(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err erro
 			s    string
 			lmfh cos.LomReader
 		)
-		if !wi.msg.AppendIfExists {
+		switch {
+		case !wi.msg.AppendIfExists:
 			wi.wfh, err = wi.archlom.CreateWork(wi.fqn)
-		} else if errX := wi.archlom.Load(false, false); errX == nil {
-			if !wi.archlom.IsChunked() {
-				s = " append"
-				lmfh, err = wi.beginAppend()
-			} else {
-				wi.wfh, err = wi.archlom.CreateWork(wi.fqn)
-			}
-		} else {
+		case wi.archlom.Load(false, false) == nil:
+			s = " append"
+			lmfh, err = wi.beginAppend()
+		default:
 			wi.wfh, err = wi.archlom.CreateWork(wi.fqn)
 		}
 		if err != nil {
 			return err
 		}
-		if cmn.Rom.FastV(5, cos.SmoduleXs) {
+		if cmn.Rom.V(5, cos.ModXs) {
 			nlog.Infof("%s: begin%s %s", r.Base.Name(), s, msg.Cname())
 		}
 
@@ -234,6 +233,8 @@ func (r *XactArch) BeginMsg(msg *cmn.ArchiveBckMsg, archlom *core.LOM) (err erro
 		// append case (above)
 		if lmfh != nil {
 			err = wi.writer.Copy(lmfh, wi.archlom.Lsize())
+			cos.Close(lmfh)
+			wi.archlom.Unlock(false)
 			if err != nil {
 				wi.writer.Fini()
 				wi.cleanup()
@@ -287,30 +288,6 @@ func (r *XactArch) DoMsg(msg *cmn.ArchiveBckMsg) {
 		return
 	}
 
-	// dynamic ctlmsg // TODO: ref
-	{
-		var sb strings.Builder
-		sb.Grow(80)
-		sb.WriteString(r.Bck().Cname(""))
-		if r.bckTo != nil && !r.bckTo.IsEmpty() {
-			sb.WriteString("=>")
-			sb.WriteString(r.bckTo.Cname(""))
-		}
-		sb.WriteByte(' ')
-		msg.ListRange.Str(&sb, lrit.lrp == lrpPrefix)
-		if msg.BaseNameOnly {
-			sb.WriteString(", basename-only")
-		}
-		if msg.InclSrcBname {
-			sb.WriteString(", incl-src-basename")
-		}
-		if msg.AppendIfExists {
-			sb.WriteString(", append-iff")
-		}
-
-		r.Base.SetCtlMsg(sb.String())
-	}
-
 	if r.IsAborted() {
 		return
 	}
@@ -325,6 +302,45 @@ func (r *XactArch) DoMsg(msg *cmn.ArchiveBckMsg) {
 		r.Abort(r.Err())
 		r.cleanup()
 	}
+}
+
+func (r *XactArch) CtlMsg() string {
+	var sb strings.Builder
+	n := r.wiCnt.Load()
+	if n == 0 {
+		sb.Grow(64)
+	} else {
+		sb.Grow(64 + 80*int(n))
+	}
+	sb.WriteString(r.Bck().Cname(""))
+	if r.bckTo != nil {
+		sb.WriteString("=>")
+		sb.WriteString(r.bckTo.Cname(""))
+	}
+	if n == 0 {
+		return sb.String()
+	}
+
+	// append work items
+	r.pending.mtx.Lock()
+	wis := make([]*archwi, 0, len(r.pending.m))
+	for _, wi := range r.pending.m {
+		wis = append(wis, wi)
+	}
+	r.pending.mtx.Unlock()
+
+	sb.WriteString(" [")
+	first := true
+	for _, wi := range wis {
+		if !first {
+			sb.WriteString("; ")
+		}
+		wi.append(&sb)
+		first = false
+	}
+	sb.WriteByte(']')
+
+	return sb.String()
 }
 
 func (r *XactArch) Run(wg *sync.WaitGroup) {
@@ -366,13 +382,14 @@ func (r *XactArch) doSend(lom *core.LOM, wi *archwi, fh cos.ReadOpenCloser) {
 		hdr.ObjAttrs.CopyFrom(lom.ObjAttrs(), false /*skip cksum*/)
 		hdr.Opaque = []byte(wi.msg.TxnUUID)
 	}
-	// o.Callback nil on purpose (lom is freed by the iterator)
+	// o.SentCB nil on purpose (lom is freed by the iterator)
 	r.p.dm.Send(o, fh, wi.tsi)
 }
 
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (r *XactArch) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
-	if err != nil && !cos.IsEOF(err) {
-		r.AddErr(err, 5, cos.SmoduleXs)
+	if err != nil && !cos.IsOkEOF(err) {
+		r.AddErr(err, 5, cos.ModXs)
 		return err
 	}
 
@@ -388,7 +405,7 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 	wi, ok := r.pending.m[cos.UnsafeS(hdr.Opaque)] // txnUUID
 	r.pending.mtx.Unlock()
 	if !ok {
-		if r.Finished() || r.IsAborted() {
+		if r.IsDone() || r.IsAborted() {
 			return nil
 		}
 		cnt, err := r.JoinErr()
@@ -401,7 +418,7 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 	debug.Assert(wi.tsi.ID() == core.T.SID() && wi.msg.TxnUUID == cos.UnsafeS(hdr.Opaque))
 
 	// NOTE: best-effort via ref-counting
-	if hdr.Opcode == opDone {
+	if hdr.Opcode == transport.OpcDone {
 		refc := wi.refc.Dec()
 		debug.Assert(refc >= 0)
 		return nil
@@ -412,7 +429,7 @@ func (r *XactArch) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 	if err == nil {
 		wi.cnt.Inc()
 	} else {
-		r.AddErr(err, 5, cos.SmoduleXs)
+		r.AddErr(err, 5, cos.ModXs)
 	}
 	return nil
 }
@@ -422,7 +439,7 @@ func (r *XactArch) finalize(wi *archwi) {
 	q := wi.quiesce()
 	if q == core.QuiTimeout {
 		err := fmt.Errorf("%s: %v", r, cmn.ErrQuiesceTimeout)
-		r.AddErr(err, 4, cos.SmoduleXs)
+		r.AddErr(err, 4, cos.ModXs)
 	}
 
 	r.pending.mtx.Lock()
@@ -432,7 +449,7 @@ func (r *XactArch) finalize(wi *archwi) {
 
 	ecode, err := r._fini(wi)
 	r.DecPending()
-	if cmn.Rom.FastV(5, cos.SmoduleXs) {
+	if cmn.Rom.V(5, cos.ModXs) {
 		var s string
 		if err != nil {
 			s = fmt.Sprintf(": %v(%d)", err, ecode)
@@ -445,16 +462,16 @@ func (r *XactArch) finalize(wi *archwi) {
 	debug.Assert(q != core.QuiAborted)
 
 	wi.cleanup()
-	r.AddErr(err, 5, cos.SmoduleXs)
+	r.AddErr(err, 5, cos.ModXs)
 }
 
 func (r *XactArch) _fini(wi *archwi) (ecode int, err error) {
-	wi.writer.Fini()
+	err = wi.writer.Fini()
 
-	if r.IsAborted() {
+	if r.IsAborted() || err != nil {
 		wi.cleanup()
 		core.FreeLOM(wi.archlom)
-		return 0, nil
+		return 0, err
 	}
 
 	var size int64
@@ -519,12 +536,10 @@ func (r *XactArch) chanFullTotal() (n int64) {
 }
 
 func (r *XactArch) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
+	snap = r.Base.NewSnap(r)
 
 	snap.Pack(len(r.joggers.m), 0 /*currently, always zero*/, r.chanFullTotal())
 
-	snap.IdleX = r.IsIdle()
 	if f, t := r.FromTo(); f != nil {
 		snap.SrcBck, snap.DstBck = f.Clone(), t.Clone()
 	}
@@ -558,6 +573,7 @@ func (j *jogger) do(archtask *archtask) {
 		lrit, wi = archtask.lrit, archtask.wi
 	)
 	debug.Assert(r == wi.r)
+	wi.lrp = lrit.lrp
 	if err := lrit.run(wi, j.r.smap, false /*prealloc buf*/); err != nil {
 		wi.r.AddErr(err)
 	}
@@ -582,9 +598,14 @@ func (j *jogger) do(archtask *archtask) {
 // archwi //
 ////////////
 
+// returns one of:
+// 1. (TAR opened for append, lmfh nil, and archlom not locked)
+// 2. (lmfh and archlom locked)
+// 3. error
 func (wi *archwi) beginAppend() (lmfh cos.LomReader, err error) {
 	msg := wi.msg
-	if msg.Mime == archive.ExtTar {
+	if msg.Mime == archive.ExtTar && !wi.archlom.IsChunked() {
+		// (special)
 		err = wi.openTarForAppend()
 		if err == nil /*can append*/ || err != archive.ErrTarIsEmpty /*fail XactArch.Begin*/ {
 			return nil, err
@@ -594,17 +615,23 @@ func (wi *archwi) beginAppend() (lmfh cos.LomReader, err error) {
 	// <extra copy>
 	// prep to copy `lmfh` --> `wi.fh` with subsequent APPEND-ing
 	// msg.Mime has been already validated (see ais/* for apc.ActArchive)
+	wi.archlom.Lock(false)
 	lmfh, err = wi.archlom.Open()
 	if err != nil {
+		wi.archlom.Unlock(false)
 		return nil, err
 	}
 	if wi.wfh, err = wi.archlom.CreateWork(wi.fqn); err != nil {
+		wi.archlom.Unlock(false)
 		cos.Close(lmfh)
 		lmfh = nil
 	}
 	return lmfh, err
 }
 
+// [NOTE]
+// - archive.OpenTarForAppend calls os.OpenFile
+// - it therefore requires archlom to be a monolithic file - no chunks
 func (wi *archwi) openTarForAppend() (err error) {
 	if err = wi.archlom.RenameMainTo(wi.fqn); err != nil {
 		return err
@@ -629,14 +656,14 @@ func (wi *archwi) openTarForAppend() (err error) {
 func (wi *archwi) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	var coldGet bool
 	if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
-		if !cos.IsNotExist(err, 0) {
-			wi.r.AddErr(err, 5, cos.SmoduleXs)
+		if !cos.IsNotExist(err) {
+			wi.r.AddErr(err, 5, cos.ModXs)
 			return
 		}
 		if coldGet = lom.Bck().IsRemote(); !coldGet {
 			if lrit.lrp == lrpList {
 				// listed, not found
-				wi.r.AddErr(err, 5, cos.SmoduleXs)
+				wi.r.AddErr(err, 5, cos.ModXs)
 			}
 			return
 		}
@@ -648,33 +675,38 @@ func (wi *archwi) do(lom *core.LOM, lrit *lrit, _ []byte) {
 			if lrit.lrp != lrpList && cos.IsNotExist(err, ecode) {
 				return // range or prefix, not found
 			}
-			wi.r.AddErr(err, 5, cos.SmoduleXs)
+			wi.r.AddErr(err, 5, cos.ModXs)
 			return
 		}
 	}
 
-	fh, err := cos.NewFileHandle(lom.FQN)
+	lom.Lock(false)
+	lh, err := lom.NewHandle(false /*loaded*/)
 	if err != nil {
-		wi.r.AddErr(err, 5, cos.SmoduleXs)
+		lom.Unlock(false)
+		wi.r.AddErr(err, 5, cos.ModXs)
 		return
 	}
 	if core.T.SID() != wi.tsi.ID() {
-		wi.r.doSend(lom, wi, fh)
+		wi.r.doSend(lom, wi, lh)
+		lom.Unlock(false)
 		return
 	}
 	// see Begin
 	if wi.wfh == nil {
+		lom.Unlock(false)
 		// NOTE: unexpected and unlikely - aborting
 		err = fmt.Errorf("%s: destination %q does not exist (not open)", wi.r.Name(), wi.fqn)
 		wi.r.Abort(err)
 		return
 	}
-	err = wi.writer.Write(wi.nameInArch(lom.ObjName), lom, fh /*reader*/)
-	cos.Close(fh)
+	err = wi.writer.Write(wi.nameInArch(lom.ObjName), lom, lh /*reader*/)
+	cos.Close(lh)
+	lom.Unlock(false)
 	if err == nil {
 		wi.cnt.Inc()
 	} else {
-		wi.r.AddErr(err, 5, cos.SmoduleXs)
+		wi.r.AddErr(err, 5, cos.ModXs)
 	}
 }
 
@@ -724,7 +756,7 @@ func (wi *archwi) finalize() (int64, error) {
 	}
 	// tar append
 	if wi.appendPos > 0 {
-		finfo, err := os.Stat(wi.fqn)
+		finfo, err := os.Lstat(wi.fqn)
 		if err != nil {
 			debug.AssertNoErr(err)
 			return 0, err
@@ -736,4 +768,38 @@ func (wi *archwi) finalize() (int64, error) {
 	wi.cksum.Finalize()
 	wi.archlom.SetCksum(&wi.cksum.Cksum)
 	return wi.cksum.Size, nil
+}
+
+func (wi *archwi) append(sb *strings.Builder) {
+	msg := wi.msg
+	msg.ListRange.Str(sb, wi.lrp == lrpPrefix)
+
+	if wi.tsi.ID() != core.T.SID() {
+		sb.WriteString(", target:")
+		sb.WriteString(wi.tsi.ID())
+	}
+	if cnt := wi.cnt.Load(); cnt > 0 {
+		sb.WriteString(", archived:")
+		sb.WriteString(strconv.FormatInt(int64(cnt), 10))
+	}
+
+	sb.WriteString(", flags:")
+	first := true
+	if msg.BaseNameOnly {
+		first = false
+		sb.WriteString("basename-only")
+	}
+	if msg.InclSrcBname {
+		if !first {
+			sb.WriteByte(',')
+		}
+		first = false
+		sb.WriteString("incl-src-bname")
+	}
+	if msg.AppendIfExists {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("append-iff")
+	}
 }

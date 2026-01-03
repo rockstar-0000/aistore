@@ -28,8 +28,15 @@ var (
 )
 
 var (
-	pool sync.Pool // bytes.Buffer mem pool (errors and warnings only)
+	// of `fixed` bufs
+	pool = sync.Pool{
+		New: func() any {
+			return &fixed{buf: make([]byte, extraSize)}
+		},
+	}
+)
 
+var (
 	nlogs [3]*nlog
 
 	logDir  string
@@ -85,8 +92,8 @@ func sname() (name string) {
 }
 
 func _shortHost(hostname string) string {
-	if i := strings.Index(hostname, "."); i >= 0 {
-		return hostname[:i]
+	if before, _, ok := strings.Cut(hostname, "."); ok {
+		return before
 	}
 	if len(hostname) < 16 || strings.IndexByte(hostname, '-') < 0 {
 		return hostname

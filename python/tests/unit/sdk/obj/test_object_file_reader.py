@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 # pylint: disable=protected-access
@@ -10,42 +10,52 @@ from io import IOBase
 from requests.exceptions import ChunkedEncodingError
 from aistore.sdk.obj.obj_file.object_file import ObjectFileReader
 from aistore.sdk.obj.obj_file.errors import ObjectFileReaderMaxResumeError
-from tests.utils import BadContentIterator
+from tests.utils import BadContentIterProvider
 
 
 class TestObjectFileReader(unittest.TestCase):
 
     def setUp(self):
-        self.content_iterator_mock = Mock()
-        self.content_iterator_mock.iter.return_value = iter(
-            [b"chunk1", b"chunk2", b"chunk3"]
+        self.content_provider_mock = Mock()
+        self.mock_generator = Mock()
+        self.mock_generator.__next__ = Mock(
+            side_effect=[b"chunk1", b"chunk2", b"chunk3", StopIteration()]
         )
+        self.mock_generator.close = Mock()
+        self.content_provider_mock.create_iter.return_value = self.mock_generator
         self.object_file = ObjectFileReader(
-            content_iterator=self.content_iterator_mock,
+            content_provider=self.content_provider_mock,
             max_resume=3,
         )
 
     def test_init(self):
         """Test that ObjectFileReader initializes all attributes correctly."""
         # Ensure all attributes are initialized properly
-        self.assertEqual(self.object_file._content_iterator, self.content_iterator_mock)
+        self.assertEqual(self.object_file._content_provider, self.content_provider_mock)
         self.assertEqual(self.object_file._max_resume, 3)
         self.assertEqual(self.object_file._resume_position, 0)
         self.assertEqual(self.object_file._resume_total, 0)
         self.assertIsNone(self.object_file._remainder)
         self.assertFalse(self.object_file._closed)
-
-        # Verify that iter() is called
-        self.content_iterator_mock.iter.assert_called_once_with()
+        self.assertIsNotNone(self.object_file._content_iter)
 
         # Verify ObjectFileReader extends IOBase
         self.assertIsInstance(self.object_file, IOBase)
 
     def test_close(self):
-        """Test that ObjectFileReader closes correctly and raises an error if closed again."""
+        """Test that ObjectFileReader closes correctly."""
+        # Read some data to initialize the generator
+        self.object_file.read(4)
+
+        # Verify file is not closed initially
         self.assertFalse(self.object_file._closed)
+
+        # Close the file
         self.object_file.close()
+
+        # Verify file is closed and stream is closed
         self.assertTrue(self.object_file._closed)
+        self.mock_generator.close.assert_called_once()
 
     def test_readable(self):
         """Test that ObjectFileReader is readable when not closed and unreadable when closed."""
@@ -122,7 +132,7 @@ class TestObjectFileReader(unittest.TestCase):
         self.assertEqual(str(context.exception), "I/O operation on closed file.")
 
     def test_context_manager(self):
-        """Test that ObjectFileReader functions as a context manager and resets state."""
+        """Test that ObjectFileReader can be used with context manager, resets state, and closes stream."""
         # Modify the object's state to simulate previous use
         self.object_file._resume_position = 10
         self.object_file._closed = True
@@ -134,8 +144,12 @@ class TestObjectFileReader(unittest.TestCase):
             self.assertEqual(self.object_file._resume_position, 0)
             self.assertIsNone(self.object_file._remainder)
 
-        # After context, file should be closed
+            # Read some data to initialize the generator
+            obj_file.read(4)
+
+        # After context, file should be closed and stream should be closed
         self.assertTrue(self.object_file._closed)
+        self.mock_generator.close.assert_called_once()
 
 
 class TestObjectFileReaderResume(unittest.TestCase):
@@ -148,13 +162,13 @@ class TestObjectFileReaderResume(unittest.TestCase):
         err_instance = (
             exc if isinstance(exc, BaseException) else exc("Simulated Exception")
         )
-        iterator = BadContentIterator(
+        content_provider = BadContentIterProvider(
             data=self.data,
             fail_on_read=fail_on_read,
             chunk_size=self.chunk_size,
             error=err_instance,
         )
-        return ObjectFileReader(iterator, max_resume=max_resume_attempts)
+        return ObjectFileReader(content_provider, max_resume=max_resume_attempts)
 
     def test_read_raises_any_exception_and_closes(self):
         """
@@ -316,8 +330,10 @@ class TestObjectFileReaderResume(unittest.TestCase):
         )
 
         # Simulate the object not being cached
-        object_file.content_iterator.client.head = Mock(
-            return_value=Mock(present=False)
+        setattr(
+            object_file._content_provider.client,
+            "head",
+            Mock(return_value=Mock(present=False)),
         )
         # Attempt to read should fail after exceeding one max retry
         with patch.object(
@@ -341,7 +357,11 @@ class TestObjectFileReaderResume(unittest.TestCase):
         )
 
         # Simulate the object being cached
-        object_file.content_iterator.client.head = Mock(return_value=Mock(present=True))
+        setattr(
+            object_file._content_provider.client,
+            "head",
+            Mock(return_value=Mock(present=True)),
+        )
         # Attempt to read should fail after exceeding one max retry
         with patch.object(
             object_file, "_reset", wraps=object_file._reset

@@ -1,22 +1,25 @@
-//go:build debug
-
-// Package authn
+// Package main contains the independent authentication server for AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
-// NOTE go:build debug (above) =====================================
-
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
+	"github.com/NVIDIA/aistore/api/env"
+	"github.com/NVIDIA/aistore/cmd/authn/config"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/tools/tassert"
 )
@@ -32,13 +35,6 @@ var (
 		},
 	}
 )
-
-func init() {
-	Conf.Init()
-	if Conf.Server.Expire == 0 {
-		Conf.Server.Expire = cos.Duration(time.Minute * 30) // NOTE: default token expiration time
-	}
-}
 
 func createUsers(mgr *mgr, t *testing.T) {
 	for idx := range users {
@@ -136,10 +132,42 @@ func testUserDelete(mgr *mgr, t *testing.T) {
 	}
 }
 
+func createCM(t *testing.T, conf *authn.Config) *config.ConfManager {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "authn.json")
+	err := jsp.SaveMeta(path, conf, nil)
+	tassert.Fatalf(t, err == nil, "failed to write config: %v", err)
+	cm := config.NewConfManager()
+	cm.Init(path)
+	return cm
+}
+
+// Create a CM with a pre-configured config struct
+func createEmptyCM(t *testing.T) *config.ConfManager {
+	conf := &authn.Config{Server: authn.ServerConf{Secret: "mytestsecret"}}
+	return createCM(t, conf)
+}
+
+func createManagerWithAdmin(cm *config.ConfManager, driver kvdb.Driver) (*mgr, error) {
+	oldPass, wasSet := os.LookupEnv(env.AisAuthAdminPassword)
+	os.Setenv(env.AisAuthAdminPassword, "admin-pass-for-test")
+	// Reset after test
+	defer func() {
+		if wasSet {
+			os.Setenv(env.AisAuthAdminPassword, oldPass)
+		} else {
+			os.Unsetenv(env.AisAuthAdminPassword)
+		}
+	}()
+	m, _, err := newMgr(cm, driver)
+	return m, err
+}
+
 func TestManager(t *testing.T) {
 	driver := mock.NewDBDriver()
+	cm := createEmptyCM(t)
 	// NOTE: new manager initializes users DB and adds a default user as a Guest
-	mgr, _, err := newMgr(driver)
+	mgr, err := createManagerWithAdmin(cm, driver)
 	tassert.CheckError(t, err)
 	createUsers(mgr, t)
 	testInvalidUser(mgr, t)
@@ -147,18 +175,27 @@ func TestManager(t *testing.T) {
 	deleteUsers(mgr, false, t)
 }
 
+func TestManagerNoAdminPass(t *testing.T) {
+	driver := mock.NewDBDriver()
+	cm := createEmptyCM(t)
+	// If no admin password exists in env, initializing manager must fail
+	_, _, err := newMgr(cm, driver)
+	if err == nil {
+		t.Fatal("expected error initializing manager without admin password Env, got nil")
+	}
+}
+
 func TestToken(t *testing.T) {
 	if testing.Short() {
 		t.Skipf("skipping %s in short mode", t.Name())
 	}
 	var (
-		err    error
-		token  string
-		secret = Conf.Secret()
+		err   error
+		token string
 	)
-
 	driver := mock.NewDBDriver()
-	mgr, _, err := newMgr(driver)
+	cm := createEmptyCM(t)
+	mgr, err := createManagerWithAdmin(cm, driver)
 	tassert.CheckFatal(t, err)
 	createUsers(mgr, t)
 	defer deleteUsers(mgr, false, t)
@@ -180,12 +217,14 @@ func TestToken(t *testing.T) {
 	if err != nil || token == "" {
 		t.Errorf("Failed to generate token for %s: %v", users[1], err)
 	}
-	info, err := tok.DecryptToken(token, secret)
+	info, err := mgr.tkParser.ValidateToken(t.Context(), token)
 	if err != nil {
 		t.Fatalf("Failed to decrypt token %v: %v", token, err)
 	}
-	if info.UserID != users[1] {
-		t.Errorf("Invalid user %s returned for token of %s", info.UserID, users[1])
+	sub, err := info.GetSubject()
+	tassert.CheckFatal(t, err)
+	if sub != users[1] {
+		t.Errorf("Invalid subject %s returned for token of %s", sub, users[1])
 	}
 
 	// incorrect user creds
@@ -197,11 +236,8 @@ func TestToken(t *testing.T) {
 
 	// expired token test
 	time.Sleep(shortExpiration)
-	tk, err := tok.DecryptToken(token, secret)
-	tassert.CheckFatal(t, err)
-	if tk.Expires.After(time.Now()) {
-		t.Fatalf("Token must be expired: %s", token)
-	}
+	_, err = mgr.tkParser.ValidateToken(t.Context(), token)
+	tassert.Fatalf(t, errors.Is(err, tok.ErrTokenExpired), "Token must be expired: %s", token)
 }
 
 func TestMergeCluACLS(t *testing.T) {
@@ -330,7 +366,7 @@ func TestMergeCluACLS(t *testing.T) {
 			},
 		},
 		{
-			title: "Update permissions for existing cluster and apend new ones",
+			title: "Update permissions for existing cluster and append new ones",
 			toACLs: []*authn.CluACL{
 				{
 					ID:     "1234",
@@ -549,7 +585,7 @@ func TestMergeBckACLS(t *testing.T) {
 			},
 		},
 		{
-			title: "Update permissions for existing buckets and apend new ones",
+			title: "Update permissions for existing buckets and append new ones",
 			toACLs: []*authn.BckACL{
 				{
 					Bck:    newBck("bck", "ais", "1234"),
@@ -635,5 +671,30 @@ func TestMergeBckACLS(t *testing.T) {
 				t.Errorf("%s[filter: %s]: %v[%v] != %v[%v]", test.title, test.cluFlt, r.Bck, r.Access, test.resACLs[i], test.resACLs[i].Access)
 			}
 		}
+	}
+}
+
+// Test retrieving the max age header for JWKS based on the configured key expiry with bounds
+func TestGetJWKSMaxAge(t *testing.T) {
+	driver := mock.NewDBDriver()
+	tests := []struct {
+		expire time.Duration
+		want   int
+	}{
+		{1 * time.Hour, int((50 * time.Minute).Seconds())},
+		{2 * time.Minute, int((5 * time.Minute).Seconds())},
+		{9000 * time.Hour, int((720 * time.Hour).Seconds())},
+		{0, int((720 * time.Hour).Seconds())},
+	}
+
+	for _, tt := range tests {
+		conf := &authn.Config{Server: authn.ServerConf{Secret: "secret", Expire: cos.Duration(tt.expire)}}
+		cm := createCM(t, conf)
+		mgr, err := createManagerWithAdmin(cm, driver)
+		tassert.CheckFatal(t, err)
+		h := newServer(mgr)
+
+		got := h.getJWKSMaxAge()
+		tassert.Errorf(t, got == tt.want, "getJWKSMaxAge() = %d, want %d", got, tt.want)
 	}
 }

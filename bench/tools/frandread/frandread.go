@@ -1,6 +1,6 @@
 // Package frandread is a file-reading benchmark that makes a special effort to visit the files randomly and equally.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -46,9 +46,9 @@ type (
 	}
 
 	bench struct {
-		sema chan struct{}
-		wg   *sync.WaitGroup
-		rnd  *rand.Rand
+		semaCh chan struct{}
+		wg     *sync.WaitGroup
+		rnd    *rand.Rand
 
 		fileNames []string
 		perm      []int
@@ -80,11 +80,11 @@ func main() {
 		fmt.Println("Build:")
 		fmt.Println("\tgo install frandread.go")
 		fmt.Println("Examples:")
-		fmt.Printf("\tfrandread -h\t\t\t\t\t- show usage\n")
-		fmt.Printf("\tfrandread -d /tmp/work -t 10m\t\t\t- read from /tmp/work, run for 10 minutes\n")
-		fmt.Printf("\tfrandread -d /tmp/work -v -t 10m -p *.tgz\t- filter by tgz extension\n")
-		fmt.Printf("\tfrandread -d /tmp/a,/tmp/work/b -e 999\t\t- read two directories, run for 999 epochs\n")
-		fmt.Printf("\tfrandread -d ~/smth -pctput 1\t\t\t- put files into ~/smth directory")
+		fmt.Print("\tfrandread -h\t\t\t\t\t- show usage\n")
+		fmt.Print("\tfrandread -d /tmp/work -t 10m\t\t\t- read from /tmp/work, run for 10 minutes\n")
+		fmt.Print("\tfrandread -d /tmp/work -v -t 10m -p *.tgz\t- filter by tgz extension\n")
+		fmt.Print("\tfrandread -d /tmp/a,/tmp/work/b -e 999\t\t- read two directories, run for 999 epochs\n")
+		fmt.Print("\tfrandread -d ~/smth -pctput 1\t\t\t- put files into ~/smth directory")
 		fmt.Println()
 		os.Exit(0)
 	}
@@ -167,9 +167,9 @@ func newBench(fileNames []string) *bench {
 	}
 	rnd := rand.New(cos.NewRandSource(uint64(cliv.seed)))
 	return &bench{
-		rnd:  rnd,
-		sema: make(chan struct{}, cliv.numWorkers),
-		wg:   &sync.WaitGroup{},
+		rnd:    rnd,
+		semaCh: make(chan struct{}, cliv.numWorkers),
+		wg:     &sync.WaitGroup{},
 
 		fileNames: fileNames,
 	}
@@ -203,10 +203,10 @@ func (b *bench) epoch() {
 	for _, idx := range b.perm {
 		fname := b.fileNames[idx]
 		b.wg.Add(1)
-		b.sema <- struct{}{}
+		b.semaCh <- struct{}{}
 		go func(fname string) {
 			defer func() {
-				<-b.sema
+				<-b.semaCh
 				b.wg.Done()
 			}()
 

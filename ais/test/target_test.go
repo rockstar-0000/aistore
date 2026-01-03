@@ -5,6 +5,7 @@
 package integration_test
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/NVIDIA/aistore/api"
@@ -46,7 +47,7 @@ func TestPutObjectNoDaemonID(t *testing.T) {
 		Reader:     reader,
 	}
 	if _, err := api.PutObject(&putArgs); err == nil {
-		t.Errorf("Error is nil, expected Bad Request error on a PUT to target with no daemon ID query string")
+		t.Error("Error is nil, expected Bad Request error on a PUT to target with no daemon ID query string")
 	}
 }
 
@@ -56,8 +57,17 @@ func TestDeleteInvalidDaemonID(t *testing.T) {
 		SkipRebalance:     true,
 		KeepInitialConfig: true,
 	}
-	tlog.Logf("Decommission invalid node %s (expecting to fail)\n", val.DaemonID)
-	if _, err := api.DecommissionNode(tools.BaseAPIParams(), val); err == nil {
-		t.Errorf("Error is nil, expected NotFound error on a delete of a non-existing target")
+	tlog.Logfln("Decommission invalid node %s (expecting to fail)", val.DaemonID)
+	if _, err := tools.DecommissionNode(tools.BaseAPIParams(), val); err == nil {
+		t.Error("Error is nil, expected NotFound error on a delete of a non-existing target")
 	}
+}
+
+func TestInvalidHTTPMethod(t *testing.T) {
+	bp := tools.BaseAPIParams()
+	proxyURL := tools.RandomProxyURL(t)
+
+	req, err := http.NewRequest("TEST", proxyURL, http.NoBody)
+	tassert.CheckFatal(t, err)
+	tassert.DoAndCheckResp(t, bp.Client, req, http.StatusMethodNotAllowed)
 }

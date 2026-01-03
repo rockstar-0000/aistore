@@ -6,6 +6,7 @@ package cli
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -36,14 +37,14 @@ var (
 	supportedBool = []string{"true", "false"}
 	propCmpls     = map[string][]string{
 		// log modules
-		confLogModules: append(cos.Smodules[:], apc.NilValue),
+		confLogModules: append(cos.Mods[:], apc.ResetToken),
 		// checksums
 		apc.HdrObjCksumType: cos.SupportedChecksums(),
 		// access
 		cmn.PropBucketAccessAttrs: apc.SupportedPermissions(),
 		// feature flags
-		clusterFeatures: append(feat.Cluster[:], apc.NilValue),
-		bucketFeatures:  append(feat.Bucket[:], apc.NilValue),
+		clusterFeatures: append(feat.Cluster[:], apc.ResetToken),
+		bucketFeatures:  append(feat.Bucket[:], apc.ResetToken),
 		// rest
 		"write_policy.data":                   apc.SupportedWritePolicy[:],
 		"write_policy.md":                     apc.SupportedWritePolicy[:],
@@ -102,14 +103,7 @@ func _lastv(c *cli.Context, values []string) bool {
 	if c.NArg() == 0 {
 		return false
 	}
-	lastArg := argLast(c)
-
-	for _, v := range values {
-		if v == lastArg {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, argLast(c))
 }
 
 // not-yet-typed:
@@ -199,11 +193,12 @@ func configSectionCompletions(_ *cli.Context, cfgScope string) {
 	if cfgScope == cfgScopeLocal {
 		v = &config.LocalConfig
 	}
+	opts := cmn.IterOpts{OnlyRead: true}
 	err = cmn.IterFields(v, func(uniqueTag string, _ cmn.IterField) (err error, b bool) {
 		section := strings.Split(uniqueTag, cmn.IterFieldNameSepa)[0]
 		props.Set(section)
 		return nil, false
-	})
+	}, opts)
 	debug.AssertNoErr(err)
 	for prop := range props {
 		fmt.Println(prop)
@@ -232,13 +227,14 @@ func setNodeConfigCompletions(c *cli.Context) {
 			fmt.Println(cmdReset)
 			fmt.Println("backend") // NOTE special case: custom marshaling (ref 080235)
 		}
+		opts := cmn.IterOpts{OnlyRead: true}
 		err := cmn.IterFields(v, func(tag string, _ cmn.IterField) (err error, b bool) {
 			props.Set(tag)
 			if tag == confLogLevel {
 				props.Set(confLogModules) // (ref 836)
 			}
 			return nil, false
-		})
+		}, opts)
 		debug.AssertNoErr(err)
 		for prop := range props {
 			if !cos.AnyHasPrefixInSlice(prop, c.Args()) {
@@ -322,6 +318,7 @@ func setCluConfigCompletions(c *cli.Context) {
 	var (
 		config   cmn.Config
 		propList = make([]string, 0, 48)
+		opts     = cmn.IterOpts{Allowed: apc.Cluster, OnlyRead: true}
 	)
 	err := cmn.IterFields(&config.ClusterConfig, func(tag string, _ cmn.IterField) (err error, b bool) {
 		propList = append(propList, tag)
@@ -329,7 +326,7 @@ func setCluConfigCompletions(c *cli.Context) {
 			propList = append(propList, confLogModules) // insert to assign separately and combine below (ref 836)
 		}
 		return
-	}, cmn.IterOpts{Allowed: apc.Cluster})
+	}, opts)
 	debug.AssertNoErr(err)
 
 	if propValueCompletion(c, false /*bucket scope*/) {
@@ -352,12 +349,9 @@ func suggestUpdatableConfig(c *cli.Context) {
 	if propValueCompletion(c, false /*bucket scope*/) {
 		return
 	}
-	scope := apc.Cluster
-	if c.NArg() > 0 && !isConfigProp(c.Args().Get(0)) {
-		scope = apc.Daemon
-	}
+	scope := cos.Ternary(c.NArg() > 0 && !isConfigProp(c.Args().Get(0)), apc.Daemon, apc.Cluster)
 
-	props := append(configPropList(scope), apc.ActTransient)
+	props := append(configPropList(scope), apc.QparamTransient)
 	for _, prop := range props {
 		if !cos.AnyHasPrefixInSlice(prop, c.Args()) {
 			fmt.Println(prop)
@@ -496,7 +490,8 @@ mloop:
 	}
 }
 
-func manyBucketsCompletions(additionalCompletions []cli.BashCompleteFunc, firstBckIdx, bucketsCnt int) cli.BashCompleteFunc {
+func manyBucketsCompletions(additionalCompletions []cli.BashCompleteFunc, firstBckIdx int) cli.BashCompleteFunc {
+	const bucketsCnt = 2 // always expect 2 buckets
 	return func(c *cli.Context) {
 		if c.NArg() < firstBckIdx || c.NArg() >= firstBckIdx+bucketsCnt {
 			// suggest different if before bucket completion
@@ -512,6 +507,7 @@ func manyBucketsCompletions(additionalCompletions []cli.BashCompleteFunc, firstB
 }
 
 func bpropCompletions(c *cli.Context) {
+	opts := cmn.IterOpts{OnlyRead: true}
 	err := cmn.IterFields(&cmn.BpropsToSet{}, func(tag string, _ cmn.IterField) (error, bool) {
 		if !cos.AnyHasPrefixInSlice(tag, c.Args()) {
 			if bpropsFilterExtra(c, tag) {
@@ -519,7 +515,7 @@ func bpropCompletions(c *cli.Context) {
 			}
 		}
 		return nil, false
-	})
+	}, opts)
 	debug.AssertNoErr(err)
 }
 
@@ -537,6 +533,7 @@ func bpropsFilterExtra(c *cli.Context, tag string) bool {
 }
 
 func bucketAndPropsCompletions(c *cli.Context) {
+	opts := cmn.IterOpts{OnlyRead: true}
 	if c.NArg() == 0 {
 		f := bucketCompletions(bcmplop{})
 		f(c)
@@ -550,7 +547,7 @@ func bucketAndPropsCompletions(c *cli.Context) {
 				sections = append(sections, uniqueTag)
 			}
 			return nil, false
-		})
+		}, opts)
 		// NOTE: do not have bprops at this point, may miss remote backend (prop)
 		if bck, err := parseBckURI(c, c.Args().Get(0), false); err == nil {
 			p := apc.NormalizeProvider(bck.Provider)
@@ -559,7 +556,7 @@ func bucketAndPropsCompletions(c *cli.Context) {
 					sections = append(sections, "extra")
 				}
 				return
-			})
+			}, opts)
 		}
 
 		debug.AssertNoErr(err)
@@ -601,8 +598,6 @@ func runningJobCompletions(c *cli.Context) {
 	case 0: // 1. NAME
 		if flagIsSet(c, allJobsFlag) {
 			names := xact.ListDisplayNames(false /*only-startable*/)
-			names = append(names, apc.ActDsort)
-			sort.Strings(names)
 			fmt.Println(strings.Join(names, " "))
 			return
 		}
@@ -763,7 +758,7 @@ func multiRoleCompletions(c *cli.Context) {
 	}
 	args := c.Args()
 	for _, role := range roleList {
-		if cos.StringInSlice(role.Name, args) {
+		if slices.Contains(args, role.Name) {
 			continue
 		}
 		fmt.Println(role.Name)
@@ -821,10 +816,11 @@ func oneClusterCompletions(c *cli.Context) {
 func authNConfigPropList() []string {
 	propList := []string{}
 	emptyCfg := authn.ConfigToUpdate{Server: &authn.ServerConfToSet{}}
+	opts := cmn.IterOpts{OnlyRead: true}
 	cmn.IterFields(emptyCfg, func(tag string, _ cmn.IterField) (error, bool) {
 		propList = append(propList, tag)
 		return nil, false
-	})
+	}, opts)
 	return propList
 }
 
@@ -833,7 +829,7 @@ func suggestUpdatableAuthNConfig(c *cli.Context) {
 	lastIsProp := c.NArg() != 0
 	if c.NArg() != 0 {
 		lastVal := argLast(c)
-		lastIsProp = cos.StringInSlice(lastVal, props)
+		lastIsProp = slices.Contains(props, lastVal)
 	}
 	if lastIsProp {
 		return
@@ -859,13 +855,24 @@ func suggestRemote(_ *cli.Context) {
 	}
 }
 
+func showRemoteConfigCompletions(c *cli.Context) {
+	if c.NArg() == 0 {
+		suggestRemote(c)
+		return
+	}
+	if c.NArg() == 1 {
+		configSectionCompletions(c, cmdCluster)
+	}
+}
+
 func cliPropCompletions(c *cli.Context) {
-	err := cmn.IterFields(cfg, func(tag string, _ cmn.IterField) (error, bool) {
+	opts := cmn.IterOpts{OnlyRead: true}
+	err := cmn.IterFields(gcfg, func(tag string, _ cmn.IterField) (error, bool) {
 		if !cos.AnyHasPrefixInSlice(tag, c.Args()) {
 			fmt.Println(tag)
 		}
 		return nil, false
-	})
+	}, opts)
 	debug.AssertNoErr(err)
 }
 

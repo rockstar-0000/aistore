@@ -16,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -31,7 +32,6 @@ type LoadType int
 
 const (
 	noLoad LoadType = iota
-	LoadUnsafe
 	Load
 )
 
@@ -48,7 +48,7 @@ type (
 		DoLoad      LoadType // if specified, lom.Load(lock type)
 		IncludeCopy bool     // visit copies (aka replicas)
 		PerBucket   bool     // num joggers = (num mountpaths) x (num buckets)
-		Throttle    bool     // true: pace itself depending on disk utilization
+		RW          bool     // true when performs data IO
 	}
 
 	// Jgroup runs jogger per mountpath which walk the entire bucket and
@@ -73,10 +73,11 @@ type (
 		stopCh    cos.StopCh
 		buf       []byte
 		numvis    atomic.Int64 // counter: num visited objects
+		adv       load.Advice  // throttle
 	}
 )
 
-func NewJoggerGroup(opts *JgroupOpts, config *cmn.Config, smi *fs.Mountpath) *Jgroup {
+func NewJgroup(opts *JgroupOpts, config *cmn.Config, smi *fs.Mountpath) *Jgroup {
 	var (
 		joggers map[string]*jogger
 		avail   = fs.GetAvail()
@@ -170,9 +171,12 @@ func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath, config *
 		config: config,
 	}
 	if opts.Prefix != "" {
-		j.bdir = mi.MakePathCT(&j.opts.Bck, fs.ObjectType) // this mountpath's bucket dir that contains objects
+		j.bdir = mi.MakePathCT(&j.opts.Bck, fs.ObjCT) // this mountpath's bucket dir that contains objects
 		j.objPrefix = filepath.Join(j.bdir, opts.Prefix)
 	}
+	// throttling context
+	j.adv.Init(load.FlMem|load.FlDsk, &load.Extra{Mi: j.mi, Cfg: &j.config.Disk, RW: j.opts.RW})
+
 	j.stopCh.Init()
 	return
 }
@@ -216,7 +220,7 @@ func (j *jogger) run() error {
 
 // run selected buckets, one at a time
 func (j *jogger) runSelected() error {
-	var errs cos.Errs
+	errs := cos.NewErrs()
 	for i := range j.opts.Buckets {
 		aborted, err := j.runBck(&j.opts.Buckets[i])
 		if err != nil {
@@ -233,9 +237,9 @@ func (j *jogger) runSelected() error {
 func (j *jogger) runQbck(qbck cmn.QueryBcks) (err error) {
 	var (
 		bmd      = core.T.Bowner().Get()
+		errs     = cos.NewErrs()
 		provider *string
 		ns       *cmn.Ns
-		errs     cos.Errs
 	)
 	if qbck.Provider != "" {
 		provider = &qbck.Provider
@@ -293,17 +297,15 @@ func (j *jogger) jog(fqn string, de fs.DirEntry) error {
 	if err := j.checkStopped(); err != nil {
 		return err
 	}
-
 	if err := j.visitFQN(fqn, j.buf); err != nil {
 		return err
 	}
 
 	n := j.numvis.Inc()
-
-	// poor man's throttle; see "rate limit"
-	if j.opts.Throttle {
-		if fs.IsThrottle(n) {
-			j.throttle()
+	if j.opts.RW && j.adv.ShouldCheck(n) {
+		j.adv.Refresh()
+		if j.adv.Sleep > 0 {
+			time.Sleep(j.adv.Sleep)
 		} else {
 			runtime.Gosched()
 		}
@@ -318,7 +320,7 @@ func (j *jogger) visitFQN(fqn string, buf []byte) error {
 	}
 
 	switch ct.ContentType() {
-	case fs.ObjectType:
+	case fs.ObjCT:
 		lom := core.AllocLOM("")
 		lom.InitCT(ct)
 		err := j.visitObj(lom, buf)
@@ -336,23 +338,14 @@ func (j *jogger) visitFQN(fqn string, buf []byte) error {
 }
 
 func (j *jogger) visitObj(lom *core.LOM, buf []byte) (err error) {
-	switch j.opts.DoLoad {
-	case noLoad:
-		goto visit
-	case LoadUnsafe:
-		err = lom.LoadUnsafe()
-	case Load:
-		err = lom.Load(false, false)
-	default:
-		debug.Assert(false, "invalid 'opts.DoLoad'", j.opts.DoLoad)
+	if j.opts.DoLoad == Load {
+		if err = lom.Load(false, false); err != nil {
+			return
+		}
+		if !j.opts.IncludeCopy && lom.IsCopy() {
+			return nil
+		}
 	}
-	if err != nil {
-		return
-	}
-	if !j.opts.IncludeCopy && lom.IsCopy() {
-		return nil
-	}
-visit:
 	return j.opts.VisitObj(lom, buf)
 }
 
@@ -366,13 +359,6 @@ func (j *jogger) checkStopped() error {
 		return cmn.NewErrAborted(j.String(), "mpath-jog", nil)
 	default:
 		return nil
-	}
-}
-
-func (j *jogger) throttle() {
-	curUtil := fs.GetMpathUtil(j.mi.Path)
-	if curUtil >= j.config.Disk.DiskUtilHighWM {
-		time.Sleep(fs.Throttle1ms)
 	}
 }
 

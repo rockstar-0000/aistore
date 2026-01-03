@@ -96,12 +96,16 @@ func (mgr *Manager) OpenStreams(withRefc bool) {
 	if !mgr.bundleEnabled.CAS(false, true) {
 		return
 	}
-	nlog.InfoDepth(1, core.T.String(), "ECM", apc.ActEcOpen)
+	nlog.InfoDepth(1, core.T.String(), "ECM", apc.ActOpenEC)
 	var (
 		client      = transport.NewIntraDataClient()
 		config      = cmn.GCO.Get()
 		compression = config.EC.Compression
-		extraReq    = transport.Extra{Callback: cbReq, Compression: compression, Config: config}
+		extraReq    = transport.Extra{
+			Parent:      &transport.Parent{SentCB: cbReq},
+			Compression: compression,
+			Config:      config,
+		}
 	)
 	reqSbArgs := bundle.Args{
 		Multiplier: config.EC.SbundleMult,
@@ -128,7 +132,7 @@ func (mgr *Manager) CloseStreams(justRefc bool) {
 	if !mgr.bundleEnabled.CAS(true, false) {
 		return
 	}
-	nlog.InfoDepth(1, core.T.String(), "ECM", apc.ActEcClose)
+	nlog.InfoDepth(1, core.T.String(), "ECM", apc.ActCloseEC)
 	mgr.req().Close(false)
 	mgr.resp().Close(false)
 }
@@ -164,6 +168,7 @@ func _renewXact(bck *meta.Bck, kind string) (core.Xact, error) {
 }
 
 // A function to process command requests from other targets
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (mgr *Manager) recvRequest(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	defer transport.FreeRecv(objReader)
 	if err != nil {
@@ -188,7 +193,7 @@ func (mgr *Manager) recvRequest(hdr *transport.ObjHdr, objReader io.Reader, err 
 	// the body must be drained to avoid errors
 	if hdr.ObjAttrs.Size != 0 {
 		n, err := io.Copy(io.Discard, objReader)
-		if err != nil && !cos.IsEOF(err) {
+		if err != nil && !cos.IsOkEOF(err) {
 			nlog.Errorf("failed to read request body: %v", err)
 			return err
 		}
@@ -207,6 +212,7 @@ func (mgr *Manager) recvRequest(hdr *transport.ObjHdr, objReader io.Reader, err 
 }
 
 // A function to process big chunks of data (replica/slice/meta) sent from other targets
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (mgr *Manager) recvResponse(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	defer transport.DrainAndFreeReader(objReader)
 	if err != nil {

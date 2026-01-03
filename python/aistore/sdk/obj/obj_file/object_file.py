@@ -2,17 +2,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 
+from sys import maxsize as sys_maxsize
 from requests.exceptions import ChunkedEncodingError, ConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError, ReadTimeoutError
 from io import BufferedIOBase, BufferedWriter
-from typing import Optional
+from typing import Optional, Generator
 from overrides import override
-from aistore.sdk.obj.content_iterator import ContentIterator
+from aistore.sdk.obj.content_iterator import BaseContentIterProvider
+from aistore.sdk.obj.obj_file.errors import ObjectFileReaderMaxResumeError
 from aistore.sdk.utils import get_logger
-from aistore.sdk.obj.obj_file.utils import (
-    handle_broken_stream,
-    compute_loop_size,
-)
+
 
 logger = get_logger(__name__)
 
@@ -24,34 +23,29 @@ class ObjectFileReader(BufferedIOBase):
 
     When a read is requested, any remaining data from a previously fetched chunk is returned first. If the remaining
     data is insufficient to satisfy the request, the `read()` method fetches additional chunks from the provided
-    `content_iterator` as needed, until the requested size is fulfilled or the end of the stream is reached.
+    iterator as needed, until the requested size is fulfilled or the end of the stream is reached.
 
     In case of unexpected stream interruptions (e.g. `ChunkedEncodingError`, `ConnectionError`) or timeouts (e.g.
     `ReadTimeout`), the `read()` method automatically retries and resumes fetching data from the last successfully
     retrieved chunk. The `max_resume` parameter controls how many retry attempts are made before an error is raised.
 
     Args:
-        content_iterator (ContentIterator): An iterator that can fetch object data from AIS in chunks.
+        content_provider (BaseContentIterProvider): A provider that creates iterators which can fetch object data from AIS in chunks.
         max_resume (int): Maximum number of resumes allowed for an ObjectFileReader instance.
     """
 
-    def __init__(self, content_iterator: ContentIterator, max_resume: int):
-        self._content_iterator = content_iterator
+    def __init__(self, content_provider: BaseContentIterProvider, max_resume: int):
+        self._content_provider = content_provider
         self._max_resume = max_resume  # Maximum number of resume attempts allowed
         self._reset()
 
     def _reset(self, retain_resumes: bool = False) -> None:
-        self._iterable = self._content_iterator.iter()
+        self._content_iter = self._content_provider.create_iter()
         self._remainder = None
         self._resume_position = 0
         self._closed = False
         if not retain_resumes:
             self._resume_total = 0
-
-    @property
-    def content_iterator(self) -> ContentIterator:
-        """Return the content iterator."""
-        return self._content_iterator
 
     @override
     def __enter__(self):
@@ -90,7 +84,10 @@ class ObjectFileReader(BufferedIOBase):
         # Cache original requested size in case of reset
         original_size = size
 
-        size = compute_loop_size(size)
+        # Compute initial size of loop using given size
+        # Maximum possible size if size is negative
+        size = sys_maxsize if original_size < 0 else original_size
+
         result = []
 
         try:
@@ -108,7 +105,7 @@ class ObjectFileReader(BufferedIOBase):
             # Fetch new chunks from the stream as needed
             while size:
                 try:
-                    chunk = memoryview(next(self._iterable))
+                    chunk = memoryview(next(self._content_iter))
                 except (
                     ConnectionError,
                     ChunkedEncodingError,
@@ -118,20 +115,17 @@ class ObjectFileReader(BufferedIOBase):
                 ) as err:
                     # If the stream is broken (e.g. TCP reset, dropped connection, malformed or incomplete chunk)
                     # or there is a timeout, retry with a new iterator from the last known position
-                    self._iterable, self._resume_total = handle_broken_stream(
-                        self._content_iterator,
-                        self._resume_position,
-                        self._resume_total,
-                        self._max_resume,
-                        err,
-                    )
+                    self._content_iter = self._handle_broken_stream(err)
 
                     # If the object is remote and not cached, reset the iterator and restart the read operation
                     # to avoid timeouts when streaming non-cached remote objects with byte ranges (must wait for
                     # entire object to be cached in-cluster).
-                    if not self._iterable:
+                    if not self._content_iter:
                         self._reset(retain_resumes=True)
-                        size = compute_loop_size(original_size)
+
+                        # Compute new size of loop using given size
+                        # Maximum possible size if size is negative
+                        size = sys_maxsize if original_size < 0 else original_size
 
                     continue
 
@@ -154,7 +148,7 @@ class ObjectFileReader(BufferedIOBase):
                     size -= len(chunk)
 
         except Exception as err:
-            obj_path = self.content_iterator.client.path
+            obj_path = self._content_provider.client.path
             # Handle any unexpected errors, log them with context, close the file, and re-raise
             logger.error(
                 "Error while reading object at '%s': %s. Closing file.",
@@ -172,6 +166,47 @@ class ObjectFileReader(BufferedIOBase):
     def close(self) -> None:
         """Close the file."""
         self._closed = True
+        if self._content_iter:
+            self._content_iter.close()
+
+    def _handle_broken_stream(
+        self, err: Exception
+    ) -> Optional[Generator[bytes, None, None]]:
+        """
+        Handle the broken stream/iterator by incrementing the resume count, logging a warning,
+        and returning a newly instantiated iterator from the last known position.
+
+        Args:
+            err (Exception): The error that caused the resume attempt.
+
+        Returns:
+            Optional[Generator[bytes, None, None]]: The new generator. None if the object is not cached.
+
+        Raises:
+            ObjectFileReaderMaxResumeError: If the maximum number of resume attempts is exceeded.
+        """
+
+        # Increment the number of resume attempts
+        # Error if exceed max resume count
+        self._resume_total += 1
+        if self._resume_total > self._max_resume:
+            raise ObjectFileReaderMaxResumeError(err, self._resume_total) from err
+
+        obj_path = self._content_provider.client.path
+        logger.warning(
+            "Error while reading '%s', retrying %d/%d",
+            obj_path,
+            self._resume_total,
+            self._max_resume,
+            exc_info=err,
+        )
+
+        # If remote object is not cached, start over
+        if not self._content_provider.client.head().present:
+            return None
+
+        # Otherwise, resume from last known position
+        return self._content_provider.create_iter(offset=self._resume_position)
 
 
 class ObjectFileWriter(BufferedWriter):

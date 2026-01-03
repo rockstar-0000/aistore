@@ -1,7 +1,6 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -18,15 +17,15 @@ import (
 
 type (
 	ctrl struct { // add/del channel to/from collector
-		s   *streamBase
+		s   *base
 		add bool
 	}
 	collector struct {
-		streams map[string]*streamBase
+		streams map[int64]*base // by session ID
 		ticker  *time.Ticker
 		stopCh  cos.StopCh
 		ctrlCh  chan ctrl
-		heap    []*streamBase
+		heap    []*base
 		none    atomic.Bool // no streams
 	}
 )
@@ -73,7 +72,7 @@ func (gc *collector) run() {
 			if !gc.none.Load() {
 				now := mono.NanoTime()
 				if time.Duration(now-prev) >= dfltCollectLog {
-					var s *streamBase
+					var s *base
 					for _, s = range gc.streams {
 						break
 					}
@@ -91,10 +90,10 @@ func (gc *collector) run() {
 				return
 			}
 			s, add := ctrl.s, ctrl.add
-			_, ok = gc.streams[s.lid]
+			_, ok = gc.streams[s.sessID]
 			if add {
-				debug.Assert(!ok, s.lid)
-				gc.streams[s.lid] = s
+				debug.Assert(!ok, s.String())
+				gc.streams[s.sessID] = s
 				heap.Push(gc, s)
 				if gc.none.CAS(true, false) {
 					gc.ticker.Reset(dfltTick)
@@ -118,7 +117,7 @@ func (gc *collector) stop() {
 	gc.stopCh.Close()
 }
 
-func (gc *collector) remove(s *streamBase) {
+func (gc *collector) remove(s *base) {
 	gc.ctrlCh <- ctrl{s, false} // remove and close workCh
 }
 
@@ -139,13 +138,13 @@ func (gc *collector) Swap(i, j int) {
 
 func (gc *collector) Push(x any) {
 	l := len(gc.heap)
-	s := x.(*streamBase)
+	s := x.(*base)
 	s.time.index = l
 	gc.heap = append(gc.heap, s)
 	heap.Fix(gc, s.time.index) // reorder the newly added stream right away
 }
 
-func (gc *collector) update(s *streamBase, ticks int) {
+func (gc *collector) update(s *base, ticks int) {
 	s.time.ticks = ticks
 	debug.Assert(s.time.ticks >= 0)
 	heap.Fix(gc, s.time.index)
@@ -161,7 +160,7 @@ func (gc *collector) Pop() any {
 
 // collector's main method
 func (gc *collector) do() {
-	for lid, s := range gc.streams {
+	for sessID, s := range gc.streams {
 		if s.IsTerminated() {
 			_, err := s.TermInfo()
 			if s.time.inSend.Swap(false) {
@@ -172,7 +171,7 @@ func (gc *collector) do() {
 
 			s.time.ticks--
 			if s.time.ticks <= 0 {
-				delete(gc.streams, lid)
+				delete(gc.streams, sessID)
 				if len(gc.streams) == 0 {
 					gc.ticker.Reset(dfltTickIdle)
 					debug.Assert(!gc.none.Load())

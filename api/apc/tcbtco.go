@@ -17,6 +17,7 @@ import (
 // TODO: `ContinueOnError` not implemented for the most part
 
 type (
+	// swagger:model
 	CopyBckMsg struct {
 		Prepend   string `json:"prepend"`              // destination naming, as in: dest-obj-name = Prepend + source-obj-name
 		Prefix    string `json:"prefix"`               // prefix to select matching _source_ objects or virtual directories
@@ -26,12 +27,15 @@ type (
 		Sync      bool   `json:"synchronize"`          // see also: 'versioning.synchronize'
 		NonRecurs bool   `json:"non-recurs,omitempty"` // do not copy contents of nested virtual subdirectories (see also: `apc.LsNoRecursion`, `apc.EvdMsg`)
 	}
+
+	// swagger:model
 	Transform struct {
-		Name    string       `json:"id,omitempty"`
-		Timeout cos.Duration `json:"request_timeout,omitempty"`
+		Name     string       `json:"id,omitempty"`
+		Pipeline []string     `json:"pipeline,omitempty"`
+		Timeout  cos.Duration `json:"request_timeout,omitempty" swaggertype:"primitive,integer"`
 	}
 
-	// bucket to bucket
+	// swagger:model
 	TCBMsg struct {
 		// Objname Extension ----------------------------------------------------------------------
 		// - resulting object names will have this extension, if specified.
@@ -40,8 +44,8 @@ type (
 		// - this field might not be any longer required
 		Ext cos.StrKVs `json:"ext"`
 
-		Transform
 		CopyBckMsg
+		Transform
 
 		// user-defined number of concurrent workers:
 		// * 0:  number of mountpaths (default)
@@ -53,10 +57,11 @@ type (
 
 	// multi-object
 	// (cmn.TCOMsg = TCOMsg +  source and destination buckets)
+	// swagger:model
 	TCOMsg struct {
 		TxnUUID string // (plstcx client; one control message)
-		TCBMsg
 		ListRange
+		TCBMsg
 	}
 )
 
@@ -84,17 +89,29 @@ func (msg *TCBMsg) ToName(name string) string {
 // CopyBckMsg //
 ////////////////
 
-func (msg *CopyBckMsg) Str(sb *strings.Builder, fromCname, toCname string) {
+func (msg *CopyBckMsg) Str(sb *strings.Builder, fromCname, toCname, tag string) {
+	sb.WriteString(tag)
 	sb.WriteString(fromCname)
 	sb.WriteString("=>")
 	sb.WriteString(toCname)
+
+	sb.WriteString(", flags:")
+	first := true
 	if msg.LatestVer {
-		sb.WriteString(", latest")
+		sb.WriteString("latest")
+		first = false
 	}
 	if msg.Sync {
-		sb.WriteString(", sync")
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("sync")
+		first = false
 	}
 	if msg.NonRecurs {
-		sb.WriteString(", non-recurs")
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("non-recurs")
 	}
 }

@@ -6,10 +6,12 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,6 +41,7 @@ const (
 	flagsAuthRevokeToken = "revoke_token"
 	flagsAuthRoleShow    = "role_show"
 	flagsAuthConfShow    = "conf_show"
+	flagsAuthOIDCShow    = "oidc_show"
 )
 
 const authnUnreachable = `AuthN unreachable at %s. You may need to update AIS CLI configuration or environment variable %s`
@@ -52,7 +55,8 @@ var (
 		flagsAuthRevokeToken: {tokenFileFlag},
 		flagsAuthUserShow:    {nonverboseFlag, verboseFlag},
 		flagsAuthRoleShow:    {nonverboseFlag, verboseFlag, clusterFilterFlag},
-		flagsAuthConfShow:    {jsonFlag},
+		flagsAuthConfShow:    {jsonFlag, noHeaderFlag},
+		flagsAuthOIDCShow:    {jsonFlag, noHeaderFlag},
 	}
 
 	// define separately to allow for aliasing (see alias_hdlr.go)
@@ -86,6 +90,17 @@ var (
 				Usage:  "Show AuthN server configuration",
 				Flags:  sortFlags(authFlags[flagsAuthConfShow]),
 				Action: wrapAuthN(showAuthConfigHandler),
+			},
+			{
+				Name:   cmdAuthOIDC,
+				Usage:  "Show AuthN OIDC configuration",
+				Flags:  sortFlags(authFlags[flagsAuthOIDCShow]),
+				Action: wrapAuthN(showAuthOIDCHandler),
+			},
+			{
+				Name:   cmdAuthJWKS,
+				Usage:  "Show AuthN public JWKS",
+				Action: wrapAuthN(showAuthJWKSHandler),
 			},
 		},
 	}
@@ -279,13 +294,13 @@ func filterRolesByCluster(roles []*authn.Role, clusters []string) ([]*authn.Role
 	filtered := roles[:0]
 	for _, role := range roles {
 		for _, clu := range role.ClusterACLs {
-			if cos.StringInSlice(clu.ID, cluIDs) {
+			if slices.Contains(cluIDs, clu.ID) {
 				filtered = append(filtered, role)
 				break
 			}
 		}
 		for _, bck := range role.BucketACLs {
-			if cos.StringInSlice(bck.Bck.Ns.UUID, cluIDs) {
+			if slices.Contains(cluIDs, bck.Bck.Ns.UUID) {
 				filtered = append(filtered, role)
 				break
 			}
@@ -726,6 +741,37 @@ func showAuthConfigHandler(c *cli.Context) (err error) {
 	}
 }
 
+func showAuthOIDCHandler(c *cli.Context) (err error) {
+	oidc, err := authn.GetOIDCConfig(authParams)
+	if err != nil {
+		return err
+	}
+	list := flattenJSON(oidc, "")
+	usejs := flagIsSet(c, jsonFlag)
+	switch {
+	case usejs:
+		return teb.Print(oidc, teb.PropValTmpl, teb.Jopts(usejs))
+	case flagIsSet(c, noHeaderFlag):
+		return teb.Print(list, teb.PropValTmplNoHdr)
+	default:
+		return teb.Print(list, teb.PropValTmpl)
+	}
+}
+
+func showAuthJWKSHandler(_ *cli.Context) (err error) {
+	rawJSON, err := authn.GetJWKS(authParams)
+	if err != nil {
+		return err
+	}
+
+	// Decode into a generic map for flattening / table output
+	var jwks any
+	if err := json.Unmarshal(*rawJSON, &jwks); err != nil {
+		return err
+	}
+	return teb.Print(jwks, teb.PropValTmpl, teb.Jopts(true))
+}
+
 func authNConfigFromArgs(c *cli.Context) (conf *authn.ConfigToUpdate, err error) {
 	conf = &authn.ConfigToUpdate{Server: &authn.ServerConfToSet{}}
 	items := c.Args()
@@ -774,7 +820,7 @@ func getTokenFilePath(c *cli.Context) (string, error) {
 		tokenFilePath = filepath.Join(config.ConfigDir, fname.Token)
 	}
 	if err := cos.Stat(tokenFilePath); err != nil {
-		if !os.IsNotExist(err) {
+		if !cos.IsNotExist(err) {
 			return "", fmt.Errorf("failed to access token file %q: %v", tokenFilePath, err)
 		}
 		if createErr := cos.CreateDir(filepath.Dir(tokenFilePath)); createErr != nil {

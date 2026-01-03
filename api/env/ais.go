@@ -43,10 +43,6 @@ const (
 	// client and dev deployment; see also cluster config "net.http.skip_verify"
 	AisSkipVerifyCrt = "AIS_SKIP_VERIFY_CRT"
 
-	// tests and CI
-	AisNumTarget = "NUM_TARGET"
-	AisNumProxy  = "NUM_PROXY"
-
 	// via ais-k8s repo
 	// see also:
 	// * https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go
@@ -58,5 +54,11 @@ const (
 	AisK8sPublicHostname       = "AIS_PUBLIC_HOSTNAME"
 	AisK8sClusterDomain        = "AIS_K8S_CLUSTER_DOMAIN"
 	AisK8sHostNetwork          = "HOST_NETWORK"
+	AisK8sPublicDNSMode        = "AIS_PUBLIC_DNS_MODE"
 	AisK8sEnableExternalAccess = "ENABLE_EXTERNAL_ACCESS"
+
+	// AisK8sPublicDNSMode values
+	PubNetDNSModeIP   string = "IP"
+	PubNetDNSModeNode string = "Node"
+	PubNetDNSModePod  string = "Pod"
 )

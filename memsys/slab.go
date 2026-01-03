@@ -42,7 +42,7 @@ func (s *Slab) Alloc() (buf []byte) {
 func (s *Slab) Free(buf []byte) {
 	s.muput.Lock()
 	debug.Assert(int64(cap(buf)) == s.Size())
-	deadbeef(buf[:cap(buf)])
+	debug.DeadBeefLarge(buf[:cap(buf)])
 	s.put = append(s.put, buf[:cap(buf)]) // always freeing the original size
 	s.muput.Unlock()
 }
@@ -64,7 +64,7 @@ func (s *Slab) _allocSlow() (buf []byte) {
 	s.muput.Lock()
 	lput := len(s.put)
 	if cnt := (curMinDepth - lput) >> 1; cnt > 0 {
-		if cmn.Rom.FastV(5, cos.SmoduleMemsys) {
+		if cmn.Rom.V(5, cos.ModMemsys) {
 			nlog.Infof("%s: grow by %d to %d, caps=(%d, %d)", s.tag, cnt, lput+cnt, cap(s.get), cap(s.put))
 		}
 		s.grow(cnt)
@@ -104,7 +104,7 @@ func (s *Slab) reduce(todepth int) int64 {
 		s.put = s.put[:lput]
 	}
 	s.muput.Unlock()
-	if pfreed > 0 && cmn.Rom.FastV(5, cos.SmoduleMemsys) {
+	if pfreed > 0 && cmn.Rom.V(5, cos.ModMemsys) {
 		nlog.Infof("%s: reduce lput %d to %d (freed %dB)", s.tag, lput, lput-cnt, pfreed)
 	}
 
@@ -119,7 +119,7 @@ func (s *Slab) reduce(todepth int) int64 {
 		}
 	}
 	s.muget.Unlock()
-	if gfreed > 0 && cmn.Rom.FastV(5, cos.SmoduleMemsys) {
+	if gfreed > 0 && cmn.Rom.V(5, cos.ModMemsys) {
 		nlog.Infof("%s: reduce lget %d to %d (freed %dB)", s.tag, lget, lget-cnt, gfreed)
 	}
 	return pfreed + gfreed

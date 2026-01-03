@@ -9,68 +9,102 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/xact"
 )
 
-// [TODO]
-// - Close() vs usage (when len(rxcbs) > 0); provide xctn.onFinished() => UnregRecv
-// - limitation: hdr.Opaque is exclusively reserved xaction ID
+// TODO: reconnect() must become common for all data-mover's xactions; add `transport.OpcReconnect`
 
-type sharedDM struct {
-	dm    DM
-	rxcbs map[string]transport.RecvObj
-	ocmu  sync.Mutex
-	rxmu  sync.Mutex
-}
+const sbrWinMax = 15 * time.Second
+
+const iniSdmCap = 16
+
+// in other words, "oldAge-rxent = cmn.SharedStreamsDflt"
+const oldAgeTickCount = int32((cmn.SharedStreamsDflt + hk.Prune2mIval - 1) / hk.Prune2mIval)
+
+// constant (until and if multiple instances)
+const SDMName = "shared-dm"
+
+type (
+	rxent struct {
+		rx    transport.Receiver
+		ticks atomic.Int32 // idle tick count: inc every hk.Prune2mIval; reset upon recv() call
+	}
+	sharedDM struct {
+		receivers map[string]*rxent
+		dm        DM
+		ocmu      sync.Mutex
+		rxmu      sync.RWMutex
+
+		// per-sender ErrSBR windows (Rx side) // TODO: prevent on/off flapping :TODO
+		sbrs struct {
+			m   map[string]*transport.ErrSBR
+			mtx sync.RWMutex
+		}
+	}
+)
 
 // global
 var SDM sharedDM
 
 // called upon target startup
 func InitSDM(config *cmn.Config, compression string) {
+	debug.Assert(oldAgeTickCount > 1)
 	extra := Extra{Config: config, Compression: compression}
+
+	// NOTE:
+	// - see bundle.go for Streams.Resync()
+	// - and note that cmn/archive/read returns cos.ReadCloseSizer (not Opener)
+	debug.Assert(extra.Multiplier == 0 || extra.Multiplier == 1, "cannot have many-to-one connections: cannot reopen archived files")
+
 	SDM.dm.init(SDM.trname(), SDM.recv, cmn.OwtNone, extra)
 }
+
+func (*sharedDM) trname() string { return SDMName }
 
 func (sdm *sharedDM) isOpen() bool { return sdm.dm.stage.opened.Load() }
 
 func (sdm *sharedDM) IsActive() (active bool) {
-	sdm.rxmu.Lock()
-	active = len(sdm.rxcbs) > 0
-	sdm.rxmu.Unlock()
+	sdm.rxmu.RLock()
+	active = sdm.getActive() != ""
+	sdm.rxmu.RUnlock()
 	return
 }
 
-// constant (until and unless we run multiple shared-DMs)
-func (*sharedDM) trname() string { return "shared-dm" }
-
-func (sdm *sharedDM) _already() {
-	nlog.WarningDepth(2, core.T.String(), sdm.trname(), "is already open")
+// is called under rlock or wlock
+func (sdm *sharedDM) getActive() string {
+	for xid, en := range sdm.receivers {
+		if en.ticks.Load() < oldAgeTickCount {
+			return xid
+		}
+	}
+	return ""
 }
 
 // called on-demand
 func (sdm *sharedDM) Open() error {
 	if sdm.isOpen() {
-		sdm._already()
 		return nil
 	}
 
 	sdm.ocmu.Lock()
 	if sdm.isOpen() {
 		sdm.ocmu.Unlock()
-		sdm._already()
 		return nil
 	}
 
 	sdm.rxmu.Lock()
-	sdm.rxcbs = make(map[string]transport.RecvObj, 4)
+	sdm.receivers = make(map[string]*rxent, iniSdmCap)
 	sdm.rxmu.Unlock()
 
 	if err := sdm.dm.RegRecv(); err != nil {
@@ -79,105 +113,198 @@ func (sdm *sharedDM) Open() error {
 		debug.AssertNoErr(err)
 		return err
 	}
+	sdm.dm.parent = &transport.Parent{
+		TermedCB: sdm.reconnect,
+	}
 	sdm.dm.Open()
 	sdm.ocmu.Unlock()
+
+	hk.Reg(sdm.trname()+hk.NameSuffix, sdm.housekeep, hk.Prune2mIval)
 
 	nlog.InfoDepth(1, core.T.String(), "open", sdm.trname())
 	return nil
 }
 
-// nothing running + 10m inactivity
-func (sdm *sharedDM) Close() error {
+// TODO: prevent a) too-frequent reconnects and/or b) too-many-during-stream's-lifetime :TODO
+func (sdm *sharedDM) reconnect(dstID string, err error) {
 	if !sdm.isOpen() {
-		return nil
+		return
 	}
+	if e := sdm.dm.data.streams.ReopenPeerStream(dstID); e != nil {
+		err = fmt.Errorf("%s: failed reconnecting to %s (%w --> %w)", sdm.trname(), dstID, err, e)
+		nlog.Errorln(core.T.String(), err, "- closing/aborting...")
+		sdm.Close(err) // NOTE -- TODO: may now close underneath
+		return
+	}
+
+	// ping remote peer
+	go sdm.gosend(dstID)
+}
+
+func (sdm *sharedDM) gosend(dstID string) {
+	o := transport.AllocSend()
+	o.Hdr.Opcode = transport.OpcReconnect
+	o.Hdr.SID = core.T.SID()
+
+	smap := core.T.Sowner().Get()
+	tsi := smap.GetNode(dstID)
+	if tsi != nil && sdm.isOpen() {
+		err := sdm.Send(o, nil /*roc*/, tsi, nil)
+		nlog.Warningln(core.T.String(), "reconnect/send:", sdm.trname(), "-->", dstID, err)
+	}
+}
+
+func (sdm *sharedDM) CanSend(sid string) (err error) {
+	sdm.sbrs.mtx.RLock()
+	if e, ok := sdm.sbrs.m[sid]; ok {
+		if e.Since() < sbrWinMax {
+			err = e
+		}
+	}
+	sdm.sbrs.mtx.RUnlock()
+	return
+}
+
+func (sdm *sharedDM) housekeep(now int64) time.Duration {
+	if !sdm.isOpen() {
+		return hk.UnregInterval
+	}
+	sdm.rxmu.RLock()
+	for _, en := range sdm.receivers {
+		en.ticks.Inc()
+	}
+	sdm.rxmu.RUnlock()
+	return hk.Jitter(hk.Prune2mIval, now)
+}
+
+// nothing running + cmn.SharedStreamsDflt (10m) inactivity
+func (sdm *sharedDM) Close(err ...error) error {
 	sdm.ocmu.Lock()
-	if !sdm.isOpen() {
-		sdm.ocmu.Unlock()
-		return nil
-	}
-
-	var (
-		xid string
-		l   int
-	)
 	sdm.rxmu.Lock()
-	for xid = range sdm.rxcbs {
-		break
-	}
-	l = len(sdm.rxcbs)
 
-	if l > 0 {
-		sdm.rxmu.Unlock()
-		sdm.ocmu.Unlock()
-		debug.Assert(cos.IsValidUUID(xid), xid)
-		return fmt.Errorf("cannot close %s: [%s, %d]", sdm.trname(), xid, l)
+	xid := sdm.getActive()
+	if xid != "" {
+		msg := fmt.Sprintf("xid %s is still active (num: %d)", xid, len(sdm.receivers))
+		if len(err) == 0 {
+			sdm.rxmu.Unlock()
+			sdm.ocmu.Unlock()
+			debug.Assert(cos.IsValidUUID(xid), xid)
+			return fmt.Errorf("cannot close %s: %s", sdm.trname(), msg)
+		}
+		nlog.Errorln(sdm.trname(), "closing despite", msg, "[", err[0], "]")
 	}
-
-	sdm.rxcbs = nil
-	sdm.rxmu.Unlock()
 
 	sdm.dm.Close(nil)
 	sdm.dm.UnregRecv()
+	sdm.receivers = nil
+	sdm.rxmu.Unlock()
+
 	sdm.ocmu.Unlock()
+
+	sdm.sbrs.mtx.Lock()
+	clear(sdm.sbrs.m)
+	sdm.sbrs.mtx.Unlock()
 
 	nlog.InfoDepth(1, core.T.String(), "close", sdm.trname())
 	return nil
 }
 
-func (sdm *sharedDM) RegRecv(xid string, cb transport.RecvObj) {
+// demux-level RegRecv (not to confuse with transport level)
+func (sdm *sharedDM) RegRecv(rx transport.Receiver) {
 	sdm.ocmu.Lock()
 	sdm.rxmu.Lock()
-	if !sdm.isOpen() {
-		sdm.rxmu.Unlock()
-		sdm.ocmu.Unlock()
-		debug.Assert(false, sdm.trname(), " ", "closed")
-		return
+	if sdm.isOpen() {
+		en := &rxent{rx: rx}
+		sdm.receivers[rx.ID()] = en
 	}
-	debug.Assert(sdm.rxcbs[xid] == nil)
-	sdm.rxcbs[xid] = cb
 	sdm.rxmu.Unlock()
 	sdm.ocmu.Unlock()
 }
 
+func (sdm *sharedDM) UseRecv(rx transport.Receiver) {
+	// fast path
+	sdm.rxmu.RLock()
+	_, ok := sdm.receivers[rx.ID()]
+	sdm.rxmu.RUnlock()
+	if ok {
+		return
+	}
+
+	// slow and unlikely
+	sdm.RegRecv(rx)
+}
+
+// remove demux entry immediately
 func (sdm *sharedDM) UnregRecv(xid string) {
-	sdm.ocmu.Lock()
 	sdm.rxmu.Lock()
-	if !sdm.isOpen() {
-		sdm.rxmu.Unlock()
-		sdm.ocmu.Unlock()
-		debug.Assert(false, sdm.trname(), " ", "closed")
-		return
-	}
-	delete(sdm.rxcbs, xid)
+	delete(sdm.receivers, xid)
 	sdm.rxmu.Unlock()
-	sdm.ocmu.Unlock()
 }
 
-// DEBUG
-func (sdm *sharedDM) RecvDEBUG(hdr *transport.ObjHdr, r io.Reader, err error) error {
-	return sdm.recv(hdr, r, err)
+func (sdm *sharedDM) Send(obj *transport.Obj, roc cos.ReadOpenCloser, tsi *meta.Snode, xctn core.Xact) error {
+	return sdm.dm.Send(obj, roc, tsi, xctn)
+}
+
+func (sdm *sharedDM) Bcast(obj *transport.Obj, roc cos.ReadOpenCloser) error {
+	return sdm.dm.Bcast(obj, roc)
 }
 
 func (sdm *sharedDM) recv(hdr *transport.ObjHdr, r io.Reader, err error) error {
 	if err != nil {
+		if e := transport.AsErrSBR(err); e != nil {
+			// add and prune
+			sdm.sbrs.mtx.Lock()
+			if sdm.sbrs.m == nil {
+				sdm.sbrs.m = make(map[string]*transport.ErrSBR, 4)
+			}
+			sdm.sbrs.m[e.SID()] = e
+			for sid, ee := range sdm.sbrs.m {
+				if ee != e && ee.Since() > sbrWinMax {
+					delete(sdm.sbrs.m, sid)
+				}
+			}
+			sdm.sbrs.mtx.Unlock()
+			nlog.Warningln(core.T.String(), sdm.trname(), e)
+		}
 		return err
 	}
-	xid := string(hdr.Opaque)
+	if hdr.Opcode == transport.OpcReconnect {
+		sdm.sbrs.mtx.Lock()
+		delete(sdm.sbrs.m, hdr.SID)
+		sdm.sbrs.mtx.Unlock()
+		nlog.Warningln(core.T.String(), sdm.trname(), "successful reconnect from", hdr.SID)
+		return nil
+	}
+
+	xid := hdr.Demux
 	if err := xact.CheckValidUUID(xid); err != nil {
-		return fmt.Errorf("%s: %v", sdm.trname(), err)
+		err = fmt.Errorf("%s: %w", sdm.trname(), err)
+		return err
 	}
 
-	sdm.rxmu.Lock()
-	if !sdm.isOpen() {
-		sdm.rxmu.Unlock()
-		return fmt.Errorf("%s is closed, dropping recv [xid: %s, oname: %s]", sdm.trname(), xid, hdr.ObjName)
-	}
-	cb, ok := sdm.rxcbs[xid]
-	sdm.rxmu.Unlock()
-
+	sdm.rxmu.RLock()
+	en, ok := sdm.receivers[xid]
 	if !ok {
+		sdm.rxmu.RUnlock()
 		return fmt.Errorf("%s: xid %s not found, dropping recv [oname: %s]", sdm.trname(), xid, hdr.ObjName)
 	}
-	return cb(hdr, r, nil)
+	sdm.rxmu.RUnlock()
+
+	// (unlikely)
+	if en.rx.ID() != xid {
+		err = fmt.Errorf("%s: xid mismatch [%q vs %q]", sdm.trname(), xid, en.rx.ID())
+		debug.AssertNoErr(err)
+		return err
+	}
+
+	// note: not holding rxmu locked - race vs UnregRecv possible but benign
+	if err := en.rx.RecvObj(hdr, r, nil); err != nil {
+		return err
+	}
+	ticks := en.ticks.Swap(0)
+	if ticks > 0 && cmn.Rom.V(4, cos.ModXs) {
+		nlog.Warningf("%s: xid %s has been idle for >= %v [oname: %s]", sdm.trname(),
+			xid, time.Duration(ticks)*hk.Prune2mIval, hdr.ObjName)
+	}
+	return nil
 }

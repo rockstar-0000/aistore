@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -48,11 +50,9 @@ func (p *proxy) clusterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-//
-// GET /v1/cluster - query cluster states and stats
-//
-
-// (compare w/ httpdaeget)
+// +gen:endpoint GET /v1/cluster[apc.QparamWhat=string]
+// Query cluster states, statistics, and information.
+// Supports various query types: node stats, system info, backends, remote AIS, mountpaths, etc.
 func (p *proxy) httpcluget(w http.ResponseWriter, r *http.Request) {
 	var (
 		query = r.URL.Query()
@@ -120,7 +120,7 @@ func (p *proxy) httpcluget(w http.ResponseWriter, r *http.Request) {
 		config := cmn.GCO.Get()
 		// hide secret
 		c := config.ClusterConfig
-		c.Auth.Secret = "**********"
+		c.Auth = config.Auth.PublicClone()
 		p.writeJSON(w, r, &c, what)
 	case apc.WhatBMD, apc.WhatSmapVote, apc.WhatSnode, apc.WhatSmap:
 		p.htrun.httpdaeget(w, r, query, nil /*htext*/)
@@ -348,7 +348,8 @@ func (p *proxy) _tresRaw(w http.ResponseWriter, r *http.Request, results sliceRe
 	return
 }
 
-// POST /v1/cluster - handles joins and keepalives
+// +gen:endpoint POST /v1/cluster/{operation}
+// Handle cluster join operations and node keepalives.
 func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathClu.L, 1, true)
 	if err != nil {
@@ -457,7 +458,7 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err := cmn.ParseHost2IP(nsi.PubNet.Hostname); err != nil {
+	if _, err := cmn.ParseHost2IP(nsi.PubNet.Hostname, false /*local*/); err != nil {
 		p.writeErrf(w, r, "%s: failed to %s %s: invalid hostname: %v", p.si, apiOp, nsi.StringEx(), err)
 		return
 	}
@@ -490,7 +491,8 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 	switch apiOp {
 	case apc.AdminJoin:
 		// call the node with cluster-metadata included
-		if ecode, err := p.adminJoinHandshake(smap, nsi, apiOp); err != nil {
+		includeCSK := config.Auth.CSKEnabled()
+		if ecode, err := p.adminJoinHandshake(smap, nsi, apiOp, includeCSK); err != nil {
 			p.writeErr(w, r, err, ecode)
 			return
 		}
@@ -501,7 +503,7 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 		if osi := smap.GetNode(nsi.ID()); osi != nil && !osi.Eq(nsi) {
 			ok, err := p._confirmSnode(osi, nsi) // handshake (expecting nsi in response)
 			if err != nil {
-				if !cos.IsRetriableConnErr(err) {
+				if !cos.IsErrRetriableConn(err) {
 					p.writeErrf(w, r, "failed to obtain node info: %v", err)
 					return
 				}
@@ -566,7 +568,8 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 
 	if apiOp == apc.SelfJoin {
 		// respond to the self-joining node with cluster-meta that does not include Smap
-		md, err := p.cluMeta(cmetaFillOpt{skipSmap: true})
+		includeCSK := config.Auth.CSKEnabled()
+		md, err := p.cluMeta(cmetaFillOpt{skipSmap: true, includeCSK: includeCSK})
 		if err != nil {
 			p.writeErr(w, r, err)
 			return
@@ -592,10 +595,10 @@ func (p *proxy) fastKaliveRsp(w http.ResponseWriter, r *http.Request, smap *smap
 	}
 	if fast {
 		var (
-			callerID   = r.Header.Get(apc.HdrCallerID)
-			callerSver = r.Header.Get(apc.HdrCallerSmapVer)
+			senderID   = r.Header.Get(apc.HdrSenderID)
+			senderSver = r.Header.Get(apc.HdrSenderSmapVer)
 		)
-		if callerID == sid && callerSver != "" && callerSver == smap.vstr {
+		if senderID == sid && senderSver != "" && senderSver == smap.vstr {
 			if si := smap.GetNode(sid); si != nil {
 				now := p.keepalive.heardFrom(sid)
 
@@ -618,8 +621,8 @@ func (p *proxy) fastKaliveRsp(w http.ResponseWriter, r *http.Request, smap *smap
 
 // when joining manually: update the node with cluster meta that does not include Smap
 // (the later gets finalized and metasync-ed upon success)
-func (p *proxy) adminJoinHandshake(smap *smapX, nsi *meta.Snode, apiOp string) (int, error) {
-	cm, err := p.cluMeta(cmetaFillOpt{skipSmap: true})
+func (p *proxy) adminJoinHandshake(smap *smapX, nsi *meta.Snode, apiOp string, includeCSK bool) (int, error) {
+	cm, err := p.cluMeta(cmetaFillOpt{skipSmap: true, includeCSK: includeCSK})
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
@@ -635,7 +638,7 @@ func (p *proxy) adminJoinHandshake(smap *smapX, nsi *meta.Snode, apiOp string) (
 	err = res.err
 	status := res.status
 	if err != nil {
-		if cos.IsRetriableConnErr(res.err) {
+		if cos.IsErrRetriableConn(res.err) {
 			err = fmt.Errorf("%s: failed to reach %s at %s:%s: %w",
 				p.si, nsi.StringEx(), nsi.PubNet.Hostname, nsi.PubNet.Port, res.err)
 		} else {
@@ -874,7 +877,7 @@ func (p *proxy) _joinedFinal(ctx *smapModifier, clone *smapX) {
 		bmd       = p.owner.bmd.get()
 		etlMD     = p.owner.etl.get()
 		actMsgExt = p.newAmsg(ctx.msg, bmd)
-		pairs     = make([]revsPair, 0, 5)
+		pairs     = make([]revsPair, 0, 6)
 	)
 	// when targets join as well (redundant?, minor)
 	config, err := p.ensureConfigURLs()
@@ -886,6 +889,10 @@ func (p *proxy) _joinedFinal(ctx *smapModifier, clone *smapX) {
 		// proceed anyway
 	} else if config != nil {
 		pairs = append(pairs, revsPair{config, actMsgExt})
+		if config.Auth.CSKEnabled() {
+			k := p.owner.csk.load()
+			pairs = append(pairs, revsPair{k, actMsgExt})
+		}
 	}
 
 	pairs = append(pairs, revsPair{clone, actMsgExt}, revsPair{bmd, actMsgExt})
@@ -914,7 +921,7 @@ func (p *proxy) _joinedFinal(ctx *smapModifier, clone *smapX) {
 func (p *proxy) _syncFinal(ctx *smapModifier, clone *smapX) {
 	var (
 		actMsgExt = p.newAmsg(ctx.msg, nil)
-		pairs     = make([]revsPair, 0, 2)
+		pairs     = make([]revsPair, 0, 4)
 		reb       = ctx.rmdCtx != nil && ctx.rmdCtx.rebID != ""
 	)
 	pairs = append(pairs, revsPair{clone, actMsgExt})
@@ -930,8 +937,18 @@ func (p *proxy) _syncFinal(ctx *smapModifier, clone *smapX) {
 		debug.Assert(nlog.Stopping(), err)
 		return
 	}
-	if config != nil /*updated*/ {
-		pairs = append(pairs, revsPair{config, actMsgExt})
+	if config == nil /*not updated - including anyway*/ {
+		config, err = p.owner.config.get()
+		if err != nil {
+			debug.Assert(nlog.Stopping(), err)
+			return
+		}
+	}
+
+	pairs = append(pairs, revsPair{config, actMsgExt})
+	if config.Auth.CSKEnabled() {
+		k := p.owner.csk.load()
+		pairs = append(pairs, revsPair{k, actMsgExt})
 	}
 
 	wg := p.metasyncer.sync(pairs...)
@@ -947,9 +964,10 @@ func (p *proxy) _syncFinal(ctx *smapModifier, clone *smapX) {
 // - cluster membership, including maintenance and decommission
 // - rebalance
 // - set-primary
-// - cluster-wide configuration
-// - start/stop xactions
-// - logs...
+// +gen:endpoint PUT /v1/cluster[apc.QparamTransient=bool] action=[apc.ActSetConfig=cmn.ConfigToSet|apc.ActResetConfig=apc.ActMsg|apc.ActRotateLogs=apc.ActMsg|apc.ActShutdownCluster=apc.ActMsg|apc.ActDecommissionCluster=apc.ActValRmNode|apc.ActStartMaintenance=apc.ActValRmNode|apc.ActDecommissionNode=apc.ActValRmNode|apc.ActShutdownNode=apc.ActValRmNode|apc.ActRmNodeUnsafe=apc.ActValRmNode|apc.ActStopMaintenance=apc.ActMsg|apc.ActResetStats=apc.ActMsg|apc.ActClearLcache=apc.ActMsg|apc.ActXactStart=apc.ActMsg|apc.ActXactStop=apc.ActMsg|apc.ActReloadBackendCreds=apc.ActMsg|apc.ActBumpMetasync=apc.ActMsg]
+// +gen:payload apc.ActDecommissionCluster={"action": "decommission", "value": {"sid": "target_id", "skip_rebalance": false, "rm_user_data": true}}
+// +gen:payload apc.ActResetStats={"action": "reset-stats", "value": false}
+// Administrative cluster operations: configuration changes, node management, log rotation, shutdown/decommission operations.
 func (p *proxy) httpcluput(w http.ResponseWriter, r *http.Request) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathClu.L, 0, true)
 	if err != nil {
@@ -1002,7 +1020,7 @@ func (p *proxy) cluputMsg(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		query := r.URL.Query()
-		if transient := cos.IsParseBool(query.Get(apc.ActTransient)); transient {
+		if transient := cos.IsParseBool(query.Get(apc.QparamTransient)); transient {
 			p.setCluCfgTransient(w, r, toUpdate, msg)
 		} else {
 			p.setCluCfgPersistent(w, r, toUpdate, msg)
@@ -1102,6 +1120,7 @@ func (p *proxy) cluputMsg(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// +gen:payload apc.ActSetConfig={"action": "set-config", "value": {"timeout": {"send_file_time": "10m"}}}
 func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUpdate *cmn.ConfigToSet, msg *apc.ActMsg) {
 	ctx := &configModifier{
 		pre:      _setConfPre,
@@ -1128,10 +1147,30 @@ func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUp
 			}
 		}
 	}
-	if toUpdate.Auth != nil {
-		from, _ := jsoniter.Marshal(config.Auth)
-		to, _ := jsoniter.Marshal(toUpdate.Auth)
-		whingeToUpdate("config.auth", string(from), string(to))
+	if toUpdate.Auth != nil && toUpdate.Auth.Enabled != nil {
+		authEnabled := *toUpdate.Auth.Enabled
+
+		if !config.Auth.Enabled && authEnabled {
+			// enabling auth - always validate
+			clone := new(cmn.AuthConf)
+			cos.CopyStruct(clone, &config.Auth)
+			config.Auth.CopyTo(clone)
+
+			if ecode, err := p.validateEnableAuth(r, clone, toUpdate.Auth); err != nil {
+				p.writeErr(w, r, err, ecode)
+				return
+			}
+		}
+		if config.Auth.Enabled != authEnabled {
+			whingeToUpdate("config.auth JWT/OIDC", strconv.FormatBool(config.Auth.Enabled), strconv.FormatBool(authEnabled))
+		}
+
+		if !config.Auth.CSKEnabled() && toUpdate.Auth.ClusterKey != nil {
+			cskEnabled := *toUpdate.Auth.ClusterKey.Enabled
+			if config.Auth.CSKEnabled() != cskEnabled {
+				whingeToUpdate("config.auth "+cskTag, strconv.FormatBool(config.Auth.CSKEnabled()), strconv.FormatBool(cskEnabled))
+			}
+		}
 	}
 	if toUpdate.Tracing != nil {
 		from, _ := jsoniter.Marshal(config.Tracing)
@@ -1211,7 +1250,7 @@ func (p *proxy) setCluCfgTransient(w http.ResponseWriter, r *http.Request, toUpd
 		Method: http.MethodPut,
 		Path:   apc.URLPathDae.S,
 		Body:   cos.MustMarshal(msg),
-		Query:  url.Values{apc.ActTransient: []string{"true"}},
+		Query:  url.Values{apc.QparamTransient: []string{"true"}},
 	}
 	args.to = core.AllNodes
 	p.bcastAndRespond(w, r, args)
@@ -1219,7 +1258,7 @@ func (p *proxy) setCluCfgTransient(w http.ResponseWriter, r *http.Request, toUpd
 }
 
 func _setConfPre(ctx *configModifier, clone *globalConfig) (updated bool, err error) {
-	if err = clone.Apply(ctx.toUpdate, apc.Cluster); err != nil {
+	if err = cmn.CopyProps(ctx.toUpdate, clone, apc.Cluster); err != nil {
 		return
 	}
 	updated = true
@@ -1227,13 +1266,34 @@ func _setConfPre(ctx *configModifier, clone *globalConfig) (updated bool, err er
 }
 
 func (p *proxy) _syncConfFinal(ctx *configModifier, clone *globalConfig) {
-	wg := p.metasyncer.sync(revsPair{clone, p.newAmsg(ctx.msg, nil)})
+	var (
+		wg  *sync.WaitGroup
+		msg = p.newAmsg(ctx.msg, nil)
+	)
+	switch {
+	case clone.Auth.CSKEnabled():
+		var k *clusterKey
+		if ctx.oldConfig == nil || !ctx.oldConfig.Auth.CSKEnabled() {
+			k = p.owner.csk.gen(p.owner.smap.get().Version)
+		} else {
+			k = p.owner.csk.load()
+		}
+		wg = p.metasyncer.sync(revsPair{clone, msg}, revsPair{k, msg})
+	case ctx.oldConfig != nil && ctx.oldConfig.Auth.CSKEnabled():
+		// clear locally; usage gated by Rom.CSKEnabled()
+		p.owner.csk.reset()
+		fallthrough
+	default:
+		wg = p.metasyncer.sync(revsPair{clone, msg})
+	}
+
 	if ctx.wait {
 		wg.Wait()
 	}
 }
 
 // xstart: rebalance, resilver, other "startables" (see xaction/api.go)
+// +gen:payload apc.ActXactStart={"action": "start-xaction", "name": "rebalance"}
 func (p *proxy) xstart(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	var xargs xact.ArgsMsg
 	if msg.Value != nil {
@@ -1250,11 +1310,7 @@ func (p *proxy) xstart(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 			// NOTE: limiting the scope of rebalance to a given bucket[/prefix] (advanced usage)
 			b := (*meta.Bck)(&xargs.Bck)
 			if _, present := p.owner.bmd.get().Get(b); !present {
-				if b.IsRemote() {
-					p.writeErr(w, r, cmn.NewErrRemoteBckNotFound(&xargs.Bck))
-				} else {
-					p.writeErr(w, r, cmn.NewErrBckNotFound(&xargs.Bck))
-				}
+				p.writeErr(w, r, cmn.NewErrBckNotFound(&xargs.Bck))
 				return
 			}
 		} else if msg.Name != "" {
@@ -1343,6 +1399,7 @@ func (p *proxy) blobdl(smap *smapX, xargs *xact.ArgsMsg, msg *apc.ActMsg) (tsi *
 	return tsi, err
 }
 
+// +gen:payload apc.ActXactStop={"action": "stop-xaction", "name": "rebalance"}
 func (p *proxy) xstop(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	var xargs xact.ArgsMsg
 	if err := cos.MorphMarshal(msg.Value, &xargs); err != nil {
@@ -1410,6 +1467,7 @@ func (p *proxy) _checkMaint(xargs *xact.ArgsMsg) error {
 	return nil
 }
 
+// +gen:payload apc.ActReloadBackendCreds={"action": "reload-backend-creds", "name": "aws"}
 func (p *proxy) reloadCreds(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{Method: http.MethodPut, Path: apc.URLPathDae.S, Body: cos.MustMarshal(msg)}
@@ -1463,6 +1521,10 @@ func (p *proxy) rebalanceCluster(w http.ResponseWriter, r *http.Request, msg *ap
 }
 
 // gracefully remove node via apc.ActStartMaintenance, apc.ActDecommission, apc.ActShutdownNode
+// +gen:payload apc.ActStartMaintenance={"action": "start-maintenance", "value": {"sid": "target_id", "skip_rebalance": false}}
+// +gen:payload apc.ActDecommissionNode={"action": "decommission-node", "value": {"sid": "target_id", "skip_rebalance": false, "rm_user_data": true}}
+// +gen:payload apc.ActShutdownNode={"action": "shutdown-node", "value": {"sid": "target_id", "skip_rebalance": false}}
+// +gen:payload apc.ActRmNodeUnsafe={"action": "remove-node-unsafe", "value": {"sid": "target_id", "skip_rebalance": false}}
 func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	var (
 		opts apc.ActValRmNode
@@ -1534,7 +1596,7 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 		if err != nil {
 			p.writeErr(w, r, cmn.NewErrFailedTo(p, msg.Action, si, err), ecode)
 		}
-	default: // target
+	default: // target // TODO: lookup RebalanceSkippedMarker and related comments
 		reb := !opts.SkipRebalance && cmn.GCO.Get().Rebalance.Enabled && !inMaint
 		nlog.Infof("%s: %s reb=%t", p, msg.Action, reb)
 		if reb {
@@ -1646,6 +1708,7 @@ func (p *proxy) _rebPostRm(ctx *smapModifier, clone *smapX) {
 	ctx.rmdCtx = rmdCtx
 }
 
+// +gen:payload apc.ActStopMaintenance={"action": "stop-maintenance", "value": {"sid": "target_id"}}
 func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	const tag = "stop-maintenance:"
 	var (
@@ -1673,7 +1736,6 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 	}
 	tout := cmn.Rom.CplaneOperation()
 	if _, status, err := p.reqHealth(si, tout, nil, smap, false /*retry pub-addr*/); err != nil {
-		// TODO: use cmn.KeepaliveRetryDuration()
 		sleep, retries := tout/2, 4
 
 		time.Sleep(sleep)
@@ -1738,7 +1800,7 @@ func (p *proxy) cluputItems(w http.ResponseWriter, r *http.Request, items []stri
 			p.writeErr(w, r, err)
 			return
 		}
-		if transient := cos.IsParseBool(query.Get(apc.ActTransient)); transient {
+		if transient := cos.IsParseBool(query.Get(apc.QparamTransient)); transient {
 			p.setCluCfgTransient(w, r, toUpdate, msg)
 		} else {
 			p.setCluCfgPersistent(w, r, toUpdate, msg)
@@ -1820,13 +1882,13 @@ func (p *proxy) actBackend(w http.ResponseWriter, r *http.Request, tag string, u
 		return
 	}
 	// (two-phase commit)
-	for _, phase := range []string{apc.ActBegin, apc.ActCommit} {
+	for _, phase := range []string{apc.Begin2PC, apc.Commit2PC} {
 		var (
 			path string
 			args = allocBcArgs()
 		)
 		// bcast
-		path = cos.JoinWords(upath.S, np, phase)
+		path = cos.JoinWP(upath.S, np, phase)
 		args.req = cmn.HreqArgs{Method: http.MethodPut, Path: path}
 		args.to = core.Targets
 		results := p.bcastGroup(args)
@@ -1888,7 +1950,7 @@ func (p *proxy) _remaisConf(ctx *configModifier, config *globalConfig) (bool, er
 				continue
 			}
 			errmsg := fmt.Sprintf("%s: %s is already attached", p.si, detail)
-			if !cos.StringInSlice(u, urls) {
+			if !slices.Contains(urls, u) {
 				return false, errors.New(errmsg)
 			}
 			nlog.Warningln(errmsg + " - proceeding anyway")
@@ -1988,6 +2050,9 @@ func (p *proxy) _stopMaintRMD(ctx *smapModifier, clone *smapX) {
 // DELETE /v1/cluster - self-unregister //
 //////////////////////////////////////////
 
+// +gen:endpoint DELETE /v1/cluster/daemon/{daemon-id}
+// Remove a node from the cluster by daemon ID.
+// Used for self-initiated node removal (e.g., when a node loses all mountpaths).
 func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathCluDaemon.L, 1, false)
 	if err != nil {
@@ -2025,14 +2090,14 @@ func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.checkIntraCall(r.Header, false /*from primary*/); err != nil {
-		err = fmt.Errorf("%v (action %q)", err, apc.ActSelfRemove)
+		err = fmt.Errorf("%w (action %q)", err, apc.ActSelfRemove)
 		p.writeErr(w, r, err)
 		return
 	}
 
-	cid := r.Header.Get(apc.HdrCallerID)
-	if cid != sid {
-		err = fmt.Errorf("expecting %s by %s, got a wrong node ID (%s != %s)", apc.ActSelfRemove, node.StringEx(), cid, sid)
+	senderID := r.Header.Get(apc.HdrSenderID)
+	if senderID != sid {
+		err = fmt.Errorf("expecting %s by %s, got a wrong node ID (%s != %s)", apc.ActSelfRemove, node.StringEx(), senderID, sid)
 		p.writeErr(w, r, err)
 		return
 	}
@@ -2089,11 +2154,11 @@ func (p *proxy) rmNodeFinal(msg *apc.ActMsg, si *meta.Snode, ctx *smapModifier) 
 		emsg := fmt.Sprintf("%s: (%s %s) final: %v - proceeding anyway...", p, msg, sname, err)
 		switch msg.Action {
 		case apc.ActShutdownNode, apc.ActDecommissionNode: // expecting EOF
-			if !cos.IsEOF(err) {
+			if !cos.IsAnyEOF(err) {
 				nlog.Errorln(emsg)
 			}
 		case apc.ActRmNodeUnsafe:
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.V(4, cos.ModAIS) {
 				nlog.Errorln(emsg)
 			}
 		default:

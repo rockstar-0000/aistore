@@ -64,9 +64,10 @@ type (
 		Smap      *smapX             `json:"smap"`
 		BMD       *bucketMD          `json:"bmd"`
 		RMD       *rebMD             `json:"rmd"`
-		EtlMD     *etlMD             `json:"etlMD"`
+		EtlMD     *etlMD             `json:"etlMD,omitempty"`
 		Config    *globalConfig      `json:"config"`
 		SI        *meta.Snode        `json:"si"`
+		CSK       []byte             `json:"csk,omitempty"`
 		PrimeTime int64              `json:"prime_time"`
 		Flags     cos.NodeStateFlags `json:"flags"`
 	}
@@ -151,6 +152,7 @@ type (
 		skipEtlMD     bool
 		fillRebMarker bool
 		skipPrimeTime bool
+		includeCSK    bool
 	}
 
 	getMaxCii struct {
@@ -217,7 +219,7 @@ type (
 
 var htverbs = [...]string{
 	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
-	http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace,
+	http.MethodDelete, http.MethodOptions, http.MethodTrace,
 }
 
 var (
@@ -268,7 +270,7 @@ func isErrDowngrade(err error) bool {
 	if _, ok := err.(*errDowngrade); ok {
 		return true
 	}
-	erd := &errDowngrade{}
+	var erd *errDowngrade
 	return errors.As(err, &erd)
 }
 
@@ -308,34 +310,28 @@ func (e *errNotPrimary) Error() string {
 ///////////////
 
 var (
-	bargsPool, cargsPool sync.Pool
-	bargs0               bcastArgs
-	cargs0               callArgs
+	bargsPool = sync.Pool{New: func() any { return new(bcastArgs) }}
+	cargsPool = sync.Pool{New: func() any { return new(callArgs) }}
+
+	bargs0 bcastArgs
+	cargs0 callArgs
 )
 
-func allocBcArgs() (a *bcastArgs) {
-	if v := bargsPool.Get(); v != nil {
-		a = v.(*bcastArgs)
-		return
-	}
-	return &bcastArgs{}
+func allocBcArgs() *bcastArgs {
+	return bargsPool.Get().(*bcastArgs)
 }
 
 func freeBcArgs(a *bcastArgs) {
 	sel := a.selected
 	*a = bargs0
 	if sel != nil {
-		a.selected = sel[:0]
+		a.selected = sel[:0] // keep capacity
 	}
 	bargsPool.Put(a)
 }
 
-func allocCargs() (a *callArgs) {
-	if v := cargsPool.Get(); v != nil {
-		a = v.(*callArgs)
-		return
-	}
-	return &callArgs{}
+func allocCargs() *callArgs {
+	return cargsPool.Get().(*callArgs)
 }
 
 func freeCargs(a *callArgs) {
@@ -358,18 +354,19 @@ func (cresmGeneric[T]) newV() any                              { return new(T) }
 func (c cresmGeneric[T]) read(res *callResult, body io.Reader) { res.v = c.newV(); res.mread(body) }
 
 var (
-	resultsPool sync.Pool
-	callResPool sync.Pool
-	callRes0    callResult
+	resultsPool = sync.Pool{
+		New: func() any { return new(sliceResults) },
+	}
+	callResPool = sync.Pool{
+		New: func() any { return new(callResult) },
+	}
+	callRes0 callResult
 )
 
-func allocCR() (a *callResult) {
-	if v := callResPool.Get(); v != nil {
-		a = v.(*callResult)
-		debug.Assert(a.si == nil)
-		return
-	}
-	return &callResult{}
+func allocCR() *callResult {
+	a := callResPool.Get().(*callResult)
+	debug.Assert(a.si == nil)
+	return a
 }
 
 func freeCR(res *callResult) {
@@ -378,18 +375,20 @@ func freeCR(res *callResult) {
 }
 
 func allocBcastRes(n int) sliceResults {
-	if v := resultsPool.Get(); v != nil {
-		a := v.(*sliceResults)
-		return *a
+	a := resultsPool.Get().(*sliceResults)
+	sr := *a
+	if cap(sr) < n {
+		sr = make(sliceResults, 0, n)
 	}
-	return make(sliceResults, 0, n)
+	sr = sr[:0]
+	return sr
 }
 
 func freeBcastRes(results sliceResults) {
 	for _, res := range results {
 		freeCR(res)
 	}
-	results = results[:0]
+	results = results[:0] // to reuse
 	resultsPool.Put(&results)
 }
 
@@ -430,7 +429,7 @@ func (res *callResult) toErr() error {
 		return nil
 	}
 	// is cmn.ErrHTTP
-	if herr := cmn.Err2HTTPErr(res.err); herr != nil {
+	if herr := cmn.AsErrHTTP(res.err); herr != nil {
 		// add status, details
 		if res.status >= http.StatusBadRequest {
 			herr.Status = res.status
@@ -470,7 +469,7 @@ func (res *callResult) errorf(format string, a ...any) error {
 	debug.Assert(res.err != nil)
 	// add formatted
 	msg := fmt.Sprintf(format, a...)
-	if herr := cmn.Err2HTTPErr(res.err); herr != nil {
+	if herr := cmn.AsErrHTTP(res.err); herr != nil {
 		herr.Message = msg + ": " + herr.Message
 		res.err = herr
 	} else {
@@ -503,48 +502,13 @@ func (*nlogWriter) Write(p []byte) (int, error) {
 // netServer //
 ///////////////
 
-// Override muxer ServeHTTP to support proxying HTTPS requests. Clients
-// initiate all HTTPS requests with CONNECT method instead of GET/PUT etc.
 func (server *netServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// plain
-	if r.Method != http.MethodConnect {
-		server.muxers.ServeHTTP(w, r)
-		return
-	}
-
-	// HTTPS
-	destConn, err := net.DialTimeout("tcp", r.Host, cmn.DfltDialupTimeout)
-	if err != nil {
-		cmn.WriteErr(w, r, err, http.StatusServiceUnavailable)
-		return
-	}
-
-	// hijack the connection
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		cmn.WriteErr(w, r, errors.New("response writer does not support hijacking"), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		nlog.Errorln(err)
-		return
-	}
-
-	// send/receive both ways (bi-directional tunnel)
-	// (one of those close() calls will fail, the one that loses the race)
-	go _copy(destConn, clientConn)
-	go _copy(clientConn, destConn)
+	server.muxers.ServeHTTP(w, r)
 }
 
-func _copy(destination io.WriteCloser, source io.ReadCloser) {
-	io.Copy(destination, source)
-	source.Close()
-	destination.Close()
-}
+const (
+	dfltIdleTimeout = cmn.DfltMaxIdleTimeout
+)
 
 func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Config, config *cmn.Config) error {
 	server.Lock()
@@ -553,6 +517,7 @@ func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Co
 		Handler:           server.muxers,
 		ErrorLog:          logger,
 		ReadHeaderTimeout: apc.ReadHeaderTimeout,
+		IdleTimeout:       dfltIdleTimeout,
 	}
 	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
 		server.s.ReadHeaderTimeout = timeout
@@ -681,7 +646,7 @@ func (m httpMuxers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sm.ServeHTTP(w, r)
 		return
 	}
-	w.WriteHeader(http.StatusBadRequest)
+	cmn.WriteErr405(w, r)
 }
 
 /////////////////
@@ -915,14 +880,8 @@ func newBckFromQuname(query url.Values, required bool) (*meta.Bck, error) {
 		}
 		return nil, nil
 	}
-	bck, objName := cmn.ParseUname(uname)
-	if objName != "" {
-		return nil, fmt.Errorf("bucket %s: not expecting object name (got %q)", bck.String(), objName)
-	}
-	if err := bck.Validate(); err != nil {
-		return nil, err
-	}
-	return meta.CloneBck(&bck), nil
+	bck, _, err := meta.ParseUname(uname, false)
+	return bck, err
 }
 
 func _reMirror(bprops, nprops *cmn.Bprops) bool {
@@ -940,7 +899,7 @@ func _reEC(bprops, nprops *cmn.Bprops, bck *meta.Bck, smap *smapX) (targetCnt in
 		if bprops.EC.Enabled {
 			// abort running ec-encode xaction, if exists
 			flt := xreg.Flt{Kind: apc.ActECEncode, Bck: bck}
-			xreg.DoAbort(flt, errors.New("ec-disabled"))
+			xreg.DoAbort(&flt, errors.New("ec-disabled"))
 		}
 		return
 	}

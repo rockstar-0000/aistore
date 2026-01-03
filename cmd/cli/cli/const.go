@@ -18,20 +18,21 @@ import (
 
 // top-level commands (categories - nouns)
 const (
-	commandAdvanced = "advanced"
-	commandAlias    = "alias"
-	commandArch     = "archive"
-	commandAuth     = "auth"
-	commandBucket   = "bucket"
-	commandCluster  = "cluster"
-	commandConfig   = "config"
-	commandETL      = apc.ETL
-	commandJob      = "job"
-	commandLog      = "log"
-	commandObject   = "object"
-	commandPerf     = "performance"
-	commandStorage  = "storage"
-	commandTLS      = "tls"
+	commandAdvanced  = "advanced"
+	commandAlias     = "alias"
+	commandArch      = "archive"
+	commandAuth      = "auth"
+	commandBucket    = "bucket"
+	commandCluster   = "cluster"
+	commandConfig    = "config"
+	commandDashboard = "dashboard"
+	commandETL       = apc.ETL
+	commandJob       = "job"
+	commandLog       = "log"
+	commandObject    = "object"
+	commandPerf      = "performance"
+	commandStorage   = "storage"
+	commandTLS       = "tls"
 
 	commandSearch = "search"
 )
@@ -68,9 +69,23 @@ const (
 	commandRemove    = "rm"
 	commandRename    = "mv"
 	commandSet       = "set"
-	commandStart     = apc.ActXactStart
-	commandStop      = apc.ActXactStop
-	commandWait      = "wait"
+
+	// multipart upload commands
+	commandMptUpload = "multipart-upload"
+	cmdMptCreate     = "create"
+	cmdMptPut        = "put-part"
+	cmdMptComplete   = "complete"
+	cmdMptAbort      = "abort"
+
+	// ml namespace and subcommands
+	commandML         = "ml"
+	cmdGetBatch       = "get-batch"
+	cmdLhotseGetBatch = "lhotse-get-batch"
+
+	// jobs
+	commandStart = apc.ActXactStart
+	commandStop  = apc.ActXactStop
+	commandWait  = "wait"
 
 	cmdSmap   = apc.WhatSmap
 	cmdBMD    = apc.WhatBMD
@@ -96,11 +111,13 @@ const (
 	cmdDsort        = apc.ActDsort
 	cmdRebalance    = apc.ActRebalance
 	cmdLRU          = apc.ActLRU
+	commandRechunk  = apc.ActRechunk
 	cmdStgCleanup   = "cleanup" // display name for apc.ActStoreCleanup
 	cmdScrub        = "validate"
 	cmdSummary      = "summary" // ditto apc.ActSummaryBck
 
 	cmdCluster    = commandCluster
+	cmdDashboard  = commandDashboard
 	cmdNode       = "node"
 	cmdPrimary    = "set-primary"
 	cmdList       = commandList
@@ -175,6 +192,8 @@ const (
 	cmdAuthCluster = cmdCluster
 	cmdAuthToken   = "token"
 	cmdAuthConfig  = cmdConfig
+	cmdAuthOIDC    = "oidc"
+	cmdAuthJWKS    = "jwks"
 
 	// K8s subcommans
 	cmdK8s        = "kubectl"
@@ -182,10 +201,9 @@ const (
 	cmdK8sCluster = commandCluster
 
 	// ETL subcommands
-	cmdInit    = "init"
-	cmdSpec    = "spec"
-	cmdCode    = "code"
-	cmdDetails = "details"
+	cmdInit   = "init"
+	cmdSpec   = "spec"
+	cmdErrors = "errors"
 
 	// config subcommands
 	cmdCLI        = "cli"
@@ -212,6 +230,9 @@ const (
 	countDefault       = 1
 	countUnlimited     = -1
 
+	execLinuxCommandTime     = 5 * time.Second
+	execLinuxCommandTimeLong = 30 * time.Second
+
 	logFlushTime = 10 * time.Second // as the name implies
 
 	//  progress bar: when stats stop moving (increasing)
@@ -232,6 +253,12 @@ const flagPrefix = "--"
 
 const (
 	dfltStdinChunkSize = 10 * cos.MiB
+
+	// PUT: multipart uploads (chunking)
+	dfltObjSizeLimit = 1 * cos.GiB // the object size threshold that triggers auto-chunking and multipart uploads for PUT
+	dfltChunkSize    = 1 * cos.MiB // the default chunk size for multipart uploads for PUT
+	chunkSizeMin     = cos.KiB
+	chunkSizeMax     = 5 * cos.GiB
 )
 
 const (
@@ -257,10 +284,14 @@ const (
 	indent4 = "            " // repeat(indent1, 4)
 )
 
+const separatorLine = "---"
+
 const (
 	archFormats = ".tar, .tgz or .tar.gz, .zip, .tar.lz4" // namely, archive.FileExtensions
 	archExts    = "(" + archFormats + ")"
 )
+
+const etlPipelineSeparator = ">>"
 
 // `ArgsUsage`: argument placeholders in help messages
 const (
@@ -276,8 +307,11 @@ const (
 	showPerfArgument = "Show performance counters, throughput, latency, disks, used/available capacities (" + tabtab + " specific view)"
 
 	// ETL
-	etlNameArgument     = "ETL_NAME"
-	etlNameListArgument = "ETL_NAME [ETL_NAME ...]"
+	etlNameArgument          = "ETL_NAME"
+	optionalETLNameArgument  = "[ETL_NAME]"
+	etlNameWithJobIDArgument = "ETL_NAME [JOB_ID]"
+	etlNameListArgument      = "ETL_NAME [ETL_NAME ...]"
+	etlNameOrSelectorArgs    = "[ETL_NAME ...] [--all] [-f <file-or-url>]"
 
 	// key/value
 	keyValuePairsArgument = "KEY=VALUE [KEY=VALUE...]"
@@ -292,6 +326,10 @@ const (
 
 	bucketObjectOrTemplateMultiArg = "BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]"
 
+	// Lhotse: DST_ARCHIVE is optional when using --output-template (multi-batch mode)
+	getBatchSpecArgument       = "[BUCKET[/NAME_or_TEMPLATE] ...] DST_ARCHIVE --spec [JSON_SPECIFICATION|YAML_SPECIFICATION]"
+	getBatchLhotseSpecArgument = "[BUCKET[/NAME_or_TEMPLATE] ...] [DST_ARCHIVE] --spec [JSON_SPECIFICATION|YAML_SPECIFICATION]"
+
 	bucketEmbeddedPrefixArg = "[BUCKET[/PREFIX]]"
 
 	bucketSrcArgument       = "SRC_BUCKET"
@@ -299,12 +337,18 @@ const (
 	bucketDstArgument       = "DST_BUCKET"
 	bucketNewArgument       = "NEW_BUCKET"
 
-	dsortSpecArgument = "[JSON_SPECIFICATION|YAML_SPECIFICATION|-] [SRC_BUCKET] [DST_BUCKET]"
+	dsortSpecArgument = "[SRC_BUCKET] [DST_BUCKET] --spec [JSON_SPECIFICATION|YAML_SPECIFICATION|-]"
 
 	// Objects
 	objectArgument          = "BUCKET/OBJECT_NAME"
 	optionalObjectsArgument = "BUCKET[/OBJECT_NAME] ..."
 	dstShardArgument        = bucketDstArgument + "/SHARD_NAME"
+
+	// Multipart upload arguments
+	mptCreateArgument   = objectArgument
+	mptPutArgument      = objectArgument + " UPLOAD_ID PART_NUMBER FILE_PATH"
+	mptCompleteArgument = objectArgument + " UPLOAD_ID PART_NUMBERS"
+	mptAbortArgument    = objectArgument + " UPLOAD_ID"
 
 	getObjectArgument = "BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-]"
 
@@ -332,6 +376,18 @@ const (
 	showLogArgument = nodeIDArgument
 	getLogArgument  = nodeIDArgument + " [OUT_FILE|OUT_DIR|-]"
 
+	// job columnar values
+	jobColNode   = "NODE"
+	jobColID     = "ID"
+	jobColKind   = "KIND"
+	jobColBucket = "BUCKET"
+	jobColState  = "STATE"
+
+	// job states
+	jobStateAborted  = "Aborted"
+	jobStateRunning  = "Running"
+	jobStateFinished = "Finished"
+
 	// cluster
 	showClusterArgument = "[NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]"
 
@@ -340,6 +396,8 @@ const (
 		"                NODE_ID [ inherited | local | all [CONFIG SECTION OR PREFIX]]"
 
 	showClusterConfigArgument = "[CONFIG_SECTION]"
+	showRemoteConfigArgument  = aliasArgument + " [CONFIG_SECTION]"
+	configSectionNotFoundHint = "Try '%s' to see all sections, or remove --json flag for table format"
 	nodeConfigArgument        = nodeIDArgument + " " + keyValuePairsArgument
 
 	// remais
@@ -400,7 +458,9 @@ var (
 	allRunningJobsFlag  = cli.BoolFlag{Name: scopeAll, Usage: "Include all running jobs"}
 	allFinishedJobsFlag = cli.BoolFlag{Name: scopeAll, Usage: "Include all finished jobs"}
 	rmrfFlag            = cli.BoolFlag{Name: scopeAll, Usage: "Remove all objects (use with extreme caution!)"}
+	rmAllBucketsFlag    = cli.BoolFlag{Name: scopeAll, Usage: "Remove all AIS buckets from the cluster (use with extreme caution - cannot be undone)"}
 	allLogsFlag         = cli.BoolFlag{Name: scopeAll, Usage: "Download all logs"}
+	evictAllBucketsFlag = cli.BoolFlag{Name: scopeAll, Usage: "Evict all remote buckets from the cluster (use with extreme caution)"}
 
 	allObjsOrBcksFlag = cli.BoolFlag{
 		Name: scopeAll,
@@ -455,6 +515,22 @@ var (
 	}
 
 	//
+	// multipart upload flags
+	//
+	mptUploadIDFlag = cli.StringFlag{
+		Name:  "upload-id",
+		Usage: "Multipart upload ID returned from create operation",
+	}
+	mptPartNumberFlag = cli.IntFlag{
+		Name:  "part-number",
+		Usage: "Part number for multipart upload (starting from 1)",
+	}
+	mptPartNumbersFlag = cli.StringFlag{
+		Name:  "part-numbers",
+		Usage: "Comma-separated list of part numbers for completion, e.g.: '1,2,3,4'",
+	}
+
+	//
 	// longRunFlags
 	//
 	refreshFlag = DurationFlag{
@@ -502,12 +578,25 @@ var (
 		Usage: "Regular expression to select jobs by name, kind, or description, e.g.: --regex \"ec|mirror|elect\"",
 	}
 
+	columnFilterFlag = cli.StringFlag{
+		Name: "filter",
+		Usage: "Regular expression to filter job table rows based on column values, format: \"COLUMN=PATTERN\", e.g.:\n" +
+			indent4 + "\t--filter \"STATE=Running\" - show only running jobs\n" +
+			indent4 + "\t--filter \"NODE=(FFIt8090|UTat8088)\" - show jobs for specific nodes\n" +
+			indent4 + "\t--filter \"BUCKET=.*ais-.*\" - show jobs for buckets matching pattern\n" +
+			indent4 + "\t--filter \"KIND=rebalance.*\" - show only rebalance jobs\n" +
+			indent4 + "\tnote: use --all to include finished jobs in any filter",
+	}
+
 	jsonFlag     = cli.BoolFlag{Name: "json,j", Usage: "JSON input/output"}
 	noHeaderFlag = cli.BoolFlag{Name: "no-headers,H", Usage: "Display tables without headers"}
 	noFooterFlag = cli.BoolFlag{Name: "no-footers,F", Usage: "Display tables without footers"}
 
-	progressFlag = cli.BoolFlag{Name: "progress", Usage: "Show progress bar(s) and progress of execution in real time"}
-	dryRunFlag   = cli.BoolFlag{Name: "dry-run", Usage: "Preview the results without really running the action"}
+	progressFlag = cli.BoolFlag{
+		Name:  "progress",
+		Usage: "Show progress bar(s) and progress of execution in real time; 'object get' with multiple objects: show number of objects processed",
+	}
+	dryRunFlag = cli.BoolFlag{Name: "dry-run", Usage: "Preview the results without really running the action"}
 
 	verboseFlag    = cli.BoolFlag{Name: "verbose,v", Usage: "Verbose output"}
 	verboseJobFlag = cli.BoolFlag{Name: verboseFlag.Name, Usage: "Show extended statistics"}
@@ -526,26 +615,35 @@ var (
 		Usage: "Ignore \"soft\" failures such as \"bucket already exists\", etc.",
 	}
 
-	// TODO: ditto `--select` (to select object props)
-
 	bucketPropsFlag = cli.StringFlag{
 		Name: "props",
 		Usage: "Create bucket with the specified (non-default) properties, e.g.:\n" +
 			indent1 + "\t* ais create ais://mmm --props=\"versioning.validate_warm_get=false versioning.synchronize=true\"\n" +
 			indent1 + "\t* ais create ais://nnn --props='mirror.enabled=true mirror.copies=4 checksum.type=md5'\n" +
-			indent1 + "\t(tip: use '--props' to override properties that a new bucket inherits from cluster config at creation time;\n" +
-			indent1 + "\t see also: 'ais bucket props show' and 'ais bucket props set')",
+			indent1 + "\t* ais create s3://bbb --props='extra.cloud.profile=prod extra.cloud.endpoint=https://s3.example.com'\n" +
+			"\tTips:\n" +
+			indent1 + "\t  1) Use '--props' to override properties that a new bucket would normally inherit from cluster config at creation time.\n" +
+			indent1 + "\t  2) Use '--props' to set up an existing cloud bucket with a custom profile and/or custom endpoint/region.\n" +
+			indent1 + "\tSee also: 'ais bucket props show' and 'ais bucket props set'",
 	}
 
-	forceFlag    = cli.BoolFlag{Name: "force,f", Usage: "Force execution of the command " + advancedUsageOnly}
+	forceFlag = cli.BoolFlag{Name: "force,f", Usage: "Force execution of the command " + advancedUsageOnly}
+
+	// space cleanup
+
 	forceClnFlag = cli.BoolFlag{
 		Name: forceFlag.Name,
-		Usage: "Disregard interrupted rebalance and possibly other conditions preventing full cleanup\n" +
-			indent1 + "\t(tip: check 'ais config cluster lru.dont_evict_time' as well)",
+		Usage: "Proceed with removing misplaced objects even if global rebalance (or local resilver) is running or was interrupted,\n" +
+			indent1 + "\tor the node has recently restarted. Does not override the 'dont_cleanup_time' window or other flags",
 	}
 
-	// TODO: rm smaller than
 	rmZeroSizeFlag = cli.BoolFlag{Name: "rm-zero-size", Usage: "Remove zero size objects " + advancedUsageOnly}
+
+	keepMisplacedFlag = cli.BoolFlag{
+		Name: "keep-misplaced",
+		Usage: "Do not remove misplaced objects (default: remove after 'dont_cleanup_time' grace period)\n" +
+			indent1 + "\tTip: use 'ais config cluster log.modules space' to enable logging for dry-run visibility",
+	}
 
 	smallSizeFlag = cli.StringFlag{
 		Name:  "small-size",
@@ -568,6 +666,11 @@ var (
 	dateTimeFlag = cli.BoolFlag{
 		Name:  "date-time",
 		Usage: "Override the default hh:mm:ss (hours, minutes, seconds) time format - include calendar date as well",
+	}
+
+	topFlag = cli.IntFlag{
+		Name:  "top",
+		Usage: "Show top N most recent jobs (e.g., --top 5 to show the 5 most recent jobs)",
 	}
 
 	// list-objects
@@ -605,6 +708,12 @@ var (
 	countAndTimeFlag = cli.BoolFlag{
 		Name:  "count-only",
 		Usage: "Print only the resulting number of listed objects and elapsed time",
+	}
+
+	// show CHUNKED column (manifest-backed objects)
+	chunkedColumnFlag = cli.BoolFlag{
+		Name:  "chunked",
+		Usage: "Include CHUNKED column indicating chunked storage. Also enabled by '--props all'.",
 	}
 
 	// bucket summary
@@ -708,7 +817,37 @@ var (
 		Usage: "Path to file containing JSON array of object names to download",
 	}
 
-	// sync
+	// HuggingFace flags for downloading convenience
+	hfModelFlag = cli.StringFlag{
+		Name: "hf-model",
+		Usage: "HuggingFace model repository name, e.g.:\n" +
+			indent4 + "\t--hf-model bert-base-uncased\n" +
+			indent4 + "\t--hf-model microsoft/DialoGPT-medium\n" +
+			indent4 + "\t--hf-model openai/whisper-large-v2",
+	}
+	hfDatasetFlag = cli.StringFlag{
+		Name: "hf-dataset",
+		Usage: "HuggingFace dataset repository name, e.g.:\n" +
+			indent4 + "\t--hf-dataset squad\n" +
+			indent4 + "\t--hf-dataset glue\n" +
+			indent4 + "\t--hf-dataset lhoestq/demo1",
+	}
+	hfFileFlag = cli.StringFlag{
+		Name:  "hf-file",
+		Usage: "Specific file to download from HF repository (optional, downloads entire repository if not specified)",
+	}
+	hfRevisionFlag = cli.StringFlag{
+		Name:  "hf-revision",
+		Value: "main",
+		Usage: "HuggingFace repository revision/branch/tag (default: main)",
+	}
+	hfAuthFlag = cli.StringFlag{
+		Name:   "hf-auth",
+		Usage:  "HuggingFace authentication token for private repositories",
+		EnvVar: "HF_TOKEN",
+	}
+
+	// latestVer and sync
 	latestVerFlag = cli.BoolFlag{
 		Name: "latest",
 		Usage: "Check in-cluster metadata and, possibly, GET, download, prefetch, or otherwise copy the latest object version\n" +
@@ -720,7 +859,7 @@ var (
 			indent1 + "\t\t- 'ais bucket props set BUCKET versioning'\n" +
 			indent1 + "\t\t- 'ais ls --check-versions'\n" +
 			indent1 + "\tsupported commands include:\n" +
-			indent1 + "\t\t- 'ais cp', 'ais prefetch', 'ais get'",
+			indent1 + "\t\t- 'ais cp', 'ais prefetch', 'ais get', 'ais start rebalance'",
 	}
 	syncFlag = cli.BoolFlag{
 		Name: "sync",
@@ -733,6 +872,7 @@ var (
 			indent1 + "\tsee also:\n" +
 			indent1 + "\t\t- 'ais show bucket BUCKET versioning'\n" +
 			indent1 + "\t\t- 'ais bucket props set BUCKET versioning'\n" +
+			indent1 + "\t\t- 'ais start rebalance'\n" +
 			indent1 + "\t\t- 'ais ls --check-versions'",
 	}
 
@@ -754,9 +894,11 @@ var (
 		Usage: "TAR file format selection (one of \"" + dfltTform + "\", \"USTAR\", \"PAX\", or \"GNU\")",
 	}
 
-	// dsort
-	dsortLogFlag  = cli.StringFlag{Name: "log", Usage: "Filename to log metrics (statistics)"}
-	dsortSpecFlag = cli.StringFlag{Name: "file,f", Value: "", Usage: "Path to JSON or YAML job specification"}
+	// (ETL, dSort, get-batch) specification
+	// see also: lhotseManifestFlag
+	specFlag = cli.StringFlag{Name: "spec,f", Value: "", Usage: "Path to JSON or YAML request specification"}
+
+	dsortLogFlag = cli.StringFlag{Name: "log", Usage: "Filename to log metrics (statistics)"}
 
 	cleanupFlag = cli.BoolFlag{
 		Name:  "cleanup",
@@ -793,7 +935,7 @@ var (
 			indent4 + "\tor, when listing files and/or directories:\n" +
 			indent4 + "\t--list \"/home/docs, /home/abc/1.tar, /home/abc/1.jpeg\"",
 	}
-	templateFlag = cli.StringFlag{
+	templateFlag = cli.StringFlag{ // see also: outputTemplateFlag
 		Name: "template",
 		Usage: "Template to match object or file names; may contain prefix (that could be empty) with zero or more ranges\n" +
 			"\t(with optional steps and gaps), e.g.:\n" +
@@ -927,6 +1069,12 @@ var (
 		Usage: "Chunk size in IEC or SI units, or \"raw\" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')",
 	}
 
+	// usage: rechunk
+	objSizeLimitFlag = cli.StringFlag{
+		Name:  "objsize-limit",
+		Usage: "Object size threshold for chunking in IEC or SI units (e.g.: 50MiB, 100mb); objects >= this size will be chunked",
+	}
+
 	blobThresholdFlag = cli.StringFlag{
 		Name: "blob-threshold",
 		Usage: "Utilize built-in blob-downloader for remote objects greater than the specified (threshold) size\n" +
@@ -935,7 +1083,13 @@ var (
 
 	blobDownloadFlag = cli.BoolFlag{
 		Name:  apc.ActBlobDl,
-		Usage: "Utilize built-in blob-downloader (and the corresponding alternative datapath) to read very large remote objects",
+		Usage: "Use blob-downloader to fetch large objects from remote backend into AIStore cluster (see docs/blob_downloader.md)",
+	}
+
+	mpdFlag = cli.BoolFlag{
+		Name: "mpd",
+		Usage: "Use multipart download to read large objects from AIStore cluster to the client-side;\n" +
+			indent4 + "\tfor single-object download only; use '--chunk-size' and '--num-workers' to configure",
 	}
 
 	// num-workers
@@ -1048,6 +1202,10 @@ var (
 		Name:  "include-src-bck",
 		Usage: "Prefix the names of archived files with the source bucket name",
 	}
+	omitSrcBucketNameFlag = cli.BoolFlag{
+		Name:  "omit-src-bck",
+		Usage: "When set, strip source bucket names from paths inside the archive (ie., use object names only)",
+	}
 
 	archSrcDirNameFlag = cli.BoolFlag{
 		Name:  "include-src-dir",
@@ -1072,7 +1230,7 @@ var (
 
 	continueOnErrorFlag = cli.BoolFlag{
 		Name:  "cont-on-err",
-		Usage: "Keep running archiving xaction (job) in presence of errors in a any given multi-object transaction",
+		Usage: "Keep running archiving xaction (job) in presence of errors in any given multi-object transaction",
 	}
 	// end archive
 
@@ -1116,20 +1274,6 @@ var (
 		Usage: "Additional arguments applying to transform a single object;\n" +
 			indent4 + "\t--args=abc\t- send \"etl_args=abc\" as query parameter in the single object transformation request",
 	}
-	fromFileFlag = cli.StringFlag{
-		Name:     "from-file",
-		Usage:    "Absolute path to the file with the spec/code for ETL",
-		Required: true,
-	}
-	depsFileFlag = cli.StringFlag{
-		Name:  "deps-file",
-		Usage: "Absolute path to the file with dependencies that must be installed before running the code",
-	}
-	runtimeFlag = cli.StringFlag{
-		Name:     "runtime",
-		Usage:    "Python version used to run the provided code (currently supported: python3.9v2, python3.10v2, python3.11v2, python3.12v2, python3.13v2)",
-		Required: true,
-	}
 	commTypeFlag = cli.StringFlag{
 		Name: "comm-type",
 		Usage: "Enumerated communication type used between aistore cluster and ETL containers that run custom transformations:\n" +
@@ -1139,19 +1283,6 @@ var (
 			indent4 + "\t - 'io' or 'io://' - for each request an aistore node will: run ETL container locally, write data\n" +
 			indent4 + "\t   to its standard input and then read transformed data from the standard output\n" +
 			indent4 + "\t For more details, see https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#communication-mechanisms",
-	}
-
-	funcTransformFlag = cli.StringFlag{
-		Name:  "transform",
-		Value: "transform", // NOTE: default name of the transform() function
-		Usage: "Receives and _transforms_ the payload",
-	}
-	argTypeFlag = cli.StringFlag{
-		Name: "arg-type",
-		Usage: "Specifies _how_ an object to transform gets passed from aistore to ETL container:\n" +
-			indent4 + "\t - \"\" - The default option (that can be omitted), whereby ETL container receives an entire payload (bytes) to transform\n" +
-			indent4 + "\t - url - URL that points towards the data to transform (the support is currently limited to '--comm-type=hpull')\n" +
-			indent4 + "\t - fqn - Fully-qualified name (FQN) of a locally stored object (requires trusted ETL container, might not be always available)",
 	}
 
 	// Node
@@ -1237,5 +1368,36 @@ var (
 	encodeObjnameFlag = cli.BoolFlag{
 		Name:  "encode-objname",
 		Usage: "Encode object names that contain special symbols (; : ' \" < > / \\ | ? #) that may otherwise break shell parsing or URL interpretation",
+	}
+
+	streamingGetFlag = cli.BoolFlag{
+		Name:  "streaming",
+		Usage: "stream the resulting archive prior to finalizing it in memory",
+	}
+
+	//
+	// Lhotse
+	//
+	lhotseManifestFlag = cli.StringFlag{ // see also: specFlag
+		Name:     "cuts",
+		Usage:    "path to Lhotse cuts.jsonl or cuts.jsonl.gz or cuts.jsonl.lz4",
+		Required: true,
+	}
+	sampleRateFlag = cli.IntFlag{
+		Name:  "sample-rate",
+		Usage: "audio sample-rate (Hz); used to convert sample offsets (in seconds) to byte offsets",
+	}
+	batchSizeFlag = cli.IntFlag{
+		Name:  "batch-size",
+		Usage: "number of cuts per output file",
+	}
+	outputTemplateFlag = cli.StringFlag{ // see also: (input) templateFlag
+		Name:  "output-template",
+		Usage: "template for multiple output files (e.g. 'batch-{001..999}.tar')",
+	}
+
+	outputTemplateForGenShards = cli.StringFlag{
+		Name:  outputTemplateFlag.Name,
+		Usage: "template for file names inside each shard (e.g. 'audio-{01..10}.wav')",
 	}
 )

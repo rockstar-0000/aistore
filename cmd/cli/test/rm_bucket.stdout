@@ -1,2 +1,6 @@
 "ais://$BUCKET_1" created
 "ais://$BUCKET_1" destroyed
+"ais://$BUCKET_1" created
+"ais://$BUCKET_2" created
+"ais://$BUCKET_1" destroyed
+"ais://$BUCKET_2" destroyed

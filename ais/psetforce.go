@@ -458,7 +458,7 @@ func (p *proxy) _cluJoinSelf(npsi *meta.Snode, nurl string) error {
 	if e == nil {
 		return nil
 	}
-	nlog.Errorln(res.toErr())
+	nlog.Errorln(eh)
 	if joinURL != secondURL {
 		nlog.Warningln("2nd attempt via", secondURL)
 		runtime.Gosched()
@@ -672,7 +672,7 @@ func (h *htrun) daeForceJoin(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	prepare, err := cos.ParseBool(q.Get(apc.QparamPrepare))
 	if err != nil {
-		err := fmt.Errorf("failed to parse %q query: %v", apc.QparamPrepare, err)
+		err := fmt.Errorf("failed to parse %q query: %w", apc.QparamPrepare, err)
 		h.writeErr(w, r, err)
 		return
 	}
@@ -692,12 +692,12 @@ func (h *htrun) daeForceJoin(w http.ResponseWriter, r *http.Request) {
 func (h *htrun) _prepForceJoin(w http.ResponseWriter, r *http.Request, msg *actMsgExt) {
 	const tag = "prep-force-join:"
 	var (
-		callerID = r.Header.Get(apc.HdrCallerID)
+		senderID = r.Header.Get(apc.HdrSenderID)
 		smap     = h.owner.smap.get()
-		psi      = smap.GetNode(callerID)
+		psi      = smap.GetNode(senderID)
 	)
 	if !smap.IsPrimary(psi) {
-		h.writeErrf(w, r, "%s expecting %s call from primary, got %q", h, tag, callerID)
+		h.writeErrf(w, r, "%s expecting %s call from primary, got %q", h, tag, senderID)
 		return
 	}
 
@@ -714,7 +714,7 @@ func (h *htrun) _prepForceJoin(w http.ResponseWriter, r *http.Request, msg *actM
 		tout   = cmn.Rom.CplaneOperation()
 	)
 	if _, code, err := h.reqHealth(npsi, tout, nil, nsmap /* -> header */, true /*retry pub-addr*/); err != nil {
-		err = fmt.Errorf("%s failed to req-health %s, err: %v(%d)", tag, npname, err, code)
+		err = fmt.Errorf("%s failed to req-health %s, err: %w(%d)", tag, npname, err, code)
 		h.writeErr(w, r, err)
 		return
 	}
@@ -739,7 +739,7 @@ func (h *htrun) _commitForceJoin(w http.ResponseWriter, r *http.Request, msg *ac
 	// update cluMeta in mem (= destination, brute force)
 	nconfig := &ncm.Config.ClusterConfig
 	if err := cmn.GCO.Update(nconfig); err != nil {
-		err = fmt.Errorf("%s failed to update config %s: %v", tag, nconfig.String(), err)
+		err = fmt.Errorf("%s failed to update config %s: %w", tag, nconfig.String(), err)
 		debug.AssertNoErr(err)
 		h.writeErr(w, r, err)
 		return
@@ -765,7 +765,7 @@ func (h *htrun) _commitForceJoin(w http.ResponseWriter, r *http.Request, msg *ac
 	// retry once
 	if joinURL != secondURL {
 		time.Sleep(time.Second)
-		nlog.Errorln(tag, res.toErr(), "- 2nd attempt via", secondURL)
+		nlog.Errorln(tag, eh, "- 2nd attempt via", secondURL)
 		res = h.regTo(secondURL, npsi, apc.DefaultTimeout, nil, false)
 		eh = res.toErr()
 		freeCR(res)
@@ -845,7 +845,7 @@ func (p *proxy) daeSetPrimary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if prepare {
-		if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+		if cmn.Rom.V(4, cos.ModAIS) {
 			nlog.Infoln("Preparation step: do nothing")
 		}
 		return

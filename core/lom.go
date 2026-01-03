@@ -7,6 +7,7 @@ package core
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
@@ -54,6 +55,7 @@ type (
 		cmn.ObjAttrs
 		atimefs uint64 // (high bit `lomDirtyMask` | int64: atime)
 		lid     lomBID // (for bitwise structure, see lombid.go)
+		flags   uint64 // reserve (storage-class, compression/encryption, write-back, etc.)
 	}
 	LOM struct {
 		mi      *fs.Mountpath
@@ -90,7 +92,6 @@ var (
 // interface guard
 var (
 	_ cos.OAH     = (*LOM)(nil)
-	_ fs.PartsFQN = (*LOM)(nil)
 	_ lifUnlocker = (*LOM)(nil)
 )
 
@@ -100,7 +101,7 @@ func Tinit(t Target, config *cmn.Config, runHK bool) {
 	bckLocker = newNameLocker()
 	T = t
 	{
-		g.maxLmeta.Store(xattrMaxSize)
+		g.maxLmeta.Store(xattrLomSize)
 		g.locker = newNameLocker()
 		g.pmm = t.PageMM()
 		g.smm = t.ByteMM()
@@ -140,9 +141,11 @@ func (lom *LOM) Lsize(special ...bool) int64 {
 	return lom.md.Size
 }
 
+func (lom *LOM) loaded() bool { return lom.md.lid != 0 } // internal
+
 // low-level access to the os.FileInfo of a chunk or whole file
 func (lom *LOM) Fstat(getAtime bool) (size, atimefs int64, mtime time.Time, _ error) {
-	finfo, err := os.Stat(lom.FQN)
+	finfo, err := os.Lstat(lom.FQN)
 	if err == nil {
 		size = finfo.Size() // NOTE: chunk?
 		mtime = finfo.ModTime()
@@ -162,24 +165,192 @@ func (lom *LOM) VersionPtr() *string     { return lom.md.Ver }
 func (lom *LOM) SetVersion(ver string)   { lom.md.SetVersion(ver) }
 func (lom *LOM) CopyVersion(oah cos.OAH) { lom.md.CopyVersion(oah) }
 
+func (lom *LOM) IncVersion() error {
+	debug.Assert(lom.Bck().IsAIS())
+	v := lom.md.Version()
+	if v == "" {
+		lom.SetVersion(lomInitialVersion)
+		return nil
+	}
+	ver, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("%s: %v", lom, err)
+	}
+	lom.SetVersion(strconv.Itoa(ver + 1))
+	return nil
+}
+
 func (lom *LOM) Uname() string     { return *lom.md.uname }
 func (lom *LOM) UnamePtr() *string { return lom.md.uname }
 func (lom *LOM) Digest() uint64    { return lom.digest }
 
 func (lom *LOM) SetSize(size int64) { lom.md.Size = size }
 
-func (lom *LOM) Checksum() *cos.Cksum      { return lom.md.Cksum }
-func (lom *LOM) SetCksum(cksum *cos.Cksum) { lom.md.Cksum = cksum }
+func (lom *LOM) Checksum() *cos.Cksum { return lom.md.Cksum }
 func (lom *LOM) EqCksum(cksum *cos.Cksum) bool {
-	return !lom.md.Cksum.IsEmpty() && lom.md.Cksum.Equal(cksum)
+	return !cos.NoneC(lom.md.Cksum) && lom.md.Cksum.Equal(cksum)
+}
+
+func (lom *LOM) SetCksum(cksum *cos.Cksum) {
+	if !cos.NoneC(cksum) {
+		debug.AssertNoErr(cksum.Validate())
+	}
+	lom.md.Cksum = cksum
 }
 
 func (lom *LOM) Atime() time.Time      { return time.Unix(0, lom.md.Atime) }
 func (lom *LOM) AtimeUnix() int64      { return lom.md.Atime }
 func (lom *LOM) SetAtimeUnix(tu int64) { lom.md.Atime = tu }
 
+// Object metadata normalization rules: Last-Modified and ETag
+// The following rules define how AIS derives HTTP-visible object metadata
+// (Last-Modified and ETag) in a consistent way across:
+//   - cloud buckets
+//   - AIS buckets
+//   - objects with or without checksums
+// --------------------
+// Last-Modified
+// --------------------
+// 1) If object custom metadata contains `cos.HdrLastModified`
+//    (typically populated from a cloud backend), it ALWAYS takes precedence.
+//    The value is expected to be RFC1123 / http.TimeFormat (GMT), as required
+//    by HTTP and S3 semantics.
+// 2) Otherwise, Last-Modified is derived from the local filesystem mtime
+//    (via syscall) and formatted as http.TimeFormat.
+// Notes:
+// - This keeps HTTP semantics correct (RFC 9110).
+// - List-objects uses cmn.LsoLastModified instead, which is RFC3339 and
+//   intentionally separate.
+// - atime is NOT used for HTTP Last-Modified.
+// --------------------
+// ETag
+// --------------------
+//   * Internally (custom metadata, ObjAttrs):
+//       - ETag is always stored unquoted.
+//   * Externally (HTTP headers, S3 XML responses):
+//       - ETag is always quoted.
+// Precedence and generation rules:
+// 1) If custom metadata contains ETag (typically from a cloud backend),
+//    it always wins and is returned as is (unquoted internally).
+// 2) Otherwise, if the object has an MD5 checksum, the MD5 value is used
+//    as the ETag (still unquoted).
+// 3) Otherwise, if the object has a non-MD5 checksum, a deterministic,
+//    collision-resistant synthetic ETag is generated:
+//        "v1-<checksum>-<mtime>"
+//    where:
+//      - <checksum> is the stored checksum value
+//      - <mtime> is filesystem mtime (via syscall) encoded in base-36
+// Notes:
+// - ETag is treated as an opaque identifier, per S3 specification.
+// - No attempt is made to preserve MD5 semantics unless MD5 actually exists.
+// - Objects explicitly configured to have no checksums intentionally
+//   do not receive an ETag.
+// and finally:
+// - Users who require strict S3-compatible semantics (for example, when
+//   using S3 SDKs such as boto3) are strongly encouraged to configure
+//   MD5 checksums at the bucket level.
+
+func (lom *LOM) LastModified() (time.Time, error) {
+	if s, ok := lom.GetCustomKey(cos.HdrLastModified); ok {
+		if mtime, err := time.Parse(http.TimeFormat, s); err == nil { // GMT/UTC
+			return mtime, nil
+		}
+	}
+	// (note: syscall)
+	return fs.MtimeUTC(lom.FQN)
+}
+
+// (same as above when callers want a string)
+func (lom *LOM) LastModifiedStr() string {
+	if v, ok := lom.GetCustomKey(cos.HdrLastModified); ok {
+		debug.AssertFunc(func() bool {
+			_, err := time.Parse(http.TimeFormat, v)
+			return err == nil
+		})
+		return v
+	}
+	// (note: syscall)
+	mtime, err := fs.MtimeUTC(lom.FQN)
+	if err != nil {
+		nlog.Errorln(lom.Cname(), "unexpected failure to get last-modified:", err)
+		return ""
+	}
+	return mtime.Format(http.TimeFormat)
+}
+
+// NOTE
+// - (list-objects, S3): prefer stored RFC3339 (cmn.LsoLastModified);
+// - else convert Last-Modified (http.TimeFormat) to RFC3339;
+// - else (perf) fall back to atime when available
+func (lom *LOM) LastModifiedLso() string {
+	if s, ok := lom.GetCustomKey(cmn.LsoLastModified); ok {
+		return s
+	}
+	if s, ok := lom.GetCustomKey(cos.HdrLastModified); ok {
+		if mtime, err := time.Parse(http.TimeFormat, s); err == nil { // GMT/UTC
+			return mtime.Format(time.RFC3339)
+		}
+	}
+	if lom.AtimeUnix() != 0 {
+		return lom.Atime().UTC().Format(time.RFC3339)
+	}
+	return ""
+}
+
+// allowGen=false: return only existing (custom or MD5) values
+// allowGen=true:  as the name implies
+func (lom *LOM) ETag(allowGen bool) string {
+	// 1. ETag via custom
+	if etag, ok := lom.GetCustomKey(cmn.ETag); ok {
+		debug.Assert(etag != "" && etag[0] != '"')
+		return etag
+	}
+
+	cksum := lom.Checksum()
+	if cos.NoneC(cksum) {
+		return "" // (no checksum => no ETag)
+	}
+
+	// 2. MD5
+	if !lom.IsChunked() && cksum.Ty() == cos.ChecksumMD5 {
+		debug.Assert(cksum.Val()[0] != '"', cksum.Val())
+		return cksum.Val()
+	}
+
+	if !allowGen {
+		return ""
+	}
+
+	// 3. make ETag
+	mtime, err := fs.MtimeUTC(lom.FQN)
+	if err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(lom.md.Cksum.Val()) + 24)
+	sb.WriteString("v1-")
+	sb.WriteString(lom.md.Cksum.Val())
+	sb.WriteByte('-')
+	sb.WriteString(strconv.FormatInt(mtime.UnixNano(), 36))
+
+	return sb.String()
+}
+
+//
+// BID, `lomBID` (type), and the two MetaverLOM_V1 `lomFlags`
+//
+
 func (lom *LOM) bid() uint64             { return lom.md.lid.bid() }
 func (lom *LOM) setbid(bpropsBID uint64) { lom.md.lid = lom.md.lid.setbid(bpropsBID) }
+func (lom *LOM) setlmfl(fl lomFlags)     { lom.md.lid = lom.md.lid.setlmfl(fl) }
+func (lom *LOM) clrlmfl(fl lomFlags)     { lom.md.lid = lom.md.lid.clrlmfl(fl) }
+
+func (lom *LOM) IsChunked(special ...bool) bool { // same convention as Lsize
+	debug.Assert(len(special) > 0 || lom.loaded(), lom.String())
+	return lom.md.lid.haslmfl(lmflChunk)
+}
+
+func (lom *LOM) IsFntl() bool { return lom.md.lid.haslmfl(lmflFntl) }
 
 // custom metadata
 func (lom *LOM) GetCustomMD() cos.StrKVs   { return lom.md.GetCustomMD() }
@@ -187,6 +358,7 @@ func (lom *LOM) SetCustomMD(md cos.StrKVs) { lom.md.SetCustomMD(md) }
 
 func (lom *LOM) GetCustomKey(key string) (string, bool) { return lom.md.GetCustomKey(key) }
 func (lom *LOM) SetCustomKey(key, value string)         { lom.md.SetCustomKey(key, value) }
+func (lom *LOM) DelCustomKey(key string)                { lom.md.DelCustomKey(key) }
 
 // subj to resilvering
 func (lom *LOM) IsHRW() bool {
@@ -194,27 +366,37 @@ func (lom *LOM) IsHRW() bool {
 	return lom.HrwFQN == p || lom.FQN == *lom.HrwFQN
 }
 
-// assorted accessors
+// assorted _convenient_ accessors
 func (lom *LOM) Bck() *meta.Bck                 { return &lom.bck }
 func (lom *LOM) Bprops() *cmn.Bprops            { return lom.bck.Props }
 func (lom *LOM) ECEnabled() bool                { return lom.Bprops().EC.Enabled }
 func (lom *LOM) IsFeatureSet(f feat.Flags) bool { return lom.Bprops().Features.IsSet(f) }
 func (lom *LOM) MirrorConf() *cmn.MirrorConf    { return &lom.Bprops().Mirror }
-func (lom *LOM) CksumConf() *cmn.CksumConf      { return lom.bck.CksumConf() }
-func (lom *LOM) CksumType() string              { return lom.bck.CksumConf().Type }
 func (lom *LOM) VersionConf() cmn.VersionConf   { return lom.bck.VersionConf() }
-func (lom *LOM) Location() string               { return T.String() + apc.LocationPropSepa + lom.mi.String() }
+func (lom *LOM) CksumConf() *cmn.CksumConf      { return lom.bck.CksumConf() }
+
+// more cksum conf
+func (lom *LOM) CksumType() string {
+	c := lom.bck.CksumConf()
+	if c.Type == "" || c.Type == cos.ChecksumNone {
+		return cos.ChecksumNone
+	}
+	return c.Type
+}
+func (lom *LOM) ValidateWarmGet() bool {
+	return lom.CksumType() != cos.ChecksumNone && lom.CksumConf().ValidateWarmGet
+}
+func (lom *LOM) ValidateColdGet() bool {
+	return lom.CksumType() != cos.ChecksumNone && lom.CksumConf().ValidateColdGet
+}
+
+// to report via list-objects and HEAD()
+func (lom *LOM) Location() string { return T.String() + apc.LocationPropSepa + lom.mi.String() }
 
 // as fs.PartsFQN
 func (lom *LOM) ObjectName() string       { return lom.ObjName }
 func (lom *LOM) Bucket() *cmn.Bck         { return (*cmn.Bck)(&lom.bck) }
 func (lom *LOM) Mountpath() *fs.Mountpath { return lom.mi }
-
-// chunks vs whole // TODO: NIY
-func (lom *LOM) IsChunked(special ...bool) bool {
-	debug.Assert(len(special) > 0 || lom.loaded())
-	return false
-}
 
 func ParseObjLoc(loc string) (tname, mpname string) {
 	i := strings.IndexByte(loc, apc.LocationPropSepa[0])
@@ -234,8 +416,6 @@ func (lom *LOM) WritePolicy() (p apc.WritePolicy) {
 	return
 }
 
-func (lom *LOM) loaded() bool { return lom.md.lid != 0 }
-
 func (lom *LOM) HrwTarget(smap *meta.Smap) (tsi *meta.Snode, local bool, err error) {
 	tsi, err = smap.HrwHash2T(lom.digest)
 	if err != nil {
@@ -243,21 +423,6 @@ func (lom *LOM) HrwTarget(smap *meta.Smap) (tsi *meta.Snode, local bool, err err
 	}
 	local = tsi.ID() == T.SID()
 	return
-}
-
-func (lom *LOM) IncVersion() error {
-	debug.Assert(lom.Bck().IsAIS())
-	v := lom.md.Version()
-	if v == "" {
-		lom.SetVersion(lomInitialVersion)
-		return nil
-	}
-	ver, err := strconv.Atoi(v)
-	if err != nil {
-		return fmt.Errorf("%s: %v", lom, err)
-	}
-	lom.SetVersion(strconv.Itoa(ver + 1))
-	return nil
 }
 
 // Returns stored checksum (if present) and computed checksum (if requested)
@@ -296,12 +461,18 @@ func (lom *LOM) ValidateMetaChecksum() error {
 		// cannot validate meta checksum
 		return nil
 	}
-	md, err = lom.lmfsReload(false)
+	md, err = lom.lmfsReload(false /*populate*/)
 	if err != nil {
-		return err
+		goto rerr
 	}
 	if md == nil {
-		return fmt.Errorf("%s: no meta", lom)
+		err = fmt.Errorf("%s: no meta", lom)
+		goto rerr
+	}
+	if err = md.Cksum.Validate(); err != nil {
+		context := fmt.Sprintf("%q metadata corruption: %v", lom, err)
+		err = cos.NewErrDataCksum(lom.md.Cksum, md.Cksum, context)
+		goto rerr
 	}
 	if lom.md.Cksum == nil {
 		lom.SetCksum(md.Cksum)
@@ -310,15 +481,18 @@ func (lom *LOM) ValidateMetaChecksum() error {
 	// different versions may have different checksums
 	if md.Version() == lom.md.Version() && !lom.EqCksum(md.Cksum) {
 		err = cos.NewErrDataCksum(lom.md.Cksum, md.Cksum, lom.String())
-		lom.UncacheDel()
+		goto rerr
 	}
+	return nil
+rerr:
+	lom.UncacheDel()
 	return err
 }
 
 // ValidateDiskChecksum validates if checksum stored in lom's in-memory metadata
 // matches object's content checksum.
 // Use lom.ValidateMetaChecksum() to check lom's checksum vs on-disk metadata.
-func (lom *LOM) ValidateContentChecksum() (err error) {
+func (lom *LOM) ValidateContentChecksum(locked bool) (err error) {
 	var (
 		cksumType = lom.CksumType()
 		cksums    = struct {
@@ -331,13 +505,13 @@ recomp:
 	if cksumType == cos.ChecksumNone { // as far as do-no-checksum-checking bucket rules
 		return nil
 	}
-	if !lom.md.Cksum.IsEmpty() {
+	if !cos.NoneC(lom.md.Cksum) {
 		cksumType = lom.md.Cksum.Ty() // takes precedence on the other hand
 	}
-	if cksums.comp, err = lom.ComputeCksum(cksumType); err != nil {
+	if cksums.comp, err = lom.ComputeCksum(cksumType, locked); err != nil {
 		return err
 	}
-	if lom.md.Cksum.IsEmpty() { // store computed
+	if cos.NoneC(lom.md.Cksum) { // store computed
 		lom.md.Cksum = cksums.comp.Clone()
 		if !lom.loaded() {
 			lom.SetAtimeUnix(time.Now().UnixNano())
@@ -373,10 +547,10 @@ ex:
 	return err
 }
 
-func (lom *LOM) ComputeSetCksum() (*cos.Cksum, error) {
+func (lom *LOM) ComputeSetCksum(locked bool) (*cos.Cksum, error) {
 	var (
 		cksum          *cos.Cksum
-		cksumHash, err = lom.ComputeCksum(lom.CksumType())
+		cksumHash, err = lom.ComputeCksum(lom.CksumType(), locked)
 	)
 	if err != nil {
 		return nil, err
@@ -388,15 +562,23 @@ func (lom *LOM) ComputeSetCksum() (*cos.Cksum, error) {
 	return cksum, nil
 }
 
-func (lom *LOM) ComputeCksum(cksumType string) (cksum *cos.CksumHash, _ error) {
+func (lom *LOM) ComputeCksum(cksumType string, locked bool) (cksum *cos.CksumHash, _ error) {
 	if cksumType == cos.ChecksumNone {
 		return nil, nil
 	}
+	if !locked {
+		lom.Lock(false)
+		defer lom.Unlock(false)
+	}
+	if err := lom.Load(false, true); err != nil {
+		return nil, fmt.Errorf("compute-checksum -- load: %v", err)
+	}
 	lmfh, err := lom.Open()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("compute-checksum -- open: %v", err)
 	}
-	// No need to allocate `buf` as `io.Discard` has efficient `io.ReaderFrom` implementation.
+
+	// `buf` is nil: `io.Discard` has efficient `io.ReaderFrom`
 	_, cksum, err = cos.CopyAndChecksum(io.Discard, lmfh, nil, cksumType)
 	cos.Close(lmfh)
 	return cksum, err
@@ -407,9 +589,9 @@ func (lom *LOM) ComputeCksum(cksumType string) (cksum *cos.CksumHash, _ error) {
 //
 // (compare w/ LoadUnsafe() below)
 func (lom *LOM) Load(cacheit, locked bool) error {
+	debug.Assert(lom.Bprops() != nil, lom.Cname()) // must be InitBck/InitFQN'ed
 	var (
 		lcache, lmd = lom.fromCache()
-		bmd         = T.Bowner().Get()
 	)
 	// fast path
 	if lmd != nil {
@@ -417,7 +599,10 @@ func (lom *LOM) Load(cacheit, locked bool) error {
 		if lom.IsFntl() {
 			lom.fixupFntl()
 		}
-		return lom._checkBucket(bmd)
+		err := lom._checkBucket()
+		if !cos.IsNotExist(err) {
+			return err
+		}
 	}
 
 	// slow path
@@ -428,59 +613,37 @@ func (lom *LOM) Load(cacheit, locked bool) error {
 		return err
 	}
 
-	// MetaverLOM = 1: always zero (not storing lom.md.lid)
-	debug.Assert(lom.bid() == 0 || lom.bid() == lom.Bprops().BID, lom.bid())
-	lom.setbid(lom.Bprops().BID)
-
-	if err := lom._checkBucket(bmd); err != nil {
+	if lom.bid() == 0 { // when LOM is a _handle_
+		lom.setbid(lom.Bprops().BID)
+	}
+	if err := lom._checkBucket(); err != nil {
 		return err
 	}
 	if cacheit {
+		debug.Assert(lom.bid() != 0)
 		md := lom.md
 		lcache.Store(lom.digest, &md)
 	}
 	return nil
 }
 
-func (lom *LOM) _checkBucket(bmd *meta.BMD) error {
+func (lom *LOM) _checkBucket() error {
 	bck := &lom.bck
+	bmd := T.Bowner().Get()
 	bprops, present := bmd.Get(bck)
 	if !present {
-		if bck.IsRemote() {
-			return cmn.NewErrRemoteBckNotFound(bck.Bucket())
-		}
+		lom.UncacheDel()
 		return cmn.NewErrBckNotFound(bck.Bucket())
 	}
-	if lom.bid() != bprops.BID {
-		return cmn.NewErrObjDefunct(lom.String(), lom.bid(), bprops.BID)
+	if lom.bid() == bprops.BID {
+		debug.Assert(bprops.BID != 0)
+		return nil
 	}
-	return nil
-}
-
-// usage: fast (and unsafe) loading object metadata except atime - no locks
-// compare with conventional Load() above
-func (lom *LOM) LoadUnsafe() (err error) {
-	var (
-		_, lmd = lom.fromCache()
-		bmd    = T.Bowner().Get()
-	)
-	// fast path
-	if lmd != nil {
-		lom.md = *lmd
-		if lom.IsFntl() {
-			lom.fixupFntl()
-		}
-		return lom._checkBucket(bmd)
+	err := cmn.NewErrObjDefunct(lom.String(), lom.bid(), bprops.BID)
+	if cmn.Rom.V(4, cos.ModCore) {
+		nlog.Warningln(err)
 	}
-
-	// read and decode xattr; NOTE: fs.GetXattr* vs fs.SetXattr race possible and must be
-	// either a) handled or b) benign from the caller's perspective
-	if _, err = lom.lmfs(true); err == nil {
-		// MetaverLOM = 1: always zero (not storing lom.md.lid)
-		debug.Assert(lom.bid() == 0 || lom.bid() == lom.Bprops().BID, lom.bid())
-		lom.setbid(lom.Bprops().BID)
-		err = lom._checkBucket(bmd)
-	}
+	lom.UncacheDel()
 	return err
 }
 
@@ -510,7 +673,7 @@ func (lom *LOM) Recache() {
 }
 
 func (lom *LOM) _collide(lmd *lmeta) {
-	if cmn.Rom.FastV(4, cos.SmoduleCore) || lom.digest&0xf == 5 {
+	if cmn.Rom.V(4, cos.ModCore) || lom.digest&0xf == 5 {
 		nlog.InfoDepth(1, LcacheCollisionCount, lom.digest, "[", *lmd.uname, "]", *lom.md.uname, lom.Cname())
 	}
 	T.StatsUpdater().Inc(LcacheCollisionCount)
@@ -569,15 +732,17 @@ func (lom *LOM) FromFS() error {
 	}
 
 	switch {
-	case os.IsNotExist(err):
-		return err
+	case cos.IsNotExist(err):
+		// instead of *fs.PathError type
+		return cos.NewErrNotFound(T, lom.Cname())
 
-	case strings.Contains(err.Error(), "not a directory") && cos.IsPathErr(err):
-		// e.g. err "stat .../aaa/111: not a directory" when there's existing ".../aaa" object
-		return fmt.Errorf("%w (object in the path?)", err)
+	case cos.IsErrNotDir(err) && cos.IsPathErr(err):
+		nlog.Warningln(cos.ErrENOTDIR, lom.Cname(), "[", err, "]")
+		return cos.NewErrNotFound(T, lom.Cname())
+
 	case cos.IsErrFntl(err):
-		lom.md.lid = lomBID(lom.Bprops().BID)
-		lom.md.lid = lom.md.lid.setlmfl(lmflFntl)
+		lom.setbid(lom.Bprops().BID)
+		lom.setlmfl(lmflFntl)
 
 		// temp substitute to check existence
 		short := lom.ShortenFntl()
@@ -589,10 +754,11 @@ func (lom *LOM) FromFS() error {
 
 		lom.PopFntl(saved)
 		debug.Assert(!cos.IsErrFntl(err))
-		if os.IsNotExist(err) {
-			return err
+		if cos.IsNotExist(err) {
+			// ditto
+			return cos.NewErrNotFound(T, lom.Cname())
 		}
-		lom.md.lid = lom.md.lid.clrlmfl(lmflFntl)
+		lom.clrlmfl(lmflFntl)
 		fallthrough
 	default:
 		err = os.NewSyscallError("stat", err)
@@ -613,9 +779,12 @@ exist:
 		}
 		return err
 	}
+
 	// fstat & atime
-	if lom.md.Size != size { // corruption or tampering
-		return cmn.NewErrLmetaCorrupted(lom.whingeSize(size))
+	if !lom.md.lid.haslmfl(lmflChunk) {
+		if lom.md.Size != size { // corruption or tampering
+			return cmn.NewErrLmetaCorrupted(lom.whingeSize(size))
+		}
 	}
 	lom.md.Atime = atimefs
 	lom.md.atimefs = uint64(atimefs)
@@ -668,27 +837,24 @@ func (lom *LOM) Unlock(exclusive bool) {
 // file name too long (0x24) ----------------------------
 //
 
-func (lom *LOM) IsFntl() bool {
-	return lom.md.lid.haslmfl(lmflFntl)
-}
-
 // (compare with fs/content Gen())
 func (lom *LOM) ShortenFntl() []string {
 	debug.Assert(fs.IsFntl(lom.ObjName), lom.FQN)
 
 	noname := fs.ShortenFntl(lom.FQN)
-	nfqn := lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, noname)
+	nfqn := lom.mi.MakePathFQN(lom.Bucket(), fs.ObjCT, noname)
 
 	debug.Assert(len(nfqn) < 4096, "PATH_MAX /usr/include/limits.h", len(nfqn))
 	return []string{nfqn, noname}
 }
 
+// TODO -- FIXME: revisit metaver v2 usage
 func (lom *LOM) fixupFntl() {
 	if !fs.IsFntl(lom.ObjName) {
 		return
 	}
-	lom.ObjName = fs.ShortenFntl(lom.FQN)                                  // noname
-	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName) // nfqn
+	lom.ObjName = fs.ShortenFntl(lom.FQN)                             // noname
+	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjCT, lom.ObjName) // nfqn
 	lom.HrwFQN = &lom.FQN
 }
 

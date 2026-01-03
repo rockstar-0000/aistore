@@ -15,10 +15,12 @@ import (
 // (common for all multi-object operations)
 type (
 	// List of object names _or_ a template specifying { optional Prefix, zero or more Ranges }
+	// swagger:model
 	ListRange struct {
 		Template string   `json:"template"`
 		ObjNames []string `json:"objnames"`
 	}
+	// swagger:model
 	EvdMsg struct {
 		ListRange
 		NumWorkers      int  `json:"num-workers,omitempty"` // number of concurrent workers; 0 - number of mountpaths (default); (-1) none
@@ -58,6 +60,7 @@ func (lrm *ListRange) Str(sb *strings.Builder, isPrefix bool) {
 }
 
 // prefetch
+// swagger:model
 type PrefetchMsg struct {
 	ListRange
 	BlobThreshold   int64 `json:"blob-threshold"`       // when greater than threshold prefetch using blob-downloader; otherwise cold GET
@@ -74,12 +77,12 @@ func (msg *PrefetchMsg) Str(isPrefix bool) string {
 	msg.ListRange.Str(&sb, isPrefix)
 	if msg.BlobThreshold > 0 {
 		msg.delim(&sb)
-		sb.WriteString("blob-threshold: ")
-		sb.WriteString(cos.ToSizeIEC(msg.BlobThreshold, 0))
+		sb.WriteString("blob-threshold:")
+		sb.WriteString(cos.IEC(msg.BlobThreshold, 0))
 	}
 	if msg.NumWorkers > 0 {
 		msg.delim(&sb)
-		sb.WriteString("workers: ")
+		sb.WriteString("workers:")
 		sb.WriteString(strconv.Itoa(msg.NumWorkers))
 	}
 	if msg.LatestVer {
@@ -106,6 +109,7 @@ func (*PrefetchMsg) delim(sb *strings.Builder) {
 // --------------------  terminology   ---------------------
 // here and elsewhere "archive" is any (.tar, .tgz/.tar.gz, .zip, .tar.lz4) formatted object.
 // [NOTE] see cmn/api for cmn.ArchiveMsg (that also contains ToBck)
+// swagger:model
 type ArchiveMsg struct {
 	TxnUUID     string `json:"-"`        // internal use
 	FromBckName string `json:"-"`        // ditto

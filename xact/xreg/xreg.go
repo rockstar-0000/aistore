@@ -23,13 +23,27 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 )
 
-// TODO: some of these constants must be configurable or derived from the config
+/* TODO shard by xact.Kind as follows:
+	kind struct {
+		bckXacts    map[string]Renewable
+		nonbckXacts map[string]Renewable
+		entries     ...
+		finDelta    atomic.Int64
+		renewMtx    sync.RWMutex
+	}
+        // registry must be statically allocated with all (statically) declared xaction kinds
+	// (see api.go)
+        registry map[string]kind
+*/
+
 const (
-	initialCap       = 256 // initial capacity
-	keepOldThreshold = 256 // keep so many
+	initialCap       = 256  // initial capacity
+	keepOldThreshold = 1024 // keep so many
 
 	waitPrevAborted = 2 * time.Second
-	waitLimitedCoex = 3 * time.Second
+	waitLimitedCoex = 5 * time.Second
+
+	waitTerminalCleanup = cos.PollSleepLong // registry housekeeping when TOCTOU
 )
 
 type WPR int
@@ -99,7 +113,7 @@ type (
 		nonbckXacts map[string]Renewable
 		entries     entries
 		finDelta    atomic.Int64
-		renewMtx    sync.RWMutex // TODO: revisit
+		renewMtx    sync.RWMutex
 	}
 )
 
@@ -122,8 +136,8 @@ func newRegistry() (r *registry) {
 	return &registry{
 		entries: entries{
 			all:      make([]Renewable, 0, initialCap),
-			active:   make([]Renewable, 0, 32),
-			roActive: make([]Renewable, 0, 64),
+			active:   make([]Renewable, 0, 128),
+			roActive: make([]Renewable, 0, 192),
 		},
 		bckXacts:    make(map[string]Renewable, 32),
 		nonbckXacts: make(map[string]Renewable, 32),
@@ -158,19 +172,45 @@ outer:
 	return xctn, nil
 }
 
+func GetActiveXact(uuid string) (xctn core.Xact) {
+	e := &dreg.entries
+	e.mtx.RLock()
+	xctn = e.getActiveXact(uuid)
+	e.mtx.RUnlock()
+	return
+}
+
+func (e *entries) getActiveXact(uuid string) core.Xact {
+	for _, entry := range e.active {
+		if x := entry.Get(); x.ID() == uuid {
+			return x
+		}
+	}
+	return nil
+}
+
 func GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	dreg.entries.getAllRunning(inout, periodic)
 }
 
 func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
-	var roActive []Renewable
-	if periodic {
-		roActive = e.roActive
-		roActive = roActive[:len(e.active)]
-	} else {
-		roActive = make([]Renewable, len(e.active))
-	}
+	var (
+		roActive []Renewable
+		l        int
+	)
 	e.mtx.RLock()
+	l = len(e.active)
+	if l == 0 {
+		e.mtx.RUnlock()
+		return
+	}
+	if periodic && cap(e.roActive) >= l { // reuse existing
+		roActive = e.roActive
+		roActive = roActive[:l]
+	} else { // allocate
+		roActive = make([]Renewable, l)
+		e.roActive = roActive // reuse later
+	}
 	copy(roActive, e.active)
 	e.mtx.RUnlock()
 
@@ -182,7 +222,7 @@ func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
 		if inout.Kind != "" && inout.Kind != k {
 			continue
 		}
-		if !xctn.Running() {
+		if !xctn.IsRunning() {
 			continue
 		}
 		var (
@@ -191,7 +231,7 @@ func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
 		)
 		if inout.Idle != nil {
 			if _, ok := xctn.(xact.Demand); ok {
-				isIdle = xctn.Snap().IsIdle()
+				isIdle = xctn.IsIdle()
 			}
 		}
 		if isIdle {
@@ -205,9 +245,9 @@ func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	sort.Strings(inout.Idle)
 }
 
-func GetRunning(flt Flt) Renewable { return dreg.getRunning(flt) }
+func GetRunning(flt *Flt) Renewable { return dreg.getRunning(flt) }
 
-func (r *registry) getRunning(flt Flt) (entry Renewable) {
+func (r *registry) getRunning(flt *Flt) (entry Renewable) {
 	e := &r.entries
 	e.mtx.RLock()
 	entry = e.findRunning(flt)
@@ -216,7 +256,7 @@ func (r *registry) getRunning(flt Flt) (entry Renewable) {
 }
 
 // NOTE: relies on the find() to walk in the newer --> older order
-func GetLatest(flt Flt) Renewable {
+func GetLatest(flt *Flt) Renewable {
 	entry := dreg.entries.find(flt)
 	return entry
 }
@@ -241,11 +281,11 @@ func AbortKind(err error, kind string) {
 
 func AbortByNewReb(err error) { dreg.abort(&abortArgs{err: err, newreb: true}) }
 
-func DoAbort(flt Flt, err error) {
+func DoAbort(flt *Flt, err error) {
 	switch {
 	case flt.ID != "":
-		xctn, err := dreg.getXact(flt.ID)
-		if xctn == nil || err != nil {
+		xctn, errV := dreg.getXact(flt.ID)
+		if xctn == nil || errV != nil {
 			return
 		}
 		debug.Assertf(flt.Kind == "" || xctn.Kind() == flt.Kind, "wrong xaction kind: %s vs %q", xctn.Cname(), flt.Kind)
@@ -262,10 +302,10 @@ func DoAbort(flt Flt, err error) {
 	}
 }
 
-func GetSnap(flt Flt) ([]*core.Snap, error) {
-	var onlyRunning bool
+func GetSnap(flt *Flt) ([]*core.Snap, error) {
+	var onl bool
 	if flt.OnlyRunning != nil {
-		onlyRunning = *flt.OnlyRunning
+		onl = *flt.OnlyRunning
 	}
 	if flt.ID != "" {
 		xctn, err := dreg.getXact(flt.ID)
@@ -273,7 +313,7 @@ func GetSnap(flt Flt) ([]*core.Snap, error) {
 			return nil, err
 		}
 		if xctn != nil {
-			if onlyRunning && xctn.Finished() {
+			if onl && xctn.IsDone() {
 				return nil, cmn.NewErrXactNotFoundError("[only-running vs " + xctn.String() + "]")
 			}
 			if flt.Kind != "" && xctn.Kind() != flt.Kind {
@@ -281,14 +321,14 @@ func GetSnap(flt Flt) ([]*core.Snap, error) {
 			}
 			return []*core.Snap{xctn.Snap()}, nil
 		}
-		if onlyRunning || flt.Kind != apc.ActRebalance {
+		if onl || flt.Kind != apc.ActRebalance {
 			return nil, cmn.NewErrXactNotFoundError("ID=" + flt.ID)
 		}
 		// not running rebalance: include all finished (but not aborted) ones
-		// with ID at ot _after_ the specified
+		// with ID at or _after_ the specified
 		return dreg.matchingXactsStats(func(xctn core.Xact) bool {
 			cmp := xact.CompareRebIDs(xctn.ID(), flt.ID)
-			return cmp >= 0 && xctn.Finished() && !xctn.IsAborted()
+			return cmp >= 0 && xctn.IsDone() && !xctn.IsAborted()
 		}), nil
 	}
 	if flt.Bck != nil || flt.Kind != "" {
@@ -300,14 +340,14 @@ func GetSnap(flt Flt) ([]*core.Snap, error) {
 			return nil, fmt.Errorf("xaction %q: unknown provider for bucket %s", flt.Kind, flt.Bck.Name)
 		}
 
-		if onlyRunning {
+		if onl {
 			var matching []*core.Snap
 
 			dreg.entries.mtx.RLock() // ----------
 			matching = make([]*core.Snap, 0, min(len(dreg.entries.active), 8))
 			if flt.Kind == "" {
 				for kind := range xact.Table {
-					entry := dreg.entries.findRunning(Flt{Kind: kind, Bck: flt.Bck})
+					entry := dreg.entries.findRunning(&Flt{Kind: kind, Bck: flt.Bck})
 					if entry != nil {
 						matching = append(matching, entry.Get().Snap())
 					}
@@ -334,7 +374,7 @@ func (r *registry) abort(args *abortArgs) {
 
 func (args *abortArgs) do(entry Renewable) bool {
 	xctn := entry.Get()
-	if xctn.Finished() {
+	if xctn.IsDone() {
 		return true
 	}
 
@@ -390,16 +430,16 @@ func (r *registry) matchingXactsStats(match func(xctn core.Xact) bool) []*core.S
 
 func (r *registry) incFinished() { r.finDelta.Inc() }
 
-func (r *registry) hkPruneActive(int64) time.Duration {
+func (r *registry) hkPruneActive(now int64) time.Duration {
 	if r.finDelta.Swap(0) == 0 {
-		return hk.PruneActiveIval
+		return hk.Jitter(hk.Prune2mIval, now)
 	}
 	e := &r.entries
 	e.mtx.Lock()
 	l := len(e.active)
 	for i := 0; i < l; i++ {
 		entry := e.active[i]
-		if !entry.Get().Finished() {
+		if !entry.Get().IsDone() {
 			continue
 		}
 		copy(e.active[i:], e.active[i+1:])
@@ -408,45 +448,46 @@ func (r *registry) hkPruneActive(int64) time.Duration {
 		e.active = e.active[:l]
 	}
 	e.mtx.Unlock()
-	return hk.PruneActiveIval
+	return hk.Jitter(hk.Prune2mIval, now)
 }
 
 func (r *registry) hkDelOld(int64) time.Duration {
 	var (
-		toRemove  []string
-		numNonLso int
-		now       = time.Now()
+		toRemove    []string
+		numKeepMore int
+		now         = time.Now() // need calendar time
 	)
 
 	r.entries.mtx.RLock()
 	l := len(r.entries.all)
 
-	// first, cleanup list-objects: walk older to newer while counting non-lso
+	// first, cleanup (x-lso, x-moss): walk older to newer while counting the other kinds
 	for i := range l {
 		xctn := r.entries.all[i].Get()
-		if xctn.Kind() != apc.ActList {
-			numNonLso++
+		if !xact.Table[xctn.Kind()].QuietBrief {
+			numKeepMore++
 			continue
 		}
-		if xctn.Finished() {
-			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeLsoX {
+		if xctn.IsDone() {
+			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeXshort {
 				toRemove = append(toRemove, xctn.ID())
 			}
 		}
 	}
+
 	// all the rest: older to newer, while keeping at least `keepOldThreshold`
-	if numNonLso > keepOldThreshold {
+	if numKeepMore > keepOldThreshold {
 		var cnt int
 		for i := range l {
 			xctn := r.entries.all[i].Get()
-			if xctn.Kind() == apc.ActList {
+			if xact.Table[xctn.Kind()].QuietBrief {
 				continue
 			}
-			if xctn.Finished() {
+			if xctn.IsDone() {
 				if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeX {
 					toRemove = append(toRemove, xctn.ID())
 					cnt++
-					if numNonLso-cnt <= keepOldThreshold {
+					if numKeepMore-cnt <= keepOldThreshold {
 						break
 					}
 				}
@@ -455,10 +496,19 @@ func (r *registry) hkDelOld(int64) time.Duration {
 	}
 	r.entries.mtx.RUnlock()
 
-	d, ll := hk.DelOldIval, len(toRemove)
-	if l-ll > keepOldThreshold<<1 {
-		d >>= 1
+	// adaptive HK cadence based on finished-registry backlog
+	var (
+		d       = hk.DelOldIval
+		ll      = len(toRemove)
+		remains = l - ll
+	)
+	switch {
+	case remains > keepOldThreshold<<1:
+		d = max(d>>2, hk.OldAgeXshort)
+	case remains > keepOldThreshold:
+		d = max(d>>1, hk.OldAgeXshort)
 	}
+
 	if ll == 0 {
 		return d
 	}
@@ -470,115 +520,21 @@ func (r *registry) hkDelOld(int64) time.Duration {
 	}
 	r.entries.mtx.Unlock()
 
-	return d
+	return hk.Jitter(d, now.UnixNano())
 }
 
 func (r *registry) renewByID(entry Renewable, bck *meta.Bck) (rns RenewRes) {
 	flt := Flt{ID: entry.UUID(), Kind: entry.Kind(), Bck: bck}
-	rns = r._renewFlt(entry, flt)
+	rns = r._renewFlt(entry, &flt)
 	rns.beingRenewed()
 	return
 }
 
 func (r *registry) renew(entry Renewable, bck *meta.Bck, buckets ...*meta.Bck) (rns RenewRes) {
 	flt := Flt{Kind: entry.Kind(), Bck: bck, Buckets: buckets}
-	rns = r._renewFlt(entry, flt)
+	rns = r._renewFlt(entry, &flt)
 	rns.beingRenewed()
 	return
-}
-
-func (r *registry) _renewFlt(entry Renewable, flt Flt) (rns RenewRes) {
-	// first, try to reuse under rlock
-	r.renewMtx.RLock()
-	if prevEntry := r.getRunning(flt); prevEntry != nil {
-		xprev := prevEntry.Get()
-		if usePrev(xprev, entry, flt) {
-			r.renewMtx.RUnlock()
-			return RenewRes{Entry: prevEntry, UUID: xprev.ID()}
-		}
-		if wpr, err := entry.WhenPrevIsRunning(prevEntry); wpr == WprUse || err != nil {
-			r.renewMtx.RUnlock()
-			if cmn.IsErrXactUsePrev(err) {
-				if wpr != WprUse {
-					nlog.Errorf("%v - not starting a new one of the same kind", err)
-				}
-			}
-			xctn := prevEntry.Get()
-			return RenewRes{Entry: prevEntry, Err: err, UUID: xctn.ID()}
-		}
-	}
-	r.renewMtx.RUnlock()
-
-	// second
-	r.renewMtx.Lock()
-	rns = r.renewLocked(entry, flt)
-	r.renewMtx.Unlock()
-	return
-}
-
-// reusing current (aka "previous") xaction: default policies
-func usePrev(xprev core.Xact, nentry Renewable, flt Flt) bool {
-	pkind, nkind := xprev.Kind(), nentry.Kind()
-	debug.Assertf(pkind == nkind && pkind != "", "%s != %s", pkind, nkind)
-	pdtor, ndtor := xact.Table[pkind], xact.Table[nkind]
-	debug.Assert(pdtor.Scope == ndtor.Scope)
-
-	// same ID
-	if xprev.ID() != "" && xprev.ID() == nentry.UUID() {
-		return true // yes, use prev
-	}
-	if _, ok := xprev.(xact.Demand); !ok {
-		return false // upon return call xaction-specific WhenPrevIsRunning()
-	}
-	//
-	// on-demand
-	//
-	if pdtor.Scope != xact.ScopeB {
-		return true
-	}
-	bck := flt.Bck
-	debug.Assert(!bck.IsEmpty())
-	if !bck.Equal(xprev.Bck(), true, true) {
-		return false
-	}
-	// on-demand (from-bucket, to-bucket)
-	from, to := xprev.FromTo()
-	if len(flt.Buckets) == 2 && from != nil && to != nil {
-		for _, bck := range flt.Buckets {
-			if !bck.Equal(from, true, true) && !bck.Equal(to, true, true) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func (r *registry) renewLocked(entry Renewable, flt Flt) (rns RenewRes) {
-	var (
-		xprev core.Xact
-		wpr   WPR
-		err   error
-	)
-	if prevEntry := r.getRunning(flt); prevEntry != nil {
-		xprev = prevEntry.Get()
-		if usePrev(xprev, entry, flt) {
-			return RenewRes{Entry: prevEntry, UUID: xprev.ID()}
-		}
-		wpr, err = entry.WhenPrevIsRunning(prevEntry)
-		if wpr == WprUse || err != nil {
-			return RenewRes{Entry: prevEntry, Err: err, UUID: xprev.ID()}
-		}
-		debug.Assert(wpr == WprAbort || wpr == WprKeepAndStartNew)
-		if wpr == WprAbort {
-			xprev.Abort(cmn.ErrXactRenewAbort)
-			time.Sleep(waitPrevAborted)
-		}
-	}
-	if err = entry.Start(); err != nil {
-		return RenewRes{Err: err}
-	}
-	r.entries.add(entry)
-	return RenewRes{Entry: entry}
 }
 
 //////////////////////
@@ -586,7 +542,7 @@ func (r *registry) renewLocked(entry Renewable, flt Flt) (rns RenewRes) {
 //////////////////////
 
 // NOTE: the caller must take rlock
-func (e *entries) findRunning(flt Flt) Renewable {
+func (e *entries) findRunning(flt *Flt) Renewable {
 	onl := true
 	flt.OnlyRunning = &onl
 	for _, entry := range e.active {
@@ -604,21 +560,21 @@ func (e *entries) findRunningKind(kind string) Renewable {
 			continue
 		}
 		xctn := entry.Get()
-		if xctn.Running() {
+		if xctn.IsRunning() {
 			return entry
 		}
 	}
 	return nil
 }
 
-func (e *entries) find(flt Flt) (entry Renewable) {
+func (e *entries) find(flt *Flt) (entry Renewable) {
 	e.mtx.RLock()
 	entry = e.findUnlocked(flt)
 	e.mtx.RUnlock()
 	return
 }
 
-func (e *entries) findUnlocked(flt Flt) Renewable {
+func (e *entries) findUnlocked(flt *Flt) Renewable {
 	if flt.OnlyRunning != nil && *flt.OnlyRunning {
 		return e.findRunning(flt)
 	}
@@ -648,7 +604,7 @@ func (e *entries) del(id string) {
 	for idx, entry := range e.all {
 		xctn := entry.Get()
 		if xctn.ID() == id {
-			debug.Assert(xctn.Finished(), xctn.String())
+			debug.Assert(xctn.IsDone(), xctn.String(), " aborted: ", xctn.IsAborted())
 			nlen := len(e.all) - 1
 			e.all[idx] = e.all[nlen]
 			e.all = e.all[:nlen]
@@ -658,7 +614,7 @@ func (e *entries) del(id string) {
 	for idx, entry := range e.active {
 		xctn := entry.Get()
 		if xctn.ID() == id {
-			if !xctn.Finished() {
+			if !xctn.IsDone() {
 				nlog.Errorln("Warning: premature HK call to del-old", xctn.String())
 				break
 			}
@@ -670,11 +626,21 @@ func (e *entries) del(id string) {
 	}
 }
 
-func (e *entries) add(entry Renewable) {
-	e.mtx.Lock()
+// is called under lock
+// history control for QuietBrief kinds (x-lso, x-moss)
+// – keep up to 1 024 finished records
+// – anything beyond is silently dropped
+func (e *entries) _add(entry Renewable) {
 	e.active = append(e.active, entry)
+
+	if l := len(e.all); xact.Table[entry.Kind()].QuietBrief && l >= keepOldThreshold {
+		if n := skipXregHst.Inc(); n%skipXregHstCnt == 1 {
+			nlog.Warningln("num entries in xreg history:", l, "exceeds the cap:", keepOldThreshold,
+				"- not adding:", xact.Cname(entry.Kind(), entry.UUID()))
+		}
+		return
+	}
 	e.all = append(e.all, entry)
-	e.mtx.Unlock()
 
 	// grow
 	if cap(e.roActive) < len(e.active) {
@@ -759,7 +725,7 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 	bck1, bck2 := bck, otherBck[0]
 	for _, entry := range r.entries.active {
 		xctn := entry.Get()
-		if !xctn.Running() {
+		if !xctn.IsRunning() {
 			continue
 		}
 		d, ok := xact.Table[xctn.Kind()]
@@ -807,11 +773,15 @@ func (r *RenewBase) Str(kind string) string {
 // RenewRes //
 //////////////
 
+// note:
+// for a newly constructed instance x-registry always returns RenewRes{Entry: entry}
+// with empty rns.UUID
+// in other words, IsRunning() can only be true when we are using xprev
 func (rns *RenewRes) IsRunning() bool {
 	if rns.UUID == "" {
 		return false
 	}
-	return rns.Entry.Get().Running()
+	return rns.Entry.Get().IsRunning()
 }
 
 // make sure existing on-demand is active to prevent it from (idle) expiration
@@ -839,11 +809,12 @@ func (flt *Flt) String() string {
 	return msg.String()
 }
 
-func (flt Flt) Matches(xctn core.Xact) (yes bool) {
+func (flt *Flt) Matches(xctn core.Xact) (yes bool) {
 	debug.Assert(xact.IsValidKind(xctn.Kind()), xctn.String())
 	// running?
 	if flt.OnlyRunning != nil {
-		if *flt.OnlyRunning != xctn.Running() {
+		onl := *flt.OnlyRunning
+		if onl != xctn.IsRunning() {
 			return false
 		}
 	}

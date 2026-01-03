@@ -6,7 +6,7 @@ package ais
 
 import (
 	"fmt"
-	"sync"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -59,20 +59,26 @@ func (g *fsprungroup) attachMpath(mpath string, label cos.MountpathLabel) (added
 	return
 }
 
-func (g *fsprungroup) _postAdd(action string, mi *fs.Mountpath) {
-	fspathsConfigAddDel(mi.Path, true /*add*/)
+func (g *fsprungroup) _postAdd(action string, ami *fs.Mountpath) {
+	fspathsConfigAddDel(ami.Path, true /*add*/)
+
+	g.preempt(action, ami)
+
 	go func() {
 		config := cmn.GCO.Get()
-		if config.Resilver.Enabled {
-			g.t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}}, nil /*wg*/)
+		if !config.Resilver.Enabled {
+			return
 		}
-		xreg.RenewMakeNCopies(cos.GenUUID(), action)
+		args := &res.Args{
+			Custom: xreg.ResArgs{Config: config},
+		}
+		g.t.runResilver(args)
 	}()
 
-	g.checkEnable(action, mi)
+	g.checkEnable(action, ami)
 
 	tstats := g.t.statsT.(*stats.Trunner)
-	for _, disk := range mi.Disks {
+	for _, disk := range ami.Disks {
 		tstats.RegDiskMetrics(g.t.si, disk)
 	}
 }
@@ -119,54 +125,78 @@ func (g *fsprungroup) rescanMpath(mpath string, dontResilver bool) error {
 	if !dontResilver {
 		config := cmn.GCO.Get()
 		if config.Resilver.Enabled {
-			go g.t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}}, nil /*wg*/)
+			args := &res.Args{Custom: xreg.ResArgs{Config: config}}
+			go g.t.runResilver(args)
 		}
 	}
 	return warn
 }
 
 func (g *fsprungroup) doDD(action string, flags uint64, mpath string, dontResilver bool) (*fs.Mountpath, error) {
-	rmi, numAvail, noResil, err := fs.BeginDD(action, flags, mpath)
+	t := g.t
+	rmi, numAvail, alreadyDD, err := fs.BeginDD(action, flags, mpath)
 	if err != nil || rmi == nil {
 		return nil, err
 	}
 	if numAvail == 0 {
-		nlog.Errorf("%s: lost (via %q) the last available mountpath %q", g.t.si, action, rmi)
+		nlog.Errorf("%s: lost (via %q) the last available mountpath %q", t.si, action, rmi)
 		g.postDD(rmi, action, nil /*xaction*/, nil /*error*/) // go ahead to disable/detach
-		g.t.disable()
+
+		// NOTE: disable this target (it's a brick but still can be revitalized)
+		t.disable()
 		return rmi, nil
 	}
 
 	core.LcacheClearMpath(rmi)
 
 	config := cmn.GCO.Get()
-	if noResil || dontResilver || !config.Resilver.Enabled {
-		nlog.Infoln(g.t.String(), "action", action, rmi.String(), "- not resilvering:")
-		nlog.Infoln("noResil (action done?):", noResil, "dontResilver:", dontResilver,
-			"config enabled:", config.Resilver.Enabled)
+	confDisabled := !config.Resilver.Enabled
+
+	// TODO: lookup ResilverSkippedMarker and related comments
+
+	if alreadyDD || dontResilver || confDisabled {
+		nlog.Infoln(t.String(), "action", action, rmi.String(), "- not resilvering:")
+		nlog.Infoln("[ already disabled or detached:", alreadyDD, "--no-resilver:", dontResilver, "disabled via config:", confDisabled, "]")
 		g.postDD(rmi, action, nil /*xaction*/, nil /*error*/) // ditto (compare with the one below)
 		return rmi, nil
 	}
 
-	prevActive := g.t.res.IsActive(1 /*interval-of-inactivity multiplier*/)
-	if prevActive {
-		nlog.Infof("%s: %q %s: starting to resilver when previous (resilvering) is active", g.t, action, rmi)
-	} else {
-		nlog.Infof("%s: %q %s: starting to resilver", g.t, action, rmi)
-	}
+	prev := g.preempt(action, rmi)
+	marked := xreg.GetResilverMarked()
 	args := &res.Args{
 		Rmi:             rmi,
 		Action:          action,
-		PostDD:          g.postDD,    // callback when done
-		SingleRmiJogger: !prevActive, // NOTE: optimization for the special/common case
+		PostDD:          g.postDD,                     // callback when done
+		SingleRmiJogger: !prev && !marked.Interrupted, // NOTE: future: also gate on !marked.Skipped once ResilverSkippedMarker gets added
 		Custom:          xreg.ResArgs{Config: config},
 	}
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go g.t.runResilver(args, wg)
-	wg.Wait()
+	go t.runResilver(args)
 
 	return rmi, nil
+}
+
+func (g *fsprungroup) preempt(action string, mi *fs.Mountpath) bool /*prev*/ {
+	const (
+		sleep = cos.PollSleepShort
+	)
+	res := g.t.res
+	// try to abort an active resilver, if any
+	if res.Abort(fmt.Errorf("%v: %q, %s", cmn.ErrXactRenewAbort, action, mi)) {
+		return true
+	}
+	xres := res.GetXact()
+	if xres == nil { // finished ok or never ran
+		return false
+	}
+	if xres.IsDone() {
+		time.Sleep(sleep) // just finished; Res atomic state
+		return false
+	}
+
+	// (unlikely)
+	time.Sleep(sleep)
+	debug.Assert(xres.IsAborted() || xres.IsDone(), xres.String())
+	return true
 }
 
 func (g *fsprungroup) postDD(rmi *fs.Mountpath, action string, xres *xs.Resilver, err error) {

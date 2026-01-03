@@ -1,7 +1,8 @@
 // Package health is a basic mountpath health monitor.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
+
 package health
 
 import (
@@ -27,6 +28,9 @@ import (
 // - the mountpath appears to be unavailable, or
 // - configured error limit is exceeded
 // the mountpath is disabled - effectively, removed from the operation henceforth.
+//
+// For much more precise and extensive description of the functionality, please refer to
+// * [docs/fshc.md](https://github.com/NVIDIA/aistore/blob/main/docs/fshc.md)
 
 // constants and tunables
 const (
@@ -41,7 +45,20 @@ const (
 )
 
 const (
+	singleDelayRetry = time.Second
+)
+
+const (
 	maxDepth = 16 // recurs read
+)
+
+const (
+	tempDir = "fshc-on-err" // to write test files
+)
+
+const (
+	faulted  = "FAULTED"
+	degraded = "DEGRADED"
 )
 
 type (
@@ -66,6 +83,9 @@ var all sync.Map // [mpath => ror]
 func NewFSHC(t disabler) (f *FSHC) { return &FSHC{t: t} }
 
 func (*FSHC) IsErr(err error) bool {
+	if cos.IsNotExist(err) {
+		return false
+	}
 	return cmn.IsErrGetCap(err) || cmn.IsErrMpathCheck(err) || cos.IsIOError(err)
 }
 
@@ -80,11 +100,15 @@ func (f *FSHC) OnErr(mi *fs.Mountpath, fqn string) {
 		r = a.(*ror)
 		since := time.Duration(now - ratomic.LoadInt64(&r.last))
 		if since < minTimeBetweenRuns {
-			nlog.Infoln("not enough time passed since the previous run [", since, "]")
+			if cmn.Rom.V(4, cos.ModFS) {
+				nlog.Infoln(mi.String(), "FSHC: not enough time passed since previous run:", since)
+			}
 			return
 		}
 		if !ratomic.CompareAndSwapInt64(&r.running, 0, now) {
-			nlog.Infoln(mi.String(), "still running [", since, "]")
+			if cmn.Rom.V(4, cos.ModFS) {
+				nlog.Infoln(mi.String(), "FSHC: run already in progress, skipping (since:", since, ")")
+			}
 			return
 		}
 	}
@@ -96,7 +120,7 @@ func run(f *FSHC, mi *fs.Mountpath, r *ror, fqn string, started int64) {
 	f.run(mi, fqn)
 
 	now := mono.NanoTime()
-	nlog.Warningln("runtime:", time.Duration(now-started))
+	nlog.Infoln(mi.String(), "FSHC runtime:", time.Duration(now-started))
 
 	ratomic.StoreInt64(&r.last, now)
 	ratomic.StoreInt64(&r.running, 0)
@@ -104,18 +128,24 @@ func run(f *FSHC, mi *fs.Mountpath, r *ror, fqn string, started int64) {
 
 func (f *FSHC) run(mi *fs.Mountpath, fqn string) {
 	var (
+		froot      *os.File
 		serr, pass string
+		reason     = degraded
 		cfg        = cmn.GCO.Get().FSHC
-		maxerrs    = cfg.HardErrs
-		numFiles   = cfg.TestFileCount
+
+		// HardErrs: maximum total (read+write) IO errors allowed in a single
+		// FSHC run before disabling the mountpath. See also IOErrs/IOErrTime,
+		// which control how often FSHC is triggered at the stats layer.
+		maxerrs  = cfg.HardErrs
+		numFiles = cfg.TestFileCount
 	)
+
 	// 1. fstat
 	err := cos.Stat(mi.Path)
-	if err != nil {
-		nlog.Errorln("fstat err #1:", err)
-		time.Sleep(time.Second)
+	if shouldRetry(mi, err) {
 		if _, err := os.Stat(mi.Path); err != nil {
-			nlog.Errorln("critical fstat err #2:", err)
+			nlog.Errorln(mi.String(), faulted, err)
+			reason = faulted
 			goto disable
 		}
 	}
@@ -123,19 +153,32 @@ func (f *FSHC) run(mi *fs.Mountpath, fqn string) {
 	// 2. resolve FS and check it vs mi.FS
 	if err = mi.CheckFS(); err != nil {
 		nlog.Errorln(err)
+		reason = faulted
 		goto disable
 	}
 
-	// 3. mi.RescanDisks (currently, only manually via CLI)
+	// 3. open root dir as a file; close immediately (retrying in re: network drives)
+	froot, err = os.Open(mi.Path)
+	if shouldRetry(mi, err) {
+		if froot, err = os.Open(mi.Path); err != nil {
+			nlog.Errorln(mi.String(), faulted, err)
+			reason = faulted
+			goto disable
+		}
+	}
+	froot.Close()
+
+	// mi.RescanDisks (currently, only manually via CLI)
 
 	// double-check before reading/writing
 	if !mi.IsAvail() {
-		nlog.Warningln(mi.String(), "is not available, nothing to do")
+		nlog.Warningln(mi.String(), "is not available, skipping FSHC run")
+		return
 	}
 
 	// 4. read/write tests
 	for i := range 2 {
-		rerrs, werrs := _rw(mi, fqn, numFiles, tmpSize)
+		etag, rerrs, werrs := _rw(mi, fqn, numFiles, tmpSize, maxerrs)
 
 		if rerrs == 0 && werrs == 0 {
 			if i == 0 {
@@ -145,36 +188,43 @@ func (f *FSHC) run(mi *fs.Mountpath, fqn string) {
 			nlog.Infoln(mi.String(), "- no read/write errors on a 2nd pass")
 			return
 		}
+
 		serr = fmt.Sprintf("(read %d, write %d (max-errors %d, write-size %s%s))",
 			rerrs, werrs, maxerrs, cos.ToSizeIEC(tmpSize, 0), pass)
+		if etag == faulted {
+			serr = fmt.Sprintf("%s %s: %s", mi, faulted, serr)
+			reason = faulted
+			break
+		}
 
 		if rerrs+werrs < maxerrs {
 			nlog.Errorln("Warning: detected read/write errors", mi.String(), serr)
 			nlog.Warningln("Warning: ignoring, _not_ disabling", mi.String())
 			return
 		}
+		serr = "exceeded I/O error limit: " + serr
 		// repeat just once
 		if i == 0 {
-			numFiles = max(min(numFiles*2, maxNumFiles), numFiles+2)
+			numFiles = cos.ClampInt(numFiles*2, numFiles+2, maxNumFiles)
 			if numFiles >= 2*cfg.TestFileCount {
 				maxerrs++
 			}
-			pass = ", pass two"
-			time.Sleep(2 * time.Second)
+			pass = ", pass #2"
+			time.Sleep(2 * singleDelayRetry)
 		}
 	}
-	nlog.Errorln("exceeded I/O error limit:", serr)
+	nlog.Errorln(serr)
 	nlog.Warningln("proceeding to disable", mi.String())
 
 disable:
-	f._disable(mi)
+	f._disable(mi, reason)
 }
 
-func (f *FSHC) _disable(mi *fs.Mountpath) {
+func (f *FSHC) _disable(mi *fs.Mountpath, reason string) {
 	if err := f.t.DisableMpath(mi); err != nil {
-		nlog.Errorf("%s: failed to disable, err: %v", mi, err)
+		nlog.Errorf("%s: failed to disable %s mountpath, err: %v", mi, reason, err)
 	} else {
-		nlog.Infoln(mi.String(), "now disabled")
+		nlog.Infoln(mi.String(), "now disabled, reason:", reason)
 		mi.SetFlags(fs.FlagDisabledByFSHC)
 	}
 }
@@ -188,16 +238,20 @@ func (f *FSHC) _disable(mi *fs.Mountpath) {
 //
 //	is accessible. When the specified local directory is inaccessible the
 //	function returns immediately without any read/write operations
-func _rw(mi *fs.Mountpath, fqn string, numFiles, fsize int) (rerrs, werrs int) {
+func _rw(mi *fs.Mountpath, fqn string, numFiles, fsize, maxerrs int) (etag string, rerrs, werrs int) {
 	var numReads int
 
 	// 1. Read the fqn that caused the error, if defined and is a file.
 	if fqn != "" {
 		nlog.Infoln("1. read one failed fqn:", fqn)
-		if finfo, err := os.Stat(fqn); err == nil && !finfo.IsDir() {
+		if finfo, err := os.Stat(fqn); err != nil {
+			if !cos.IsNotExist(err) && cos.IsIOError(err) {
+				rerrs++ // not a read error; counting anyway
+			}
+		} else if !finfo.IsDir() {
 			numReads++
-			if err := _read(fqn); err != nil && !os.IsNotExist(err) {
-				nlog.Errorln(fqn+":", err)
+			if err := _read(fqn); err != nil && !cos.IsNotExist(err) {
+				nlog.Errorln(fqn, "[", err, "]")
 				if cos.IsIOError(err) {
 					rerrs++
 				}
@@ -206,68 +260,88 @@ func _rw(mi *fs.Mountpath, fqn string, numFiles, fsize int) (rerrs, werrs int) {
 	}
 
 	// 2. Read up to numFiles files.
+	// Allow up to 2x iterations to account for empty dirs, symlinks, and non-regular files
 	nlog.Infoln("2. read randomly up to", numFiles, "existing files")
-	for numReads < numFiles {
-		fqn, err := getRandFname(mi.Path, 0 /*recurs depth*/)
+	for i := 0; numReads < numFiles && rerrs < maxerrs && i < numFiles*2; i++ {
+		fqn, etag, err := getRandFname(mi, mi.Path, 0 /*recurs depth*/)
 		if err == io.EOF {
 			if numReads == 0 {
-				nlog.Warningln(mi.String(), "is suspiciously empty (???)")
+				nlog.Infoln(mi.String(), "has no regular files to sample")
 			}
 			break
 		}
 		if err != nil {
-			if cos.IsIOError(err) {
-				rerrs++
+			if etag == faulted {
+				return etag, rerrs, 0
 			}
-			nlog.Errorf("%s: failed to select a random file to read: (%d, %d, %v)", mi, numReads, rerrs, err)
+			const efmt = "%s: %s (num-reads: %d, rerr: %d, err: %v)"
+			if cos.IsIOError(err) {
+				nlog.Errorf(efmt, mi, "io-error", numReads, rerrs, err)
+				rerrs++
+			} else {
+				nlog.Warningf(efmt, mi, "failed to select existing file to read", numReads, rerrs, err)
+			}
 			continue
 		}
 		if err = _read(fqn); err != nil {
-			rerrs++
-			nlog.Errorf("%s: failed to read %s (%d, %d, %v)", mi, fqn, numReads, rerrs, err)
+			const efmt = "%s: failed to read %s (%d, %d, %v)"
+			if cos.IsIOError(err) {
+				rerrs++
+				nlog.Errorf(efmt, mi, fqn, numReads, rerrs, err)
+			} else {
+				nlog.Warningf(efmt, mi, fqn, numReads, rerrs, err)
+			}
 			continue
 		}
 		numReads++
 	}
 
-	// Create temp dir under the mountpath (under $deleted).
-	tmpDir := mi.TempDir("fshc-on-err")
-	if err := cos.CreateDir(tmpDir); err != nil {
-		if cos.IsIOError(err) {
-			werrs++
-		}
-		nlog.Errorf("%s: failed to create temp dir (%d, %v)", mi, werrs, err)
-		return rerrs, werrs
-	}
-
 	// 3. Generate and write numFiles files.
-	nlog.Infoln("3. write", numFiles, "temp files to", tmpDir)
-	for numWrites := 1; numWrites <= numFiles; numWrites++ {
-		if err := _write(tmpDir, fsize); err != nil {
+	tmp := mi.TempDir(tempDir)
+	nlog.Infoln("3. write", numFiles, "temp files to", tmp)
+	if err := cos.CreateDir(tmp); err != nil { // create temp dir under the mountpath (under $deleted).
+		const efmt = "%s: failed to create temp dir (%v, %q)"
+		if cos.IsIOError(err) && shouldRetry(mi, err) {
+			err = cos.CreateDir(tmp)
+		}
+		if cos.IsIOError(err) {
+			etag = faulted
+			werrs++
+			nlog.Errorf(efmt, mi, err, etag)
+		} else {
+			nlog.Warningf(efmt, mi, err, etag)
+		}
+		return etag, rerrs, werrs
+	}
+	for numWrites := 1; numWrites <= numFiles && werrs < maxerrs; numWrites++ {
+		if err := _write(tmp, fsize); err != nil {
+			const efmt = "%s: failed to write (%d, %d, %v)"
 			if cos.IsIOError(err) {
 				werrs++
+				nlog.Errorf(efmt, mi, numWrites, werrs, err)
+			} else {
+				nlog.Warningf(efmt, mi, numWrites, werrs, err)
 			}
-			nlog.Errorf("%s: %v (%d)", mi, err, werrs)
 		}
 	}
 
 	// 4. Remove temp dir
-	nlog.Infoln("4. remove", tmpDir)
-	if err := os.RemoveAll(tmpDir); err != nil {
+	nlog.Infoln("4. remove", tmp)
+	if err := os.RemoveAll(tmp); err != nil {
 		if cos.IsIOError(err) {
 			werrs++
 		}
 		nlog.Errorf("%s: %v (%d)", mi, err, werrs)
 	}
 
-	return rerrs, werrs
+	return etag, rerrs, werrs
 }
 
 //
 // helper methods
 //
 
-// Open (O_DIRECT), read, and dicard.
+// Open (O_DIRECT), read, and discard.
 func _read(fqn string) error {
 	file, err := fs.DirectOpen(fqn, os.O_RDONLY, 0)
 	if err != nil {
@@ -299,49 +373,56 @@ func _write(tmpDir string, fsize int) error {
 	}
 
 cleanup:
-	erc := wfh.Close()
-	if erc != nil {
-		nlog.Errorln("failed to fclose", fname, erc)
+	if e := wfh.Close(); err == nil && e != nil {
+		err = e
+		nlog.Errorln("failed to fclose", fname, err)
 	}
-	erd := cos.RemoveFile(fname)
-	if erd != nil {
-		nlog.Errorln("failed to remove", fname, erd)
+	if e := cos.RemoveFile(fname); err == nil && e != nil {
+		err = e
+		nlog.Errorln("failed to remove", fname, err)
 	}
-
-	if err == nil && erc == nil && erd == nil {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if erc != nil {
-		return erc
-	}
-	return erd
+	return err
 }
 
-// Look up a random file to read inside `basePath`.
-func getRandFname(basePath string, depth int) (string, error) {
-	file, errN := os.Open(basePath)
+// traverse `dir` for a random file to read
+func getRandFname(mi *fs.Mountpath, dir string, depth int) (fqn, etag string, _ error) {
+	fdir, errN := os.Open(dir)
 	if errN != nil {
-		return "", errN
+		etag = cos.Ternary(depth == 0 && cos.IsIOError(errN), faulted, degraded)
+		if etag == faulted && shouldRetry(mi, errN) {
+			fdir, errN = os.Open(dir)
+		}
+		if errN != nil {
+			return "", etag, errN
+		}
 	}
 
-	dentries, err := file.ReadDir(maxNumFiles)
+	dentries, err := fdir.ReadDir(maxNumFiles)
+
 	if err != nil {
-		return "", err
+		etag = cos.Ternary(depth == 0 && cos.IsIOError(err), faulted, degraded)
+		if etag == faulted && shouldRetry(mi, err) {
+			dentries, err = fdir.ReadDir(maxNumFiles)
+		}
+		if err != nil {
+			fdir.Close()
+			return "", etag, err
+		}
 	}
+
+	fdir.Close()
+
 	l := len(dentries)
 	if l == 0 {
-		return "", io.EOF
+		return "", "", io.EOF
 	}
 	pos := rand.IntN(l)
 	for i := range l {
 		j := (pos + i) % l
 		de := dentries[j]
-		fqn := filepath.Join(basePath, de.Name())
+		fqn := filepath.Join(dir, de.Name())
 		if de.Type().IsRegular() {
-			return fqn, nil
+			return fqn, "", nil
 		}
 		if !de.IsDir() {
 			nlog.Warningln("not a directory and not a file:", fqn, "(???)")
@@ -352,15 +433,24 @@ func getRandFname(basePath string, depth int) (string, error) {
 		if depth > maxDepth {
 			continue
 		}
-		fqn, err = getRandFname(fqn, depth)
+		fqn, _, err = getRandFname(mi, fqn, depth)
 		if err != nil {
 			if err == io.EOF {
 				continue
 			}
-			return "", err
+			return "", etag, err
 		}
-		return fqn, nil
+		return fqn, "", nil
 	}
 
-	return "", io.EOF
+	return "", "", io.EOF
+}
+
+func shouldRetry(mi *fs.Mountpath, err error) bool {
+	if err == nil {
+		return false
+	}
+	nlog.Warningln(mi.String(), faulted, err, "- retrying once...")
+	time.Sleep(singleDelayRetry)
+	return true
 }

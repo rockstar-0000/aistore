@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -45,6 +45,20 @@ func (*crand) Uint64() uint64 {
 func (*crand) Seed(int64) {}
 
 func CryptoRandS(n int) string { return RandStringWithSrc(crnd, n) }
+
+func CryptoRandB(n int) (b []byte) {
+	b = make([]byte, n)
+	_, err := cryptorand.Read(b)
+	debug.AssertNoErr(err)
+	return
+}
+
+func CryptoRandI() uint16 {
+	var buf [SizeofI16]byte
+	_, err := cryptorand.Read(buf[:])
+	debug.AssertNoErr(err)
+	return binary.LittleEndian.Uint16(buf[:])
+}
 
 //
 // misc. rand utils

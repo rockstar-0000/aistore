@@ -1,5 +1,5 @@
 // Package stats provides methods and functionality to register, track, log,
-// and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
+// and export metrics that, for the most part, include "counter" and "latency" kinds.
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -21,6 +21,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/cmn/oom"
@@ -42,11 +43,6 @@ import (
 //
 // all error counters must have "err_" prefix (see `errPrefix`)
 
-// Linkage:
-// - this source is common for both Prometheus (common_prom.go) and StatsD (common_statsd.go)
-// - one of the two pairs (common, common_prom) OR (common, common_statsd) gets compiled with
-//   both Proxy (proxy_stats.go) and Target (target_stats.go)
-
 // defaults and tunables
 const (
 	dfltKaliveClearAlert  = 5 * time.Minute      // clear `cos.KeepAliveErrors` alert when `ErrKaliveCount` doesn't inc that much time
@@ -54,18 +50,18 @@ const (
 	dfltPeriodicTimeStamp = time.Hour            // extended date/time complementary to log timestamps (e.g., "11:29:11.644596")
 	dfltStatsLogInterval  = int64(time.Minute)   // stats logging interval when not idle; `config.Log.StatsTime` takes precedence if defined
 	dlftCapLogInterval    = int64(4 * time.Hour) // capacity logging interval
+	dlftFDsLogInterval    = dlftCapLogInterval   // size of FD table in the kernel
 )
 
 // periodic
 const (
-	maxLogSizeCheckTime = time.Hour              // periodically check the logs for max accumulated size
-	startupSleep        = 300 * time.Millisecond // periodically poll ClusterStarted()
+	maxLogSizeCheckTime = time.Hour         // periodically check the logs for max accumulated size
+	startupSleep        = cos.PollSleepLong // periodically poll ClusterStarted()
 )
 
 const (
-	ngrHighTime    = 10 * time.Minute // log a warning if the number of goroutines remains high
-	ngrExtremeTime = 5 * time.Minute  // when more then twice the maximum (below)
-	lshiftGorHigh  = 8                // max expressed as left shift of the num CPUs
+	NgrPrompt   = "Number of goroutines"
+	ngrHighTime = 10 * time.Minute // log a warning if the number of goroutines remains high
 )
 
 // Naming conventions: error counters' prefixes
@@ -98,6 +94,8 @@ const (
 	RenameCount = "ren.n"
 	ListCount   = "lst.n" // list-objects
 
+	GetBlobCount = "getblob.n"
+
 	// error counters
 	// see also: `Inc`, `regCommon`, `ioErrNames`
 	ErrGetCount    = errPrefix + GetCount
@@ -107,6 +105,8 @@ const (
 	ErrDeleteCount = errPrefix + DeleteCount
 	ErrRenameCount = errPrefix + RenameCount
 	ErrListCount   = errPrefix + ListCount
+
+	ErrGetBlobCount = errPrefix + GetBlobCount
 
 	ErrKaliveCount    = errPrefix + "kalive.n"
 	ErrHTTPWriteCount = errPrefix + "http.write.n"
@@ -231,6 +231,12 @@ func (r *runner) regCommon(snode *meta.Snode) {
 			VarLabs: BckVlabs,
 		},
 	)
+	r.reg(snode, GetBlobCount, KindCounter,
+		&Extra{
+			Help:    "total number of executed blob download requests",
+			VarLabs: BckVlabs,
+		},
+	)
 
 	// basic error counters, respectively
 	r.reg(snode, ErrGetCount, KindCounter,
@@ -272,6 +278,12 @@ func (r *runner) regCommon(snode *meta.Snode) {
 	r.reg(snode, ErrListCount, KindCounter,
 		&Extra{
 			Help:    "total number of list-objects errors",
+			VarLabs: BckVlabs,
+		},
+	)
+	r.reg(snode, ErrGetBlobCount, KindCounter,
+		&Extra{
+			Help:    "total number of blob download errors",
 			VarLabs: BckVlabs,
 		},
 	)
@@ -356,14 +368,14 @@ func (r *runner) SetFlag(name string, set cos.NodeStateFlags) {
 	v := r.core.Tracker[name]
 	oval := ratomic.LoadInt64(&v.Value)
 	nval := oval | int64(set)
-	ratomic.StoreInt64(&v.Value, nval)
+	r.core.set(name, nval)
 }
 
 func (r *runner) ClrFlag(name string, clr cos.NodeStateFlags) {
 	v := r.core.Tracker[name]
 	oval := ratomic.LoadInt64(&v.Value)
 	nval := oval &^ int64(clr)
-	ratomic.StoreInt64(&v.Value, nval)
+	r.core.set(name, nval)
 }
 
 func (r *runner) SetClrFlag(name string, set, clr cos.NodeStateFlags) {
@@ -374,7 +386,7 @@ func (r *runner) SetClrFlag(name string, set, clr cos.NodeStateFlags) {
 		return
 	}
 	nval &^= int64(clr)
-	ratomic.StoreInt64(&v.Value, nval)
+	r.core.set(name, nval)
 }
 
 func (r *runner) Name() string { return r.name }
@@ -447,7 +459,6 @@ waitStartup:
 	ticker.Stop()
 
 	config = cmn.GCO.Get()
-	goMaxProcs := runtime.GOMAXPROCS(0)
 	nlog.Infoln("Starting", r.Name())
 	hk.Reg(r.Name()+"-logs"+hk.NameSuffix, hkLogs, maxLogSizeCheckTime)
 
@@ -455,15 +466,13 @@ waitStartup:
 	r.ticker = time.NewTicker(statsTime)
 	r.startedUp.Store(true)
 
-	// one StatsD or Prometheus (depending on the build tag)
-	r.core.initStarted(r.node.Snode())
-
 	var (
 		lastNgr           int64
 		lastKaliveErrInc  int64
 		kaliveErrs        int64
 		startTime         = mono.NanoTime() // uptime henceforth
 		lastDateTimestamp = startTime       // RFC822
+		lastFDs           = startTime
 	)
 	for {
 		select {
@@ -473,7 +482,7 @@ waitStartup:
 			logger.log(now, time.Duration(now-startTime) /*uptime*/, config)
 
 			// 1. "High number of"
-			lastNgr = r.checkNgr(now, lastNgr, goMaxProcs)
+			lastNgr = r.checkNgr(now, lastNgr)
 
 			if statsTime != config.Periodic.StatsTime.D() {
 				statsTime = config.Periodic.StatsTime.D()
@@ -506,6 +515,9 @@ waitStartup:
 				// clear
 				r.ClrFlag(NodeAlerts, cos.KeepAliveErrors)
 			}
+
+			// 5. FD count
+			lastFDs = _checkFDs(now, lastFDs)
 		case <-r.stopCh:
 			r.ticker.Stop()
 			return nil
@@ -529,14 +541,14 @@ func (r *runner) _memload(mm *memsys.MMSA, set, clr cos.NodeStateFlags) {
 		if !flags.IsSet(cos.OOM) {
 			set |= cos.OOM
 			clr |= cos.LowMemory
-			nlog.Errorln(r.node.String(), mm.Str(&r.mem))
+			nlog.Warningln(r.node.String(), mm.Name, "alert: oom")
 		}
 		oom.FreeToOS(true)
 	case pressure >= memsys.PressureHigh:
 		clr |= cos.OOM
 		if !flags.IsSet(cos.LowMemory) {
 			set |= cos.LowMemory
-			nlog.Warningln(mm.Str(&r.mem))
+			nlog.Warningln(r.node.String(), mm.Name, "alert: low memory")
 		}
 	default:
 		if flags.IsAnySet(cos.LowMemory | cos.OOM) {
@@ -558,8 +570,8 @@ func (r *runner) _memload(mm *memsys.MMSA, set, clr cos.NodeStateFlags) {
 func _load(sname string, flags, set, clr cos.NodeStateFlags) (cos.NodeStateFlags, cos.NodeStateFlags) {
 	const tag = "CPU utilization:"
 	var (
-		load = sys.MaxLoad()
-		ncpu = sys.NumCPU()
+		load, isExtreme = sys.MaxLoad2()
+		ncpu            = sys.NumCPU()
 	)
 	// 1. normal
 	if load < float64(ncpu>>1) { // 50%
@@ -570,11 +582,7 @@ func _load(sname string, flags, set, clr cos.NodeStateFlags) (cos.NodeStateFlags
 		return set, clr
 	}
 	// 2. extreme
-	var (
-		fcpu  = float64(ncpu)
-		oocpu = max(fcpu*sys.ExtremeLoad/100, 1)
-	)
-	if load >= oocpu {
+	if isExtreme {
 		if !flags.IsSet(cos.OOCPU) {
 			set |= cos.OOCPU
 			clr |= cos.LowCPU
@@ -583,8 +591,8 @@ func _load(sname string, flags, set, clr cos.NodeStateFlags) (cos.NodeStateFlags
 		return set, clr
 	}
 	// 3. high
-	highcpu := fcpu * sys.HighLoad / 100
-	if load >= highcpu {
+	highcpu := ncpu * sys.HighLoad / 100
+	if load > float64(highcpu) {
 		clr |= cos.OOCPU
 		if !flags.IsSet(cos.LowCPU) {
 			set |= cos.LowCPU
@@ -616,34 +624,51 @@ func (r *runner) GetMetricNames() cos.StrKVs {
 	return out
 }
 
-func (r *runner) checkNgr(now, lastNgr int64, goMaxProcs int) int64 {
-	lim := goMaxProcs << lshiftGorHigh
-	ngr := runtime.NumGoroutine()
-	if ngr < lim {
+// TODO: add Prometheus metric
+func (r *runner) checkNgr(now, lastNgr int64) int64 {
+	var (
+		ngr     = runtime.NumGoroutine()
+		ngrLoad = load.Gor(ngr)
+	)
+	if ngrLoad < load.High {
 		if lastNgr != 0 {
-			r.ClrFlag(NodeAlerts, cos.NumGoroutines)
-			nlog.Infoln("Number of goroutines is now back to normal:", ngr)
+			r.ClrFlag(NodeAlerts, cos.HighNumGoroutines|cos.NumGoroutines)
+			nlog.Infoln(NgrPrompt, "is now back to normal:", ngr)
 		}
 		return 0
 	}
-	if lastNgr == 0 {
-		r.SetFlag(NodeAlerts, cos.NumGoroutines)
-		lastNgr = now
-	} else if d := time.Duration(now - lastNgr); (d >= ngrHighTime) || (ngr > lim<<1 && d >= ngrExtremeTime) {
-		lastNgr = now
+
+	var set, clr cos.NodeStateFlags
+	tag := "(red alert)"
+	if ngrLoad == load.High { // yellow
+		clr = cos.HighNumGoroutines
+		set = cos.NumGoroutines
+		tag = "(yellow alert)"
+	} else { // Critical
+		set = cos.HighNumGoroutines
+		clr = cos.NumGoroutines
 	}
-	if lastNgr == now {
-		nlog.Warningln("High number of goroutines:", ngr)
+	r.SetClrFlag(NodeAlerts, set, clr)
+
+	if lastNgr == 0 || time.Duration(now-lastNgr) >= ngrHighTime {
+		lastNgr = now
+		nlog.Warningln(NgrPrompt, ngr, tag)
 	}
 	return lastNgr
+}
+
+func _checkFDs(now, lastFDs int64) int64 {
+	if now-lastFDs > dlftFDsLogInterval {
+		nlog.Infoln("currently allocated FD table:", sys.ProcFDSize())
+		return now
+	}
+	return lastFDs
 }
 
 func (r *runner) Stop(err error) {
 	nlog.Infoln("Stopping", r.Name(), "err:", err)
 	r.stopCh <- struct{}{}
 	close(r.stopCh)
-
-	r.closeStatsD()
 }
 
 // [log] serialize itself (slightly more efficiently than JSON)
@@ -756,7 +781,7 @@ func hkLogs(int64) time.Duration {
 		n       = len(dentries)
 		nn      = n - n>>2
 		finfos  = make([]iofs.FileInfo, 0, nn)
-		verbose = cmn.Rom.FastV(4, cos.SmoduleStats)
+		verbose = cmn.Rom.V(4, cos.ModStats)
 	)
 	for i, logtype := range []string{".INFO.", ".ERROR."} {
 		finfos, tot = _sizeLogs(dentries, logtype, finfos)
@@ -808,7 +833,7 @@ func _rmLogs(tot, maxtotal int64, logdir, logtype string, finfos []iofs.FileInfo
 		return finfos[i].ModTime().Before(finfos[j].ModTime())
 	}
 	l := len(finfos)
-	verbose := cmn.Rom.FastV(4, cos.SmoduleStats)
+	verbose := cmn.Rom.V(4, cos.ModStats)
 	if verbose {
 		nlog.Infoln(gcLogs, logtype, "total:", tot, "max:", maxtotal, "num:", l)
 	}

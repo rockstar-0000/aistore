@@ -5,20 +5,19 @@
 package etl
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/k8s"
-	"github.com/NVIDIA/aistore/ext/etl/runtime"
 
 	jsoniter "github.com/json-iterator/go"
 	corev1 "k8s.io/api/core/v1"
@@ -35,24 +34,22 @@ const (
 	ETLSpecType = "etl-spec"
 
 	// common fields
-	Name              = "NAME"
-	CommunicationType = "COMMUNICATION_TYPE"
-	ArgType           = "ARG_TYPE"
-	DirectPut         = "DIRECT_PUT"
+	Name              = "name"
+	CommunicationType = "communication_type"
+	DirectPut         = "direct_put"
 
-	// `InitCodeMsg` fields
-	Spec = "SPEC"
-
-	// `InitCodeMsg` fields
-	Runtime   = "RUNTIME"
-	Code      = "CODE"
-	Deps      = "DEPENDENCIES"
-	ChunkSize = "CHUNK_SIZE"
+	// `InitSpecMsg` fields
+	Spec = "spec"
 
 	// `ETLSpecMsg` fields
-	Image   = "IMAGE"
-	Command = "COMMAND"
-	Env     = "ENV"
+	Runtime = "runtime"
+	Image   = "image"
+	Command = "command"
+	Env     = "env"
+
+	// consts for unmarshalling ETL details
+	InitMsgType = "init_msg"
+	ObjErrsType = "obj_errors"
 )
 
 // consistent with rfc2396.txt "Uniform Resource Identifiers (URI): Generic Syntax"
@@ -78,7 +75,7 @@ const (
 	Unknown Stage = iota
 	Initializing
 	Running
-	Stopped
+	Aborted
 )
 
 // enum communication types (`commTypes`)
@@ -97,19 +94,13 @@ const (
 	WebSocket = "ws://"
 )
 
-// enum arg types (`argTypes`)
-const (
-	ArgTypeDefault = ""
-	ArgTypeURL     = "url"
-	ArgTypeFQN     = "fqn"
-)
-
 type (
 	InitMsg interface {
 		Name() string
-		MsgType() string // Code or Spec
+		Cname() string
+		PodName(tid string) string // ETL pod name on the given target
+		MsgType() string
 		CommType() string
-		ArgType() string
 		Validate() error
 		IsDirectPut() bool
 		ParsePodSpec() (*corev1.Pod, error)
@@ -119,60 +110,57 @@ type (
 	}
 
 	// and implementations
+	// swagger:model
 	InitMsgBase struct {
 		EtlName          string          `json:"name" yaml:"name"`
 		CommTypeX        string          `json:"communication" yaml:"communication"`
-		ArgTypeX         string          `json:"argument" yaml:"argument"`
-		InitTimeout      cos.Duration    `json:"init_timeout,omitempty" yaml:"init_timeout,omitempty"`
-		ObjTimeout       cos.Duration    `json:"obj_timeout,omitempty" yaml:"obj_timeout,omitempty"`
+		Env              []corev1.EnvVar `json:"env,omitempty" yaml:"env,omitempty" swaggertype:"array,object"`
+		InitTimeout      cos.Duration    `json:"init_timeout,omitempty" yaml:"init_timeout,omitempty" swaggertype:"primitive,string"`
+		ObjTimeout       cos.Duration    `json:"obj_timeout,omitempty" yaml:"obj_timeout,omitempty" swaggertype:"primitive,string"`
 		SupportDirectPut bool            `json:"support_direct_put,omitempty" yaml:"support_direct_put,omitempty"`
-		Env              []corev1.EnvVar `json:"env,omitempty" yaml:"env,omitempty"`
 	}
+
+	// swagger:model
 	InitSpecMsg struct {
-		Spec []byte `json:"spec"`
-		InitMsgBase
+		Spec        []byte `json:"spec"`
+		InitMsgBase `yaml:",inline"`
 	}
 
 	// ETLSpecMsg is a YAML representation of the ETL pod spec.
+	// swagger:model
 	ETLSpecMsg struct {
-		InitMsgBase             // included all optional fields from InitMsgBase
-		Runtime     RuntimeSpec `json:"runtime" yaml:"runtime"`
+		InitMsgBase `yaml:",inline"`            // included all optional fields from InitMsgBase
+		Runtime     RuntimeSpec                 `json:"runtime" yaml:"runtime"`
+		Resources   corev1.ResourceRequirements `json:"resources,omitempty" yaml:"resources,omitempty" swaggertype:"object"`
 	}
 
+	// swagger:model
 	RuntimeSpec struct {
 		Image   string          `json:"image" yaml:"image"`
 		Command []string        `json:"command,omitempty" yaml:"command,omitempty"`
-		Env     []corev1.EnvVar `json:"env,omitempty" yaml:"env,omitempty"`
-	}
-
-	// ========================================================================================
-	// InitCodeMsg carries the name of the transforming function;
-	// the `Transform` function is mandatory and cannot be "" (empty) - it _will_ be called
-	// by the `Runtime` container (see etl/runtime/all.go for all supported pre-built runtimes);
-	// ChunkSize:
-	//     0 (zero) - read the entire payload in memory and then transform it in one shot;
-	//     > 0      - use chunk-size buffering and transform incrementally, one chunk at a time
-	// Flags:
-	//     bitwise flags: (streaming | debug | strict | ...) future enhancements
-	// =========================================================================================
-	InitCodeMsg struct {
-		Runtime string `json:"runtime"`
-		Funcs   struct {
-			Transform string `json:"transform"`
-		}
-		Code []byte `json:"code"` // cannot be omitted
-
-		Deps []byte `json:"dependencies"`
-		InitMsgBase
-		ChunkSize int64 `json:"chunk_size"`
-		Flags     int64 `json:"flags"`
+		Env     []corev1.EnvVar `json:"env,omitempty" yaml:"env,omitempty" swaggertype:"array,object"`
 	}
 
 	WebsocketCtrlMsg struct {
-		Daddr string `json:"dst_addr,omitempty"`
-		Targs string `json:"etl_args,omitempty"`
-		FQN   string `json:"fqn,omitempty"`
-		Path  string `json:"path,omitempty"`
+		Pipeline string `json:"pipeline,omitempty"`
+		Targs    string `json:"etl_args,omitempty"`
+		FQN      string `json:"fqn,omitempty"`
+		Path     string `json:"path,omitempty"`
+	}
+
+	// ETLObjDownloadCtx contains ETL download job parameters
+	ETLObjDownloadCtx struct {
+		ObjName string // Target object name
+		Link    string // Source URL to download from
+		ETLArgs string // Transform arguments
+	}
+
+	// used by 2PC initialization
+	PodMap  map[string]PodInfo // target ID to ETL pod info
+	PodInfo struct {
+		URI     string `json:"uri"`      // ETL pod URI
+		PodName string `json:"pod_name"` // ETL pod name
+		SvcName string `json:"svc_name"` // ETL service name
 	}
 )
 
@@ -185,6 +173,17 @@ type (
 		ObjCount int64  `json:"obj_count"`
 		InBytes  int64  `json:"in_bytes"`
 		OutBytes int64  `json:"out_bytes"`
+	}
+
+	Details struct {
+		InitMsg InitMsg  `json:"init_msg"`
+		ObjErrs []ObjErr `json:"obj_errors,omitempty"`
+	}
+	ObjErrs []ObjErr
+	ObjErr  struct {
+		ObjName string `json:"obj_name"` // object name
+		Message string `json:"msg"`      // error message
+		Ecode   int    `json:"ecode"`    // error code
 	}
 
 	LogsByTarget []Logs
@@ -207,10 +206,7 @@ type (
 	}
 )
 
-var (
-	commTypes = []string{Hpush, Hpull, HpushStdin, WebSocket}    // NOTE: must contain all
-	argTypes  = []string{ArgTypeDefault, ArgTypeURL, ArgTypeFQN} // ditto
-)
+var commTypes = []string{Hpush, Hpull, HpushStdin, WebSocket} // NOTE: must contain all
 
 ////////////////
 // InitMsg*** //
@@ -218,73 +214,54 @@ var (
 
 // interface guard
 var (
-	_ InitMsg = (*InitCodeMsg)(nil)
 	_ InitMsg = (*InitSpecMsg)(nil)
 	_ InitMsg = (*ETLSpecMsg)(nil)
 )
 
-func (m *InitMsgBase) CommType() string  { return m.CommTypeX }
-func (m *InitMsgBase) ArgType() string   { return m.ArgTypeX }
-func (m *InitMsgBase) Name() string      { return m.EtlName }
-func (m *InitMsgBase) IsDirectPut() bool { return m.SupportDirectPut }
+func (m *InitMsgBase) CommType() string          { return m.CommTypeX }
+func (m *InitMsgBase) Name() string              { return m.EtlName }
+func (m *InitMsgBase) Cname() string             { return "ETL[" + m.EtlName + "]" }
+func (m *InitMsgBase) PodName(tid string) string { return m.EtlName + "-" + strings.ToLower(tid) }
+func (m *InitMsgBase) IsDirectPut() bool         { return m.SupportDirectPut }
 
 func (m *InitMsgBase) GetEnv() []corev1.EnvVar { return m.Env }
 func (m *InitMsgBase) Timeouts() (initTimeout, objTimeout cos.Duration) {
 	return m.InitTimeout, m.ObjTimeout
 }
 
-func (*InitCodeMsg) MsgType() string { return CodeType }
 func (*InitSpecMsg) MsgType() string { return SpecType }
 func (*ETLSpecMsg) MsgType() string  { return ETLSpecType }
 
-func (m *InitCodeMsg) String() string {
-	return fmt.Sprintf("init-%s[%s-%s-%s-%s], timeout=(%v, %v)", CodeType, m.Name(), m.CommType(), m.ArgType(), m.Runtime, m.InitTimeout.D(), m.ObjTimeout.D())
-}
-
 func (m *InitSpecMsg) String() string {
-	return fmt.Sprintf("init-%s[%s-%s-%s], timeout=(%v, %v)", SpecType, m.Name(), m.CommType(), m.ArgType(), m.InitTimeout.D(), m.ObjTimeout.D())
+	return fmt.Sprintf("init-%s[%s-%s], timeout=(%v, %v)", SpecType, m.Name(), m.CommType(), m.InitTimeout.D(), m.ObjTimeout.D())
 }
 
 func (e *ETLSpecMsg) String() string {
-	return fmt.Sprintf("init-%s[%s-%s-%s], env=%s, timeout=(%v, %v)", ETLSpecType, e.Name(), e.CommType(), e.ArgType(), e.FormatEnv(), e.InitTimeout.D(), e.ObjTimeout.D())
+	return fmt.Sprintf("init-%s[%s-%s], env=%s, timeout=(%v, %v)", ETLSpecType, e.Name(), e.CommType(), e.FormatEnv(), e.InitTimeout.D(), e.ObjTimeout.D())
 }
 
-func UnmarshalInitMsg(b []byte) (msg InitMsg, err error) {
+func UnmarshalInitMsg(b []byte) (InitMsg, error) {
+	var err1, err2 error
 	// try parsing it as ETLSpecMsg first
 	var etlSpec ETLSpecMsg
-	if err = jsoniter.Unmarshal(b, &etlSpec); err == nil {
-		if etlSpec.Validate() == nil {
+	if err1 = jsoniter.Unmarshal(b, &etlSpec); err1 == nil {
+		if err1 = etlSpec.Validate(); err1 == nil {
 			return &etlSpec, nil
 		}
 	}
 
-	// if fail, try parsing it as InitSpecMsg or InitCodeMsg
-	var msgInf map[string]json.RawMessage
-	if err = jsoniter.Unmarshal(b, &msgInf); err != nil {
-		return nil, err
+	// if fail, try parsing it as InitSpecMsg
+	var podSpec InitSpecMsg
+	if err2 = jsoniter.Unmarshal(b, &podSpec); err2 == nil {
+		if err2 = podSpec.Validate(); err2 == nil {
+			return &podSpec, nil
+		}
 	}
 
-	_, hasCode := msgInf[CodeType]
-	_, hasSpec := msgInf[SpecType]
-
-	if hasCode && hasSpec {
-		return nil, fmt.Errorf("invalid etl.InitMsg: both '%s' and '%s' fields are present", CodeType, SpecType)
-	}
-
-	if hasCode {
-		msg = &InitCodeMsg{}
-		err = jsoniter.Unmarshal(b, msg)
-		return msg, err
-	}
-	if hasSpec {
-		msg = &InitSpecMsg{}
-		err = jsoniter.Unmarshal(b, msg)
-		return msg, err
-	}
-	return nil, fmt.Errorf("invalid etl.InitMsg: %+v", msgInf)
+	return nil, fmt.Errorf("invalid etl.InitMsg: ETLSpecMsg error: %v; InitSpecMsg error: %v", err1, err2)
 }
 
-func (m *InitMsgBase) validate(detail string) error {
+func (m *InitMsgBase) Validate(detail string) error {
 	const ferr = "%v [%s]"
 
 	if err := k8s.ValidateEtlName(m.EtlName); err != nil {
@@ -292,35 +269,8 @@ func (m *InitMsgBase) validate(detail string) error {
 	}
 
 	errCtx := &cmn.ETLErrCtx{ETLName: m.Name()}
-	if m.CommTypeX != "" && !cos.StringInSlice(m.CommTypeX, commTypes) {
+	if m.CommTypeX != "" && !slices.Contains(commTypes, m.CommTypeX) {
 		err := fmt.Errorf("unknown comm-type %q", m.CommTypeX)
-		return cmn.NewErrETLf(errCtx, ferr, err, detail)
-	}
-
-	if !cos.StringInSlice(m.ArgTypeX, argTypes) {
-		err := fmt.Errorf("unsupported arg-type %q", m.ArgTypeX)
-		return cmn.NewErrETLf(errCtx, ferr, err, detail)
-	}
-
-	//
-	// not-implemented-yet type limitations:
-	//
-	if m.ArgTypeX == ArgTypeURL && m.CommTypeX != Hpull {
-		err := fmt.Errorf("arg-type %q requires comm-type %q (%q is not supported yet)", m.ArgTypeX, Hpull, m.CommTypeX)
-		return cmn.NewErrETLf(errCtx, ferr, err, detail)
-	}
-	if m.ArgTypeX == ArgTypeFQN && m.CommTypeX != Hpull && m.CommTypeX != Hpush && m.CommTypeX != WebSocket {
-		err := fmt.Errorf("arg-type %q requires comm-type (%q or %q or %q) - %q is not supported yet",
-			m.ArgTypeX, Hpull, Hpush, WebSocket, m.CommTypeX)
-		return cmn.NewErrETLf(errCtx, ferr, err, detail)
-	}
-
-	//
-	// ArgTypeFQN ("fqn") can also be globally disallowed
-	//
-	if m.ArgTypeX == ArgTypeFQN && cmn.Rom.Features().IsSet(feat.DontAllowPassingFQNtoETL) {
-		err := fmt.Errorf("arg-type %q is not permitted by the configured feature flags (%s)",
-			m.ArgTypeX, cmn.Rom.Features().String())
 		return cmn.NewErrETLf(errCtx, ferr, err, detail)
 	}
 
@@ -346,31 +296,6 @@ func (m *InitMsgBase) validate(detail string) error {
 	}
 	if m.ObjTimeout == 0 {
 		m.ObjTimeout = cos.Duration(DefaultObjTimeout)
-	}
-	return nil
-}
-
-func (m *InitCodeMsg) Validate() error {
-	if err := m.InitMsgBase.validate(m.String()); err != nil {
-		return err
-	}
-
-	if len(m.Code) == 0 {
-		return fmt.Errorf("source code is empty (%q)", m.Runtime)
-	}
-	if m.Runtime == "" {
-		return fmt.Errorf("runtime is not specified (comm-type %q)", m.CommTypeX)
-	}
-	if _, ok := runtime.Get(m.Runtime); !ok {
-		return fmt.Errorf("unsupported runtime %q (supported: %v)", m.Runtime, runtime.GetNames())
-	}
-
-	if m.Funcs.Transform == "" {
-		return fmt.Errorf("transform function cannot be empty (comm-type %q, funcs %+v)", m.CommTypeX, m.Funcs)
-	}
-	if m.ChunkSize < 0 || m.ChunkSize > cos.MiB {
-		return fmt.Errorf("chunk-size %d is invalid, expecting 0 <= chunk-size <= MiB (%q, comm-type %q)",
-			m.ChunkSize, m.CommTypeX, m.Runtime)
 	}
 	return nil
 }
@@ -420,7 +345,7 @@ func (m *InitSpecMsg) Validate() error {
 		}
 	}
 
-	return m.InitMsgBase.validate(m.String())
+	return m.InitMsgBase.Validate(m.String())
 }
 
 func (e *ETLSpecMsg) Validate() error {
@@ -428,7 +353,7 @@ func (e *ETLSpecMsg) Validate() error {
 	if e.Runtime.Image == "" {
 		return cmn.NewErrETLf(errCtx, "runtime.image must be specified")
 	}
-	return e.InitMsgBase.validate(e.String())
+	return e.InitMsgBase.Validate(e.String())
 }
 
 // ParsePodSpec parses `m.Spec` into a Kubernetes Pod object.
@@ -443,28 +368,6 @@ func (m *InitSpecMsg) ParsePodSpec() (*corev1.Pod, error) {
 		return nil, errors.New("expected pod spec, got: " + kind)
 	}
 	return pod, nil
-}
-
-func (m *InitCodeMsg) ParsePodSpec() (*corev1.Pod, error) {
-	var (
-		ftp      = fromToPairs(m)
-		replacer = strings.NewReplacer(ftp...)
-	)
-	r, exists := runtime.Get(m.Runtime)
-	debug.Assert(exists, m.Runtime) // must've been checked by proxy
-
-	podSpec := replacer.Replace(r.PodSpec())
-
-	m.Env = append(m.Env,
-		corev1.EnvVar{Name: r.CodeEnvName(), Value: string(m.Code)},
-		corev1.EnvVar{Name: r.DepsEnvName(), Value: string(m.Deps)},
-	)
-
-	msg := &InitSpecMsg{
-		Spec:        cos.UnsafeB(podSpec),
-		InitMsgBase: m.InitMsgBase,
-	}
-	return msg.ParsePodSpec()
 }
 
 func (e *ETLSpecMsg) ParsePodSpec() (*corev1.Pod, error) {
@@ -486,8 +389,9 @@ func (e *ETLSpecMsg) ParsePodSpec() (*corev1.Pod, error) {
 						},
 					},
 				},
-				Command: e.Runtime.Command,
-				Env:     e.Runtime.Env,
+				Command:   e.Runtime.Command,
+				Env:       e.Runtime.Env,
+				Resources: e.Resources,
 			}},
 		},
 	}
@@ -507,17 +411,38 @@ func (e *ETLSpecMsg) FormatEnv() string {
 	return b.String()
 }
 
+// UnmarshalYAML works around the fact that resource.Quantity can't unmarshal from YAML directly.
+// We decode the YAML node into a map, marshal it to JSON, and unmarshal again to parse resource.Quantity correctly.
+func (e *ETLSpecMsg) UnmarshalYAML(node *yaml.Node) error {
+	var intermediate map[string]any
+	if err := node.Decode(&intermediate); err != nil {
+		return fmt.Errorf("yaml node decode: %w", err)
+	}
+	data, err := jsoniter.Marshal(intermediate)
+	if err != nil {
+		return fmt.Errorf("json marshal: %w", err)
+	}
+	if err := jsoniter.Unmarshal(data, e); err != nil {
+		return fmt.Errorf("json unmarshal: %w", err)
+	}
+	return nil
+}
+
 func (s Stage) String() string {
 	switch s {
 	case Initializing:
 		return "Initializing"
 	case Running:
 		return "Running"
-	case Stopped:
-		return "Stopped"
+	case Aborted:
+		return "Aborted"
 	default:
 		return "Unknown"
 	}
+}
+
+func (eo ObjErr) Error() string {
+	return fmt.Sprintf("ETL object %s transform error (%d): %s", eo.ObjName, eo.Ecode, eo.Message)
 }
 
 //////////////

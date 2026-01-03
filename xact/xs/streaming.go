@@ -76,11 +76,11 @@ func (p *streamingF) _tag(fromBck, toBck *meta.Bck) (tag []byte) {
 		pack = cos.NewPacker(nil, l)
 	)
 	pack.WriteString(p.kind)
-	pack.WriteByte('|')
+	pack.WriteUint8('|')
 	pack.WriteBytes(from)
-	pack.WriteByte('|')
+	pack.WriteUint8('|')
 	pack.WriteBytes(to)
-	pack.WriteByte('|')
+	pack.WriteUint8('|')
 	pack.WriteInt64(bmd.Version)
 	tag = pack.Bytes()
 	debug.Assert(len(tag) == l, len(tag), " vs ", l)
@@ -163,9 +163,9 @@ func (r *streamingX) sendTerm(uuid string, tsi *meta.Snode, abortErr error) {
 	o.Hdr.SID = core.T.SID()
 	o.Hdr.Opaque = cos.UnsafeB(uuid)
 	if abortErr == nil {
-		o.Hdr.Opcode = opDone
+		o.Hdr.Opcode = transport.OpcDone
 	} else {
-		o.Hdr.Opcode = opAbort
+		o.Hdr.Opcode = transport.OpcAbort
 		o.Hdr.ObjName = abortErr.Error()
 	}
 
@@ -182,14 +182,14 @@ func (r *streamingX) sendTerm(uuid string, tsi *meta.Snode, abortErr error) {
 	case err != nil:
 		nlog.WarningDepth(1, r.String(), err)
 	default:
-		if cmn.Rom.FastV(4, cos.SmoduleXs) {
+		if cmn.Rom.V(4, cos.ModXs) {
 			nlog.Infoln(r.Name(), "done")
 		}
 	}
 }
 
 func (r *streamingX) fin(unreg bool) {
-	if r.DemandBase.Finished() {
+	if r.DemandBase.IsDone() {
 		// must be aborted
 		r.p.dm.Close(r.Err())
 		r.p.dm.UnregRecv()

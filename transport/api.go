@@ -1,5 +1,4 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -7,7 +6,6 @@ package transport
 
 import (
 	"io"
-	"math"
 	"time"
 	"unsafe"
 
@@ -17,22 +15,12 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
-	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
 ///////////////////
 // object stream //
 ///////////////////
-
-// range of 16 `Obj.Hdr.Opcode` and `Msg.Opcode` values
-// reserved for _internal_ use
-const (
-	opcFin = iota + math.MaxUint16 - 16
-	opcIdleTick
-)
-
-func ReservedOpcode(opc int) bool { return opc >= opcFin }
 
 const (
 	SizeUnknown = cos.ContentLengthUnknown // -1: obj size unknown (not set)
@@ -45,11 +33,42 @@ const (
 
 const sizeofh = int(unsafe.Sizeof(Obj{}))
 
+// ObjHdr represents the transport header passed to recv callbacks.
+//
+// NOTE: ObjHdr and all of its fields (especially []byte fields like Opaque and Demux)
+// alias a temporary buffer (`it.hbuf`) reused on the next iteration of RxAnyStream.
+// Therefore:
+//
+//   • DO NOT retain ObjHdr or its fields beyond the recv() call
+//   • DO NOT pass ObjHdr to goroutines
+//   • DO NOT store ObjHdr in long-lived structures
+//
+// Correct usage: consume ObjHdr synchronously and inline inside the recv() callback.
+
 type (
-	// advanced usage: additional stream control
+	// object-sent callback that has the following signature can optionally be defined on a:
+	// a) per-stream basis (via NewStream constructor - see Extra struct above)
+	// b) for a given object that is being sent (for instance, to support a call-per-batch semantics)
+	// Naturally, object callback "overrides" the per-stream one: when object callback is defined
+	// (i.e., non-nil), the stream callback is ignored/skipped.
+	// NOTE: if defined, the callback executes asynchronously as far as the sending part is concerned
+	SentCB func(*ObjHdr, io.ReadCloser, any, error)
+
+	// scope: stream
+	// flow: connection dead => terminate => TermedCB => [reconnect() => fresh stream to same peer]
+	TermedCB func(dstID string, err error)
+
+	// usage and scope:
+	// - entire stream's lifetime (all Send() calls)
+	// - additional stream control
+	// - global or optional params (to override defaults)
+	Parent struct {
+		Xact     core.Xact // sender ID; abort
+		SentCB   SentCB    // to free SGLs, close files, etc. cleanup
+		TermedCB TermedCB  // when err-ed
+	}
 	Extra struct {
-		Xact         core.Xact     // usage: sender ID; abort
-		Callback     ObjSentCB     // typical usage: to free SGLs, close files
+		Parent       *Parent
 		Config       *cmn.Config   // (to optimize-out GCO.Get())
 		Compression  string        // see CompressAlways, etc. enum
 		IdleTeardown time.Duration // when exceeded, causes PUT to terminate (and to renew upon the very next send)
@@ -58,40 +77,23 @@ type (
 		MaxHdrSize   int32         // overrides config.Transport.MaxHeaderSize
 	}
 
-	// receive-side session stats indexed by session ID (see recv.go for "uid")
-	// optional, currently tests only
-	RxStats map[uint64]*Stats
-
-	// object header
+	// _object_ header (not to confuse w/ objects in buckets)
 	ObjHdr struct {
 		Bck      cmn.Bck
 		ObjName  string
 		SID      string       // sender node ID
+		Demux    string       // for shared data mover(s), to demux on the receive side
 		Opaque   []byte       // custom control (optional)
 		ObjAttrs cmn.ObjAttrs // attributes/metadata of the object that's being transmitted
 		Opcode   int          // (see reserved range above)
 	}
 	// object to transmit
 	Obj struct {
-		Reader   io.ReadCloser // reader (to read the object, and close when done)
-		CmplArg  any           // optional context passed to the ObjSentCB callback
-		Callback ObjSentCB     // called when the last byte is sent _or_ when the stream terminates (see term.reason)
-		prc      *atomic.Int64 // private; if present, ref-counts so that we call ObjSentCB only once
-		Hdr      ObjHdr
-	}
-
-	// object-sent callback that has the following signature can optionally be defined on a:
-	// a) per-stream basis (via NewStream constructor - see Extra struct above)
-	// b) for a given object that is being sent (for instance, to support a call-per-batch semantics)
-	// Naturally, object callback "overrides" the per-stream one: when object callback is defined
-	// (i.e., non-nil), the stream callback is ignored/skipped.
-	// NOTE: if defined, the callback executes asynchronously as far as the sending part is concerned
-	ObjSentCB func(*ObjHdr, io.ReadCloser, any, error)
-
-	Msg struct {
-		SID    string
-		Body   []byte
-		Opcode int
+		Reader  io.ReadCloser // reader (to read the object, and close when done)
+		CmplArg any           // optional context passed to the SentCB callback
+		SentCB  SentCB        // called when the last byte is sent _or_ when the stream terminates (see term.reason)
+		prc     *atomic.Int64 // private; if present, ref-counts so that we call SentCB only once
+		Hdr     ObjHdr
 	}
 
 	// stream collector
@@ -99,7 +101,14 @@ type (
 
 	// Rx callbacks
 	RecvObj func(hdr *ObjHdr, objReader io.Reader, err error) error
-	RecvMsg func(msg Msg, err error) error
+)
+
+// shared data mover (SDM)
+type (
+	Receiver interface {
+		ID() string
+		RecvObj(hdr *ObjHdr, objReader io.Reader, err error) error // Rx callback above
+	}
 )
 
 ///////////////////
@@ -112,9 +121,12 @@ func NewObjStream(client Client, dstURL, dstID string, extra *Extra) (s *Stream)
 	} else if extra.Config == nil {
 		extra.Config = cmn.GCO.Get()
 	}
-	s = &Stream{streamBase: *newBase(client, dstURL, dstID, extra)}
-	s.streamBase.streamer = s
-	s.callback = extra.Callback
+	s = &Stream{}
+	s.initBase(client, dstURL, dstID, extra)
+	s.base.streamer = s
+	if extra.Parent != nil {
+		s.sentCB = extra.Parent.SentCB
+	}
 	if extra.Compressed() {
 		s.initCompression(extra)
 	}
@@ -125,10 +137,10 @@ func NewObjStream(client Client, dstURL, dstID string, extra *Extra) (s *Stream)
 	s.cmplCh = make(chan cmpl, chsize) // Send Completion Queue (SCQ)
 
 	s.wg.Add(2)
-	go s.sendLoop(dryrun()) // handle SQ
-	go s.cmplLoop()         // handle SCQ
+	go s.sendLoop(extra.Config, dryrun()) // handle SQ
+	go s.cmplLoop()                       // handle SCQ
 
-	gc.ctrlCh <- ctrl{&s.streamBase, true /* collect */}
+	gc.ctrlCh <- ctrl{&s.base, true /* collect */}
 	return
 }
 
@@ -142,10 +154,10 @@ func NewObjStream(client Client, dstURL, dstID string, extra *Extra) (s *Stream)
 //     when the header's Dsize field is set to zero), the reader is not required and the
 //     corresponding argument in Send() can be set to nil.
 //   - object reader is *always* closed irrespectively of whether the Send() succeeds
-//     or fails. On success, if send-completion (ObjSentCB) callback is provided
+//     or fails. On success, if send-completion (SentCB) callback is provided
 //     (i.e., non-nil), the closing is done by doCmpl().
 //   - Optional reference counting is also done by (and in) the doCmpl, so that the
-//     ObjSentCB gets called if and only when the refcount (if provided i.e., non-nil)
+//     SentCB gets called if and only when the refcount (if provided i.e., non-nil)
 //     reaches zero.
 //   - For every transmission of every object there's always an doCmpl() completion
 //     (with its refcounting and reader-closing). This holds true in all cases including
@@ -175,16 +187,8 @@ func (s *Stream) Fin() {
 // receive-side API //
 //////////////////////
 
-func Handle(trname string, rxObj RecvObj, withStats ...bool) error {
-	var h handler
-	if len(withStats) > 0 && withStats[0] {
-		hkName := ObjURLPath(trname)
-		hex := &hdlExtra{hdl: hdl{trname: trname, rxObj: rxObj}, hkName: hkName}
-		hk.Reg(hkName+hk.NameSuffix, hex.cleanup, sessionIsOld)
-		h = hex
-	} else {
-		h = &hdl{trname: trname, rxObj: rxObj}
-	}
+func Handle(trname string, rxObj RecvObj) error {
+	h := &handler{trname: trname, rxObj: rxObj}
 	return oput(trname, h)
 }
 
@@ -198,21 +202,7 @@ func ObjURLPath(trname string) string { return _urlPath(apc.ObjStream, trname) }
 
 func _urlPath(endp, trname string) string {
 	if trname == "" {
-		return cos.JoinWords(apc.Version, endp)
+		return cos.JoinW0(apc.Version, endp)
 	}
-	return cos.JoinWords(apc.Version, endp, trname)
-}
-
-func GetRxStats() (netstats map[string]RxStats) {
-	netstats = make(map[string]RxStats)
-	for i, hmap := range hmaps {
-		hmtxs[i].Lock()
-		for trname, h := range hmap {
-			if s := h.getStats(); s != nil {
-				netstats[trname] = s
-			}
-		}
-		hmtxs[i].Unlock()
-	}
-	return
+	return cos.JoinW0(apc.Version, endp, trname)
 }

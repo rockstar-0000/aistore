@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -16,7 +16,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/memsys"
 )
 
 //
@@ -26,15 +25,17 @@ import (
 // intra-cluster data path: control structures and types
 type (
 	PutParams struct {
-		Reader  io.ReadCloser
-		Cksum   *cos.Cksum // checksum to check
-		Atime   time.Time
-		Xact    Xact
-		WorkTag string // (=> work fqn)
-		Size    int64
-		OWT     cmn.OWT
-		SkipEC  bool // don't erasure-code when finalizing
-		ColdGET bool // this PUT is in fact a cold-GET
+		Reader    io.ReadCloser
+		Cksum     *cos.Cksum // checksum to check
+		Atime     time.Time
+		Xact      Xact
+		WorkTag   string // (=> work fqn)
+		Size      int64
+		ChunkSize int64 // if set, the object will be chunked with this size regardless of the bucket's chunk properties
+		OWT       cmn.OWT
+		SkipEC    bool // don't erasure-code when finalizing
+		ColdGET   bool // this PUT is in fact a cold-GET
+		Locked    bool // true if the LOM is already locked by the caller
 	}
 	PromoteParams struct {
 		Bck             *meta.Bck   // destination bucket
@@ -44,16 +45,23 @@ type (
 		apc.PromoteArgs             // all of the above
 	}
 
-	// blob
-	WriteSGL func(*memsys.SGL) error
-
 	BlobParams struct {
-		Lmfh     cos.LomWriter
-		RspW     http.ResponseWriter // (GET)
-		WriteSGL WriteSGL            // custom write
+		Lom *LOM
+		Msg *apc.BlobMsg
+
+		// When `RespWriter` is set, `XactBlobDl` not only downloads chunks into the cluster,
+		// but also stitches them together and sequentially writes to `RespWriter`.
+		// This makes the blob downloading job synchronous and blocking until all chunks are written.
+		// Only set this if you need to simultaneously download and write to the response writer (e.g., for streaming blob GET).
+		RespWriter io.Writer
+	}
+
+	GfnParams struct {
 		Lom      *LOM
-		Msg      *apc.BlobMsg
-		Wfqn     string
+		Tsi      *meta.Snode
+		Config   *cmn.Config
+		ArchPath string
+		Size     int64
 	}
 )
 
@@ -110,5 +118,7 @@ type (
 		ECRestoreReq(ct *CT, si *meta.Snode, uuid string) error
 
 		BMDVersionFixup(r *http.Request, bck ...cmn.Bck)
+
+		GetFromNeighbor(params *GfnParams) (*http.Response, error)
 	}
 )

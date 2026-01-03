@@ -38,9 +38,9 @@ import (
 
 type (
 	prfFactory struct {
-		xreg.RenewBase
 		xctn *prefetch
 		msg  *apc.PrefetchMsg
+		xreg.RenewBase
 	}
 	pebl struct {
 		parent  *prefetch
@@ -79,7 +79,7 @@ func (*prfFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 
 func (p *prfFactory) Start() (err error) {
 	if p.msg.BlobThreshold > 0 && p.msg.BlobThreshold < minBlobDlPrefetch {
-		a, b := cos.ToSizeIEC(p.msg.BlobThreshold, 0), cos.ToSizeIEC(minBlobDlPrefetch, 0)
+		a, b := cos.IEC(p.msg.BlobThreshold, 0), cos.IEC(minBlobDlPrefetch, 0)
 		nlog.Warningln("blob-threshold (", a, ") is too small, must be at least", b, "- updating...")
 		p.msg.BlobThreshold = minBlobDlPrefetch
 	}
@@ -106,6 +106,13 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 	var lsflags uint64
 	r = &prefetch{config: cmn.GCO.Get(), msg: msg}
 
+	smap := core.T.Sowner().Get()
+	nat := smap.CountActiveTs()
+	r.brl, err = bck.NewFrontendRateLim(nat) // TODO: support RateLimitConf.Verbs - here and elsewhere; `nat` vs num-workers
+	if err != nil {
+		return nil, err
+	}
+
 	if msg.NonRecurs {
 		lsflags = apc.LsNoRecursion
 	}
@@ -113,12 +120,8 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 	if err != nil {
 		return nil, err
 	}
-	r.InitBase(xargs.UUID, kind, msg.Str(r.lrp == lrpPrefix), bck)
+	r.InitBase(xargs.UUID, kind, bck)
 	r.latestVer = bck.VersionConf().ValidateWarmGet || msg.LatestVer
-
-	smap := core.T.Sowner().Get()
-	nat := smap.CountActiveTs()
-	r.brl = bck.NewFrontendRateLim(nat) // TODO: support RateLimitConf.Verbs - here and elsewhere; `nat` vs num-workers
 
 	r.bp = core.T.Backend(bck)
 	r.vlabs = map[string]string{
@@ -134,6 +137,10 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 	return r, nil
 }
 
+func (r *prefetch) CtlMsg() string {
+	return r.msg.Str(r.lrit.lrp == lrpPrefix)
+}
+
 func (r *prefetch) Run(wg *sync.WaitGroup) {
 	nlog.Infoln(r.Name())
 
@@ -141,7 +148,7 @@ func (r *prefetch) Run(wg *sync.WaitGroup) {
 
 	err := r.lrit.run(r, core.T.Sowner().Get(), false /*prealloc buf*/)
 	if err != nil {
-		r.AddErr(err, 5, cos.SmoduleXs) // duplicated?
+		r.AddErr(err, 5, cos.ModXs) // duplicated?
 	}
 	r.lrit.wait()
 
@@ -178,7 +185,7 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 		if lrit.lrp != lrpList {
 			return // deleted or not found remotely, prefix or range
 		}
-		r.AddErr(err, 5, cos.SmoduleXs)
+		r.AddErr(err, 5, cos.ModXs)
 		return
 	case oa != nil:
 		// not latest
@@ -186,7 +193,7 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	case err == nil:
 		return // nothing to do
 	case !cmn.IsErrObjNought(err):
-		r.AddErr(err, 5, cos.SmoduleXs)
+		r.AddErr(err, 5, cos.ModXs)
 		return
 	}
 
@@ -195,7 +202,7 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 		r.brl.RetryAcquire(time.Second)
 	}
 	if r.msg.BlobThreshold > 0 && size >= r.msg.BlobThreshold && !r.pebl.busy() {
-		err = r.blobdl(lom, oa)
+		ecode, err = r.blobdl(lom, oa)
 	} else {
 		if r.msg.BlobThreshold == 0 && size > cos.GiB {
 			r._whinge(lom, size)
@@ -204,7 +211,7 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	}
 
 	if err == nil {
-		if cmn.Rom.FastV(5, cos.SmoduleXs) {
+		if cmn.Rom.V(5, cos.ModXs) {
 			nlog.Infoln(r.Name(), lom.Cname())
 		}
 		return
@@ -214,12 +221,12 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	switch {
 	case cos.IsNotExist(err, ecode) || cmn.IsErrBusy(err) || err == cmn.ErrSkip:
 		if lrit.lrp == lrpList {
-			r.AddErr(err, 5, cos.SmoduleXs)
+			r.AddErr(err, 5, cos.ModXs)
 		}
 	case cos.IsErrOOS(err):
 		r.Abort(err)
 	default:
-		r.AddErr(err, 5, cos.SmoduleXs)
+		r.AddErr(err, 5, cos.ModXs)
 	}
 }
 
@@ -228,7 +235,7 @@ func (r *prefetch) _whinge(lom *core.LOM, size int64) {
 	sb.Grow(256)
 	sb.WriteString(r.Name())
 	sb.WriteString(": prefetching large size ")
-	sb.WriteString(cos.ToSizeIEC(size, 1))
+	sb.WriteString(cos.IEC(size, 1))
 	sb.WriteString(" with blob-downloading disabled [")
 	sb.WriteString(lom.Cname())
 	sb.WriteByte(']')
@@ -258,12 +265,8 @@ func (r *prefetch) getCold(lom *core.LOM) (ecode int, err error) {
 }
 
 func (r *prefetch) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
+	snap = r.Base.NewSnap(r)
 	snap.Pack(0, len(r.lrit.nwp.workers), r.lrit.nwp.chanFull.Load())
-
-	snap.IdleX = r.IsIdle()
 	return
 }
 
@@ -271,32 +274,40 @@ func (r *prefetch) Snap() (snap *core.Snap) {
 // async, via blob-downloader --------------------------
 //
 
-func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) error {
+func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) (int, error) {
 	params := &core.BlobParams{
 		Lom: core.AllocLOM(lom.ObjName),
 		Msg: &apc.BlobMsg{},
 	}
-	if err := params.Lom.InitBck(lom.Bucket()); err != nil {
-		return err
+	if err := params.Lom.InitBck(lom.Bck()); err != nil {
+		return 0, err
 	}
+	xctn, err := core.T.GetColdBlob(params, oa)
+
+	// error handling
+	switch {
+	case cmn.IsErrTooManyRequests(err):
+		// fall back to regular cold GET if blob download is rejected due to resource pressure
+		nlog.Warningln(r.Name(), ": blob download rejected due to resource pressure, falling back to regular cold GET, error: ", err)
+		return r.getCold(lom)
+	case err != nil:
+		return 0, err
+	}
+
 	notif := &xact.NotifXact{
 		Base: nl.Base{
 			When: core.UponTerm,
 			F:    r.pebl.done,
 		},
 	}
-	xctn, err := core.T.GetColdBlob(params, oa)
-	if err != nil {
-		return err
-	}
 	notif.Xact = xctn
 	xctn.AddNotif(notif)
 
-	if xctn.Finished() {
-		return nil
+	if xctn.IsDone() {
+		return 0, nil
 	}
 	r.pebl.add(xctn)
-	return nil
+	return 0, nil
 }
 
 //////////
@@ -340,7 +351,7 @@ func (pebl *pebl) done(nmsg core.Notif, err error, aborted bool) {
 			continue
 		}
 		// finished - remove as well
-		if xctn.Finished() {
+		if xctn.IsDone() {
 			continue
 		}
 		// keep
@@ -358,13 +369,15 @@ func (pebl *pebl) done(nmsg core.Notif, err error, aborted bool) {
 		return
 	}
 
-	// log
+	// log and stats
 	xname := pebl.parent.Name()
 	switch {
 	case aborted || err != nil:
 		nlog.Warningln(xname, "::", xblob.String(), "[", msg.String(), err, "]")
+		pebl.parent.AddErr(err)
 	default:
-		if xblob.Size() >= cos.GiB/2 || cmn.Rom.FastV(4, cos.SmoduleXs) {
+		pebl.parent.ObjsAdd(1, xblob.Size())
+		if xblob.Size() >= cos.GiB/2 || cmn.Rom.V(4, cos.ModXs) {
 			if n > 0 {
 				nlog.Infoln(xname, "::", xblob.String(), "( num-pending", strconv.Itoa(int(n)), ")")
 			} else {

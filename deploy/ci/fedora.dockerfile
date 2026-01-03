@@ -1,6 +1,6 @@
 FROM quay.io/podman/stable:latest
 
-ARG GO_VERSION=1.24.2
+ARG GO_VERSION=1.25
 
 RUN dnf -y update && \
     dnf -y install \
@@ -11,20 +11,29 @@ RUN dnf -y update && \
        coreutils \
        curl \
        gcc \
+       gcc-c++ \
        gettext \
        git \
+       java-21-openjdk \
+       jq \
        lsof \
        make \
+       maven \
+       openssl \
        podman-docker \
        procps-ng \
        python3-pip \
        python3-setuptools \
        python3.11 \
+       ruby \
+       rubygems \
        s3cmd \
        sysstat \
        tar \
        uuid \
        which \
+       xxhash \
+       yq \
     && dnf clean all
 
 # Install Go
@@ -41,10 +50,22 @@ RUN python3 --version \
  && python3 -m pip install --upgrade pip \
  && python3 -m pip install awscli black[jupyter]
 
+# Configure Ruby and website generation tools
+RUN gem install bundler && \
+    mkdir -p /usr/local/bin/openapitools && \
+    curl -L https://raw.githubusercontent.com/OpenAPITools/openapi-generator/master/bin/utils/openapi-generator-cli.sh > /usr/local/bin/openapitools/openapi-generator-cli && \
+    chmod +x /usr/local/bin/openapitools/openapi-generator-cli
+ENV PATH="/usr/local/bin/openapitools:${PATH}"
+
 # Install Kubectl
 RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl \
     && mv kubectl /usr/local/bin/kubectl
+
+# Install kapp
+RUN curl -LO "https://github.com/carvel-dev/kapp/releases/latest/download/kapp-linux-amd64" \
+    && chmod +x kapp-linux-amd64 \
+    && mv kapp-linux-amd64 /usr/local/bin/kapp
 
 # Configure Podman
 RUN sed -i \
@@ -75,7 +96,7 @@ COPY operator-test.tar operator-test.tar
 
 # Install `uv` and multiple Python versions for testing
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-RUN uv python install 3.8 3.9 3.10 3.11 3.12 3.13
+RUN uv python install 3.8 3.9 3.10 3.11 3.12 3.13 3.14
 
 # Create a directory for K8s logs
 RUN mkdir -p /ais/log

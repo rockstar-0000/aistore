@@ -65,8 +65,8 @@ type (
 		m             *Manager
 		streams       dsortStreams
 		creationPhase struct {
-			connector       *rwConnector // used to connect readers (streams, local data) with writers (shards)
-			requestedShards chan string
+			connector   *rwConnector // used to connect readers (streams, local data) with writers (shards)
+			reqShardsCh chan string
 
 			adjuster struct {
 				read  *concAdjuster
@@ -181,7 +181,7 @@ func (*dsorterMem) name() string { return MemType }
 
 func (ds *dsorterMem) init(config *cmn.Config) error {
 	ds.creationPhase.connector = newRWConnector(ds.m)
-	ds.creationPhase.requestedShards = make(chan string, max(1024, config.Dsort.Burst))
+	ds.creationPhase.reqShardsCh = make(chan string, max(1024, config.Dsort.Burst))
 
 	ds.creationPhase.adjuster.read = newConcAdjuster(
 		ds.m.Pars.CreateConcMaxLimit,
@@ -247,7 +247,7 @@ func (*dsorterMem) cleanup() {}
 
 func (ds *dsorterMem) finalCleanup() error {
 	err := ds.cleanupStreams()
-	close(ds.creationPhase.requestedShards)
+	close(ds.creationPhase.reqShardsCh)
 	ds.creationPhase.connector.free()
 	ds.creationPhase.connector = nil
 	return err
@@ -266,7 +266,7 @@ func (ds *dsorterMem) preShardCreation(shardName string, mi *fs.Mountpath) error
 			return err
 		}
 	}
-	ds.creationPhase.requestedShards <- shardName // we also need to inform ourselves
+	ds.creationPhase.reqShardsCh <- shardName // we also need to inform ourselves
 	ds.creationPhase.adjuster.write.acquireSema(mi)
 	return nil
 }
@@ -319,18 +319,14 @@ func (ds *dsorterMem) createShardsLocally() error {
 	sa := newInmemShardAllocator(maxMemoryToUse - mem.ActualUsed)
 
 	// read
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		ds.localRead(stopCh, errCh)
-		wg.Done()
-	}()
+	})
 
 	// write
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		ds.localWrite(sa, stopCh, errCh)
-		wg.Done()
-	}()
+	})
 
 	wg.Wait()
 
@@ -357,7 +353,7 @@ outer:
 		}
 
 		select {
-		case shardName := <-ds.creationPhase.requestedShards:
+		case shardName := <-ds.creationPhase.reqShardsCh:
 			shard, ok := phaseInfo.metadata.SendOrder[shardName]
 			if !ok {
 				break
@@ -426,7 +422,7 @@ func (ds *dsorterMem) connectOrSend(rec *shard.Record, obj *shard.RecordObj, tsi
 		fullContentPath = ds.m.recm.FullContentPath(obj)
 	)
 
-	ct, err := core.NewCTFromBO(&ds.m.Pars.OutputBck, fullContentPath, nil)
+	ct, err := core.NewDsortCT(&ds.m.Pars.OutputBck, fullContentPath)
 	if err != nil {
 		return err
 	}
@@ -493,6 +489,7 @@ func (ds *dsorterMem) sentCallback(_ *transport.ObjHdr, rc io.ReadCloser, x any,
 func (*dsorterMem) postExtraction() {}
 
 // implements receiver i/f
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (ds *dsorterMem) recvReq(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	ds.m.inFlightInc()
 	defer func() {
@@ -516,10 +513,11 @@ func (ds *dsorterMem) recvReq(hdr *transport.ObjHdr, objReader io.Reader, err er
 		return ds.m.newErrAborted()
 	}
 
-	ds.creationPhase.requestedShards <- req.shardName
+	ds.creationPhase.reqShardsCh <- req.shardName
 	return nil
 }
 
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (ds *dsorterMem) recvResp(hdr *transport.ObjHdr, object io.Reader, err error) error {
 	ds.m.inFlightInc()
 	defer func() {
@@ -626,7 +624,7 @@ func (resp *dsmCS) connectOrSend(r cos.ReadOpenCloser) (err error) {
 	} else {
 		o := transport.AllocSend()
 		o.Hdr = resp.hdr
-		o.Callback, o.CmplArg = resp.ds.sentCallback, &resp.rsp
+		o.SentCB, o.CmplArg = resp.ds.sentCallback, &resp.rsp
 		err = resp.ds.streams.response.Send(o, r, resp.tsi)
 		resp.decRef = true // sentCallback will call decrementRef
 	}

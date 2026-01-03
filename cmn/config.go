@@ -12,9 +12,9 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,19 +26,23 @@ import (
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/hk"
 
 	jsoniter "github.com/json-iterator/go"
 )
 
 const (
-	confDisabled = "Disabled"
+	confDisabled = "Disabled" // common conf.String()
 )
 
 type (
-	Validator interface {
+	validator interface {
 		Validate() error
 	}
-	PropsValidator interface {
+	contextValidator interface {
+		Validate(*Config) error
+	}
+	propsValidator interface {
 		ValidateAsProps(arg ...any) error
 	}
 )
@@ -90,7 +94,10 @@ type (
 	}
 )
 
-// global configuration
+// Global configuration
+// Note: updating any of these fields on a per-node basis:
+// - will fail for (cluster-scoped) sections tagged with `allow:"cluster"`
+// - is at your own risk otherwise; such changes may cause inconsistent behavior across the cluster.
 type (
 	ClusterConfig struct {
 		Backend     BackendConf     `json:"backend" allow:"cluster"`
@@ -100,39 +107,43 @@ type (
 		UUID        string          `json:"uuid"`
 		Dsort       DsortConf       `json:"distributed_sort"`
 		Proxy       ProxyConf       `json:"proxy" allow:"cluster"`
-		Cksum       CksumConf       `json:"checksum"`
-		Auth        AuthConf        `json:"auth"`
-		Tracing     TracingConf     `json:"tracing"`
-		TCB         TCBConf         `json:"tcb"`
-		TCO         TCOConf         `json:"tco"`
-		Arch        ArchConf        `json:"arch"`
+		Cksum       CksumConf       `json:"checksum" allow:"cluster"`
+		Auth        AuthConf        `json:"auth" allow:"cluster"` // (see gco.Clone())
+		Tracing     *TracingConf    `json:"tracing,omitempty"`    // (see gco.Clone())
+		TCB         TCBConf         `json:"tcb" allow:"cluster"`
+		TCO         TCOConf         `json:"tco" allow:"cluster"`
+		Arch        ArchConf        `json:"arch" allow:"cluster"`
 		RateLimit   RateLimitConf   `json:"rate_limit"`
 		Keepalive   KeepaliveConf   `json:"keepalivetracker"`
 		Rebalance   RebalanceConf   `json:"rebalance" allow:"cluster"`
 		Log         LogConf         `json:"log"`
 		EC          ECConf          `json:"ec" allow:"cluster"`
-		Net         NetConf         `json:"net"`
+		Net         NetConf         `json:"net" allow:"cluster"`
 		Timeout     TimeoutConf     `json:"timeout"`
-		Transport   TransportConf   `json:"transport"`
-		Memsys      MemsysConf      `json:"memsys"`
-		FSHC        FSHCConf        `json:"fshc"`
-		Disk        DiskConf        `json:"disk"`
 		Space       SpaceConf       `json:"space"`
-		Periodic    PeriodConf      `json:"periodic"`
+		Transport   TransportConf   `json:"transport" allow:"cluster"`
+		Memsys      MemsysConf      `json:"memsys"`
+		Disk        DiskConf        `json:"disk"`
+		FSHC        FSHCConf        `json:"fshc"`
+		Chunks      ChunksConf      `json:"chunks" allow:"cluster"`
+		LRU         LRUConf         `json:"lru"`
 		Client      ClientConf      `json:"client"`
 		Mirror      MirrorConf      `json:"mirror" allow:"cluster"`
-		LRU         LRUConf         `json:"lru"`
+		Periodic    PeriodConf      `json:"periodic" allow:"cluster"`
 		Downloader  DownloaderConf  `json:"downloader"`
-		Features    feat.Flags      `json:"features,string" allow:"cluster"` // enumerated features to flip assorted global defaults (cmn/feat/feat.go)
+		Features    feat.Flags      `json:"features,string" allow:"cluster"` // enumerated features to flip assorted global defaults (cmn/feat/feat and docs/feat*)
 		Version     int64           `json:"config_version,string"`
 		Versioning  VersionConf     `json:"versioning" allow:"cluster"`
 		Resilver    ResilverConf    `json:"resilver"`
+		GetBatch    GetBatchConf    `json:"get_batch" allow:"cluster"`
 	}
+	// contains ClusterConfig and LocalConfig
 	ConfigToSet struct {
 		// ClusterConfig
 		Backend     *BackendConf          `json:"backend,omitempty"`
 		Mirror      *MirrorConfToSet      `json:"mirror,omitempty"`
 		EC          *ECConfToSet          `json:"ec,omitempty"`
+		Chunks      *ChunksConfToSet      `json:"chunks,omitempty"`
 		Log         *LogConfToSet         `json:"log,omitempty"`
 		Periodic    *PeriodConfToSet      `json:"periodic,omitempty"`
 		Tracing     *TracingConfToSet     `json:"tracing,omitempty"`
@@ -158,6 +169,7 @@ type (
 		Proxy       *ProxyConfToSet       `json:"proxy,omitempty"`
 		RateLimit   *RateLimitConfToSet   `json:"rate_limit"`
 		Features    *feat.Flags           `json:"features,string,omitempty"`
+		GetBatch    *GetBatchConfToSet    `json:"get_batch,omitempty"`
 
 		// LocalConfig
 		FSP *FSPConf `json:"fspaths,omitempty"`
@@ -220,6 +232,51 @@ type (
 		DiskOnly     *bool  `json:"disk_only,omitempty"`
 	}
 
+	ChunksConf struct {
+		// ObjSizeLimit is the object size threshold that triggers auto-chunking.
+		//  0   : never auto-chunk;
+		//  > 0 : auto-chunk using the configured ChunkSize if object size >= limit.
+		//
+		// ObjSizeLimit is a **soft limit** (user preference).
+		//
+		// Multipart uploads (MPU) always result in chunked storage using
+		// the client-specified part sizes, regardless of the ObjSizeLimit and/or ChunkSize.
+		ObjSizeLimit cos.SizeIEC `json:"objsize_limit"`
+
+		// The maximum size for storing objects as single contiguous files.
+		//
+		// This is a **hard limit** that cannot be disabled and protects the
+		// cluster from issues with extremely large monolithic objects.
+		//
+		// Validation:
+		// - objsize_limit <= max_monolithic_size (when objsize_limit enabled)
+		// - when specified (ie., non-zero) allowed range is [1GiB, 1TiB]
+		//
+		// See also:
+		// - constants minMaxMonolithicSize and MaxMonolithicSize below.
+		MaxMonolithicSize cos.SizeIEC `json:"max_monolithic_size,omitempty"`
+
+		// Default chunk size (aka "part size") used for auto-chunking (see above);
+		// 0 (zero) means default; Validate() sets it to chunkSizeDflt (1GiB).
+		ChunkSize cos.SizeIEC `json:"chunk_size,omitempty"`
+
+		// Persist the partial manifest after every N received chunks.
+		// 0 (zero) means keeping partial manifest strictly in memory for the entire
+		// duration of the upload.
+		CheckpointEvery int `json:"checkpoint_every,omitempty"`
+
+		// Reserved bitwise field for future advanced behaviors (compression, GC, placement, etc.)
+		Flags uint64 `json:"flags,omitempty"`
+	}
+
+	ChunksConfToSet struct {
+		ObjSizeLimit      *cos.SizeIEC `json:"objsize_limit,omitempty"`
+		MaxMonolithicSize *cos.SizeIEC `json:"max_monolithic_size,omitempty"`
+		ChunkSize         *cos.SizeIEC `json:"chunk_size,omitempty"`
+		CheckpointEvery   *int         `json:"checkpoint_every,omitempty"`
+		Flags             *uint64      `json:"flags,omitempty"`
+	}
+
 	LogConf struct {
 		Level     cos.LogLevel `json:"level"`      // log level (aka verbosity)
 		MaxSize   cos.SizeIEC  `json:"max_size"`   // exceeding this size triggers log rotation
@@ -233,8 +290,8 @@ type (
 		ToStderr  *bool         `json:"to_stderr,omitempty"`
 		MaxSize   *cos.SizeIEC  `json:"max_size,omitempty"`
 		MaxTotal  *cos.SizeIEC  `json:"max_total,omitempty"`
-		FlushTime *cos.Duration `json:"flush_time,omitempty"`
-		StatsTime *cos.Duration `json:"stats_time,omitempty"`
+		FlushTime *cos.Duration `json:"flush_time,omitempty" swaggertype:"primitive,string"`
+		StatsTime *cos.Duration `json:"stats_time,omitempty" swaggertype:"primitive,string"`
 	}
 
 	// TracingConf defines the configuration used for the OpenTelemetry (OTEL) trace exporter.
@@ -284,9 +341,9 @@ type (
 		NotifTime     cos.Duration `json:"notif_time"`      // (IC notifications)
 	}
 	PeriodConfToSet struct {
-		StatsTime     *cos.Duration `json:"stats_time,omitempty"`
-		RetrySyncTime *cos.Duration `json:"retry_sync_time,omitempty"`
-		NotifTime     *cos.Duration `json:"notif_time,omitempty"`
+		StatsTime     *cos.Duration `json:"stats_time,omitempty" swaggertype:"primitive,string"`
+		RetrySyncTime *cos.Duration `json:"retry_sync_time,omitempty" swaggertype:"primitive,string"`
+		NotifTime     *cos.Duration `json:"notif_time,omitempty" swaggertype:"primitive,string"`
 	}
 
 	// maximum intra-cluster latencies (in the increasing order)
@@ -305,15 +362,15 @@ type (
 		ColdGetConflict cos.Duration `json:"cold_get_conflict,omitempty"`
 	}
 	TimeoutConfToSet struct {
-		CplaneOperation *cos.Duration `json:"cplane_operation,omitempty"`
-		MaxKeepalive    *cos.Duration `json:"max_keepalive,omitempty"`
-		MaxHostBusy     *cos.Duration `json:"max_host_busy,omitempty"`
-		Startup         *cos.Duration `json:"startup_time,omitempty"`
-		JoinAtStartup   *cos.Duration `json:"join_startup_time,omitempty"`
-		SendFile        *cos.Duration `json:"send_file_time,omitempty"`
-		EcStreams       *cos.Duration `json:"ec_streams_time,omitempty"`
-		ObjectMD        *cos.Duration `json:"object_md,omitempty"`
-		ColdGetConflict *cos.Duration `json:"cold_get_conflict,omitempty"`
+		CplaneOperation *cos.Duration `json:"cplane_operation,omitempty" swaggertype:"primitive,string"`
+		MaxKeepalive    *cos.Duration `json:"max_keepalive,omitempty" swaggertype:"primitive,string"`
+		MaxHostBusy     *cos.Duration `json:"max_host_busy,omitempty" swaggertype:"primitive,string"`
+		Startup         *cos.Duration `json:"startup_time,omitempty" swaggertype:"primitive,string"`
+		JoinAtStartup   *cos.Duration `json:"join_startup_time,omitempty" swaggertype:"primitive,string"`
+		SendFile        *cos.Duration `json:"send_file_time,omitempty" swaggertype:"primitive,string"`
+		EcStreams       *cos.Duration `json:"ec_streams_time,omitempty" swaggertype:"primitive,string"`
+		ObjectMD        *cos.Duration `json:"object_md,omitempty" swaggertype:"primitive,string"`
+		ColdGetConflict *cos.Duration `json:"cold_get_conflict,omitempty" swaggertype:"primitive,string"`
 	}
 
 	ClientConf struct {
@@ -322,9 +379,9 @@ type (
 		ListObjTimeout cos.Duration `json:"list_timeout"`
 	}
 	ClientConfToSet struct {
-		Timeout        *cos.Duration `json:"client_timeout,omitempty"` // readonly as far as intra-cluster
-		TimeoutLong    *cos.Duration `json:"client_long_timeout,omitempty"`
-		ListObjTimeout *cos.Duration `json:"list_timeout,omitempty"`
+		Timeout        *cos.Duration `json:"client_timeout,omitempty" swaggertype:"primitive,string"` // readonly as far as intra-cluster
+		TimeoutLong    *cos.Duration `json:"client_long_timeout,omitempty" swaggertype:"primitive,string"`
+		ListObjTimeout *cos.Duration `json:"list_timeout,omitempty" swaggertype:"primitive,string"`
 	}
 
 	ProxyConf struct {
@@ -356,28 +413,51 @@ type (
 		// Out-of-Space: if exceeded, the target starts failing new PUTs and keeps
 		// failing them until its local used-cap gets back below HighWM (see above)
 		OOS int64 `json:"out_of_space"`
+
+		// Specifies a unit of space-cleanup processing;
+		// Zero value _translates_ as a system default 32*1024 items
+		// See also:
+		// - SpaceConf.Validate()
+		BatchSize int64 `json:"batch_size,omitempty"`
+
+		// Sets the interval of time for cleanup and GC operations to skip (or ignore)
+		// any stored content with mtime or atime that fall within the interval;
+		// zero value _translates_ as a system default 2h (dontCleanupTimeDflt).
+		// See also:
+		// - SpaceConf.Validate()
+		// - lru.dont_evict_time
+		DontCleanupTime cos.Duration `json:"dont_cleanup_time,omitempty"`
 	}
 	SpaceConfToSet struct {
-		CleanupWM *int64 `json:"cleanupwm,omitempty"`
-		LowWM     *int64 `json:"lowwm,omitempty"`
-		HighWM    *int64 `json:"highwm,omitempty"`
-		OOS       *int64 `json:"out_of_space,omitempty"`
+		CleanupWM       *int64        `json:"cleanupwm,omitempty"`
+		LowWM           *int64        `json:"lowwm,omitempty"`
+		HighWM          *int64        `json:"highwm,omitempty"`
+		OOS             *int64        `json:"out_of_space,omitempty"`
+		BatchSize       *int64        `json:"batch_size,omitempty"`
+		DontCleanupTime *cos.Duration `json:"dont_cleanup_time,omitempty"`
 	}
 
 	LRUConf struct {
-		// DontEvictTimeStr denotes the period of time during which eviction of an object
+		// DontEvictTime denotes the period of time during which eviction of an object
 		// is forbidden [atime, atime + DontEvictTime]
 		DontEvictTime cos.Duration `json:"dont_evict_time"`
 
-		// CapacityUpdTimeStr denotes the frequency at which AIStore updates local capacity utilization
+		// CapacityUpdTime denotes the frequency at which AIS targets update capacity (free/avail) utilization
 		CapacityUpdTime cos.Duration `json:"capacity_upd_time"`
+
+		// Specifies a unit of LRU eviction processing;
+		// Zero value _translates_ as a system default 32*1024 (objects to be evicted)
+		// See also:
+		// - LRUConf.Validate()
+		BatchSize int64 `json:"batch_size,omitempty"`
 
 		// Enabled: LRU will only run when set to true
 		Enabled bool `json:"enabled"`
 	}
 	LRUConfToSet struct {
-		DontEvictTime   *cos.Duration `json:"dont_evict_time,omitempty"`
-		CapacityUpdTime *cos.Duration `json:"capacity_upd_time,omitempty"`
+		DontEvictTime   *cos.Duration `json:"dont_evict_time,omitempty" swaggertype:"primitive,string"`
+		CapacityUpdTime *cos.Duration `json:"capacity_upd_time,omitempty" swaggertype:"primitive,string"`
+		BatchSize       *int64        `json:"batch_size,omitempty"`
 		Enabled         *bool         `json:"enabled,omitempty"`
 	}
 
@@ -387,13 +467,28 @@ type (
 		DiskUtilMaxWM   int64        `json:"disk_util_max_wm"`
 		IostatTimeLong  cos.Duration `json:"iostat_time_long"`
 		IostatTimeShort cos.Duration `json:"iostat_time_short"`
+
+		// Linear history window for disk utilization smoothing
+		// (not to confuse with storage capacity (aka, space) utilization).
+		// How it works:
+		// - previously sampled disk utilizations that fall into this window
+		// get then factored-in to compute the resulting "smoothed" numbers;
+		// - the idea is to eliminate instantaneous short-term spikes and further use
+		// the utilization stats in throttling and least-used decisions;
+		// - zero value _maps_ to a system default (see below)
+		// - any positive value smaller than `IostatTimeLong` disables smoothing
+		// (in other words, causes to report "raw" IO utilizations)
+		IostatTimeSmooth cos.Duration `json:"iostat_time_smooth,omitempty"`
 	}
 	DiskConfToSet struct {
 		DiskUtilLowWM   *int64        `json:"disk_util_low_wm,omitempty"`
 		DiskUtilHighWM  *int64        `json:"disk_util_high_wm,omitempty"`
 		DiskUtilMaxWM   *int64        `json:"disk_util_max_wm,omitempty"`
-		IostatTimeLong  *cos.Duration `json:"iostat_time_long,omitempty"`
-		IostatTimeShort *cos.Duration `json:"iostat_time_short,omitempty"`
+		IostatTimeLong  *cos.Duration `json:"iostat_time_long,omitempty" swaggertype:"primitive,string"`
+		IostatTimeShort *cos.Duration `json:"iostat_time_short,omitempty" swaggertype:"primitive,string"`
+
+		// see above
+		IostatTimeSmooth *cos.Duration `json:"iostat_time_smooth,omitempty"`
 	}
 
 	RebalanceConf struct {
@@ -403,7 +498,7 @@ type (
 	}
 	RebalanceConfToSet struct {
 		XactConfToSet
-		DestRetryTime *cos.Duration `json:"dest_retry_time,omitempty"`
+		DestRetryTime *cos.Duration `json:"dest_retry_time,omitempty" swaggertype:"primitive,string"`
 		Enabled       *bool         `json:"enabled,omitempty"`
 	}
 
@@ -452,6 +547,8 @@ type (
 		// - prefetch bucket (*)
 		// - prefetch multiple objects (see api/multiobj.go)
 		// - copy bucket
+		// - rebalance (object migration)
+		//
 		// Applies to Cloud and remote AIS buckets - generally, buckets that have remote backends
 		// that in turn provide some form of object versioning.
 		// (*) Xactions (ie., jobs) that read-access multiple objects (e.g., prefetch, copy-bucket)
@@ -491,7 +588,7 @@ type (
 		CertKey       string `json:"server_key"`    // HTTPS: X.509 key
 		ServerNameTLS string `json:"domain_tls"`    // #6410
 		ClientCA      string `json:"client_ca_tls"` // #6410
-		// added v3.26
+		// clients "idle" config: intra-cluster and backend
 		IdleConnTimeout     cos.Duration `json:"idle_conn_time"`
 		MaxIdleConnsPerHost int          `json:"idle_conns_per_host"`
 		MaxIdleConns        int          `json:"idle_conns"`
@@ -509,7 +606,7 @@ type (
 		ServerNameTLS *string `json:"domain_tls,omitempty"`
 		ClientCA      *string `json:"client_ca_tls,omitempty"`
 		// added v3.26
-		IdleConnTimeout     *cos.Duration `json:"idle_conn_time,omitempty"`
+		IdleConnTimeout     *cos.Duration `json:"idle_conn_time,omitempty" swaggertype:"primitive,string"`
 		MaxIdleConnsPerHost *int          `json:"idle_conns_per_host,omitempty"`
 		MaxIdleConns        *int          `json:"idle_conns,omitempty"`
 		// cont-d
@@ -544,17 +641,77 @@ type (
 		TestFileCount *int          `json:"test_files,omitempty"`
 		HardErrs      *int          `json:"error_limit,omitempty"`
 		IOErrs        *int          `json:"io_err_limit,omitempty"`
-		IOErrTime     *cos.Duration `json:"io_err_time,omitempty"`
+		IOErrTime     *cos.Duration `json:"io_err_time,omitempty" swaggertype:"primitive,string"`
 		Enabled       *bool         `json:"enabled,omitempty"`
 	}
 
-	AuthConf struct {
+	// AuthConfV4 [backwards compatibility]: v4.0 and prior
+	AuthConfV4 struct {
 		Secret  string `json:"secret"`
 		Enabled bool   `json:"enabled"`
 	}
-	AuthConfToSet struct {
-		Secret  *string `json:"secret,omitempty"`
+
+	AuthConfV4ToSet struct {
 		Enabled *bool   `json:"enabled,omitempty"`
+		Secret  *string `json:"secret,omitempty"`
+	}
+
+	AuthConf struct {
+		// Fields for validating JWT signature
+		Signature *AuthSignatureConf `json:"signature,omitempty"`
+		// JWT claims to validate
+		RequiredClaims *RequiredClaimsConf `json:"required_claims,omitempty"`
+		// Config for OIDC behavior such as issuer public key discovery
+		OIDC *OIDCConf `json:"oidc,omitempty"`
+
+		// Cluster key config
+		ClusterKey *ClusterKeyConf `json:"cluster_key,omitempty"`
+
+		// Enable external user authentication via JWT/OIDC tokens
+		// (does not control internal cluster security - see ClusterConfig)
+		Enabled bool `json:"enabled"`
+	}
+	AuthConfToSet struct {
+		Enabled        *bool                    `json:"enabled,omitempty"`
+		Signature      *AuthSignatureConfToSet  `json:"signature,omitempty"`
+		RequiredClaims *RequiredClaimsConfToSet `json:"required_claims,omitempty"`
+		OIDC           *OIDCConfToSet           `json:"oidc,omitempty"`
+		ClusterKey     *ClusterKeyConfToSet     `json:"cluster_key,omitempty"`
+	}
+	Censored          string
+	AuthSignatureConf struct {
+		Key    Censored `json:"key"`
+		Method string   `json:"method"`
+	}
+	AuthSignatureConfToSet struct {
+		Key    *string `json:"key,omitempty"`
+		Method *string `json:"method,omitempty"`
+	}
+	RequiredClaimsConf struct {
+		Aud []string `json:"aud"`
+	}
+	RequiredClaimsConfToSet struct {
+		Aud *[]string `json:"aud,omitempty"`
+	}
+	OIDCConf struct {
+		IssuerCA       string   `json:"issuer_ca_bundle,omitempty"`
+		AllowedIssuers []string `json:"allowed_iss"`
+	}
+	OIDCConfToSet struct {
+		AllowedIssuers *[]string `json:"allowed_iss,omitempty"`
+		IssuerCA       *string   `json:"issuer_ca_bundle,omitempty"`
+	}
+	ClusterKeyConf struct {
+		Enabled       bool         `json:"enabled"`
+		TTL           cos.Duration `json:"ttl"`            // default: 0 (never expire)
+		NonceWindow   cos.Duration `json:"nonce_window"`   // max clock skew for timestamp validation, default: 1m
+		RotationGrace cos.Duration `json:"rotation_grace"` // accept old+new key during rotation, default: 1m
+	}
+	ClusterKeyConfToSet struct {
+		Enabled       *bool         `json:"enabled,omitempty"`
+		TTL           *cos.Duration `json:"ttl,omitempty"`
+		NonceWindow   *cos.Duration `json:"nonce_window,omitempty"`
+		RotationGrace *cos.Duration `json:"rotation_grace,omitempty"`
 	}
 
 	// keepalive
@@ -576,7 +733,7 @@ type (
 		Factor   uint8        `json:"factor"`   // only average
 	}
 	KeepaliveTrackerConfToSet struct {
-		Interval *cos.Duration `json:"interval,omitempty"`
+		Interval *cos.Duration `json:"interval,omitempty" swaggertype:"primitive,string"`
 		Name     *string       `json:"name,omitempty" list:"readonly"`
 		Factor   *uint8        `json:"factor,omitempty"`
 	}
@@ -585,18 +742,18 @@ type (
 		Timeout cos.Duration `json:"timeout"`
 	}
 	DownloaderConfToSet struct {
-		Timeout *cos.Duration `json:"timeout,omitempty"`
+		Timeout *cos.Duration `json:"timeout,omitempty" swaggertype:"primitive,string"`
 	}
 
 	DsortConf struct {
+		DuplicatedRecords   string `json:"duplicated_records"`
+		MissingShards       string `json:"missing_shards"` // cmn.SupportedReactions enum
+		EKMMalformedLine    string `json:"ekm_malformed_line"`
+		EKMMissingKey       string `json:"ekm_missing_key"`
+		DefaultMaxMemUsage  string `json:"default_max_mem_usage"`
+		DsorterMemThreshold string `json:"dsorter_mem_threshold"`
 		XactConf
-		DuplicatedRecords   string       `json:"duplicated_records"`
-		MissingShards       string       `json:"missing_shards"` // cmn.SupportedReactions enum
-		EKMMalformedLine    string       `json:"ekm_malformed_line"`
-		EKMMissingKey       string       `json:"ekm_missing_key"`
-		DefaultMaxMemUsage  string       `json:"default_max_mem_usage"`
-		DsorterMemThreshold string       `json:"dsorter_mem_threshold"`
-		CallTimeout         cos.Duration `json:"call_timeout"`
+		CallTimeout cos.Duration `json:"call_timeout" swaggertype:"primitive,integer"`
 	}
 	DsortConfToSet struct {
 		XactConfToSet
@@ -605,7 +762,7 @@ type (
 		EKMMalformedLine    *string       `json:"ekm_malformed_line,omitempty"`
 		EKMMissingKey       *string       `json:"ekm_missing_key,omitempty"`
 		DefaultMaxMemUsage  *string       `json:"default_max_mem_usage,omitempty"`
-		CallTimeout         *cos.Duration `json:"call_timeout,omitempty"`
+		CallTimeout         *cos.Duration `json:"call_timeout,omitempty" swaggertype:"primitive,string"`
 		DsorterMemThreshold *string       `json:"dsorter_mem_threshold,omitempty"`
 	}
 
@@ -626,8 +783,8 @@ type (
 	TransportConfToSet struct {
 		MaxHeaderSize    *int          `json:"max_header,omitempty"`
 		Burst            *int          `json:"burst_buffer,omitempty"`
-		IdleTeardown     *cos.Duration `json:"idle_teardown,omitempty"`
-		QuiesceTime      *cos.Duration `json:"quiescent,omitempty"`
+		IdleTeardown     *cos.Duration `json:"idle_teardown,omitempty" swaggertype:"primitive,string"`
+		QuiesceTime      *cos.Duration `json:"quiescent,omitempty" swaggertype:"primitive,string"`
 		LZ4BlockMaxSize  *cos.SizeIEC  `json:"lz4_block,omitempty"`
 		LZ4FrameChecksum *bool         `json:"lz4_frame_checksum,omitempty"`
 	}
@@ -644,7 +801,7 @@ type (
 		MinFree        *cos.SizeIEC  `json:"min_free,omitempty"`
 		DefaultBufSize *cos.SizeIEC  `json:"default_buf,omitempty"`
 		SizeToGC       *cos.SizeIEC  `json:"to_gc,omitempty"`
-		HousekeepTime  *cos.Duration `json:"hk_time,omitempty"`
+		HousekeepTime  *cos.Duration `json:"hk_time,omitempty" swaggertype:"primitive,string"`
 		MinPctTotal    *int          `json:"min_pct_total,omitempty"`
 		MinPctFree     *int          `json:"min_pct_free,omitempty"`
 	}
@@ -710,7 +867,7 @@ type (
 	}
 	RateLimitBaseToSet struct {
 		Verbs     *string       `json:"per_op_max_tokens,omitempty"`
-		Interval  *cos.Duration `json:"interval,omitempty"`
+		Interval  *cos.Duration `json:"interval,omitempty" swaggertype:"primitive,string"`
 		MaxTokens *int          `json:"max_tokens,omitempty"`
 		Enabled   *bool         `json:"enabled,omitempty"`
 	}
@@ -742,6 +899,45 @@ type (
 	}
 )
 
+// ref: https://github.com/NVIDIA/aistore/releases/tag/v1.4.0#getbatch-api-ml-endpoint
+type (
+	GetBatchConf struct {
+		// Maximum time to wait for remote targets to send their data during
+		// distributed multi-object/multi-file retrieval. When a sending target
+		// fails or is slow to respond, the designated target (DT) waits up to
+		// this duration before attempting recovery.
+		// Longer values increase tolerance for transient slowdowns but delay
+		// error detection. Shorter values fail faster but may be too aggressive.
+		MaxWait cos.Duration `json:"max_wait,omitempty"`
+
+		// Number of worker goroutines for pagecache read-ahead warming.
+		// Helps reduce cold-read latency by pre-loading file data into memory.
+		// Always auto-disabled under extreme system load.
+		// - (-1): disabled
+		// - 0:    default (enabled w/ 2 workers)
+		// - >0:   enabled with N workers
+		NumWarmupWorkers int `json:"warmup_workers,omitempty"`
+
+		// Max number of soft (recoverable) errors allowed during a single
+		// GetBatch request when ContinueOnErr = true.
+		// A soft error is either:
+		//  - a remote stream-break (ErrSBR) that gets converted into a missing
+		//    entry, OR
+		//  - a timed-out missing entry (technically referred to as a "hole")
+		//    when a (reassembling) AIS target spent up to MaxWait (see above)
+		//    waiting for the input from another node in the cluster.
+		// If MaxSoftErrs == 0, the system default (6) is used.
+		// Once the request exceeds this limit, the target stops treating further
+		// failures as recoverable and aborts the request.
+		MaxSoftErrs int `json:"max_soft_errs,omitempty"`
+	}
+	GetBatchConfToSet struct {
+		MaxWait          *cos.Duration `json:"max_wait,omitempty"`
+		NumWarmupWorkers *int          `json:"warmup_workers,omitempty"`
+		MaxSoftErrs      *int          `json:"max_soft_errs,omitempty"`
+	}
+)
+
 // assorted named fields that require (cluster | node) restart for changes to make an effect
 // (used by CLI)
 var ConfigRestartRequired = [...]string{"auth.secret", "memsys", "net"}
@@ -766,41 +962,60 @@ func (*LocalConfig) JspOpts() jsp.Options   { return jsp.Plain() }
 func (*ClusterConfig) JspOpts() jsp.Options { return _jspOpts() }
 func (*ConfigToSet) JspOpts() jsp.Options   { return _jspOpts() }
 
-// interface guard
+// interface guard: config validators
 var (
-	_ Validator = (*BackendConf)(nil)
-	_ Validator = (*CksumConf)(nil)
-	_ Validator = (*LogConf)(nil)
-	_ Validator = (*LRUConf)(nil)
-	_ Validator = (*SpaceConf)(nil)
-	_ Validator = (*MirrorConf)(nil)
-	_ Validator = (*ECConf)(nil)
-	_ Validator = (*VersionConf)(nil)
-	_ Validator = (*KeepaliveConf)(nil)
-	_ Validator = (*PeriodConf)(nil)
-	_ Validator = (*TimeoutConf)(nil)
-	_ Validator = (*ClientConf)(nil)
-	_ Validator = (*RebalanceConf)(nil)
-	_ Validator = (*ResilverConf)(nil)
-	_ Validator = (*NetConf)(nil)
-	_ Validator = (*FSHCConf)(nil)
-	_ Validator = (*HTTPConf)(nil)
-	_ Validator = (*DownloaderConf)(nil)
-	_ Validator = (*DsortConf)(nil)
-	_ Validator = (*TransportConf)(nil)
-	_ Validator = (*MemsysConf)(nil)
-	_ Validator = (*TCBConf)(nil)
-	_ Validator = (*WritePolicyConf)(nil)
-	_ Validator = (*TracingConf)(nil)
+	_ validator = (*BackendConf)(nil)
+	_ validator = (*CksumConf)(nil)
+	_ validator = (*LogConf)(nil)
+	_ validator = (*LRUConf)(nil)
+	_ validator = (*SpaceConf)(nil)
+	_ validator = (*MirrorConf)(nil)
+	_ validator = (*ECConf)(nil)
+	_ validator = (*ChunksConf)(nil)
+	_ validator = (*VersionConf)(nil)
+	_ validator = (*PeriodConf)(nil)
+	_ validator = (*TimeoutConf)(nil)
+	_ validator = (*ClientConf)(nil)
+	_ validator = (*RebalanceConf)(nil)
+	_ validator = (*ResilverConf)(nil)
+	_ validator = (*NetConf)(nil)
+	_ validator = (*FSHCConf)(nil)
+	_ validator = (*AuthConf)(nil)
+	_ validator = (*HTTPConf)(nil)
+	_ validator = (*DownloaderConf)(nil)
+	_ validator = (*DsortConf)(nil)
+	_ validator = (*TransportConf)(nil)
+	_ validator = (*MemsysConf)(nil)
+	_ validator = (*TCBConf)(nil)
+	_ validator = (*WritePolicyConf)(nil)
+	_ validator = (*TracingConf)(nil)
+	_ validator = (*GetBatchConf)(nil)
 
-	_ PropsValidator = (*CksumConf)(nil)
-	_ PropsValidator = (*SpaceConf)(nil)
-	_ PropsValidator = (*MirrorConf)(nil)
-	_ PropsValidator = (*ECConf)(nil)
-	_ PropsValidator = (*WritePolicyConf)(nil)
+	_ validator = (*feat.Flags)(nil) // is called explicitly from main config validator
 
+	_ contextValidator = (*KeepaliveConf)(nil)
+)
+
+// interface guard: bucket-level validators-as-props
+var (
+	_ propsValidator = (*CksumConf)(nil)
+	_ propsValidator = (*MirrorConf)(nil)
+	_ propsValidator = (*ECConf)(nil)
+
+	_ propsValidator = (*ExtraProps)(nil)
+	_ propsValidator = (*feat.Flags)(nil)
+
+	_ propsValidator = (*WritePolicyConf)(nil)
+	_ propsValidator = (*RateLimitConf)(nil)
+	_ propsValidator = (*ChunksConf)(nil)
+	_ propsValidator = (*LRUConf)(nil)
+)
+
+// interface guard: special (un)marshaling
+var (
 	_ json.Marshaler   = (*BackendConf)(nil)
 	_ json.Unmarshaler = (*BackendConf)(nil)
+	_ json.Unmarshaler = (*AuthConf)(nil)
 	_ json.Marshaler   = (*FSPConf)(nil)
 	_ json.Unmarshaler = (*FSPConf)(nil)
 )
@@ -818,8 +1033,9 @@ func (c *Config) Validate() error {
 		return errors.New("invalid log dir value (must be non-empty)")
 	}
 
-	// NOTE: These two validations require more context and so we call them explicitly;
-	//       The rest all implement generic interface.
+	//
+	// NOTE: the following validations perform cross-sections checks - call them explicitly
+	//
 	if err := c.LocalConfig.HostNet.Validate(c); err != nil {
 		return err
 	}
@@ -829,16 +1045,19 @@ func (c *Config) Validate() error {
 	if err := c.LocalConfig.TestFSP.Validate(c); err != nil {
 		return err
 	}
-
+	if err := c.Features.Validate(); err != nil {
+		return err
+	}
 	opts := IterOpts{VisitAll: true}
-	return IterFields(c, _validateFld, opts)
+	return IterFields(c, c.validateFld, opts)
 }
 
-func _validateFld(_ string, field IterField) (error, bool) {
-	if v, ok := field.Value().(Validator); ok {
-		if err := v.Validate(); err != nil {
-			return err, false
-		}
+func (c *Config) validateFld(_ string, field IterField) (error, bool) {
+	switch v := field.Value().(type) {
+	case contextValidator:
+		return v.Validate(c), false
+	case validator:
+		return v.Validate(), false
 	}
 	return nil, false
 }
@@ -848,9 +1067,8 @@ func (c *Config) SetRole(role string) {
 	c.role = role
 }
 
-func (c *Config) UpdateClusterConfig(updateConf *ConfigToSet, asType string) (err error) {
-	err = c.ClusterConfig.Apply(updateConf, asType)
-	if err != nil {
+func (c *Config) UpdateClusterConfig(updateConf *ConfigToSet, asType string, opts CopyPropsOpts) (err error) {
+	if err = CopyProps(updateConf, &c.ClusterConfig, asType, opts); err != nil {
 		return
 	}
 	return c.Validate()
@@ -872,7 +1090,7 @@ func (c *Config) TestingEnv() bool {
 func (ctu *ConfigToSet) FillFromQuery(query url.Values) error {
 	var anyExists bool
 	for key := range query {
-		if key == apc.ActTransient {
+		if key == apc.QparamTransient {
 			continue
 		}
 		anyExists = true
@@ -911,10 +1129,6 @@ func (ctu *ConfigToSet) FillFromKVS(kvs []string) (err error) {
 ///////////////////
 // ClusterConfig //
 ///////////////////
-
-func (c *ClusterConfig) Apply(updateConf *ConfigToSet, asType string) error {
-	return CopyProps(updateConf, c, asType)
-}
 
 func (c *ClusterConfig) String() string {
 	if c == nil {
@@ -1044,7 +1258,7 @@ func (c *BackendConf) Validate() (err error) {
 		case apc.AIS:
 			var aisConf BackendConfAIS
 			if err := jsoniter.Unmarshal(b, &aisConf); err != nil {
-				return fmt.Errorf("invalid cloud specification: %v", err)
+				return fmt.Errorf("invalid cloud specification: %w", err)
 			}
 			for alias, urls := range aisConf {
 				if len(urls) == 0 {
@@ -1083,6 +1297,9 @@ func (c *BackendConf) Get(provider string) (conf any) {
 }
 
 func (c *BackendConf) Set(provider string, newConf any) {
+	if c.Conf == nil {
+		c.Conf = make(map[string]any, 1)
+	}
 	c.Conf[provider] = newConf
 }
 
@@ -1128,20 +1345,48 @@ func (c BackendConfAIS) String() (s string) {
 // DiskConf //
 //////////////
 
+const (
+	iosSmoothMaxMultiplier = 10
+
+	iosTimeLongMax  = 60 * time.Second
+	iosTimeLongMin  = 2 * time.Second
+	iosTimeShortMin = time.Millisecond
+)
+
 func (c *DiskConf) Validate() (err error) {
 	lwm, hwm, maxwm := c.DiskUtilLowWM, c.DiskUtilHighWM, c.DiskUtilMaxWM
 	if lwm <= 0 || hwm <= lwm || maxwm <= hwm || maxwm > 100 {
 		return fmt.Errorf("invalid (disk_util_lwm, disk_util_hwm, disk_util_maxwm) config %+v", c)
 	}
-	if c.IostatTimeLong <= 0 {
-		return errors.New("disk.iostat_time_long is zero")
+	if c.IostatTimeShort.D() < iosTimeShortMin || c.IostatTimeShort.D() > iosTimeLongMax {
+		return fmt.Errorf("invalid disk.ios_time_short %v (expecting range [%v, %v])",
+			c.IostatTimeShort, iosTimeShortMin, iosTimeLongMax)
 	}
-	if c.IostatTimeShort <= 0 {
-		return errors.New("disk.iostat_time_short is zero")
+	if c.IostatTimeLong.D() < iosTimeLongMin || c.IostatTimeLong.D() > iosTimeLongMax {
+		return fmt.Errorf("invalid disk.ios_time_long %v (expecting range [%v, %v])",
+			c.IostatTimeLong, iosTimeLongMin, iosTimeLongMax)
 	}
 	if c.IostatTimeLong < c.IostatTimeShort {
-		return fmt.Errorf("disk.iostat_time_long %v shorter than disk.iostat_time_short %v",
+		return fmt.Errorf("disk.ios_time_long %v shorter than disk.ios_time_short %v",
 			c.IostatTimeLong, c.IostatTimeShort)
+	}
+
+	if c.IostatTimeSmooth == 0 {
+		// try to come up with a sensible multiplier
+		switch {
+		case c.IostatTimeLong.D() >= iosTimeLongMax/2:
+			c.IostatTimeSmooth = c.IostatTimeLong
+		case c.IostatTimeLong.D() > 10*time.Second:
+			c.IostatTimeSmooth = 2 * c.IostatTimeLong
+		case c.IostatTimeLong.D() > 5*time.Second:
+			c.IostatTimeSmooth = 3 * c.IostatTimeLong
+		default:
+			c.IostatTimeSmooth = 4 * c.IostatTimeLong
+		}
+		// NOTE: a small positive value is interpreted as: disable smoothing, report raw values
+	} else if c.IostatTimeSmooth < 0 || c.IostatTimeSmooth > iosSmoothMaxMultiplier*c.IostatTimeLong {
+		return fmt.Errorf("invalid disk.ios_time_smooth %v (must be a non-negative value <= %d*ios_time_long)",
+			c.IostatTimeSmooth, iosSmoothMaxMultiplier)
 	}
 	return nil
 }
@@ -1150,14 +1395,36 @@ func (c *DiskConf) Validate() (err error) {
 // SpaceConf //
 ///////////////
 
-func (c *SpaceConf) Validate() (err error) {
-	if c.CleanupWM <= 0 || c.LowWM < c.CleanupWM || c.HighWM < c.LowWM || c.OOS < c.HighWM || c.OOS > 100 {
-		err = fmt.Errorf("invalid %s (expecting: 0 < cleanup < low < high < OOS < 100)", c)
-	}
-	return
-}
+const (
+	dontCleanupTimeDflt = 2 * time.Hour
+	dontCleanupTimeMin  = time.Hour
+)
 
-func (c *SpaceConf) ValidateAsProps(...any) error { return c.Validate() }
+// common for both SpaceConf and LRUConf
+const (
+	GCBatchSizeMin  = 1024
+	GCBatchSizeDflt = 32 * 1024
+	GCBatchSizeMax  = 512 * 1024
+)
+
+func (c *SpaceConf) Validate() error {
+	if c.CleanupWM <= 0 || c.LowWM < c.CleanupWM || c.HighWM < c.LowWM || c.OOS < c.HighWM || c.OOS > 100 {
+		return fmt.Errorf("invalid %s (expecting: 0 < cleanup < low < high < OOS < 100)", c)
+	}
+
+	if c.DontCleanupTime == 0 {
+		c.DontCleanupTime = cos.Duration(dontCleanupTimeDflt)
+	} else if c.DontCleanupTime.D() < dontCleanupTimeMin {
+		return fmt.Errorf("invalid %+v (expecting: space.dont_cleanup_time >= %v)", c, dontCleanupTimeMin)
+	}
+
+	if c.BatchSize == 0 {
+		c.BatchSize = GCBatchSizeDflt
+	} else if n := c.BatchSize; n < GCBatchSizeMin || n > GCBatchSizeMax {
+		return fmt.Errorf("invalid space.batch_size=%d (expecting range [%d - %d])", n, GCBatchSizeMin, GCBatchSizeMax)
+	}
+	return nil
+}
 
 func (c *SpaceConf) String() string {
 	return fmt.Sprintf("space config: cleanup=%d%%, low=%d%%, high=%d%%, OOS=%d%%",
@@ -1168,19 +1435,34 @@ func (c *SpaceConf) String() string {
 // LRUConf //
 /////////////
 
+const (
+	capUpdTimeMin    = 10 * time.Second
+	dontEvictTimeMin = time.Hour
+)
+
 func (c *LRUConf) String() string {
 	if !c.Enabled {
 		return confDisabled
 	}
-	return fmt.Sprintf("lru.dont_evict_time=%v, lru.capacity_upd_time=%v", c.DontEvictTime, c.CapacityUpdTime)
+	return fmt.Sprintf("lru: dont_evict_time=%v, capacity_upd_time=%v, batch_size=%d", c.DontEvictTime, c.CapacityUpdTime, c.BatchSize)
 }
 
 func (c *LRUConf) Validate() (err error) {
-	if c.CapacityUpdTime.D() < 10*time.Second {
-		err = fmt.Errorf("invalid %s (expecting: lru.capacity_upd_time >= 10s)", c)
+	if c.CapacityUpdTime.D() < capUpdTimeMin {
+		return fmt.Errorf("invalid %+v (expecting: lru.capacity_upd_time >= %v)", c, capUpdTimeMin)
+	}
+	if c.BatchSize == 0 {
+		c.BatchSize = GCBatchSizeDflt
+	} else if n := c.BatchSize; n < GCBatchSizeMin || n > GCBatchSizeMax {
+		return fmt.Errorf("invalid lru.batch_size=%d (expecting range [%d - %d])", n, GCBatchSizeMin, GCBatchSizeMax)
+	}
+	if c.DontEvictTime.D() < dontEvictTimeMin {
+		err = fmt.Errorf("invalid %+v (expecting: lru.dont_evict_time >= %v)", c, dontEvictTimeMin)
 	}
 	return
 }
+
+func (c *LRUConf) ValidateAsProps(...any) error { return c.Validate() }
 
 ///////////////
 // CksumConf //
@@ -1278,15 +1560,15 @@ func (c *MirrorConf) String() string {
 ////////////
 
 const (
-	ObjSizeToAlwaysReplicate = -1 // (see `ObjSizeLimit` comment above)
+	ObjSizeToAlwaysReplicate = -1 // (that's when we have monolithic objects; see `ObjSizeLimit` comment above)
 
 	MinSliceCount = 1  // minimum number of data or parity slices
 	MaxSliceCount = 32 // maximum --/--
 )
 
 func (c *ECConf) Validate() error {
-	if c.ObjSizeLimit < -1 {
-		return fmt.Errorf("invalid ec.obj_size_limit: %d (expecting an integer greater or equal -1)", c.ObjSizeLimit)
+	if c.ObjSizeLimit < 0 && c.ObjSizeLimit != ObjSizeToAlwaysReplicate {
+		return fmt.Errorf("invalid ec.objsize_limit: %d (expecting an integer greater than or equal to -1)", c.ObjSizeLimit)
 	}
 	if c.DataSlices < MinSliceCount || c.DataSlices > MaxSliceCount {
 		err := fmt.Errorf("invalid ec.data_slices: %d (expected value in range [%d, %d])",
@@ -1336,7 +1618,7 @@ func (c *ECConf) String() string {
 	if objSizeLimit == ObjSizeToAlwaysReplicate {
 		return fmt.Sprintf("no EC - always producing %d total replicas", c.ParitySlices+1)
 	}
-	return fmt.Sprintf("%d:%d (objsize limit %s)", c.DataSlices, c.ParitySlices, cos.ToSizeIEC(objSizeLimit, 0))
+	return fmt.Sprintf("%d:%d (objsize limit %s)", c.DataSlices, c.ParitySlices, cos.IEC(objSizeLimit, 0))
 }
 
 func (c *ECConf) numRequiredTargets() int {
@@ -1349,6 +1631,92 @@ func (c *ECConf) numRequiredTargets() int {
 
 func (c *ECConf) RequiredRestoreTargets() int {
 	return c.DataSlices
+}
+
+////////////////
+// ChunksConf //
+////////////////
+
+const (
+	MaxMonolithicSize    = cos.TiB
+	minMaxMonolithicSize = cos.GiB
+
+	chunkSizeMin  = cos.KiB
+	chunkSizeDflt = cos.GiB
+	chunkSizeMax  = 5 * cos.GiB
+
+	checkpointEveryMax = 1024
+)
+
+const (
+	chunksmms = "chunks.max_monolithic_size"
+	chunksosl = "chunks.objsize_limit"
+)
+
+func (c *ChunksConf) AutoEnabled() bool { return c.ObjSizeLimit > 0 }
+
+func (c *ChunksConf) Validate() error {
+	switch {
+	case c.MaxMonolithicSize < 0:
+		return fmt.Errorf("invalid %s: %d (expecting a non-negative integer)", chunksmms, c.MaxMonolithicSize)
+	case c.MaxMonolithicSize == 0:
+		c.MaxMonolithicSize = MaxMonolithicSize
+	default:
+		if c.MaxMonolithicSize < minMaxMonolithicSize || c.MaxMonolithicSize > MaxMonolithicSize {
+			return fmt.Errorf("invalid %s: %d (%s) - must be in range [%s, %s]",
+				chunksmms, c.MaxMonolithicSize, c.MaxMonolithicSize,
+				cos.IEC(minMaxMonolithicSize, 0), cos.IEC(MaxMonolithicSize, 0))
+		}
+	}
+
+	switch {
+	case c.ObjSizeLimit < 0:
+		return fmt.Errorf("invalid %s %d (expecting a non-negative integer)", chunksosl, c.ObjSizeLimit)
+	case c.ObjSizeLimit > c.MaxMonolithicSize:
+		return fmt.Errorf("invalid %s %d (%s) - cannot be greater than %s %d (%s)",
+			chunksosl, c.ObjSizeLimit, c.ObjSizeLimit, chunksmms, c.MaxMonolithicSize, c.MaxMonolithicSize)
+	}
+
+	if !c.AutoEnabled() { // including v4.0 and prior
+		return nil
+	}
+
+	if c.ChunkSize == 0 {
+		c.ChunkSize = chunkSizeDflt
+	} else if c.ChunkSize < chunkSizeMin || c.ChunkSize > chunkSizeMax {
+		return fmt.Errorf("expecting chunks.chunk_size in the range [%s, %s], got %d (%s)",
+			cos.IEC(chunkSizeMin, 0), cos.IEC(chunkSizeMax, 0), c.ChunkSize, c.ChunkSize)
+	}
+
+	if c.CheckpointEvery < 0 || c.CheckpointEvery > checkpointEveryMax {
+		return fmt.Errorf("chunks.checkpoint_every must be an integer in the range [0, %d] (got %d)", checkpointEveryMax, c.CheckpointEvery)
+	}
+	return nil
+}
+
+func (c *ChunksConf) ValidateAsProps(...any) error {
+	return c.Validate()
+}
+
+func (c *ChunksConf) String() string {
+	if !c.AutoEnabled() {
+		return "auto-chunking disabled"
+	}
+	var checkpoint string
+	switch c.CheckpointEvery {
+	case 0:
+		checkpoint = "checkpoint: never"
+	case 1:
+		checkpoint = "checkpoint: every chunk"
+	default:
+		checkpoint = fmt.Sprintf("checkpoint: every %d chunks", c.CheckpointEvery)
+	}
+
+	s := fmt.Sprintf("chunk-size: %s; %s; objsize-limit: %s", c.ChunkSize.String(), checkpoint, c.ObjSizeLimit.String())
+	if c.Flags != 0 {
+		s += fmt.Sprintf("; flags: 0x%x", c.Flags)
+	}
+	return s
 }
 
 /////////////////////
@@ -1376,7 +1744,14 @@ func (c *WritePolicyConf) ValidateAsProps(...any) error { return c.Validate() }
 // see palive.retry in re "total number of failures prior to removing"
 const kaNumRetries = 3
 
-func (c *KeepaliveConf) Validate() error {
+// interval bounds
+const (
+	kaliveIvalMin = 1 * time.Second
+	kaliveIvalMax = 1 * time.Minute
+	kaliveToutMax = 2 * time.Minute
+)
+
+func (c *KeepaliveConf) Validate(config *Config) error {
 	if c.Proxy.Name != "heartbeat" {
 		return fmt.Errorf("invalid keepalivetracker.proxy.name %s", c.Proxy.Name)
 	}
@@ -1392,12 +1767,35 @@ func (c *KeepaliveConf) Validate() error {
 	if c.NumRetries < 1 || c.NumRetries > 10 {
 		return fmt.Errorf("invalid keepalivetracker.num_retries %d (expecting range [1, 10])", c.NumRetries)
 	}
-	return nil
+
+	if err := c.Proxy.validate(&config.Timeout); err != nil {
+		return err
+	}
+	return c.Target.validate(&config.Timeout)
 }
 
 func KeepaliveRetryDuration(c *Config) time.Duration {
 	d := c.Timeout.CplaneOperation.D() * time.Duration(c.Keepalive.RetryFactor)
 	return min(d, c.Timeout.MaxKeepalive.D()+time.Second)
+}
+
+func (c *KeepaliveTrackerConf) validate(timeoutConf *TimeoutConf) error {
+	if c.Interval.D() < kaliveIvalMin || c.Interval.D() > kaliveIvalMax {
+		return fmt.Errorf("invalid keepalivetracker.interval=%s (expected range [%v, %v])",
+			c.Interval, kaliveIvalMin, kaliveIvalMax)
+	}
+	//
+	// must be consistent w/ assorted timeout knobs
+	//
+	if c.Interval.D() < timeoutConf.MaxKeepalive.D() {
+		return fmt.Errorf("keepalivetracker.interval=%s should be >= timeout.max_keepalive=%s",
+			c.Interval, timeoutConf.MaxKeepalive)
+	}
+	kwin := c.Interval.D() * time.Duration(c.Factor)
+	if kwin > kaliveToutMax {
+		return fmt.Errorf("keepalive detection window=%v (interval * factor) exceeds %v", kwin, kaliveToutMax)
+	}
+	return nil
 }
 
 /////////////
@@ -1419,18 +1817,29 @@ func (c *NetConf) Validate() (err error) {
 	return nil
 }
 
+// see also:
+// - docs/idle_connections.md
+// - DefaultMaxIdle* in cmn/client
+// - `listen` in ais/htcommon
+const (
+	dfltMaxIdleConns   = 4096
+	dfltMaxIdlePerHost = 128
+
+	DfltMaxIdleTimeout = 30 * time.Second
+)
+
 func (c *HTTPConf) Validate() error {
 	if c.ServerNameTLS != "" {
 		return fmt.Errorf("invalid domain_tls %q: expecting empty (domain names/SANs should be set in X.509 cert)", c.ServerNameTLS)
 	}
-	if d := c.IdleConnTimeout.D(); d < 0 || d > 90*time.Second {
-		return fmt.Errorf("invalid idle_conn_time %v (expecting range [0 - %v])", d, 90*time.Second)
+	if d := c.IdleConnTimeout.D(); d < 0 || d > DfltMaxIdleTimeout {
+		return fmt.Errorf("invalid idle_conn_time %v (expecting range [0 - %v])", d, DfltMaxIdleTimeout)
 	}
-	if c.MaxIdleConns != 0 && c.MaxIdleConnsPerHost > c.MaxIdleConns {
-		return fmt.Errorf("invalid (idle_conns, idle_conns_per_host): (%d and %d), respectively", c.MaxIdleConns, c.MaxIdleConnsPerHost)
+	if n := c.MaxIdleConns; n < 0 || n > dfltMaxIdleConns {
+		return fmt.Errorf("invalid idle_conns %d (expecting range [0 - %d])", n, dfltMaxIdleConns)
 	}
-	if n := c.MaxIdleConns; n < 0 || n > 1000 {
-		return fmt.Errorf("invalid idle_conns %d (expecting range [0 - %d])", n, 1000)
+	if n := min(c.MaxIdleConns, dfltMaxIdlePerHost); c.MaxIdleConnsPerHost != 0 && c.MaxIdleConnsPerHost > n {
+		return fmt.Errorf("invalid idle_conns_per_host: %d (expecting range [0 - %d])", c.MaxIdleConnsPerHost, n)
 	}
 	return nil
 }
@@ -1485,6 +1894,227 @@ func (c *FSHCConf) Validate() error {
 	return nil
 }
 
+//////////////
+// AuthConf //
+//////////////
+
+// note: not cloning Auth.RequiredClaims.Aud etc. slices (low risk)
+func (c *AuthConf) CopyTo(dst *AuthConf) {
+	if c.Signature != nil {
+		v := *c.Signature
+		dst.Signature = &v
+	}
+	if c.OIDC != nil {
+		v := *c.OIDC
+		dst.OIDC = &v
+	}
+	if c.RequiredClaims != nil {
+		v := *c.RequiredClaims
+		dst.RequiredClaims = &v
+	}
+	if c.ClusterKey != nil {
+		v := *c.ClusterKey
+		dst.ClusterKey = &v
+	}
+}
+
+func (c *AuthConf) CSKEnabled() bool {
+	return c.ClusterKey != nil && c.ClusterKey.Enabled
+}
+
+func (c *AuthConf) Validate() error {
+	// First validate sub-configs if defined
+	if c.Signature != nil {
+		if err := c.Signature.validate(); err != nil {
+			return err
+		}
+	}
+	if c.OIDC != nil {
+		if err := c.OIDC.validate(); err != nil {
+			return err
+		}
+	}
+	// Method determines how the key is parsed, so use it to determine if static signature is to be used
+	sigConfigured := c.Signature != nil && c.Signature.Method != ""
+	// Only consider OIDC configured if it has allowed issuer URLs, validated above
+	oidcConfigured := c.OIDC != nil && c.OIDC.AllowedIssConfigured()
+	if c.Enabled && !sigConfigured && !oidcConfigured {
+		return errors.New("invalid auth config: must provide one of signature or OIDC config if enabled")
+	}
+	if sigConfigured && oidcConfigured {
+		return errors.New("invalid auth config: only one of signature or OIDC config should be provided")
+	}
+	if c.CSKEnabled() {
+		return c.ClusterKey.validate()
+	}
+	return nil
+}
+
+func (c *AuthConf) UnmarshalJSON(data []byte) error {
+	// Try unmarshalling as the current AuthConf format first
+	type Alias AuthConf
+	var tmp Alias
+	errCurrent := cos.JSON.Unmarshal(data, &tmp)
+	if errCurrent == nil {
+		*c = AuthConf(tmp)
+		return nil
+	}
+
+	// [backwards compatibility] try legacy AuthConfV4
+	var v4 AuthConfV4
+	errLegacy := cos.JSON.Unmarshal(data, &v4)
+	if errLegacy != nil {
+		return fmt.Errorf("failed to parse auth config using current config structure (err: %v) and v4.0 (err: %v)", errCurrent, errLegacy)
+	}
+	c.Enabled = v4.Enabled
+	// All legacy keys are 256 bit HMAC
+	c.Signature = &AuthSignatureConf{Key: Censored(v4.Secret), Method: "HS256"}
+	c.RequiredClaims = nil
+	c.OIDC = nil
+	return nil
+}
+
+const censoredVal = "**********"
+
+func (Censored) String() string   { return censoredVal }
+func (Censored) GoString() string { return "Censored(*)" }
+
+func (c *AuthConf) PublicClone() (out AuthConf) {
+	out = *c
+	// only hide shared secret, not public key
+	if out.Signature != nil && !out.Signature.IsRSA() {
+		sig := *out.Signature
+		sig.Key = censoredVal
+		out.Signature = &sig
+	}
+	return out
+}
+
+///////////////////////
+// AuthSignatureConf //
+///////////////////////
+
+const (
+	SigMethodHMAC = "HS256"
+	SigMethodRSA  = "RS256"
+)
+
+var (
+	hmacNames = []string{"HMAC", "HS256", "HS384", "HS512"}
+	rsaNames  = []string{"RSA", "RS256", "RS384", "RS512"}
+)
+
+func (c *AuthSignatureConf) validate() error {
+	if c.Key != "" && c.Method == "" {
+		return errors.New("invalid auth signature config, method is required if key provided")
+	}
+	if !c.IsHMAC() && !c.IsRSA() && c.Method != "" {
+		return fmt.Errorf("invalid auth signature config, provided method %q must be one of: %q", c.Method, c.ValidMethods())
+	}
+	return nil
+}
+
+func (*AuthSignatureConf) ValidMethods() string {
+	return strings.Join(slices.Concat(hmacNames, rsaNames), ",")
+}
+
+func (c *AuthSignatureConf) IsHMAC() bool {
+	return slices.Contains(hmacNames, strings.ToUpper(c.Method))
+}
+
+func (c *AuthSignatureConf) IsRSA() bool {
+	return slices.Contains(rsaNames, strings.ToUpper(c.Method))
+}
+
+//////////////
+// OIDCConf //
+//////////////
+
+func (c *OIDCConf) AllowedIssConfigured() bool {
+	return len(c.AllowedIssuers) > 0
+}
+
+func (c *OIDCConf) validate() error {
+	for _, iss := range c.AllowedIssuers {
+		err := ValidateIssuerURL(iss)
+		if err != nil {
+			return fmt.Errorf("failed to parse allowed issuer URL in auth OIDC config: %v", err)
+		}
+	}
+	return nil
+}
+
+func (c *OIDCConf) GetAllowedIssSet() map[string]struct{} {
+	allowSet := make(map[string]struct{}, len(c.AllowedIssuers))
+	for _, v := range c.AllowedIssuers {
+		allowSet[v] = struct{}{}
+	}
+	return allowSet
+}
+
+// ValidateIssuerURL Parse and validate key issuer URLs used for JWKS discovery and fetching
+func ValidateIssuerURL(urlString string) error {
+	parsedURL, err := url.Parse(urlString)
+	if err != nil {
+		return fmt.Errorf("invalid URL %s: %w", urlString, err)
+	}
+
+	if parsedURL.Scheme != "https" {
+		return fmt.Errorf("must use HTTPS: %s", urlString)
+	}
+
+	if parsedURL.Host == "" {
+		return fmt.Errorf("must have a host: %s", urlString)
+	}
+
+	return nil
+}
+
+////////////////////
+// ClusterKeyConf //
+////////////////////
+
+const (
+	dfltClusterKeyTTL = 0 // never expire
+	minClusterKeyTTL  = time.Hour
+
+	dfltNonceWindow   = time.Minute
+	dfltRotationGrace = time.Minute
+
+	maxNonceWindow   = 10 * time.Minute
+	maxRotationGrace = time.Hour
+)
+
+func (c *ClusterKeyConf) validate() error {
+	if !c.Enabled {
+		return nil
+	}
+
+	// TTL: 0 == never expire; otherwise must be >= minClusterKeyTTL
+	if d := c.TTL.D(); d != dfltClusterKeyTTL {
+		if d < 0 {
+			return fmt.Errorf("invalid cluster_key.ttl %v (expecting >= 0)", d)
+		}
+		if d < minClusterKeyTTL {
+			return fmt.Errorf("invalid cluster_key.ttl %v (expecting >= %v)", d, minClusterKeyTTL)
+		}
+	}
+	if c.NonceWindow == 0 {
+		c.NonceWindow = cos.Duration(dfltNonceWindow)
+	}
+	if c.RotationGrace == 0 {
+		c.RotationGrace = cos.Duration(dfltRotationGrace)
+	}
+	if nw := c.NonceWindow.D(); nw <= 0 || nw > maxNonceWindow {
+		return fmt.Errorf("invalid cluster_key.nonce_window %v (expecting > 0 and <= %v)", nw, maxNonceWindow)
+	}
+	if rg := c.RotationGrace.D(); rg <= 0 || rg > maxRotationGrace {
+		return fmt.Errorf("invalid cluster_key.rotation_grace %v (expecting > 0 and <= %v)", rg, maxRotationGrace)
+	}
+
+	return nil
+}
+
 ////////////////////
 // LocalNetConfig //
 ////////////////////
@@ -1497,11 +2127,19 @@ func (c *LocalNetConfig) Validate(contextConfig *Config) error {
 	c.HostnameIntraData = strings.ReplaceAll(c.HostnameIntraData, " ", "")
 
 	if addr, over := ipsOverlap(c.Hostname, c.HostnameIntraControl); over {
-		return fmt.Errorf("public (%s) and intra-cluster control (%s) share the same: %q",
+		if c.Port == c.PortIntraControl {
+			return fmt.Errorf("public (%s) and intra-cluster control (%s) share the same IP and port: %s:%d",
+				c.Hostname, c.HostnameIntraControl, addr, c.Port)
+		}
+		nlog.Warningf("public (%s) and intra-cluster control (%s) share the same IP: %q",
 			c.Hostname, c.HostnameIntraControl, addr)
 	}
 	if addr, over := ipsOverlap(c.Hostname, c.HostnameIntraData); over {
-		return fmt.Errorf("public (%s) and intra-cluster data (%s) share the same: %q",
+		if c.Port == c.PortIntraData {
+			return fmt.Errorf("public (%s) and intra-cluster data (%s) share the same IP and port: %s:%d",
+				c.Hostname, c.HostnameIntraData, addr, c.Port)
+		}
+		nlog.Warningf("public (%s) and intra-cluster data (%s) share the same IP: %q",
 			c.Hostname, c.HostnameIntraData, addr)
 	}
 	if addr, over := ipsOverlap(c.HostnameIntraControl, c.HostnameIntraData); over {
@@ -1515,16 +2153,16 @@ func (c *LocalNetConfig) Validate(contextConfig *Config) error {
 
 	// Parse ports
 	if _, err := ValidatePort(c.Port); err != nil {
-		return fmt.Errorf("invalid %s port: %v", NetPublic, err)
+		return fmt.Errorf("invalid %s port: %w", NetPublic, err)
 	}
 	if c.PortIntraControl != 0 {
 		if _, err := ValidatePort(c.PortIntraControl); err != nil {
-			return fmt.Errorf("invalid %s port: %v", NetIntraControl, err)
+			return fmt.Errorf("invalid %s port: %w", NetIntraControl, err)
 		}
 	}
 	if c.PortIntraData != 0 {
 		if _, err := ValidatePort(c.PortIntraData); err != nil {
-			return fmt.Errorf("invalid %s port: %v", NetIntraData, err)
+			return fmt.Errorf("invalid %s port: %w", NetIntraData, err)
 		}
 	}
 
@@ -1566,29 +2204,30 @@ func (c *DsortConf) Validate() (err error) {
 }
 
 func (c *DsortConf) ValidateWithOpts(allowEmpty bool) (err error) {
-	checkReaction := func(reaction string) bool {
-		return cos.StringInSlice(reaction, SupportedReactions) || (allowEmpty && reaction == "")
+	f := func(reaction string) bool {
+		return ((allowEmpty && reaction == "") || slices.Contains(SupportedReactions, reaction))
 	}
 
-	if !checkReaction(c.DuplicatedRecords) {
-		return fmt.Errorf(_idsort+"duplicated_records: %s (expecting one of: %s)", c.DuplicatedRecords, SupportedReactions)
+	const s = "expecting one of:"
+	if !f(c.DuplicatedRecords) {
+		return fmt.Errorf(_idsort+"duplicated_records: %s (%s %v)", c.DuplicatedRecords, s, SupportedReactions)
 	}
-	if !checkReaction(c.MissingShards) {
-		return fmt.Errorf(_idsort+"missing_shards: %s (expecting one of: %s)", c.MissingShards, SupportedReactions)
+	if !f(c.MissingShards) {
+		return fmt.Errorf(_idsort+"missing_shards: %s (%s %v)", c.MissingShards, s, SupportedReactions)
 	}
-	if !checkReaction(c.EKMMalformedLine) {
-		return fmt.Errorf(_idsort+"ekm_malformed_line: %s (expecting one of: %s)", c.EKMMalformedLine, SupportedReactions)
+	if !f(c.EKMMalformedLine) {
+		return fmt.Errorf(_idsort+"ekm_malformed_line: %s (%s %v)", c.EKMMalformedLine, s, SupportedReactions)
 	}
-	if !checkReaction(c.EKMMissingKey) {
-		return fmt.Errorf(_idsort+"ekm_missing_key: %s (expecting one of: %s)", c.EKMMissingKey, SupportedReactions)
+	if !f(c.EKMMissingKey) {
+		return fmt.Errorf(_idsort+"ekm_missing_key: %s (%s %v)", c.EKMMissingKey, s, SupportedReactions)
 	}
 	if !allowEmpty {
 		if _, err := cos.ParseQuantity(c.DefaultMaxMemUsage); err != nil {
-			return fmt.Errorf(_idsort+"default_max_mem_usage: %s (err: %s)", c.DefaultMaxMemUsage, err)
+			return fmt.Errorf(_idsort+"default_max_mem_usage: %s (err: %v)", c.DefaultMaxMemUsage, err)
 		}
 	}
 	if _, err := cos.ParseSize(c.DsorterMemThreshold, cos.UnitsIEC); err != nil && (!allowEmpty || c.DsorterMemThreshold != "") {
-		return fmt.Errorf(_idsort+"dsorter_mem_threshold: %s (err: %s)", c.DsorterMemThreshold, err)
+		return fmt.Errorf(_idsort+"dsorter_mem_threshold: %s (err: %v)", c.DsorterMemThreshold, err)
 	}
 	return nil
 }
@@ -1607,7 +2246,7 @@ func (c *FSPConf) MarshalJSON() ([]byte, error) {
 }
 
 func (c *FSPConf) Validate(contextConfig *Config) error {
-	debug.Assertf(cos.StringInSlice(contextConfig.role, []string{apc.Proxy, apc.Target}),
+	debug.Assertf(slices.Contains([]string{apc.Proxy, apc.Target}, contextConfig.role),
 		"unexpected node type: %q", contextConfig.role)
 
 	// Don't validate in testing environment.
@@ -1815,7 +2454,7 @@ const (
 	// config bloat vs specificity; consider phasing out `timeout.ec_streams_time` and
 	// using `timeout.shared_streams_time` instead
 	SharedStreamsEver = -time.Second
-	SharedStreamsDflt = 10 * time.Minute
+	SharedStreamsDflt = 10 * time.Minute // NOTE: must be > hk.Prune2mIval
 	SharedStreamsMin  = 5 * time.Minute
 	SharedStreamsNack = max(SharedStreamsMin>>1, 3*time.Minute)
 
@@ -1830,6 +2469,7 @@ const (
 )
 
 func (c *TimeoutConf) Validate() error {
+	debug.Assert(SharedStreamsDflt >= 2*hk.Prune2mIval)
 	if c.CplaneOperation.D() < 10*time.Millisecond {
 		return fmt.Errorf("invalid timeout.cplane_operation=%s", c.CplaneOperation)
 	}
@@ -2037,7 +2677,51 @@ func (*RateLimitConf) verbs(tag, name, value string) error {
 	return nil
 }
 
+// NOTE: separately, frontend-rate-limiter validation in `makeNewBckProps`
 func (c *RateLimitConf) ValidateAsProps(...any) error { return c.Validate() }
+
+//////////////////
+// GetBatchConf //
+//////////////////
+
+const (
+	getBatchWaitDflt = 30 * time.Second
+	GetBatchWaitMin  = time.Second
+	getBatchWaitMax  = time.Minute
+
+	numWarmupWorkersDisabled = -1
+	numWarmupWorkersDflt     = 2
+
+	GetBatchSoftErrsDflt = 6
+)
+
+func (c *GetBatchConf) WarmupWorkers() int {
+	return cos.Ternary(c.NumWarmupWorkers == numWarmupWorkersDisabled, 0, c.NumWarmupWorkers)
+}
+
+func (c *GetBatchConf) Validate() error {
+	debug.Assert(numWarmupWorkersDisabled < 0 && getBatchWaitDflt > GetBatchWaitMin && GetBatchWaitMin < getBatchWaitMax)
+	if c.MaxWait == 0 {
+		c.MaxWait = cos.Duration(getBatchWaitDflt)
+	} else if c.MaxWait.D() < GetBatchWaitMin || c.MaxWait.D() > getBatchWaitMax {
+		return fmt.Errorf("invalid get_batch.max_wait=%s (must be in range [%v, %v])", c.MaxWait, GetBatchWaitMin, getBatchWaitMax)
+	}
+	switch c.NumWarmupWorkers {
+	case numWarmupWorkersDisabled:
+	case 0:
+		c.NumWarmupWorkers = numWarmupWorkersDflt
+	default:
+		if c.NumWarmupWorkers < 0 || c.NumWarmupWorkers > 10 {
+			return fmt.Errorf("invalid get_batch.warmup_workers=%d (expecting range [%d, %d])", c.NumWarmupWorkers, 0, 10)
+		}
+	}
+	if c.MaxSoftErrs == 0 {
+		c.MaxSoftErrs = GetBatchSoftErrsDflt
+	} else if c.MaxSoftErrs < 0 {
+		return fmt.Errorf("invalid get_batch.max_soft_errs=%d (expecting non-negative integer)", c.MaxSoftErrs)
+	}
+	return nil
+}
 
 //
 // misc config utilities ---------------------------------------------------------
@@ -2048,8 +2732,7 @@ func ipsOverlap(alist, blist string) (addr string, overlap bool) {
 	if alist == "" || blist == "" {
 		return
 	}
-	alistAddrs := strings.Split(alist, HostnameListSepa)
-	for _, a := range alistAddrs {
+	for a := range strings.SplitSeq(alist, HostnameListSepa) {
 		a = strings.TrimSpace(a)
 		if a == "" {
 			continue
@@ -2104,7 +2787,7 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 	// form (in accordance with the associated ClusterConfig.JspOpts()).
 	globalFpath := filepath.Join(config.ConfigDir, fname.GlobalConfig)
 	if _, err := jsp.LoadMeta(globalFpath, &config.ClusterConfig); err != nil {
-		if !os.IsNotExist(err) {
+		if !cos.IsNotExist(err) {
 			if _, ok := err.(*jsp.ErrUnsupportedMetaVersion); ok {
 				cos.Errorf("ERROR: "+FmtErrBackwardCompat+"\n", err)
 			}
@@ -2164,7 +2847,7 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 func handleOverrideConfig(config *Config) error {
 	overrideConfig, err := loadOverrideConfig(config.ConfigDir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if cos.IsNotExist(err) {
 			err = config.Validate() // always validate
 		}
 		return err
@@ -2176,7 +2859,7 @@ func handleOverrideConfig(config *Config) error {
 		config.LocalConfig.FSP = *overrideConfig.FSP // override local config's fspaths
 		overrideConfig.FSP = nil
 	}
-	return config.UpdateClusterConfig(overrideConfig, apc.Daemon)
+	return config.UpdateClusterConfig(overrideConfig, apc.Daemon, CopyPropsOpts{Transient: false, IgnoreScope: true})
 }
 
 func SaveOverrideConfig(configDir string, toUpdate *ConfigToSet) error {

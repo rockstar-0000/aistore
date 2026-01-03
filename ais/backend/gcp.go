@@ -34,6 +34,7 @@ import (
 )
 
 const (
+	gcpXMLEndpoint  = "https://storage.googleapis.com"
 	gcpChecksumType = "x-goog-meta-ais-cksum-type"
 	gcpChecksumVal  = "x-goog-meta-ais-cksum-val"
 
@@ -44,8 +45,9 @@ const (
 
 type (
 	gsbp struct {
-		t         core.TargetPut
-		projectID string
+		t          core.TargetPut
+		projectID  string
+		httpClient *http.Client // for raw requests
 		base
 	}
 )
@@ -112,7 +114,9 @@ func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 		}
 		return nil, cmn.NewErrFailedTo(nil, "gcp-backend: create", "http transport", err)
 	}
-	opts = append(opts, option.WithHTTPClient(tracing.NewTraceableClient(&http.Client{Transport: transport})))
+	// Store authenticated HTTP client for raw requests (e.g., multipart uploads)
+	gsbp.httpClient = tracing.NewTraceableClient(&http.Client{Transport: transport})
+	opts = append(opts, option.WithHTTPClient(gsbp.httpClient))
 	// create HTTP client
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
@@ -128,7 +132,7 @@ func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 //
 
 func (*gsbp) HeadBucket(ctx context.Context, bck *meta.Bck) (bckProps cos.StrKVs, ecode int, err error) {
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infof("head_bucket %s", bck.Name)
 	}
 	cloudBck := bck.RemoteBck()
@@ -179,7 +183,7 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, 
 	)
 	nextPageToken, errPage := pager.NextPage(&objs)
 	if errPage != nil {
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infof("list_objects %s: %v", cloudBck.Name, errPage)
 		}
 		return gcpErrorToAISError(errPage, cloudBck)
@@ -220,7 +224,7 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, 
 		lst.Entries = append(lst.Entries, &en)
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+	if cmn.Rom.V(4, cos.ModBackend) {
 		nlog.Infof("[list_objects] count %d", len(lst.Entries))
 	}
 
@@ -252,7 +256,7 @@ func (gsbp *gsbp) ListBuckets(_ cmn.QueryBcks) (cmn.Bcks, int, error) {
 		}
 
 		bcks = append(bcks, cmn.Bck{Name: battrs.Name, Provider: apc.GCP})
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infof("[bucket_names] %s: created %v, versioning %t", battrs.Name, battrs.Created, battrs.VersioningEnabled)
 		}
 	}
@@ -302,7 +306,7 @@ func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (*cmn.
 	// unlike other custom attrs, "Content-Type" is not getting stored w/ LOM
 	// - only shown via list-objects and HEAD when not present
 	oa.SetCustomKey(cos.HdrContentType, attrs.ContentType)
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infof("[head_object] %s", cloudBck.Cname(lom.ObjName))
 	}
 
@@ -322,7 +326,7 @@ func (gsbp *gsbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *htt
 	params := allocPutParams(res, owt)
 	err := gsbp.t.PutObject(lom, params)
 	core.FreePutParams(params)
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infoln("[get_object]", lom.String(), err)
 	}
 	return 0, err
@@ -340,6 +344,8 @@ func (*gsbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int
 		res.ErrCode, res.Err = gcpErrorToAISError(res.Err, cloudBck)
 		return res
 	}
+
+	// range read
 	if length > 0 {
 		rc, res.Err = o.NewRangeReader(ctx, offset, length)
 		if res.Err != nil {
@@ -348,21 +354,43 @@ func (*gsbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int
 			}
 			return res
 		}
-	} else {
-		rc, res.Err = o.NewReader(ctx)
-		if res.Err != nil {
+		// NOTE: for range reads, use the requested length, not rc.Attrs.Size (which is the full object size)
+		rsize := rc.Remain()
+		if rsize < 0 {
+			res.Err = errors.New("gcp: returned length is less than 0")
 			return res
 		}
-		// custom metadata
-		lom.SetCustomKey(cmn.SourceObjMD, apc.GCP)
-		if cksumType, ok := attrs.Metadata[gcpChecksumType]; ok {
-			if cksumValue, ok := attrs.Metadata[gcpChecksumVal]; ok {
-				lom.SetCksum(cos.NewCksum(cksumType, cksumValue))
-			}
+		if length < rsize {
+			res.Err = errors.New("gcp: returned length is more than the requested range-read length")
+			return res
 		}
-		res.ExpCksum = setCustomGs(lom, attrs)
+		debug.Assertf(offset+rsize <= attrs.Size, "offset + rsize %d > attrs.Size %d", offset+rsize, attrs.Size)
+		res.Size = rsize
+		res.R = rc
+		return res
 	}
 
+	// full read
+	rc, res.Err = o.NewReader(ctx)
+	if res.Err != nil {
+		return res
+	}
+	// custom metadata
+	lom.SetCustomKey(cmn.SourceObjMD, apc.GCP)
+	if cksumType, ok := attrs.Metadata[gcpChecksumType]; ok {
+		if cksumValue, ok := attrs.Metadata[gcpChecksumVal]; ok {
+			cksum := cos.NewCksum(cksumType, cksumValue)
+			lom.SetCksum(cksum)
+			res.ExpCksum = cksum // Use custom checksum as expected checksum
+		}
+	}
+
+	expCksum := setCustomGs(lom, attrs)
+	if res.ExpCksum == nil {
+		res.ExpCksum = expCksum
+	}
+
+	// For full reads, use rc.Attrs.Size
 	res.Size = rc.Attrs.Size
 	res.R = rc
 	return res
@@ -428,7 +456,7 @@ func (gsbp *gsbp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, _ 
 	}
 
 	_ = setCustomGs(lom, attrs)
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infof("[put_object] %s, size %d", lom, written)
 	}
 	return 0, nil
@@ -447,7 +475,7 @@ func (*gsbp) DeleteObj(ctx context.Context, lom *core.LOM) (ecode int, err error
 		ecode, err = handleObjectError(ctx, gcpClient, err, cloudBck)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infof("[delete_object] %s", lom)
 	}
 	return
@@ -474,13 +502,13 @@ func readCredFile() (projectID string) {
 const gcpErrPrefix = "gcp-error"
 
 func gcpErrorToAISError(gcpError error, bck *cmn.Bck) (int, error) {
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.InfoDepth(1, "begin "+gcpErrPrefix+" =========================")
 		nlog.InfoDepth(1, gcpError)
 		nlog.InfoDepth(1, "end "+gcpErrPrefix+" ===========================")
 	}
 	if gcpError == storage.ErrBucketNotExist {
-		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
+		return http.StatusNotFound, cmn.NewErrRemBckNotFound(bck)
 	}
 	err := _gcpErr(gcpError)
 	if gcpError == storage.ErrObjectNotExist {
@@ -492,7 +520,7 @@ func gcpErrorToAISError(gcpError error, bck *cmn.Bck) (int, error) {
 		return http.StatusInternalServerError, err
 	case apiErr.Code == http.StatusForbidden && strings.Contains(apiErr.Error(), "may not exist"):
 		// HACK: "not found or misspelled" vs  "service not paid for" (the latter less likely)
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infoln(err)
 		}
 		return http.StatusNotFound, err

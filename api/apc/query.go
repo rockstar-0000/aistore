@@ -4,18 +4,26 @@
  */
 package apc
 
-// see related "GET(what)" set of APIs: api/cluster and api/daemon
+//
+// NOTE: when adding new (or changing existing) query parameters, see ais/dpq.go comment on _categories_.
+//
+
 const (
+	// see related "GET(what)" set of APIs: api/cluster and api/daemon
 	QparamWhat = "what" // "smap" | "bmd" | "config" | "stats" | "xaction" ... (enum below)
 
 	QparamProps = "props" // e.g. "checksum, size"|"atime, size"|"cached"|"bucket, size"| ...
 
-	QparamUUID  = "uuid"  // xaction
-	QparamJobID = "jobid" // job
+	QparamTransient = "transient" // transient - in-memory only
+
+	QparamUUID  = "uuid"  // Transaction/xaction UUID identifier
+	QparamJobID = "jobid" // Job identifier
 
 	// etl
 	QparamETLName          = "etl_name"
+	QparamETLPipeline      = "etl_pipeline"
 	QparamETLTransformArgs = "etl_args"
+	QparamETLFQN           = "etl_fqn"
 	QparamETLSecret        = "etl_secret" // secret generated during ETL init to validate directly target access from trusted ETL
 
 	QparamRegex      = "regex"       // dsort: list regex
@@ -26,18 +34,19 @@ const (
 	QparamNewCustom = "set-new-custom"
 
 	// Main bucket query params.
-	QparamProvider  = "provider" // aka backend provider or, simply, backend
-	QparamNamespace = "namespace"
+	QparamProvider  = "provider"  // Backend provider type (ais, s3, gcp, azure, etc.)
+	QparamNamespace = "namespace" // Namespace for remote buckets and cross-cluster operations
 
-	// e.g., usage: copy bucket
-	QparamBckTo = "bck_to"
+	// e.g., usage: copy bucket, copy object
+	QparamBckTo = "bck_to"    // Destination bucket for copy/move operations
+	QparamObjTo = "object_to" // Destination object name for copy/move operations
 
 	// Do not add remote bucket to cluster's BMD e.g. when checking existence
 	// via api.HeadBucket
 	// By default, when existence of a remote buckets is confirmed the bucket's
 	// metadata gets automatically (and transactionally) added to the cluster's BMD.
 	// This query parameter can be used to override the default behavior.
-	QparamDontAddRemote = "dont_add_remote_bck_md"
+	QparamDontAddRemote = "dont_add_remote_bck_md" // Don't add remote bucket to cluster BMD
 
 	// Add remote bucket to BMD _unconditionally_ and without executing HEAD request
 	// (to check access and load the bucket's properties)
@@ -47,27 +56,27 @@ const (
 	// - `LsDontHeadRemote`
 	// - docs/bucket.md
 	// - docs/cli/aws_profile_endpoint.md
-	QparamDontHeadRemote = "dont_head_remote_bck"
+	QparamDontHeadRemote = "dont_head_remote_bck" // Add remote bucket without HEAD request validation
 
 	// When evicting, keep remote bucket in BMD (i.e., evict data only)
-	QparamKeepRemote = "keep_bck_md"
+	QparamKeepRemote = "keep_bck_md" // Keep bucket metadata when evicting remote bucket data
 
 	// (api.GetBucketInfo)
 	// NOTE: non-empty value indicates api.GetBucketInfo; "true" value further requires "with remote obj-s"
-	QparamBinfoWithOrWithoutRemote = "bsumm_remote"
+	QparamBinfoWithOrWithoutRemote = "bsumm_remote" // Include remote objects in bucket summary/info
 
 	// "presence" in a given cluster shall not be confused with "existence" (possibly, remote).
 	// See also:
 	// - Flt* enum below
 	// - ListObjsMsg flags, docs/providers.md (for terminology)
-	QparamFltPresence = "presence"
+	QparamFltPresence = "presence" // Filter bucket/object by presence state (FltExists, FltPresent, etc.)
 
 	// APPEND(object) operation - QparamAppendType enum below
-	QparamAppendType   = "append_type"
-	QparamAppendHandle = "append_handle"
+	QparamAppendType   = "append_type"   // Type of append operation (append, flush)
+	QparamAppendHandle = "append_handle" // Handle for ongoing append operations
 
 	// HTTP bucket support.
-	QparamOrigURL = "original_url"
+	QparamOrigURL = "original_url" // Original URL for HTTP bucket objects
 
 	// Get logs
 	QparamLogSev  = "severity" // see { LogInfo, ...} enum
@@ -119,12 +128,12 @@ const (
 	// used to overcome certain restrictions, e.g.:
 	// - shutdown the primary and the entire cluster
 	// - attach invalid mountpath
-	QparamForce = "frc"
+	QparamForce = "frc" // Force operation to override restrictions
 
 	// same as `Versioning.ValidateWarmGet` (cluster config and bucket props)
 	// - usage: GET and (copy|transform) x (bucket|multi-object) operations
 	// - implies remote backend
-	QparamLatestVer = "latest-ver"
+	QparamLatestVer = "latest-ver" // Get latest version of objects from remote backend
 
 	// in addition to the latest-ver (above), also entails removing remotely
 	// deleted objects
@@ -135,13 +144,17 @@ const (
 
 	// when true, skip nlog.Error and friends
 	// (to opt-out logging too many messages and/or benign warnings)
-	QparamSilent = "sln"
+	QparamSilent = "sln" // Suppress error logging and warnings
 
 	// (see api.AttachMountpath vs. LocalConfig.FSP)
 	QparamMpathLabel = "mountpath_label"
 
 	// Request to restore an object
 	QparamECObject = "object"
+
+	QparamMptUploads  = "uploads"    // Start multipart upload
+	QparamMptUploadID = "uploadId"   // Complete, abort, or list parts of specific multipart upload
+	QparamMptPartNo   = "partNumber" // Part number for multipart upload
 )
 
 // QparamFltPresence enum.
@@ -158,8 +171,12 @@ const (
 	FltExistsNoProps         // same as above but no need to return props/info
 	FltPresent               // bucket: is present | object: present and properly located
 	FltPresentNoProps        // same as above but no need to return props/info
-	FltPresentCluster        // objects: present anywhere/anyhow _in_ the cluster as: replica, ec-slices, misplaced
-	FltExistsOutside         // not present - exists _outside_ cluster (NOTE: currently, only list-buckets)
+
+	// Objects are present on any target, any disk inside the cluster (including replicas, EC slices, misplaced, or rebalancing).
+	// TODO: Currently, `FltPresentCluster` only checks whether the LOM can be loaded, and tries to find/restore it on the same target if loading fails.
+	// This should be extended to check whether the object is present on any target or any disk inside the cluster (see also: `t.headObjBcast()`).
+	FltPresentCluster
+	FltExistsOutside // not present - exists _outside_ cluster (NOTE: currently, only list-buckets)
 )
 
 func IsFltPresent(v int) bool {
@@ -187,7 +204,7 @@ const (
 
 // Internal query params.
 const (
-	QparamProxyID          = "pid" // ID of the redirecting proxy.
+	QparamPID              = "pid" // ID of a redirecting proxy.
 	QparamPrimaryCandidate = "can" // candidate for the primary proxy (voting ID, force URL)
 	QparamPrepare          = "prp" // 2-phase commit where 'true' corresponds to 'begin'; usage: (primary election; set-primary)
 	QparamUnixTime         = "utm" // Unix time since 01/01/70 UTC (nanoseconds)
@@ -196,6 +213,8 @@ const (
 	QparamRebData          = "rbd" // true: get EC rebalance data (pulling data if push way fails)
 	QparamClusterInfo      = "cii" // true: /Health to return `cos.NodeStateInfo` including cluster metadata versions and state flags
 	QparamOWT              = "owt" // object write transaction enum { OwtPut, ..., OwtGet* }
+
+	QparamTID = "tid" // designated target
 
 	QparamDontResilver = "dntres" // true: do not resilver data off of mountpaths that are being disabled/detached
 
@@ -215,6 +234,11 @@ const (
 
 	// Notification target's node ID (usually, the node that initiates the operation).
 	QparamNotifyMe = "nft"
+
+	// added in v4.1
+	QparamSmapVer = "vpams"
+	QparamNonce   = "x"
+	QparamHMAC    = "u"
 )
 
 // QparamWhat enum.

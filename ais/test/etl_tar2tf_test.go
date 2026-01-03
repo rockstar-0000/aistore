@@ -46,7 +46,7 @@ func startTar2TfTransformer(t *testing.T) (etlName string) {
 	xid, err := api.ETLInit(baseParams, msg)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("ETL %q: running x-etl-spec[%s]\n", etlName, xid)
+	tlog.Logfln("ETL %q: running x-etl-spec[%s]", etlName, xid)
 	return
 }
 
@@ -72,7 +72,13 @@ func TestETLTar2TFS3(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 	// PUT TAR to the cluster
-	f, err := readers.NewExistingFile(tarPath, cos.ChecksumCesXxh)
+	f, err := readers.New(&readers.Arg{
+		Type:      readers.File,
+		Path:      tarPath,
+		Size:      readers.ExistingFileSize,
+		CksumType: cos.ChecksumCesXxh,
+	})
+
 	tassert.CheckFatal(t, err)
 	putArgs := api.PutArgs{
 		BaseParams: baseParams,
@@ -150,7 +156,12 @@ func TestETLTar2TFRanges(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 
 	// PUT TAR to the cluster
-	f, err := readers.NewExistingFile(tarPath, cos.ChecksumCesXxh)
+	f, err := readers.New(&readers.Arg{
+		Type:      readers.File,
+		Path:      tarPath,
+		Size:      readers.ExistingFileSize,
+		CksumType: cos.ChecksumCesXxh,
+	})
 	tassert.CheckFatal(t, err)
 	putArgs := api.PutArgs{
 		BaseParams: baseParams,

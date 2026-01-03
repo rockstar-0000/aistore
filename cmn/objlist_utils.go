@@ -7,6 +7,7 @@ package cmn
 
 import (
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -35,6 +36,7 @@ func (entries LsoEntries) cmp(i, j int) bool {
 func (be *LsoEnt) IsPresent() bool { return be.Flags&apc.EntryIsCached != 0 }
 
 func (be *LsoEnt) SetFlag(fl uint16)           { be.Flags |= fl }
+func (be *LsoEnt) ClrFlag(fl uint16)           { be.Flags &^= fl }
 func (be *LsoEnt) IsAnyFlagSet(fl uint16) bool { return be.Flags&fl != 0 }
 
 // location _status_
@@ -84,11 +86,23 @@ func (be *LsoEnt) CopyWithProps(propsSet cos.StrSet) (ne *LsoEnt) {
 	return
 }
 
+// Sorting list-objects results.
 //
-// sorting and merging functions
-//
+// SortLsoLex() is intended for non-recursive listing where directory entries are included.
+// The default SortLso() uses dirs-first ordering (via `LsoEnt.less`) which groups
+// virtual directories before objects. This breaks token-based pagination because tokens
+// are lexicographical cursors - AIS always returns entries where `name > token`.
 
 func SortLso(entries LsoEntries) { sort.Slice(entries, entries.cmp) }
+
+func SortLsoLex(entries LsoEntries) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Name != entries[j].Name {
+			return entries[i].Name < entries[j].Name
+		}
+		return entries.cmp(i, j) // or compare status/flags deterministically
+	})
+}
 
 // Returns true if the continuation token >= object's name (in other words, the object is
 // already listed and must be skipped). Note that string `>=` is lexicographic.
@@ -110,26 +124,58 @@ func ObjHasPrefix(objName, prefix string) bool {
 	return strings.HasPrefix(objName, prefix)
 }
 
-// no recursion (LsNoRecursion) helper function:
-// check the level of nesting
-// return:
-//   - true, to include virtual directory
-//   - filepath.SkipDir, to skip further recursion
+// CheckDirNoRecurs determines how to handle a directory during non-recursive listing.
+//
+// Parameters:
+//   - prefix:  the user's query prefix (e.g., "aaa/" or "")
+//   - relPath: the directory being visited during filesystem walk (e.g., "aaa", "aaa/bbb")
+//
+// Returns:
+//   - addDirEntry: true = add this directory to listing results
+//   - error:       SkipDir = don't walk into this directory; nil = continue walking into it
+//
+// Cases (assuming prefix="aaa/"):
+//
+//	| relPath       | suffix    | addDirEntry | error   | Reason                              |
+//	|---------------|-----------|-------------|---------|-------------------------------------|
+//	| "bbb"         | "bbb"     | false       | SkipDir | Wrong subtree, skip entirely        |
+//	| "aaa"         | ""        | false       | nil     | Prefix dir itself, walk into it     |
+//	| "aaa/bbb"     | "bbb"     | true        | SkipDir | Direct child, add & don't recurse   |
+//	| "aaa/bbb/ccc" | "bbb/ccc" | false       | SkipDir | Too deep, skip entirely             |
+//
+// Special case: if prefix="" or "/", add all top-level directories (return true, SkipDir).
 func CheckDirNoRecurs(prefix, relPath string) (addDirEntry bool, _ error) {
+	// Case 1: Empty prefix - user wants root level, add all top-level dirs
 	if prefix == "" || prefix == cos.PathSeparator {
 		return true, filepath.SkipDir
 	}
+
+	// Normalize: "aaa/" -> "aaa"
 	prefix = cos.TrimLastB(prefix, '/')
+
+	// Extract what comes after the prefix
 	suffix := strings.TrimPrefix(relPath, prefix)
+
+	// Case 2: relPath doesn't start with prefix - wrong subtree
 	if suffix == relPath {
-		// wrong subtree (unlikely, given higher-level traversal logic)
 		return false, filepath.SkipDir
 	}
+
+	// Remove leading separator: "/bbb" -> "bbb"
+	suffix = strings.TrimPrefix(suffix, cos.PathSeparator)
+
+	// Case 3: relPath equals prefix directory itself - walk into it but don't add
+	if suffix == "" {
+		return false, nil
+	}
+
+	// Case 4: suffix contains "/" - nested too deep, skip
 	if strings.Contains(suffix, cos.PathSeparator) {
-		// nesting-wise, we are deeper than allowed by the prefix
 		return false, filepath.SkipDir
 	}
-	return true, nil
+
+	// Case 5: Direct child directory - add to results, don't recurse into it
+	return true, filepath.SkipDir
 }
 
 //
@@ -180,7 +226,7 @@ func CustomMD2S(md cos.StrKVs) string {
 			if k == OrigFntl {
 				continue
 			}
-			if cos.StringInSlice(k, stdCustomProps[:]) {
+			if slices.Contains(stdCustomProps[:], k) {
 				continue
 			}
 			if prev {

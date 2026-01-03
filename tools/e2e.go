@@ -13,13 +13,11 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools/tlog"
 	"github.com/NVIDIA/aistore/tools/trand"
@@ -32,8 +30,6 @@ type E2EFramework struct {
 	Dir  string
 	Vars map[string]string // Custom variables passed to input and output files.
 }
-
-var onceK8s sync.Once
 
 func (f *E2EFramework) RunE2ETest(fileName string) {
 	var (
@@ -136,6 +132,7 @@ func (f *E2EFramework) RunE2ETest(fileName string) {
 				config, err := getClusterConfig()
 				cos.AssertNoErr(err)
 				if !config.TestingEnv() {
+					tlog.Logfln("SKIPPING %q: requires local deployment", fileName)
 					ginkgo.Skip("requires local deployment")
 					return
 				}
@@ -147,21 +144,45 @@ func (f *E2EFramework) RunE2ETest(fileName string) {
 				if config, err := getClusterConfig(); err == nil && config.Auth.Enabled {
 					continue
 				}
+				tlog.Logfln("SKIPPING %q: AuthN not enabled", fileName)
 				ginkgo.Skip("AuthN not enabled - skipping")
 				return
 			case "k8s":
-				onceK8s.Do(k8s.Init)
-				if k8s.IsK8s() {
-					continue
+				// Skip if we can't verify or aren't on a Kubernetes cluster
+				status, err := isClusterK8s()
+				if err != nil {
+					tlog.Logfln("SKIPPING %q: cannot determine cluster type: %v", fileName, err)
+					ginkgo.Skip(fmt.Sprintf("cannot determine cluster type: %v", err))
 				}
-				ginkgo.Skip("not running in K8s - skipping")
-				return
+				if !status {
+					tlog.Logfln("SKIPPING %q: requires Kubernetes deployment", fileName)
+					ginkgo.Skip("requires Kubernetes deployment")
+				}
+				// Otherwise, we’re on K8s – run the test step
+				continue
+			case "remais":
+				// Skip if no remote AIS clusters are attached
+				if RemoteCluster.UUID == "" {
+					tlog.Logfln("SKIPPING %q: no remote AIS clusters attached", fileName)
+					ginkgo.Skip("no remote AIS clusters attached")
+					return
+				}
+				continue
+			case "clean-cluster":
+				// Skip if there are pre-existing buckets in the cluster
+				if hasExistingBuckets() {
+					tlog.Logfln("SKIPPING %q: cluster has pre-existing buckets", fileName)
+					ginkgo.Skip("cluster has pre-existing buckets")
+					return
+				}
+				continue
 			default:
 				cos.AssertMsg(false, "invalid run mode: "+comment)
 			}
 		case strings.HasPrefix(scmd, "// SKIP"):
 			message := strings.TrimSpace(strings.TrimPrefix(scmd, "// SKIP"))
 			message = strings.Trim(message, `"`)
+			tlog.Logfln("SKIPPING %q: %s", fileName, message)
 			ginkgo.Skip(message)
 			return
 		}
@@ -245,6 +266,13 @@ func destroyMatchingBuckets(subName string) (err error) {
 		return err
 	}
 
+	if RemoteCluster.UUID != "" {
+		remoteBcks, errR := api.ListBuckets(bp, cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.NsAnyRemote}, apc.FltExists)
+		if errR == nil {
+			bcks = append(bcks, remoteBcks...)
+		}
+	}
+
 	for _, bck := range bcks {
 		if !strings.Contains(bck.Name, subName) {
 			continue
@@ -292,6 +320,26 @@ func readContent(r io.Reader, ignoreEmpty bool) []string {
 	}
 	gomega.Expect(scanner.Err()).NotTo(gomega.HaveOccurred())
 	return lines
+}
+
+// hasExistingBuckets checks if there are any existing AIS or remote AIS buckets in the cluster
+func hasExistingBuckets() bool {
+	proxyURL := GetPrimaryURL()
+	bp := BaseAPIParams(proxyURL)
+
+	// Check for AIS buckets
+	aisBcks, err := api.ListBuckets(bp, cmn.QueryBcks{Provider: apc.AIS}, apc.FltExists)
+	if err == nil && len(aisBcks) > 0 {
+		return true
+	}
+
+	// Check for remote AIS buckets
+	remaisBcks, err := api.ListBuckets(bp, cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.NsAnyRemote}, apc.FltExists)
+	if err == nil && len(remaisBcks) > 0 {
+		return true
+	}
+
+	return false
 }
 
 func isLineRegex(msg string) bool {

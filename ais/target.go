@@ -40,12 +40,14 @@ import (
 	"github.com/NVIDIA/aistore/fs/health"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/mirror"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/volume"
+	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
 )
@@ -64,14 +66,15 @@ type (
 	rlbackends map[string]*rlbackend
 	// main
 	target struct {
-		htrun
 		bps      backends
 		rlbps    rlbackends
 		fshc     *health.FSHC
-		fsprg    fsprungroup
 		reb      *reb.Reb
 		res      *res.Res
+		fsprg    fsprungroup
 		txns     txns
+		ups      ups
+		htrun    // common w/ proxy
 		regstate regstate
 	}
 )
@@ -164,6 +167,10 @@ func (t *target) initBackends() {
 // - remote (e.g. cloud) backends  w/ empty stubs unless populated via build tags
 // - enabled/disabled via config.Backend
 func (t *target) initBuiltTagged(config *cmn.Config, startingUp bool) error {
+	const (
+		fmtErrUnknown = "%s: unknown backend provider %q"
+		fmtErrFailed  = "%s: failed to initialize [%s] backend, err: %w"
+	)
 	var (
 		enabled   []string
 		disabled  []string
@@ -189,7 +196,7 @@ func (t *target) initBuiltTagged(config *cmn.Config, startingUp bool) error {
 		case apc.AIS:
 			continue
 		default:
-			return fmt.Errorf("unknown backend provider %q", provider)
+			return fmt.Errorf(fmtErrUnknown, t, provider)
 		}
 		t.bps[provider] = bp
 
@@ -202,13 +209,13 @@ func (t *target) initBuiltTagged(config *cmn.Config, startingUp bool) error {
 		case err != nil && configured:
 			if !cmn.IsErrInitMissingBackend(err) {
 				// as is
-				return fmt.Errorf("%s: failed to initialize [%s] backend, err: %v", t, provider, err)
+				return fmt.Errorf(fmtErrFailed, t, provider, err)
 			}
 			notlinked = append(notlinked, provider)
 		case err != nil && !configured:
 			_, ok := err.(*cmn.ErrInitBackend) // error type to indicate a _mock_ backend
 			if !ok {
-				return fmt.Errorf("%s: failed to initialize [%s] backend, err: %v", t, provider, err)
+				return fmt.Errorf(fmtErrFailed, t, provider, err)
 			}
 		}
 	}
@@ -293,9 +300,8 @@ func (t *target) init(config *cmn.Config) {
 
 	t.fsprg.init(t, newVol) // subgroup of the daemon.rg rungroup
 
-	sc := transport.Init(ts)                  // init transport sub-system
-	daemon.rg.add(sc)                         // new stream collector
-	bundle.InitSDM(config, apc.CompressNever) // shared streams
+	sc := transport.Init(ts) // init transport sub-system
+	daemon.rg.add(sc)        // new stream collector
 
 	t.fshc = health.NewFSHC(t)
 
@@ -377,6 +383,8 @@ func (t *target) Run() error {
 
 	core.Tinit(t, config, true /*run hk*/)
 
+	bundle.InitSDM(config, apc.CompressNever) // shared streams; requires certloader when use-https
+
 	fatalErr, writeErr := t.checkRestarted(config)
 	if fatalErr != nil {
 		cos.ExitLog(fatalErr)
@@ -387,9 +395,7 @@ func (t *target) Run() error {
 		nlog.Errorln("")
 	}
 
-	// register object type and workfile type
-	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
-	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{})
+	t.ups.t = t
 
 	// Init meta-owners and load local instances
 	if prev := t.owner.bmd.init(); prev {
@@ -402,7 +408,7 @@ func (t *target) Run() error {
 		smap = newSmap()
 		smap.Tmap[t.SID()] = t.si // add self to initial temp smap
 	} else {
-		nlog.Infoln(t.String()+": loaded", smap.StringEx())
+		nlog.Infoln(t.String(), "loaded", smap.StringEx())
 	}
 	t.owner.smap.put(smap)
 
@@ -426,7 +432,6 @@ func (t *target) Run() error {
 	}
 
 	// begin target metrics, disks first -------
-
 	avail, disabled := fs.Get()
 	if len(avail) == 0 {
 		cos.ExitLog(cmn.ErrNoMountpaths)
@@ -437,8 +442,10 @@ func (t *target) Run() error {
 	tstats.RegMetrics(t.si)
 
 	t.initBackends() // (+ reg backend metrics)
-
 	// end target metrics -----------------------
+
+	// probe xattrs
+	fs.ProbeMaxsz(avail, t.String())
 
 	db, err := kvdb.NewBuntDB(filepath.Join(config.ConfigDir, dbName))
 	if err != nil {
@@ -464,6 +471,7 @@ func (t *target) Run() error {
 		go t.goresilver(config, marked.Interrupted)
 	}
 
+	etl.Tinit()
 	dsort.Tinit(db, config)
 	dload.Init(db, &config.Client)
 
@@ -473,8 +481,8 @@ func (t *target) Run() error {
 	cos.Close(db) // close kv db
 
 	// gracefully
-	fs.RemoveMarker(fname.NodeRestartedPrev, t.statsT)
-	fs.RemoveMarker(fname.NodeRestartedMarker, t.statsT)
+	fs.RemoveMarker(fname.NodeRestartedPrev, t.statsT, true)
+	fs.RemoveMarker(fname.NodeRestartedMarker, t.statsT, true)
 	return err
 }
 
@@ -510,10 +518,15 @@ func (t *target) goresilver(config *cmn.Config, interrupted bool) {
 	} else if daemon.resilver.required {
 		nlog.Infoln("Starting resilver, reason:", daemon.resilver.reason)
 	}
-	t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}}, nil /*wg*/)
+	t.runResilver(&res.Args{Custom: xreg.ResArgs{Config: config}})
 }
 
-func (t *target) runResilver(args *res.Args, wg *sync.WaitGroup) {
+func (t *target) runResilver(args *res.Args) {
+	// [convention] Non-empty UUID means admin–initiated job
+	// (with AIS proxy then generating cluster-wide UUID);
+	// the WG barrier ensures all targets become visible at the same time.
+	debug.Assert(args.UUID == "" || args.WG != nil)
+
 	// with no cluster-wide UUID it's a local run
 	if args.UUID == "" {
 		args.UUID = cos.GenUUID()
@@ -525,11 +538,7 @@ func (t *target) runResilver(args *res.Args, wg *sync.WaitGroup) {
 	debug.Assert(args.Custom.Config != nil)
 	smap := t.owner.smap.get()
 	args.Custom.Smap = &smap.Smap
-
-	if wg != nil {
-		wg.Done() // compare w/ xact.GoRunW(()
-	}
-	t.res.RunResilver(args, t.statsT)
+	t.res.Run(args, t.statsT)
 }
 
 func (t *target) endStartupStandby() (err error) {
@@ -570,8 +579,13 @@ func (t *target) initRecvHandlers() {
 		{r: apc.Sort, h: dsort.TargetHandler, net: accessControlData},
 		{r: apc.ETL, h: t.etlHandler, net: accessNetAll},
 
+		// machine learning
+		{r: apc.ML, h: t.mlHandler, net: accessNetPublicControl},
+
 		{r: "/" + apc.S3, h: t.s3Handler, net: accessNetPublicData},
 		{r: "/", h: t.errURL, net: accessNetAll},
+
+		// plus, PromHandler() at "/metrics" (see ais/htrun)
 	}
 	t.regNetHandlers(networkHandlers)
 }
@@ -584,9 +598,9 @@ func (t *target) checkRestarted(config *cmn.Config) (fatalErr, writeErr error) {
 			return
 		}
 		t.statsT.SetFlag(cos.NodeAlerts, cos.NodeRestarted)
-		fs.PersistMarker(fname.NodeRestartedPrev)
+		fs.PersistMarker(fname.NodeRestartedPrev, false /*quiet*/)
 	}
-	fatalErr, writeErr = fs.PersistMarker(fname.NodeRestartedMarker)
+	fatalErr, writeErr = fs.PersistMarker(fname.NodeRestartedMarker, false /*quiet*/)
 	return
 }
 
@@ -609,8 +623,9 @@ func (red *redial) acked() bool {
 	}
 	for _, addr := range addrs {
 		for elapsed := time.Duration(0); elapsed < red.totalTout; elapsed += sleep {
-			_, err = net.DialTimeout("tcp4", addr, max(2*time.Second, red.dialTout))
-			if err != nil {
+			ctx := context.Background()
+			dialer := &net.Dialer{Timeout: red.dialTout}
+			if _, err = dialer.DialContext(ctx, "tcp4", addr); err != nil {
 				break
 			}
 			once = true
@@ -706,7 +721,7 @@ func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 		t.httpobjdelete(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodPost:
-		apireq := apiReqAlloc(2, apc.URLPathObjects.L, false /*useDpq*/)
+		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true)
 		t.httpobjpost(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodPatch:
@@ -743,7 +758,7 @@ func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiR
 		return
 	}
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if apireq.dpq.ptime == "" /*isRedirect*/ && t.checkIntraCall(r.Header, false /*from primary*/) != nil {
+		if apireq.dpq.sys.ptime == "" /*isRedirect*/ && t.checkIntraCall(r.Header, false /*from primary*/) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
@@ -759,10 +774,10 @@ func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiR
 }
 
 func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck *meta.Bck, lom *core.LOM) (*core.LOM, error) {
-	if err := lom.InitBck(bck.Bucket()); err != nil {
+	if err := lom.InitBck(bck); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
-			err = lom.InitBck(bck.Bucket())
+			err = lom.InitBck(bck)
 		}
 		if err != nil {
 			return lom, err
@@ -770,25 +785,24 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 	}
 
 	// two special flows
-	if dpq.etl.name != "" {
+	switch {
+	case dpq.get(apc.QparamETLName) != "":
 		t.inlineETL(w, r, dpq, lom)
 		return lom, nil
-	}
-	if cos.IsParseBool(r.Header.Get(apc.HdrBlobDownload)) {
+	case cos.IsParseBool(r.Header.Get(apc.HdrBlobDownload)):
 		var msg apc.BlobMsg
 		if err := msg.FromHeader(r.Header); err != nil {
 			return lom, err
 		}
 
-		// NOTE: make a blocking call w/ simultaneous Tx
 		args := &core.BlobParams{
-			RspW: w,
-			Lom:  lom,
-			Msg:  &msg,
+			RespWriter: w, // NOTE: make a blocking call
+			Lom:        lom,
+			Msg:        &msg,
 		}
-		xid, _, err := t.blobdl(args, nil /*oa*/)
+		xid, _, err := t.blobdl(args, nil /*oa*/, w.Header())
 		if err != nil && xid != "" {
-			// (for the same reason as errGetTxBenign)
+			// (for the same reason as cmn.ErrGetTxBenign)
 			nlog.Warningln("GET", lom.Cname(), "via blob-download["+xid+"]:", err)
 			err = nil
 		}
@@ -803,8 +817,8 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		// - with periodic readjustment (***)
 		goi.atime = time.Now().UnixNano()
 		goi.ltime = mono.NanoTime()
-		if dpq.ptime != "" {
-			if d := ptLatency(goi.atime, dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
+		if dpq.sys.ptime != "" {
+			if d := ptLatency(goi.atime, dpq.sys.ptime, r.Header.Get(apc.HdrSenderIsPrimary)); d > 0 {
 				t.statsT.Add(stats.GetRedirLatency, d)
 			}
 		}
@@ -833,7 +847,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 
 	// apc.QparamOrigURL
 	if bck.IsHT() {
-		originalURL := dpq.origURL
+		originalURL := dpq.sys.origURL
 		goi.ctx = context.WithValue(goi.ctx, cos.CtxOriginalURL, originalURL)
 	}
 
@@ -844,7 +858,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		if goi.isIOErr {
 			t.statsT.IncWith(stats.ErrGetCount, vlabs)
 			t.statsT.IncWith(stats.IOErrGetCount, vlabs)
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.V(4, cos.ModAIS) {
 				nlog.Warningln("io-error [", err, "]", goi.lom.String())
 			}
 		} else {
@@ -852,7 +866,7 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		}
 
 		// handle right here, return nil
-		if err != errGetTxBenign && !isErrGetTxSevere(err) {
+		if err != cmn.ErrGetTxBenign && !isErrGetTxSevere(err) {
 			goi.lom.UncacheDel()
 			if dpq.isS3 {
 				s3.WriteErr(w, r, err, ecode)
@@ -878,7 +892,7 @@ func _validateWarmGet(lom *core.LOM, latestVer bool /*apc.QparamLatestVer*/) boo
 }
 
 func (t *target) _erris(w http.ResponseWriter, r *http.Request, err error, code int, silent bool) {
-	if silent { // e.g,. apc.QparamSilent, StatusNotFound
+	if silent /*e.g,. apc.QparamSilent*/ || code == http.StatusNotFound {
 		t.writeErr(w, r, err, code, Silent)
 	} else {
 		t.writeErr(w, r, err, code)
@@ -886,14 +900,14 @@ func (t *target) _erris(w http.ResponseWriter, r *http.Request, err error, code 
 }
 
 // PUT /v1/objects/bucket-name/object-name; does:
-// 1) append object 2) append to archive 3) PUT
+// 1) append object 2) append to archive 3) PUT 4) single object copy 5) multipart upload
 func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRequest, lom *core.LOM) {
 	var (
 		config  = cmn.GCO.Get()
 		started = time.Now().UnixNano()
 		t2tput  = isT2TPut(r.Header)
 	)
-	if apireq.dpq.ptime == "" && !t2tput {
+	if apireq.dpq.sys.ptime == "" && !t2tput {
 		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
 		return
 	}
@@ -908,10 +922,10 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 	}
 
 	// init
-	if err := lom.InitBck(apireq.bck.Bucket()); err != nil {
+	if err := lom.InitBck(apireq.bck); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
-			err = lom.InitBck(apireq.bck.Bucket())
+			err = lom.InitBck(apireq.bck)
 		}
 		if err != nil {
 			t.writeErr(w, r, err)
@@ -921,30 +935,70 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 
 	// do
 	var (
-		handle string
-		err    error
-		ecode  int
+		handle   string
+		err      error
+		ecode    int
+		dpq      = apireq.dpq
+		uploadID = dpq.get(apc.QparamMptUploadID)
+		apndTy   = dpq.get(apc.QparamAppendType)
 	)
 	switch {
-	case apireq.dpq.arch.path != "": // apc.QparamArchpath
-		apireq.dpq.arch.mime, err = archive.MimeFQN(t.smm, apireq.dpq.arch.mime, lom.FQN)
+	case dpq.sys.objto != "": // apc.QparamObjTo
+		var (
+			bck     *meta.Bck
+			objName string
+		)
+
+		bck, objName, err = meta.ParseUname(dpq.sys.objto, true /*object name required*/)
+		if err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		if err := bck.Init(t.owner.bmd); err != nil {
+			if cmn.IsErrRemoteBckNotFound(err) {
+				t.BMDVersionFixup(r)
+				err = bck.Init(t.owner.bmd)
+			}
+			if err != nil {
+				t.writeErr(w, r, err)
+				return
+			}
+		}
+		ecode, err = t.copyObject(lom, bck, objName, dpq, config) // lom is locked/unlocked during the call
+	case uploadID != "":
+		partNo, e := strconv.Atoi(dpq.get(apc.QparamMptPartNo))
+		if e != nil {
+			t.writeErrf(w, r, "%s: invalid part number %q for uploadID %q", lom, dpq.get(apc.QparamMptPartNo), uploadID)
+			return
+		}
+		args := partArgs{
+			req:      r,
+			size:     r.ContentLength,
+			reader:   r.Body,
+			lom:      lom,
+			uploadID: uploadID,
+			partNum:  partNo,
+		}
+		_, ecode, err = t.ups.putPart(&args)
+	case dpq.arch.path != "": // apc.QparamArchpath
+		dpq.arch.mime, err = archive.MimeFQN(t.smm, dpq.arch.mime, lom.FQN)
 		if err != nil {
 			break
 		}
 		// do
 		lom.Lock(true)
-		ecode, err = t.putApndArch(r, lom, started, apireq.dpq)
+		ecode, err = t.putApndArch(r, lom, started, dpq)
 		lom.Unlock(true)
-	case apireq.dpq.apnd.ty != "": // apc.QparamAppendType
+	case apndTy != "":
 		a := &apndOI{
 			started: started,
 			t:       t,
 			config:  config,
 			lom:     lom,
 			r:       r.Body,
-			op:      apireq.dpq.apnd.ty, // apc.QparamAppendType
+			op:      apndTy,
 		}
-		if err := a.parse(apireq.dpq.apnd.hdl /*apc.QparamAppendHandle*/); err != nil {
+		if err := a.parse(dpq.get(apc.QparamAppendHandle)); err != nil {
 			t.writeErr(w, r, err)
 			return
 		}
@@ -956,7 +1010,7 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
 		t.statsT.IncWith(stats.ErrAppendCount, vlabs)
 	default:
-		ecode, err = t.putObject(w, r, apireq.dpq, lom, t2tput, config)
+		ecode, err = t.putObject(w, r, dpq, lom, t2tput, config)
 	}
 	if err != nil {
 		t.FSHC(err, lom.Mountpath(), "") // TODO: removed from the place where happened, fqn missing...
@@ -974,8 +1028,8 @@ func (t *target) putObject(w http.ResponseWriter, r *http.Request, dpq *dpq, lom
 	poi := allocPOI()
 	{
 		poi.atime = time.Now().UnixNano()
-		if dpq.ptime != "" {
-			if d := ptLatency(poi.atime, dpq.ptime, r.Header.Get(apc.HdrCallerIsPrimary)); d > 0 {
+		if dpq.sys.ptime != "" {
+			if d := ptLatency(poi.atime, dpq.sys.ptime, r.Header.Get(apc.HdrSenderIsPrimary)); d > 0 {
 				t.statsT.Add(stats.PutRedirLatency, d)
 			}
 		}
@@ -1006,9 +1060,21 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 		return
 	}
 
+	if msg.Action == apc.ActMptAbort {
+		lom := &core.LOM{ObjName: objName}
+		if err := lom.InitBck(apireq.bck); err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		if ecode, err := t.ups.abort(r, lom, apireq.query.Get(apc.QparamMptUploadID)); err != nil {
+			t.writeErr(w, r, err, ecode)
+		}
+		return
+	}
+
 	evict := msg.Action == apc.ActEvictObjects
 	lom := core.AllocLOM(objName)
-	if err := lom.InitBck(apireq.bck.Bucket()); err != nil {
+	if err := lom.InitBck(apireq.bck); err != nil {
 		t.writeErr(w, r, err)
 		core.FreeLOM(lom)
 		return
@@ -1040,34 +1106,32 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 	if t.parseReq(w, r, apireq) != nil {
 		return
 	}
-	if isRedirect(apireq.query) == "" {
+	if apireq.dpq.isRedirect() == "" {
 		t.writeErrf(w, r, "%s: %s-%s(obj) is expected to be redirected", t.si, r.Method, msg.Action)
 		return
 	}
-	var lom *core.LOM
+
+	var ecode int
+	// TODO: consolidate lom and bucket initialization and error handling across all actions
 	switch msg.Action {
 	case apc.ActRenameObject:
-		lom = core.AllocLOM(apireq.items[1])
-		if err = lom.InitBck(apireq.bck.Bucket()); err != nil {
+		lom := &core.LOM{ObjName: apireq.items[1]}
+		if err = lom.InitBck(apireq.bck); err != nil {
 			break
 		}
 		if err = t.objMv(lom, msg); err == nil {
 			t.statsT.IncBck(stats.RenameCount, lom.Bucket())
-			core.FreeLOM(lom)
-			lom = nil
 		} else {
 			vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
 			t.statsT.IncWith(stats.ErrRenameCount, vlabs)
 		}
 	case apc.ActBlobDl:
-		// TODO: add stats.GetBlobCount and *ErrCount
 		var (
 			xid     string
-			objName = msg.Name
 			blobMsg apc.BlobMsg
+			lom     = &core.LOM{ObjName: msg.Name}
 		)
-		lom = core.AllocLOM(objName)
-		if err = lom.InitBck(apireq.bck.Bucket()); err != nil {
+		if err = lom.InitBck(apireq.bck); err != nil {
 			break
 		}
 		if err = cos.MorphMarshal(msg.Value, &blobMsg); err != nil {
@@ -1075,25 +1139,63 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 			break
 		}
 		args := &core.BlobParams{
-			Lom: lom,
+			Lom: lom, // eventually freed by x-blob
 			Msg: &blobMsg,
 		}
-		if xid, _, err = t.blobdl(args, nil /*oa*/); xid != "" {
+		if xid, _, err = t.blobdl(args, nil /*oa*/, nil /*object headers*/); xid != "" {
 			debug.AssertNoErr(err)
 			writeXid(w, xid)
-
-			// lom is eventually freed by x-blob
 		}
+	case apc.ActMptUpload:
+		lom := &core.LOM{ObjName: apireq.items[1]}
+		if err = lom.InitBck(apireq.bck); err != nil {
+			if cmn.IsErrRemoteBckNotFound(err) {
+				t.BMDVersionFixup(r)
+				err = lom.InitBck(apireq.bck)
+			}
+			if err != nil {
+				break
+			}
+		}
+		var uploadID string
+		if uploadID, err = t.ups.start(r, lom, false /*coldGET*/); err == nil {
+			writeXid(w, uploadID)
+		}
+	case apc.ActMptComplete:
+		var (
+			mptCompletedParts apc.MptCompletedParts
+			uploadID          = apireq.dpq.get(apc.QparamMptUploadID)
+		)
+		err = cos.MorphMarshal(msg.Value, &mptCompletedParts)
+		if err != nil {
+			break
+		}
+		lom := &core.LOM{ObjName: apireq.items[1]}
+		if err = lom.InitBck(apireq.bck); err != nil {
+			if cmn.IsErrRemoteBckNotFound(err) {
+				t.BMDVersionFixup(r)
+				err = lom.InitBck(apireq.bck)
+			}
+			if err != nil {
+				break
+			}
+		}
+		_, ecode, err = t.ups.complete(&completeArgs{
+			r:        r,
+			lom:      lom,
+			uploadID: uploadID,
+			body:     nil,
+			parts:    mptCompletedParts,
+		})
 	case apc.ActCheckLock:
 		t._checkLocked(w, r, apireq.bck, apireq.items[1])
-		return
 	default:
 		t.writeErrAct(w, r, msg.Action)
-		return
 	}
+
+	// common return
 	if err != nil {
-		t.writeErr(w, r, err)
-		core.FreeLOM(lom)
+		t.writeErr(w, r, err, ecode)
 	}
 }
 
@@ -1108,7 +1210,7 @@ func (t *target) _checkLocked(w http.ResponseWriter, r *http.Request, bck *meta.
 		lom    = core.AllocLOM(objName)
 	)
 	defer core.FreeLOM(lom)
-	if err := lom.InitBck(bck.Bucket()); err != nil {
+	if err := lom.InitBck(bck); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
@@ -1148,70 +1250,70 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 }
 
 // NOTE: sets whdr.ContentLength = obj-size, with no response body
+//
+// Returns non-standard HTTP status codes:
+// - 409 (Conflict): local and remote object metadata mismatch when latest=true
+// - 410 (Gone): remote backend returned 404 when latest=true (object was deleted remotely)
+// - 429 (TooManyRequests): remote backend is throttling requests
+// - 503 (ServiceUnavailable): remote backend is temporarily unavailable
 func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *meta.Bck, lom *core.LOM) (int, error) {
 	var (
+		started     = mono.NanoTime()
 		fltPresence int
-		exists      = true
+		exists      bool
+		err         error
 	)
 	if tmp := q.Get(apc.QparamFltPresence); tmp != "" {
 		var erp error
 		fltPresence, erp = strconv.Atoi(tmp)
 		debug.AssertNoErr(erp)
 	}
-	if err := lom.InitBck(bck.Bucket()); err != nil {
+
+	// 1. initialize bucket and load LOM
+	if err = lom.InitBck(bck); err != nil {
 		if cmn.IsErrBucketNought(err) {
 			return http.StatusNotFound, err
 		}
 		return 0, err
 	}
-	if err := lom.Load(true /*cache it*/, false /*locked*/); err == nil {
-		if apc.IsFltNoProps(fltPresence) {
-			return 0, nil
-		}
+
+	err = lom.Load(true /*cache it*/, false /*locked*/)
+	switch {
+	case err == nil:
+		exists = true
 		if fltPresence == apc.FltExistsOutside {
 			return 0, fmt.Errorf(fmtOutside, lom.Cname(), fltPresence)
 		}
-	} else {
-		if !cmn.IsErrObjNought(err) {
-			return 0, err
+		if apc.IsFltNoProps(fltPresence) {
+			return 0, nil // early return: found locally, no props needed
 		}
-		exists = false
+	case cmn.IsErrObjNought(err):
+		// object not found locally - try restore if requested
 		if fltPresence == apc.FltPresentCluster {
+			// try to fix local placement if present-on-this-node-but-misplaced
 			exists = lom.RestoreToLocation()
 		}
+	default:
+		return 0, err
 	}
 
-	if !exists {
-		if bck.IsAIS() || apc.IsFltPresent(fltPresence) {
-			return http.StatusNotFound, cos.NewErrNotFound(t, lom.Cname())
-		}
+	// 2. handle not-found-locally for AIS buckets or presence-required filters
+	if !exists && (bck.IsAIS() || apc.IsFltPresent(fltPresence)) {
+		return http.StatusNotFound, cos.NewErrNotFound(t, lom.Cname())
 	}
 
-	// props
+	// 3. build object properties from local data
 	var (
 		op    = cmn.ObjectProps{Name: lom.ObjName, Bck: *lom.Bucket(), Present: exists}
 		hasEC bool
 	)
 	if exists {
 		op.ObjAttrs = *lom.ObjAttrs()
+
+		// TODO: in `HeadObjectV2`, include location, mirror copies, and EC metadata only if user explicitly requested them
 		op.Location = lom.Location()
 		op.Mirror.Copies = lom.NumCopies()
-		if lom.HasCopies() {
-			lom.Lock(false)
-			for fs := range lom.GetCopies() {
-				if idx := strings.Index(fs, "/@"); idx >= 0 {
-					fs = fs[:idx]
-				}
-				op.Mirror.Paths = append(op.Mirror.Paths, fs)
-			}
-			lom.Unlock(false)
-		} else {
-			fs := lom.FQN
-			if idx := strings.Index(fs, "/@"); idx >= 0 {
-				fs = fs[:idx]
-			}
-			op.Mirror.Paths = append(op.Mirror.Paths, fs)
-		}
+		op.Mirror.Paths = lom.MirrorPaths()
 		if lom.ECEnabled() {
 			if md, err := ec.ObjectMetadata(lom.Bck(), lom.ObjName); err == nil {
 				hasEC = true
@@ -1223,9 +1325,9 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 		}
 	}
 
+	// 4. Cold HEAD: check remote backend if object not found locally or if latest version requested
 	latest := cos.IsParseBool(q.Get(apc.QparamLatestVer))
 	if !exists || latest {
-		// cold HEAD
 		oa, ecode, err := t.HeadCold(lom, r)
 		if err != nil {
 			switch {
@@ -1239,28 +1341,45 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 			return ecode, err
 		}
 		if apc.IsFltNoProps(fltPresence) {
-			return 0, nil
+			return 0, nil // early return: found remotely, no props needed
 		}
 
-		if exists && latest {
+		// reconcile local vs remote attrs
+		switch {
+		case exists && latest:
+			// verify local matches remote (compare with lom.CheckRemoteMD)
 			if e := op.ObjAttrs.CheckEq(oa); e != nil {
-				// (compare with lom.CheckRemoteMD)
-				return http.StatusNotFound, cmn.NewErrRemoteMetadataMismatch(e)
+				return http.StatusConflict, cmn.NewErrRemoteMetadataMismatch(e)
 			}
-		} else {
-			op.ObjAttrs = *oa
+		case !exists:
+			// NOTE: Present stays false after cold HEAD (not cached locally)
+			op.ObjAttrs = *oa // use remote attrs
 			op.ObjAttrs.Atime = 0
 		}
 	}
 
-	// to header
-	cmn.ToHeader(&op.ObjAttrs, whdr, op.ObjAttrs.Size)
+	// 5. serialize to response headers
+	objPropsToHeader(&op, whdr, hasEC)
+
+	// 6. stats
+	delta := mono.SinceNano(started)
+	vlabs := bvlabs(bck)
+	t.statsT.IncWith(stats.HeadCount, vlabs)
+	t.statsT.AddWith(
+		cos.NamedVal64{Name: stats.HeadLatencyTotal, Value: delta, VarLabs: vlabs},
+	)
+	return 0, nil
+}
+
+// objPropsToHeader serializes ObjectProps to HTTP response headers for HEAD object
+func objPropsToHeader(op *cmn.ObjectProps, hdr http.Header, hasEC bool) {
+	cmn.ToHeader(&op.ObjAttrs, hdr, op.ObjAttrs.Size)
 	if op.ObjAttrs.Cksum == nil {
 		// cos.Cksum does not have default nil/zero value (reflection)
-		op.ObjAttrs.Cksum = cos.NewCksum("", "")
+		op.ObjAttrs.Cksum = cos.NoneCksum
 	}
-	// TODO: revisit
 	errIter := cmn.IterFields(op, func(tag string, field cmn.IterField) (error, bool) {
+		// TODO: remove in `HeadObjectV2` - must be able to avoid reflection unless user is asking for
 		if !hasEC && strings.HasPrefix(tag, "ec.") {
 			return nil, false
 		}
@@ -1273,11 +1392,10 @@ func (t *target) objHead(r *http.Request, whdr http.Header, q url.Values, bck *m
 			return nil, false
 		}
 		name := cmn.PropToHeader(tag)
-		whdr.Set(name, v)
+		hdr.Set(name, v)
 		return nil, false
 	})
 	debug.AssertNoErr(errIter)
-	return 0, nil
 }
 
 // PATCH /v1/objects/<bucket-name>/<object-name>
@@ -1307,12 +1425,12 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 
 	lom := core.AllocLOM(apireq.items[1] /*objName*/)
 	defer core.FreeLOM(lom)
-	if err := lom.InitBck(apireq.bck.Bucket()); err != nil {
+	if err := lom.InitBck(apireq.bck); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
 	if err := lom.Load(true /*cache it*/, false /*locked*/); err != nil {
-		if cos.IsNotExist(err, 0) {
+		if cos.IsNotExist(err) {
 			t.writeErr(w, r, err, http.StatusNotFound)
 		} else {
 			t.writeErr(w, r, err)
@@ -1359,7 +1477,7 @@ func (t *target) putApndArch(r *http.Request, lom *core.LOM, started int64, dpq 
 		put:      false, // below
 	}
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
-		if !os.IsNotExist(err) {
+		if !cos.IsNotExist(err) {
 			return http.StatusInternalServerError, err
 		}
 		if flags == apc.ArchAppend {
@@ -1400,7 +1518,7 @@ func (t *target) DeleteObject(lom *core.LOM, evict bool) (code int, err error) {
 	}
 
 	// stats
-	vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
+	vlabs := bvlabs(lom.Bck())
 	switch {
 	case err == nil:
 		t.statsT.IncWith(stats.DeleteCount, vlabs)
@@ -1419,6 +1537,64 @@ func (t *target) DeleteObject(lom *core.LOM, evict bool) (code int, err error) {
 	return code, err
 }
 
+func (t *target) copyObject(lom *core.LOM, bck *meta.Bck, objName string, dpq *dpq, config *cmn.Config) (ecode int, err error) {
+	coiParams := xs.AllocCOI()
+	{
+		coiParams.BckTo = bck
+		coiParams.OWT = cmn.OwtCopy
+		coiParams.Config = config
+		coiParams.ObjnameTo = objName
+		coiParams.OAH = lom
+	}
+
+	var xetl *etl.XactETL
+	if dpq != nil {
+		coiParams.LatestVer = dpq.latestVer
+		coiParams.Sync = dpq.sync
+		if etlName := dpq.get(apc.QparamETLName); etlName != "" {
+			etlArgs := &core.ETLArgs{TransformArgs: dpq.get(apc.QparamETLTransformArgs)}
+			if etlPipeline := dpq.get(apc.QparamETLPipeline); etlPipeline != "" {
+				etlArgs.Pipeline, err = etl.GetPipeline(strings.Split(etlPipeline, apc.ETLPipelineSeparator))
+				if err != nil {
+					xs.FreeCOI(coiParams)
+					return 0, fmt.Errorf("%w [%s, %s]", err, t.si, lom)
+				}
+			}
+			coiParams.ETLArgs = etlArgs
+			coiParams.GetROC, xetl, _, err = etl.GetOfflineTransform(etlName, nil /*xaction*/)
+			if err != nil {
+				xs.FreeCOI(coiParams)
+				return 0, fmt.Errorf("%w [%s, %s]", err, t.si, lom)
+			}
+		}
+	}
+
+	coi := (*coi)(coiParams)
+	res := coi.do(t, nil, lom)
+	xs.FreeCOI(coiParams)
+
+	// stats and error handling
+	if xetl != nil {
+		switch {
+		case res.Err == nil:
+			xetl.ObjsAdd(1, res.Lsize)
+		case res.Err == cmn.ErrSkip:
+			// ErrSkip is returned when the object is arrived through direct put
+			xetl.OutObjsAdd(1, res.Lsize)
+		case cos.IsNotExist(res.Err, res.Ecode):
+			xetl.InlineObjErrs.Add(&etl.ObjErr{
+				ObjName: lom.Cname(),
+				Message: "object not found",
+				Ecode:   res.Ecode,
+			})
+		default:
+			xetl.InlineObjErrs.Add(res.Err)
+		}
+	}
+
+	return res.Ecode, res.Err
+}
+
 // NOTE: s3 will return err=nil with OK status to indicate (not deleting) non-existing object (see also aws.go)
 func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 	var (
@@ -1429,7 +1605,7 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 	delFromBackend = lom.Bck().IsRemote() && !evict
 	err := lom.Load(false /*cache it*/, true /*locked*/)
 	if err != nil {
-		if !cos.IsNotExist(err, 0) {
+		if !cos.IsNotExist(err) {
 			if cmn.IsErrObjNought(err) {
 				// cleanup in place
 				if errNested := lom.RemoveMain(); errNested != nil {
@@ -1440,7 +1616,7 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 			return 0, err, false
 		}
 		if !delFromBackend {
-			return http.StatusNotFound, err, false
+			return http.StatusNotFound, cos.NewErrNotFound(t, lom.Cname()), false
 		}
 	} else {
 		delFromAIS = true
@@ -1454,7 +1630,7 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 		size := lom.Lsize()
 		aisErr = lom.RemoveObj()
 		if aisErr != nil {
-			if !os.IsNotExist(aisErr) {
+			if !cos.IsNotExist(aisErr) {
 				if backendErr != nil {
 					// (unlikely)
 					nlog.Errorf("double-failure to delete %s: ais err %v, backend err %v(%d)",
@@ -1515,7 +1691,7 @@ func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) error {
 }
 
 // compare running the same via (generic) t.xstart
-func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs.XactBlobDl, error) {
+func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs, whdr http.Header) (string, *xs.XactBlobDl, error) {
 	// cap
 	cs := fs.Cap()
 	if errCap := cs.Err(); errCap != nil {
@@ -1526,7 +1702,9 @@ func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs.
 	}
 
 	if oa != nil {
-		return _blobdl(params, oa)
+		// write HTTP headers before starting blob download
+		cmn.ToHeader(oa, whdr, oa.Size)
+		return t._blobdl(params, oa)
 	}
 
 	// - try-lock (above) to load, check availability
@@ -1556,41 +1734,35 @@ func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs.
 		return "", nil, err
 	}
 
-	// handle: (not-present || latest-not-eq)
-	return _blobdl(params, oa)
-}
-
-// returns an empty xid ("") if nothing to do
-func _blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs.XactBlobDl, error) {
-	if params.WriteSGL == nil {
-		// regular lom save (custom writer not present)
-		wfqn := fs.CSM.Gen(params.Lom, fs.WorkfileType, "blob-dl")
-		lmfh, err := params.Lom.CreateWork(wfqn)
+	if oa == nil {
+		oa, _, err = t.HeadCold(lom, nil /*origReq*/)
 		if err != nil {
 			return "", nil, err
 		}
-		params.Lmfh = lmfh
-		params.Wfqn = wfqn
 	}
-	// new
+	// write HTTP headers before starting blob download
+	cmn.ToHeader(oa, whdr, oa.Size)
+	// handle: (not-present || latest-not-eq)
+	return t._blobdl(params, oa)
+}
+
+// returns an empty xid ("") if nothing to do
+func (t *target) _blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs.XactBlobDl, error) {
 	xid := cos.GenUUID()
 	rns := xs.RenewBlobDl(xid, params, oa)
 	if rns.Err != nil || rns.IsRunning() { // cmn.IsErrXactUsePrev(rns.Err): single blob-downloader per blob
-		if params.Lmfh != nil {
-			cos.Close(params.Lmfh)
-		}
-		if params.Wfqn != "" {
-			if errRemove := cos.RemoveFile(params.Wfqn); errRemove != nil {
-				nlog.Errorln("nested err", errRemove)
-			}
-		}
 		return "", nil, rns.Err
 	}
 
-	// a) via x-start, x-blob-download
 	xblob := rns.Entry.Get().(*xs.XactBlobDl)
-	if params.RspW == nil {
-		go xblob.Run(nil)
+	notif := &xact.NotifXact{
+		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
+		Xact: xblob,
+	}
+	xblob.AddNotif(notif)
+	// a) via x-start, x-blob-download
+	if params.RespWriter == nil {
+		xact.GoRunW(xblob)
 		return xblob.ID(), xblob, nil
 	}
 	// b) via GET (blocking w/ simultaneous transmission)

@@ -1,5 +1,4 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -138,8 +137,8 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 	smap.Version = 1
 
 	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
-		if err != nil && !cos.IsEOF(err) {
-			tassert.CheckFatal(t, err)
+		if err != nil && !cos.IsOkEOF(err) {
+			return err
 		}
 		written, _ := io.Copy(io.Discard, objReader)
 		cos.Assert(written == hdr.ObjAttrs.Size || hdr.IsUnsized())
@@ -191,14 +190,14 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 		objSize := hdr.ObjAttrs.Size
 		if num%7 == 0 {
 			objSize, hdr.ObjAttrs.Size = 0, 0
-			err = sb.Send(&transport.Obj{Hdr: hdr, Callback: callback}, nil)
+			err = sb.Send(&transport.Obj{Hdr: hdr, SentCB: callback}, nil)
 		} else {
 			reader := &randReader{buf: wbuf, hdr: hdr, slab: slab, clone: true} // FIXME: multiplier reopen
 			if hdr.IsUnsized() {
 				reader.offEOF = int64(random.Int32()>>1) + 1
 				objSize = reader.offEOF
 			}
-			err = sb.Send(&transport.Obj{Hdr: hdr, Callback: callback}, reader)
+			err = sb.Send(&transport.Obj{Hdr: hdr, SentCB: callback}, reader)
 		}
 		if err != nil {
 			t.Fatalf("%s: exiting with err [%v]\n", sb, err)
@@ -211,21 +210,9 @@ func testBundle(t *testing.T, nvs cos.StrKVs) {
 		}
 	}
 	sb.Close(true /* gracefully */)
-	stats := sb.GetStats()
 
 	slab.Free(wbuf)
 
-	if nvs["compression"] != apc.CompressNever {
-		for id, tstat := range stats {
-			tlog.Logf("send$ %s/%s: offset=%d, num=%d(%d), compression-ratio=%.2f\n",
-				id, trname, tstat.Offset.Load(), tstat.Num.Load(), num, tstat.CompressionRatio())
-		}
-	} else {
-		for id, tstat := range stats {
-			tlog.Logf("send$ %s/%s: offset=%d, num=%d(%d)\n",
-				id, trname, tstat.Offset.Load(), tstat.Num.Load(), num)
-		}
-	}
 	tlog.Logf("send$: num-sent=%d, num-completed=%d\n", num, numCompleted.Load())
 }
 

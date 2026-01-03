@@ -6,12 +6,15 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
-	"sync"
+	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -65,8 +68,7 @@ type (
 	}
 	wrappedResp struct {
 		*http.Response
-		cksumValue string // checksum value of the response
-		n          int64  // number bytes read from `resp.Body`
+		n int64 // number bytes read from `resp.Body`
 	}
 )
 
@@ -75,7 +77,7 @@ func HTTPStatus(err error) int {
 	if err == nil {
 		return http.StatusOK
 	}
-	if herr := cmn.Err2HTTPErr(err); herr != nil {
+	if herr := cmn.AsErrHTTP(err); herr != nil {
 		return herr.Status
 	}
 	return -1 // invalid
@@ -153,10 +155,8 @@ func (reqParams *ReqParams) doReqStr(out *string) (int, error) {
 	return resp.StatusCode, err
 }
 
-// Makes request via do() and uses provided writer to write `resp.Body`
-// (which is also closes)
-//
-// Returns the entire wrapped response.
+// do() and use provided writer (to write `resp.Body`)
+// return the entire wrapped response
 func (reqParams *ReqParams) doWriter(w io.Writer) (wresp *wrappedResp, err error) {
 	var resp *http.Response
 	resp, err = reqParams.do()
@@ -167,6 +167,20 @@ func (reqParams *ReqParams) doWriter(w io.Writer) (wresp *wrappedResp, err error
 	cos.DrainReader(resp.Body)
 	resp.Body.Close()
 	return
+}
+
+// do() and return a checked response *with* the `resp.Body` as is
+// and *without*  draining or closing the latter
+func (reqParams *ReqParams) doStream() (wresp *wrappedResp, body io.ReadCloser, err error) {
+	resp, err := reqParams.do()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = reqParams.checkResp(resp); err != nil {
+		resp.Body.Close()
+		return nil, nil, err
+	}
+	return &wrappedResp{Response: resp}, resp.Body, nil
 }
 
 // same as above except that it returns response body (as io.ReadCloser) for subsequent reading
@@ -189,23 +203,27 @@ func (reqParams *ReqParams) do() (resp *http.Response, err error) {
 		reqBody = bytes.NewBuffer(reqParams.Body)
 	}
 	urlPath := reqParams.BaseParams.URL + reqParams.Path
-	req, errR := http.NewRequest(reqParams.BaseParams.Method, urlPath, reqBody)
+	req, errR := http.NewRequestWithContext(context.Background(), reqParams.BaseParams.Method, urlPath, reqBody)
 	if errR != nil {
 		return nil, fmt.Errorf("failed to create http request: %w", errR)
 	}
 	reqParams.setRequestOptParams(req)
 	SetAuxHeaders(req, &reqParams.BaseParams)
 
-	rr := reqResp{client: reqParams.BaseParams.Client, req: req}
-	_, err = cmn.NetworkCallWithRetry(&cmn.RetryArgs{
-		Call:      rr.call,
-		Verbosity: cmn.RetryLogOff,
-		SoftErr:   httpMaxRetries,
-		Sleep:     httpRetrySleep,
-		BackOff:   true,
-		IsClient:  true,
-	})
+	var (
+		rr   = reqResp{client: reqParams.BaseParams.Client, req: req}
+		args = &cmn.RetryArgs{
+			Call:      rr.call,
+			Verbosity: cmn.RetryLogOff,
+			SoftErr:   httpMaxRetries,
+			Sleep:     httpRetrySleep,
+			BackOff:   true,
+			IsClient:  true,
+		}
+	)
+	_, err = args.Do()
 	resp = rr.resp
+
 	if err == nil {
 		return resp, nil
 	}
@@ -267,7 +285,7 @@ func (reqParams *ReqParams) readAny(resp *http.Response, out any) (err error) {
 		err = jsoniter.NewDecoder(resp.Body).Decode(out)
 	}
 	if err != nil {
-		err = fmt.Errorf("unexpected: failed to decode response: %v -> %T", err, out)
+		err = fmt.Errorf("unexpected: failed to decode response: %w -> %T", err, out)
 	}
 	return
 }
@@ -308,6 +326,7 @@ func (reqParams *ReqParams) readValidate(resp *http.Response, w io.Writer) (*wra
 	if err := reqParams.checkResp(resp); err != nil {
 		return nil, err
 	}
+	// write _and_ compute client-side checksum
 	n, cksum, err := cos.CopyAndChecksum(w, resp.Body, nil, cksumType)
 	if err != nil {
 		return nil, err
@@ -322,11 +341,10 @@ func (reqParams *ReqParams) readValidate(resp *http.Response, w io.Writer) (*wra
 		return nil, fmt.Errorf(errNilCksumType, cksumType)
 	}
 
-	// compare
-	wresp.cksumValue = cksum.Value()
+	// compare client-side checksum with the one that cluster has
 	hdrCksumValue := wresp.Header.Get(apc.HdrObjCksumVal)
-	if wresp.cksumValue != hdrCksumValue {
-		return nil, cmn.NewErrInvalidCksum(hdrCksumValue, wresp.cksumValue)
+	if hdrCksumValue != cksum.Val() {
+		return nil, cmn.NewErrInvalidCksum(hdrCksumValue, cksum.Val())
 	}
 	return wresp, nil
 }
@@ -377,6 +395,67 @@ func (reqParams *ReqParams) checkResp(resp *http.Response) error {
 	}
 }
 
+// read multipart content, as per:
+// * https://datatracker.ietf.org/doc/html/rfc2046#section-5.1
+// given a single (GetBatch) use case, we currently
+// - always expect two parts, whereby:
+//  1. `apc.MossMetaPart` is JSON unmarshaled into `out`
+//  2. `apc.MossDataPart` is written into `writer`
+func (reqParams *ReqParams) readMultipart(out any, writer io.Writer) (int, error) {
+	debug.AssertNotPstr(out)
+	resp, err := reqParams.do()
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if err := reqParams.checkResp(resp); err != nil {
+		return 0, err
+	}
+
+	ctype := resp.Header.Get(cos.HdrContentType)
+	mediatype, params, err := mime.ParseMediaType(ctype)
+	if err != nil || !strings.HasPrefix(mediatype, "multipart/") { // standard MIME multipart prefix per RFC 2046
+		return 0, fmt.Errorf("expected multipart response, got %q, err: %w", ctype, err)
+	}
+
+	mr := multipart.NewReader(resp.Body, params["boundary"]) // standard MIME header parameter name: "boundary"
+
+	// Part 1: JSON metadata
+	part1, err := mr.NextPart()
+	if err != nil {
+		return 0, fmt.Errorf("missing metadata part: %w", err)
+	}
+
+	debug.Assert(part1.FormName() == apc.MossMetaPart, part1.FormName(), " vs ", apc.MossMetaPart)
+
+	err = jsoniter.NewDecoder(part1).Decode(out)
+	if err != nil {
+		part1.Close()
+		return 0, fmt.Errorf("failed to decode multipart JSON: %w", err)
+	}
+
+	// Part 2: stream (e.g. TAR)
+	// always closes the previous part (part1, in this case)
+	part2, err := mr.NextPart()
+	if err != nil {
+		return 0, fmt.Errorf("missing stream part: %w", err)
+	}
+
+	// the part's filename is also available via part2.Header.Get("Content-Disposition")
+	// and may look as follows (e.g.):
+	// form-data; name="archive"; filename="get-batch[YhwQiOpRb]"
+	debug.Assert(part2.FormName() == apc.MossDataPart, part2.FormName(), " vs ", apc.MossDataPart)
+
+	n, err := io.Copy(writer, part2)
+	part2.Close()
+	if err != nil {
+		return 0, fmt.Errorf("stream copy error: %w", err)
+	}
+
+	return int(n), nil
+}
+
 /////////////
 // reqResp //
 /////////////
@@ -388,37 +467,3 @@ func (rr *reqResp) call() (status int, err error) {
 	}
 	return status, err
 }
-
-//
-// mem-pools
-//
-
-var (
-	reqParamPool sync.Pool
-	reqParams0   ReqParams
-
-	msgpPool sync.Pool
-)
-
-func AllocRp() *ReqParams {
-	if v := reqParamPool.Get(); v != nil {
-		return v.(*ReqParams)
-	}
-	return &ReqParams{}
-}
-
-func FreeRp(reqParams *ReqParams) {
-	*reqParams = reqParams0
-	reqParamPool.Put(reqParams)
-}
-
-func allocMbuf() (buf []byte) {
-	if v := msgpPool.Get(); v != nil {
-		buf = *(v.(*[]byte))
-	} else {
-		buf = make([]byte, msgpBufSize)
-	}
-	return
-}
-
-func freeMbuf(buf []byte) { msgpPool.Put(&buf) }

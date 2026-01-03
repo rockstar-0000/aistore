@@ -14,7 +14,7 @@ For background and in-depth presentation, please see this [document](/docs/dsort
 
 ## Usage
 
-`ais dsort [JSON_SPECIFICATION|YAML_SPECIFICATION|-] [SRC_BUCKET] [DST_BUCKET]` [command options]
+`ais dsort [SRC_BUCKET] [DST_BUCKET]` --spec [JSON_SPECIFICATION|YAML_SPECIFICATION|-] [command options]
 
 ```console
 $ ais dsort --help
@@ -53,10 +53,10 @@ NAME:
    See also: docs/dsort.md, docs/cli/dsort.md, and ais/test/scripts/dsort*
 
 USAGE:
-   ais dsort [JSON_SPECIFICATION|YAML_SPECIFICATION|-] [SRC_BUCKET] [DST_BUCKET] [command options]
+   ais dsort [SRC_BUCKET] [DST_BUCKET] --spec [JSON_SPECIFICATION|YAML_SPECIFICATION|-] [command options]
 
 OPTIONS:
-   --file value, -f value  path to JSON or YAML job specification
+   --spec value, -f value  path to JSON or YAML request specification
    --verbose, -v           verbose
    --help, -h              show help
 ```
@@ -107,7 +107,7 @@ Put randomly generated shards into a bucket. The main use case for this command 
 
 ## Start dSort job
 
-`ais start dsort JOB_SPEC` or `ais start dsort -f <PATH_TO_JOB_SPEC>`
+`ais start dsort --spec JOB_SPEC` or `ais start dsort -f <PATH_TO_JOB_SPEC>`
 
 Start new dSort job with the provided specification.
 Specification should be provided by either argument or `-f` flag - providing both argument and flag will result in error.
@@ -115,7 +115,7 @@ Upon creation, `JOB_ID` of the job is returned - it can then be used to abort it
 
 | Flag | Type | Description | Default |
 | --- | --- | --- | --- |
-| `--file, -f` | `string` | Path to file containing JSON or YAML job specification. Providing `-` will result in reading from STDIN | `""` |
+| `--spec, -f` | `string` | Path to JSON or YAML specification. Providing `-` will result in reading from STDIN | `""` |
 
 The following table describes JSON/YAML keys which can be used in the specification.
 
@@ -284,7 +284,7 @@ shard-1.tar:
 You can run:
 
 ```console
-$ ais start dsort '{
+$ ais start dsort --spec '{
     "extension": ".tar",
     "input_bck": {"name": "dsort-testing"},
     "input_format": {"template": "shard-{0..9}"},

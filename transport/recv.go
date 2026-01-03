@@ -1,20 +1,17 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"path"
 	"runtime"
-	"strconv"
-	"sync"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -23,60 +20,37 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/NVIDIA/aistore/hk"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/memsys"
 
-	onexxh "github.com/OneOfOne/xxhash"
 	"github.com/pierrec/lz4/v4"
 )
 
-const sessionIsOld = time.Hour
+// TODO:
+// - see "amend all callers" below
+// - err.IsBenign()
 
 // private types
 type (
-	rxStats interface {
-		addOff(int64)
-		incNum()
+	handler struct {
+		rxObj  RecvObj
+		trname string
 	}
 	iterator struct {
 		body    io.Reader
-		handler handler
+		handler *handler
 		pdu     *rpdu
-		stats   rxStats
 		hbuf    []byte
+		sid     string
+		loghdr  string
 	}
 	objReader struct {
 		body   io.Reader
 		pdu    *rpdu
-		loghdr string
+		parent *iterator
 		hdr    ObjHdr
 		off    int64
 	}
-
-	handler interface {
-		recv(hdr *ObjHdr, objReader io.Reader, err error) error // RecvObj
-		stats(*http.Request, string) (rxStats, uint64, string)
-		unreg()
-		addOld(uint64)
-		getStats() RxStats
-	}
-	hdl struct {
-		rxObj  RecvObj
-		trname string
-		now    int64
-	}
-	hdlExtra struct {
-		sessions    sync.Map
-		oldSessions sync.Map
-		hkName      string
-		hdl
-	}
-)
-
-// interface guard
-var (
-	_ handler = (*hdl)(nil)
-	_ handler = (*hdlExtra)(nil)
 )
 
 // global
@@ -104,7 +78,7 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 		//  at the lowest level (and with no handler and its rxObj cb).
 		//
 		if _, ok := err.(*errAlreadyClosedTrname); ok {
-			if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+			if cmn.Rom.V(5, cos.ModTransport) {
 				nlog.Errorln(trname, "err:", err)
 			}
 		} else {
@@ -120,15 +94,19 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		config             = cmn.GCO.Get()
-		stats, uid, loghdr = h.stats(r, trname)
-		it                 = &iterator{handler: h, body: reader, stats: stats}
+		config = cmn.GCO.Get()
+		it     = &iterator{
+			handler: h,
+			body:    reader,
+			sid:     r.Header.Get(apc.HdrSenderID),
+		}
 	)
 	debug.Assert(config.Transport.IdleTeardown > 0, "invalid config ", config.Transport)
 	it.hbuf, _ = mm.AllocSize(_sizeHdr(config, 0))
 
 	// receive loop (until eof or error)
-	err = it.rxloop(uid, loghdr, mm)
+	it.loghdr = _loghdr(h.trname, it.sid, core.T.SID(), false /*transmit*/, lz4Reader != nil)
+	err = it.rxloop(mm)
 
 	// cleanup
 	if lz4Reader != nil {
@@ -139,7 +117,7 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 	}
 	mm.Free(it.hbuf)
 
-	if !cos.IsEOF(err) {
+	if !cos.IsOkEOF(err) {
 		cmn.WriteErr(w, r, err)
 	}
 }
@@ -149,78 +127,8 @@ func RxAnyStream(w http.ResponseWriter, r *http.Request) {
 ////////////////
 
 // begin t2t session
-func (h *hdl) stats(r *http.Request, trname string) (rxStats, uint64, string) {
-	debug.Assertf(h.trname == trname, "%q vs %q", h.trname, trname)
-	sid := r.Header.Get(apc.HdrSessID)
-	loghdr := h.trname + "[" + r.RemoteAddr + ":" + sid + "]"
-	return nopRxStats{}, 0, loghdr
-}
-
-// ditto, with Rx stats
-func (h *hdlExtra) stats(r *http.Request, trname string) (rxStats, uint64, string) {
-	debug.Assertf(h.trname == trname, "%q vs %q", h.trname, trname)
-	sid := r.Header.Get(apc.HdrSessID)
-
-	sessID, err := strconv.ParseInt(sid, 10, 64)
-	if err != nil || sessID == 0 {
-		err = fmt.Errorf("%s[:%q]: invalid session ID, err %v", h.trname, sid, err)
-		cos.AssertNoErr(err)
-	}
-
-	// yet another id to index optional h.sessions & h.oldSessions sync.Maps
-	uid := uniqueID(r, sessID)
-	statsif, _ := h.sessions.LoadOrStore(uid, &Stats{})
-
-	xxh, _ := UID2SessID(uid)
-	loghdr := fmt.Sprintf("%s[%d:%d]", h.trname, xxh, sessID)
-	if cmn.Rom.FastV(5, cos.SmoduleTransport) {
-		nlog.Infoln(loghdr, "start-of-stream from", r.RemoteAddr)
-	}
-	return statsif.(rxStats), uid, loghdr
-}
-
-func (*hdl) unreg()        {}
-func (h *hdlExtra) unreg() { hk.Unreg(h.hkName + hk.NameSuffix) }
-
-func (*hdl) addOld(uint64)            {}
-func (h *hdlExtra) addOld(uid uint64) { h.oldSessions.Store(uid, mono.NanoTime()) }
-
-func (h *hdlExtra) cleanup(now int64) time.Duration {
-	h.now = now
-	h.oldSessions.Range(h.cl)
-	return sessionIsOld
-}
-
-func (h *hdlExtra) cl(key, value any) bool {
-	timeClosed := value.(int64)
-	if time.Duration(h.now-timeClosed) > sessionIsOld {
-		uid := key.(uint64)
-		h.oldSessions.Delete(uid)
-		h.sessions.Delete(uid)
-	}
-	return true
-}
-
-func (h *hdl) recv(hdr *ObjHdr, objReader io.Reader, err error) error {
+func (h *handler) recv(hdr *ObjHdr, objReader io.Reader, err error) error {
 	return h.rxObj(hdr, objReader, err)
-}
-
-func (*hdl) getStats() RxStats { return nil }
-
-func (h *hdlExtra) getStats() (s RxStats) {
-	s = make(RxStats, 4)
-	h.sessions.Range(s.f)
-	return s
-}
-
-func (s RxStats) f(key, value any) bool {
-	out := &Stats{}
-	uid := key.(uint64)
-	in := value.(*Stats)
-	out.Num.Store(in.Num.Load())       // via rxStats.incNum
-	out.Offset.Store(in.Offset.Load()) // via rxStats.addOff
-	s[uid] = out
-	return true
 }
 
 //////////////////////////////////
@@ -229,50 +137,64 @@ func (s RxStats) f(key, value any) bool {
 
 func (it *iterator) Read(p []byte) (n int, err error) { return it.body.Read(p) }
 
-func (it *iterator) rxloop(uid uint64, loghdr string, mm *memsys.MMSA) (err error) {
+func (it *iterator) rxloop(mm *memsys.MMSA) (err error) {
 	for err == nil {
 		var (
 			flags uint64
 			hlen  int
 		)
-		hlen, flags, err = it.nextProtoHdr(loghdr)
+		hlen, flags, err = it.nextProtoHdr()
+
+		// Protocol header read - first line of defense for transport errors.
+		// Note that io.EOF from sender's Stream.Fin() (opcFin) is normal termination
+		// (hence, cos.IsOkEOF() filter below).
+		//
+		// We do call recv() for all other errors (connection reset, malformed headers,
+		// unexpected EOF, etc.) so receivers can see and handle transport failures.
+		//
+		// Compare w/ recv() callbacks below that handle object-header and object-payload
+		// level errors.
+
 		if err != nil {
+			if !cos.IsOkEOF(err) { //
+				if errCb := it.handler.recv(&ObjHdr{SID: it.sid}, nil, err); errCb != nil {
+					err = errCb
+				}
+			}
 			break
 		}
 		if hlen > cap(it.hbuf) {
 			if hlen > cmn.MaxTransportHeader {
-				err = fmt.Errorf("sbr1 %s: transport header %d exceeds maximum %d", loghdr, hlen, cmn.MaxTransportHeader)
+				err = it.newErr(err, sbrProtoHdrTooLong, fmt.Sprintf("%d>%d", hlen, cmn.MaxTransportHeader))
 				break
 			}
 			// grow
-			nlog.Warningf("%s: header length %d exceeds the current buffer %d", loghdr, hlen, cap(it.hbuf))
+			nlog.Warningf("%s: header length %d exceeds the current buffer %d", it.loghdr, hlen, cap(it.hbuf))
 			mm.Free(it.hbuf)
 			it.hbuf, _ = mm.AllocSize(min(int64(hlen)<<1, cmn.MaxTransportHeader))
 		}
 
-		it.stats.addOff(int64(hlen + sizeProtoHdr))
 		debug.Assert(flags&msgFl == 0) //  messaging: not used, removed
 		if flags&pduStreamFl != 0 {
 			if it.pdu == nil {
 				pbuf, _ := mm.AllocSize(maxSizePDU)
-				it.pdu = newRecvPDU(it.body, pbuf)
+				it.pdu = newRecvPDU(it, pbuf)
 			} else {
 				it.pdu.reset()
 			}
 		}
-		err = it.rxObj(loghdr, hlen)
+		err = it.rxObj(hlen)
 	}
 
-	it.handler.addOld(uid)
 	return err
 }
 
-func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
+func (it *iterator) rxObj(hlen int) (err error) {
 	var (
 		obj *objReader
 		h   = it.handler
 	)
-	obj, err = it.nextObj(loghdr, hlen)
+	obj, err = it.nextObj(hlen)
 	if obj != nil {
 		if !obj.hdr.IsHeaderOnly() {
 			obj.pdu = it.pdu
@@ -282,10 +204,10 @@ func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
 		if errCb := h.recv(&obj.hdr, obj, err); errCb != nil {
 			err = errCb
 		}
+		debug.DeadBeefSmall(it.hbuf[:hlen])
 		// stats
 		if err == nil {
-			it.stats.incNum()                   // 1. this stream stats
-			g.tstats.Inc(cos.StreamsInObjCount) // 2. stats/target_stats.go
+			g.tstats.Inc(cos.StreamsInObjCount) // stats/target_stats.go
 
 			if size >= 0 {
 				g.tstats.Add(cos.StreamsInObjSize, size)
@@ -295,7 +217,7 @@ func (it *iterator) rxObj(loghdr string, hlen int) (err error) {
 			}
 		}
 	} else if err != nil && err != io.EOF {
-		if errCb := h.recv(&ObjHdr{}, nil, err); errCb != nil {
+		if errCb := h.recv(&ObjHdr{SID: it.sid}, nil, err); errCb != nil {
 			err = errCb
 		}
 	}
@@ -314,19 +236,26 @@ func eofOK(err error) error {
 // - hlen: header length for transport.Obj (and formerly, message length for transport.Msg)
 // - flags: msgFl | pduFl | pduLastFl | pduStreamFl
 // - error
-func (it *iterator) nextProtoHdr(loghdr string) (int, uint64, error) {
+func (it *iterator) nextProtoHdr() (int, uint64, error) {
 	n, err := it.Read(it.hbuf[:sizeProtoHdr])
 	if n < sizeProtoHdr {
-		if err == nil {
-			err = fmt.Errorf("sbr3 %s: failed to receive proto hdr (n=%d)", loghdr, n)
+		switch {
+		case err == nil:
+			err = it.newErr(io.ErrUnexpectedEOF, sbrProtoHdr, fmt.Sprintf("n=%d", n))
+		case n == 0 && cos.IsOkEOF(err):
+			// ok
+		case n == 0:
+			err = it.newErr(err, sbrProtoHdr, "")
+		default:
+			err = it.newErr(err, sbrProtoHdr, fmt.Sprintf("n=%d", n))
 		}
 		return 0, 0, err
 	}
 	// extract and validate hlen
-	return extProtoHdr(it.hbuf, loghdr)
+	return it.extProtoHdr(it.hbuf)
 }
 
-func (it *iterator) nextObj(loghdr string, hlen int) (*objReader, error) {
+func (it *iterator) nextObj(hlen int) (*objReader, error) {
 	n, err := it.Read(it.hbuf[:hlen])
 	if n < hlen {
 		if err == nil {
@@ -348,7 +277,10 @@ func (it *iterator) nextObj(loghdr string, hlen int) (*objReader, error) {
 			}
 		}
 		if n < hlen {
-			return nil, fmt.Errorf("sbr4 %s: failed to receive obj hdr (%d < %d)", loghdr, n, hlen)
+			if err == nil || errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, it.newErr(err, sbrObjHdrTooShort, fmt.Sprintf("%d<%d", n, hlen))
 		}
 	}
 	hdr := ExtObjHeader(it.hbuf, hlen)
@@ -357,8 +289,19 @@ func (it *iterator) nextObj(loghdr string, hlen int) (*objReader, error) {
 	}
 
 	obj := allocRecv()
-	obj.body, obj.hdr, obj.loghdr = it.body, hdr, loghdr
+	obj.body, obj.hdr, obj.parent = it.body, hdr, it
 	return obj, nil
+}
+
+func (it *iterator) newErr(err error, code, ctx string) error {
+	return &ErrSBR{
+		err:    err,
+		loghdr: it.loghdr,
+		sid:    it.sid,
+		code:   code,
+		ctx:    ctx,
+		ts:     mono.NanoTime(),
+	}
 }
 
 ///////////////
@@ -370,23 +313,33 @@ func (obj *objReader) Read(b []byte) (n int, err error) {
 		return obj.readPDU(b)
 	}
 	debug.Assert(obj.Size() >= 0)
+
 	rem := obj.Size() - obj.off
-	if rem < int64(len(b)) {
+	if rem < int64(len(b)) && rem >= 0 {
 		b = b[:int(rem)]
 	}
+
 	n, err = obj.body.Read(b)
 	obj.off += int64(n) // NOTE: `GORACE` complaining here can be safely ignored
+
 	switch err {
 	case nil:
 		if obj.off >= obj.Size() {
+			// ok (w/ EOF to the caller)
 			err = io.EOF
 		}
 	case io.EOF:
+		// premature EOF
 		if obj.off != obj.Size() {
-			err = fmt.Errorf("sbr6 %s: premature eof %d != %s, err %w", obj.loghdr, obj.off, obj, err)
+			err = obj.parent.newErr(io.ErrUnexpectedEOF, sbrObjDataEOF, obj.String())
 		}
 	default:
-		err = fmt.Errorf("sbr7 %s: off %d, obj %s, err %w", obj.loghdr, obj.off, obj, err)
+		// ditto, w/ error
+		if obj.off < obj.Size() {
+			err = obj.parent.newErr(err, sbrObjDataSize, obj.String())
+		} else {
+			err = obj.parent.newErr(err, sbrObjData, obj.String())
+		}
 	}
 	return n, err
 }
@@ -405,14 +358,14 @@ func (obj *objReader) IsUnsized() bool { return obj.hdr.IsUnsized() }
 func (obj *objReader) readPDU(b []byte) (n int, err error) {
 	pdu := obj.pdu
 	if pdu.woff == 0 {
-		err = pdu.readHdr(obj.loghdr)
+		err = pdu.readHdr()
 		if err != nil {
 			return 0, err
 		}
 	}
 	for !pdu.done {
 		if _, err = pdu.readFrom(); err != nil && err != io.EOF {
-			err = fmt.Errorf("sbr8 %s: failed to receive PDU, err %w, obj %s", obj.loghdr, err, obj)
+			err = obj.parent.newErr(err, sbrPDUData, obj.String())
 			break
 		}
 		debug.Assert(err == nil || (err == io.EOF && pdu.done))
@@ -432,28 +385,13 @@ func (obj *objReader) readPDU(b []byte) (n int, err error) {
 			if obj.IsUnsized() {
 				obj.hdr.ObjAttrs.Size = obj.off
 			} else if obj.Size() != obj.off {
-				err = fmt.Errorf("sbr9 %s: off %d != %s", obj.loghdr, obj.off, obj)
-				nlog.Warningln(err)
+				err = obj.parent.newErr(io.ErrUnexpectedEOF, sbrPDUDataSize, obj.String())
 			}
 		} else {
 			pdu.reset()
 		}
 	}
 	return n, err
-}
-
-//
-// session ID <=> unique ID
-//
-
-func uniqueID(r *http.Request, sessID int64) uint64 {
-	hash := onexxh.Checksum64S(cos.UnsafeB(r.RemoteAddr), cos.MLCG32)
-	return (hash&math.MaxUint32)<<32 | uint64(sessID)
-}
-
-func UID2SessID(uid uint64) (xxh, sessID uint64) {
-	xxh, sessID = uid>>32, uid&math.MaxUint32
-	return xxh, sessID
 }
 
 // DrainAndFreeReader:

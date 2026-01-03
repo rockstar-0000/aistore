@@ -17,9 +17,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
@@ -33,7 +33,7 @@ type (
 	encodeCtx struct {
 		lom          *core.LOM        // replica
 		md           *Metadata        //
-		fh           *cos.FileHandle  // file handle for the replica
+		lh           *core.LomHandle  // lom handle for the replica
 		sliceSize    int64            // calculated slice size
 		padSize      int64            // zero tail of the last object's data slice
 		dataSlices   int              // the number of data slices
@@ -48,15 +48,16 @@ type (
 		parent *XactPut
 		slab   *memsys.Slab
 		buffer []byte
-		mpath  string
+		mi     *fs.Mountpath
 
 		putCh  chan *request // top priority operation (object PUT)
 		xactCh chan *request // low priority operation (ec-encode)
 		stopCh cos.StopCh    // jogger management channel: to stop it
 
-		ntotal int64 // (throttle to prevent OOM)
-		micro  bool  // (throttle tuneup)
-		toDisk bool  // use files or SGL (NOTE: toDisk == false may cause OOM)
+		ntotal int64
+		adv    load.Advice // throttle
+
+		toDisk bool // use files or SGL (NOTE: toDisk == false may cause OOM)
 	}
 )
 
@@ -76,7 +77,7 @@ func allocCtx() (ctx *encodeCtx) {
 }
 
 func (ctx *encodeCtx) freeReplica() {
-	freeObject(ctx.fh)
+	freeObject(ctx.lh)
 }
 
 ///////////////
@@ -84,7 +85,7 @@ func (ctx *encodeCtx) freeReplica() {
 ///////////////
 
 func (c *putJogger) run(wg *sync.WaitGroup) {
-	nlog.Infoln("start [", c.parent.bck.Cname(""), c.mpath, "]")
+	nlog.Infoln("start [", c.parent.bck.Cname(""), c.mi.String(), "]")
 
 	defer wg.Done()
 	c.buffer, c.slab = g.pmm.Alloc()
@@ -112,7 +113,7 @@ func (c *putJogger) freeResources() {
 func (c *putJogger) do(req *request) {
 	lom, err := req.LIF.LOM()
 	if err != nil {
-		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Warningln(err)
 		}
 		return
@@ -131,7 +132,7 @@ func (c *putJogger) do(req *request) {
 func (c *putJogger) _do(req *request, lom *core.LOM) {
 	if req.Action == ActSplit {
 		if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
-			if cmn.Rom.FastV(4, cos.SmoduleEC) {
+			if cmn.Rom.V(4, cos.ModEC) {
 				nlog.Warningln(err)
 			}
 			return
@@ -145,25 +146,22 @@ func (c *putJogger) _do(req *request, lom *core.LOM) {
 	c.parent.stats.updateWaitTime(now.Sub(req.tm))
 	req.tm = now
 
-	if err := c.ec(req, lom); err != nil {
+	err := c.ec(req, lom)
+	if err != nil {
 		err = cmn.NewErrFailedTo(core.T, req.Action, lom.Cname(), err)
 		c.parent.AddErr(err, 0)
 	}
 	c.ntotal++
-	if (c.micro && fs.IsMicroThrottle(c.ntotal)) || fs.IsMiniThrottle(c.ntotal) {
-		if pressure := g.pmm.Pressure(); pressure >= memsys.PressureHigh {
-			time.Sleep(fs.Throttle100ms)
-			if !c.micro && pressure >= memsys.PressureExtreme {
-				// too late?
-				c.micro = true
-				oom.FreeToOS(true /*force*/)
-			}
+	if err == nil && c.adv.ShouldCheck(c.ntotal) {
+		c.adv.Refresh()
+		if c.adv.Sleep > 0 {
+			time.Sleep(c.adv.Sleep)
 		}
 	}
 }
 
 func (c *putJogger) stop() {
-	nlog.Infoln("stop [", c.parent.bck.Cname(""), c.mpath, "]")
+	nlog.Infoln("stop [", c.parent.bck.Cname(""), c.mi.String(), "]")
 	c.stopCh.Close()
 }
 
@@ -171,7 +169,7 @@ func (c *putJogger) ec(req *request, lom *core.LOM) (err error) {
 	switch req.Action {
 	case ActSplit:
 		if err = c.encode(req, lom); err != nil {
-			ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
+			ctMeta := core.NewCTFromLOM(lom, fs.ECMetaCT)
 			errRm := cos.RemoveFile(ctMeta.FQN())
 			debug.AssertNoErr(errRm)
 		}
@@ -215,7 +213,7 @@ func (c *putJogger) splitAndDistribute(ctx *encodeCtx) error {
 
 // calculates and stores data and parity slices
 func (c *putJogger) encode(req *request, lom *core.LOM) error {
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("Encoding %q...", lom)
 	}
 	var (
@@ -231,9 +229,13 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 		return fmt.Errorf("%v: given EC config (d=%d, p=%d), %d targets required to encode %s (have %d, %s)",
 			cmn.ErrNotEnoughTargets, ecConf.DataSlices, ecConf.ParitySlices, reqTargets, lom, targetCnt, smap.StringEx())
 	}
+	targets, err := smap.HrwTargetList(lom.UnamePtr(), reqTargets)
+	if err != nil {
+		return err
+	}
 
 	var (
-		ctMeta                = core.NewCTFromLOM(lom, fs.ECMetaType)
+		ctMeta                = core.NewCTFromLOM(lom, fs.ECMetaCT)
 		generation            = mono.NanoTime()
 		cksumType, cksumValue = lom.Checksum().Get()
 	)
@@ -252,13 +254,11 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 
 	c.parent.LomAdd(lom)
 
+	lom.Lock(false)
 	ctx, err := c.newCtx(lom, md)
 	defer c.freeCtx(ctx)
 	if err != nil {
-		return err
-	}
-	targets, err := smap.HrwTargetList(ctx.lom.UnamePtr(), reqTargets)
-	if err != nil {
+		lom.Unlock(false)
 		return err
 	}
 	ctx.targets = targets[1:]
@@ -276,6 +276,7 @@ func (c *putJogger) encode(req *request, lom *core.LOM) error {
 	} else {
 		err = c.splitAndDistribute(ctx)
 	}
+	lom.Unlock(false)
 	if err != nil {
 		return err
 	}
@@ -305,7 +306,7 @@ func (*putJogger) newCtx(lom *core.LOM, md *Metadata) (ctx *encodeCtx, err error
 	ctx.padSize = ctx.sliceSize*int64(ctx.dataSlices) - ctx.lom.Lsize()
 	debug.Assert(ctx.padSize >= 0)
 
-	ctx.fh, err = cos.NewFileHandle(lom.FQN)
+	ctx.lh, err = lom.NewHandle(false /*loaded*/)
 	return ctx, err
 }
 
@@ -325,10 +326,10 @@ func (c *putJogger) ctSendCallback(hdr *transport.ObjHdr, _ io.ReadCloser, _ any
 // Remove slices and replicas across the cluster: remove local metafile
 // if exists and broadcast the request to other targets
 func (c *putJogger) cleanup(lom *core.LOM) error {
-	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
+	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaCT)
 	md, err := LoadMetadata(ctMeta.FQN())
 	if err != nil {
-		if os.IsNotExist(err) {
+		if cos.IsNotExist(err) {
 			// Metafile does not exist = nothing to clean up
 			err = nil
 		}
@@ -343,7 +344,7 @@ func (c *putJogger) cleanup(lom *core.LOM) error {
 	o := transport.AllocSend()
 	o.Hdr = transport.ObjHdr{ObjName: lom.ObjName, Opaque: request, Opcode: reqDel}
 	o.Hdr.Bck.Copy(lom.Bucket())
-	o.Callback = c.ctSendCallback
+	o.SentCB = c.ctSendCallback
 	c.parent.IncPending()
 	return c.parent.mgr.req().Send(o, nil, nodes...)
 }
@@ -359,7 +360,7 @@ func (c *putJogger) createCopies(ctx *encodeCtx) error {
 
 	// broadcast the replica to the targets
 	src := &dataSource{
-		reader:   ctx.fh,
+		reader:   ctx.lh,
 		size:     ctx.lom.Lsize(),
 		metadata: ctx.md,
 		reqType:  reqPut,
@@ -412,13 +413,13 @@ func initializeSlices(ctx *encodeCtx) (err error) {
 			offset     = int64(i) * ctx.sliceSize
 		)
 		if sizeLeft < ctx.sliceSize {
-			reader = cos.NewSectionHandle(ctx.fh, offset, sizeLeft, ctx.padSize)
-			cksmReader = cos.NewSectionHandle(ctx.fh, offset, sizeLeft, ctx.padSize)
+			reader = cos.NewSectionHandle(ctx.lh, offset, sizeLeft, ctx.padSize)
+			cksmReader = cos.NewSectionHandle(ctx.lh, offset, sizeLeft, ctx.padSize)
 		} else {
-			reader = cos.NewSectionHandle(ctx.fh, offset, ctx.sliceSize, 0)
-			cksmReader = cos.NewSectionHandle(ctx.fh, offset, ctx.sliceSize, 0)
+			reader = cos.NewSectionHandle(ctx.lh, offset, ctx.sliceSize, 0)
+			cksmReader = cos.NewSectionHandle(ctx.lh, offset, ctx.sliceSize, 0)
 		}
-		ctx.slices[i] = &slice{obj: ctx.fh, reader: reader}
+		ctx.slices[i] = &slice{obj: ctx.lh, reader: reader}
 		cksmReaders[i] = cksmReader
 		sizeLeft -= ctx.sliceSize
 	}
@@ -474,7 +475,7 @@ func generateSlicesToDisk(ctx *encodeCtx) error {
 
 	cksumType := ctx.lom.CksumType()
 	for i := range ctx.paritySlices {
-		workFQN := fs.CSM.Gen(ctx.lom, fs.WorkfileType, fmt.Sprintf("ec-write-%d", i))
+		workFQN := ctx.lom.GenFQN(fs.WorkCT, fmt.Sprintf("ec-write-%d", i))
 		writer, err := ctx.lom.CreateSlice(workFQN)
 		if err != nil {
 			return err
@@ -542,7 +543,7 @@ func (c *putJogger) sendSlices(ctx *encodeCtx) (err error) {
 		return err
 	}
 
-	dataSlice := &slice{refCnt: *atomic.NewInt32(int32(ctx.dataSlices)), obj: ctx.fh}
+	dataSlice := &slice{refCnt: *atomic.NewInt32(int32(ctx.dataSlices)), obj: ctx.lh}
 	// If the slice is data one - no immediate cleanup is required because this
 	// slice is just a section reader of the entire file.
 	var copyErr error
@@ -565,7 +566,7 @@ func (c *putJogger) sendSlices(ctx *encodeCtx) (err error) {
 		nlog.Errorf("Error while copying (data=%d, parity=%d) for %q: %v",
 			ctx.dataSlices, ctx.paritySlices, ctx.lom.ObjName, copyErr)
 		err = errSliceSendFailed
-	} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	} else if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("EC created (data=%d, parity=%d) for %q",
 			ctx.dataSlices, ctx.paritySlices, ctx.lom.ObjName)
 	}

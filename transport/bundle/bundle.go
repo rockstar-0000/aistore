@@ -7,6 +7,7 @@ package bundle
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,7 +52,6 @@ type (
 		multiplier   int // optionally: multiple streams per destination (round-robin)
 		manualResync bool
 	}
-	Stats map[string]*transport.Stats // by DaemonID
 
 	Args struct {
 		Extra        *transport.Extra // additional parameters
@@ -103,7 +103,7 @@ func New(cl transport.Client, args Args) (sb *Streams) {
 	sb.Resync()
 	sb.smaplock.Unlock()
 
-	sb._lid()
+	sb.lid = sb._lid()
 	nlog.Infoln("open", sb.lid)
 
 	// for auto-resync, register this stream-bundle as Smap listener
@@ -114,10 +114,14 @@ func New(cl transport.Client, args Args) (sb *Streams) {
 	return sb
 }
 
-func (sb *Streams) _lid() {
-	var s strings.Builder
+func (sb *Streams) String() string { return sb.lid }
 
-	s.WriteString("sb-[")
+// (compare w/ transport._loghdr)
+func (sb *Streams) _lid() string {
+	var s strings.Builder
+	s.Grow(20 + len(sb.trname))
+
+	s.WriteString(cos.Ternary(sb.extra.Compressed(), "sb(z)-[", "sb-["))
 	s.WriteString(core.T.SID())
 	if sb.network != cmn.NetIntraData {
 		s.WriteByte('-')
@@ -128,11 +132,9 @@ func (sb *Streams) _lid() {
 	s.WriteByte('-')
 	s.WriteString(sb.trname)
 
-	sb.extra.Lid(&s)
-
 	s.WriteByte(']')
 
-	sb.lid = s.String() // approx. "sb[%s-%s-%s...]"
+	return s.String()
 }
 
 // Close closes all contained streams and unregisters the bundle from Smap listeners;
@@ -158,7 +160,7 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 	streams := sb.get()
 
 	if err := sb._validate(obj, streams, nodes); err != nil {
-		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+		if cmn.Rom.V(5, cos.ModTransport) {
 			nlog.Warningln(err)
 		}
 		// compare w/ transport doCmpl()
@@ -166,9 +168,6 @@ func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*me
 		return err
 	}
 
-	if obj.Callback == nil {
-		obj.Callback = sb.extra.Callback
-	}
 	if obj.IsHeaderOnly() {
 		roc = nil
 	}
@@ -230,12 +229,11 @@ func _doCmpl(obj *transport.Obj, roc cos.ReadOpenCloser, err error) {
 	if roc != nil {
 		cos.Close(roc)
 	}
-	if obj.Callback != nil {
-		obj.Callback(&obj.Hdr, roc, obj.CmplArg, err)
+	if obj.SentCB != nil {
+		obj.SentCB(&obj.Hdr, roc, obj.CmplArg, err)
 	}
 }
 
-func (sb *Streams) String() string   { return sb.lid }
 func (sb *Streams) Smap() *meta.Smap { return sb.smap }
 
 // keep streams to => (clustered nodes as per rxNodeType) in sync at all times
@@ -248,17 +246,6 @@ func (sb *Streams) ListenSmapChanged() {
 	sb.smaplock.Lock()
 	sb.Resync()
 	sb.smaplock.Unlock()
-}
-
-func (sb *Streams) GetStats() Stats {
-	streams := sb.get()
-	stats := make(Stats, len(streams))
-	for id, robin := range streams {
-		s := robin.stsdest[0]
-		tstat := s.GetStats()
-		stats[id] = &tstat
-	}
-	return stats
 }
 
 //
@@ -377,9 +364,8 @@ func (sb *Streams) Resync() {
 		l = max(len(obundle), len(obundle)+l)
 	}
 	nbundle := make(bundle, l)
-	for id, robin := range obundle {
-		nbundle[id] = robin
-	}
+	maps.Copy(nbundle, obundle)
+
 	for id, si := range added {
 		if id == core.T.SID() {
 			continue
@@ -411,6 +397,7 @@ func (sb *Streams) Resync() {
 		}
 		delete(nbundle, id)
 	}
+
 	sb.streams.Store(&nbundle)
 	sb.smap = smap
 }
@@ -440,6 +427,58 @@ func mdiff(oldMaps, newMaps []meta.NodeMap) (added, removed meta.NodeMap) {
 		}
 	}
 	return
+}
+
+// renew stream (or streams) to a given peer
+func (sb *Streams) ReopenPeerStream(dstID string) error {
+	// 1) validate
+	old := sb.get()
+	orobin, ok := old[dstID]
+	if !ok {
+		return &ErrDestinationMissing{sb.String(), dstID, sb.smap.String()}
+	}
+	if len(orobin.stsdest) == 0 {
+		debug.Assert(false) // not expecting
+		return nil
+	}
+	smap := core.T.Sowner().Get()
+	if smap.Version != sb.smap.Version {
+		// to err on the side of caution
+		return fmt.Errorf("%s: reopening individual streams when cluster map changes is not supported yet (%s vs %s)",
+			sb, smap.StringEx(), sb.smap.StringEx())
+	}
+	si := sb.smap.GetNode(dstID)
+	if si == nil {
+		// (unlikely - checked above)
+		return fmt.Errorf("%s: destination %q not found in the streams' %s", sb, dstID, sb.smap.StringEx())
+	}
+	dstURL := si.URL(sb.network) + transport.ObjURLPath(sb.trname)
+
+	// 2) build new `robin` (same multiplier; consider setting nrobin.i)
+	nrobin := &robin{stsdest: make(stsdest, len(orobin.stsdest))}
+	for k := range nrobin.stsdest {
+		extra := sb.extra // by value
+		ns := transport.NewObjStream(sb.client, dstURL, dstID, &extra)
+		nrobin.stsdest[k] = ns
+	}
+	nbundle := maps.Clone(old)
+	if nbundle == nil {
+		nbundle = make(bundle)
+	}
+	nbundle[dstID] = nrobin
+
+	// 3) switch over
+	sb.streams.Store(&nbundle)
+
+	// 4) stop old streams async
+	for _, os := range orobin.stsdest {
+		if !os.IsTerminated() {
+			os.Stop() // via stopCh
+		}
+	}
+
+	nlog.Infoln(sb.String(), "successfully restablished connectivity to", dstID)
+	return nil
 }
 
 ///////////////////////////

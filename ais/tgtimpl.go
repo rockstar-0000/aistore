@@ -9,8 +9,10 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -35,9 +37,9 @@ func (t *target) Health(si *meta.Snode, timeout time.Duration, query url.Values)
 	return t.reqHealth(si, timeout, query, t.owner.smap.get(), false /*retry*/)
 }
 
-func (t *target) PutObject(lom *core.LOM, params *core.PutParams) error {
+func (t *target) PutObject(lom *core.LOM, params *core.PutParams) (err error) {
 	debug.Assert(params.WorkTag != "" && !params.Atime.IsZero())
-	workFQN := fs.CSM.Gen(lom, fs.WorkfileType, params.WorkTag)
+	workFQN := lom.GenFQN(fs.WorkCT, params.WorkTag)
 
 	poi := allocPOI()
 	{
@@ -52,11 +54,19 @@ func (t *target) PutObject(lom *core.LOM, params *core.PutParams) error {
 		poi.owt = params.OWT
 		poi.skipEC = params.SkipEC
 		poi.coldGET = params.ColdGET
+		poi.locked = params.Locked
 	}
 	if poi.owt != cmn.OwtPut {
 		poi.cksumToUse = params.Cksum
 	}
-	_, err := poi.putObject()
+
+	switch {
+	case params.ChunkSize > 0:
+		_, err = poi.chunk(params.ChunkSize)
+	default:
+		_, err = poi.putObject()
+	}
+
 	freePOI(poi)
 	debug.Func(func() {
 		if err == nil {
@@ -121,7 +131,7 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, xkind string, owt c
 	switch owt {
 	case cmn.OwtGetTryLock: // e.g., downloader
 		if !lom.TryLock(true) {
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			if cmn.Rom.V(4, cos.ModAIS) {
 				nlog.Warningln(t.String(), lom.String(), owt.String(), "is busy")
 			}
 			return 0, cmn.ErrSkip // TODO: must be cmn.ErrBusy
@@ -175,7 +185,7 @@ func (t *target) rgetstats(backend core.Backend, cname, xkind string, size, lat 
 func (t *target) GetColdBlob(params *core.BlobParams, oa *cmn.ObjAttrs) (xctn core.Xact, err error) {
 	debug.Assert(params.Lom != nil)
 	debug.Assert(params.Msg != nil)
-	_, xctn, err = t.blobdl(params, oa)
+	_, xctn, err = t.blobdl(params, oa, nil /*object headers*/)
 	return xctn, err
 }
 
@@ -195,4 +205,54 @@ func (t *target) HeadCold(lom *core.LOM, origReq *http.Request) (oa *cmn.ObjAttr
 		)
 	}
 	return oa, ecode, err
+}
+
+func (t *target) GetFromNeighbor(params *core.GfnParams) (*http.Response, error) {
+	var (
+		lom   = params.Lom
+		query = lom.Bck().NewQuery()
+	)
+	query.Set(apc.QparamIsGFNRequest, "true")
+	if params.ArchPath != "" {
+		// (compare w/ t.getObject)
+		debug.Assertf(!strings.HasPrefix(params.ArchPath, lom.ObjName),
+			"expecting archpath _in_ archive, got (%q, %q)", params.ArchPath, lom.ObjName)
+		query.Set(apc.QparamArchpath, params.ArchPath)
+	}
+
+	reqArgs := cmn.AllocHra()
+	{
+		reqArgs.Method = http.MethodGet
+		reqArgs.Base = params.Tsi.URL(cmn.NetIntraData)
+		reqArgs.Header = http.Header{
+			apc.HdrSenderID:   []string{t.SID()},
+			apc.HdrSenderName: []string{t.String()},
+		}
+		reqArgs.Path = apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName)
+		reqArgs.Query = query
+	}
+
+	req, err := reqArgs.Req()
+	if err != nil {
+		cmn.FreeHra(reqArgs)
+		return nil, err
+	}
+
+	config := params.Config
+	if config == nil {
+		config = cmn.GCO.Get()
+	}
+	tout := config.Timeout.SendFile.D()
+	if params.ArchPath == "" {
+		tout = cos.ClampDuration(tout, config.Client.Timeout.D(), time.Minute)
+	}
+	_, cancel := context.WithTimeout(context.Background(), tout)
+
+	resp, err := g.client.data.Do(req)
+
+	cmn.FreeHra(reqArgs)
+	cmn.HreqFree(req)
+	cancel()
+
+	return resp, err
 }

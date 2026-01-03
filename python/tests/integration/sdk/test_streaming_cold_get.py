@@ -13,7 +13,7 @@ from requests.exceptions import ConnectionError as RequestsConnectionError, Time
 from tests.integration import REMOTE_SET, REMOTE_BUCKET, CLUSTER_ENDPOINT
 from tests.integration.sdk import TEST_RETRY_CONFIG, DEFAULT_TEST_CLIENT
 from tests.utils import random_string
-from tests.const import MIB, GIB
+from tests.const import MIB, GIB, TEST_TIMEOUT
 
 from aistore.sdk import Bucket, Object, Client
 from aistore.sdk.const import HTTP_METHOD_PATCH
@@ -54,8 +54,8 @@ class MidStreamDropper:
 
 
 class TestStreamingColdGet(unittest.TestCase):
-    bucket: Optional[Bucket] = None
-    object: Optional[Object] = None
+    bucket: Optional[Bucket]
+    object: Optional[Object]
     OBJECT_NAME = f"TestStreamingColdGet-{random_string(6)}"
     OBJECT_SIZE = GIB  # 1 GiB object for testing
 
@@ -87,7 +87,8 @@ class TestStreamingColdGet(unittest.TestCase):
     def setUp(self) -> None:
         # Evict the object before each test
         eviction_job = self.bucket.objects(obj_names=[self.OBJECT_NAME]).evict()
-        self.client.job(job_id=eviction_job).wait()
+        result = self.client.job(job_id=eviction_job).wait(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
 
         self.bucket_uri = f"{self.bucket.provider.value}://{self.bucket.name}"
 
@@ -146,7 +147,7 @@ class TestStreamingColdGet(unittest.TestCase):
         chunk = (
             self.object.get_reader()
             .raw()
-            .read(MIB)  # Read the first 1 MB chunk directly using raw
+            .raw.read(MIB)  # Read the first 1 MB chunk directly using raw
         )
         self.assertEqual(len(chunk), MIB, "No initial chunk received.")
 

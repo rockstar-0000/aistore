@@ -40,7 +40,7 @@ func (lom *LOM) PreInit(fqn string) error {
 	if err != nil {
 		return err
 	}
-	debug.Assert(parsed.ContentType == fs.ObjectType)
+	debug.Assert(parsed.ContentType == fs.ObjCT)
 	lom.HrwFQN = &hrwFQN
 	lom.FQN = fqn
 	lom.mi = parsed.Mountpath
@@ -72,7 +72,7 @@ func (lom *LOM) InitFQN(fqn string, expbck *cmn.Bck) error {
 }
 
 func (lom *LOM) InitCT(ct *CT) {
-	debug.Assert(ct.contentType == fs.ObjectType)
+	debug.Assert(ct.contentType == fs.ObjCT)
 	debug.Assert(ct.bck.Props != nil, ct.bck.String()+" must be initialized")
 	lom.FQN = ct.fqn
 	lom.HrwFQN = ct.hrwFQN
@@ -83,8 +83,12 @@ func (lom *LOM) InitCT(ct *CT) {
 	lom.md.uname = ct.UnamePtr()
 }
 
-func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
-	lom.bck = *(*meta.Bck)(bck)
+func (lom *LOM) InitCmnBck(bck *cmn.Bck) (err error) {
+	return lom.InitBck((*meta.Bck)(bck))
+}
+
+func (lom *LOM) InitBck(bck *meta.Bck) (err error) {
+	lom.bck = *bck
 	if err = lom.bck.InitFast(T.Bowner()); err != nil {
 		return
 	}
@@ -94,7 +98,7 @@ func (lom *LOM) InitBck(bck *cmn.Bck) (err error) {
 	if err != nil {
 		return
 	}
-	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
+	lom.FQN = lom.mi.MakePathFQN(lom.Bucket(), fs.ObjCT, lom.ObjName)
 	lom.HrwFQN = &lom.FQN
 	return
 }
@@ -118,11 +122,16 @@ func (lom *LOM) String() string {
 
 // allocates and copies metadata (in particular, atime and uname)
 // NOTE: cloned lom.bid() == 0 is possible - copying/transforming scenarios
-func (lom *LOM) CloneMD(fqn string) *LOM {
-	dst := AllocLOM("")
-	*dst = *lom
-	dst.md = lom.md
-	dst.md.copies = nil
-	dst.FQN = fqn
-	return dst
+func (lom *LOM) CloneTo(fqn string) *LOM {
+	clone := lom.Clone()
+	clone.FQN = fqn
+	clone.md.copies = nil
+	return clone
+}
+
+func (lom *LOM) Clone() *LOM {
+	clone := AllocLOM("")
+	*clone = *lom
+	clone.md = lom.md
+	return clone
 }

@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/NVIDIA/aistore/ais/backend"
 	"github.com/NVIDIA/aistore/api"
@@ -27,6 +28,7 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
+	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/readers"
@@ -92,7 +94,7 @@ func TestObjectInvalidName(t *testing.T) {
 		t.Run(test.op, func(t *testing.T) {
 			switch test.op {
 			case putOP:
-				reader, err := readers.NewRand(cos.KiB, cos.ChecksumNone)
+				reader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: cos.KiB, CksumType: cos.ChecksumNone})
 				tassert.CheckFatal(t, err)
 				_, err = api.PutObject(&api.PutArgs{
 					BaseParams: baseParams,
@@ -138,7 +140,7 @@ func TestRemoteBucketObject(t *testing.T) {
 				bck.Name = cliBck.Name
 			}
 
-			reader, err := readers.NewRand(cos.KiB, cos.ChecksumNone)
+			reader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: cos.KiB, CksumType: cos.ChecksumNone})
 			tassert.CheckFatal(t, err)
 
 			defer api.DeleteObject(baseParams, bck, object)
@@ -154,7 +156,7 @@ func TestRemoteBucketObject(t *testing.T) {
 				})
 				if err == nil {
 					oa := oah.Attrs()
-					tlog.Logf("PUT(%s) attrs %s\n", bck.Cname(object), oa.String())
+					tlog.Logfln("PUT(%s) attrs %s", bck.Cname(object), oa.String())
 				}
 			case getOP:
 				if test.exists {
@@ -292,7 +294,7 @@ func TestAppendObject(t *testing.T) {
 			writer := bytes.NewBuffer(nil)
 			getArgs := api.GetArgs{Writer: writer}
 			oah, err := api.GetObjectWithValidation(baseParams, bck, objName, &getArgs)
-			if !cksum.IsEmpty() {
+			if !cos.NoneH(cksum) {
 				tassert.CheckFatal(t, err)
 			}
 			tassert.Errorf(
@@ -302,6 +304,78 @@ func TestAppendObject(t *testing.T) {
 			)
 		})
 		time.Sleep(3 * time.Second)
+	}
+}
+
+func TestCopyObject(t *testing.T) {
+	var (
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+		bckFrom    = cmn.Bck{
+			Name:     "obj-cp-from-" + trand.String(5),
+			Provider: apc.AIS,
+		}
+		bckTo = cmn.Bck{
+			Name:     "obj-cp-to-" + trand.String(5),
+			Provider: apc.AIS,
+		}
+		objFrom = "test-from-obj"
+		objTo   = "test-to-obj"
+		data    = []byte("this is test data for copy object")
+	)
+
+	// Create bucket and PUT source object
+	tools.CreateBucket(t, proxyURL, bckFrom, nil, true /*cleanup*/)
+	tools.CreateBucket(t, proxyURL, bckTo, nil, true /*cleanup*/)
+	putArgs := api.PutArgs{
+		BaseParams: baseParams,
+		Bck:        bckFrom,
+		ObjName:    objFrom,
+		Reader:     readers.NewBytes(data),
+	}
+	_, err := api.PutObject(&putArgs)
+	tassert.CheckFatal(t, err)
+
+	err = api.CopyObject(baseParams, &api.CopyArgs{
+		FromBck:     bckFrom,
+		FromObjName: objFrom,
+		ToBck:       bckTo,
+		ToObjName:   objTo,
+	})
+	tassert.CheckFatal(t, err)
+
+	// GET destination object to validate content
+	writer := bytes.NewBuffer(nil)
+	getArgs := api.GetArgs{Writer: writer}
+	_, err = api.GetObject(baseParams, bckTo, objTo, &getArgs)
+	tassert.CheckFatal(t, err)
+
+	// Compare content
+	tassert.Errorf(t, bytes.Equal(writer.Bytes(), data), "copied object content mismatch: expected %q, got %q",
+		string(data), writer.String())
+
+	// HEAD both source and destination to ensure existence
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+	_, err = api.HeadObject(baseParams, bckFrom, objFrom, hargs)
+	tassert.CheckFatal(t, err)
+	_, err = api.HeadObject(baseParams, bckTo, objTo, hargs)
+	tassert.CheckFatal(t, err)
+
+	// Attempt to copy to a nonexistent bucket
+	bckNonexistent := cmn.Bck{
+		Name:     "nonexistent-bucket-" + trand.String(5),
+		Provider: apc.AIS,
+	}
+	err = api.CopyObject(baseParams, &api.CopyArgs{
+		FromBck:     bckFrom,
+		FromObjName: objFrom,
+		ToBck:       bckNonexistent,
+		ToObjName:   objTo,
+	})
+	tassert.Errorf(t, err != nil, "expected error when copying to nonexistent bucket")
+	if err != nil {
+		status := api.HTTPStatus(err)
+		tassert.Errorf(t, status == http.StatusNotFound, "expected status %d, got %d", http.StatusNotFound, status)
 	}
 }
 
@@ -339,7 +413,7 @@ func TestSameBucketName(t *testing.T) {
 	}
 
 	// PUT/GET/DEL Without ais bucket
-	tlog.Logf("Validating responses for non-existent ais bucket...\n")
+	tlog.Logfln("Validating responses for non-existent ais bucket...")
 	_, err := api.PutObject(&putArgsLocal)
 	if err == nil {
 		t.Fatalf("ais bucket %s does not exist: Expected an error.", bckLocal.String())
@@ -363,7 +437,7 @@ func TestSameBucketName(t *testing.T) {
 		t.Fatalf("ais bucket %s does not exist: Expected an error.", bckLocal.String())
 	}
 
-	tlog.Logf("PrefetchList num=%d\n", len(files))
+	tlog.Logfln("PrefetchList num=%d", len(files))
 	{
 		var msg apc.PrefetchMsg
 		msg.ObjNames = files
@@ -374,7 +448,7 @@ func TestSameBucketName(t *testing.T) {
 		tassert.CheckFatal(t, err)
 	}
 
-	tlog.Logf("PrefetchRange %s\n", objRange)
+	tlog.Logfln("PrefetchRange %s", objRange)
 	{
 		var msg apc.PrefetchMsg
 		msg.Template = objRange
@@ -385,20 +459,50 @@ func TestSameBucketName(t *testing.T) {
 		tassert.CheckFatal(t, err)
 	}
 
+	// Verify both objects are cached locally before deletion
+	for _, objName := range files {
+		exists := tools.CheckObjIsPresent(proxyURL, bckRemote, objName)
+		if !exists {
+			t.Fatalf("Object %s should be cached locally after prefetch", objName)
+		}
+	}
+
 	// delete one obj from remote, and check evictions (below)
 	err = api.DeleteObject(baseParams, bckRemote, fileName1)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("EvictList %v\n", files)
+	tlog.Logfln("EvictList %v", files)
 	evdListMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: files}}
 	evictListID, err := api.EvictMultiObj(baseParams, bckRemote, evdListMsg)
 	tassert.CheckFatal(t, err)
-	args := xact.ArgsMsg{ID: evictListID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
-	status, err := api.WaitForXactionIC(baseParams, &args)
-	tassert.CheckFatal(t, err)
-	tassert.Errorf(t, status.ErrMsg != "", "expecting errors when not finding listed objects")
 
-	tlog.Logf("EvictRange\n")
+	// Wait for xaction to complete
+	args := xact.ArgsMsg{ID: evictListID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	err = api.WaitForXactionNode(baseParams, &args, xactSnapNotRunning)
+	tassert.CheckFatal(t, err)
+
+	// Query the xaction snaps directly to get errors
+	snaps, err := api.QueryXactionSnaps(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	// Extract error from snapshots
+	var statusErr string
+	for _, snapList := range snaps {
+		for _, snap := range snapList {
+			if snap.Err != "" {
+				statusErr = snap.Err
+				break
+			}
+		}
+		if statusErr != "" {
+			break
+		}
+	}
+
+	tlog.Logfln("Received expected evict status error: %s", statusErr)
+	tassert.Errorf(t, statusErr != "", "expecting errors when not finding listed objects")
+
+	tlog.Logfln("EvictRange")
 	evdRangeMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: objRange}}
 	evictRangeID, err := api.EvictMultiObj(baseParams, bckRemote, evdRangeMsg)
 	tassert.CheckFatal(t, err)
@@ -409,7 +513,7 @@ func TestSameBucketName(t *testing.T) {
 	tools.CreateBucket(t, proxyURL, bckLocal, nil, true /*cleanup*/)
 
 	// PUT
-	tlog.Logf("PUT %s and %s -> both buckets...\n", fileName1, fileName2)
+	tlog.Logfln("PUT %s and %s -> both buckets...", fileName1, fileName2)
 	_, err = api.PutObject(&putArgsLocal)
 	tassert.CheckFatal(t, err)
 	putArgsLocal.ObjName = fileName2
@@ -425,7 +529,7 @@ func TestSameBucketName(t *testing.T) {
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
 
 	// Check that ais bucket has 2 objects
-	tlog.Logf("Validating that ais bucket contains %s and %s ...\n", fileName1, fileName2)
+	tlog.Logfln("Validating that ais bucket contains %s and %s ...", fileName1, fileName2)
 	_, err = api.HeadObject(baseParams, bckLocal, fileName1, hargs)
 	tassert.CheckFatal(t, err)
 	_, err = api.HeadObject(baseParams, bckLocal, fileName2, hargs)
@@ -449,7 +553,7 @@ func TestSameBucketName(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	// Delete from cloud bucket
-	tlog.Logf("Deleting %s and %s from cloud bucket ...\n", fileName1, fileName2)
+	tlog.Logfln("Deleting %s and %s from cloud bucket ...", fileName1, fileName2)
 	deleteID, err := api.DeleteMultiObj(baseParams, bckRemote, evdListMsg)
 	tassert.CheckFatal(t, err)
 	args = xact.ArgsMsg{ID: deleteID, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
@@ -457,7 +561,7 @@ func TestSameBucketName(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	// Delete from ais bucket
-	tlog.Logf("Deleting %s and %s from ais bucket ...\n", fileName1, fileName2)
+	tlog.Logfln("Deleting %s and %s from ais bucket ...", fileName1, fileName2)
 	deleteID, err = api.DeleteMultiObj(baseParams, bckLocal, evdListMsg)
 	tassert.CheckFatal(t, err)
 	args = xact.ArgsMsg{ID: deleteID, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
@@ -515,7 +619,7 @@ func Test_SameAISAndRemoteBucketName(t *testing.T) {
 	bucketPropsRemote := &cmn.BpropsToSet{}
 
 	// Put
-	tlog.Logf("PUT %s => %s\n", fileName, bckLocal.String())
+	tlog.Logfln("PUT %s => %s", fileName, bckLocal.String())
 	putArgs := api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bckLocal,
@@ -528,7 +632,7 @@ func Test_SameAISAndRemoteBucketName(t *testing.T) {
 	resLocal, err := api.ListObjects(baseParams, bckLocal, msg, api.ListArgs{})
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("PUT %s => %s\n", fileName, bckRemote.String())
+	tlog.Logfln("PUT %s => %s", fileName, bckRemote.String())
 	putArgs = api.PutArgs{
 		BaseParams: baseParams,
 		Bck:        bckRemote,
@@ -679,7 +783,7 @@ func Test_coldgetmd5(t *testing.T) {
 
 	start := time.Now()
 	m.gets(nil /*api.GetArgs*/, false /*withValidation*/)
-	tlog.Logf("GET %s without MD5 validation: %v\n", cos.ToSizeIEC(totalSize, 0), time.Since(start))
+	tlog.Logfln("GET %s without MD5 validation: %v", cos.IEC(totalSize, 0), time.Since(start))
 
 	m.evict()
 
@@ -694,7 +798,126 @@ func Test_coldgetmd5(t *testing.T) {
 
 	start = time.Now()
 	m.gets(nil /*api.GetArgs*/, true /*withValidation*/)
-	tlog.Logf("GET %s with MD5 validation:    %v\n", cos.ToSizeIEC(totalSize, 0), time.Since(start))
+	tlog.Logfln("GET %s with MD5 validation:    %v", cos.IEC(totalSize, 0), time.Since(start))
+}
+
+func TestColdGetChunked(t *testing.T) {
+	const (
+		chunkSize   = 16 * cos.MiB
+		maxMonoSize = 1 * cos.GiB
+	)
+
+	tests := []struct {
+		name          string
+		objSize       uint64 // object size
+		sourceChunked bool   // use chunksConf when provisioning source
+		evict         bool   // evict after provision
+		longOnly      bool   // run only with long tests
+	}{
+		// Cold GET scenarios (evicted): chunking based on size limit
+		{name: "chunked-src-evict-exceeds", objSize: 1 * cos.GiB, sourceChunked: true, evict: true, longOnly: true},     // exceeds limit => chunks
+		{name: "chunked-src-evict-small", objSize: 48 * cos.MiB, sourceChunked: true, evict: true, longOnly: true},      // doesn't exceed => monolithic
+		{name: "monolithic-src-evict-exceeds", objSize: 1 * cos.GiB, sourceChunked: false, evict: true, longOnly: true}, // exceeds limit => chunks
+		{name: "monolithic-src-evict-small", objSize: 48 * cos.MiB, sourceChunked: false, evict: true, longOnly: true},  // doesn't exceed => monolithic
+
+		// Warm GET scenarios (not evicted): object stays as provisioned
+		{name: "chunked-src-no-evict-exceeds", objSize: 1 * cos.GiB, sourceChunked: true, evict: false, longOnly: true},     // source chunked => chunks
+		{name: "chunked-src-no-evict-small", objSize: 48 * cos.MiB, sourceChunked: true, evict: false, longOnly: true},      // source chunked => chunks
+		{name: "monolithic-src-no-evict-exceeds", objSize: 1 * cos.GiB, sourceChunked: false, evict: false, longOnly: true}, // source monolithic => monolithic
+		{name: "monolithic-src-no-evict-small", objSize: 48 * cos.MiB, sourceChunked: false, evict: false, longOnly: true},  // source monolithic => monolithic
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				numObjs  = 1
+				proxyURL = tools.RandomProxyURL(t)
+			)
+
+			m := ioContext{
+				t:             t,
+				bck:           cliBck,
+				num:           numObjs,
+				fileSizeRange: [2]uint64{tt.objSize + 1, tt.objSize + chunkSize - 1}, // range within chunkSize for predictable chunk count
+				prefix:        "coldget-chunked/" + tt.name + trand.String(5),
+				getErrIsFatal: true,
+			}
+
+			tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: m.bck, Long: tt.longOnly})
+
+			// Configure source provisioning
+			if tt.sourceChunked {
+				m.chunksConf = &ioCtxChunksConf{
+					numChunks: int(tt.objSize / chunkSize),
+					multipart: true,
+				}
+			}
+
+			m.init(true /*cleanup*/)
+			initMountpaths(t, proxyURL)
+			baseParams := tools.BaseAPIParams(proxyURL)
+
+			// Provision objects to remote backend
+			tlog.Logfln("Provisioning %d objects (chunked=%v, size=%s, evict=%v)...", numObjs, tt.sourceChunked, cos.ToSizeIEC(int64(tt.objSize), 0), tt.evict)
+			m.remotePuts(tt.evict)
+
+			// Save original bucket props for cleanup
+			p, err := api.HeadBucket(baseParams, m.bck, false)
+			tassert.CheckFatal(t, err)
+
+			// Configure bucket chunking properties
+			_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
+				Chunks: &cmn.ChunksConfToSet{
+					MaxMonolithicSize: apc.Ptr(cos.SizeIEC(maxMonoSize)),
+					ChunkSize:         apc.Ptr(cos.SizeIEC(chunkSize)),
+				},
+			})
+			tassert.CheckFatal(t, err)
+
+			t.Cleanup(func() {
+				_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
+					Chunks: &cmn.ChunksConfToSet{
+						MaxMonolithicSize: apc.Ptr(p.Chunks.MaxMonolithicSize),
+						ChunkSize:         apc.Ptr(p.Chunks.ChunkSize),
+					},
+				})
+				tassert.CheckError(t, err)
+			})
+
+			if tt.evict {
+				tlog.Logln("Performing cold GET...")
+			} else {
+				tlog.Logln("Performing warm GET...")
+			}
+			m.gets(nil, true)
+
+			// Determine expected chunking outcome
+			// Cold GET (evicted): chunks if size > limit
+			// Warm GET (not evicted): stays as provisioned
+			expectChunked := (tt.evict && tt.objSize > maxMonoSize) || (!tt.evict && tt.sourceChunked)
+
+			// Verify chunks on disk only if expected to be chunked
+			if expectChunked {
+				tlog.Logfln("Verifying objects are chunked")
+				ls, err := api.ListObjects(baseParams, m.bck, &apc.LsoMsg{Prefix: m.prefix, Props: apc.GetPropsChunked}, api.ListArgs{})
+				tassert.CheckFatal(t, err)
+				tassert.Fatalf(t, len(ls.Entries) == m.num, "expected %d objects, got %d", m.num, len(ls.Entries))
+
+				tlog.Logfln("Verifying chunks are persisted on disk...")
+				expectedChunkCount := int(tt.objSize / chunkSize)
+				for _, objName := range m.objNames {
+					if tt.sourceChunked && !tt.evict {
+						// stay as provisioned
+						expectedChunkCount = m.chunksConf.numChunks - 1
+					}
+					chunks := m.findObjChunksOnDisk(m.bck, objName)
+					tassert.Fatalf(t, len(chunks) == expectedChunkCount, "expected %d chunk files for %s, found %d", expectedChunkCount, objName, len(chunks))
+				}
+			}
+
+			tlog.Logfln("Test case '%s' completed successfully!", tt.name)
+		})
+	}
 }
 
 func TestHeadBucket(t *testing.T) {
@@ -769,7 +992,7 @@ func TestHeadNonexistentBucket(t *testing.T) {
 
 	_, err = api.HeadBucket(baseParams, bck, true /* don't add */)
 	if err == nil {
-		t.Fatalf("Expected an error, but go no errors.")
+		t.Fatal("Expected an error, but go no errors.")
 	}
 
 	status := api.HTTPStatus(err)
@@ -845,30 +1068,30 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 		tassert.CheckFatal(t, err)
 	}
 
-	fqn := findObjOnDisk(m.bck, objName)
+	fqn := m.findObjOnDisk(m.bck, objName)
 	tools.CheckPathExists(t, fqn, false /*dir*/)
 	oldFileInfo, _ := os.Stat(fqn)
 
 	// Test when the contents of the file are changed
-	tlog.Logf("Changing contents of the file [%s]: %s\n", objName, fqn)
+	tlog.Logfln("Changing contents of the file [%s]: %s", objName, fqn)
 	err = os.WriteFile(fqn, []byte("Contents of this file have been changed."), cos.PermRWR)
 	tassert.CheckFatal(t, err)
 	validateGETUponFileChangeForChecksumValidation(t, proxyURL, objName, fqn, oldFileInfo)
 
 	// Test when the xxHash of the file is changed
 	objName = m.nextObjName()
-	fqn = findObjOnDisk(m.bck, objName)
+	fqn = m.findObjOnDisk(m.bck, objName)
 	tools.CheckPathExists(t, fqn, false /*dir*/)
 	oldFileInfo, _ = os.Stat(fqn)
 
-	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234"))
+	tlog.Logfln("Changing file xattr[%s]: %s", objName, fqn)
+	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "deadbeefcafebabe"))
 	tassert.CheckError(t, err)
 	validateGETUponFileChangeForChecksumValidation(t, proxyURL, objName, fqn, oldFileInfo)
 
 	// Test for no checksum algo
 	objName = m.nextObjName()
-	fqn = findObjOnDisk(m.bck, objName)
+	fqn = m.findObjOnDisk(m.bck, objName)
 
 	if p.Cksum.Type != cos.ChecksumNone {
 		propsToSet := &cmn.BpropsToSet{
@@ -880,8 +1103,8 @@ func TestChecksumValidateOnWarmGetForRemoteBucket(t *testing.T) {
 		tassert.CheckFatal(t, err)
 	}
 
-	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234abcde"))
+	tlog.Logfln("Changing file xattr[%s]: %s", objName, fqn)
+	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "badc0ffee0ddf00d"))
 	tassert.CheckError(t, err)
 
 	_, err = api.GetObject(baseParams, m.bck, objName, nil)
@@ -907,6 +1130,9 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{CloudBck: true, Bck: m.bck})
 	if docker.IsRunning() {
 		t.Skipf("test %q requires xattrs to be set, doesn't work with docker", t.Name())
+	}
+	if m.chunksConf != nil {
+		t.Skipf("skipping %s: relies on 'initMountpaths/findObjOnDisk' to modify content and cannot work with chunked objects", t.Name())
 	}
 
 	p, err := api.HeadBucket(baseParams, m.bck, false /*don't add*/)
@@ -982,7 +1208,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 			modify     func(*testing.T, *core.LOM)
 		}{
 			"checksum": {modify: func(_ *testing.T, lom *core.LOM) {
-				lom.SetCksum(cos.NewCksum(cos.ChecksumCesXxh, "01234"))
+				lom.SetCksum(cos.NewCksum(cos.ChecksumCesXxh, "deadbeefcafebabe"))
 			}},
 			"local_content": {modify: func(t *testing.T, lom *core.LOM) {
 				err := os.WriteFile(lom.FQN, []byte("modified"), cos.PermRWR)
@@ -1031,7 +1257,7 @@ func TestValidateOnWarmGetRemoteBucket(t *testing.T) {
 				objName := m.nextObjName()
 
 				// Modify local version.
-				fqn := findObjOnDisk(m.bck, objName)
+				fqn := m.findObjOnDisk(m.bck, objName)
 				tools.ModifyLOM(t, fqn, m.bck, test.modify)
 
 				// Make sure that object is not returned.
@@ -1046,6 +1272,7 @@ func TestEvictRemoteBucket(t *testing.T) {
 	t.Run("Cloud/KeepMD", func(t *testing.T) { testEvictRemoteBucket(t, cliBck, true) })
 	t.Run("Cloud/DeleteMD", func(t *testing.T) { testEvictRemoteBucket(t, cliBck, false) })
 	t.Run("RemoteAIS", testEvictRemoteAISBucket)
+	t.Run("MultiObject", testEvictMultiObject)
 }
 
 func testEvictRemoteAISBucket(t *testing.T) {
@@ -1114,6 +1341,157 @@ func testEvictRemoteBucket(t *testing.T, bck cmn.Bck, keepMD bool) {
 	} else {
 		tassert.Fatalf(t, !bProps.Mirror.Enabled, "test property not reset")
 	}
+}
+
+func testEvictMultiObject(t *testing.T) {
+	var (
+		bck = cliBck
+		m   = ioContext{
+			t:        t,
+			bck:      bck,
+			num:      0, // Manual object creation
+			fileSize: cos.KiB,
+		}
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+	)
+
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
+	m.initAndSaveState(true /*cleanup*/)
+
+	t.Cleanup(func() {
+		m.del()
+	})
+
+	// Different eviction scenarios
+	testObjects := map[string][]byte{
+		"obj1.txt":             []byte("obj1 content"),
+		"obj2.txt":             []byte("obj2 content"),
+		"test_prefix_1.txt":    []byte("prefix content 1"),
+		"test_prefix_2.txt":    []byte("prefix content 2"),
+		"single_obj.txt":       []byte("single content"),
+		"template_001.txt":     []byte("template content 1"),
+		"template_002.txt":     []byte("template content 2"),
+		"keepmd_test.txt":      []byte("keepmd content"),
+		"nonrec/file.txt":      []byte("nonrecursive content"),
+		"nonrec/deep/file.txt": []byte("deeper content"),
+		"nested/deep/file.txt": []byte("nested content"),
+	}
+
+	// PUT all test objects
+	for objName, content := range testObjects {
+		putArgs := api.PutArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+			Reader:     readers.NewBytes(content),
+		}
+		_, err := api.PutObject(&putArgs)
+		tassert.CheckFatal(t, err)
+	}
+
+	for objName := range testObjects {
+		exists := tools.CheckObjIsPresent(proxyURL, bck, objName)
+		tassert.Fatalf(t, exists, "object should be cached: %s", objName)
+	}
+
+	// Evict specific objects using list
+	tlog.Logln("Testing evict with object list...")
+	evdListMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: []string{"obj1.txt", "obj2.txt"}}}
+	evictListID, err := api.EvictMultiObj(baseParams, bck, evdListMsg)
+	tassert.CheckFatal(t, err)
+	time.Sleep(time.Second)
+	args := xact.ArgsMsg{ID: evictListID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	for _, objName := range []string{"obj1.txt", "obj2.txt"} {
+		exists := tools.CheckObjIsPresent(proxyURL, bck, objName)
+		tassert.Errorf(t, !exists, "object should be evicted: %s", objName)
+	}
+
+	// Evict with prefix (template without ranges)
+	tlog.Logln("Testing evict with prefix...")
+	evdPrefixMsg := &apc.EvdMsg{ListRange: apc.ListRange{Template: "test_prefix_"}}
+	evictPrefixID, err := api.EvictMultiObj(baseParams, bck, evdPrefixMsg)
+	tassert.CheckFatal(t, err)
+	time.Sleep(time.Second)
+	args = xact.ArgsMsg{ID: evictPrefixID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	for _, objName := range []string{"test_prefix_1.txt", "test_prefix_2.txt"} {
+		exists := tools.CheckObjIsPresent(proxyURL, bck, objName)
+		tassert.Errorf(t, !exists, "object should be evicted: %s", objName)
+	}
+
+	// Single object eviction with --keep-md (equivalent)
+	tlog.Logln("Testing single object evict...")
+	evdSingleMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: []string{"keepmd_test.txt"}}}
+	evictSingleID, err := api.EvictMultiObj(baseParams, bck, evdSingleMsg)
+	tassert.CheckFatal(t, err)
+	time.Sleep(time.Second)
+	args = xact.ArgsMsg{ID: evictSingleID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	exists := tools.CheckObjIsPresent(proxyURL, bck, "keepmd_test.txt")
+	tassert.Errorf(t, !exists, "object should be evicted: keepmd_test.txt")
+
+	// Template-based eviction with brace expansion
+	tlog.Logln("Testing evict with template...")
+	evdTemplateMsg := &apc.EvdMsg{ListRange: apc.ListRange{Template: "template_{001..002}.txt"}}
+	evictTemplateID, err := api.EvictMultiObj(baseParams, bck, evdTemplateMsg)
+	tassert.CheckFatal(t, err)
+	time.Sleep(time.Second)
+	args = xact.ArgsMsg{ID: evictTemplateID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	for _, objName := range []string{"template_001.txt", "template_002.txt"} {
+		exists := tools.CheckObjIsPresent(proxyURL, bck, objName)
+		tassert.Errorf(t, !exists, "object should be evicted: %s", objName)
+	}
+
+	// Non-recursive prefix eviction
+	tlog.Logln("Testing non-recursive evict...")
+	evdNonRecMsg := &apc.EvdMsg{
+		ListRange: apc.ListRange{Template: "nonrec/"},
+		NonRecurs: true,
+	}
+	evictNonRecID, err := api.EvictMultiObj(baseParams, bck, evdNonRecMsg)
+	tassert.CheckFatal(t, err)
+	args = xact.ArgsMsg{ID: evictNonRecID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+	time.Sleep(time.Second)
+
+	exists = tools.CheckObjIsPresent(proxyURL, bck, "nonrec/file.txt")
+	tassert.Errorf(t, !exists, "direct file should be evicted: nonrec/file.txt")
+	exists = tools.CheckObjIsPresent(proxyURL, bck, "nonrec/deep/file.txt")
+	tassert.Fatalf(t, exists, "deeper file should remain cached: nonrec/deep/file.txt")
+
+	// Recursive prefix eviction (default behavior)
+	tlog.Logln("Testing recursive evict...")
+	evdRecMsg := &apc.EvdMsg{ListRange: apc.ListRange{Template: "nested/"}}
+	evictRecID, err := api.EvictMultiObj(baseParams, bck, evdRecMsg)
+	tassert.CheckFatal(t, err)
+	time.Sleep(time.Second)
+	args = xact.ArgsMsg{ID: evictRecID, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	exists = tools.CheckObjIsPresent(proxyURL, bck, "nested/deep/file.txt")
+	tassert.Errorf(t, !exists, "nested object should be evicted: nested/deep/file.txt")
+
+	// Verify remaining objects still exist
+	remainingObjects := []string{"single_obj.txt", "nonrec/deep/file.txt"}
+	for _, objName := range remainingObjects {
+		exists := tools.CheckObjIsPresent(proxyURL, bck, objName)
+		tassert.Fatalf(t, exists, "object should still be cached: %s", objName)
+	}
+
+	tlog.Logf("Multi-object eviction test completed successfully")
 }
 
 func validateGETUponFileChangeForChecksumValidation(t *testing.T, proxyURL, objName, fqn string,
@@ -1190,60 +1568,82 @@ func TestChecksumValidateOnWarmGetForBucket(t *testing.T) {
 	}
 
 	// Test changing the file content.
-	objName := m.objNames[0]
-	fqn := findObjOnDisk(m.bck, objName)
-	tlog.Logf("Changing contents of the file [%s]: %s\n", objName, fqn)
+	var (
+		objName   = m.objNames[0]
+		fqn       string
+		isChunked = m.chunksConf != nil && m.chunksConf.multipart
+	)
+	if isChunked {
+		fqns := m.findObjChunksOnDisk(m.bck, objName)
+		tassert.Fatalf(t, len(fqns) > 0, "object should have chunks: %s", objName)
+		fqn = fqns[0]
+	} else {
+		fqn = m.findObjOnDisk(m.bck, objName)
+	}
+
+	tlog.Logfln("Changing contents of the file [%s]: %s", objName, fqn)
 	err := os.WriteFile(fqn, []byte("Contents of this file have been changed."), cos.PermRWR)
 	tassert.CheckFatal(t, err)
-	executeTwoGETsForChecksumValidation(proxyURL, m.bck, objName, t)
+	executeTwoGETsForChecksumValidation(proxyURL, m.bck, objName, isChunked, t)
 
-	// Test changing the file xattr.
-	objName = m.objNames[1]
-	fqn = findObjOnDisk(m.bck, objName)
-	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234abcde"))
-	tassert.CheckError(t, err)
-	executeTwoGETsForChecksumValidation(proxyURL, m.bck, objName, t)
+	// Skip xattr tests for chunked/multipart objects
+	if !isChunked {
+		// Test changing the file xattr.
+		objName = m.objNames[1]
+		fqn = m.findObjOnDisk(m.bck, objName)
+		tlog.Logfln("Changing file xattr[%s]: %s", objName, fqn)
+		err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "deadbeefcafebabe"))
+		tassert.CheckError(t, err)
+		executeTwoGETsForChecksumValidation(proxyURL, m.bck, objName, isChunked, t)
 
-	// Test for none checksum algorithm.
-	objName = m.objNames[2]
-	fqn = findObjOnDisk(m.bck, objName)
+		// Test for none checksum algorithm.
+		objName = m.objNames[2]
+		fqn = m.findObjOnDisk(m.bck, objName)
 
-	if cksumConf.Type != cos.ChecksumNone {
-		propsToSet := &cmn.BpropsToSet{
-			Cksum: &cmn.CksumConfToSet{
-				Type: apc.Ptr(cos.ChecksumNone),
-			},
+		if cksumConf.Type != cos.ChecksumNone {
+			propsToSet := &cmn.BpropsToSet{
+				Cksum: &cmn.CksumConfToSet{
+					Type: apc.Ptr(cos.ChecksumNone),
+				},
+			}
+			_, err = api.SetBucketProps(baseParams, m.bck, propsToSet)
+			tassert.CheckFatal(t, err)
 		}
-		_, err = api.SetBucketProps(baseParams, m.bck, propsToSet)
-		tassert.CheckFatal(t, err)
-	}
 
-	tlog.Logf("Changing file xattr[%s]: %s\n", objName, fqn)
-	err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "01234abcde"))
-	tassert.CheckError(t, err)
-	_, err = api.GetObject(baseParams, m.bck, objName, nil)
-	tassert.CheckError(t, err)
+		tlog.Logfln("Changing file xattr[%s]: %s", objName, fqn)
+		err = tools.SetXattrCksum(fqn, m.bck, cos.NewCksum(cos.ChecksumCesXxh, "deadbeefcafebabe"))
+		tassert.CheckError(t, err)
+		_, err = api.GetObject(baseParams, m.bck, objName, nil)
+		tassert.CheckError(t, err)
+	}
 }
 
-func executeTwoGETsForChecksumValidation(proxyURL string, bck cmn.Bck, objName string, t *testing.T) {
+func executeTwoGETsForChecksumValidation(proxyURL string, bck cmn.Bck, objName string, isChunked bool, t *testing.T) {
 	baseParams := tools.BaseAPIParams(proxyURL)
 	_, err := api.GetObjectWithValidation(baseParams, bck, objName, nil)
-	if err == nil {
+	herr := cmn.AsErrHTTP(err)
+	switch {
+	case herr == nil:
 		t.Error("Error is nil, expected internal server error on a GET for an object")
-	} else if !strings.Contains(err.Error(), "ErrBadCksum") {
-		t.Errorf("Expected bad checksum error on a GET for a corrupted object, got [%v]", err)
+	case isChunked && !strings.Contains(herr.Message, "truncated"): // TODO: create a new error type for it and replace it with generic `IsErr*` check
+		t.Errorf("Expected chunk truncated error on a GET for a corrupted object, got [%v]", herr)
+	case !isChunked && !cos.IsErrBadCksum(herr):
+		t.Errorf("Expected bad checksum error on a GET for a corrupted object, got [%v]", herr)
 	}
+
 	// Execute another GET to make sure that the object is deleted
 	_, err = api.GetObjectWithValidation(baseParams, bck, objName, nil)
-	if err == nil {
+	herr = cmn.AsErrHTTP(err)
+	switch {
+	case herr == nil:
 		t.Error("Error is nil, expected not found on a second GET for a corrupted object")
-	} else if !strings.Contains(err.Error(), "ErrNotFound") {
-		t.Errorf("Expected Not Found on a second GET for a corrupted object, got [%v]", err)
+	case isChunked && !strings.Contains(herr.Message, "truncated"):
+		t.Errorf("Expected chunk truncated error on a GET for a corrupted object, got [%v]", herr)
+	case !isChunked && !cos.IsErrNotFound(herr):
+		t.Errorf("Expected Not Found on a second GET for a corrupted object, got [%v]", herr)
 	}
 }
 
-// TODO: validate range checksums
 func TestRangeRead(t *testing.T) {
 	initMountpaths(t, tools.RandomProxyURL(t)) // to run findObjOnDisk() and validate range
 
@@ -1262,13 +1662,14 @@ func TestRangeRead(t *testing.T) {
 		)
 
 		m.init(true /*cleanup*/)
+
 		m.puts()
 		if m.bck.IsRemote() {
 			defer m.del()
 		}
 		objName := m.objNames[0]
 
-		defer func() {
+		t.Cleanup(func() {
 			tlog.Logln("Cleaning up...")
 			propsToSet := &cmn.BpropsToSet{
 				Cksum: &cmn.CksumConfToSet{
@@ -1277,7 +1678,7 @@ func TestRangeRead(t *testing.T) {
 			}
 			_, err := api.SetBucketProps(baseParams, m.bck, propsToSet)
 			tassert.CheckError(t, err)
-		}()
+		})
 
 		tlog.Logln("Valid range with object checksum...")
 		// Validate that entire object checksum is being returned
@@ -1290,7 +1691,7 @@ func TestRangeRead(t *testing.T) {
 			_, err := api.SetBucketProps(baseParams, m.bck, propsToSet)
 			tassert.CheckFatal(t, err)
 		}
-		testValidCases(t, proxyURL, bck.Clone(), cksumProps.Type, m.fileSize, objName, true)
+		testValidCases(&m, bck.Clone(), cksumProps, m.fileSize, objName)
 
 		// Validate only that range checksum is being returned
 		tlog.Logln("Valid range with range checksum...")
@@ -1303,7 +1704,7 @@ func TestRangeRead(t *testing.T) {
 			_, err := api.SetBucketProps(baseParams, bck.Clone(), propsToSet)
 			tassert.CheckFatal(t, err)
 		}
-		testValidCases(t, proxyURL, m.bck, cksumProps.Type, m.fileSize, objName, false)
+		testValidCases(&m, m.bck, cksumProps, m.fileSize, objName)
 
 		tlog.Logln("Valid range query...")
 		verifyValidRangesQuery(t, proxyURL, m.bck, objName, "bytes=-1", 1)
@@ -1328,61 +1729,44 @@ func TestRangeRead(t *testing.T) {
 	})
 }
 
-// TODO: validate range checksum if enabled
-func testValidCases(t *testing.T, proxyURL string, bck cmn.Bck, cksumType string, fileSize uint64, objName string,
-	checkEntireObjCksum bool) {
-	// Range-Read the entire file in 500 increments
-	byteRange := int64(500)
+func testValidCases(m *ioContext, bck cmn.Bck, cksumConf *cmn.CksumConf, fileSize uint64, objName string) {
+	const byteRange = int64(500)
 	iterations := int64(fileSize) / byteRange
-	for i := int64(0); i < iterations; i += byteRange {
-		verifyValidRanges(t, proxyURL, bck, cksumType, objName, i, byteRange, byteRange, checkEntireObjCksum)
+	for j := range iterations {
+		off := j * byteRange
+		verifyValidRanges(m, bck, cksumConf, objName, off, byteRange, byteRange)
 	}
-
-	verifyValidRanges(t, proxyURL, bck, cksumType, objName, byteRange*iterations, byteRange,
-		int64(fileSize)%byteRange, checkEntireObjCksum)
+	if rem := int64(fileSize) % byteRange; rem != 0 {
+		verifyValidRanges(m, bck, cksumConf, objName, iterations*byteRange, byteRange, rem)
+	}
 }
 
-func verifyValidRanges(t *testing.T, proxyURL string, bck cmn.Bck, cksumType, objName string,
-	offset, length, expectedLength int64, checkEntireObjCksum bool) {
+func verifyValidRanges(m *ioContext, bck cmn.Bck, cksumConf *cmn.CksumConf, objName string, offset, length, expectedLength int64) {
 	var (
 		w          = bytes.NewBuffer(nil)
 		rng        = cmn.MakeRangeHdr(offset, length)
 		hdr        = http.Header{cos.HdrRange: []string{rng}}
-		baseParams = tools.BaseAPIParams(proxyURL)
-		fqn        = findObjOnDisk(bck, objName)
+		baseParams = tools.BaseAPIParams(m.proxyURL)
 		args       = api.GetArgs{Writer: w, Header: hdr}
+		oah        api.ObjAttrs
+		err        error
 	)
-
-	oah, err := api.GetObjectWithValidation(baseParams, bck, objName, &args)
-	if err != nil {
-		if !checkEntireObjCksum {
-			t.Errorf("Failed to GET %s: %v", bck.Cname(objName), err)
-		} else {
-			if ckErr, ok := err.(*cmn.ErrInvalidCksum); ok {
-				file, err := os.Open(fqn)
-				if err != nil {
-					t.Fatalf("Unable to open file: %s. Error:  %v", fqn, err)
-				}
-				defer file.Close()
-				_, cksum, err := cos.CopyAndChecksum(io.Discard, file, nil, cksumType)
-				if err != nil {
-					t.Errorf("Unable to compute cksum of file: %s. Error:  %s", fqn, err)
-				}
-				if cksum.Value() != ckErr.Expected() {
-					t.Errorf("Expected entire object checksum [%s], checksum returned in response [%s]",
-						ckErr.Expected(), cksum)
-				}
-			} else {
-				t.Errorf("Unexpected error returned [%v].", err)
-			}
-		}
-	} else if oah.Size() != expectedLength {
-		t.Errorf("number of bytes received (%d) is different from expected (%d)", oah.Size(), expectedLength)
+	isrng := offset > 0 || length != 0
+	if isrng && !cksumConf.EnableReadRange {
+		oah, err = api.GetObject(baseParams, bck, objName, &args)
+	} else {
+		oah, err = api.GetObjectWithValidation(baseParams, bck, objName, &args)
 	}
+	tassert.CheckError(m.t, err)
+	if oah.Size() != expectedLength {
+		m.t.Errorf("number of bytes received (%d) is different from expected (%d)", oah.Size(), expectedLength)
+	}
+
+	fqn := m.findObjOnDisk(bck, objName)
 
 	file, err := os.Open(fqn)
 	if err != nil {
-		t.Fatalf("Unable to open file: %s. Error:  %v", fqn, err)
+		m.t.Fatalf("Unable to open file: %s. Error:  %v", fqn, err)
 	}
 	defer file.Close()
 	outputBytes := w.Bytes()
@@ -1390,19 +1774,19 @@ func verifyValidRanges(t *testing.T, proxyURL string, bck cmn.Bck, cksumType, ob
 	expectedBytesBuffer := bytes.NewBuffer(nil)
 	_, err = expectedBytesBuffer.ReadFrom(sectionReader)
 	if err != nil {
-		t.Errorf("Unable to read the file %s, from offset: %d and length: %d. Error: %v", fqn, offset, length, err)
+		m.t.Errorf("Unable to read the file %s, from offset: %d and length: %d. Error: %v", fqn, offset, length, err)
 	}
 	expectedBytes := expectedBytesBuffer.Bytes()
 	if len(outputBytes) != len(expectedBytes) {
-		t.Errorf("Bytes length mismatch. Expected bytes: [%d]. Actual bytes: [%d]", len(expectedBytes), len(outputBytes))
+		m.t.Errorf("Bytes length mismatch. Expected bytes: [%d]. Actual bytes: [%d]", len(expectedBytes), len(outputBytes))
 	}
 	if int64(len(outputBytes)) != expectedLength {
-		t.Errorf("Returned bytes don't match expected length. Expected length: [%d]. Output length: [%d]",
+		m.t.Errorf("Returned bytes don't match expected length. Expected length: [%d]. Output length: [%d]",
 			expectedLength, len(outputBytes))
 	}
 	for i := range expectedBytes {
 		if expectedBytes[i] != outputBytes[i] {
-			t.Errorf("Byte mismatch. Expected: %v, Actual: %v", string(expectedBytes), string(outputBytes))
+			m.t.Errorf("Byte mismatch. Expected: %v, Actual: %v", string(expectedBytes), string(outputBytes))
 		}
 	}
 }
@@ -1415,8 +1799,6 @@ func verifyValidRangesQuery(t *testing.T, proxyURL string, bck cmn.Bck, objName,
 	)
 	oah, err := api.GetObject(baseParams, bck, objName, &args)
 	tassert.CheckFatal(t, err)
-
-	tlog.Logf("rangeQuery=%s, n=%d\n", rangeQuery, oah.Size()) // DEBUG
 
 	// check size
 	tassert.Errorf(t, oah.Size() == expectedLength, "expected range length %d, got %d",
@@ -1497,7 +1879,7 @@ func Test_checksum(t *testing.T) {
 
 	start := time.Now()
 	m.gets(nil /*api.GetArgs*/, false /*withValidate*/)
-	tlog.Logf("GET %s without any checksum validation: %v\n", cos.ToSizeIEC(totalSize, 0), time.Since(start))
+	tlog.Logfln("GET %s without any checksum validation: %v", cos.IEC(totalSize, 0), time.Since(start))
 
 	m.evict()
 
@@ -1512,7 +1894,7 @@ func Test_checksum(t *testing.T) {
 
 	start = time.Now()
 	m.gets(nil /*api.GetArgs*/, true /*withValidate*/)
-	tlog.Logf("GET %s and validate checksum: %v\n", cos.ToSizeIEC(totalSize, 0), time.Since(start))
+	tlog.Logfln("GET %s and validate checksum: %v", cos.IEC(totalSize, 0), time.Since(start))
 }
 
 func validateBucketProps(t *testing.T, expected *cmn.BpropsToSet, actual *cmn.Bprops) {
@@ -1529,29 +1911,6 @@ func resetBucketProps(t *testing.T, proxyURL string, bck cmn.Bck) {
 	baseParams := tools.BaseAPIParams(proxyURL)
 	_, err := api.ResetBucketProps(baseParams, bck)
 	tassert.CheckError(t, err)
-}
-
-func corruptSingleBitInFile(t *testing.T, bck cmn.Bck, objName string) {
-	var (
-		fqn     = findObjOnDisk(bck, objName)
-		fi, err = os.Stat(fqn)
-		b       = []byte{0}
-	)
-	tassert.CheckFatal(t, err)
-	off := rand.Int64N(fi.Size())
-	file, err := os.OpenFile(fqn, os.O_RDWR, cos.PermRWR)
-	tassert.CheckFatal(t, err)
-	_, err = file.Seek(off, 0)
-	tassert.CheckFatal(t, err)
-	_, err = file.Read(b)
-	tassert.CheckFatal(t, err)
-	bit := rand.IntN(8)
-	b[0] ^= 1 << bit
-	_, err = file.Seek(off, 0)
-	tassert.CheckFatal(t, err)
-	_, err = file.Write(b)
-	tassert.CheckFatal(t, err)
-	file.Close()
 }
 
 func TestPutObjectWithChecksum(t *testing.T) {
@@ -1613,7 +1972,7 @@ func TestPutObjectWithChecksum(t *testing.T) {
 
 		_, err := api.PutObject(&putArgs)
 		if err == nil {
-			t.Errorf("Bad checksum provided by the user, Expected an error")
+			t.Error("Bad checksum provided by the user, Expected an error")
 		}
 
 		_, err = api.HeadObject(baseParams, bck, fileName, api.HeadArgs{FltPresence: apc.FltExists})
@@ -1633,6 +1992,557 @@ func TestPutObjectWithChecksum(t *testing.T) {
 		attrs2 := op.ObjAttrs
 		tassert.Errorf(t, attrs1.CheckEq(&attrs2) == nil, "PUT(obj) attrs %s != %s HEAD\n", attrs1.String(), attrs2.String())
 	}
+}
+
+func TestMultipartUpload(t *testing.T) {
+	var (
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+		bck        = cmn.Bck{
+			Name:     trand.String(10),
+			Provider: apc.AIS,
+		}
+		objName = "test-multipart-object"
+
+		// Test data to upload in 3 parts
+		part1Data = []byte("This is the first part of the multipart upload test. ")
+		part2Data = []byte("This is the second part containing more test data. ")
+		part3Data = []byte("This is the final third part to complete the upload.")
+
+		// Complete expected content
+		expectedContent = append(append(part1Data, part2Data...), part3Data...)
+		partNumbers     = make([]int, 0, 3)
+	)
+
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+
+	tlog.Logfln("multipart upload: %s/%s", bck.Name, objName)
+
+	// Step 1: Create multipart upload
+	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
+
+	// Step 2: Upload three parts
+	testParts := []struct {
+		partNum int
+		data    []byte
+	}{
+		{1, part1Data},
+		{2, part2Data},
+		{3, part3Data},
+	}
+
+	for _, part := range testParts {
+		putPartArgs := &api.PutPartArgs{
+			PutArgs: api.PutArgs{
+				BaseParams: baseParams,
+				Bck:        bck,
+				ObjName:    objName,
+				Reader:     readers.NewBytes(part.data),
+				Size:       uint64(len(part.data)),
+			},
+			UploadID:   uploadID,
+			PartNumber: part.partNum,
+		}
+
+		err = api.UploadPart(putPartArgs)
+		tassert.CheckFatal(t, err)
+
+		partNumbers = append(partNumbers, part.partNum)
+	}
+
+	// Step 3: Complete multipart upload
+	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	tassert.CheckFatal(t, err)
+
+	// Step 4: Verify the uploaded object
+
+	// Check object exists
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+	objAttrs, err := api.HeadObject(baseParams, bck, objName, hargs)
+	tassert.CheckFatal(t, err)
+
+	// Verify object size matches expected content
+	expectedSize := int64(len(expectedContent))
+	tassert.Errorf(t, objAttrs.Size == expectedSize,
+		"object size mismatch: expected %d, got %d", expectedSize, objAttrs.Size)
+
+	// Download and verify content
+	writer := bytes.NewBuffer(nil)
+	getArgs := api.GetArgs{Writer: writer}
+	_, err = api.GetObject(baseParams, bck, objName, &getArgs)
+	tassert.CheckFatal(t, err)
+
+	downloadedContent := writer.Bytes()
+	tassert.Errorf(t, bytes.Equal(downloadedContent, expectedContent),
+		"content mismatch: expected %q, got %q", string(expectedContent), string(downloadedContent))
+}
+
+func TestMultipartUploadParallel(t *testing.T) {
+	var (
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+		bck        = cmn.Bck{
+			Name:     trand.String(10),
+			Provider: apc.AIS,
+		}
+		objName = "test-multipart-parallel-object"
+
+		// Test data to upload in 5 parts
+		part1Data = []byte("Part 1: This is the first chunk of data. ")
+		part2Data = []byte("Part 2: This is the second chunk with more content. ")
+		part3Data = []byte("Part 3: Here is the middle section of our test. ")
+		part4Data = []byte("Part 4: Almost done with the parallel upload. ")
+		part5Data = []byte("Part 5: Final part to complete our test object.")
+
+		// Complete expected content in proper order
+		expectedContent = append(append(append(append(part1Data, part2Data...), part3Data...), part4Data...), part5Data...)
+	)
+
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+
+	tlog.Logfln("multipart upload (parallel): %s/%s", bck.Name, objName)
+
+	// Step 1: Create multipart upload
+	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
+
+	// Step 2: Upload five parts in parallel with shuffled order
+	testParts := []struct {
+		partNum int
+		data    []byte
+	}{
+		{1, part1Data},
+		{2, part2Data},
+		{3, part3Data},
+		{4, part4Data},
+		{5, part5Data},
+	}
+
+	shuffledOrder := []int{3, 1, 5, 2, 4} // Upload parts in shuffled order
+
+	g := errgroup.Group{}
+	for _, partIdx := range shuffledOrder {
+		part := testParts[partIdx-1] // Convert to 0-based index
+
+		g.Go(func() error {
+			putPartArgs := &api.PutPartArgs{
+				PutArgs: api.PutArgs{
+					BaseParams: baseParams,
+					Bck:        bck,
+					ObjName:    objName,
+					Reader:     readers.NewBytes(part.data),
+					Size:       uint64(len(part.data)),
+				},
+				UploadID:   uploadID,
+				PartNumber: part.partNum,
+			}
+
+			return api.UploadPart(putPartArgs)
+		})
+	}
+
+	// Wait for all goroutines to complete and check for errors
+	err = g.Wait()
+	tassert.CheckFatal(t, err)
+
+	// Step 3: Complete multipart upload with parts in correct order
+	partNumbers := []int{1, 2, 3, 4, 5} // Parts must be completed in correct order
+	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	tassert.CheckFatal(t, err)
+
+	// Step 4: Verify the uploaded object
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+	objAttrs, err := api.HeadObject(baseParams, bck, objName, hargs)
+	tassert.CheckFatal(t, err)
+
+	expectedSize := int64(len(expectedContent))
+	tassert.Errorf(t, objAttrs.Size == expectedSize,
+		"object size mismatch: expected %d, got %d", expectedSize, objAttrs.Size)
+
+	writer := bytes.NewBuffer(nil)
+	getArgs := api.GetArgs{Writer: writer}
+	_, err = api.GetObject(baseParams, bck, objName, &getArgs)
+	tassert.CheckFatal(t, err)
+
+	downloadedContent := writer.Bytes()
+	tassert.Errorf(t, bytes.Equal(downloadedContent, expectedContent),
+		"content mismatch: expected %q, got %q", string(expectedContent), string(downloadedContent))
+
+	tlog.Logfln("parallel multipart upload completed successfully with correct content ordering")
+}
+
+func TestMultipartMaxChunks(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
+
+	var (
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+		bck        = cmn.Bck{
+			Name:     trand.String(10),
+			Provider: apc.AIS,
+		}
+		miniPartData = []byte("x") // Minimal 1-byte data per part
+	)
+
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+
+	t.Run("exceed-limit", func(t *testing.T) {
+		var (
+			objName  = "test-multipart-exceed-limit"
+			numParts = core.MaxChunkCount + 100 // Exceed limit by 100
+		)
+
+		uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+		tassert.CheckFatal(t, err)
+
+		err = uploadPartsInParallel(objName, uploadID, numParts, bck, miniPartData)
+
+		// We expect an error because we're exceeding MaxChunkCount
+		tassert.Fatalf(t, err != nil, "expected error when exceeding MaxChunkCount, but upload succeeded")
+		herr := cmn.AsErrHTTP(err)
+		tassert.Fatalf(t, herr != nil, "expected ErrHTTP, got %v", err)
+		tassert.Fatalf(t, strings.Contains(herr.Message, "exceeds the maximum allowed"),
+			"expected error message to contain 'exceeds the maximum allowed', got: %v", err)
+
+		tlog.Logfln("multipart upload correctly rejected when exceeding MaxChunkCount (%d)", core.MaxChunkCount)
+
+		// Cleanup: abort the upload
+		_ = api.AbortMultipartUpload(baseParams, bck, objName, uploadID)
+	})
+
+	t.Run("equal-to-limit", func(t *testing.T) {
+		var (
+			objName  = "test-multipart-at-limit"
+			numParts = core.MaxChunkCount // Exactly at the limit
+		)
+
+		uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
+
+		// Upload parts in parallel - all should succeed
+		err = uploadPartsInParallel(objName, uploadID, numParts, bck, miniPartData)
+		tassert.CheckFatal(t, err)
+
+		// Complete multipart upload
+		partNumbers := make([]int, numParts)
+		for i := range numParts {
+			partNumbers[i] = i + 1
+		}
+		err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+		tassert.CheckFatal(t, err)
+
+		tlog.Logfln("multipart upload completed successfully with %d parts at MaxChunkCount", numParts)
+
+		// Verify the uploaded object
+		hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+		objAttrs, err := api.HeadObject(baseParams, bck, objName, hargs)
+		tassert.CheckFatal(t, err)
+
+		expectedSize := int64(numParts * len(miniPartData))
+		tassert.Fatalf(t, objAttrs.Size == expectedSize, "object size mismatch: expected %d, got %d", expectedSize, objAttrs.Size)
+
+		// GET the object and validate content
+		writer := bytes.NewBuffer(nil)
+		getArgs := api.GetArgs{Writer: writer}
+		_, err = api.GetObject(baseParams, bck, objName, &getArgs)
+		tassert.CheckFatal(t, err)
+
+		downloadedContent := writer.Bytes()
+		tassert.Errorf(t, len(downloadedContent) == numParts,
+			"content length mismatch: expected %d bytes, got %d", numParts, len(downloadedContent))
+
+		// Validate all bytes are 'x'
+		for i, b := range downloadedContent {
+			if b != 'x' {
+				t.Fatalf("byte at position %d is %q, expected 'x'", i, b)
+			}
+		}
+
+		tlog.Logfln("object content validated successfully: %d bytes, all 'x'", len(downloadedContent))
+	})
+}
+
+func uploadPartsInParallel(objName, uploadID string, numParts int, bck cmn.Bck, data []byte) error {
+	g := errgroup.Group{}
+	g.SetLimit(sys.MaxParallelism())
+
+	for partNum := 1; partNum <= numParts; partNum++ {
+		pn := partNum
+
+		g.Go(func() error {
+			putPartArgs := &api.PutPartArgs{
+				PutArgs: api.PutArgs{
+					BaseParams: baseParams,
+					Bck:        bck,
+					ObjName:    objName,
+					Reader:     readers.NewBytes(data),
+					Size:       uint64(len(data)),
+				},
+				UploadID:   uploadID,
+				PartNumber: pn,
+			}
+
+			return api.UploadPart(putPartArgs)
+		})
+	}
+
+	return g.Wait()
+}
+
+func TestMultipartUploadAbort(t *testing.T) {
+	var (
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+		bck        = cmn.Bck{
+			Name:     trand.String(10),
+			Provider: apc.AIS,
+		}
+		objName = "test-multipart-abort-object"
+
+		// Test data to upload in parts
+		part1Data = []byte("Part 1: This is the first part before abort. ")
+		part2Data = []byte("Part 2: This is the second part before abort. ")
+		part3Data = []byte("Part 3: This part should fail after abort. ")
+	)
+
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+
+	tlog.Logfln("multipart upload abort test: %s/%s", bck.Name, objName)
+
+	// Step 1: Create multipart upload
+	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
+
+	// Step 2: Upload first two parts successfully
+	testParts := []struct {
+		partNum int
+		data    []byte
+	}{
+		{1, part1Data},
+		{2, part2Data},
+	}
+
+	for _, part := range testParts {
+		putPartArgs := &api.PutPartArgs{
+			PutArgs: api.PutArgs{
+				BaseParams: baseParams,
+				Bck:        bck,
+				ObjName:    objName,
+				Reader:     readers.NewBytes(part.data),
+				Size:       uint64(len(part.data)),
+			},
+			UploadID:   uploadID,
+			PartNumber: part.partNum,
+		}
+
+		err = api.UploadPart(putPartArgs)
+		tassert.CheckFatal(t, err)
+		tlog.Logfln("successfully uploaded part %d before abort", part.partNum)
+	}
+
+	// Step 3: Abort the multipart upload
+	tlog.Logfln("aborting multipart upload with ID: %s", uploadID)
+	err = api.AbortMultipartUpload(baseParams, bck, objName, uploadID)
+	tassert.CheckFatal(t, err)
+
+	// Negative tests below
+
+	// Step 4: Try to upload another part after abort - should fail
+	tlog.Logfln("attempting to upload part after abort (should fail)")
+	putPartArgs := &api.PutPartArgs{
+		PutArgs: api.PutArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+			Reader:     readers.NewBytes(part3Data),
+			Size:       uint64(len(part3Data)),
+		},
+		UploadID:   uploadID,
+		PartNumber: 3,
+	}
+
+	err = api.UploadPart(putPartArgs)
+	tassert.Errorf(t, err != nil, "upload part after abort should fail, but succeeded")
+	if err != nil {
+		tlog.Logfln("correctly failed to upload part after abort: %v", err)
+	}
+
+	// Step 5: Try to complete multipart upload after abort - should fail
+	tlog.Logfln("attempting to complete upload after abort (should fail)")
+	partNumbers := []int{1, 2}
+	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	tassert.Errorf(t, err != nil, "complete multipart upload after abort should fail, but succeeded")
+	if err != nil {
+		tlog.Logfln("correctly failed to complete upload after abort: %v", err)
+	}
+
+	// Step 6: Try to abort again - should be idempotent or fail gracefully
+	tlog.Logfln("attempting to abort again (should be idempotent)")
+	err = api.AbortMultipartUpload(baseParams, bck, objName, uploadID)
+	// This may succeed (idempotent) or fail gracefully, both are acceptable
+	if err != nil {
+		tlog.Logfln("second abort failed as expected: %v", err)
+	} else {
+		tlog.Logfln("second abort succeeded (idempotent behavior)")
+	}
+
+	// Step 7: Verify that no object was created
+	tlog.Logfln("verifying that object was not created after abort")
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+	_, err = api.HeadObject(baseParams, bck, objName, hargs)
+	tassert.Errorf(t, err != nil, "object should not exist after abort, but HEAD succeeded")
+	if err != nil {
+		tlog.Logfln("correctly confirmed object does not exist after abort")
+	}
+
+	// Step 8: Test abort workflow with immediate abort (no parts uploaded)
+	tlog.Logfln("testing immediate abort without uploading parts")
+	objName2 := "test-multipart-immediate-abort"
+	uploadID2, err := api.CreateMultipartUpload(baseParams, bck, objName2)
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, uploadID2 != "", "upload ID should not be empty")
+
+	// Immediately abort without uploading any parts
+	err = api.AbortMultipartUpload(baseParams, bck, objName2, uploadID2)
+	tassert.CheckFatal(t, err)
+	tlog.Logfln("successfully aborted upload immediately without any parts")
+
+	// Verify this object also doesn't exist
+	_, err = api.HeadObject(baseParams, bck, objName2, hargs)
+	tassert.Errorf(t, err != nil, "immediately aborted object should not exist")
+
+	tlog.Logfln("multipart upload abort test completed successfully")
+}
+
+func TestMultipartUploadAndCopyBucket(t *testing.T) {
+	var (
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+		bck        = cmn.Bck{
+			Name:     trand.String(10),
+			Provider: apc.AIS,
+		}
+		dstBck = cmn.Bck{
+			Name:     trand.String(10),
+			Provider: apc.AIS,
+		}
+
+		// Create 30 multipart objects
+		numObjects = 30
+
+		// Test data to upload in 3 parts per object
+		part1Data = []byte("This is the first part of the multipart upload test. ")
+		part2Data = []byte("This is the second part containing more test data. ")
+		part3Data = []byte("This is the final third part to complete the upload.")
+
+		// Complete expected content per object
+		expectedContent = append(append(part1Data, part2Data...), part3Data...)
+
+		// Track all created objects
+		createdObjects = make([]string, numObjects)
+	)
+
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+
+	tlog.Logfln("Creating %d multipart objects in bucket: %s", numObjects, bck.Name)
+
+	// Step 1: Create 30 multipart objects
+	for i := range numObjects {
+		objName := fmt.Sprintf("test-multipart-object-%d", i)
+		createdObjects[i] = objName
+
+		// Create multipart upload
+		uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, uploadID != "", "upload ID should not be empty for object %d", i)
+
+		// Upload three parts
+		testParts := []struct {
+			partNum int
+			data    []byte
+		}{
+			{1, part1Data},
+			{2, part2Data},
+			{3, part3Data},
+		}
+
+		var partNumbers []int
+		for _, part := range testParts {
+			putPartArgs := &api.PutPartArgs{
+				PutArgs: api.PutArgs{
+					BaseParams: baseParams,
+					Bck:        bck,
+					ObjName:    objName,
+					Reader:     readers.NewBytes(part.data),
+					Size:       uint64(len(part.data)),
+				},
+				UploadID:   uploadID,
+				PartNumber: part.partNum,
+			}
+
+			err = api.UploadPart(putPartArgs)
+			tassert.CheckFatal(t, err)
+
+			partNumbers = append(partNumbers, part.partNum)
+		}
+
+		// Complete multipart upload
+		err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+		tassert.CheckFatal(t, err)
+	}
+
+	tlog.Logfln("Successfully created %d multipart objects", numObjects)
+
+	// Step 2: Copy bucket
+	tlog.Logfln("Copying bucket with %d chunked files: %s -> %s", numObjects, bck.Name, dstBck.Name)
+	xid, err := api.CopyBucket(baseParams, bck, dstBck, &apc.TCBMsg{CopyBckMsg: apc.CopyBckMsg{}, ContinueOnError: true})
+	if err != nil && ensurePrevRebalanceIsFinished(baseParams, err) {
+		// can retry
+		xid, err = api.CopyBucket(baseParams, bck, dstBck, &apc.TCBMsg{CopyBckMsg: apc.CopyBckMsg{}, ContinueOnError: true})
+	}
+	tassert.CheckFatal(t, err)
+
+	t.Cleanup(func() {
+		tools.DestroyBucket(t, proxyURL, dstBck)
+	})
+
+	// Wait for copy to complete
+	args := xact.ArgsMsg{ID: xid, Kind: apc.ActCopyBck, Timeout: 3 * time.Minute}
+	_, err = api.WaitForXactionIC(baseParams, &args)
+	tassert.CheckFatal(t, err)
+
+	// Step 3: Verify all objects were copied correctly
+	tlog.Logfln("Verifying all %d copied objects in destination bucket", numObjects)
+
+	expectedSize := int64(len(expectedContent))
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
+
+	for i, objName := range createdObjects {
+		// Check object exists in destination
+		objAttrs, err := api.HeadObject(baseParams, dstBck, objName, hargs)
+		tassert.CheckFatal(t, err)
+
+		// Verify size
+		tassert.Errorf(t, objAttrs.Size == expectedSize,
+			"object %d size mismatch: expected %d, got %d", i, expectedSize, objAttrs.Size)
+
+		// Download and verify content
+		writer := bytes.NewBuffer(nil)
+		getArgs := api.GetArgs{Writer: writer}
+		_, err = api.GetObject(baseParams, dstBck, objName, &getArgs)
+		tassert.CheckFatal(t, err)
+
+		downloadedContent := writer.Bytes()
+		tassert.Errorf(t, bytes.Equal(downloadedContent, expectedContent),
+			"object %d content mismatch", i)
+	}
+
+	tlog.Logfln("SUCCESS: All %d multipart chunked objects copied correctly", numObjects)
 }
 
 func TestOperationsWithRanges(t *testing.T) {
@@ -1661,7 +2571,7 @@ func TestOperationsWithRanges(t *testing.T) {
 					)
 				}
 				for _, objName := range objList {
-					r, _ := readers.NewRand(objSize, cksumType)
+					r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: objSize, CksumType: cksumType})
 					_, err := api.PutObject(&api.PutArgs{
 						BaseParams: baseParams,
 						Bck:        bck.Clone(),
@@ -1719,7 +2629,7 @@ func TestOperationsWithRanges(t *testing.T) {
 				}
 
 				for idx, test := range tests {
-					tlog.Logf("%d. %s; range: [%s]\n", idx+1, test.name, test.rangeStr)
+					tlog.Logfln("%d. %s; range: [%s]", idx+1, test.name, test.rangeStr)
 
 					var (
 						err    error
@@ -1741,6 +2651,7 @@ func TestOperationsWithRanges(t *testing.T) {
 						continue
 					}
 
+					time.Sleep(time.Second)
 					args := xact.ArgsMsg{ID: xid, Kind: kind, Timeout: waitTimeout}
 					_, err = api.WaitForXactionIC(baseParams, &args)
 					tassert.CheckFatal(t, err)
@@ -1757,14 +2668,14 @@ func TestOperationsWithRanges(t *testing.T) {
 						continue
 					}
 
-					tlog.Logf("  %d objects have been deleted/evicted\n", test.delta)
+					tlog.Logfln("  %d objects have been deleted/evicted", test.delta)
 				}
 
 				msg := &apc.LsoMsg{Prefix: "test/"}
 				lst, err := api.ListObjects(baseParams, b, msg, api.ListArgs{})
 				tassert.CheckFatal(t, err)
 
-				tlog.Logf("Cleaning up remaining objects...\n")
+				tlog.Logfln("Cleaning up remaining objects...")
 				for _, obj := range lst.Entries {
 					err := tools.Del(proxyURL, b, obj.Name, nil, nil, true /*silent*/)
 					tassert.CheckError(t, err)

@@ -19,24 +19,34 @@ jobs:
         python-version: ['3.9','3.10','3.11','3.12','3.13']
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
+      - name: Configure system
+        run: |
+          sudo sysctl -w vm.swappiness=10
 
       - name: Create KinD K8s Cluster
         uses: helm/kind-action@v1
 
+      - name: Install kapp
+        run: |
+          curl -LO "https://github.com/carvel-dev/kapp/releases/latest/download/kapp-linux-amd64"
+          chmod +x kapp-linux-amd64
+          sudo mv kapp-linux-amd64 /usr/local/bin/kapp
+
       - name: Run AIStore in KinD
         run: |
-          cd $GITHUB_WORKSPACE/deploy/dev/k8s/kustomize
+          cd $GITHUB_WORKSPACE/deploy/dev/k8s
           make github-ci
 
       - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Python ETL Tests
         run: |
           cd $GITHUB_WORKSPACE/python/
-          source $GITHUB_WORKSPACE/deploy/dev/k8s/kustomize/utils/export_endpoint.sh
+          source $GITHUB_WORKSPACE/deploy/dev/k8s/export_endpoint.sh
           make python_etl_tests
 

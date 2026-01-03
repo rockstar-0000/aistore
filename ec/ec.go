@@ -6,6 +6,7 @@ package ec
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -201,9 +202,6 @@ func Init() {
 	g.pmm = core.T.PageMM()
 	g.smm = core.T.ByteMM()
 
-	fs.CSM.Reg(fs.ECSliceType, &fs.ECSliceContentResolver{})
-	fs.CSM.Reg(fs.ECMetaType, &fs.ECMetaContentResolver{})
-
 	xreg.RegBckXact(&getFactory{})
 	xreg.RegBckXact(&putFactory{})
 	xreg.RegBckXact(&rspFactory{})
@@ -320,7 +318,7 @@ func unique(prefix string, bck *meta.Bck, objName string) string {
 		pack  = cos.NewPacker(nil, l)
 	)
 	pack.WriteString(prefix)
-	pack.WriteByte(filepath.Separator)
+	pack.WriteUint8(filepath.Separator)
 	pack.WriteBytes(uname)
 	b := pack.Bytes()
 	debug.Assert(len(b) == l, len(b), " vs ", l)
@@ -335,14 +333,18 @@ func IsECCopy(size int64, ecConf *cmn.ECConf) bool {
 // Depends on available free memory and size of an object to process
 func useDisk(objSize int64, config *cmn.Config) bool {
 	if config.EC.DiskOnly {
+		nlog.Infoln("config: using disk")
 		return true
 	}
 	memPressure := g.pmm.Pressure()
 	switch memPressure {
 	case memsys.OOM, memsys.PressureExtreme:
+		nlog.Warningln("using disk")
 		return true
 	case memsys.PressureHigh:
-		return objSize > objSizeHighMem
+		use := objSize > objSizeHighMem
+		nlog.Infoln("use disk:", use, "[", objSize, objSizeHighMem, "]")
+		return use
 	default:
 		return false
 	}
@@ -358,7 +360,7 @@ func freeObject(r any) {
 		if handle != nil {
 			handle.Free()
 		}
-	case *cos.FileHandle:
+	case *core.LomHandle:
 		if handle != nil {
 			// few slices share the same handle, on error all release everything
 			_ = handle.Close()
@@ -387,7 +389,7 @@ func RequestECMeta(bck *cmn.Bck, objName string, si *meta.Snode, client *http.Cl
 	query := url.Values{}
 	query = bck.AddToQuery(query)
 	url := si.URL(cmn.NetIntraControl) + path
-	rq, err := http.NewRequest(http.MethodGet, url, http.NoBody)
+	rq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -442,12 +444,12 @@ func validateBckBID(bck *cmn.Bck, bid uint64) error {
 
 // WriteSliceAndMeta saves slice and its metafile
 func WriteSliceAndMeta(hdr *transport.ObjHdr, args *WriteArgs) error {
-	ct, err := core.NewCTFromBO(&hdr.Bck, hdr.ObjName, core.T.Bowner(), fs.ECSliceType)
+	ct, err := core.NewCTFromBO(meta.CloneBck(&hdr.Bck), hdr.ObjName, fs.ECSliceCT)
 	if err != nil {
 		return err
 	}
 	ct.Lock(true)
-	ctMeta := ct.Clone(fs.ECMetaType)
+	ctMeta := ct.Clone(fs.ECMetaCT)
 	defer func() {
 		ct.Unlock(true)
 		if err == nil {
@@ -465,7 +467,7 @@ func WriteSliceAndMeta(hdr *transport.ObjHdr, args *WriteArgs) error {
 			return nil
 		}
 	}
-	tmpFQN := ct.Make(fs.WorkfileType)
+	tmpFQN := ct.GenFQN(fs.WorkCT, "w-slice-meta")
 	if err := ct.Write(args.Reader, hdr.ObjAttrs.Size, tmpFQN); err != nil {
 		return err
 	}
@@ -485,7 +487,7 @@ func WriteSliceAndMeta(hdr *transport.ObjHdr, args *WriteArgs) error {
 func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) error {
 	lom.Lock(false)
 	if args.Generation != 0 {
-		ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
+		ctMeta := core.NewCTFromLOM(lom, fs.ECMetaCT)
 		if oldMeta, oldErr := LoadMetadata(ctMeta.FQN()); oldErr == nil && oldMeta.Generation > args.Generation {
 			lom.Unlock(false)
 			return nil
@@ -497,12 +499,12 @@ func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) error {
 	if err := writeObject(lom, args.Reader, lom.Lsize(true), args.Xact); err != nil {
 		return err
 	}
-	if !args.Cksum.IsEmpty() && !lom.EqCksum(args.Cksum) {
+	if !cos.NoneC(args.Cksum) && !lom.EqCksum(args.Cksum) {
 		return cos.NewErrDataCksum(args.Cksum, lom.Checksum(), lom.Cname())
 	}
 
 	// meta
-	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
+	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaCT)
 	ctMeta.Lock(true)
 	err := ctMeta.Write(bytes.NewReader(args.MD), -1, "" /*work fqn*/)
 	if err == nil {
@@ -526,7 +528,7 @@ func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) error {
 // lom <= transport.ObjHdr (NOTE: caller must call freeLOM)
 func AllocLomFromHdr(hdr *transport.ObjHdr) (*core.LOM, error) {
 	lom := core.AllocLOM(hdr.ObjName)
-	if err := lom.InitBck(&hdr.Bck); err != nil {
+	if err := lom.InitCmnBck(&hdr.Bck); err != nil {
 		return nil, err
 	}
 	lom.CopyAttrs(&hdr.ObjAttrs, false /*skip checksum*/)

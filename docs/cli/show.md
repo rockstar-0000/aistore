@@ -11,7 +11,8 @@ COMMANDS:
    auth            show entity in authn
    object          show object properties
    bucket          show bucket properties
-   cluster         main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
+   cluster         Show cluster: health, version and build, and nodes (including capacity and memory, load averages and alerts)
+   dashboard       show cluster at-a-glance dashboard: node counts, capacity, performance, health, software version, and more
    performance     show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
    storage         show storage usage and utilization, disks and mountpaths
    rebalance       show rebalance status and stats
@@ -48,15 +49,16 @@ As far as `ais show`, the command currently extends as follows:
 $ ais show <TAB-TAB>
 
 auth             bucket           performance      rebalance        remote-cluster   log
-object           cluster          storage          config           job              tls
+object           cluster          dashboard        storage          config           job              tls
 ```
 
-In other words, there are currently 11 subcommands that are briefly described in the rest of this text.
+In other words, there are currently 12 subcommands that are briefly described in the rest of this text.
 
 ## Table of Contents
 - [`ais show performance`](#ais-show-performance)
 - [`ais show job`](#ais-show-job)
 - [`ais show cluster`](#ais-show-cluster)
+- [`ais show dashboard`](#ais-show-dashboard)
 - [`ais show auth`](#ais-show-auth)
 - [`ais show bucket`](#ais-show-bucket)
 - [`ais show object`](#ais-show-object)
@@ -156,11 +158,13 @@ NAME:
    e.g.:
      - show job prefetch-listrange         - show all running prefetch jobs;
      - show job prefetch                   - same as above;
+     - show job prefetch --top 5           - show 5 most recent prefetch jobs;
      - show job tco-cysbohAGL              - show a given (multi-object copy/transform) job identified by its unique ID;
      - show job copy-listrange             - show all running multi-object copies;
      - show job copy-objects               - same as above (using display name);
      - show job copy                       - show all copying jobs including both bucket-to-bucket and multi-object;
      - show job copy-objects --all         - show both running and already finished (or stopped) multi-object copies;
+     - show job copy-objects --all --top 10 - show 10 most recent multi-object copy jobs;
      - show job ec                         - show all erasure-coding;
      - show job list                       - show all running list-objects jobs;
      - show job ls                         - same as above;
@@ -185,6 +189,7 @@ OPTIONS:
    refresh       Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
                  valid time units: ns, us (or µs), ms, s (default), m, h
    regex         Regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   top           Show top N most recent jobs (e.g., --top 5 to show the 5 most recent jobs)
    units         Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
                  iec - IEC format, e.g.: KiB, MiB, GiB (default)
                  si  - SI (metric) format, e.g.: KB, MB, GB
@@ -244,11 +249,13 @@ NAME:
    e.g.:
      - show job prefetch-listrange         - show all running prefetch jobs;
      - show job prefetch                   - same as above;
+     - show job prefetch --top 5           - show 5 most recent prefetch jobs;
      - show job tco-cysbohAGL              - show a given (multi-object copy/transform) job identified by its unique ID;
      - show job copy-listrange             - show all running multi-object copies;
      - show job copy-objects               - same as above (using display name);
      - show job copy                       - show all copying jobs including both bucket-to-bucket and multi-object;
      - show job copy-objects --all         - show both running and already finished (or stopped) multi-object copies;
+     - show job copy-objects --all --top 10 - show 10 most recent multi-object copy jobs;
      - show job ec                         - show all erasure-coding;
      - show job list                       - show all running list-objects jobs;
      - show job ls                         - same as above;
@@ -273,6 +280,7 @@ OPTIONS:
    refresh       Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
                  valid time units: ns, us (or µs), ms, s (default), m, h
    regex         Regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   top           Show top N most recent jobs (e.g., --top 5 to show the 5 most recent jobs)
    units         Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
                  iec - IEC format, e.g.: KiB, MiB, GiB (default)
                  si  - SI (metric) format, e.g.: KB, MB, GB
@@ -414,7 +422,7 @@ proxy    target   smap     bmd      config   stats
 ```console
 $ ais show cluster --help
 NAME:
-   ais show cluster - main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
+   ais show cluster - Show cluster: health, version and build, and nodes (including capacity and memory, load averages and alerts)
 
 USAGE:
    ais show cluster command [NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]] [command options]
@@ -464,10 +472,12 @@ t[uxvpIDPc]      0.15%           362.57GiB       77.67%          31.846TiB      
 t[vAWmZZPv]      0.11%           363.68GiB       78.67%          31.608TiB       23.09%         94d      ais-target-3    online
 t[wSJzGVnU]      0.10%           363.33GiB       76.67%          30.972TiB       17.13%         94d      ais-target-9    online
 
-Summary:
+Cluster:
    Proxies:             10 (0 unelectable)
    Targets:             10
+   Endpoint:            http://<cluster-endpoint>:<port>
    Cluster Map:         version 1512, UUID AGetvIKTz, primary p[EciZrNdH]
+   Backend:             AWS
    Deployment:          K8s
    Status:              20 online
    Rebalance:           n/a
@@ -487,6 +497,128 @@ Summary:
 * [`ais cluster` command](cluster.md#cluster-or-daemon-status)
 
 
+## `ais show dashboard`
+
+The `ais show dashboard` command provides comprehensive cluster analytics and health monitoring. Unlike the basic `ais show cluster` command which shows node tables and basic summary, this command focuses on detailed analytics including storage metrics, performance indicators, error tracking, and system health.
+
+### Command Overview
+
+```console
+$ ais show dashboard --help
+NAME:
+   ais show dashboard - Show cluster at-a-glance dashboard: node counts, capacity, performance, health, software version, and more
+
+USAGE:
+   ais show dashboard [NODE_ID] [command options]
+
+
+
+OPTIONS:
+   --refresh value   interval for continuous monitoring;
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --count value     used together with '--refresh' to limit the number of generated reports (default: 0)
+   --verbose, -v     verbose output
+   --json, -j        json input/output
+   --no-headers, -H  display tables without headers
+   --help, -h        show help
+```
+
+### What it shows
+
+The command provides a comprehensive view of your cluster's health and performance:
+
+**Performance and Health Section:**
+- **State**: Overall cluster operational status with summary of affected nodes and issue types
+- **Throughput**: Current read/write throughput rates (only shown when active)
+- **I/O Errors**: Total disk I/O errors across all nodes
+- **Load Avg**: 1-minute load average aggregated across all nodes (avg, min, max)
+- **Disk Usage**: Average, minimum, and maximum disk usage percentages
+- **Network**: Network health status (healthy, degraded, etc.)
+- **Storage**: Total mountpaths and their health status
+- **Filesystems**: Types and counts of filesystems in use
+- **Active Jobs**: Currently running job types (download, rebalance, etc.)
+
+
+**Cluster Section:**
+- **Proxies**: Number of proxy nodes and their electability status
+- **Targets**: Number of target nodes and total disks
+- **Endpoint**: Cluster endpoint URL for API access
+- **Capacity**: Used and available storage capacity with percentages
+- **Cluster Map**: Version, UUID, and primary node information
+- **Software**: Version and build information
+- **Backend**: Detected backend type (AWS, GCP, etc.)
+- **Deployment**: Deployment type (dev, K8s, etc.)
+- **Status**: Number of online nodes
+- **Rebalance**: Current rebalance status
+- **Authentication**: Authentication status (enabled/disabled)
+- **Version**: Software version information
+- **Build**: Build timestamp
+
+### Example Output
+
+```console
+$ ais show dashboard --refresh 5
+
+Performance and Health:
+   State:               Multiple issues (6 node(s) affected: 2 maintenance, 4 rebalancing)
+      Details:          Use '--verbose' for detailed breakdown
+   Throughput:          Read 2.4MiB/s, Write 13.2MiB/s (5s avg)
+   I/O Errors:          0
+   Load Avg:            avg 0.5, min 0.5, max 0.5 (1m)
+   Disk Usage:          avg 12.0%, min 12.0%, max 12.0%
+   Network:             healthy
+   Storage:             28 mountpaths (all healthy)
+   Filesystems:         ext4(28)
+   Active Jobs:         download, rebalance
+
+Cluster:
+   Proxies:             6 (all electable)
+   Targets:             6 (one disk)
+   Endpoint:            http://<cluster-endpoint>:<port>
+   Capacity:            used 53.03GiB (12%), available 364.47GiB
+   Cluster Map:         version 30, UUID Ba5eThUG9, primary p[rbap8080]
+   Software:            3.29.e230a780d (build: 2025-07-14T11:39:53-0700)
+   Backend:             AWS
+   Deployment:          dev
+   Status:              12 online
+   Rebalance:           -
+   Authentication:      disabled
+   Version:             3.29.e230a780d
+   Build:               2025-07-14T11:39:53-0700
+```
+
+### Detailed Issue Breakdown
+
+When cluster issues are detected, use the `--verbose` flag for a detailed breakdown:
+
+```console
+$ ais show dashboard --verbose
+
+Performance and Health:
+   State:               Multiple issues (6 node(s) affected: 2 maintenance, 4 rebalancing)
+   ...
+
+CLUSTER HEALTH DETAILS:
+Maintenance (2/6):   t[FFIt8090], t[zHut8091]
+Rebalancing (4/6):   t[ZHHt8087], t[atEt8086], t[UTat8088], t[xgAt8089]
+```
+
+### Continuous Monitoring
+
+Use the `--refresh` flag for continuous monitoring:
+
+```console
+# Monitor cluster every 5 seconds
+$ ais show dashboard --refresh 5
+
+# Monitor for 10 iterations (50 seconds total)
+$ ais show dashboard --refresh 5 --count 10
+
+# Monitor with JSON output
+$ ais show dashboard --refresh 10 --json
+```
+
+
 ## `ais show auth`
 The following subcommands are currently supported:
 
@@ -497,18 +629,18 @@ The following subcommands are currently supported:
    config   show AuthN server configuration
 ```
 
-[Refer to `ais auth` documentation for details and examples.](auth.md#command-list)
+[Refer to `ais auth` documentation for details and examples.](/docs/cli/auth.md#command-list)
 
 
 ## `ais show bucket`
 Show bucket properties.
 
-[Refer to `ais bucket` documentation for details and examples.](bucket.md#show-bucket-properties)
+[Refer to `ais bucket` documentation for details and examples.](/docs/cli/bucket.md#show-bucket-properties)
 
 ## `ais show object`
 Show object details.
 
-[Refer to `ais object` documentation for details and examples.](object.md#show-object-properties)
+[Refer to `ais object` documentation for details and examples.](/docs/cli/object.md#show-object-properties)
 
 ## `ais show storage`
 Show storage usage and utilization in the cluster. Show disks and mountpaths - for a single selected node or for all storage nodes.

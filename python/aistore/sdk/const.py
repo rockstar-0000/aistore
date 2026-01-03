@@ -6,12 +6,20 @@
 GB = 10**9
 KIB = 2**10
 
+# Archive extensions
+EXT_TAR = ".tar"
+EXT_TGZ = ".tgz"
+EXT_TARGZ = ".tar.gz"
+EXT_TARLZ4 = ".tar.lz4"
+EXT_ZIP = ".zip"
+
 # Standard Header Keys
 HEADER_ACCEPT = "Accept"
 HEADER_USER_AGENT = "User-Agent"
 HEADER_CONTENT_TYPE = "Content-Type"
 HEADER_CONTENT_LENGTH = "Content-Length"
 HEADER_LOCATION = "Location"
+HEADER_CONNECTION = "Connection"
 # Standard Header Values
 USER_AGENT_BASE = "ais/python"
 JSON_CONTENT_TYPE = "application/json"
@@ -40,7 +48,8 @@ HEADER_NODE_URL = HEADER_PREFIX + "node-url"
 HEADER_OBJECT_BLOB_DOWNLOAD = HEADER_PREFIX + "blob-download"
 HEADER_OBJECT_BLOB_CHUNK_SIZE = HEADER_PREFIX + "blob-chunk"
 HEADER_OBJECT_BLOB_WORKERS = HEADER_PREFIX + "blob-workers"
-HEADER_OBJECT_APPEND_HANDLE = "ais-append-handle"
+HEADER_OBJECT_APPEND_HANDLE = HEADER_PREFIX + "append-handle"
+HEADER_DIRECT_PUT_LENGTH = HEADER_PREFIX + "direct-put-length"
 # Ref: https://www.rfc-editor.org/rfc/rfc7233#section-2.1
 HEADER_RANGE = "Range"
 # AuthN Headers
@@ -62,15 +71,22 @@ QPARAM_PRIMARY_READY_REB = "prr"
 QPARAM_NAMESPACE = "namespace"
 QPARAM_OBJ_APPEND = "append_type"
 QPARAM_OBJ_APPEND_HANDLE = "append_handle"
+QPARAM_OBJ_TO = "object_to"
 DSORT_UUID = "uuid"
 QPARAM_UUID = "uuid"
 QPARAM_LATEST = "latest-ver"
+QPARAM_SYNC = "synchronize"
 QPARAM_NEW_CUSTOM = "set-new-custom"
+# multipart upload
+QPARAM_MPT_UPLOAD_ID = "uploadId"
+QPARAM_MPT_PART_NO = "partNumber"
 # etl
 QPARAM_ETL_NAME = "etl_name"
 QPARAM_ETL_ARGS = "etl_args"
+QPARAM_ETL_PIPELINE = "etl_pipeline"
+QPARAM_ETL_FQN = "etl_fqn"
 # etl websocket
-ETL_WS_DESTINATION_ADDR = "dst_addr"
+ETL_WS_PIPELINE = "pipeline"
 ETL_WS_FQN = "fqn"
 ETL_WS_PATH = "path"
 
@@ -98,6 +114,7 @@ URL_PATH_AUTHN_USERS = "users"
 URL_PATH_AUTHN_CLUSTERS = "clusters"
 URL_PATH_AUTHN_ROLES = "roles"
 URL_PATH_AUTHN_TOKENS = "tokens"
+URL_PATH_GB = "ml/moss"
 
 # HTTP Methods
 HTTP_METHOD_GET = "get"
@@ -106,6 +123,7 @@ HTTP_METHOD_DELETE = "delete"
 HTTP_METHOD_PUT = "put"
 HTTP_METHOD_HEAD = "head"
 HTTP_METHOD_PATCH = "patch"
+HTTP_BOUNDARY_REGEX = r"boundary=([^;,\s]+)"
 
 # Actions
 # See api/apc/actmsg.go
@@ -128,6 +146,10 @@ ACT_TRANSFORM_OBJECTS = "etl-listrange"
 ACT_ARCHIVE_OBJECTS = "archive"
 # Job actions
 ACT_START = "start"
+# Multipart upload actions
+ACT_MPT_UPLOAD = "mpt-upload"
+ACT_MPT_COMPLETE = "mpt-complete"
+ACT_MPT_ABORT = "mpt-abort"
 
 # Defaults
 DEFAULT_CHUNK_SIZE = 32 * KIB
@@ -135,6 +157,7 @@ DEFAULT_JOB_WAIT_TIMEOUT = 300
 DEFAULT_DSORT_WAIT_TIMEOUT = 300
 DEFAULT_DATASET_MAX_COUNT = 100000
 DEFAULT_JOB_POLL_TIME = 0.2
+DEFAULT_MAX_BUFFER_SIZE = 64 * KIB
 
 # ENCODING
 UTF_ENCODING = "utf-8"
@@ -144,9 +167,12 @@ STATUS_ACCEPTED = 202
 STATUS_NO_CONTENT = 204
 STATUS_OK = 200
 STATUS_BAD_REQUEST = 400
+STATUS_UNAUTHORIZED = 401
+STATUS_FORBIDDEN = 403
 STATUS_PARTIAL_CONTENT = 206
 STATUS_REDIRECT_TMP = 307
 STATUS_REDIRECT_PERM = 301
+STATUS_INTERNAL_SERVER_ERROR = 500
 
 # Protocol
 HTTP = "http://"
@@ -157,6 +183,9 @@ AIS_CLIENT_CA = "AIS_CLIENT_CA"
 AIS_AUTHN_TOKEN = "AIS_AUTHN_TOKEN"
 AIS_CLIENT_CRT = "AIS_CRT"
 AIS_CLIENT_KEY = "AIS_CRT_KEY"
+AIS_READ_TIMEOUT = "AIS_READ_TIMEOUT"
+AIS_CONNECT_TIMEOUT = "AIS_CONNECT_TIMEOUT"
+AIS_MAX_CONN_POOL = "AIS_MAX_CONN_POOL"
 
 # Content Constants
 LOREM = (
@@ -202,3 +231,44 @@ WORKER_COUNT_SHIFT = JOGGER_COUNT_BITS
 WORKER_COUNT_MASK = ((1 << WORKER_COUNT_BITS) - 1) << WORKER_COUNT_SHIFT
 CHANNEL_COUNT_SHIFT = JOGGER_COUNT_BITS + WORKER_COUNT_BITS
 CHANNEL_COUNT_MASK = ((1 << CHANNEL_COUNT_BITS) - 1) << CHANNEL_COUNT_SHIFT
+
+# Multipart Decoder
+MULTIPART_MARKER = b"--"
+WIN_LINE_END = b"\r\n\r\n"
+UNIX_LINE_END = b"\n\n"
+
+# Batch (Get-Batch) API constants
+GB_MISSING_FILES_DIR = "__404__"
+
+# GetBatch (GB) API Constants (see api/ml.go and api/apc/ml.go)
+
+# MossIn/MossOut Constants
+GB_OBJNAME = "objname"
+GB_BCK = "bucket"
+GB_PROVIDER = "provider"
+GB_UNAME = "uname"
+GB_ARCHPATH = "archpath"
+GB_START = "start"
+GB_LENGTH = "length"
+GB_OPAQUE = "opaque"
+GB_ERR_MSG = "err_msg"
+GB_SIZE = "size"
+
+# MossReq Constants
+GB_IN = "in"
+GB_OUTPUT_FMT = "mime"
+GB_CONTINUE_ERR = "coer"
+GB_ONLY_OBJ_NAME = "onob"
+GB_STRM_GET = "strm"
+
+# MossResp structs
+GB_OUT = "out"
+GB_UUID = "uuid"
+
+# ASCII
+ASCII_CR = 13  # Carriage Return (CR)
+ASCII_LF = 10  # Line Feed (LF)
+ASCII_SPACE = 32  # Space
+ASCII_TAB = 9  # Tab
+
+WHITESPACE_CHARS = {ASCII_CR, ASCII_LF, ASCII_SPACE, ASCII_TAB}

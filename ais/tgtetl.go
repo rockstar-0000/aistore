@@ -5,22 +5,22 @@
 package ais
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/k8s"
-	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/nl"
-	"github.com/NVIDIA/aistore/xact"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 // [METHOD] /v1/etl
@@ -31,13 +31,13 @@ func (t *target) etlHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut:
-		t.handleETLPut(w, r)
-	case http.MethodPost:
-		t.handleETLPost(w, r)
+		t.handleETLPut(w, r) // TODO: move to proxy (control plane operation)
 	case http.MethodDelete:
-		t.handleETLDelete(w, r)
+		t.handleETLDelete(w, r) // TODO: move to proxy (control plane operation)
 	case http.MethodGet:
-		t.handleETLGet(w, r)
+		dpq := dpqAlloc()
+		t.handleETLGet(w, r, dpq)
+		dpqFree(dpq)
 	case http.MethodHead:
 		t.headObjectETL(w, r)
 	default:
@@ -60,14 +60,6 @@ func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/etl
-	if len(apiItems) == 0 {
-		if err := t.initETLFromMsg(r); err != nil {
-			t.writeErr(w, r, err)
-		}
-		return
-	}
-
 	// /v1/etl/_object/<secret>/<uname>
 	if apiItems[0] == apc.ETLObject {
 		t.putObjectETL(w, r)
@@ -75,9 +67,14 @@ func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request) {
+func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 	apiItems, err := t.parseURL(w, r, apc.URLPathETL.L, 0, true)
 	if err != nil {
+		return
+	}
+
+	if err := dpq.parse(r.URL.RawQuery); err != nil {
+		t.writeErr(w, r, err)
 		return
 	}
 
@@ -89,7 +86,7 @@ func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request) {
 
 	// /v1/etl/_object/<secret>/<uname>
 	if apiItems[0] == apc.ETLObject {
-		t.getObjectETL(w, r)
+		t.getObjectETL(w, r, dpq)
 		return
 	}
 
@@ -105,30 +102,13 @@ func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request) {
 		t.logsETL(w, r, apiItems[0])
 	case apc.ETLHealth:
 		t.healthETL(w, r, apiItems[0])
+	case apc.ETLDetails:
+		t.detailsETL(w, r, dpq, apiItems[0])
 	case apc.ETLMetrics:
 		k8s.InitMetricsClient()
 		t.metricsETL(w, r, apiItems[0])
 	default:
 		t.writeErrURL(w, r)
-	}
-}
-
-// POST /v1/etl/<etl-name>/stop (or) /v1/etl/<etl-name>/start
-//
-// Handles starting/stopping ETL pods
-func (t *target) handleETLPost(w http.ResponseWriter, r *http.Request) {
-	apiItems, err := t.parseURL(w, r, apc.URLPathETL.L, 2, true)
-	if err != nil {
-		return
-	}
-	switch op := apiItems[1]; op {
-	case apc.ETLStop:
-		t.stopETL(w, r, apiItems[0])
-	case apc.ETLStart:
-		t.startETL(w, r)
-	default:
-		debug.Assert(false, "invalid operation: "+op)
-		t.writeErrAct(w, r, "invalid operation: "+op)
 	}
 }
 
@@ -145,24 +125,9 @@ func (t *target) handleETLDelete(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *target) startETL(w http.ResponseWriter, r *http.Request) {
-	if err := t.initETLFromMsg(r); err != nil {
-		t.writeErr(w, r, err)
-	}
-}
-
-func (t *target) stopETL(w http.ResponseWriter, r *http.Request, etlName string) {
-	if err := etl.Stop(etlName, cmn.ErrXactUserAbort); err != nil {
-		if cos.IsErrNotFound(err) {
-			nlog.Infof("ETL %q doesn't exist on target\n", etlName)
-			return
-		}
-		t.writeErr(w, r, err)
-	}
-}
-
 func (t *target) inlineETL(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM) {
-	comm, errN := etl.GetCommunicator(dpq.etl.name)
+	started := mono.NanoTime()
+	comm, errN := etl.GetCommunicator(dpq.get(apc.QparamETLName))
 	if errN != nil {
 		switch {
 		case cos.IsErrNotFound(errN):
@@ -177,24 +142,51 @@ func (t *target) inlineETL(w http.ResponseWriter, r *http.Request, dpq *dpq, lom
 	}
 
 	// do
-	xetl := comm.Xact()
-	ecode, err := comm.InlineTransform(w, r, lom, dpq.latestVer, dpq.etl.targs)
-
-	if err == nil {
-		xetl.ObjsAdd(1, lom.Lsize(true)) // _special_ as the transformed size could be `cos.ContentLengthUnknown` at this point
-		return                           // ok
+	var (
+		xetl     = comm.Xact()
+		pipeline apc.ETLPipeline
+		err      error
+	)
+	if etlPipeline := dpq.get(apc.QparamETLPipeline); etlPipeline != "" {
+		pipeline, err = etl.GetPipeline(strings.Split(etlPipeline, apc.ETLPipelineSeparator))
+		if err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
 	}
+	size, ecode, err := comm.InlineTransform(w, r, lom, &etl.InlineTransArgs{
+		LatestVer:     dpq.latestVer,
+		TransformArgs: dpq.get(apc.QparamETLTransformArgs),
+		Pipeline:      pipeline,
+	})
 
-	// NOTE:
-	// - poll for a while here for a possible abort error (e.g., pod runtime error)
-	// - and notice hardcoded timeout
-	if abortErr := xetl.AbortedAfter(etl.DefaultAbortTimeout); abortErr != nil {
-		t.writeErr(w, r, abortErr, ecode)
-		return
+	// error handling
+	switch {
+	case err == nil:
+		if size >= 0 {
+			tstats := core.T.StatsUpdater()
+			tstats.IncWith(stats.ETLInlineCount, xetl.Vlabs)
+			tstats.AddWith(
+				cos.NamedVal64{Name: stats.ETLInlineLatencyTotal, Value: mono.SinceNano(started), VarLabs: xetl.Vlabs},
+				cos.NamedVal64{Name: stats.ETLInlineSize, Value: size, VarLabs: xetl.Vlabs},
+			)
+			xetl.ObjsAdd(1, size)
+		}
+	case cos.IsNotExist(err, ecode):
+		xetl.InlineObjErrs.Add(&etl.ObjErr{
+			ObjName: lom.Cname(),
+			Message: "object not found",
+			Ecode:   ecode,
+		})
+		t.writeErr(w, r, err, ecode)
+	default:
+		xetl.InlineObjErrs.Add(&etl.ObjErr{
+			ObjName: lom.Cname(),
+			Message: err.Error(),
+			Ecode:   ecode,
+		})
+		t.writeErr(w, r, err, ecode)
 	}
-
-	xetl.AddErr(err)
-	t.writeErr(w, r, err, ecode)
 }
 
 func (t *target) logsETL(w http.ResponseWriter, r *http.Request, etlName string) {
@@ -219,6 +211,37 @@ func (t *target) healthETL(w http.ResponseWriter, r *http.Request, etlName strin
 	writeXid(w, health)
 }
 
+// GET /v1/etl/<etl-name>/details
+//
+// Returns ETL errors (if any) for the given ETL xaction.
+func (t *target) detailsETL(w http.ResponseWriter, r *http.Request, dpq *dpq, etlName string) {
+	var (
+		offlineXid = dpq.sys.uuid
+		errs       []error
+	)
+	comm, err := etl.GetCommunicator(etlName)
+	if err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	xetl := comm.Xact()
+	if offlineXid == "" {
+		errs = xetl.InlineObjErrs.Unwrap()
+	} else {
+		errs = xetl.GetObjErrs(offlineXid)
+	}
+
+	objErrs := make([]etl.ObjErr, 0, len(errs))
+	for _, e := range errs {
+		var objErr *etl.ObjErr
+		if !errors.As(e, &objErr) {
+			continue
+		}
+		objErrs = append(objErrs, *objErr)
+	}
+	t.writeJSON(w, r, objErrs, "etl-obj-errors")
+}
+
 func (t *target) metricsETL(w http.ResponseWriter, r *http.Request, etlName string) {
 	metricMsg, err := etl.PodMetrics(etlName)
 	if err != nil {
@@ -240,23 +263,15 @@ func etlParseObjectReq(r *http.Request) (etlName, secret string, bck *meta.Bck, 
 	}
 	etlName = items[0]
 	secret = items[1]
+
 	// Encoding is done in `transformerPath`.
 	var uname string
 	uname, err = url.PathUnescape(items[2])
 	if err != nil {
 		return
 	}
-	var b cmn.Bck
-	b, objName = cmn.ParseUname(uname)
-	if err = b.Validate(); err != nil {
-		err = fmt.Errorf("%v, uname=%q", err, uname)
-		return
-	}
-	if objName == "" {
-		err = fmt.Errorf("object name is missing (bucket=%s, uname=%q)", b.String(), uname)
-		return
-	}
-	bck = meta.CloneBck(&b)
+
+	bck, objName, err = meta.ParseUname(uname, true /*object name required*/)
 	return
 }
 
@@ -267,7 +282,7 @@ func etlParseObjectReq(r *http.Request) (etlName, secret string, bck *meta.Bck, 
 //
 // NOTE: this is an internal URL with "_object" in its path intended to avoid
 // conflicts with ETL name in `/v1/elt/<etl-name>/...`
-func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
+func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 	etlName, secret, bck, objName, err := etlParseObjectReq(r)
 	if err != nil {
 		t.writeErr(w, r, err)
@@ -277,12 +292,7 @@ func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 		t.writeErr(w, r, err)
 		return
 	}
-	dpq := dpqAlloc()
-	if err := dpq.parse(r.URL.RawQuery); err != nil {
-		dpqFree(dpq)
-		t.writeErr(w, r, err)
-		return
-	}
+
 	lom := core.AllocLOM(objName)
 	lom, err = t.getObject(w, r, dpq, bck, lom)
 	core.FreeLOM(lom)
@@ -290,7 +300,6 @@ func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		t._erris(w, r, err, 0, dpq.silent)
 	}
-	dpqFree(dpq)
 }
 
 // PUT /v1/etl/_object/<etl-name>/<secret>/<uname>?uuid=<xid>
@@ -311,10 +320,10 @@ func (t *target) putObjectETL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lom := core.AllocLOM(objName)
-	if err := lom.InitBck(bck.Bucket()); err != nil {
+	if err := lom.InitBck(bck); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
-			err = lom.InitBck(bck.Bucket())
+			err = lom.InitBck(bck)
 		}
 		if err != nil {
 			t.writeErr(w, r, err)
@@ -359,34 +368,4 @@ func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
 		// always silent (compare w/ httpobjhead)
 		t.writeErr(w, r, err, ecode, Silent)
 	}
-}
-
-func (t *target) initETLFromMsg(r *http.Request) error {
-	var xetl core.Xact
-	b, err := cos.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	r.Body.Close()
-
-	initMsg, err := etl.UnmarshalInitMsg(b)
-	if err != nil {
-		return err
-	}
-	xid := r.URL.Query().Get(apc.QparamUUID)
-	secret := r.URL.Query().Get(apc.QparamETLSecret)
-	xetl, err = etl.Init(initMsg, xid, secret)
-
-	if err != nil {
-		return err
-	}
-
-	// setup proxy notification on abort
-	notif := &xact.NotifXact{
-		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},
-		Xact: xetl,
-	}
-	xetl.AddNotif(notif)
-
-	return err
 }

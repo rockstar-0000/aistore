@@ -1,12 +1,13 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -56,10 +57,9 @@ func (*proFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 
 func (p *proFactory) Start() error {
 	var (
-		xctn   = &XactDirPromote{p: p}
-		ctlmsg = p.args.String()
+		xctn = &XactDirPromote{p: p}
 	)
-	xctn.BckJog.Init(p.Args.UUID /*global xID*/, apc.ActPromote, ctlmsg, p.Bck, &mpather.JgroupOpts{}, cmn.GCO.Get())
+	xctn.BckJog.Init(p.Args.UUID /*global xID*/, apc.ActPromote, p.Bck, &mpather.JgroupOpts{}, cmn.GCO.Get())
 	p.xctn = xctn
 	return nil
 }
@@ -76,6 +76,13 @@ func (*proFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 ////////////////////
 
 func (r *XactDirPromote) SetFshare(v bool) { r.confirmedFshare = v } // is called before Run()
+
+func (r *XactDirPromote) CtlMsg() string {
+	var sb strings.Builder
+	sb.Grow(128)
+	r.p.args.Str(&sb)
+	return sb.String()
+}
 
 func (r *XactDirPromote) Run(wg *sync.WaitGroup) {
 	wg.Done()
@@ -138,20 +145,14 @@ func (r *XactDirPromote) walk(fqn string, de fs.DirEntry) error {
 	if cos.IsNotExist(err, ecode) {
 		err = nil
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleXs) {
+	if cmn.Rom.V(5, cos.ModXs) {
 		nlog.Infof("%s: %s => %s (over=%t, del=%t, share=%t): %v", r.Base.Name(), fqn, bck.Cname(objName),
 			args.OverwriteDst, args.DeleteSrc, r.confirmedFshare, err)
 	}
 	return err
 }
 
-func (r *XactDirPromote) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return
-}
+func (r *XactDirPromote) Snap() *core.Snap { return r.Base.NewSnap(r) }
 
 //
 // destination naming

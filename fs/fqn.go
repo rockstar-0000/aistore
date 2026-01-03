@@ -31,6 +31,7 @@ const (
 	WorkfileRemote       = "remote"         // getting object from neighbor target when rebalancing
 	WorkfileColdget      = "cold"           // object GET: coldget
 	WorkfilePut          = "put"            // object PUT
+	WorkfileTransform    = "transform"      // ETL offline transform
 	WorkfileCopy         = "copy"           // copy object
 	WorkfileAppend       = "append"         // APPEND to object (as file)
 	WorkfileAppendToArch = "append-to-arch" // APPEND to existing archive
@@ -40,7 +41,7 @@ const (
 type ParsedFQN struct {
 	Mountpath   *Mountpath
 	Bck         cmn.Bck
-	ContentType string // enum: { ObjectType, WorkfileType, ECSliceType, ... }
+	ContentType string // enum: { ObjCT, WorkCT, ECSliceCT, ... }
 	ObjName     string
 	Digest      uint64
 }
@@ -80,30 +81,31 @@ func (parsed *ParsedFQN) Init(fqn string) error {
 			continue
 		}
 
-		item := rel[prev:i]
+		// Use offset-based access instead of creating substring
+		start, end := prev, i
 		switch itemIdx {
 		case 0: // backend provider
-			if item[0] != prefProvider {
-				return fmt.Errorf("%s %s: bad provider %q", tag, fqn, item)
+			if rel[start] != prefProvider {
+				return fmt.Errorf("%s %s: bad provider %q", tag, fqn, rel[start:end])
 			}
-			provider := item[1:]
+			provider := rel[start+1 : end]
 			parsed.Bck.Provider = provider
 			if !apc.IsProvider(provider) {
 				return fmt.Errorf("%s %s: unknown provider %q", tag, fqn, provider)
 			}
 		case 1: // namespace or bucket name
-			if item == "" {
+			if end == start {
 				return fmt.Errorf("%s %s: bad bucket name (or namespace)", tag, fqn)
 			}
 
-			switch item[0] {
+			switch rel[start] {
 			case prefNsName:
 				parsed.Bck.Ns = cmn.Ns{
-					Name: item[1:],
+					Name: rel[start+1 : end],
 				}
 				itemIdx-- // we must visit this case again
 			case prefNsUUID:
-				ns := item[1:]
+				ns := rel[start+1 : end]
 				idx := strings.IndexRune(ns, prefNsName)
 				if idx == -1 {
 					return fmt.Errorf("%s %s: bad namespace %q", tag, fqn, ns)
@@ -114,18 +116,18 @@ func (parsed *ParsedFQN) Init(fqn string) error {
 				}
 				itemIdx-- // revisit
 			default:
-				parsed.Bck.Name = item
+				parsed.Bck.Name = rel[start:end]
 			}
 		case 2: // content type and object name
-			if item[0] != prefCT {
-				return fmt.Errorf("%s %s: bad content type %q", tag, fqn, item)
+			if rel[start] != prefCT {
+				return fmt.Errorf("%s %s: bad content type %q", tag, fqn, rel[start:end])
 			}
 
-			item = item[1:]
-			if _, ok := CSM.m[item]; !ok {
-				return fmt.Errorf("%s %s: bad content type %q", tag, fqn, item)
+			contentType := rel[start+1 : end]
+			if _, ok := CSM.m[contentType]; !ok {
+				return fmt.Errorf("%s %s: bad content type %q", tag, fqn, contentType)
 			}
-			parsed.ContentType = item
+			parsed.ContentType = contentType
 
 			// object name
 			objName := rel[i+1:]
@@ -192,13 +194,13 @@ func CleanPathErr(err error) {
 	if strings.Contains(pathErr.Err.Error(), "no such file") {
 		var what string
 		switch parsed.ContentType {
-		case ObjectType:
+		case ObjCT:
 			what = "object"
-		case WorkfileType:
+		case WorkCT:
 			what = "work file"
-		case ECSliceType:
+		case ECSliceCT:
 			what = "ec slice"
-		case ECMetaType:
+		case ECMetaCT:
 			what = "ec metadata"
 		default:
 			what = fmt.Sprintf("content type '%s'(?)", parsed.ContentType)

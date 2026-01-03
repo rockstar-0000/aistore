@@ -81,6 +81,10 @@ func RenewBckLoadLomCache(uuid string, bck *meta.Bck) RenewRes {
 	return RenewBucketXact(apc.ActLoadLomCache, bck, Args{UUID: uuid})
 }
 
+func RenewBckRechunks(bck *meta.Bck, uuid string, args *RechunkArgs) RenewRes {
+	return RenewBucketXact(apc.ActRechunk, bck, Args{Custom: args, UUID: uuid})
+}
+
 func RenewPutMirror(lom *core.LOM) RenewRes {
 	return RenewBucketXact(apc.ActPutCopies, lom.Bck(), Args{Custom: lom})
 }
@@ -103,12 +107,12 @@ func RenewDsort(id string, custom *DsortArgs) RenewRes {
 	)
 }
 
-func RenewBckRename(bckFrom, bckTo *meta.Bck, uuid string, rmdVersion int64, phase string) RenewRes {
-	custom := &BckRenameArgs{
+func RenewBckRename(bckFrom, bckTo *meta.Bck, uuid, phase string) RenewRes {
+	custom := &TCBArgs{
 		Phase:   phase,
-		RebID:   xact.RebID2S(rmdVersion),
 		BckFrom: bckFrom,
 		BckTo:   bckTo,
+		Msg:     &apc.TCBMsg{},
 	}
 	return RenewBucketXact(apc.ActMoveBck, bckTo, Args{Custom: custom, UUID: uuid})
 }

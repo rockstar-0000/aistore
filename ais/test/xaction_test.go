@@ -1,10 +1,11 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,16 @@ func TestXactionNotFound(t *testing.T) {
 	)
 	_, err := api.QueryXactionSnaps(baseParams, &xact.ArgsMsg{ID: "dummy-" + cos.GenUUID()})
 	tools.CheckErrIsNotFound(t, err)
+}
+
+func _string(vec nl.StatusVec) string {
+	var sb strings.Builder
+	for _, ns := range vec {
+		sb.WriteString(ns.String())
+		sb.WriteString(", ")
+	}
+	s := sb.String()
+	return s[:max(0, len(s)-2)]
 }
 
 func TestXactionAllStatus(t *testing.T) {
@@ -51,7 +62,7 @@ func TestXactionAllStatus(t *testing.T) {
 				continue
 			}
 			if kind != apc.ActList {
-				tlog.Logln(vec.String())
+				tlog.Logln(_string(vec))
 			}
 			for _, ns := range vec {
 				tassert.Errorf(t, ns.Kind == kind, "kind %q vs %q", ns.Kind, kind)
@@ -64,10 +75,10 @@ func TestXactionAllStatus(t *testing.T) {
 			var aborted nl.StatusVec
 			for _, ns := range vec {
 				if ns.AbortedX {
-					tlog.Logf("%q is aborted but hasn't finished yet\n", ns.String())
+					tlog.Logfln("%q is aborted but hasn't finished yet", ns.String())
 					aborted = append(aborted, ns)
 				} else if ns.EndTimeX != 0 {
-					tlog.Logf("Warning: must've %q already finished (non-zero fin time=%v)\n",
+					tlog.Logfln("Warning: must've %q already finished (non-zero fin time=%v)",
 						ns.String(), time.Unix(0, ns.EndTimeX))
 
 					// un-race

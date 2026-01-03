@@ -19,7 +19,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
-	"github.com/NVIDIA/aistore/ext/dsort/ct"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 
@@ -148,10 +147,7 @@ func (recm *RecordManager) RecordWithBuffer(args *extractRecordArgs) (size int64
 		// If extractor was initialized we need to read the content, since it
 		// may contain information about the sorting/shuffling key.
 		if needRead || args.w != nil {
-			dst := io.Discard
-			if args.w != nil {
-				dst = args.w
-			}
+			dst := cos.Ternary(args.w != nil, args.w, io.Discard)
 			if _, err := io.CopyBuffer(dst, r, args.buf); err != nil {
 				return 0, errors.WithStack(err)
 			}
@@ -189,7 +185,7 @@ func (recm *RecordManager) RecordWithBuffer(args *extractRecordArgs) (size int64
 		DaemonID: core.T.SID(),
 		Objects: []*RecordObj{{
 			ContentPath:    contentPath,
-			ObjectFileType: args.fileType,
+			ObjectFileType: args.fileType, // FIXME: rename as ContentType
 			StoreType:      storeType,
 			Offset:         args.offset,
 			MetadataSize:   mdSize,
@@ -246,9 +242,9 @@ func (recm *RecordManager) encodeRecordName(storeType, shardName, recordName str
 		//  * fullContentPath = fqn to recordUniqueName with extension (eg. <bucket_fqn>/shard_1-record_name.cls)
 		recordExt := cosExt(recordName)
 		contentPath := genRecordUname(shardName, recordName) + recordExt
-		c, err := core.NewCTFromBO(&recm.bck, contentPath, nil)
+		ct, err := core.NewDsortCT(&recm.bck, contentPath)
 		debug.AssertNoErr(err)
-		return contentPath, c.Make(ct.DsortFileType)
+		return contentPath, ct.GenFQN(fs.DsortFileCT)
 	default:
 		debug.Assert(false, storeType)
 		return "", ""
@@ -260,9 +256,9 @@ func (recm *RecordManager) FullContentPath(obj *RecordObj) string {
 	case OffsetStoreType:
 		// To convert contentPath to fullContentPath we need to make shard name
 		// full FQN.
-		ct, err := core.NewCTFromBO(&recm.bck, obj.ContentPath, nil)
+		ct, err := core.NewDsortCT(&recm.bck, obj.ContentPath)
 		debug.AssertNoErr(err)
-		return ct.Make(obj.ObjectFileType)
+		return ct.GenFQN(obj.ObjectFileType)
 	case SGLStoreType:
 		// To convert contentPath to fullContentPath we need to add record
 		// object extension.
@@ -271,9 +267,9 @@ func (recm *RecordManager) FullContentPath(obj *RecordObj) string {
 		// To convert contentPath to fullContentPath we need to make record
 		// unique name full FQN.
 		contentPath := obj.ContentPath
-		c, err := core.NewCTFromBO(&recm.bck, contentPath, nil)
+		ct, err := core.NewDsortCT(&recm.bck, contentPath)
 		debug.AssertNoErr(err)
-		return c.Make(ct.DsortFileType)
+		return ct.GenFQN(fs.DsortFileCT)
 	default:
 		debug.Assert(false, obj.StoreType)
 		return ""
@@ -295,7 +291,7 @@ func (recm *RecordManager) FreeMem(fullContentPath, newStoreType string, value a
 	if !exists {
 		// Generally should not happen but it is not proven that it cannot.
 		// There is nothing wrong with just returning here though.
-		nlog.Errorln("failed to find", fullContentPath, recordObjExt, contentPath) // TODO: FastV
+		nlog.Errorln("failed to find", fullContentPath, recordObjExt, contentPath) // TODO: V
 		return 0
 	}
 

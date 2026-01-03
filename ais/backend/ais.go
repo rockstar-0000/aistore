@@ -95,10 +95,10 @@ func extractErrCode(e error, uuid string) (int, error) {
 	if e == nil {
 		return http.StatusOK, nil
 	}
-	if cos.IsClientTimeout(e) {
+	if cos.IsErrClientTimeout(e) {
 		return http.StatusRequestTimeout, e
 	}
-	herr := cmn.Err2HTTPErr(e)
+	herr := cmn.AsErrHTTP(e)
 	if herr == nil {
 		return http.StatusInternalServerError, e
 	}
@@ -268,10 +268,7 @@ func (r *remAis) init(alias string, confURLs []string, cfg *cmn.ClusterConfig) (
 	)
 
 	for _, u := range confURLs {
-		client := cliH
-		if cos.IsHTTPS(u) {
-			client = cliTLS
-		}
+		client := cos.Ternary(cos.IsHTTPS(u), cliTLS, cliH)
 		smap, err := api.GetClusterMap(api.BaseParams{Client: client, URL: u, UA: ua})
 		if err != nil {
 			nlog.Warningf("remote cluster failing to reach %q via %s: %v", alias, u, err)
@@ -467,7 +464,7 @@ func (m *AISbp) ListObjects(remoteBck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRe
 		ecode, err = extractErrCode(err, remAis.uuid)
 		return
 	}
-	*lst = *lstRes
+	*lst = *lstRes // NOTE: not clearing remote `apc.EntryIsCached` - done later by x-lso
 
 	// Restore the original request UUID (UUID of the remote cluster is already inside `ContinuationToken`).
 	lst.UUID = msg.UUID

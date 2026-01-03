@@ -1,6 +1,6 @@
 // Package fs_test provides tests for fs package
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs_test
 
@@ -37,7 +37,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.AIS, Ns: cmn.Ns{Name: "namespace"}},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -46,7 +46,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.AIS, Ns: cmn.NsGlobal},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -55,7 +55,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.AWS, Ns: cmn.NsGlobal},
-			fs.WorkfileType, "objname", false,
+			fs.WorkCT, "objname", false,
 			false,
 		},
 		{
@@ -64,7 +64,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.AWS, Ns: cmn.NsGlobal},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -73,7 +73,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.GCP, Ns: cmn.NsGlobal},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -82,7 +82,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.AIS, Ns: cmn.Ns{Name: "namespace"}},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -91,7 +91,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath},
 			tmpMpath,
 			cmn.Bck{Name: "bucket", Provider: apc.AIS, Ns: cmn.Ns{UUID: "uuid", Name: "namespace"}},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -100,7 +100,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath + "/super/long"},
 			tmpMpath + "/super/long",
 			cmn.Bck{Name: "bucket", Provider: apc.AWS, Ns: cmn.NsGlobal},
-			fs.ObjectType, "objname", false,
+			fs.ObjCT, "objname", false,
 			false,
 		},
 		{
@@ -109,7 +109,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{tmpMpath + "/super/long"},
 			tmpMpath + "/super/long",
 			cmn.Bck{Name: "bucket", Provider: apc.AWS, Ns: cmn.NsGlobal},
-			fs.ObjectType, "folder/objname", false,
+			fs.ObjCT, "folder/objname", false,
 			false,
 		},
 
@@ -120,7 +120,7 @@ func TestParseFQN(t *testing.T) {
 			[]string{"/super/long", "/super/long/long"},
 			"",
 			cmn.Bck{Name: "bucket", Provider: apc.AWS, Ns: cmn.NsGlobal},
-			fs.ObjectType, "folder/objname", true,
+			fs.ObjCT, "folder/objname", true,
 			true,
 		},
 		{
@@ -258,7 +258,7 @@ func TestParseFQN(t *testing.T) {
 			fs.TestNew(mios)
 
 			for _, mpath := range tt.mpaths {
-				if err := cos.Stat(mpath); os.IsNotExist(err) {
+				if err := cos.Stat(mpath); cos.IsNotExist(err) {
 					cos.CreateDir(mpath)
 					defer os.RemoveAll(mpath)
 				}
@@ -267,8 +267,6 @@ func TestParseFQN(t *testing.T) {
 					tassert.CheckFatal(t, err)
 				}
 			}
-			fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
-			fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 
 			var parsed fs.ParsedFQN
 			err := parsed.Init(tt.fqn)
@@ -313,7 +311,7 @@ func TestMakeAndParseFQN(t *testing.T) {
 				Provider: apc.AIS,
 				Ns:       cmn.NsGlobal,
 			},
-			contentType: fs.ObjectType,
+			contentType: fs.ObjCT,
 			objName:     "object/name",
 		},
 		{
@@ -323,7 +321,7 @@ func TestMakeAndParseFQN(t *testing.T) {
 				Provider: apc.AWS,
 				Ns:       cmn.Ns{UUID: "uuid", Name: "namespace"},
 			},
-			contentType: fs.WorkfileType,
+			contentType: fs.WorkCT,
 			objName:     "object/name",
 		},
 		{
@@ -333,7 +331,7 @@ func TestMakeAndParseFQN(t *testing.T) {
 				Provider: apc.AWS,
 				Ns:       cmn.Ns{Name: "alias"},
 			},
-			contentType: fs.ObjectType,
+			contentType: fs.ObjCT,
 			objName:     "object/name",
 		},
 		{
@@ -343,7 +341,7 @@ func TestMakeAndParseFQN(t *testing.T) {
 				Provider: apc.GCP,
 				Ns:       cmn.NsGlobal,
 			},
-			contentType: fs.ObjectType,
+			contentType: fs.ObjCT,
 			objName:     "object/name",
 		},
 	}
@@ -354,15 +352,12 @@ func TestMakeAndParseFQN(t *testing.T) {
 			mios := mock.NewIOS()
 			fs.TestNew(mios)
 
-			if err := cos.Stat(tt.mpath); os.IsNotExist(err) {
+			if err := cos.Stat(tt.mpath); cos.IsNotExist(err) {
 				cos.CreateDir(tt.mpath)
 				defer os.RemoveAll(tt.mpath)
 			}
 			_, err := fs.Add(tt.mpath, "daeID")
 			tassert.CheckFatal(t, err)
-
-			fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
-			fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
 
 			mpaths := fs.GetAvail()
 			fqn := mpaths[tt.mpath].MakePathFQN(&tt.bck, tt.contentType, tt.objName)
@@ -403,13 +398,11 @@ func BenchmarkParseFQN(b *testing.B) {
 	cos.CreateDir(mpath)
 	defer os.RemoveAll(mpath)
 	fs.Add(mpath, "daeID")
-	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{})
 
 	mpaths := fs.GetAvail()
-	fqn := mpaths[mpath].MakePathFQN(&bck, fs.ObjectType, "super/long/name")
-	b.ResetTimer()
+	fqn := mpaths[mpath].MakePathFQN(&bck, fs.ObjCT, "super/long/name")
 
-	for range b.N {
+	for b.Loop() {
 		var parsed fs.ParsedFQN
 		parsed.Init(fqn)
 	}

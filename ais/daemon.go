@@ -29,6 +29,8 @@ import (
 	"github.com/NVIDIA/aistore/tracing"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
+
+	"golang.org/x/sys/unix"
 )
 
 const usecli = " -role=<proxy|target> -config=</dir/config.json> -local_config=</dir/local-config.json> ..."
@@ -172,7 +174,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 		if err := toUpdate.FillFromKVS(kvs); err != nil {
 			cos.ExitLog(err)
 		}
-		if err := setConfigInMem(toUpdate, config, apc.Daemon); err != nil {
+		if err := setConfigInMem(toUpdate, config, apc.Daemon, true /*transient*/); err != nil {
 			cos.ExitLogf("failed to update config in memory: %v", err)
 		}
 
@@ -241,7 +243,10 @@ func initDaemon(version, buildTime string) cos.Runner {
 		cmn.Init(p.si.Name(), nil)
 
 		// init distributed tracing
-		tracing.Init(&config.Tracing, p.si, nil, version)
+		tracing.Init(config.Tracing, p.si, nil, version)
+
+		// check ulimits
+		checkUlimits(apc.UlimitProxy, config.TestingEnv())
 
 		return p
 	}
@@ -261,9 +266,12 @@ func initDaemon(version, buildTime string) cos.Runner {
 	cmn.Init(t.si.Name(), fs.CleanPathErr)
 
 	// init distributed tracing
-	tracing.Init(&config.Tracing, t.si, nil, version)
+	tracing.Init(config.Tracing, t.si, nil, version)
 
 	cmn.InitObjProps2Hdr()
+
+	// check ulimits
+	checkUlimits(apc.UlimitTarget, config.TestingEnv())
 
 	return t
 }
@@ -324,6 +332,26 @@ func newTarget(co *configOwner) *target {
 	t.owner.etl = newEtlMDOwnerTgt()
 	t.owner.config = co
 	return t
+}
+
+func checkUlimits(expectMax uint64, testingEnv bool) {
+	lim := unix.Rlimit{}
+	err := unix.Getrlimit(unix.RLIMIT_NOFILE, &lim)
+	if err != nil {
+		nlog.Errorln("failed to get file descriptor limit:", err)
+		return
+	}
+	if lim.Cur >= expectMax {
+		return
+	}
+	// warn
+	s := fmt.Sprintf("file descriptor limit is low (%d); hard limit (%d); recommended %d+",
+		lim.Cur, lim.Max, expectMax)
+	if testingEnv {
+		nlog.Infoln("Warning:", s)
+	} else {
+		nlog.Warningln(s, "for production")
+	}
 }
 
 // Run is the 'main' where everything gets started

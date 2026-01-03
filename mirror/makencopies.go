@@ -6,6 +6,8 @@ package mirror
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -77,20 +79,34 @@ func newMNC(p *mncFactory, slab *memsys.Slab) (r *mncXact) {
 	debug.Assert(p.args.Tag != "" && p.args.Copies > 0)
 	r = &mncXact{p: p}
 	mpopts := &mpather.JgroupOpts{
-		CTs:      []string{fs.ObjectType},
+		CTs:      []string{fs.ObjCT},
 		VisitObj: r.visitObj,
 		Slab:     slab,
-		DoLoad:   mpather.LoadUnsafe,
-		Throttle: true,
+		DoLoad:   mpather.Load,
+		RW:       true,
 	}
 	mpopts.Bck.Copy(p.Bck.Bucket())
-	s := fmt.Sprintf("%s-copies-%d", r.p.args.Tag, r.p.args.Copies)
-	r.BckJog.Init(p.UUID(), apc.ActMakeNCopies, s /*ctlmsg*/, p.Bck, mpopts, cmn.GCO.Get())
+	s := r.CtlMsg()
+	r.BckJog.Init(p.UUID(), apc.ActMakeNCopies, p.Bck, mpopts, cmn.GCO.Get())
 
 	// name
 	r._nam = r.Base.Name() + "-" + s
 	r._str = r.Base.String() + "-" + s
 	return r
+}
+
+func (r *mncXact) CtlMsg() string {
+	var sb strings.Builder
+	sb.Grow(64)
+	sb.WriteString(r.p.args.Tag)
+	sb.WriteString(", copies:")
+	sb.WriteString(strconv.Itoa(r.p.args.Copies))
+	nv := r.NumVisits()
+	if nv > 0 {
+		sb.WriteString(", visited:")
+		sb.WriteString(strconv.FormatInt(nv, 10))
+	}
+	return sb.String()
 }
 
 func (r *mncXact) Run(wg *sync.WaitGroup) {
@@ -130,7 +146,7 @@ func (r *mncXact) visitObj(lom *core.LOM, buf []byte) (err error) {
 	}
 
 	if err != nil {
-		if cos.IsNotExist(err, 0) {
+		if cos.IsNotExist(err) {
 			return nil
 		}
 		if cos.IsErrOOS(err) {
@@ -146,7 +162,7 @@ func (r *mncXact) visitObj(lom *core.LOM, buf []byte) (err error) {
 		return err
 	}
 
-	if cmn.Rom.FastV(5, cos.SmoduleMirror) {
+	if cmn.Rom.V(5, cos.ModMirror) {
 		nlog.Infof("%s: %s, copies %d=>%d, size=%d", r.Base.Name(), lom.Cname(), n, copies, size)
 	}
 	r.ObjsAdd(1, size)
@@ -160,13 +176,6 @@ func (r *mncXact) visitObj(lom *core.LOM, buf []byte) (err error) {
 	return err
 }
 
-func (r *mncXact) String() string { return r._str }
-func (r *mncXact) Name() string   { return r._nam }
-
-func (r *mncXact) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return
-}
+func (r *mncXact) String() string   { return r._str }
+func (r *mncXact) Name() string     { return r._nam }
+func (r *mncXact) Snap() *core.Snap { return r.Base.NewSnap(r) }

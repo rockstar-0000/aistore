@@ -4,13 +4,135 @@ All notable changes to the AIStore Python SDK project are documented in this fil
 
 We structure this changelog in accordance with [Keep a Changelog](https://keepachangelog.com/) guidelines, and this project follows [Semantic Versioning](https://semver.org/).
 
----
 ## Unreleased
+
+### Fixed
+
+- Fixed HMAC signature mismatch (401 Unauthorized) when using HTTPS with cluster key enabled:
+  - Calculate content length for all data types (bytes, strings, file-like objects) to ensure accurate headers.
+  - Fix HTTPS manual redirect to avoid SSL EOF errors when sending request data.
+  - Include `Content-Length` header in proxy requests for proper URL signing (previously signed with 0, causing 401 on target).
+
+### Added
+
+- `ParallelContentIterProvider`: A new content iterator that fetches object chunks using concurrent HTTP range-reads while yielding them in sequential order.
+- `num_workers` parameter in `Object.get_reader()`: When specified, uses `ParallelContentIterProvider` for parallel downloads, improving throughput for large objects.
+- `ObjectClient.get_chunk(start, end)`: Fetch a specific byte range of an object. Used for parallel chunk fetching.
+
+## [1.18.0] - 2025-12-05
+
+### Changed
+
+- Update to Pydantic v2 for all API type parsing.
+- Improved type hinting with more explicit Optionals
+- **IMPORTANT** - Timeout Behavior Change:
+  - Default timeout changed from `(3, 20)` to `None`: When `timeout=None` (the new default), the client now checks environment variables `AIS_CONNECT_TIMEOUT` and `AIS_READ_TIMEOUT`. If not set, it falls back to `(3, 20)`.
+  - To disable timeout, use `0` instead of `None`: Previously, `timeout=None` disabled timeouts. Now, use `timeout=0` or `timeout=(0, 0)` to disable all timeouts.
+  - Granular timeout control: Use tuples with `0` to disable specific timeouts: `timeout=(0, 20)` disables connect timeout only, `timeout=(5, 0)` disables read timeout only.
+  - Environment variables: Added support for environment variables to configure connection timeout (`AIS_CONNECT_TIMEOUT`), read timeout (`AIS_READ_TIMEOUT`), and maximum connection pool size (`AIS_MAX_CONN_POOL`). Set `AIS_CONNECT_TIMEOUT=0` or `AIS_READ_TIMEOUT=0` to disable specific timeouts via environment variables.
+- All job wait methods (`Job.wait()`, `Job.wait_for_idle()`, `Job.wait_single_node()`, `Dsort.wait()`) now return unified `WaitResult` dataclass:
+  - Check `result.success` to verify success of wait operation.
+  - Access error details via `result.error` and completion time via `result.end_time`.
+  - Wait timeouts raise `Timeout` exception with detailed debug info.
+
+### Fixed
+
+- `Job.wait_for_idle()` now correctly exits early when job is aborted or failed, instead of falsely timing out.
+
+## [1.17.0] - 2025-10-16
+
+### Added
+
+- Introduced a new `Batch` class to handle GetBatch requests, replacing the old `BatchLoader`.
+- Added support for creating batches with multiple objects.
+
+### Changed
+
+- FastAPI ETL Webserver: Introduced HTTP connection pooling via `httpx.Limits` to manage maximum concurrent and keep-alive connections, improving network efficiency under load.
+- Transformation handling: Removed per-request thread creation and now rely on the existing executor loop for CPU-bound transforms, reducing thread overhead and overall CPU usage.
+- Updated the SDK to utilize `MossIn` and `MossOut` types for better metadata handling (Match Go API 1:1).
+
+### Fixed
+
+- Optimize error message URL parsing regex by bounding quantifiers and removing greedy patterns.
+
+### Removed
+
+- Removed `BatchLoader` and `BatchRequest` classes.
+
+
+## [1.16.0] - 2025-10-03
+
+### Added
+
+- Add multipart upload support for objects.
+  - Introduce `MultipartUpload` class with `create()`, `add_part()`, `complete()`, and `abort()` methods.
+  - Add `Object.multipart_upload()` method to create multipart upload sessions.
+
+### Changed
+
+- Move cold get retry delay logic into the tenacity `before_sleep` option and improve logging.
+- Add path parameter to `direct_put` methods across all webserver.
+
+## [1.15.2] - 2025-08-18
+
+### Added
+
+- Add functionality to pipeline multiple ETLs.
+  - Add `>>` operator for combining multiple ETLs into a pipeline.
+  - Introduce `QPARAM_ETL_PIPELINE` constant for ETL pipeline configuration and object inline transformation.
+  - Add `etl_pipeline` argument to `Bucket.transform` and `ObjectGroup.transform` APIs.
+- Add `pip-system-certs` to common requirements to allow `requests` to access a local certificate in the `uv` virtual environment.
+
+### Removed
+
+- Remove 'deserialize_class' function from ETL Webserver Utils and clean imports.
+- Remove `arg_type` environment variable configuration for all ETL web servers, types, and documents; FQN path is now specified per request via query parameter.
+
+## [1.15.1] - 2025-08-11
+
+### Added
+
+- Add ETL pipeline header processing and direct put handling in all ETL webservers.
+- Add ETL pipeline processing in WebSocket control message of ETL FastAPI web server.
+
+### Changed
+- **BREAKING**: `BatchLoader.get_batch()` no longer takes `extractor` and `decoder` args. Instead, use `return_raw` and `decode_as_stream`.
+- Support `ETLConfig.args` parameter in `Object.copy` method.
+
+## [1.15.0] - 2025-07-15
 
 ### Added
 
 - Add `ETLRuntimeSpec` class to formalize runtime configuration.
 - Add `etl.init(image, command, …)` for simplified setup using only image and command.
+- Add archive-extension constant (`EXT_TAR`).
+- Add `init_class` method on the Etl client to register and initialize an ETLServer subclass.
+- Add support for ETL context manager.
+- Add `cont_on_err` option for bucket transform.
+- Add `job_id` option to `Etl.view()` method.
+- Add support for OS packages in `init_class`.
+- Add `MultipartDecoder` class to allow for the parsing of multipart HTTP responses.
+- Add `Object.copy()` method with support for `ETLConfig` parameter for copying/transforming a single object.
+- Add `Object.copy()` method with support for `latest` and `sync` options.
+- Add `BatchLoader`, `BatchRequest`, and `BatchResponseItem` classes for new GetBatch AIStore API.
+- Add `ArchiveStreamExtractor` for extraction of archive contents streamed from GetBatch calls.
+- Added new internal `BatchObjectRequest` and `BatchResponse` classes to represent metadata.
+- Add new `parse_as_stream` field for `MultipartDecoder` allowing for on-the-fly decoding.
+
+### Changed
+
+- **BREAKING**: Update ObjectGroup `copy()` and `archive()` methods to return `List[str]` instead of `str` as these operations can return multiple job IDs (perform operations separately on each job ID).
+- Make usage clear for ObjectReader API in `Object.get` deprecation message.
+- Make usage clear for ObjectWriter API in `Object.put_content`, `Object.put_file`, `Object.append_content`, and `Object.set_custom_props` deprecation messages.
+- Add `list_archive` function to Bucket class: helper method to list entries inside an archived object, with the option to include the archive itself.
+- Removes ETL `init_code`.
+- Extend `ETLDetails` type with a list of `ETLObjError`.
+- Return transformed object size in direct put response for ETL Webservers.
+- Update `ObjectReader.__iter__()` to return `Generator[bytes, None, None]`.
+- Update `ObjectFileReader.close()` to call `generator.close()` to properly close underlying HTTP streams.
+- Rename `Cluster.list_running_etls()` method to `Cluster.list_etls()`, introducing an optional `stage` argument for filtering ETLs by lifecycle stage.
+- Rename ETL `Stopped` stage to `Aborted` for improved clarity.
 
 ## [1.14.0] - 2025-05-27
 

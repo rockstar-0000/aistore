@@ -17,7 +17,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/xact"
@@ -94,7 +93,7 @@ func (t *target) httpxget(w http.ResponseWriter, r *http.Request) {
 	xactQuery := xreg.Flt{
 		ID: xactMsg.ID, Kind: xactMsg.Kind, Bck: bck, OnlyRunning: xactMsg.OnlyRunning,
 	}
-	t.xquery(w, r, what, xactQuery)
+	t.xquery(w, r, what, &xactQuery)
 }
 
 func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +120,7 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 
 	// TODO: not checking `xargs.Buckets` vs `xargs.Bck` and not initializing the former :NOTE
 
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.V(4, cos.ModAIS) {
 		nlog.Infoln(msg.Action, xargs.String())
 	}
 	switch msg.Action {
@@ -164,18 +163,9 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		err := cmn.ErrXactUserAbort
-		if msg.Name == cmn.ErrXactICNotifAbort.Error() {
-			err = cmn.ErrXactICNotifAbort
-		}
+		err := cos.Ternary(msg.Name == cmn.ErrXactICNotifAbort.Error(), cmn.ErrXactICNotifAbort, cmn.ErrXactUserAbort)
 		flt := xreg.Flt{ID: xargs.ID, Kind: xargs.Kind, Bck: bck}
-		xreg.DoAbort(flt, err)
-
-		if xargs.Kind == apc.ActETLInline {
-			if err := etl.StopByXid(xargs.ID, err); err != nil {
-				t.writeErrf(w, r, "%v: %s", err, xargs.String())
-			}
-		}
+		xreg.DoAbort(&flt, err)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
@@ -199,7 +189,7 @@ func (t *target) xget(w http.ResponseWriter, r *http.Request, what, uuid string)
 	t.writeErr(w, r, err, http.StatusNotFound, Silent)
 }
 
-func (t *target) xquery(w http.ResponseWriter, r *http.Request, what string, xactQuery xreg.Flt) {
+func (t *target) xquery(w http.ResponseWriter, r *http.Request, what string, xactQuery *xreg.Flt) {
 	stats, err := xreg.GetSnap(xactQuery)
 	if err == nil {
 		t.writeJSON(w, r, stats, what) // ok
@@ -289,22 +279,28 @@ func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck, msg *apc.ActMsg) (xid
 			Custom: xreg.ResArgs{
 				Config: cmn.GCO.Get(),
 			},
+			WG: wg,
 		}
-		go t.runResilver(resargs, wg)
+		go t.runResilver(resargs)
 		wg.Wait()
+	case apc.ActRechunk:
+		return t.runRechunk(args.ID, bck, &xreg.RechunkArgs{
+			ObjSizeLimit: int64(bck.Props.Chunks.ObjSizeLimit),
+			ChunkSize:    int64(bck.Props.Chunks.ChunkSize),
+		})
 	case apc.ActLoadLomCache:
 		rns := xreg.RenewBckLoadLomCache(args.ID, bck)
 		return xid, rns.Err
 	case apc.ActBlobDl:
 		debug.Assert(msg.Name != "")
 		lom := core.AllocLOM(msg.Name)
-		err := lom.InitBck(&args.Bck)
+		err := lom.InitCmnBck(&args.Bck)
 		if err == nil {
 			params := &core.BlobParams{
 				Lom: lom,
 				Msg: &apc.BlobMsg{}, // default tunables when executing via x-start API
 			}
-			xid, _, err = t.blobdl(params, nil /*oa*/)
+			xid, _, err = t.blobdl(params, nil /*oa*/, nil /*object headers*/)
 		}
 		if err != nil {
 			core.FreeLOM(lom)
@@ -342,8 +338,7 @@ func (t *target) httpxpost(w http.ResponseWriter, r *http.Request) {
 
 	xactID := amsg.Name
 	if strings.IndexByte(xactID, xact.SepaID[0]) > 0 {
-		uuids := strings.Split(xactID, xact.SepaID)
-		for _, xid := range uuids {
+		for xid := range strings.SplitSeq(xactID, xact.SepaID) {
 			if xctn, err = xreg.GetXact(xid); err == nil {
 				break
 			}

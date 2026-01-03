@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
@@ -75,6 +76,7 @@ var (
 		"put":      "object put",
 		"rmo":      "object rm",
 		"prefetch": "object prefetch", // same as "job start prefetch"
+		"mpu":      "object multipart-upload",
 		// bucket
 		"ls":     "bucket ls",
 		"create": "bucket create",
@@ -197,8 +199,8 @@ func Load(args []string, reset string) (*Config, error) {
 		resetAndExit bool
 	)
 	if err := jsp.LoadAppConfig(ConfigDir, fname.CliConfig, cfg); err != nil {
-		if !os.IsNotExist(err) {
-			if !cos.StringInSlice(reset, args) {
+		if !cos.IsNotExist(err) {
+			if !slices.Contains(args, reset) {
 				path := filepath.Join(ConfigDir, fname.CliConfig)
 				return nil, fmt.Errorf("failed to load CLI config %q: %v\n\n%s", path, err, tipReset)
 			}
@@ -219,9 +221,9 @@ func Load(args []string, reset string) (*Config, error) {
 
 	if err := cfg.validate(); err != nil {
 		path := filepath.Join(ConfigDir, fname.CliConfig)
-		if cos.StringInSlice(reset, args) {
+		if slices.Contains(args, reset) {
 			fmt.Fprintf(os.Stderr, "CLI config at %s: %v\n", path, err)
-			fmt.Fprintf(os.Stderr, "Resetting config to system defaults...\t")
+			fmt.Fprint(os.Stderr, "Resetting config to system defaults...\t")
 			time.Sleep(time.Second)
 			if err = Save(&defaultConfig); err != nil {
 				return nil, err // (unlikely)

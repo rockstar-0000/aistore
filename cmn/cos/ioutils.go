@@ -50,9 +50,14 @@ func ReadAll(r io.Reader) ([]byte, error) {
 
 // including "unexpecting EOF" to accommodate unsized streaming and
 // early termination of the other side (prior to sending the first byte)
-func IsEOF(err error) bool {
+func IsAnyEOF(err error) bool {
 	return err == io.EOF || err == io.ErrUnexpectedEOF ||
 		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
+}
+
+// graceful
+func IsOkEOF(err error) bool {
+	return err == io.EOF || errors.Is(err, io.EOF)
 }
 
 // ExpandPath replaces common abbreviations in file path (eg. `~` with absolute
@@ -158,10 +163,8 @@ func SaveReader(fqn string, reader io.Reader, buf []byte, cksumType string, size
 		return nil, erc
 	}
 	cksum, err := _save(fqn, WriterOnly{wfh} /*hide ReadFrom*/, reader, buf, cksumType, size)
-	erc = wfh.Close()
-
-	if err == nil && erc != nil {
-		err = fmt.Errorf("failed to close %s: %w", fqn, erc)
+	if erc := wfh.Close(); err == nil && erc != nil {
+		err = erc
 	}
 	if err != nil {
 		os.Remove(fqn) // cleanup

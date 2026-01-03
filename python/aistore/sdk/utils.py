@@ -6,7 +6,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Iterator, Optional, Tuple, Type, TypeVar, Union
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, parse_qs
 
 import braceexpand
 import humanize
@@ -14,7 +14,7 @@ import requests
 import xxhash
 
 from msgspec import msgpack
-from pydantic.v1 import BaseModel, parse_raw_as
+from pydantic import BaseModel, TypeAdapter
 from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
 from aistore.sdk.const import (
@@ -22,7 +22,9 @@ from aistore.sdk.const import (
     MSGPACK_CONTENT_TYPE,
     DEFAULT_LOG_FORMAT,
     XX_HASH_SEED,
+    QPARAM_PROVIDER,
 )
+from aistore.sdk.provider import Provider, provider_aliases
 
 T = TypeVar("T")
 MASK = 0xFFFFFFFFFFFFFFFF  # 64-bit mask
@@ -32,6 +34,13 @@ CONST1 = 0xbf58476d1ce4e5b9
 CONST2 = 0x94d049bb133111eb
 # fmt: on
 ROTATION_BITS = 7
+
+# URL parsing regex components
+URL_PROVIDERS = "|".join([p.value for p in Provider] + list(provider_aliases))
+MAX_BUCKET_PART_LEN = (
+    132  # Accommodates constraint of @uuid(32)#namespace(32)/bucket(64)
+)
+BUCKET_CHARS = r"[A-Za-z0-9@#._-]"
 
 
 class HttpError(BaseModel):
@@ -80,7 +89,7 @@ def _check_path_exists(path: Path) -> None:
         raise ValueError(f"Path: {path} does not exist")
 
 
-def validate_file(path: str or Path) -> None:
+def validate_file(path: Union[str, Path]) -> None:
     """
     Validate that a file exists and is a file
     Args:
@@ -97,7 +106,7 @@ def validate_file(path: str or Path) -> None:
         raise ValueError(f"Path: {path} is a directory, not a file")
 
 
-def validate_directory(path: str or Path) -> None:
+def validate_directory(path: Union[str, Path]) -> None:
     """
     Validate that a directory exists and is a directory
     Args:
@@ -157,7 +166,7 @@ def decode_response(
     """
     if resp.headers.get(HEADER_CONTENT_TYPE) == MSGPACK_CONTENT_TYPE:
         return msgpack.decode(resp.content, type=res_model)
-    return parse_raw_as(res_model, resp.text)
+    return TypeAdapter(res_model).validate_json(resp.text)
 
 
 def parse_url(url: str) -> Tuple[str, str, str]:
@@ -177,25 +186,24 @@ def parse_url(url: str) -> Tuple[str, str, str]:
 
 def extract_and_parse_url(msg: str) -> Optional[Tuple[str, str, bool]]:
     """
-    Extract provider, bucket, and object from raw string.
+    Extract provider, bucket, and whether an object is present from raw string.
 
     Args:
         msg (str): Any string that may contain an AIS FQN.
 
     Returns:
-        Optional[Tuple[str, str, bool]]: (prov, bck, obj) if a FQN is found, otherwise None.
+        Optional[Tuple[str, str, bool]]: (prov, bck, has_obj) if a FQN is found, otherwise None.
     """
-    pattern = r"([a-z0-9]+)://([A-Za-z0-9@._-]+)(/.*)?"
+    pattern = rf"({URL_PROVIDERS})://({BUCKET_CHARS}{{1,{MAX_BUCKET_PART_LEN}}})(?:(/)|(?!{BUCKET_CHARS}))"
     match = re.search(pattern, msg)
-
     if not match:
         return None
 
     prov = match.group(1)
     bck = match.group(2)
-    obj = match.group(3)  # Not None if `/` after bucket
+    has_obj = bool(match.group(3))
 
-    return prov, bck, obj
+    return prov, bck, has_obj
 
 
 def get_logger(name: str, log_format: str = DEFAULT_LOG_FORMAT):
@@ -284,29 +292,6 @@ def convert_to_seconds(time_val: Union[str, int]) -> int:
     return int(num) * multipliers[unit]
 
 
-def compose_etl_direct_put_url(direct_put_url: str, host_target: str) -> str:
-    """
-    Composes the final direct PUT URL by merging the AIS target base URL (`host_target`)
-    with the destination node address and object path from `direct_put_url`.
-
-    Args:
-        direct_put_url (str): The destination node's direct PUT URL, including path and query.
-        host_target (str): The base AIS target URL used as the scheme and path base.
-
-    Returns:
-        str: A complete direct PUT URL targeting the appropriate AIS node.
-    """
-    parsed_target = urlparse(direct_put_url)
-    parsed_host = urlparse(host_target)
-    return urlunparse(
-        parsed_host._replace(
-            netloc=parsed_target.netloc,
-            path=parsed_host.path + parsed_target.path,
-            query=parsed_target.query,  # pass xid on direct put for statistics
-        )
-    )
-
-
 def is_read_timeout(exc: requests.ConnectionError) -> bool:
     """
     Check if a given ConnectionError was caused by an underlying ReadTimeoutError
@@ -322,4 +307,33 @@ def is_read_timeout(exc: requests.ConnectionError) -> bool:
     # Expect it to be wrapped in urllib's retry
     if not isinstance(inner_exc, MaxRetryError):
         return False
+    # urllib3 ReadTimeoutError != requests ReadTimeout
     return isinstance(inner_exc.reason, ReadTimeoutError)
+
+
+def get_provider_from_request(
+    req: Union[requests.Request, requests.PreparedRequest],
+) -> Provider:
+    """
+    Given either a Request or PreparedRequest, return an AIS bucket provider.
+    The request property of a `requests.RequestException` can be either of these types,
+        so this can be used to find the bucket provider involved in the initial request.
+
+    Args:
+        req (Union[requests.Request, requests.PreparedRequest]): Any request or prepared request.
+
+    Returns:
+        Parsed AIS bucket Provider Enum.
+    """
+    if isinstance(req, requests.Request):
+        qparams = req.params
+    else:
+        parsed_url = urlparse(req.url)
+        qparams = (
+            {k: v[0] for k, v in parse_qs(parsed_url.query).items()}
+            if parsed_url.query and isinstance(parsed_url.query, str)
+            else None
+        )
+    if not qparams:
+        raise ValueError("Cannot parse provider from request with no query params")
+    return Provider.parse(qparams.get(QPARAM_PROVIDER, ""))

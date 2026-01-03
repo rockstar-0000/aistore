@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
@@ -27,10 +28,7 @@ import (
 
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
-)
-
-const (
-	fileStdIO = "-" // STDIN (for `ais put`), STDOUT (for `ais put`)
+	"github.com/vbauerster/mpb/v4/decor"
 )
 
 const extractVia = "--extract(*)"
@@ -52,8 +50,9 @@ func catHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	var warned bool
 	a := qparamArch{archpath: parseStrFlag(c, archpathGetFlag)}
-	return getObject(c, bck, objName, fileStdIO, a, true /*quiet*/, false /*extract*/)
+	return getObject(c, bck, objName, stdInOut, a, &warned, true /*quiet*/, false /*extract*/)
 }
 
 func getHandler(c *cli.Context) error {
@@ -63,13 +62,11 @@ func getHandler(c *cli.Context) error {
 	if flagIsSet(c, lengthFlag) != flagIsSet(c, offsetFlag) {
 		return fmt.Errorf("%s and %s must be both present (or not)", qflprn(lengthFlag), qflprn(offsetFlag))
 	}
-	if flagIsSet(c, latestVerFlag) {
-		if flagIsSet(c, headObjPresentFlag) {
-			return fmt.Errorf(errFmtExclusive, qflprn(latestVerFlag), qflprn(headObjPresentFlag))
-		}
-		if flagIsSet(c, getObjCachedFlag) {
-			return fmt.Errorf(errFmtExclusive, qflprn(latestVerFlag), qflprn(getObjCachedFlag))
-		}
+	if err := errMutuallyExclusive(c, latestVerFlag, headObjPresentFlag); err != nil {
+		return err
+	}
+	if err := errMutuallyExclusive(c, latestVerFlag, getObjCachedFlag); err != nil {
+		return err
 	}
 
 	// source
@@ -105,6 +102,17 @@ func getHandler(c *cli.Context) error {
 		if flagIsSet(c, progressFlag) {
 			tip := fmt.Sprintf("Tip: try 'ais %s %s --progress')", cmdBlobDownload, uri)
 			return fmt.Errorf("cannot show progress when running GET via blob-downloader - "+NIY+"\n(%s)", tip)
+		}
+		if flagIsSet(c, mpdFlag) {
+			return fmt.Errorf(errFmtExclusive, qflprn(blobDownloadFlag), qflprn(mpdFlag))
+		}
+	}
+
+	// --chunk-size and --num-workers require either --blob-download or --mpd
+	if flagIsSet(c, chunkSizeFlag) || flagIsSet(c, numBlobWorkersFlag) {
+		if !flagIsSet(c, blobDownloadFlag) && !flagIsSet(c, mpdFlag) {
+			return fmt.Errorf("%s and %s require either %s or %s",
+				qflprn(chunkSizeFlag), qflprn(numBlobWorkersFlag), qflprn(blobDownloadFlag), qflprn(mpdFlag))
 		}
 	}
 
@@ -164,6 +172,10 @@ func getHandler(c *cli.Context) error {
 					uri, qflprn(getObjPrefixFlag))
 			}
 		}
+		// warn: --mpd is for single object only
+		if flagIsSet(c, mpdFlag) {
+			actionWarn(c, qflprn(mpdFlag)+" is designed for single large object download - ignoring in multi-object mode")
+		}
 
 		// `getMultiObj` is a fusion of 'ais ls' and GET, with progress bar and a
 		// very limited archival support (that boils down to listing archived files)
@@ -172,7 +184,8 @@ func getHandler(c *cli.Context) error {
 	}
 
 	// GET
-	return getObject(c, bck, objName, outFile, a, false /*quiet*/, extract)
+	var warned bool
+	return getObject(c, bck, objName, outFile, a, &warned, false /*quiet*/, extract)
 }
 
 // GET multiple -- currently, only prefix (TODO: list/range)
@@ -184,7 +197,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 	)
 	if flagIsSet(c, listArchFlag) && prefix != "" {
 		// when prefix crosses shard boundary
-		if external, internal := splitPrefixShardBoundary(prefix); internal != "" {
+		if external, internal := splitArchivePath(prefix); internal != "" {
 			prefix = external
 			debug.Assert(prefix != origPrefix)
 			lstFilter._add(func(obj *cmn.LsoEnt) bool {
@@ -230,7 +243,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 	// can't do many to one
 	l := len(lst.Entries)
 	if l > 1 {
-		if outFile != "" && outFile != fileStdIO && !discardOutput(outFile) {
+		if outFile != "" && outFile != stdInOut && !discardOutput(outFile) {
 			finfo, errEx := os.Stat(outFile)
 			// destination directory must exist
 			if errEx != nil || !finfo.IsDir() {
@@ -257,7 +270,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 	switch {
 	case discardOutput(outFile):
 		discard = " (and discard)"
-	case outFile == fileStdIO:
+	case outFile == stdInOut:
 		out = " to standard output"
 	default:
 		out = outFile
@@ -301,6 +314,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 		u.barObjs = totalBars[0]
 		u.barSize = totalBars[1]
 	}
+	var warned bool
 	for _, en := range lst.Entries {
 		var shardName string
 
@@ -309,7 +323,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 			actionNote(c, "virtual directory '"+en.Name+"' in 'list-objects' results (skipping)")
 			continue
 		}
-		if err := cmn.ValidOname(en.Name); err != nil {
+		if err := cos.ValidOname(en.Name); err != nil {
 			continue
 		}
 
@@ -338,7 +352,9 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 			}
 		}
 		u.wg.Add(1)
-		go u.get(c, bck, en, shardName, outFile, quiet, extract)
+
+		// TODO: racy access to *warned (benign)
+		go u.get(c, bck, en, shardName, outFile, &warned, quiet, extract)
 	}
 	u.wg.Wait()
 
@@ -356,7 +372,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 // uctx - "get" extension
 //////////
 
-func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEnt, shardName, outFile string, quiet, extract bool) {
+func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEnt, shardName, outFile string, warned *bool, quiet, extract bool) {
 	var (
 		a       qparamArch // effectively, ignore user-specified command line and redefine to GET a given shardName
 		objName = entry.Name
@@ -364,7 +380,7 @@ func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEnt, shardName, ou
 	if shardName != "" {
 		objName = shardName
 		a.archpath = strings.TrimPrefix(entry.Name, shardName+"/")
-		if outFile != fileStdIO && !discardOutput(outFile) {
+		if outFile != stdInOut && !discardOutput(outFile) {
 			// when getting multiple files retain the full archpath
 			// (compare w/ filepath.Base usage otherwise)
 			outFile = filepath.Join(outFile, a.archpath)
@@ -373,7 +389,7 @@ func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEnt, shardName, ou
 			}
 		}
 	}
-	err := getObject(c, bck, objName, outFile, a, quiet, extract)
+	err := getObject(c, bck, objName, outFile, a, warned, quiet, extract)
 	if err != nil {
 		u.errCount.Inc()
 	}
@@ -391,15 +407,15 @@ func (u *uctx) get(c *cli.Context, bck cmn.Bck, entry *cmn.LsoEnt, shardName, ou
 }
 
 // get one (main function)
-func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArch, quiet, extract bool) error {
-	if outFile == fileStdIO && extract {
+func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArch, warned *bool, quiet, extract bool) error {
+	if outFile == stdInOut && extract {
 		return errors.New("cannot extract archived files to standard output - " + NIY)
 	}
 	if discardOutput(outFile) && extract {
 		return errors.New("cannot extract and discard archived files - " + NIY)
 	}
 	if flagIsSet(c, listArchFlag) && a.archpath == "" {
-		if external, internal := splitPrefixShardBoundary(objName); internal != "" {
+		if external, internal := splitArchivePath(objName); internal != "" {
 			objName, a.archpath = external, internal
 		}
 	}
@@ -430,7 +446,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 		} else {
 			outFile = filepath.Base(objName)
 		}
-	} else if outFile != fileStdIO && !discardOutput(outFile) {
+	} else if outFile != stdInOut && !discardOutput(outFile) {
 		finfo, errEx := os.Stat(outFile)
 		if errEx == nil {
 			if !finfo.IsDir() && extract {
@@ -482,45 +498,54 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 		if !quiet {
 			now = mono.NanoTime()
 		}
-	} else if flagIsSet(c, chunkSizeFlag) || flagIsSet(c, numBlobWorkersFlag) {
-		return fmt.Errorf("command line options (%s, %s) can be used only together with %s",
-			qflprn(chunkSizeFlag), qflprn(numBlobWorkersFlag), qflprn(blobDownloadFlag))
+	}
+
+	// multipart download (client-side, with progress bar)
+	if flagIsSet(c, mpdFlag) {
+		if outFile == stdInOut || discardOutput(outFile) {
+			return errors.New("multipart download requires a file destination")
+		}
+		wfh, errC := os.Create(outFile)
+		if errC != nil {
+			return errC
+		}
+		defer cos.Close(wfh)
+
+		return mpdGet(c, bck, objName, wfh, quiet)
 	}
 
 	var getArgs api.GetArgs
 	switch {
-	case outFile == fileStdIO:
+	case outFile == stdInOut:
 		getArgs = api.GetArgs{Writer: os.Stdout, Header: hdr}
 		quiet = true
 	case discardOutput(outFile):
 		getArgs = api.GetArgs{Writer: io.Discard, Header: hdr}
 	default:
-		var file *os.File
-		if file, err = os.Create(outFile); err != nil {
+		wfh, err := os.Create(outFile)
+		if err != nil {
 			return err
 		}
 		defer func() {
-			file.Close()
+			cos.Close(wfh)
 			if err != nil {
 				os.Remove(outFile)
 			}
 		}()
-		getArgs = api.GetArgs{Writer: file, Header: hdr}
+		getArgs = api.GetArgs{Writer: wfh, Header: hdr}
 	}
 
 	// finally: http query and API call
 	getArgs.Query = a.getQuery(c, &bck)
 
-	// encode special symbols
-	if flagIsSet(c, encodeObjnameFlag) {
-		objName = url.PathEscape(objName)
-	}
+	// encode special symbols if requested
+	encObjName := warnEscapeObjName(c, objName, warned)
 
 	var oah api.ObjAttrs
 	if flagIsSet(c, cksumFlag) {
-		oah, err = api.GetObjectWithValidation(apiBP, bck, objName, &getArgs)
+		oah, err = api.GetObjectWithValidation(apiBP, bck, encObjName, &getArgs)
 	} else {
-		oah, err = api.GetObject(apiBP, bck, objName, &getArgs)
+		oah, err = api.GetObject(apiBP, bck, encObjName, &getArgs)
 	}
 	if err != nil {
 		if cmn.IsStatusNotFound(err) && !a.enabled() {
@@ -560,7 +585,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 	switch {
 	case discardOutput(outFile):
 		discard = " and discard"
-	case outFile == fileStdIO:
+	case outFile == stdInOut:
 		out = " to standard output"
 	case extract:
 		out = " to " + outFile
@@ -735,7 +760,79 @@ func (ex *extractor) _write(filename string, size int64, wfh *os.File, reader io
 	return false, nil
 }
 
-// discard
-func discardOutput(outf string) bool {
-	return outf == "/dev/null" || outf == "dev/null" || outf == "dev/nil"
+//
+// multipart download with progress bar
+//
+
+func mpdGet(c *cli.Context, bck cmn.Bck, objName string, wfh *os.File, quiet bool) error {
+	var (
+		mpdArgs   api.MultipartDownloadArgs
+		callAfter = 100 * time.Millisecond // default: update progress ~10x per second
+	)
+	mpdArgs.Writer = wfh
+
+	if flagIsSet(c, chunkSizeFlag) {
+		sz, err := parseSizeFlag(c, chunkSizeFlag)
+		if err != nil {
+			return err
+		}
+		mpdArgs.ChunkSize = sz
+	}
+	if flagIsSet(c, numBlobWorkersFlag) {
+		mpdArgs.NumWorkers = parseIntFlag(c, numBlobWorkersFlag)
+	}
+	if flagIsSet(c, refreshFlag) {
+		callAfter = parseDurationFlag(c, refreshFlag)
+	}
+
+	// progress bar
+	var (
+		progress    *mpb.Progress
+		bar         *mpb.Bar
+		lastCurrent int64
+		lastTime    = time.Now()
+	)
+	if !quiet {
+		progress = mpb.New(mpb.WithWidth(barWidth))
+		bar = progress.AddBar(0, // will set total later
+			mpb.PrependDecorators(
+				decor.Name(objName+" ", decor.WC{W: len(objName) + 1, C: decor.DidentRight}),
+				decor.CountersKibiByte("% .2f / % .2f"),
+			),
+			mpb.AppendDecorators(
+				decor.Elapsed(decor.ET_STYLE_HHMMSS, decor.WCSyncWidth),
+				decor.Name(" "),
+				decor.EwmaSpeed(decor.UnitKiB, "% .1f", 60, decor.WC{W: 10}),
+			),
+		)
+		mpdArgs.Callback = func(cnt *api.MpdCounter) {
+			if bar.Current() == 0 && cnt.Total() > 0 {
+				bar.SetTotal(cnt.Total(), false)
+			}
+			curr := cnt.Current()
+			if delta := curr - lastCurrent; delta > 0 {
+				bar.IncrInt64(delta, time.Since(lastTime))
+				lastCurrent = curr
+				lastTime = time.Now()
+			}
+			if cnt.IsFinished() {
+				bar.SetTotal(curr, true)
+			}
+		}
+		mpdArgs.CallAfter = callAfter
+	}
+
+	err := api.MultipartDownload(apiBP, bck, objName, &mpdArgs)
+
+	if progress != nil {
+		progress.Wait()
+	}
+	if err != nil {
+		return err
+	}
+
+	if !quiet {
+		actionDone(c, "GET "+bck.Cname(objName))
+	}
+	return nil
 }

@@ -6,7 +6,6 @@ package ais
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	ratomic "sync/atomic"
@@ -95,14 +94,7 @@ func (r *rebMD) String() string {
 	if r == nil {
 		return "RMD <nil>"
 	}
-	if len(r.TargetIDs) == 0 && r.Resilver == "" {
-		return fmt.Sprintf("RMD v%d[%s]", r.Version, r.CluID)
-	}
-	var s string
-	if r.Resilver != "" {
-		s = ", " + r.Resilver
-	}
-	return fmt.Sprintf("RMD v%d[%s, %v%s]", r.Version, r.CluID, r.TargetIDs, s)
+	return fmt.Sprintf("RMD v%d[%s, %v]", r.Version, r.CluID, r.TargetIDs)
 }
 
 //////////////
@@ -126,7 +118,7 @@ func (r *rmdOwner) load() {
 		r.put(rmd)
 		return
 	}
-	if !os.IsNotExist(err) {
+	if !cos.IsNotExist(err) {
 		nlog.Errorln("failed to load RMD:", err)
 		nlog.Infoln("Warning: make sure to properly decommission previously deployed clusters, proceeding anyway...")
 	}
@@ -191,7 +183,6 @@ func (r *rmdOwner) do(ctx *rmdModifier) (clone *rebMD, err error) {
 
 	clone = ctx.prev.clone()
 	clone.TargetIDs = nil
-	clone.Resilver = ""
 	clone.CluID = r.cluID
 	debug.Assert(cos.IsValidUUID(clone.CluID), clone.CluID)
 	ctx.pre(ctx, clone) // `pre` callback
@@ -297,7 +288,7 @@ func (m *rmdModifier) log(nl nl.Listener) {
 	debug.Assert(nl.UUID() == m.rebID)
 	var (
 		err  = nl.Err()
-		abrt = nl.Aborted()
+		abrt = nl.IsAborted()
 		name = "rebalance[" + nl.UUID() + "]"
 	)
 	switch {

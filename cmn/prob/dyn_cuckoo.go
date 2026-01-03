@@ -1,6 +1,6 @@
 // Package prob implements fully features dynamic probabilistic filter.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package prob
 
@@ -10,28 +10,27 @@ import (
 	cuckoo "github.com/seiflotfy/cuckoofilter"
 )
 
+//
+// Dynamic Probabilistic Filter
+//
+
 const (
-	// filterInitSize determines the number of keys we can keep in first filter.
-	// For now we allow `10M` keys -> memory allocation of `10MB`. If we exceed
-	// that number of keys, additional filter is added dynamically of size:
-	// `last_filter_size` * `grow_factor`.
-	filterInitSize = 10 * 1000 * 1000
-	growFactor     = 3 // how much size of next, new filter will grow comparing to previous filter
+	// size of the first (unconditional) filter: 128K entries
+	filterInitSize = 128 * 1024
+
+	// extra filters, if any required, currently will have a constant
+	// (filterInitSize * growFactor) size;
+	// TODO consider geometric growth, as in: next-size = (1 + ratio) * previous-size
+	growFactor = 4
 )
 
-// Filter is dynamic probabilistic filter which grows if there is more space
-// needed.
-//
-// NOTE: Underneath it uses Cuckoo filters - Bloom filters could be also used
-// but in the future we might need `Delete` method which Bloom filters cannot
-// implement.
 type Filter struct {
 	filters []*cuckoo.Filter
 	size    uint
 	mtx     sync.RWMutex
 }
 
-func NewFilter(initSize uint) *Filter {
+func newFilter(initSize uint) *Filter {
 	return &Filter{
 		filters: make([]*cuckoo.Filter, 0, 5),
 		size:    initSize,
@@ -39,7 +38,7 @@ func NewFilter(initSize uint) *Filter {
 }
 
 func NewDefaultFilter() *Filter {
-	return NewFilter(filterInitSize)
+	return newFilter(filterInitSize)
 }
 
 func (f *Filter) Lookup(k []byte) bool {
@@ -99,6 +98,6 @@ func (f *Filter) Reset() {
 		f.filters[idx].Reset()
 	}
 	clear(f.filters)
-	f.filters = f.filters[:0]
+	f.filters = nil // gc
 	f.mtx.Unlock()
 }

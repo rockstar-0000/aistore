@@ -1,7 +1,6 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -17,10 +16,9 @@ import (
 	"github.com/NVIDIA/aistore/cmn/xoshiro256"
 )
 
-// proto header
 const (
 	// flags
-	msgFl       = uint64(1 << (63 - iota)) // message vs object demux
+	msgFl       = uint64(1) << (63 - iota) // message vs object demux
 	pduFl                                  // is PDU
 	pduLastFl                              // is last PDU
 	pduStreamFl                            // PDU-based stream
@@ -32,9 +30,34 @@ const (
 	sizeProtoHdr = cos.SizeofI64 * 2
 )
 
-////////////////////////////////
-// proto header serialization //
-////////////////////////////////
+//
+// ObjHdr.Opcode enums: 3 groups
+//
+
+// group 1: application-level opcodes (sentinels)
+const (
+	OpcDone = iota + 27182
+	OpcAbort
+	OpcRequest
+	OpcResponse
+)
+
+// group 2: transport/bundle (data mover's) opcodes
+const (
+	OpcReconnect = iota + 46351
+)
+
+// group 3: transport's internal range of 16 `Obj.Hdr.Opcode` values
+const (
+	opcFin = iota + math.MaxUint16 - 16
+	opcIdleTick
+)
+
+func ReservedOpcode(opc int) bool { return opc >= opcFin }
+
+//
+// proto header: serialization
+//
 
 func insObjHeader(hbuf []byte, hdr *ObjHdr, usePDU bool) (off int) {
 	debug.Assert(usePDU || !hdr.IsUnsized())
@@ -47,6 +70,7 @@ func insObjHeader(hbuf []byte, hdr *ObjHdr, usePDU bool) (off int) {
 	off = insString(off, hbuf, hdr.Bck.Ns.UUID)
 	off = insString(off, hbuf, hdr.ObjName)
 	off = insBytes(off, hbuf, hdr.Opaque)
+	off = insString(off, hbuf, hdr.Demux)
 	off = insAttrs(off, hbuf, &hdr.ObjAttrs)
 	word1 := uint64(off - sizeProtoHdr)
 	if usePDU {
@@ -71,7 +95,7 @@ func (pdu *spdu) insHeader() {
 }
 
 func insString(off int, to []byte, str string) int {
-	return insBytes(off, to, []byte(str))
+	return insBytes(off, to, cos.UnsafeB(str))
 }
 
 func insBytes(off int, to, b []byte) int {
@@ -120,19 +144,21 @@ func insAttrs(off int, to []byte, attr *cmn.ObjAttrs) int {
 	return off
 }
 
-//////////////////////////////////
-// proto header deserialization //
-//////////////////////////////////
+//
+// proto header: deserialization
+//
 
-func extProtoHdr(hbuf []byte, loghdr string) (hlen int, flags uint64, err error) {
+func (it *iterator) extProtoHdr(hbuf []byte) (hlen int, flags uint64, err error) {
 	off, word1 := extUint64(0, hbuf)
 	hlen = int(word1 & ^allFlags)
 	flags = word1 & allFlags
+	//
 	// validate checksum
+	//
 	_, checksum := extUint64(0, hbuf[off:])
 	chc := xoshiro256.Hash(word1)
 	if checksum != chc {
-		err = fmt.Errorf("sbrk %s: bad checksum %x != %x (hlen=%d)", loghdr, checksum, chc, hlen)
+		err = it.newErr(nil, sbrHdrChecksum, fmt.Sprintf("%x != %x (hlen=%d)", checksum, chc, hlen))
 	}
 	return
 }
@@ -147,16 +173,8 @@ func ExtObjHeader(body []byte, hlen int) (hdr ObjHdr) {
 	off, hdr.Bck.Ns.UUID = extString(off, body)
 	off, hdr.ObjName = extString(off, body)
 	off, hdr.Opaque = extBytes(off, body)
+	off, hdr.Demux = extString(off, body)
 	off, hdr.ObjAttrs = extAttrs(off, body)
-	debug.Assertf(off == hlen, "off %d, hlen %d", off, hlen)
-	return
-}
-
-func ExtMsg(body []byte, hlen int) (msg Msg) {
-	var off int
-	off, msg.SID = extString(0, body)
-	off, msg.Opcode = extUint16(off, body)
-	off, msg.Body = extBytes(off, body)
 	debug.Assertf(off == hlen, "off %d, hlen %d", off, hlen)
 	return
 }
@@ -239,24 +257,3 @@ func (hdr *ObjHdr) ObjSize() int64     { return hdr.ObjAttrs.Size }
 // reserved opcodes
 func (hdr *ObjHdr) isFin() bool      { return hdr.Opcode == opcFin }
 func (hdr *ObjHdr) isIdleTick() bool { return hdr.Opcode == opcIdleTick }
-
-////////////////////
-// Msg and MsgHdr //
-////////////////////
-
-func (*Msg) IsHeaderOnly() bool { return true }
-
-func (msg *Msg) String() string {
-	if msg.isFin() {
-		return "smsg-last"
-	}
-	if msg.isIdleTick() {
-		return "smsg-tick"
-	}
-	l := min(len(msg.Body), 16)
-	return fmt.Sprintf("smsg-[%s](len=%d)", msg.Body[:l], l)
-}
-
-// reserved opcodes
-func (msg *Msg) isFin() bool      { return msg.Opcode == opcFin }
-func (msg *Msg) isIdleTick() bool { return msg.Opcode == opcIdleTick }

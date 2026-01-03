@@ -1,10 +1,11 @@
-// Package authn is authentication server for AIStore.
+// Package main contains the independent authentication server for AIStore.
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
 	"github.com/NVIDIA/aistore/api/env"
+	"github.com/NVIDIA/aistore/cmd/authn/config"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -30,6 +32,8 @@ type mgr struct {
 	clientH   *http.Client
 	clientTLS *http.Client
 	db        kvdb.Driver
+	cm        *config.ConfManager
+	tkParser  *tok.TokenParser
 }
 
 var (
@@ -47,16 +51,26 @@ var (
 )
 
 // If user DB exists, loads the data from the file and decrypts passwords
-func newMgr(driver kvdb.Driver) (m *mgr, code int, err error) {
+func newMgr(cm *config.ConfManager, driver kvdb.Driver) (m *mgr, code int, err error) {
 	m = &mgr{
 		db: driver,
+		cm: cm,
 	}
-	m.clientH, m.clientTLS = cmn.NewDefaultClients(time.Duration(Conf.Timeout.Default))
+	m.clientH, m.clientTLS = cmn.NewDefaultClients(cm.GetDefaultTimeout())
 	code, err = initializeDB(driver)
+	if err != nil {
+		return
+	}
+	sigConf, err := cm.GetSigConf()
+	if err != nil {
+		return
+	}
+	// Create a limited token parser with no issuer lookup
+	m.tkParser = tok.NewTokenParser(&cmn.AuthConf{Signature: sigConf}, nil)
 	return
 }
 
-func (*mgr) String() string { return svcName }
+func (*mgr) String() string { return config.ServiceName }
 
 //
 // users ============================================================
@@ -289,7 +303,7 @@ func (m *mgr) getCluster(cluID string) (*authn.CluACL, int, error) {
 }
 
 // Registers a new cluster
-func (m *mgr) addCluster(clu *authn.CluACL) (int, error) {
+func (m *mgr) addCluster(ctx context.Context, clu *authn.CluACL) (int, error) {
 	if clu.ID == "" {
 		return http.StatusBadRequest, errors.New("cluster UUID is undefined")
 	}
@@ -303,7 +317,7 @@ func (m *mgr) addCluster(clu *authn.CluACL) (int, error) {
 	}
 
 	// secret handshake
-	if err := m.validateSecret(clu); err != nil {
+	if err := m.validateCluster(clu); err != nil {
 		return http.StatusInternalServerError, err
 	}
 
@@ -312,7 +326,7 @@ func (m *mgr) addCluster(clu *authn.CluACL) (int, error) {
 	}
 	m.createRolesForCluster(clu)
 
-	go m.syncTokenList(clu)
+	go m.syncTokenList(ctx, clu)
 	return http.StatusOK, nil
 }
 
@@ -340,7 +354,7 @@ func (m *mgr) updateCluster(cluID string, info *authn.CluACL) (int, error) {
 	}
 
 	// secret handshake
-	if err := m.validateSecret(clu); err != nil {
+	if err := m.validateCluster(clu); err != nil {
 		return http.StatusInternalServerError, err
 	}
 
@@ -362,7 +376,7 @@ func (m *mgr) delCluster(cluID string) (int, error) {
 
 // Generates a token for a user if user credentials are valid. If the token is
 // already generated and is not expired yet the existing token is returned.
-// Token includes user ID, permissions, and token expiration time.
+// AISClaims includes user ID, permissions, and token expiration time.
 // If a new token was generated then it sends the proxy a new valid token list
 func (m *mgr) issueToken(uid, pwd string, msg *authn.LoginMsg) (token string, code int, err error) {
 	var (
@@ -397,8 +411,8 @@ func (m *mgr) issueToken(uid, pwd string, msg *authn.LoginMsg) (token string, co
 	return token, http.StatusOK, nil
 }
 
-func (m *mgr) _token(msg *authn.LoginMsg, uInfo *authn.User, cluACLs []*authn.CluACL, bckACLs []*authn.BckACL) (token string, err error) {
-	expDelta := Conf.Expire()
+func (m *mgr) _token(msg *authn.LoginMsg, uInfo *authn.User, cluACLs []*authn.CluACL, bckACLs []*authn.BckACL) (string, error) {
+	expDelta := m.cm.GetExpiry()
 	if msg.ExpiresIn != nil {
 		expDelta = *msg.ExpiresIn
 	}
@@ -409,15 +423,25 @@ func (m *mgr) _token(msg *authn.LoginMsg, uInfo *authn.User, cluACLs []*authn.Cl
 	// put all useful info into token: who owns the token, when it was issued,
 	// when it expires and credentials to log in AWS, GCP etc.
 	// If a user is a super user, it is enough to pass only isAdmin marker
-	expires := time.Now().Add(expDelta)
+	expires := time.Now().UTC().Add(expDelta)
 	uid := uInfo.ID
+	// TODO: parse from ACLs and/or LoginMsg
+	aud := ""
 	if uInfo.IsAdmin() {
-		token, err = tok.AdminJWT(expires, uid, Conf.Secret())
-	} else {
-		m.fixClusterIDs(cluACLs)
-		token, err = tok.JWT(expires, uid, bckACLs, cluACLs, Conf.Secret())
+		return m.createTokenWithClaims(tok.AdminClaims(expires, uid, aud))
 	}
-	return token, err
+	m.fixClusterIDs(cluACLs)
+	return m.createTokenWithClaims(tok.StandardClaims(expires, uid, aud, bckACLs, cluACLs))
+}
+
+func (m *mgr) createTokenWithClaims(c *tok.AISClaims) (string, error) {
+	if m.cm.HasHMACSecret() {
+		return tok.CreateHMACTokenStr(c, m.cm.GetSecret())
+	}
+	if pKey := m.cm.GetPrivateKey(); pKey != nil {
+		return tok.CreateRSATokenStr(c, pKey)
+	}
+	return "", errors.New("no valid signing key configured")
 }
 
 // Before putting a list of cluster permissions to a token, cluster aliases
@@ -455,25 +479,22 @@ func (m *mgr) revokeToken(token string) (int, error) {
 
 // Create a list of non-expired and valid revoked tokens.
 // Obsolete and invalid tokens are removed from the database.
-func (m *mgr) generateRevokedTokenList() ([]string, int, error) {
+func (m *mgr) generateRevokedTokenList(ctx context.Context) ([]string, int, error) {
 	tokens, code, err := m.db.List(revokedCollection, "")
 	if err != nil {
 		debug.AssertNoErr(err)
 		return nil, code, err
 	}
 
-	now := time.Now()
 	revokeList := make([]string, 0, len(tokens))
-	secret := Conf.Secret()
 	for _, token := range tokens {
-		tk, err := tok.DecryptToken(token, secret)
+		_, err = m.tkParser.ValidateToken(ctx, token)
 		if err != nil {
-			m.db.Delete(revokedCollection, token)
-			continue
-		}
-		if tk.Expires.Before(now) {
-			nlog.Infof("removing %s", tk)
-			m.db.Delete(revokedCollection, token)
+			nlog.Infof("removing invalid token %q due to validation error %v", token, err)
+			_, err = m.db.Delete(revokedCollection, token)
+			if err != nil {
+				nlog.Errorf("failed to delete token %q due to error %v", token, err)
+			}
 			continue
 		}
 		revokeList = append(revokeList, token)
@@ -520,7 +541,10 @@ func initializeDB(driver kvdb.Driver) (int, error) {
 
 	// environment override
 	userName := cos.Right(adminUserID, os.Getenv(env.AisAuthAdminUsername))
-	password := cos.Right(adminUserPass, os.Getenv(env.AisAuthAdminPassword))
+	password, exists := os.LookupEnv(env.AisAuthAdminPassword)
+	if !exists || password == "" {
+		return 0, fmt.Errorf("failed to initialize DB, no password provided for admin user. Set with %q", env.AisAuthAdminPassword)
+	}
 
 	// Create the admin user
 	su := &authn.User{

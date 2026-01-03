@@ -36,21 +36,23 @@ const (
 
 type (
 	nlog struct {
-		file           *os.File
-		pw, buf1, buf2 *fixed
-		line           fixed
-		toFlush        []*fixed
-		last           atomic.Int64
-		written        atomic.Int64
-		sev            severity
-		oob            atomic.Bool
-		erred          atomic.Bool
-		mw             sync.Mutex
+		file    *os.File
+		pw      *fixed
+		buf1    *fixed
+		buf2    *fixed
+		toFlush []*fixed
+		line    fixed
+		last    atomic.Int64
+		written atomic.Int64
+		sev     severity
+		mw      sync.Mutex
+		oob     atomic.Bool
+		erred   atomic.Bool
 	}
 )
 
 // main function
-func log(sev severity, depth int, format string, args ...any) {
+func logf(sev severity, depth int, format string, args ...any) {
 	onceInitFiles.Do(initFiles)
 
 	switch {
@@ -315,14 +317,10 @@ func _whileStopping(p []byte) {
 // - none of the "fixed" ones available
 // - alsoToStderr
 
-func alloc() (fb *fixed) {
-	if v := pool.Get(); v != nil {
-		fb = v.(*fixed)
-		fb.reset()
-	} else {
-		fb = &fixed{buf: make([]byte, extraSize)}
-	}
-	return
+func alloc() *fixed {
+	fb := pool.Get().(*fixed)
+	fb.reset()
+	return fb
 }
 
 func free(fb *fixed) {

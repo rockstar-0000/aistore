@@ -2,7 +2,7 @@
 
 // Package hrw provides a way to benchmark different HRW variants.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package hrw
@@ -42,7 +42,7 @@ func BenchmarkHRW(b *testing.B) {
 			for _, hashFunc := range hashFuncs {
 				b.Run(fmt.Sprintf("%s/%d/%d", hashFunc.name, numNodes, nameLen), func(b *testing.B) {
 					var nodeID int
-					for range b.N {
+					for b.Loop() {
 						// Record the result to prevent the compiler
 						// eliminating the function call.
 						nodeID = hashFunc.hashF(fileName, nodes)

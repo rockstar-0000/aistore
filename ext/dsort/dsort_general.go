@@ -329,7 +329,7 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *shard.Record, obj *shard.
 	opaque := cos.MustMarshal(req)
 	o := transport.AllocSend()
 	o.Hdr = transport.ObjHdr{Opaque: opaque}
-	o.Callback, o.CmplArg = ds.sentCallback, &req
+	o.SentCB, o.CmplArg = ds.sentCallback, &req
 
 	if err := ds.streams.request.Send(o, nil, tsi); err != nil {
 		return 0, errors.WithStack(err)
@@ -400,6 +400,7 @@ func (ds *dsorterGeneral) errHandler(err error, node *meta.Snode, o *transport.O
 }
 
 // implements receiver i/f
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (ds *dsorterGeneral) recvReq(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 	ds.m.inFlightInc()
 	defer func() {
@@ -407,16 +408,17 @@ func (ds *dsorterGeneral) recvReq(hdr *transport.ObjHdr, objReader io.Reader, er
 		transport.FreeRecv(objReader)
 	}()
 	req := remoteRequest{}
-	if err := jsoniter.Unmarshal(hdr.Opaque, &req); err != nil {
-		err := fmt.Errorf(cmn.FmtErrUnmarshal, apc.ActDsort, "recv request", cos.BHead(hdr.Opaque), err)
+	if errM := jsoniter.Unmarshal(hdr.Opaque, &req); errM != nil {
+		if err == nil {
+			err = fmt.Errorf(cmn.FmtErrUnmarshal, apc.ActDsort, "recv request", cos.BHead(hdr.Opaque), errM)
+		}
 		ds.m.abort(err)
 		return err
 	}
 
 	fromNode := ds.m.smap.GetTarget(hdr.SID)
 	if fromNode == nil {
-		err := fmt.Errorf("received request (%v) from %q not present in the %s", req.Record, hdr.SID, ds.m.smap)
-		return err
+		return fmt.Errorf("received request (%v) from %q not present in the %s", req.Record, hdr.SID, ds.m.smap)
 	}
 
 	if err != nil {
@@ -430,7 +432,7 @@ func (ds *dsorterGeneral) recvReq(hdr *transport.ObjHdr, objReader io.Reader, er
 
 	o := transport.AllocSend()
 	o.Hdr = transport.ObjHdr{ObjName: req.Record.MakeUniqueName(req.RecordObj)}
-	o.Callback = ds.responseCallback
+	o.SentCB = ds.responseCallback
 
 	fullContentPath := ds.m.recm.FullContentPath(req.RecordObj)
 
@@ -495,6 +497,7 @@ func (ds *dsorterGeneral) postExtraction() {
 	ds.mw.stopWatchingReserved()
 }
 
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (ds *dsorterGeneral) recvResp(hdr *transport.ObjHdr, object io.Reader, err error) error {
 	ds.m.inFlightInc()
 	defer func() {

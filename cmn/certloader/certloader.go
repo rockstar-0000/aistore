@@ -1,6 +1,6 @@
 // Package certloader loads and reloads X.509 certs.
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package certloader
 
@@ -44,9 +44,9 @@ type (
 	}
 	certLoader struct {
 		tstats   cos.StatsUpdater
+		xcert    atomic.Pointer[xcert]
 		certFile string
 		keyFile  string
-		xcert    atomic.Pointer[xcert]
 	}
 
 	// tls.Config.GetCertificate
@@ -99,7 +99,7 @@ func Props() (out cos.StrKVs) {
 	if flags.IsAnySet(cos.CertificateInvalid | cos.CertificateExpired) {
 		out = make(cos.StrKVs, 1)
 		flags &= (cos.CertificateInvalid | cos.CertificateExpired)
-		out["error"] = flags.String()
+		out["error"] = flags.Str()
 		return out
 	}
 	xcert := gcl.xcert.Load()
@@ -118,7 +118,7 @@ func Props() (out cos.StrKVs) {
 		out["valid"] += " to " + fmtTime(leaf.NotAfter)
 
 		if flags.IsSet(cos.CertWillSoonExpire) {
-			out["warning"] = cos.CertWillSoonExpire.String()
+			out["warning"] = cos.CertWillSoonExpire.Str()
 		}
 	}
 

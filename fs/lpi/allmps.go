@@ -37,7 +37,7 @@ func (lpis *Lpis) Init(bck *cmn.Bck, prefix string, smap *meta.Smap) {
 		lpis.bck = bck
 	}
 	for _, mi := range avail {
-		it, err := New(mi.MakePathCT(bck, fs.ObjectType) /*root*/, prefix, smap)
+		it, err := New(mi.MakePathCT(bck, fs.ObjCT) /*root*/, prefix, smap)
 		debug.AssertNoErr(err)
 		milpi := milpi{
 			page: make(Page),
@@ -101,13 +101,13 @@ func (milpi *milpi) run(bck *cmn.Bck, lastName, tag string) {
 		return
 	}
 	if lastName != "" {
-		eop = milpi.mi.MakePathFQN(bck, fs.ObjectType, lastName)
+		eop = milpi.mi.MakePathFQN(bck, fs.ObjCT, lastName)
 	}
 
 	// next local page "until"
 	lpiMsg := Msg{EOP: eop}
 	if err := milpi.it.Next(lpiMsg, milpi.page); err != nil {
-		if cmn.Rom.FastV(4, cos.SmoduleFS) {
+		if cmn.Rom.V(4, cos.ModFS) {
 			nlog.Warningln(tag, err)
 		}
 	}

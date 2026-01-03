@@ -142,7 +142,11 @@ func isRemoteAndPresentBucket(tb testing.TB, proxyURL string, bck cmn.Bck) bool 
 }
 
 func PutObjRR(bp api.BaseParams, bck cmn.Bck, objName string, objSize int64, cksumType string) error {
-	reader, err := readers.NewRand(objSize, cksumType)
+	reader, err := readers.New(&readers.Arg{
+		Type:      readers.Rand,
+		Size:      objSize,
+		CksumType: cksumType,
+	})
 	if err != nil {
 		return err
 	}
@@ -184,7 +188,7 @@ func isClusterK8s() (isK8s bool, err error) {
 	return
 }
 
-func isClusterLocal() (isLocal bool, err error) {
+func IsClusterLocal() (isLocal bool, err error) {
 	var (
 		primaryURL = GetPrimaryURL()
 		smap       *meta.Smap
@@ -200,7 +204,7 @@ func isClusterLocal() (isLocal bool, err error) {
 	}
 	fileData, err = os.ReadFile(filepath.Join(config.ConfigDir, fname.ProxyID))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if cos.IsNotExist(err) {
 			err = nil
 		}
 		return

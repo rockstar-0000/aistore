@@ -6,17 +6,20 @@ package etl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
-	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 
@@ -34,10 +37,11 @@ type (
 
 	// Session represents a per-xaction communication context created by the statefulCommunicator.
 	Session interface {
-		// OfflineTransform is an instance of `core.GetROC` function, which is driven by `TCB` and `TCO` to provide offline transformation
-		OfflineTransform(lom *core.LOM, latestVer, sync bool, gargs *core.GetROCArgs) core.ReadResp
 		// Finish cleans up the job's communication channel, and aborts the undergoing xaction (`TCB`/`TCO`) if errCause is provided
 		Finish(errCause error) error
+		OfflineWrite(lom *core.LOM, latestVer, sync bool, writer io.WriteCloser, args *core.ETLArgs) (written int64, ecode int, err error)
+
+		transform(lom *core.LOM, latestVer, sync bool, writer io.WriteCloser, args *core.ETLArgs) (written int64, ecode int, err error)
 	}
 
 	//nolint:dupword // ASCII diagram contains repeated characters by design
@@ -75,45 +79,50 @@ type (
 	 */
 
 	webSocketComm struct {
+		commCtx       context.Context
+		inlineSession Session
+		sessions      map[string]Session // includes inlineSession
+		commCtxCancel context.CancelFunc
 		baseComm
-		commCtx         context.Context
-		inlineSession   Session
-		offlineSessions map[string]Session
-		commCtxCancel   context.CancelFunc
-		m               sync.Mutex
+		m sync.Mutex
 	}
 
 	wsSession struct {
-		txctn            core.Xact
+		msg              InitMsg
+		txctn            core.Xact // tcb/tcobjs xaction that uses this session to perform transformation
 		sessionCtx       context.Context
 		workCh           chan *transformTask
 		sessionCtxCancel context.CancelFunc
-		argType          string
+		fincb            func() // callback to self-remove this session from the communicator's session list
 		connections      []*wsConnCtx
 		chanFull         cos.ChanFull
-		isDirectPut      bool
+		finished         atomic.Bool
 	}
 
 	wsConnCtx struct {
-		etlxctn        core.Xact // parent xaction of the underlying ETL pod (`xs.xactETL` type)
-		txctn          core.Xact // tcb/tcobjs xaction that uses this session to perform transformatio
-		ctx            context.Context
-		conn           *websocket.Conn
-		workCh         chan *transformTask // outbound messages of the original objects to send to ETL pod
-		writerCh       chan *io.PipeWriter // inbound (post-transform) messages from ETL pod
-		eg             *errgroup.Group
-		name           string
-		writerChanFull cos.ChanFull
+		txctn             core.Xact // tcb/tcobjs xaction that uses this session to perform transformation
+		ctx               context.Context
+		etlxctn           *XactETL // parent xaction of the underlying ETL pod (`xs.xactETL` type)
+		conn              *websocket.Conn
+		workCh            chan *transformTask // outbound messages of the original objects to send to ETL pod
+		transformCh       chan *transformTask // inbound (post-transform) messages from ETL pod
+		eg                *errgroup.Group
+		name              string
+		transformChanFull cos.ChanFull
 	}
 
 	transformTask struct {
-		WebsocketCtrlMsg
-		rwpair `json:"-"`
+		rwpair
+		err     error
+		txctn   core.Xact
+		ctrlmsg WebsocketCtrlMsg
+		wg      sync.WaitGroup // used to wait for the task to finish
+		written int64
 	}
 
 	rwpair struct {
 		r io.ReadCloser
-		w *io.PipeWriter
+		w io.WriteCloser
 	}
 )
 
@@ -134,31 +143,24 @@ const (
 	offlineSessionMultiplier = 4
 )
 
-// SetupConnection establishes a test connection to the ETL pod's websocket endpoint.
+// setupConnection establishes a test connection to the ETL pod's websocket endpoint.
 // Close immediately if the connection is successful (only for verifying connectivity).
-func (ws *webSocketComm) SetupConnection() (err error) {
-	if err := ws.boot.setupConnection("ws://"); err != nil {
-		return err
+func (ws *webSocketComm) setupConnection(_, podAddr string) (ecode int, err error) {
+	if ecode, err := ws.baseComm.setupConnection("ws://", podAddr); err != nil {
+		return ecode, err
 	}
-	ws.boot.uri += "/ws" // TODO: make this endpoint configurable
+	ws.podURI += "/ws" // TODO: make this endpoint configurable
 
-	ws.inlineSession, err = ws.createSession(ws.boot.xctn, inlineSessionMultiplier)
-	return err
+	ws.inlineSession, err = ws.createSession(ws.xctn, inlineSessionMultiplier)
+	return 0, err
 }
 
-func (ws *webSocketComm) InlineTransform(w http.ResponseWriter, _ *http.Request, lom *core.LOM, latestVer bool, targs string) (int, error) {
-	buf, slab := core.T.PageMM().Alloc()
-	defer slab.Free(buf)
-
-	resp := ws.inlineSession.OfflineTransform(lom, latestVer, false /*sync*/, &core.GetROCArgs{TransformArgs: targs})
-	if _, err := cos.CopyBuffer(w, resp.R, buf); err != nil {
-		return 0, err
-	}
-	if resp.Err != nil {
-		return resp.Ecode, resp.Err
-	}
-
-	return 0, resp.R.Close()
+func (ws *webSocketComm) InlineTransform(w http.ResponseWriter, _ *http.Request, lom *core.LOM, args *InlineTransArgs) (int64, int, error) {
+	// use pre-established inline sessions to serve inline transform requests
+	return ws.inlineSession.transform(lom, args.LatestVer, false /*sync*/, cos.NopWriteCloser(w), &core.ETLArgs{
+		Pipeline:      args.Pipeline,
+		TransformArgs: args.TransformArgs,
+	})
 }
 
 func (ws *webSocketComm) createSession(xctn core.Xact, multiplier int) (Session, error) {
@@ -166,36 +168,41 @@ func (ws *webSocketComm) createSession(xctn core.Xact, multiplier int) (Session,
 		return nil, cos.NewErrNotFound(core.T, "invalid xact parameter")
 	}
 
-	connPerSession := ws.boot.config.TCB.SbundleMult * multiplier // TODO: add specific ETL config on this
+	connPerSession := ws.config.TCB.SbundleMult * multiplier // TODO: add specific ETL config on this
 	wss := &wsSession{
 		txctn:       xctn,
-		isDirectPut: ws.boot.msg.IsDirectPut(),
-		argType:     ws.boot.msg.ArgType(),
+		msg:         ws.msg,
 		workCh:      make(chan *transformTask, wockChSize),
 		connections: make([]*wsConnCtx, 0, connPerSession),
+		fincb: func() {
+			ws.m.Lock()
+			delete(ws.sessions, xctn.ID())
+			ws.m.Unlock()
+		},
 	}
 	wss.sessionCtx, wss.sessionCtxCancel = context.WithCancel(ws.commCtx)
 
 	for i := range connPerSession {
-		conn, resp, err := websocket.DefaultDialer.Dial(ws.boot.uri, nil)
+		conn, resp, err := websocket.DefaultDialer.Dial(ws.podURI, nil)
 		if err != nil {
-			return nil, fmt.Errorf("%s: failed to dial %s: %w", xctn.Name(), ws.boot.uri, err)
+			return nil, fmt.Errorf("%s: failed to dial %s: %w", xctn.Name(), ws.podURI, err)
 		}
 		resp.Body.Close()
+		debug.IncCounter(xctn.ID() + "-conn") // connection count for the session
 
 		conn.SetReadLimit(maxMsgSize)
 
 		group, ctx := errgroup.WithContext(wss.sessionCtx)
 
 		wcs := &wsConnCtx{
-			name:     ws.ETLName() + "-" + strconv.Itoa(i),
-			etlxctn:  ws.Xact(), // for abort listening and runtime error report
-			txctn:    xctn,      // for abort listening and runtime error report
-			conn:     conn,
-			workCh:   wss.workCh,
-			writerCh: make(chan *io.PipeWriter, wockChSize),
-			ctx:      ctx,
-			eg:       group,
+			name:        ws.ETLName() + "-" + strconv.Itoa(i),
+			etlxctn:     ws.Xact(), // for abort listening and runtime error report
+			txctn:       xctn,      // for abort listening and runtime error report
+			conn:        conn,
+			workCh:      wss.workCh,
+			transformCh: make(chan *transformTask, wockChSize),
+			ctx:         ctx,
+			eg:          group,
 		}
 
 		group.Go(wcs.readLoop)
@@ -205,140 +212,137 @@ func (ws *webSocketComm) createSession(xctn core.Xact, multiplier int) (Session,
 	}
 
 	ws.m.Lock()
-	ws.offlineSessions[xctn.ID()] = wss
+	ws.sessions[xctn.ID()] = wss
 	ws.m.Unlock()
 	return wss, nil
 }
 
-func (ws *webSocketComm) Stop() {
-	for _, session := range ws.offlineSessions {
+func (ws *webSocketComm) stop() error {
+	if err := ws.baseComm.stop(); err != nil {
+		return err
+	}
+	// inlineSession is stored in ws.sessions
+	for _, session := range ws.sessions {
 		session.Finish(cmn.ErrXactUserAbort)
 	}
-	ws.offlineSessions = nil
-	if ws.inlineSession != nil {
-		ws.inlineSession.Finish(cmn.ErrXactUserAbort)
-		ws.inlineSession = nil
-	}
+	ws.sessions = nil
 	ws.commCtxCancel()
-	ws.baseComm.Stop()
+	return nil
+}
+
+func (*webSocketComm) ProcessDownloadJob(_ *ETLObjDownloadCtx) (cos.ReadCloseSizer, int, error) {
+	return nil, http.StatusNotImplemented, errors.New("ETL downloads not supported for websocket communication type")
 }
 
 ///////////////
 // wsSession //
 ///////////////
 
-func (wss *wsSession) OfflineTransform(lom *core.LOM, latestVer, sync bool, gargs *core.GetROCArgs) core.ReadResp {
-	var (
-		task = &transformTask{}
-		err  error
-		r    io.ReadCloser
-		oah  = &cos.SimpleOAH{Atime: time.Now().UnixNano()}
-	)
-	task.Path = lom.ObjName
-	switch wss.argType {
-	case ArgTypeDefault, ArgTypeURL:
-		srcResp := lom.GetROC(latestVer, sync)
-		if srcResp.Err != nil {
-			return srcResp
-		}
-		r = srcResp.R
-		oah.Size = srcResp.OAH.Lsize()
-	case ArgTypeFQN:
-		if ecode, err := lomLoad(lom, wss.txctn.Kind()); err != nil {
-			return core.ReadResp{Err: err, Ecode: ecode}
-		}
-		task.FQN = url.PathEscape(lom.FQN)
+func (wss *wsSession) transform(lom *core.LOM, latestVer, sync bool, woc io.WriteCloser, args *core.ETLArgs) (written int64, ecode int, err error) {
+	task, ecode, err := wss.createTask(lom, latestVer, sync, woc)
+	if err != nil {
+		return 0, ecode, err
 	}
 
-	pr, pw := io.Pipe() // TODO -- FIXME: revise and remove
-	task.rwpair = rwpair{r, pw}
-
-	if gargs != nil {
-		task.Targs = gargs.TransformArgs
-		if wss.isDirectPut && !gargs.Local && gargs.Daddr != "" {
-			task.Daddr = gargs.Daddr
-			err = cmn.ErrSkip
+	if args != nil {
+		task.ctrlmsg.Targs = args.TransformArgs
+		if len(args.Pipeline) != 0 {
+			task.ctrlmsg.Pipeline = args.Pipeline.Pack()
 		}
 	}
 
-	// local object should contain empty direct put address; remote object should contain valid direct put address
-	debug.Assert(gargs == nil || task.Daddr == "" && gargs.Local || task.Daddr != "" && !gargs.Local)
-	debug.Assert(task.Targs == "" || task.Daddr == "") // Targs is for inline transform, while Daddr is for offline transform
+	if cmn.Rom.V(5, cos.ModETL) {
+		nlog.Infoln(WebSocket, lom.Cname(), args.Pipeline.String(), err, ecode)
+	}
 
 	l, c := len(wss.workCh), cap(wss.workCh)
 	wss.chanFull.Check(l, c)
 
+	// Ensure `task.done()` is called exactly once after `wss.createTask()` succeeds to unblock `task.wg.Wait()`
+	// Cases for calling `task.done()`:
+	// 1. Task completes successfully (direct put or local copy) => call with `nil` error
+	// 2. Task fails (e.g., network or I/O error) => call with the error
+	// 3. Task is drained during session finish => call with the given `errCause` on abort
+	task.wg.Add(1)
 	wss.workCh <- task
+	task.wg.Wait()
 
-	return core.ReadResp{
-		R:     cos.NopOpener(pr),
-		OAH:   oah, // TODO: estimate the post-transformed Lsize for stats
-		Err:   err,
-		Ecode: http.StatusNoContent, // promise to deliver
+	return task.written, 0, task.err
+}
+
+func (wss *wsSession) createTask(lom *core.LOM, latestVer, sync bool, woc io.WriteCloser) (*transformTask, int, error) {
+	task := &transformTask{txctn: wss.txctn}
+
+	task.w = woc
+	task.ctrlmsg.Path = lom.ObjName
+	switch {
+	case latestVer, sync, cmn.Rom.Features().IsSet(feat.DontAllowPassingFQNtoETL): // TODO -- FIXME: consider chunked case
+		srcResp := lom.GetROC(latestVer, sync)
+		if srcResp.Err != nil {
+			if woc != nil {
+				cos.Close(woc)
+			}
+			return nil, 0, srcResp.Err
+		}
+		task.r = srcResp.R
+	default:
+		// default to FQN
+		if ecode, err := lomLoad(lom, wss.txctn.Kind()); err != nil {
+			if woc != nil {
+				cos.Close(woc)
+			}
+			return nil, ecode, err
+		}
+		task.ctrlmsg.FQN = url.PathEscape(lom.FQN)
 	}
+
+	debug.IncCounter(task.txctn.ID() + "-task") // count for tasks in this session
+
+	return task, 0, nil
+}
+
+func (wss *wsSession) OfflineWrite(lom *core.LOM, latestVer, sync bool, woc io.WriteCloser, args *core.ETLArgs) (written int64, ecode int, err error) {
+	return wss.transform(lom, latestVer, sync, woc, args)
 }
 
 func (wss *wsSession) Finish(errCause error) error {
+	// Note: Finish can be called from communicator's `Stop()` or TCB/TCO's finish/abort
+	if !wss.finished.CAS(false, true) {
+		return nil
+	}
+
+	wss.fincb() // self-remove from the communicator's session list
 	wss.sessionCtxCancel()
 	for _, wsConn := range wss.connections {
 		wsConn.finish(errCause)
 	}
+	drainTaskCh(wss.workCh, errCause)
+	debug.AssertCounterEquals(wss.txctn.ID()+"-task", 0) // all tasks should be done
+	debug.AssertCounterEquals(wss.txctn.ID()+"-conn", 0) // all connections should be closed
 	return nil
+}
+
+func (wss *wsSession) String() string {
+	return "[" + wss.msg.Name() + "]-" + wss.txctn.ID()
 }
 
 ///////////////
 // wsConnCtx //
 ///////////////
 
-func (wctx *wsConnCtx) finish(errCause error) error {
+func (wctx *wsConnCtx) finish(errCause error) {
 	if errCause != nil {
 		wctx.txctn.Abort(errCause)
 	}
+	wctx.conn.Close()
+	debug.DecCounter(wctx.txctn.ID() + "-conn")
 	if err := wctx.eg.Wait(); err != nil {
 		nlog.Errorf("error shutting down webSocketComm goroutines: %v", err)
 	}
-	return wctx.conn.Close()
+	drainTaskCh(wctx.transformCh, errCause)
 }
 
-func (wctx *wsConnCtx) readLoop() error {
-	buf, slab := core.T.PageMM().Alloc()
-	defer slab.Free(buf)
-
-	for {
-		select {
-		case <-wctx.ctx.Done():
-			return nil
-		case <-wctx.txctn.ChanAbort():
-			return nil
-		case <-wctx.etlxctn.ChanAbort():
-			return nil
-		default:
-			ty, r, err := wctx.conn.NextReader()
-			if err != nil {
-				err = fmt.Errorf("error reading message from %s: %w", wctx.name, err)
-				wctx.txctn.AddErr(err)
-				return err
-			}
-			writer := <-wctx.writerCh
-
-			// direct put success (TextMessage ack from ETL server)
-			if ty == websocket.TextMessage {
-				cos.Close(writer)
-				continue
-			}
-
-			if _, err = cos.CopyBuffer(writer, r, buf); err != nil {
-				cos.Close(writer)
-				err = fmt.Errorf("error copying message from %s: %w", wctx.name, err)
-				wctx.txctn.AddErr(err)
-				return err
-			}
-			cos.Close(writer)
-		}
-	}
-}
-
-func (wctx *wsConnCtx) writeLoop() error {
+func (wctx *wsConnCtx) writeLoop() (err error) {
 	buf, slab := core.T.PageMM().Alloc()
 	defer slab.Free(buf)
 
@@ -353,41 +357,123 @@ func (wctx *wsConnCtx) writeLoop() error {
 		case task := <-wctx.workCh:
 			// Leverages the fact that WebSocket preserves message order and boundaries.
 			// Sends two consecutive WebSocket messages:
-			//   1. A TextMessage containing the direct PUT address
-			//   2. A BinaryMessage containing the object content
+			//   1. A BinaryMessage as control message containing the direct PUT address, fqn, Path, and etl_args
+			//   2. A BinaryMessage containing the object content (if not fqn)
 			//
 			// The ETL server is expected to consume them in the same order and treat them as logically linked.
 
 			// 1. send control message
-			err := wctx.conn.WriteMessage(websocket.BinaryMessage, cos.MustMarshal(*task))
+			err := wctx.conn.WriteMessage(websocket.BinaryMessage, cos.MustMarshal(task.ctrlmsg))
 			if err != nil {
 				err = fmt.Errorf("error writing control message %s: %w", wctx.name, err)
 				wctx.txctn.AddErr(err)
-				return err
+				return task.done(err)
 			}
 
 			// 2. send object content if any (not fqn case)
 			if task.r != nil {
-				writer, err := wctx.conn.NextWriter(websocket.BinaryMessage)
+				connWriter, err := wctx.conn.NextWriter(websocket.BinaryMessage)
 				if err != nil {
-					err = fmt.Errorf("error getting next writer from %s: %w", wctx.name, err)
+					err = fmt.Errorf("error getting connection writer from %s: %w", wctx.name, err)
 					wctx.txctn.AddErr(err)
-					return err
+					return task.done(err)
 				}
-				if _, err := cos.CopyBuffer(writer, task.r, buf); err != nil {
+				if _, err := cos.CopyBuffer(connWriter, task.r, buf); err != nil {
 					err = fmt.Errorf("error writing to %s: %w", wctx.name, err)
 					wctx.txctn.AddErr(err)
-					return err
+					return task.done(err)
 				}
-				cos.Close(task.r)
-				cos.Close(writer)
+				cos.Close(connWriter)
 			}
 
-			// For each object sent to the ETL via `wctx.workCh`, we reserve a corresponding slot in `wctx.writerCh`
-			// for its writer. This guarantees that the correct writer is matched with the response when it arrives.
-			l, c := len(wctx.writerCh), cap(wctx.writerCh)
-			wctx.writerChanFull.Check(l, c)
-			wctx.writerCh <- task.w
+			// serialize the task to the transform channel
+			l, c := len(wctx.transformCh), cap(wctx.transformCh)
+			wctx.transformChanFull.Check(l, c)
+			wctx.transformCh <- task
+		}
+	}
+}
+
+func (wctx *wsConnCtx) readLoop() (err error) {
+	buf, slab := core.T.PageMM().Alloc()
+	defer slab.Free(buf)
+
+	for {
+		select {
+		case <-wctx.ctx.Done():
+			return nil
+		case <-wctx.txctn.ChanAbort():
+			return nil
+		case <-wctx.etlxctn.ChanAbort():
+			return nil
+		default:
+			ty, r, err := wctx.conn.NextReader()
+			if err != nil {
+				// Handle benign errors that occur when the connection is closed by the ETL server
+				// These errors indicate normal closure or server shutdown and should exit the read loop without reporting the error
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseServiceRestart) ||
+					cos.IsErrRetriableConn(err) || strings.Contains(err.Error(), "use of closed network connection") { // common errors
+					return nil
+				}
+				// For other errors, log and propagate them as they indicate unexpected issues during message reading
+				err = fmt.Errorf("error reading message from %s: %w", wctx.name, err)
+				wctx.txctn.AddErr(err)
+				return err
+			}
+			task := <-wctx.transformCh
+
+			// direct put success (TextMessage ack from ETL server)
+			if ty == websocket.TextMessage {
+				// TODO: update task.written with the actual size of direct put (for stats)
+				task.err = cmn.ErrSkip // indicates that the object was successfully handled by direct put
+				task.done(nil)
+				continue
+			}
+
+			if task.w == nil {
+				err = fmt.Errorf("task.w is nil, expected direct put but got result from pipeline: %s, task: %v", task.ctrlmsg.Pipeline, task)
+				debug.AssertNoErr(err)
+				task.done(err)
+				cos.DrainReader(r)
+				continue
+			}
+
+			written, err := cos.CopyBuffer(task.w, r, buf)
+			if err != nil {
+				err = fmt.Errorf("error copying message from %s: %w", wctx.name, err)
+				wctx.txctn.AddErr(err)
+				return task.done(err)
+			}
+			task.written = written
+			task.done(nil)
+		}
+	}
+}
+
+func (task *transformTask) done(err error) error {
+	task.wg.Done()
+	if task.r != nil {
+		cos.Close(task.r)
+	}
+	if task.w != nil {
+		cos.Close(task.w)
+	}
+	task.err = err
+	debug.DecCounter(task.txctn.ID() + "-task") // decrement task count for the session
+	return err
+}
+
+// Non-blocking drain of work channel; see also transport/sendobj.go
+func drainTaskCh(workCh chan *transformTask, err error) {
+	for {
+		select {
+		case task, ok := <-workCh:
+			if !ok {
+				return
+			}
+			task.done(err)
+		default:
+			return
 		}
 	}
 }

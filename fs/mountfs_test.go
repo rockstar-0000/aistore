@@ -1,6 +1,6 @@
-// Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
+// Package fs_test provides tests for fs package
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs_test
 
@@ -287,7 +287,7 @@ func TestMoveMarkers(t *testing.T) {
 
 			mpath := createMountpath(t)
 
-			fatalErr, writeErr := fs.PersistMarker(fname.RebalanceMarker)
+			fatalErr, writeErr := fs.PersistMarker(fname.RebalanceMarker, false /*quiet*/)
 			tassert.CheckFatal(t, fatalErr)
 			tassert.CheckFatal(t, writeErr)
 
@@ -328,9 +328,8 @@ func BenchmarkMakePathFQN(b *testing.B) {
 	)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		s := mi.MakePathFQN(&bck, fs.ObjectType, objName)
+	for b.Loop() {
+		s := mi.MakePathFQN(&bck, fs.ObjCT, objName)
 		cos.Assert(s != "")
 	}
 }

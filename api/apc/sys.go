@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -11,6 +11,7 @@ import (
 	"github.com/NVIDIA/aistore/sys"
 )
 
+// swagger:model
 type MemCPUInfo struct {
 	MemUsed    uint64      `json:"mem_used"`
 	MemAvail   uint64      `json:"mem_avail"`

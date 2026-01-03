@@ -3,11 +3,13 @@
 #
 
 import base64
-from typing import Type
+from typing import Type, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import cloudpickle
 from aistore.sdk.etl.webserver.base_etl_server import ETLServer
 from aistore.sdk.const import UTF_ENCODING
+from aistore.sdk.errors import InvalidPipelineError
 
 
 def serialize_class(cls: Type[ETLServer], encoding: str = UTF_ENCODING) -> str:
@@ -30,23 +32,78 @@ def serialize_class(cls: Type[ETLServer], encoding: str = UTF_ENCODING) -> str:
     return base64.b64encode(pickled).decode(encoding)
 
 
-def deserialize_class(payload: str, encoding: str = UTF_ENCODING) -> Type[ETLServer]:
+def compose_etl_direct_put_url(
+    direct_put_url: str, host_target: str, obj_path: str
+) -> str:
     """
-    Decode a Base64 payload and unpickle it back into an ETLServer subclass.
+    Compose the final direct PUT URL by combining components from multiple URLs.
+
+    Scenarios:
+    1) Pipeline stage: direct_put_url has no path → append object path.
+    2) Offline transform: direct_put_url has a path → prepend host_target path
+       (e.g. "/v1/etl/_object/<etl-name>/<etl-secret>/") to validate request.
 
     Args:
-        payload: Base64-encoded pickled data.
-        encoding: The string encoding used to decode the payload.
+        direct_put_url (str): Destination node's direct PUT URL, possibly with path/query.
+        host_target (str): Base AIS target URL used for scheme and base path.
+        obj_path (str): Path of the object to PUT.
+    Returns:
+        str: Complete direct PUT URL targeting the correct AIS node.
+    """
+    direct = urlparse(direct_put_url)
+    host = urlparse(host_target)
+
+    if direct.path:
+        # Case 2: offline transform → prepend host target's path
+        final_path = host.path + direct.path
+    else:
+        # Case 1: pipeline stage → append object path
+        final_path = obj_path
+
+    return urlunparse(
+        host._replace(
+            netloc=direct.netloc,
+            path=final_path,
+            query=direct.query,  # keep xid or stats query params
+        )
+    )
+
+
+def parse_etl_pipeline(pipeline_header: str) -> Tuple[str, str]:
+    """
+    Parse ETL pipeline from header value with validation.
+
+    Args:
+        pipeline_header: Comma-separated pipeline URLs
 
     Returns:
-        The ETLServer subclass.
+        Tuple of (first_url, remaining_pipeline_header)
+        where remaining_pipeline_header is comma-joined remaining URLs
+        or empty string if no remaining stages
 
     Raises:
-        TypeError: If the unpickled object is not a subclass of ETLServer.
+        InvalidPipelineError: If pipeline header is malformed
     """
-    raw = base64.b64decode(payload.encode(encoding))
-    cls = cloudpickle.loads(raw)
+    if not pipeline_header or not pipeline_header.strip():
+        return "", ""
 
-    if not isinstance(cls, type) or not issubclass(cls, ETLServer):
-        raise TypeError(f"Deserialized object {cls!r} is not an ETLServer subclass")
-    return cls
+    # Validate basic format - check for empty entries
+    pipeline_header = pipeline_header.strip()
+    entries = [entry.strip() for entry in pipeline_header.split(",")]
+
+    for entry in entries:
+        if not entry:
+            raise InvalidPipelineError("Pipeline header contains empty entry")
+
+    # Find the first comma efficiently (after validation)
+    comma_index = pipeline_header.find(",")
+
+    if comma_index == -1:
+        # No comma found, only one URL (already validated)
+        return pipeline_header.strip(), ""
+
+    # Extract first URL and remaining pipeline
+    first_url = pipeline_header[:comma_index].strip()
+    remaining_pipeline = pipeline_header[comma_index + 1 :].strip()
+
+    return first_url, remaining_pipeline

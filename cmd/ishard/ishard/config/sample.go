@@ -1,12 +1,14 @@
 // Package config provides types and functions to configure ishard executable.
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package config
 
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -44,10 +46,8 @@ func NewMissingExtManager(name string, sampleExts []string) (*MissingExtManager,
 	if len(sampleExts) == 0 {
 		return nil, errors.New("invalid extensions, should have at least one specified extension")
 	}
-	for _, ext := range sampleExts {
-		if ext == "" {
-			return nil, errors.New("invalid extensions, extension can't be empty string \"\"")
-		}
+	if slices.Contains(sampleExts, "") {
+		return nil, errors.New("invalid extensions, extension can't be empty string \"\"")
 	}
 	mgr := &MissingExtManager{
 		Name:   name,
@@ -128,7 +128,7 @@ func (mgr *MissingExtManager) exclude(recs *shard.Records) (*shard.Records, erro
 // difference finds the differences between two sets: `want` and `have`.
 // returns `extra` (extensions in `have` but not in `want`) and `missing` (extensions in `want` but not in `have`).
 func difference(want cos.StrSet, have []*shard.RecordObj) (extra, missing cos.StrSet) {
-	missing = want.Clone()
+	missing = maps.Clone(want)
 	extra = cos.NewStrSet()
 	for _, obj := range have {
 		if !missing.Contains(obj.Extension) {

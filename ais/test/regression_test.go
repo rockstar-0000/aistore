@@ -6,7 +6,6 @@ package integration_test
 
 import (
 	"fmt"
-	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -23,8 +22,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/feat"
-	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
@@ -48,184 +45,8 @@ type regressionTestData struct {
 }
 
 const (
-	rootDir        = "/tmp/ais"
 	testBucketName = "TESTAISBUCKET"
 )
-
-func TestListObjectsLocalGetLocation(t *testing.T) {
-	var (
-		m = ioContext{
-			t:         t,
-			num:       1000,
-			fileSize:  cos.KiB,
-			fixedSize: true,
-		}
-
-		targets    = make(map[string]struct{})
-		proxyURL   = tools.RandomProxyURL(t)
-		baseParams = tools.BaseAPIParams(proxyURL)
-		smap       = tools.GetClusterMap(t, proxyURL)
-	)
-
-	m.initAndSaveState(true /*cleanup*/)
-	m.expectTargets(1)
-
-	tools.CreateBucket(t, proxyURL, m.bck, nil, true /*cleanup*/)
-
-	m.puts()
-
-	msg := &apc.LsoMsg{Props: apc.GetPropsLocation}
-	lst, err := api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: int64(m.num)})
-	tassert.CheckFatal(t, err)
-
-	if len(lst.Entries) != m.num {
-		t.Errorf("Expected %d bucket list entries, found %d\n", m.num, len(lst.Entries))
-	}
-
-	j := 10
-	if len(lst.Entries) >= 200 {
-		j = 100
-	}
-	for i, e := range lst.Entries {
-		if e.Location == "" {
-			t.Fatalf("[%#v]: location is empty", e)
-		}
-		tname, _ := core.ParseObjLoc(e.Location)
-		tid := meta.N2ID(tname)
-		targets[tid] = struct{}{}
-		tsi := smap.GetTarget(tid)
-		url := tsi.URL(cmn.NetPublic)
-		baseParams := tools.BaseAPIParams(url)
-
-		oah, err := api.GetObject(baseParams, m.bck, e.Name, nil)
-		tassert.CheckFatal(t, err)
-		if uint64(oah.Size()) != m.fileSize {
-			t.Errorf("Expected filesize: %d, actual filesize: %d\n", m.fileSize, oah.Size())
-		}
-
-		if i%j == 0 {
-			if i == 0 {
-				tlog.Logln("Modifying config to enforce intra-cluster access, expecting errors...\n")
-			}
-			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.String()})
-			t.Cleanup(func() {
-				tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
-			})
-
-			_, err = api.GetObject(baseParams, m.bck, e.Name, nil)
-			if err == nil {
-				tlog.Logln("Warning: expected error, got nil")
-			}
-			tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
-		}
-	}
-
-	if smap.CountActiveTs() != len(targets) { // The objects should have been distributed to all targets
-		t.Errorf("Expected %d different target URLs, actual: %d different target URLs",
-			smap.CountActiveTs(), len(targets))
-	}
-
-	// Ensure no target URLs are returned when the property is not requested
-	msg.Props = ""
-	lst, err = api.ListObjects(baseParams, m.bck, msg, api.ListArgs{Limit: int64(m.num)})
-	tassert.CheckFatal(t, err)
-
-	if len(lst.Entries) != m.num {
-		t.Errorf("Expected %d bucket list entries, found %d\n", m.num, len(lst.Entries))
-	}
-
-	for _, e := range lst.Entries {
-		if e.Location != "" {
-			t.Fatalf("[%#v]: location expected to be empty\n", e)
-		}
-	}
-}
-
-func TestListObjectsCloudGetLocation(t *testing.T) {
-	var (
-		m = ioContext{
-			t:        t,
-			bck:      cliBck,
-			num:      100,
-			fileSize: cos.KiB,
-		}
-		targets    = make(map[string]struct{})
-		bck        = cliBck
-		proxyURL   = tools.RandomProxyURL(t)
-		baseParams = tools.BaseAPIParams(proxyURL)
-		smap       = tools.GetClusterMap(t, proxyURL)
-	)
-
-	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
-
-	m.initAndSaveState(true /*cleanup*/)
-	m.expectTargets(2)
-
-	m.puts()
-
-	listObjectsMsg := &apc.LsoMsg{Props: apc.GetPropsLocation, Flags: apc.LsCached}
-	lst, err := api.ListObjects(baseParams, bck, listObjectsMsg, api.ListArgs{})
-	tassert.CheckFatal(t, err)
-
-	if len(lst.Entries) < m.num {
-		t.Errorf("Bucket %s has %d objects, expected %d", m.bck.String(), len(lst.Entries), m.num)
-	}
-	j := 10
-	if len(lst.Entries) >= 200 {
-		j = 100
-	}
-	for i, e := range lst.Entries {
-		if e.Location == "" {
-			t.Fatalf("[%#v]: location is empty", e)
-		}
-		tmp := strings.Split(e.Location, apc.LocationPropSepa)
-		tid := meta.N2ID(tmp[0])
-		targets[tid] = struct{}{}
-		tsi := smap.GetTarget(tid)
-		url := tsi.URL(cmn.NetPublic)
-		baseParams := tools.BaseAPIParams(url)
-
-		oah, err := api.GetObject(baseParams, bck, e.Name, nil)
-		tassert.CheckFatal(t, err)
-		if uint64(oah.Size()) != m.fileSize {
-			t.Errorf("Expected fileSize: %d, actual fileSize: %d\n", m.fileSize, oah.Size())
-		}
-
-		if i%j == 0 {
-			if i == 0 {
-				tlog.Logln("Modifying config to enforce intra-cluster access, expecting errors...\n")
-			}
-			tools.SetClusterConfig(t, cos.StrKVs{"features": feat.EnforceIntraClusterAccess.String()})
-			_, err = api.GetObject(baseParams, m.bck, e.Name, nil)
-
-			if err == nil {
-				tlog.Logln("Warning: expected error, got nil")
-			}
-
-			tools.SetClusterConfig(t, cos.StrKVs{"features": "0"})
-		}
-	}
-
-	// The objects should have been distributed to all targets
-	if m.originalTargetCount != len(targets) {
-		t.Errorf("Expected %d different target URLs, actual: %d different target URLs", m.originalTargetCount, len(targets))
-	}
-
-	// Ensure no target URLs are returned when the property is not requested
-	listObjectsMsg.Props = ""
-	lst, err = api.ListObjects(baseParams, bck, listObjectsMsg, api.ListArgs{})
-	tassert.CheckFatal(t, err)
-
-	if len(lst.Entries) != m.num {
-		t.Errorf("Expected %d bucket list entries, found %d\n", m.num, len(lst.Entries))
-	}
-
-	for _, e := range lst.Entries {
-		if e.Location != "" {
-			t.Fatalf("[%#v]: location expected to be empty\n", e)
-		}
-	}
-}
 
 // 1. PUT file
 // 2. Corrupt the file
@@ -255,8 +76,15 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 
 	// Test corrupting the file contents.
 	objName := m.objNames[0]
-	fqn := findObjOnDisk(m.bck, objName)
-	tlog.Logf("Corrupting object data %q: %s\n", objName, fqn)
+	var fqn string
+	if m.chunksConf != nil && m.chunksConf.multipart {
+		fqns := m.findObjChunksOnDisk(m.bck, objName)
+		tassert.Fatalf(t, len(fqns) > 0, "object should have chunks: %s", objName)
+		fqn = fqns[0]
+	} else {
+		fqn = m.findObjOnDisk(m.bck, objName)
+	}
+	tlog.Logfln("Corrupting object data %q: %s", objName, fqn)
 	err := os.WriteFile(fqn, []byte("this file has been corrupted"), cos.PermRWR)
 	tassert.CheckFatal(t, err)
 
@@ -277,8 +105,6 @@ func TestRegressionBuckets(t *testing.T) {
 }
 
 func TestRenameBucket(t *testing.T) {
-	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
-
 	var (
 		bck = cmn.Bck{
 			Name:     testBucketName,
@@ -340,7 +166,7 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 		}
 		tassert.CheckFatal(t, err)
 
-		tlog.Logf("Renamed %s => %s\n", rtd.bck.String(), rtd.renamedBck.String())
+		tlog.Logfln("Renamed %s => %s", rtd.bck.String(), rtd.renamedBck.String())
 		if rtd.wait {
 			postRenameWaitAndCheck(t, baseParams, rtd, m.num, m.objNames, xid)
 		}
@@ -375,7 +201,7 @@ func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regress
 		}
 		tassert.CheckFatal(t, err)
 	} else {
-		tlog.Logf("rename-bucket[%s] %s => %s done\n", xid, rtd.bck.String(), rtd.renamedBck.String())
+		tlog.Logfln("rename-bucket[%s] %s => %s done", xid, rtd.bck.String(), rtd.renamedBck.String())
 	}
 	bcks, err := api.ListBuckets(baseParams, cmn.QueryBcks{Provider: rtd.bck.Provider}, apc.FltPresent)
 	tassert.CheckFatal(t, err)
@@ -407,9 +233,16 @@ func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regress
 		unique[base] = true
 	}
 	if len(unique) != numPuts {
+		const maxcnt = 4
+		var cnt int
 		for _, name := range objNames {
 			if _, ok := unique[name]; !ok {
-				tlog.Logf("not found: %s\n", name)
+				cnt++
+				if cnt > maxcnt && numPuts-len(unique)-cnt > 1 {
+					tlog.Logfln("not found: %s (and %d more objects)", name, numPuts-len(unique)-cnt)
+					break
+				}
+				tlog.Logfln("not found: %s", name)
 			}
 		}
 		err := fmt.Errorf("wrong number of objects in the bucket %s renamed as %s (before: %d. after: %d)",
@@ -453,7 +286,7 @@ func TestRenameObjects(t *testing.T) {
 
 		i++
 		if i%50 == 0 {
-			tlog.Logf("Renamed %s => %s\n", objName, newObjName)
+			tlog.Logfln("Renamed %s => %s", objName, newObjName)
 		}
 	}
 
@@ -520,7 +353,7 @@ func TestReregisterMultipleTargets(t *testing.T) {
 
 	targets := m.smap.Tmap.ActiveNodes()
 	for i := range targetsToUnregister {
-		tlog.Logf("Put %s in maintenance (no rebalance)\n", targets[i].StringEx())
+		tlog.Logfln("Put %s in maintenance (no rebalance)", targets[i].StringEx())
 		args := &apc.ActValRmNode{DaemonID: targets[i].ID(), SkipRebalance: true}
 		_, err := api.StartMaintenance(baseParams, args)
 		tassert.CheckFatal(t, err)
@@ -530,7 +363,7 @@ func TestReregisterMultipleTargets(t *testing.T) {
 	smap, err := tools.WaitForClusterState(proxyURL, "remove targets",
 		m.smap.Version, m.originalProxyCount, m.originalTargetCount-targetsToUnregister)
 	tassert.CheckFatal(t, err)
-	tlog.Logf("The cluster now has %d target(s)\n", smap.CountActiveTs())
+	tlog.Logfln("The cluster now has %d target(s)", smap.CountActiveTs())
 
 	// Step 2: PUT objects into a newly created bucket
 	tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
@@ -551,7 +384,7 @@ func TestReregisterMultipleTargets(t *testing.T) {
 		time.Sleep(5 * time.Second) // wait some time before reregistering next target
 	}
 	wg.Wait()
-	tlog.Logf("Stopping GETs...\n")
+	tlog.Logfln("Stopping GETs...")
 	m.stopGets()
 
 	baseParams := tools.BaseAPIParams(m.proxyURL)
@@ -566,8 +399,8 @@ func TestReregisterMultipleTargets(t *testing.T) {
 	}
 
 	// Step 5: Log rebalance stats
-	tlog.Logf("Rebalance sent     %s in %d files\n", cos.ToSizeIEC(bytesSent, 2), filesSent)
-	tlog.Logf("Rebalance received %s in %d files\n", cos.ToSizeIEC(bytesRecv, 2), filesRecv)
+	tlog.Logfln("Rebalance sent     %s in %d files", cos.IEC(bytesSent, 2), filesSent)
+	tlog.Logfln("Rebalance received %s in %d files", cos.IEC(bytesRecv, 2), filesRecv)
 
 	m.ensureNoGetErrors()
 	m.waitAndCheckCluState()
@@ -580,17 +413,17 @@ func TestGetNodeStats(t *testing.T) {
 
 	proxy, err := smap.GetRandProxy(false)
 	tassert.CheckFatal(t, err)
-	tlog.Logf("%s:\n", proxy.StringEx())
+	tlog.Logfln("%s:", proxy.StringEx())
 	stats, err := api.GetDaemonStats(baseParams, proxy)
 	tassert.CheckFatal(t, err)
-	tlog.Logf("%+v\n", stats)
+	tlog.Logfln("%+v", stats)
 
 	target, err := smap.GetRandTarget()
 	tassert.CheckFatal(t, err)
-	tlog.Logf("%s:\n", target.StringEx())
+	tlog.Logfln("%s:", target.StringEx())
 	stats, err = api.GetDaemonStats(baseParams, target)
 	tassert.CheckFatal(t, err)
-	tlog.Logf("%+v\n", stats)
+	tlog.Logfln("%+v", stats)
 }
 
 func TestGetClusterStats(t *testing.T) {
@@ -617,7 +450,7 @@ func TestGetClusterStats(t *testing.T) {
 			tcdf := tCDF.Mountpaths[mpath]
 			s := tname + mpath
 			if tcdf.Capacity.Used != 0 {
-				tlog.Logf("%-30s %+v %+v\n", s, tcdf.Disks, tcdf.Capacity)
+				tlog.Logfln("%-30s %+v %+v", s, tcdf.Disks, tcdf.Capacity)
 			}
 		}
 	}
@@ -632,14 +465,20 @@ func TestLRU(t *testing.T) {
 			t:      t,
 			bck:    cliBck,
 			num:    100,
-			prefix: t.Name(),
+			prefix: t.Name() + "_" + cos.GenTie(),
 		}
 	)
 
-	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: m.bck})
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: m.bck, RequiredDeployment: tools.ClusterTypeLocal})
 
 	m.init(true /*cleanup*/)
 	m.remotePuts(false /*evict*/)
+
+	// NOTE: cannot "fight" atimes here, need to unload all cached LOMs
+	err := api.ClearLcache(baseParams, "" /*all targets*/)
+	tassert.CheckFatal(t, err)
+
+	m.backdateLocalObjs(time.Hour * 3)
 
 	// Remember targets' watermarks
 	var (
@@ -668,12 +507,12 @@ func TestLRU(t *testing.T) {
 		return
 	}
 
-	tlog.Logf("LRU: current min space usage in the cluster: %d%%\n", usedPct)
-	tlog.Logf("setting 'space.lowwm=%d' and 'space.highwm=%d'\n", lowWM, highWM)
+	tlog.Logfln("LRU: current min space usage in the cluster: %d%%", usedPct)
+	tlog.Logfln("setting 'space.lowwm=%d' and 'space.highwm=%d'", lowWM, highWM)
 
 	// All targets: set new watermarks; restore upon exit
 	oconfig := tools.GetClusterConfig(t)
-	defer func() {
+	t.Cleanup(func() {
 		var (
 			cleanupWMStr, _ = cos.ConvertToString(oconfig.Space.CleanupWM)
 			lowWMStr, _     = cos.ConvertToString(oconfig.Space.LowWM)
@@ -686,7 +525,7 @@ func TestLRU(t *testing.T) {
 			"lru.dont_evict_time":   oconfig.LRU.DontEvictTime.String(),
 			"lru.capacity_upd_time": oconfig.LRU.CapacityUpdTime.String(),
 		})
-	}()
+	})
 
 	// Cluster-wide reduce dont-evict-time
 	cleanupWMStr, _ := cos.ConvertToString(cleanupWM)
@@ -696,7 +535,7 @@ func TestLRU(t *testing.T) {
 		"space.cleanupwm":       cleanupWMStr,
 		"space.lowwm":           lowWMStr,
 		"space.highwm":          highWMStr,
-		"lru.dont_evict_time":   "0s",
+		"lru.dont_evict_time":   time.Hour.String(),
 		"lru.capacity_upd_time": "10s",
 	})
 
@@ -716,7 +555,7 @@ func TestLRU(t *testing.T) {
 		diffBytesEvicted := tools.GetNamedStatsVal(v, "lru.evict.size") - bytesEvicted[k]
 		tlog.Logf(
 			"Target %s: evicted %d objects - %s (%dB) total\n",
-			k, diffFilesEvicted, cos.ToSizeIEC(diffBytesEvicted, 2), diffBytesEvicted,
+			k, diffFilesEvicted, cos.IEC(diffBytesEvicted, 2), diffBytesEvicted,
 		)
 
 		if diffFilesEvicted == 0 {
@@ -732,6 +571,10 @@ func TestPrefetchList(t *testing.T) {
 			bck:      cliBck,
 			num:      100,
 			fileSize: cos.KiB,
+			chunksConf: &ioCtxChunksConf{
+				multipart: true,
+				numChunks: 4, // will create 4 chunks
+			},
 		}
 		bck        = cliBck
 		proxyURL   = tools.RandomProxyURL(t)
@@ -745,7 +588,7 @@ func TestPrefetchList(t *testing.T) {
 	m.puts()
 
 	// 2. Evict those objects from the cache and prefetch them
-	tlog.Logf("Evicting and prefetching %d objects\n", len(m.objNames))
+	tlog.Logfln("Evicting and prefetching %d objects", len(m.objNames))
 	evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: m.objNames}}
 	xid, err := api.EvictMultiObj(baseParams, bck, evdMsg)
 	if err != nil {
@@ -786,7 +629,7 @@ func TestPrefetchList(t *testing.T) {
 	if len(lst.Entries) != m.num {
 		t.Errorf("list-objects %s: expected %d, got %d", bck.String(), m.num, len(lst.Entries))
 	} else {
-		tlog.Logf("list-objects %s: %d is correct\n", bck.String(), len(m.objNames))
+		tlog.Logfln("list-objects %s: %d is correct", bck.String(), len(m.objNames))
 	}
 }
 
@@ -806,7 +649,7 @@ func TestDeleteList(t *testing.T) {
 
 		// 1. Put files to delete
 		for i := range objCnt {
-			r, err := readers.NewRand(fileSize, bck.Props.Cksum.Type)
+			r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: fileSize, CksumType: bck.Props.Cksum.Type})
 			tassert.CheckFatal(t, err)
 
 			keyname := fmt.Sprintf("%s%d", prefix, i)
@@ -814,13 +657,13 @@ func TestDeleteList(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				tools.Put(proxyURL, b, keyname, r, errCh)
+				tools.Put(proxyURL, b, keyname, r, fileSize /*size*/, 0 /*numChunks*/, errCh)
 			}()
 			files = append(files, keyname)
 		}
 		wg.Wait()
 		tassert.SelectErr(t, errCh, "put", true)
-		tlog.Logf("PUT done.\n")
+		tlog.Logfln("PUT done.")
 
 		// 2. Delete the objects
 		evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: files}}
@@ -881,7 +724,7 @@ func TestPrefetchRange(t *testing.T) {
 
 	// 3. Evict those objects from the cache, and then prefetch them
 	rng := fmt.Sprintf("%s%s", m.prefix, prefetchRange)
-	tlog.Logf("Evicting and prefetching %d objects (range: %s)\n", len(files), rng)
+	tlog.Logfln("Evicting and prefetching %d objects (range: %s)", len(files), rng)
 	evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: rng}}
 	xid, err := api.EvictMultiObj(baseParams, bck, evdMsg)
 	tassert.CheckError(t, err)
@@ -926,7 +769,7 @@ func TestPrefetchRange(t *testing.T) {
 		if count != len(files) {
 			t.Errorf("list-objects %s/%s: expected %d, got %d", bck.String(), m.prefix, len(files), count)
 		} else {
-			tlog.Logf("list-objects %s/%s: %d is correct\n", bck.String(), m.prefix, len(files))
+			tlog.Logfln("list-objects %s/%s: %d is correct", bck.String(), m.prefix, len(files))
 		}
 	}
 }
@@ -951,21 +794,21 @@ func TestDeleteRange(t *testing.T) {
 
 		// 1. Put files to delete
 		for i := range objCnt {
-			r, err := readers.NewRand(fileSize, bck.Props.Cksum.Type)
+			r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: fileSize, CksumType: bck.Props.Cksum.Type})
 			tassert.CheckFatal(t, err)
 
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				tools.Put(proxyURL, b, fmt.Sprintf("%s%04d", prefix, i), r, errCh)
+				tools.Put(proxyURL, b, fmt.Sprintf("%s%04d", prefix, i), r, fileSize, 0 /*numChunks*/, errCh)
 			}(i)
 		}
 		wg.Wait()
 		tassert.SelectErr(t, errCh, "put", true)
-		tlog.Logf("PUT done.\n")
+		tlog.Logfln("PUT done.")
 
 		// 2. Delete the small range of objects
-		tlog.Logf("Delete in range %s\n", smallrange)
+		tlog.Logfln("Delete in range %s", smallrange)
 		evdSmallMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: smallrange}}
 		xid, err := api.DeleteMultiObj(baseParams, b, evdSmallMsg)
 		tassert.CheckError(t, err)
@@ -994,7 +837,7 @@ func TestDeleteRange(t *testing.T) {
 			}
 		}
 
-		tlog.Logf("Delete in range %s\n", bigrange)
+		tlog.Logfln("Delete in range %s", bigrange)
 		// 4. Delete the big range of objects
 		evdBigMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: bigrange}}
 		xid, err = api.DeleteMultiObj(baseParams, b, evdBigMsg)
@@ -1045,7 +888,7 @@ func TestStressDeleteRange(t *testing.T) {
 	for i := range numReaders {
 		size := rand.Int64N(cos.KiB*128) + cos.KiB/3
 		tassert.CheckFatal(t, err)
-		reader, err := readers.NewRand(size, cksumType)
+		reader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: size, CksumType: cksumType})
 		tassert.CheckFatal(t, err)
 
 		wg.Add(1)
@@ -1065,7 +908,7 @@ func TestStressDeleteRange(t *testing.T) {
 				if err != nil {
 					errCh <- err
 				}
-				reader.Seek(0, io.SeekStart)
+				reader.Reset()
 			}
 		}(i, reader)
 	}
@@ -1073,7 +916,7 @@ func TestStressDeleteRange(t *testing.T) {
 	tassert.SelectErr(t, errCh, "put", true)
 
 	// 2. Delete a range of objects
-	tlog.Logf("Deleting objects in range: %s\n", partialRange)
+	tlog.Logfln("Deleting objects in range: %s", partialRange)
 	evdPartialMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: partialRange}}
 	xid, err := api.DeleteMultiObj(baseParams, bck, evdPartialMsg)
 	tassert.CheckError(t, err)
@@ -1106,7 +949,7 @@ func TestStressDeleteRange(t *testing.T) {
 	}
 
 	// 4. Delete the entire range of objects
-	tlog.Logf("Deleting objects in range: %s\n", fullRange)
+	tlog.Logfln("Deleting objects in range: %s", fullRange)
 	evdFullMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: nil, Template: fullRange}}
 	xid, err = api.DeleteMultiObj(baseParams, bck, evdFullMsg)
 	tassert.CheckError(t, err)

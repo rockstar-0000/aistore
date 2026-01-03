@@ -8,6 +8,7 @@ package xs
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,7 @@ type (
 		pend struct {
 			n atomic.Int64
 		}
+		lrp int
 	}
 )
 
@@ -113,16 +115,19 @@ func (p *tcoFactory) Start() error {
 	r.pend.m = make(map[string]*tcowi, burst)
 	r.owt = cmn.OwtCopy
 
+	p.xctn = r
+	r.DemandBase.Init(p.UUID(), p.Kind(), p.Bck, xact.IdleDefault)
+
 	if p.kind == apc.ActETLObjects {
 		r.owt = cmn.OwtTransform
-		r.copier.getROC, r.transform, err = etl.GetOfflineTransform(p.args.Msg.Transform.Name, r)
+		r.copier.getROC, r.copier.xetl, r.transform, err = etl.GetOfflineTransform(p.args.Msg.Transform.Name, r)
 		if err != nil {
 			return err
 		}
+		if r.transform != nil {
+			r.putWOC = r.transform.OfflineWrite
+		}
 	}
-
-	p.xctn = r
-	r.DemandBase.Init(p.UUID(), p.Kind(), "" /*ctlmsg via SetCtlMsg later*/, p.Bck, xact.IdleDefault)
 
 	smap := core.T.Sowner().Get()
 	if err := core.InMaintOrDecomm(smap, core.T.Snode(), r); err != nil {
@@ -160,10 +165,10 @@ func (p *tcoFactory) Start() error {
 	// (rgetstats)
 	if bck := r.args.BckFrom; bck.IsRemote() {
 		r.bp = core.T.Backend(bck)
-		r.vlabs = map[string]string{
-			stats.VlabBucket: bck.Cname(""),
-			stats.VlabXkind:  r.Kind(),
-		}
+	}
+	r.vlabs = map[string]string{
+		stats.VlabBucket: r.args.BckFrom.Cname(""),
+		stats.VlabXkind:  r.Kind(),
 	}
 
 	xact.GoRunW(r)
@@ -185,12 +190,9 @@ func (r *XactTCO) String() string {
 func (r *XactTCO) FromTo() (*meta.Bck, *meta.Bck) { return r.args.BckFrom, r.args.BckTo }
 
 func (r *XactTCO) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
+	snap = r.Base.NewSnap(r)
 	snap.Pack(0, int(r.nworkers.Load()), r.chanFull.Load())
 
-	snap.IdleX = r.IsIdle()
 	f, t := r.FromTo()
 	snap.SrcBck, snap.DstBck = f.Clone(), t.Clone()
 	return snap
@@ -258,21 +260,13 @@ func (r *XactTCO) doMsg(msg *cmn.TCOMsg) (stop bool) {
 			msg.TCBMsg.Prefix, " vs ", lrit.prefix)
 		lrit.prefix = cos.Left(lrit.prefix, msg.TCBMsg.Prefix)
 	}
+	wi.lrp = lrit.lrp
 
 	nworkers := int64(len(lrit.nwp.workers))
 	r.nworkers.Add(nworkers)
 
 	// run
 	var wg *sync.WaitGroup
-	{
-		var sb strings.Builder
-		sb.Grow(160)
-		msg.CopyBckMsg.Str(&sb, r.args.BckFrom.Cname(msg.Prefix), r.args.BckTo.Cname(msg.Prepend))
-		sb.WriteByte(' ')
-		msg.ListRange.Str(&sb, lrit.lrp == lrpPrefix)
-		r.Base.SetCtlMsg(sb.String())
-	}
-	// run
 	if msg.Sync && lrit.lrp != lrpList {
 		// TODO -- FIXME: revisit stopCh and related
 		wg = &sync.WaitGroup{}
@@ -325,10 +319,15 @@ outer:
 	}
 	if r.p.dm != nil {
 		if err := r.AbortErr(); err != nil {
-			if _, ok := err.(*recvAbortErr); !ok {
+			if !isErrRecvAbort(err) {
 				r.sntl.bcast(r.ID(), r.p.dm, err)
 			}
 		}
+	}
+
+	// finish the ETL session, if any
+	if r.transform != nil {
+		r.transform.Finish(nil)
 	}
 
 	r.fin(true /*unreg Rx*/) // TODO: compare w/ tcb quiescing
@@ -350,7 +349,7 @@ outer:
 
 // NOTE: strict(est) error handling: abort on any of the errors below
 func (r *XactTCO) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
-	if err != nil && !cos.IsEOF(err) {
+	if err != nil && !cos.IsOkEOF(err) {
 		goto ex
 	}
 
@@ -359,16 +358,17 @@ func (r *XactTCO) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) er
 	r.DecPending()
 	transport.DrainAndFreeReader(objReader)
 ex:
-	if err != nil && cmn.Rom.FastV(4, cos.SmoduleXs) {
+	if err != nil && cmn.Rom.V(4, cos.ModXs) {
 		nlog.Errorln(err)
 	}
 	return err
 }
 
+// (note: ObjHdr and its fields must be consumed synchronously)
 func (r *XactTCO) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 	if hdr.Opcode != 0 {
 		switch hdr.Opcode {
-		case opDone:
+		case transport.OpcDone:
 			uuid := cos.UnsafeS(hdr.Opaque) // txnUUID
 			r.pend.mtx.Lock()
 			wi, ok := r.pend.m[uuid]
@@ -382,7 +382,7 @@ func (r *XactTCO) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 				r.wiCnt.Dec()
 			}
 			r.pend.mtx.Unlock()
-		case opAbort:
+		case transport.OpcAbort:
 			uuid := cos.UnsafeS(hdr.Opaque)
 			debug.Assert(uuid == r.ID(), uuid, " vs ", r.ID())
 
@@ -401,7 +401,7 @@ func (r *XactTCO) _recv(hdr *transport.ObjHdr, objReader io.Reader) error {
 }
 
 func (r *XactTCO) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LOM) (err error) {
-	if err = lom.InitBck(&hdr.Bck); err != nil {
+	if err = lom.InitCmnBck(&hdr.Bck); err != nil {
 		return
 	}
 	lom.CopyAttrs(&hdr.ObjAttrs, true /*skip cksum*/)
@@ -423,11 +423,48 @@ func (r *XactTCO) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LOM
 	core.FreePutParams(params)
 
 	if err != nil {
-		r.AddErr(err, 5, cos.SmoduleXs)
-	} else if cmn.Rom.FastV(5, cos.SmoduleXs) {
+		r.AddErr(err, 5, cos.ModXs)
+	} else if cmn.Rom.V(5, cos.ModXs) {
 		nlog.Infof("%s: tco-Rx %s, size=%d", r.Base.Name(), lom.Cname(), hdr.ObjAttrs.Size)
 	}
 	return
+}
+
+func (r *XactTCO) CtlMsg() string {
+	var sb strings.Builder
+	n := r.wiCnt.Load()
+	if n == 0 {
+		sb.Grow(64)
+	} else {
+		sb.Grow(64 + 100*int(n))
+	}
+	tag := cos.Ternary(r.Kind() == apc.ActETLObjects, "etl: ", "cp :")
+	sb.WriteString(tag)
+	sb.WriteString(r.args.BckFrom.Cname(""))
+	sb.WriteString("=>")
+	sb.WriteString(r.args.BckTo.Cname(""))
+
+	if n == 0 {
+		return sb.String()
+	}
+
+	r.pend.mtx.Lock()
+	wis := make([]*tcowi, 0, len(r.pend.m))
+	for _, wi := range r.pend.m {
+		wis = append(wis, wi)
+	}
+	r.pend.mtx.Unlock()
+
+	sb.WriteString(" [")
+	for i, wi := range wis {
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		wi.append(&sb)
+	}
+	sb.WriteByte(']')
+
+	return sb.String()
 }
 
 ///////////
@@ -440,14 +477,59 @@ func (r *XactTCO) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LOM
 
 func (wi *tcowi) do(lom *core.LOM, lrit *lrit, buf []byte) {
 	r := wi.r
-	a := r.copier.prepare(lom, r.args.BckTo, &r.args.Msg.TCBMsg, r.config, buf, r.owt)
+	a, err := r.copier.prepare(lom, r.args.BckTo, &r.args.Msg.TCBMsg, r.config, buf, r.owt)
+	if err != nil {
+		r.Abort(err)
+		return
+	}
 
 	// multiple messages per x-tco (compare w/ x-tcb)
 	a.LatestVer, a.Sync = wi.msg.LatestVer, wi.msg.Sync
 
-	err := r.copier.do(a, lom, r.p.dm)
-	if cos.IsNotExist(err, 0) && lrit.lrp == lrpList {
-		r.AddErr(err, 5, cos.SmoduleXs)
+	err = r.copier.do(a, lom, r.p.dm)
+	if cos.IsNotExist(err) && lrit.lrp == lrpList {
+		r.AddErr(err, 5, cos.ModXs)
+	}
+}
+
+func (wi *tcowi) append(sb *strings.Builder) {
+	msg := wi.msg
+
+	msg.ListRange.Str(sb, wi.lrp == lrpPrefix)
+	if msg.Transform.Name != "" {
+		sb.WriteString(", etl:")
+		sb.WriteString(msg.Transform.Name)
+	}
+	if pend := wi.pend.n.Load(); pend > 0 {
+		sb.WriteString(", pending:")
+		sb.WriteString(strconv.FormatInt(pend, 10))
+	}
+
+	sb.WriteString(", flags:")
+	first := true
+	if msg.LatestVer {
+		sb.WriteString("latest-ver")
+		first = false
+	}
+	if msg.Sync {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("sync")
+		first = false
+	}
+	if msg.TCBMsg.NonRecurs {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("non-recurs")
+		first = false
+	}
+	if msg.ContinueOnError {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("continue-on-error")
 	}
 }
 

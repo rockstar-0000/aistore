@@ -35,22 +35,28 @@ type (
 		Recover bool
 	}
 	BckRenameArgs struct {
-		BckFrom *meta.Bck
-		BckTo   *meta.Bck
-		RebID   string
-		Phase   string
+		TCBArgs
 	}
 	MNCArgs struct {
 		Tag    string
 		Copies int
+	}
+	RechunkArgs struct {
+		ObjSizeLimit int64
+		ChunkSize    int64
+		Prefix       string
 	}
 	LsoArgs struct {
 		Msg *apc.LsoMsg
 		Hdr http.Header
 	}
 	ResArgs struct {
-		Config            *cmn.Config
-		Smap              *meta.Smap
-		SkipGlobMisplaced bool
+		Config *cmn.Config
+		Smap   *meta.Smap
+	}
+	RebArgs struct {
+		Bck    *meta.Bck // (limited-scope)
+		Prefix string    // (ditto)
+		Flags  uint32    // = xact.ArgsMsg.Flags
 	}
 )

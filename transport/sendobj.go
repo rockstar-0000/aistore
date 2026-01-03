@@ -1,5 +1,4 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -22,13 +21,13 @@ import (
 // object stream & private types
 type (
 	Stream struct {
-		workCh   chan *Obj // aka SQ: next object to stream
-		cmplCh   chan cmpl // aka SCQ; note that SQ and SCQ together form a FIFO
-		callback ObjSentCB // to free SGLs, close files, etc.
-		lz4s     *lz4Stream
-		sendoff  sendoff
+		workCh  chan *Obj // send queue (SQ): next object to stream
+		cmplCh  chan cmpl // SCQ (note: SQ and SCQ form a FIFO)
+		sentCB  SentCB    // to free SGLs, close files, etc. cleanup
+		lz4s    *lz4Stream
+		sendoff sendoff
+		base
 		chanFull cos.ChanFull
-		streamBase
 	}
 	lz4Stream struct {
 		s             *Stream
@@ -49,6 +48,7 @@ type (
 )
 
 // interface guard
+// (curerently, a single implementation but keeping it interfaced for possible futures)
 var _ streamer = (*Stream)(nil)
 
 ///////////////////
@@ -75,7 +75,7 @@ func (s *Stream) terminate(err error, reason string) (actReason string, actErr e
 	// Remove stream after lock because we could deadlock between `do()`
 	// (which checks for `Terminated` status) and this function which
 	// would be under lock.
-	gc.remove(&s.streamBase)
+	gc.remove(&s.base)
 
 	if s.compressed() {
 		s.lz4s.sgl.Free()
@@ -149,10 +149,10 @@ func (s *Stream) doCmpl(obj *Obj, err error) {
 	}
 	// SCQ completion callback
 	if rc == 0 {
-		if obj.Callback != nil {
-			obj.Callback(&obj.Hdr, obj.Reader, obj.CmplArg, err)
-		} else if s.callback != nil {
-			s.callback(&obj.Hdr, obj.Reader, obj.CmplArg, err)
+		if obj.SentCB != nil {
+			obj.SentCB(&obj.Hdr, obj.Reader, obj.CmplArg, err)
+		} else if s.sentCB != nil {
+			s.sentCB(&obj.Hdr, obj.Reader, obj.CmplArg, err)
 		}
 	}
 	freeSend(obj)
@@ -239,8 +239,8 @@ repeat:
 		s.sendoff.ins = inHdr
 		return s.sendHdr(b)
 	case <-s.stopCh.Listen():
-		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
-			nlog.Infoln(s.String(), "stopped [", s.numCur, s.stats.Num.Load(), "]")
+		if cmn.Rom.V(5, cos.ModTransport) {
+			nlog.Infoln(s.String(), "stopped [", s.numCur, "]")
 		}
 		return 0, io.EOF
 	}
@@ -253,7 +253,6 @@ func (s *Stream) sendHdr(b []byte) (n int, err error) {
 		return
 	}
 	debug.Assert(s.sendoff.off == int64(len(s.header)))
-	s.stats.Offset.Add(s.sendoff.off)
 
 	obj := &s.sendoff.obj
 	if s.usePDU() && !obj.IsHeaderOnly() {
@@ -261,8 +260,8 @@ func (s *Stream) sendHdr(b []byte) (n int, err error) {
 	} else {
 		s.sendoff.ins = inData
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleTransport) && s.numCur&0x3f == 2 {
-		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, s.stats.Num.Load(), "]")
+	if cmn.Rom.V(5, cos.ModTransport) && s.numCur&0x3f == 2 {
+		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, "]")
 	}
 	s.sendoff.off = 0
 	if obj.Hdr.isFin() {
@@ -309,7 +308,6 @@ func (s *Stream) eoObj(err error) {
 		objSize = s.sendoff.off
 	}
 	s.sizeCur += s.sendoff.off
-	s.stats.Offset.Add(s.sendoff.off)
 	if err != nil {
 		goto exit
 	}
@@ -318,11 +316,9 @@ func (s *Stream) eoObj(err error) {
 		goto exit
 	}
 	// this stream stats
-	s.stats.Size.Add(objSize)
 	s.numCur++
-	s.stats.Num.Inc()
-	if cmn.Rom.FastV(5, cos.SmoduleTransport) && s.numCur&0x3f == 3 {
-		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, s.stats.Num.Load(), "]")
+	if cmn.Rom.V(5, cos.ModTransport) && s.numCur&0x3f == 3 {
+		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, "]")
 	}
 
 	// target stats
@@ -343,17 +339,22 @@ func (s *Stream) inSend() bool { return s.sendoff.ins >= inHdr || s.sendoff.ins 
 func (s *Stream) dryrun() {
 	var (
 		body = io.NopCloser(s)
-		h    = &hdl{trname: s.trname}
-		it   = iterator{handler: h, body: body, hbuf: make([]byte, cmn.DfltTransportHeader)}
+		h    = &handler{trname: s.trname}
+		it   = iterator{
+			handler: h,
+			body:    body,
+			hbuf:    make([]byte, cmn.DfltTransportHeader),
+			loghdr:  s.String(),
+		}
 	)
 	for {
-		hlen, flags, err := it.nextProtoHdr(s.String())
+		hlen, flags, err := it.nextProtoHdr()
 		if err == io.EOF {
 			break
 		}
 		debug.AssertNoErr(err)
 		debug.Assert(flags&msgFl == 0)
-		obj, err := it.nextObj(s.String(), hlen)
+		obj, err := it.nextObj(hlen)
 		if obj != nil {
 			cos.DrainReader(obj) // TODO: recycle `objReader` here
 			continue
@@ -374,8 +375,10 @@ func (s *Stream) errCmpl(err error) {
 func (s *Stream) drain(err error) {
 	for {
 		select {
-		case obj := <-s.workCh:
-			s.doCmpl(obj, err)
+		case obj, ok := <-s.workCh:
+			if ok {
+				s.doCmpl(obj, err)
+			}
 		default:
 			return
 		}
@@ -397,20 +400,10 @@ func (s *Stream) closeAndFree() {
 func (s *Stream) idleTick() {
 	if len(s.workCh) == 0 && s.sessST.CAS(active, inactive) {
 		s.workCh <- &Obj{Hdr: ObjHdr{Opcode: opcIdleTick}}
-		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+		if cmn.Rom.V(5, cos.ModTransport) {
 			nlog.Infoln(s.String(), "active => inactive")
 		}
 	}
-}
-
-///////////
-// Stats //
-///////////
-
-func (stats *Stats) CompressionRatio() float64 {
-	bytesRead := stats.Offset.Load()
-	bytesSent := stats.CompressedSize.Load()
-	return float64(bytesRead) / float64(bytesSent)
 }
 
 ///////////////
@@ -452,7 +445,6 @@ re:
 		n, _ = lz4s.sgl.Read(b)
 	}
 ex:
-	lz4s.s.stats.CompressedSize.Add(int64(n))
 	if lz4s.sgl.Len() == 0 {
 		lz4s.sgl.Reset()
 	}

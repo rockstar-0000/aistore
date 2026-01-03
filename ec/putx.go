@@ -13,6 +13,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -66,7 +67,7 @@ func (*putFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 
 func (p *putFactory) Start() error {
 	xec := ECM.NewPutXact(p.Bck.Bucket())
-	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), "" /*ctlmsg*/, p.Bck, 0 /*use default*/)
+	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
 	p.xctn = xec
 
 	xact.GoRunW(xec)
@@ -94,20 +95,24 @@ func newPutXact(bck *cmn.Bck, mgr *Manager) *XactPut {
 	avail, disabled := fs.Get()
 	xctn.putJoggers = make(map[string]*putJogger, len(avail)+len(disabled))
 	for _, mpi := range []fs.MPI{avail, disabled} {
-		for mpath := range mpi {
-			xctn.putJoggers[mpath] = xctn.newPutJogger(mpath)
+		for _, mi := range mpi {
+			xctn.putJoggers[mi.Path] = xctn.newPutJogger(mi)
 		}
 	}
 	return xctn
 }
 
-func (r *XactPut) newPutJogger(mpath string) *putJogger {
+func (r *XactPut) newPutJogger(mi *fs.Mountpath) *putJogger {
 	j := &putJogger{
 		parent: r,
-		mpath:  mpath,
+		mi:     mi,
 		putCh:  make(chan *request, max(putxBurstSize, r.config.EC.Burst)),
 		xactCh: make(chan *request, max(encodeBurstSize, r.config.EC.Burst)),
 	}
+	j.adv.Init(
+		load.FlMem|load.FlCla|load.FlDsk,
+		&load.Extra{Mi: mi, Cfg: &r.config.Disk, RW: true /* heavy IO */},
+	)
 	j.stopCh.Init()
 	return j
 }
@@ -134,7 +139,7 @@ func (r *XactPut) dispatchRequest(req *request, lom *core.LOM) error {
 		r.Abort(err)
 		return err
 	}
-	if cmn.Rom.FastV(4, cos.SmoduleEC) {
+	if cmn.Rom.V(4, cos.ModEC) {
 		nlog.Infof("ECPUT (bg queue = %d): dispatching object %s....", len(jogger.putCh), lom)
 	}
 	if req.rebuild {
@@ -170,7 +175,7 @@ func (r *XactPut) mainLoop(ticker *time.Ticker) {
 	for {
 		select {
 		case <-ticker.C:
-			if cmn.Rom.FastV(4, cos.SmoduleEC) {
+			if cmn.Rom.V(4, cos.ModEC) {
 				if s := fmt.Sprintf("%v", r.Snap()); s != "" {
 					nlog.Infoln(s)
 				}
@@ -229,8 +234,11 @@ func (r *XactPut) cleanup(req *request, lom *core.LOM) {
 	}
 }
 
+func (*XactPut) CtlMsg() string { return "" }
+
 func (r *XactPut) Snap() (snap *core.Snap) {
-	snap = r.baseSnap()
+	snap = r.Base.NewSnap(r)
+
 	st := r.stats.stats()
 	snap.Ext = &ExtECPutStats{
 		AvgEncodeTime:  cos.Duration(st.EncodeTime),

@@ -1,14 +1,21 @@
 #
 # Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
 #
+
+# pylint: disable=duplicate-code
+
 import random
 import unittest
 import io
 import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import pytest
+import xxhash
 
 from aistore.sdk.blob_download_config import BlobDownloadConfig
+from aistore.sdk.etl import ETLConfig
+from aistore.sdk.errors import AISError
 from aistore.sdk.const import (
     AIS_CUSTOM_MD,
     AIS_VERSION,
@@ -23,7 +30,6 @@ from tests.const import (
     SMALL_FILE_SIZE,
     OBJ_READ_TYPE_ALL,
     OBJ_READ_TYPE_CHUNK,
-    TEST_TIMEOUT,
 )
 from tests.integration.sdk.parallel_test_base import ParallelTestBase
 from tests.utils import (
@@ -31,8 +37,10 @@ from tests.utils import (
     create_archive,
     string_to_dict,
     has_targets,
+    random_string,
 )
-from tests.integration import CLUSTER_ENDPOINT, REMOTE_SET
+from tests.const import TEST_TIMEOUT
+from tests.integration import CLUSTER_ENDPOINT, REMOTE_SET, AWS_BUCKET
 
 
 # pylint: disable=unused-variable, too-many-public-methods
@@ -185,7 +193,8 @@ class TestObjectOps(ParallelTestBase):
         objects = self._put_objects(1, SMALL_FILE_SIZE)
         obj_names = list(objects.keys())
         evict_job_id = self.bucket.objects(obj_names=obj_names).evict()
-        self.client.job(evict_job_id).wait(timeout=TEST_TIMEOUT)
+        result = self.client.job(evict_job_id).wait(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
 
         for obj_name, content in objects.items():
             start_time = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -218,7 +227,8 @@ class TestObjectOps(ParallelTestBase):
 
         # Evict the object
         evict_job_id = self.bucket.objects(obj_names=[obj.name]).evict()
-        self.client.job(job_id=evict_job_id).wait(timeout=TEST_TIMEOUT)
+        result = self.client.job(job_id=evict_job_id).wait(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
 
         # Check the `Ais-Present` attribute after eviction
         # Note: `Ais-Present` should be "false" after eviction
@@ -272,7 +282,8 @@ class TestObjectOps(ParallelTestBase):
 
         # If promote is executed as an asynchronous job, wait until it completes
         if promote_job:
-            self.client.job(job_id=promote_job).wait_for_idle(timeout=TEST_TIMEOUT)
+            result = self.client.job(job_id=promote_job).wait(timeout=TEST_TIMEOUT)
+            self.assertTrue(result.success)
 
         # Check bucket, only top object is promoted
         self.assertEqual(1, len(self.bucket.list_all_objects()))
@@ -296,7 +307,8 @@ class TestObjectOps(ParallelTestBase):
 
         # If promote is executed as an asynchronous job, wait until it completes
         if promote_job:
-            self.client.job(job_id=promote_job).wait_for_idle(timeout=TEST_TIMEOUT)
+            result = self.client.job(job_id=promote_job).wait(timeout=TEST_TIMEOUT)
+            self.assertTrue(result.success)
 
         # Check bucket, both objects promoted, top overwritten
         self.assertEqual(2, len(self.bucket.list_all_objects()))
@@ -323,7 +335,7 @@ class TestObjectOps(ParallelTestBase):
         bucket_size = 10
         delete_cnt = 7
 
-        obj_names = self._create_objects(num_obj=bucket_size)
+        obj_names = list(self._create_objects(num_obj=bucket_size).keys())
         objects = self.bucket.list_objects()
         self.assertEqual(len(objects.entries), bucket_size)
 
@@ -340,14 +352,16 @@ class TestObjectOps(ParallelTestBase):
         obj, _ = self._create_object_with_content()
 
         evict_job_id = self.bucket.objects(obj_names=[obj.name]).evict()
-        self.client.job(evict_job_id).wait(timeout=TEST_TIMEOUT)
+        result = self.client.job(evict_job_id).wait(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
         self.assertFalse(obj.props.present)
 
         blob_download_job_id = obj.blob_download()
         self.assertNotEqual(blob_download_job_id, "")
-        self.client.job(job_id=blob_download_job_id).wait_single_node(
+        result = self.client.job(job_id=blob_download_job_id).wait_single_node(
             timeout=TEST_TIMEOUT
         )
+        self.assertTrue(result.success)
         self.assertTrue(obj.props.present)
 
     def test_get_archregex(self):
@@ -475,3 +489,273 @@ class TestObjectOps(ParallelTestBase):
                 .read_all()
             )
             self.assertEqual(content, expected_content)
+
+    @cases(
+        "%",
+        "%25",
+        "%3D",
+        r"yHvMJM(s\(0hR\3\)",
+        "file.mp3",
+        "audio/raw/file.wav",
+        "file_#@!$%^&*()_+.mp3",
+        "track?name=lofi&v=1",
+        "track%20space.wav",
+        "my audio file .m4a",
+        "你好世界",
+        "-hiddenfile.ogg",
+        ".audio_hidden.wav",
+        "MiXeD_CaSe_Track.WAV",
+        "track=id=1234.mp3",
+    )
+    def test_object_name_encoding(self, obj_name):
+        """
+        Test that object names with special characters are correctly encoded and decoded.
+        """
+        obj = self.bucket.object(obj_name)
+        content = b"Special character test content"
+
+        # Put object with special characters in name
+        obj.get_writer().put_content(content)
+
+        # Get object and verify content
+        fetched_content = obj.get_reader().read_all()
+        self.assertEqual(content, fetched_content)
+
+        # Verify that the object can be listed with its special name
+        listed_objects = self.bucket.list_objects_iter(prefix=obj_name)
+        self.assertIn(obj_name, [o.name for o in listed_objects])
+        obj.delete()
+
+    def test_copy_object_same_name(self):
+        """Test copying an object to another bucket with the same name."""
+        dest_bucket = self._create_bucket(prefix="copy-dest-bucket")
+        source_obj, content = self._create_object_with_content()
+
+        dest_obj = dest_bucket.object(source_obj.name)
+        response = source_obj.copy(dest_obj)
+        self.assertEqual(response.status_code, 200)
+
+        copied_content = dest_obj.get_reader().read_all()
+        self.assertEqual(content, copied_content)
+
+        source_content = source_obj.get_reader().read_all()
+        self.assertEqual(content, source_content)
+
+    @unittest.skipIf(
+        not AWS_BUCKET,
+        "AWS bucket is not set",
+    )
+    def test_copy_object_latest_flag(self):
+        """Test copying an object with latest flag to get updated version from remote backend."""
+        dest_bucket = self._create_bucket(prefix="copy-latest-dest")
+        obj_name = random_string()
+        first_version_content = b"first version content"
+        second_version_content = b"second version content"
+        self._register_for_post_test_cleanup(names=[obj_name], is_bucket=False)
+
+        # out-of-band PUT: first version
+        self.s3_client.put_object(
+            Bucket=self.bucket.name, Key=obj_name, Body=first_version_content
+        )
+
+        # cold GET to cache the object
+        source_obj = self.bucket.object(obj_name)
+        content = source_obj.get_reader().read_all()
+        self.assertEqual(first_version_content, content)
+
+        # out-of-band PUT: 2nd version (overwrite)
+        self.s3_client.put_object(
+            Bucket=self.bucket.name, Key=obj_name, Body=second_version_content
+        )
+
+        # Copy without latest flag - should copy the cached first version
+        dest_obj_old = dest_bucket.object(f"{obj_name}-old")
+        response = source_obj.copy(dest_obj_old)
+        self.assertEqual(response.status_code, 200)
+
+        # Verify copied content is the old cached version
+        copied_content_old = dest_obj_old.get_reader().read_all()
+        self.assertEqual(first_version_content, copied_content_old)
+
+        # Copy with latest=True - should copy the updated version from remote
+        dest_obj_latest = dest_bucket.object(f"{obj_name}-latest")
+        response = source_obj.copy(dest_obj_latest, latest=True)
+        self.assertEqual(response.status_code, 200)
+
+        # Verify copied content is the updated version
+        copied_content_latest = dest_obj_latest.get_reader().read_all()
+        self.assertEqual(second_version_content, copied_content_latest)
+
+        # out-of-band DELETE
+        self.s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
+
+        # Copy without latest should still work (using cached version)
+        dest_obj_cached = dest_bucket.object(f"{obj_name}-cached")
+        response = source_obj.copy(dest_obj_cached)
+        self.assertEqual(response.status_code, 200)
+
+        copied_content_cached = dest_obj_cached.get_reader().read_all()
+        self.assertEqual(first_version_content, copied_content_cached)
+
+        # Copy with latest=True should fail since object was deleted from remote
+        dest_obj_deleted = dest_bucket.object(f"{obj_name}-deleted")
+        with self.assertRaises(AISError):
+            source_obj.copy(dest_obj_deleted, latest=True)
+
+    @unittest.skipIf(
+        not AWS_BUCKET,
+        "AWS bucket is not set",
+    )
+    def test_copy_object_sync_flag(self):
+        """Test copying objects with sync flag to ensure synchronization with remote backend."""
+        dest_bucket = self._create_bucket(prefix="copy-sync-dest")
+        obj_name = random_string()
+        content = b"sync test content"
+        self._register_for_post_test_cleanup(names=[obj_name], is_bucket=False)
+
+        # Create object out-of-band via S3
+        self.s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=content)
+
+        # Cache object by reading it
+        source_obj = self.bucket.object(obj_name)
+        cached_content = source_obj.get_reader().read_all()
+        self.assertEqual(content, cached_content)
+
+        # Copy without sync should work (uses cached version)
+        dest_obj_no_sync = dest_bucket.object(f"no-sync-{obj_name}")
+        response = source_obj.copy(dest_obj_no_sync)
+        self.assertEqual(response.status_code, 200)
+
+        # Verify copy worked
+        copied_content = dest_obj_no_sync.get_reader().read_all()
+        self.assertEqual(content, copied_content)
+
+        # Delete object out-of-band via S3
+        self.s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
+
+        # Copy without sync should still work (uses cached version)
+        dest_obj_cached = dest_bucket.object(f"cached-{obj_name}")
+        response = source_obj.copy(dest_obj_cached)
+        self.assertEqual(response.status_code, 200)
+
+        # Copy with sync=True should fail since object was deleted from remote
+        dest_obj_sync = dest_bucket.object(f"sync-{obj_name}")
+        with self.assertRaises(AISError):
+            source_obj.copy(dest_obj_sync, sync=True)
+
+    def test_copy_object_different_name(self):
+        """Test copying an object to another bucket with a different name."""
+        dest_bucket = self._create_bucket(prefix="copy-dest-bucket")
+        source_obj, content = self._create_object_with_content()
+
+        new_name = f"copied-{source_obj.name}"
+        dest_obj = dest_bucket.object(new_name)
+        response = source_obj.copy(dest_obj)
+        self.assertEqual(response.status_code, 200)
+
+        copied_content = dest_obj.get_reader().read_all()
+        self.assertEqual(content, copied_content)
+
+        original_name_objs = list(dest_bucket.list_objects_iter(prefix=source_obj.name))
+        original_name_matches = [
+            obj for obj in original_name_objs if obj.name == source_obj.name
+        ]
+        self.assertEqual(len(original_name_matches), 0)
+
+    def test_copy_object_same_bucket(self):
+        """Test copying an object within the same bucket with a different name."""
+        source_obj, content = self._create_object_with_content()
+
+        new_name = f"copy-of-{source_obj.name}"
+        dest_obj = self.bucket.object(new_name)
+        response = source_obj.copy(dest_obj)
+        self.assertEqual(response.status_code, 200)
+
+        copied_content = dest_obj.get_reader().read_all()
+        self.assertEqual(content, copied_content)
+
+        source_content = source_obj.get_reader().read_all()
+        self.assertEqual(content, source_content)
+
+        all_objects = list(self.bucket.list_objects_iter())
+        object_names = [obj.name for obj in all_objects]
+        self.assertIn(source_obj.name, object_names)
+        self.assertIn(new_name, object_names)
+
+    def test_copy_multiple_objects_sequence(self):
+        """Test copying multiple objects in sequence to verify no conflicts."""
+        dest_bucket = self._create_bucket(prefix="copy-multi-dest")
+        objects = self._put_objects(3)
+
+        # Copy all objects
+        for obj_name, content in objects.items():
+            source_obj = self.bucket.object(obj_name)
+            dest_obj = dest_bucket.object(obj_name)
+            response = source_obj.copy(dest_obj)
+            self.assertEqual(response.status_code, 200)
+
+        # Verify all objects were copied correctly
+        for obj_name, expected_content in objects.items():
+            copied_obj = dest_bucket.object(obj_name)
+            copied_content = copied_obj.get_reader().read_all()
+            self.assertEqual(expected_content, copied_content)
+
+        # Verify destination bucket has correct number of objects
+        dest_objects = list(dest_bucket.list_objects_iter())
+        self.assertEqual(len(dest_objects), len(objects))
+
+    @pytest.mark.etl
+    def test_copy_object_with_etl(self):
+        """Test copying an object with ETL transformation."""
+        dest_bucket = self._create_bucket(prefix="copy-etl-dest")
+        source_obj, content = self._create_object_with_content()
+
+        # Create ETL for MD5 transformation
+        etl_name = "etl-copy-test"
+        etl = self.client.etl(etl_name)
+
+        try:
+            etl.init(image="aistorage/transformer_hash_with_args:latest")
+
+            # Copy with ETL transformation
+            dest_obj = dest_bucket.object(source_obj.name)
+            etl_config = ETLConfig(name=etl_name, args="123")
+            response = source_obj.copy(dest_obj, etl=etl_config)
+            self.assertIn(response.status_code, [200, 204])
+
+            # Verify the copied object has the transformed content (MD5 hash)
+            copied_obj = dest_bucket.object(source_obj.name)
+            copied_content = copied_obj.get_reader().read_all()
+
+            hasher = xxhash.xxh64(seed=int(etl_config.args))
+            hasher.update(content)
+            self.assertEqual(copied_content, hasher.hexdigest().encode("ascii"))
+
+            # Verify original object is unchanged
+            original_content = source_obj.get_reader().read_all()
+            self.assertEqual(original_content, content)
+
+        finally:
+            try:  # pylint: disable=duplicate-code
+                etl.stop()
+                etl.delete()
+            except AISError:
+                pass
+
+    def test_copy_object_to_nonexistent_bucket(self):
+        """Test copying an object to a non-existent bucket raises an error."""
+        source_obj, _ = self._create_object_with_content()
+
+        # Use a random bucket name to avoid conflicts
+        bucket_name = f"nonexistent-bucket-{random_string(8)}"
+        nonexistent_bucket = self.client.bucket(bucket_name)
+
+        dest_obj = nonexistent_bucket.object("test-object")
+
+        # Copy should raise an error
+        with self.assertRaises(AISError) as context:
+            source_obj.copy(dest_obj)
+
+        # Verify error content from response body
+        self.assertIn("bucket", context.exception.message.lower())
+        self.assertIn("does not exist", context.exception.message.lower())

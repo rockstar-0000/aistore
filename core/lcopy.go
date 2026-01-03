@@ -1,17 +1,21 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/sys"
 )
 
 //
@@ -119,7 +123,7 @@ func (lom *LOM) DelExtraCopies(fqn ...string) (removed bool, err error) {
 	}
 	avail := fs.GetAvail()
 	for _, mi := range avail {
-		copyFQN := mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
+		copyFQN := mi.MakePathFQN(lom.Bucket(), fs.ObjCT, lom.ObjName)
 		if _, ok := lom.md.copies[copyFQN]; ok {
 			continue
 		}
@@ -151,7 +155,7 @@ func (lom *LOM) syncMetaWithCopies() (err error) {
 			break
 		}
 		lom.delCopyMd(copyFQN)
-		if err1 := cos.Stat(copyFQN); err1 != nil && !os.IsNotExist(err1) {
+		if err1 := cos.Stat(copyFQN); err1 != nil && !cos.IsNotExist(err1) {
 			mi, _, err2 := fs.FQN2Mpath(copyFQN)
 			if err2 != nil {
 				nlog.Errorln("nested err:", err2, "fqn:", copyFQN)
@@ -181,7 +185,7 @@ func (lom *LOM) RestoreToLocation() (exists bool) {
 		if path == lom.mi.Path {
 			continue
 		}
-		fqn := mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
+		fqn := mi.MakePathFQN(lom.Bucket(), fs.ObjCT, lom.ObjName)
 		if err := cos.Stat(fqn); err != nil {
 			continue
 		}
@@ -203,7 +207,7 @@ func (lom *LOM) RestoreToLocation() (exists bool) {
 }
 
 func (lom *LOM) _restore(fqn string, buf []byte) (dst *LOM, err error) {
-	src := lom.CloneMD(fqn)
+	src := lom.CloneTo(fqn)
 	defer FreeLOM(src)
 	if err = src.InitFQN(fqn, lom.Bucket()); err != nil {
 		return
@@ -212,24 +216,34 @@ func (lom *LOM) _restore(fqn string, buf []byte) (dst *LOM, err error) {
 		return
 	}
 	// restore at default location
-	dst, err = src.Copy2FQN(lom.FQN, buf)
-	return
+	return src.Copy2FQN(lom.FQN, buf)
 }
 
 // increment the object's num copies by (well) copying the former
 // (compare with lom.Copy2FQN below)
 func (lom *LOM) Copy(mi *fs.Mountpath, buf []byte) error {
+	debug.Assert(lom.bid() != 0, lom.String())
+	if err := lom._checkBucket(); err != nil {
+		debug.AssertNoErr(err)
+		return err
+	}
 	var (
-		copyFQN = mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
-		workFQN = mi.MakePathFQN(lom.Bucket(), fs.WorkfileType, fs.WorkfileCopy+"."+lom.ObjName)
+		copyFQN = mi.MakePathFQN(lom.Bucket(), fs.ObjCT, lom.ObjName)
+		dstlom  = AllocLOM(lom.ObjName)
 	)
+	defer FreeLOM(dstlom)
+	if err := dstlom.InitFQN(copyFQN, lom.Bucket()); err != nil {
+		return err
+	}
+	workFQN := dstlom.GenFQN(fs.WorkCT, fs.WorkfileCopy)
+
 	// copy is a no-op if the destination exists and is identical
 	errExists := cos.Stat(copyFQN)
 	if errExists == nil {
 		cplom := AllocLOM(lom.ObjName)
 		defer FreeLOM(cplom)
 		if errExists = cplom.InitFQN(copyFQN, lom.Bucket()); errExists == nil {
-			if errExists = cplom.Load(false /*cache it*/, true /*locked*/); errExists == nil {
+			if errExists = cplom.LoadMetaFromFS(); errExists == nil {
 				if cplom.CheckEq(lom) == nil {
 					goto add // skip copying
 				}
@@ -242,7 +256,7 @@ func (lom *LOM) Copy(mi *fs.Mountpath, buf []byte) error {
 		return err
 	}
 	if err := cos.Rename(workFQN, copyFQN); err != nil {
-		if errRemove := cos.RemoveFile(workFQN); errRemove != nil && !os.IsNotExist(errRemove) {
+		if errRemove := cos.RemoveFile(workFQN); errRemove != nil && !cos.IsNotExist(errRemove) {
 			nlog.Errorln("nested err:", errRemove)
 		}
 		return err
@@ -259,10 +273,12 @@ add:
 }
 
 // copy object => any local destination
-// recommended for copying between different buckets (compare with lom.Copy() above)
-// NOTE: `lom` source must be w-locked
+// usage: copying between different buckets (compare with lom.Copy() above)
+// compare w/ Ufest.Relocate(lom)
 func (lom *LOM) Copy2FQN(dstFQN string, buf []byte) (dst *LOM, err error) {
-	dst = lom.CloneMD(dstFQN)
+	debug.Assert(lom.IsLocked() >= apc.LockRead, lom.Cname(), " source not locked")
+
+	dst = lom.CloneTo(dstFQN)
 	if err = dst.InitFQN(dstFQN, nil); err == nil {
 		err = lom.copy2fqn(dst, buf)
 	}
@@ -273,45 +289,145 @@ func (lom *LOM) Copy2FQN(dstFQN string, buf []byte) (dst *LOM, err error) {
 	return
 }
 
+// copyChunks handles copying all chunks and manifest from source to destination LOM
+// TODO -- FIXME:
+// - copying the chunks and the manifest not respecting the destination bucket's chunks config
+
+func (lom *LOM) copyChunks(dst *LOM, buf []byte) error {
+	// Load the completed Ufest manifest from source
+	srcUfest, err := NewUfest("", lom, true)
+	if err != nil {
+		return fmt.Errorf("failed to create Ufest for source %s: %w", lom.Cname(), err)
+	}
+
+	err = srcUfest.LoadCompleted(lom)
+	if err != nil {
+		return fmt.Errorf("failed to load completed manifest for %s: %w", lom.Cname(), err)
+	}
+
+	// Create a new Ufest for destination
+	dstUfest, err := NewUfest("", dst, false) // don't require existing
+	if err != nil {
+		return fmt.Errorf("failed to create Ufest for destination %s: %w", dst.Cname(), err)
+	}
+
+	// Copy each chunk from source to destination
+	srcUfest.Lock()
+	defer srcUfest.Unlock()
+
+	var (
+		wg = cos.NewLimitedWaitGroup(min(sys.MaxParallelism(), 4), srcUfest.Count())
+		// errs  = cos.NewErrs(srcUfest.Count())
+		errCh = make(chan error, srcUfest.Count())
+	)
+
+	for i := range srcUfest.chunks {
+		wg.Add(1)
+		go func(srcChunk Uchunk) {
+			defer wg.Done()
+
+			dstChunk, err := dstUfest.NewChunk(int(srcChunk.Num()), dst)
+			if err != nil {
+				errCh <- dstUfest._undoCopy(fmt.Errorf("failed to create destination chunk %d: %w", srcChunk.Num(), err))
+				return
+			}
+
+			_, _, err = cos.CopyFile(srcChunk.Path(), dstChunk.Path(), buf, srcChunk.cksum.Type())
+			if err != nil {
+				errCh <- dstUfest._undoCopy(fmt.Errorf("failed to copy chunk %d from %s to %s: %w",
+					srcChunk.Num(), srcChunk.Path(), dstChunk.Path(), err))
+				return
+			}
+
+			if srcChunk.cksum != nil {
+				dstChunk.SetCksum(srcChunk.cksum.Clone())
+			}
+
+			err = dstUfest.Add(dstChunk, srcChunk.Size(), int64(srcChunk.Num()))
+			if err != nil {
+				errCh <- dstUfest._undoCopy(fmt.Errorf("failed to add chunk %d to destination manifest: %w", srcChunk.Num(), err))
+				return
+			}
+		}(srcUfest.chunks[i])
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// collect up to 4 errors and join them (allocate only if needed)
+	var errs []error
+	for err := range errCh {
+		if err == nil {
+			continue
+		}
+		if errs == nil {
+			errs = make([]error, 0, 4)
+		}
+		if len(errs) < 4 {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return dstUfest._undoCopy(errors.Join(errs...))
+	}
+
+	// Compute the whole checksum for the destination manifest
+	wholeCksum := cos.NewCksumHash(dst.CksumConf().Type)
+	if err := dstUfest.ComputeWholeChecksum(wholeCksum); err != nil {
+		return dstUfest._undoCopy(fmt.Errorf("failed to compute whole checksum for destination %s: %w", dst.Cname(), err))
+	}
+	dst.SetCksum(&wholeCksum.Cksum)
+
+	// Store the completed manifest for destination
+	err = dstUfest.storeCompleted(dst, false /*override*/)
+	if err != nil {
+		return dstUfest._undoCopy(fmt.Errorf("failed to store completed manifest for destination %s: %w", dst.Cname(), err))
+	}
+
+	dst.setlmfl(lmflChunk)
+	return nil
+}
+
+func (u *Ufest) _undoCopy(err error) error {
+	u.removeChunks(u.lom, false /*except first*/)
+	return err
+}
+
 func (lom *LOM) copy2fqn(dst *LOM, buf []byte) (err error) {
 	var (
-		dstCksum  *cos.CksumHash
-		dstFQN    = dst.FQN
-		srcCksum  = lom.Checksum()
-		cksumType = cos.ChecksumNone
+		dstCksum   *cos.CksumHash
+		dstFQN     = dst.FQN
+		dstCksumTy = dst.CksumType()
 	)
-	if !srcCksum.IsEmpty() {
-		cksumType = srcCksum.Ty()
-	}
 	if dst.isMirror(lom) && lom.md.copies != nil {
-		dst.md.copies = make(fs.MPI, len(lom.md.copies)+1)
-		for fqn, mpi := range lom.md.copies {
-			dst.md.copies[fqn] = mpi
-		}
+		dst.md.copies = maps.Clone(lom.md.copies)
 	}
 	if !dst.Bck().Equal(lom.Bck(), true /*same ID*/, true /*same backend*/) {
 		// The copy will be in a new bucket - completely separate object. Hence, we have to set initial version.
 		dst.SetVersion(lomInitialVersion)
 	}
 
-	workFQN := fs.CSM.Gen(dst, fs.WorkfileType, fs.WorkfileCopy)
-	_, dstCksum, err = cos.CopyFile(lom.FQN, workFQN, buf, cksumType)
+	workFQN := dst.GenFQN(fs.WorkCT, fs.WorkfileCopy)
+	_, dstCksum, err = cos.CopyFile(lom.FQN, workFQN, buf, dstCksumTy)
 	if err != nil {
 		return err
 	}
 
 	if err = cos.Rename(workFQN, dstFQN); err != nil {
-		if errRemove := cos.RemoveFile(workFQN); errRemove != nil && !os.IsNotExist(errRemove) {
+		if errRemove := cos.RemoveFile(workFQN); errRemove != nil && !cos.IsNotExist(errRemove) {
 			nlog.Errorln("nested err:", errRemove)
 		}
 		return err
 	}
-
-	if cksumType != cos.ChecksumNone {
-		if !dstCksum.Equal(lom.Checksum()) {
-			return cos.NewErrDataCksum(&dstCksum.Cksum, lom.Checksum())
+	switch {
+	case lom.IsChunked():
+		if err := lom.copyChunks(dst, buf); err != nil {
+			return err
 		}
+	case dstCksumTy != cos.ChecksumNone:
 		dst.SetCksum(dstCksum.Clone())
+	default:
+		dst.SetCksum(cos.NoneCksum)
 	}
 
 	// persist
@@ -343,34 +459,40 @@ func (lom *LOM) copy2fqn(dst *LOM, buf []byte) (err error) {
 	return err
 }
 
-// load-balanced GET
-func (lom *LOM) LBGet() (fqn string) {
-	if !lom.HasCopies() {
-		return lom.FQN
-	}
-	return lom.leastUtilCopy()
-}
+// load-balanced GET from replicated lom
+// - picks least-utilized mountpath
+// - returns (open reader + its FQN) or (nil, "")
+func (lom *LOM) OpenCopy() (cos.LomReader, string) {
+	debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked")
+	debug.Assert(!lom.IsChunked())
 
-// NOTE: reconsider counting GETs (and the associated overhead)
-// vs ios.refreshIostatCache (and the associated delay)
-func (lom *LOM) leastUtilCopy() (fqn string) {
+	if !lom.HasCopies() {
+		return nil, ""
+	}
+
 	var (
-		mpathUtils = fs.GetAllMpathUtils()
-		minUtil    = mpathUtils.Get(lom.mi.Path)
-		copies     = lom.GetCopies()
+		fqn   = lom.FQN
+		utils = fs.GetAllMpathUtils()
+		curr  = utils.Get(lom.mi.Path)
 	)
-	fqn = lom.FQN
-	for copyFQN, copyMPI := range copies {
-		if copyFQN != lom.FQN {
-			if util := mpathUtils.Get(copyMPI.Path); util < minUtil {
-				fqn, minUtil = copyFQN, util
-			}
+	for cfqn, cmi := range lom.md.copies {
+		if cfqn == lom.FQN {
+			continue
+		}
+		if cutil := utils.Get(cmi.Path); cutil < curr {
+			fqn, curr = cfqn, cutil
 		}
 	}
-	return
+	if fqn == lom.FQN {
+		return nil, ""
+	}
+	if lh, err := os.Open(fqn); err == nil { // (compare w/ lom.Open())
+		return lh, fqn
+	}
+	return nil, ""
 }
 
-// returns the least utilized mountpath that does _not_ have a copy of this `lom` yet
+// returns the least-utilized mountpath that does _not_ have a copy of this `lom` yet
 // (compare with leastUtilCopy())
 func (lom *LOM) LeastUtilNoCopy() (mi *fs.Mountpath) {
 	var (
@@ -440,4 +562,17 @@ func (lom *LOM) ToMpath() (mi *fs.Mountpath, fixHrw bool) {
 	}
 	mi = lom.LeastUtilNoCopy() // NOTE: nil when not enough mountpaths
 	return mi, false
+}
+
+func (lom *LOM) MirrorPaths() []string {
+	if !lom.HasCopies() {
+		return []string{lom.mi.Path}
+	}
+	lom.Lock(false)
+	paths := make([]string, 0, len(lom.md.copies))
+	for _, mi := range lom.md.copies {
+		paths = append(paths, mi.Path)
+	}
+	lom.Unlock(false)
+	return paths
 }

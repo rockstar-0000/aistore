@@ -61,9 +61,9 @@ var (
 func New(root, prefix string, smap *meta.Smap) (*Iter, error) {
 	// validate root
 	debug.Assert(!cos.IsLastB(root, filepath.Separator), root)
-	finfo, err := os.Stat(root)
+	finfo, err := os.Lstat(root)
 	if err != nil {
-		return nil, fmt.Errorf("root fstat: %v", err)
+		return nil, fmt.Errorf("root fstat: %w", err)
 	}
 	if !finfo.IsDir() {
 		return nil, fmt.Errorf("root is not a directory: %s", root)
@@ -107,7 +107,7 @@ func (lpi *Iter) Next(msg Msg, out Page) error {
 		ErrorCallback: lpi.ErrorCallback,
 	})
 	if err != nil && err != errStop {
-		return fmt.Errorf("error gowalk-ing: %v", err)
+		return fmt.Errorf("error gowalk-ing: %w", err)
 	}
 
 	return nil
@@ -161,7 +161,7 @@ func (lpi *Iter) Callback(pathname string, de *godirwalk.Dirent) (err error) {
 
 		// NOTE: unit test only
 		if lpi.smap == nil {
-			if finfo, e := os.Stat(pathname); e == nil {
+			if finfo, e := os.Lstat(pathname); e == nil {
 				lpi.page[rel] = finfo.Size()
 			}
 			break
@@ -209,7 +209,7 @@ func (lpi *Iter) _cb(fqn, rel string, lom *core.LOM) (err error) {
 	return nil
 
 rerr:
-	if cmn.Rom.FastV(4, cos.SmoduleFS) {
+	if cmn.Rom.V(4, cos.ModFS) {
 		nlog.Warningln(lom.String(), "[", err, "]")
 	}
 	return nil

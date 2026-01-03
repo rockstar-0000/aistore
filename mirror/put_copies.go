@@ -6,6 +6,8 @@ package mirror
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +68,7 @@ func (p *putFactory) _tag(bck *meta.Bck) []byte {
 		pack  = cos.NewPacker(nil, l)
 	)
 	pack.WriteString(p.Kind())
-	pack.WriteByte('|')
+	pack.WriteUint8('|')
 	pack.WriteBytes(uname)
 	return pack.Bytes()
 }
@@ -95,7 +97,7 @@ func (p *putFactory) Start() error {
 		// is Ok (compare with x-archive, x-tco)
 		beid = cos.GenUUID()
 	}
-	r.DemandBase.Init(beid, p.Kind(), "" /*ctlmsg*/, bck, xact.IdleDefault)
+	r.DemandBase.Init(beid, p.Kind(), bck, xact.IdleDefault)
 
 	// joggers
 	r.wkg, err = mpather.NewWorkerGroup(&mpather.WorkerGroupOpts{
@@ -125,6 +127,19 @@ func (p *putFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 // XactPut //
 /////////////
 
+func (r *XactPut) CtlMsg() string {
+	if !r.mirror.Enabled {
+		return "mirror disabled"
+	}
+	var sb strings.Builder
+	sb.Grow(32)
+	sb.WriteString("copies:")
+	sb.WriteString(strconv.FormatInt(r.mirror.Copies, 10))
+	sb.WriteString(", burst:")
+	sb.WriteString(strconv.Itoa(r.mirror.Burst))
+	return sb.String()
+}
+
 // (one worker per mountpath)
 func (r *XactPut) do(lom *core.LOM, buf []byte) {
 	copies := int(lom.Bprops().Mirror.Copies)
@@ -134,7 +149,7 @@ func (r *XactPut) do(lom *core.LOM, buf []byte) {
 	lom.Unlock(true)
 
 	if err != nil {
-		r.AddErr(err, 5, cos.SmoduleMirror)
+		r.AddErr(err, 5, cos.ModMirror)
 	} else {
 		r.ObjsAdd(1, size)
 	}
@@ -169,7 +184,7 @@ loop:
 
 // main method
 func (r *XactPut) Repl(lom *core.LOM) {
-	debug.Assert(!r.Finished(), r.String())
+	debug.Assert(!r.IsDone(), r.String())
 
 	// ref-count on-demand, decrement via worker.Callback = r.do
 	r.IncPending()
@@ -205,7 +220,7 @@ func (r *XactPut) waitPending() {
 func (r *XactPut) stop() (err error) {
 	r.DemandBase.Stop()
 	n := r.wkg.Stop()
-	if nn := drainWorkCh(r.workCh); nn > 0 {
+	if nn := core.DrainLIF(r.workCh); nn > 0 {
 		n += nn
 	}
 	if n > 0 {
@@ -218,10 +233,4 @@ func (r *XactPut) stop() (err error) {
 	return err
 }
 
-func (r *XactPut) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return snap
-}
+func (r *XactPut) Snap() *core.Snap { return r.Base.NewSnap(r) }

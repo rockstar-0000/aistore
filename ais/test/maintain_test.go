@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -29,17 +29,17 @@ func TestMaintenanceOnOff(t *testing.T) {
 	proxyURL := tools.RandomProxyURL(t)
 	smap := tools.GetClusterMap(t, proxyURL)
 
-	tlog.Logf("targets: %d, proxies: %d\n", smap.CountActiveTs(), smap.CountActivePs())
+	tlog.Logfln("targets: %d, proxies: %d", smap.CountActiveTs(), smap.CountActivePs())
 
 	// Invalid target case
 	msg := &apc.ActValRmNode{DaemonID: "fakeID", SkipRebalance: true}
-	_, err := api.StartMaintenance(baseParams, msg)
+	_, err := tools.StartMaintenance(baseParams, msg)
 	tassert.Fatalf(t, err != nil, "Maintenance for invalid daemon ID succeeded")
 
 	mntTarget, _ := smap.GetRandTarget()
 	msg.DaemonID = mntTarget.ID()
 	baseParams := tools.BaseAPIParams(proxyURL)
-	_, err = api.StartMaintenance(baseParams, msg)
+	_, err = tools.StartMaintenance(baseParams, msg)
 	tassert.CheckFatal(t, err)
 	smap, err = tools.WaitForClusterState(proxyURL, "target in maintenance",
 		smap.Version, smap.CountActivePs(), smap.CountActiveTs()-1)
@@ -88,9 +88,9 @@ func TestMaintenanceListObjects(t *testing.T) {
 
 	// 2. Put a random target in maintenance mode
 	tsi, _ := m.smap.GetRandTarget()
-	tlog.Logf("Put target %s in maintenance mode\n", tsi.StringEx())
+	tlog.Logfln("Put target %s in maintenance mode", tsi.StringEx())
 	actVal := &apc.ActValRmNode{DaemonID: tsi.ID(), SkipRebalance: false}
-	rebID, err := api.StartMaintenance(baseParams, actVal)
+	rebID, err := tools.StartMaintenance(baseParams, actVal)
 	tassert.CheckFatal(t, err)
 
 	defer func() {
@@ -139,23 +139,23 @@ func TestMaintenanceMD(t *testing.T) {
 		allTgtsMpaths = tools.GetTargetsMountpaths(t, smap, baseParams)
 	)
 
-	tlog.Logf("targets: %d, proxies: %d\n", smap.CountActiveTs(), smap.CountActivePs())
+	tlog.Logfln("targets: %d, proxies: %d", smap.CountActiveTs(), smap.CountActivePs())
 
 	t.Cleanup(func() {
 		args := xact.ArgsMsg{Kind: apc.ActRebalance, Timeout: tools.RebalanceTimeout}
 		api.WaitForXactionIC(baseParams, &args)
 	})
 
-	tlog.Logf("Decommission %s\n", dcmTarget.StringEx())
+	tlog.Logfln("Decommission %s", dcmTarget.StringEx())
 	cmd := tools.GetRestoreCmd(dcmTarget)
 	msg := &apc.ActValRmNode{DaemonID: dcmTarget.ID(), SkipRebalance: true, KeepInitialConfig: true}
-	_, err := api.DecommissionNode(baseParams, msg)
+	_, err := tools.DecommissionNode(baseParams, msg)
 	tassert.CheckFatal(t, err)
 
 	_, err = tools.WaitForClusterState(proxyURL, "target decommissioned", smap.Version, smap.CountActivePs(),
 		smap.CountTargets()-1)
 	if err == tools.ErrTimedOutStabilize {
-		tlog.Logf("Retrying - checking with primary %s ...\n", smap.Primary.StringEx())
+		tlog.Logfln("Retrying - checking with primary %s ...", smap.Primary.StringEx())
 		proxyURL = smap.Primary.URL(cmn.NetPublic)
 		_, err = tools.WaitForClusterState(proxyURL, "target decommissioned", smap.Version, smap.CountActivePs(),
 			smap.CountTargets()-1)
@@ -203,12 +203,12 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		origActiveProxyCount = smap.CountActivePs()
 		bck                  = cmn.Bck{Name: t.Name(), Provider: apc.AIS}
 	)
-	tlog.Logf("targets: %d, proxies: %d\n", smap.CountActiveTs(), smap.CountActivePs())
+	tlog.Logfln("targets: %d, proxies: %d", smap.CountActiveTs(), smap.CountActivePs())
 
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	for i := range objCount {
 		objName := fmt.Sprintf("%sobj%04d", objPath, i)
-		r, _ := readers.NewRand(int64(fileSize), cos.ChecksumCesXxh)
+		r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: int64(fileSize), CksumType: cos.ChecksumCesXxh})
 		_, err := api.PutObject(&api.PutArgs{
 			BaseParams: baseParams,
 			Bck:        bck,
@@ -219,16 +219,16 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		tassert.CheckFatal(t, err)
 	}
 
-	tlog.Logf("Decommission %s\n", dcmTarget.StringEx())
+	tlog.Logfln("Decommission %s", dcmTarget.StringEx())
 	cmd := tools.GetRestoreCmd(dcmTarget)
 	msg := &apc.ActValRmNode{DaemonID: dcmTarget.ID(), RmUserData: true, KeepInitialConfig: true}
-	rebID, err := api.DecommissionNode(baseParams, msg)
+	rebID, err := tools.DecommissionNode(baseParams, msg)
 	tassert.CheckError(t, err)
 	_, err = tools.WaitForClusterState(proxyURL, "target decommissioned",
 		smap.Version, origActiveProxyCount, origTargetCount-1, dcmTarget.ID())
 
 	if err == tools.ErrTimedOutStabilize {
-		tlog.Logf("Retrying - checking with primary %s ...\n", smap.Primary.StringEx())
+		tlog.Logfln("Retrying - checking with primary %s ...", smap.Primary.StringEx())
 		proxyURL = smap.Primary.URL(cmn.NetPublic)
 		_, err = tools.WaitForClusterState(proxyURL, "target decommissioned",
 			smap.Version, origActiveProxyCount, origTargetCount-1, dcmTarget.ID())
@@ -268,7 +268,7 @@ func TestMaintenanceDecommissionRebalance(t *testing.T) {
 		}
 	}
 	if dcm != nil {
-		tlog.Logf("Canceling maintenance for %s\n", dcm.ID())
+		tlog.Logfln("Canceling maintenance for %s", dcm.ID())
 		args := xact.ArgsMsg{Kind: apc.ActRebalance}
 		err = api.AbortXaction(baseParams, &args)
 		tassert.CheckError(t, err)
@@ -325,10 +325,10 @@ func TestMaintenanceRebalance(t *testing.T) {
 
 	m.puts()
 	tsi, _ := m.smap.GetRandTarget()
-	tlog.Logf("Removing %s\n", tsi.StringEx())
+	tlog.Logfln("Removing %s", tsi.StringEx())
 	restored := false
 	actVal.DaemonID = tsi.ID()
-	rebID, err := api.StartMaintenance(baseParams, actVal)
+	rebID, err := tools.StartMaintenance(baseParams, actVal)
 	tassert.CheckError(t, err)
 	defer func() {
 		if !restored {
@@ -371,6 +371,81 @@ func TestMaintenanceRebalance(t *testing.T) {
 	tools.WaitForRebalanceByID(t, baseParams, rebID)
 }
 
+func TestMaintenanceRebalanceWithChunkedObjects(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3})
+	var (
+		bck = cmn.Bck{Name: "maint-reb", Provider: apc.AIS}
+		m   = &ioContext{
+			t:               t,
+			num:             1000,
+			fileSizeRange:   [2]uint64{4 * cos.KiB, 4 * cos.MiB},
+			bck:             bck,
+			numGetsEachFile: 1,
+			proxyURL:        proxyURL,
+			chunksConf: &ioCtxChunksConf{
+				numChunks: 10,
+				multipart: true,
+			},
+		}
+		proxyURL   = tools.RandomProxyURL(t)
+		baseParams = tools.BaseAPIParams(proxyURL)
+	)
+
+	if testing.Short() {
+		m.num /= 10
+		m.fileSizeRange[1] /= 8
+	}
+
+	m.initAndSaveState(true /*cleanup*/)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+	origProxyCnt, origTargetCount := m.smap.CountActivePs(), m.smap.CountActiveTs()
+
+	m.puts()
+	tsi, _ := m.smap.GetRandTarget()
+	tlog.Logfln("Removing %s", tsi.StringEx())
+	rebID, err := tools.StartMaintenance(baseParams, &apc.ActValRmNode{DaemonID: tsi.ID()})
+	tassert.CheckError(t, err)
+
+	maintenanceStopped := false
+	t.Cleanup(func() {
+		if !maintenanceStopped {
+			stopMaintenance(t, baseParams, &apc.ActValRmNode{DaemonID: tsi.ID()}, proxyURL, m.smap.Version, origProxyCnt, origTargetCount)
+		}
+		tools.ClearMaintenance(baseParams, tsi)
+	})
+
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
+
+	smap, err := tools.WaitForClusterState(proxyURL, "target removed from the cluster", m.smap.Version, origProxyCnt, origTargetCount-1, tsi.ID())
+	tassert.CheckFatal(t, err)
+	m.smap = smap
+
+	m.gets(nil, true)
+	m.ensureNoGetErrors()
+
+	rebID, err = stopMaintenance(t, baseParams, &apc.ActValRmNode{DaemonID: tsi.ID()}, proxyURL, m.smap.Version, origProxyCnt, origTargetCount)
+	tassert.CheckFatal(t, err)
+	maintenanceStopped = true
+
+	smap, err = tools.WaitForClusterState(proxyURL, "target joined", m.smap.Version, origProxyCnt, origTargetCount)
+	tassert.CheckFatal(t, err)
+	m.smap = smap
+
+	tools.WaitForRebalanceByID(t, baseParams, rebID)
+}
+
+func stopMaintenance(t *testing.T, baseParams api.BaseParams, actVal *apc.ActValRmNode, proxyURL string, smapVersion int64, origProxyCnt, origTargetCount int) (string, error) {
+	rebID, err := api.StopMaintenance(baseParams, actVal)
+	if err != nil {
+		return "", err
+	}
+	_, err = tools.WaitForClusterState(proxyURL, "target joined (cleanup)", smapVersion, origProxyCnt, origTargetCount)
+	if err == nil {
+		tools.WaitForRebalanceByID(t, baseParams, rebID)
+	}
+	return rebID, nil
+}
+
 func TestMaintenanceGetWhileRebalance(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{MinTargets: 3, Long: true})
 	var (
@@ -398,10 +473,10 @@ func TestMaintenanceGetWhileRebalance(t *testing.T) {
 	stopped := false
 
 	tsi, _ := m.smap.GetRandTarget()
-	tlog.Logf("Removing %s\n", tsi.StringEx())
+	tlog.Logfln("Removing %s", tsi.StringEx())
 	restored := false
 	actVal.DaemonID = tsi.ID()
-	rebID, err := api.StartMaintenance(baseParams, actVal)
+	rebID, err := tools.StartMaintenance(baseParams, actVal)
 	tassert.CheckFatal(t, err)
 	defer func() {
 		if !stopped {
@@ -490,7 +565,8 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 	tassert.CheckFatal(t, err)
 
 	// 1. Shutdown a random node.
-	_, cmd, rebID, err := tools.ShutdownNode(t, baseParams, node)
+	_, cmd, rebID, err := tools.ShutdownNode(baseParams, node)
+
 	tassert.CheckFatal(t, err)
 	if nodeType == apc.Target && origTargetCount > 1 {
 		time.Sleep(time.Second)
@@ -498,10 +574,10 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 		for range 3 {
 			status, err := api.WaitForXactionIC(baseParams, &xargs)
 			if err == nil {
-				tlog.Logf("%v\n", status)
+				tlog.Logfln("%v", status)
 				break
 			}
-			if herr := cmn.Err2HTTPErr(err); herr != nil {
+			if herr := cmn.AsErrHTTP(err); herr != nil {
 				tassert.Errorf(t, herr.Status == http.StatusNotFound, "expecting not found, got %+v", herr)
 			}
 			time.Sleep(time.Second)
@@ -540,6 +616,9 @@ func testNodeShutdown(t *testing.T, nodeType string) {
 	}
 }
 
+// TODO -- FIXME: pass with chunked objects
+// Currently, rebalance transfers objects to another target node as a whole, even if objects were originally chunked.
+// As a result, after rebalance, objects lose their chunked state and the `chunked` flag no longer matches.
 func TestShutdownListObjects(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	var (
@@ -575,7 +654,7 @@ func TestShutdownListObjects(t *testing.T) {
 
 	// 2. Shut down a random target.
 	tsi, _ := m.smap.GetRandTarget()
-	_, cmd, rebID, err := tools.ShutdownNode(t, baseParams, tsi)
+	_, cmd, rebID, err := tools.ShutdownNode(baseParams, tsi)
 	tassert.CheckFatal(t, err)
 
 	// Restore target after test is over.
@@ -608,10 +687,10 @@ func TestShutdownListObjects(t *testing.T) {
 		for range 3 {
 			status, err := api.WaitForXactionIC(baseParams, &xargs)
 			if err == nil {
-				tlog.Logf("%v\n", status)
+				tlog.Logfln("%v", status)
 				break
 			}
-			herr := cmn.Err2HTTPErr(err)
+			herr := cmn.AsErrHTTP(err)
 			tassert.Errorf(t, herr.Status == http.StatusNotFound, "expecting not found, got %+v", herr)
 			time.Sleep(time.Second)
 		}

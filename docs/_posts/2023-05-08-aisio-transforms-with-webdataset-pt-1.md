@@ -33,7 +33,7 @@ For this example we will be using:
 - Python 3.10
 - [WebDataset Python Library v0.2.48](https://pypi.org/project/webdataset/0.2.48/) 
 - [AIStore Python SDK v1.2.2](https://pypi.org/project/aistore/)
-- [AIStore Cluster v3.17](https://github.com/NVIDIA/aistore) -- Running in Kubernetes (see [here](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/kustomize/README.md) for local deployment or [here](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#kubernetes-deployments) for more advanced options)
+- [AIStore Cluster v3.17](https://github.com/NVIDIA/aistore) -- Running in Kubernetes (see [here](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/README.md) for local deployment or [here](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#kubernetes-deployments) for more advanced options)
 
 --- 
 ## The Dataset
@@ -69,7 +69,7 @@ The full code is available [here](https://github.com/NVIDIA/aistore/blob/main/do
 def load_data(bucket, sample_generator):
 
     def upload_shard(filename):
-        bucket.object(filename).put_file(filename)
+        bucket.object(filename).get_writer().put_file(filename)
         os.unlink(filename)
 
     # Writes data as tar to disk, uses callback function "post" to upload to AIS and delete
@@ -170,7 +170,7 @@ In future posts, we'll show how to run transformations on this data and load it 
 
 1. GitHub:
     - [AIStore](https://github.com/NVIDIA/aistore)
-    - [Local Kubernetes Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/kustomize/README.md)
+    - [Local Kubernetes Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/dev/k8s/README.md)
     - [AIS/Kubernetes Operator, AIS on bare-metal, Deployment Playbooks, Helm](https://github.com/NVIDIA/ais-k8s)
     - [WebDataset Library](https://github.com/webdataset/webdataset)
 2. Documentation, blogs, videos:

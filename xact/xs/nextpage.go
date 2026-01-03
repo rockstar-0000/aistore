@@ -50,7 +50,7 @@ func (npg *npgCtx) nextPageA() error {
 	npg.idx = 0
 	opts := &fs.WalkBckOpts{
 		ValidateCb: npg.validateCb,
-		WalkOpts:   fs.WalkOpts{CTs: []string{fs.ObjectType}, Callback: npg.cb, Sorted: true},
+		WalkOpts:   fs.WalkOpts{CTs: []string{fs.ObjCT}, Callback: npg.cb, Sorted: true},
 	}
 	opts.WalkOpts.Bck.Copy(npg.bck.Bucket())
 	err := fs.WalkBck(opts)
@@ -127,7 +127,7 @@ func (npg *npgCtx) nextPageR(nentries cmn.LsoEntries) (lst *cmn.LsoRes, err erro
 // - see also: cmn.ConcatLso
 func (npg *npgCtx) filterAddLmeta(lst *cmn.LsoRes) error {
 	var (
-		bck  = npg.bck.Bucket()
+		bck  = npg.bck
 		post = npg.wi.lomVisitedCb
 		msg  = npg.wi.msg
 		i    int
@@ -153,6 +153,7 @@ func (npg *npgCtx) filterAddLmeta(lst *cmn.LsoRes) error {
 			continue
 		}
 
+		en.ClrFlag(apc.EntryIsCached) // always clear remote (ie, remais) 'is-cached' bit
 		lom := core.AllocLOM(en.Name)
 		if err := lom.InitBck(bck); err != nil {
 			if cmn.IsErrBucketNought(err) {
@@ -172,6 +173,9 @@ func (npg *npgCtx) filterAddLmeta(lst *cmn.LsoRes) error {
 		npg.wi.setWanted(en, lom)
 		en.SetFlag(apc.EntryIsCached) // formerly, SetPresent
 
+		if lom.IsChunked() {
+			en.SetFlag(apc.EntryIsChunked)
+		}
 		if post != nil {
 			post(lom)
 		}

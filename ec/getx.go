@@ -67,7 +67,7 @@ func (*getFactory) New(_ xreg.Args, bck *meta.Bck) xreg.Renewable {
 
 func (p *getFactory) Start() error {
 	xec := ECM.NewGetXact(p.Bck.Bucket())
-	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), "" /*ctlmsg*/, p.Bck, 0 /*use default*/)
+	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
 	p.xctn = xec
 
 	xact.GoRunW(xec)
@@ -114,7 +114,7 @@ func (r *XactGet) dispatchResp(iReq intraReq, hdr *transport.ObjHdr, bck *meta.B
 	// Read the data into the slice writer and notify the slice when
 	// the transfer is complete
 	case respPut:
-		if cmn.Rom.FastV(4, cos.SmoduleEC) {
+		if cmn.Rom.V(4, cos.ModEC) {
 			nlog.Infoln("response from", hdr.SID, bck.Cname(objName))
 		}
 		r.dOwner.mtx.Lock()
@@ -198,7 +198,7 @@ func (r *XactGet) Run(gowg *sync.WaitGroup) {
 	for {
 		select {
 		case <-ticker.C:
-			if cmn.Rom.FastV(4, cos.SmoduleEC) {
+			if cmn.Rom.V(4, cos.ModEC) {
 				if s := r.ECStats().String(); s != "" {
 					nlog.Infoln(s)
 				}
@@ -311,8 +311,11 @@ func (r *XactGet) removeMpath(mpath string) {
 	delete(r.getJoggers, mpath)
 }
 
+func (*XactGet) CtlMsg() string { return "" }
+
 func (r *XactGet) Snap() (snap *core.Snap) {
-	snap = r.baseSnap()
+	snap = r.Base.NewSnap(r)
+
 	st := r.stats.stats()
 	snap.Ext = &ExtECGetStats{
 		AvgTime:     cos.Duration(st.DecodeTime),

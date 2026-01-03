@@ -1,7 +1,6 @@
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -28,6 +27,8 @@ const (
 const (
 	dfltCollectLog  = 10 * time.Minute
 	dfltCollectChan = 256
+
+	iniCollectCap = 64
 )
 
 type global struct {
@@ -51,8 +52,8 @@ func Init(tstats cos.StatsUpdater) *StreamCollector {
 	// real stream collector
 	gc = &collector{
 		ctrlCh:  make(chan ctrl, dfltCollectChan),
-		streams: make(map[string]*streamBase, 64),
-		heap:    make([]*streamBase, 0, 64), // min-heap sorted by stream.time.ticks
+		streams: make(map[int64]*base, iniCollectCap),
+		heap:    make([]*base, 0, iniCollectCap), // min-heap sorted by stream.time.ticks
 	}
 	gc.stopCh.Init()
 	heap.Init(gc)

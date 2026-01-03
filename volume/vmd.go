@@ -1,7 +1,7 @@
 // Package volume provides volume (a.k.a. pool of disks) abstraction and methods to configure, store,
 // and validate the corresponding metadata. AIS volume is built on top of mountpaths (fs package).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package volume
 
@@ -110,7 +110,7 @@ func (vmd *VMD) equal(other *VMD) bool {
 	debug.Assert(other.cksum != nil)
 	return vmd.DaemonID == other.DaemonID &&
 		vmd.Version == other.Version &&
-		!vmd.cksum.IsEmpty() && vmd.cksum.Equal(other.cksum)
+		!cos.NoneC(vmd.cksum) && vmd.cksum.Equal(other.cksum)
 }
 
 func (vmd *VMD) String() string {

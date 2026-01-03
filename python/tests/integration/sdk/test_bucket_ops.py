@@ -1,33 +1,47 @@
 #
 # Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
 #
+import io
 import random
+import tarfile
 import unittest
-from pathlib import Path
 import warnings
+from pathlib import Path
 
 import pytest
 import requests
 
 from aistore.sdk import ListObjectFlag
-from aistore.sdk.const import UTF_ENCODING, LOREM, DUIS
-from aistore.sdk.dataset.dataset_config import DatasetConfig
+from aistore.sdk.const import (
+    LOREM,
+    DUIS,
+    UTF_ENCODING,
+)
+from aistore.sdk.etl.etl_templates import ECHO
+from aistore.sdk.etl.etl_const import ETL_COMM_HPUSH
 from aistore.sdk.dataset.data_attribute import DataAttribute
+from aistore.sdk.dataset.dataset_config import DatasetConfig
 from aistore.sdk.dataset.label_attribute import LabelAttribute
-from aistore.sdk.errors import InvalidBckProvider, AISError, ErrBckNotFound
 from aistore.sdk.enums import FLTPresence
+from aistore.sdk.errors import (
+    AISError,
+    ErrBckNotFound,
+    InvalidBckProvider,
+)
 from aistore.sdk.provider import Provider
-
 from tests.integration.sdk.parallel_test_base import ParallelTestBase
 
-from tests.utils import random_string, cases, has_targets
+from tests.utils import (
+    cases,
+    has_targets,
+    random_string,
+)
 from tests.const import (
     OBJECT_COUNT,
     OBJ_CONTENT,
     PREFIX_NAME,
-    TEST_TIMEOUT,
     SUFFIX_NAME,
-    TEST_TIMEOUT_LONG,
+    TEST_TIMEOUT,
 )
 from tests.integration import REMOTE_SET, AWS_BUCKET
 
@@ -47,7 +61,7 @@ def _create_files(folder, file_dict):
             file.write(data)
 
 
-# pylint: disable=unused-variable, too-many-public-methods
+# pylint: disable=too-many-public-methods
 class TestBucketOps(ParallelTestBase):
     def _create_put_files_structure(self, top_level_files, lower_level_files):
         _create_files(self.local_test_files, top_level_files)
@@ -104,7 +118,8 @@ class TestBucketOps(ParallelTestBase):
         self.assertNotEqual(job_id, "")
 
         # wait for rename to finish
-        self.client.job(job_id).wait(TEST_TIMEOUT_LONG)
+        result = self.client.job(job_id).wait(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
 
         # new bucket should be created and accessible
         to_bck = self.client.bucket(to_bck_name)
@@ -143,7 +158,8 @@ class TestBucketOps(ParallelTestBase):
         self.assertNotEqual(job_id, "")
 
         job = self.client.job(job_id)
-        job.wait()
+        result = job.wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
         try:
             actual_workers = job.get_details().get_num_workers()
             self.assertEqual(
@@ -209,21 +225,25 @@ class TestBucketOps(ParallelTestBase):
     def test_copy_sync_flag(self):
         to_bck = self._create_bucket()
         num_obj = OBJECT_COUNT
-        obj_names = self._create_objects(num_obj=num_obj, suffix=SUFFIX_NAME)
+        obj_names = list(
+            self._create_objects(num_obj=num_obj, suffix=SUFFIX_NAME).keys()
+        )
 
         obj_group = self.bucket.objects(obj_names=obj_names)
 
         # cache and verify
         job_id = obj_group.prefetch()
-        self.client.job(job_id).wait(timeout=TEST_TIMEOUT * 2)
+        result = self.client.job(job_id).wait(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
         self._verify_cached_objects(num_obj, range(num_obj))
         # copy objs to dst bck
         copy_job = self.bucket.copy(prefix_filter=self.obj_prefix, to_bck=to_bck)
-        self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        result = self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
         self.assertEqual(num_obj, len(to_bck.list_all_objects()))
 
-        # randomly delete 10% of the objects
-        num_to_del = int(num_obj * 0.1)
+        # randomly delete 50% of the objects
+        num_to_del = int(num_obj * 0.5)
 
         # out of band delete
         for obj_name in random.sample(obj_names, num_to_del):
@@ -233,7 +253,8 @@ class TestBucketOps(ParallelTestBase):
         copy_job = self.bucket.copy(
             prefix_filter=self.obj_prefix, to_bck=to_bck, sync=True
         )
-        self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT * 3)
+        result = self.client.job(job_id=copy_job).wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
         self.assertEqual(
             num_obj - num_to_del, len(to_bck.list_all_objects(prefix=self.obj_prefix))
         )
@@ -376,7 +397,7 @@ class TestBucketOps(ParallelTestBase):
         self.assertEqual(OBJECT_COUNT, len(objects))
 
     def test_list_object_iter(self):
-        obj_names = set(self._create_objects())
+        obj_names = set(self._create_objects().keys())
 
         # Empty iterator if there are no objects matching the prefix.
         obj_iter = self.bucket.list_objects_iter(prefix="invalid-obj-")
@@ -421,7 +442,9 @@ class TestBucketOps(ParallelTestBase):
         # Upload objects to the bucket with different prefixes
         obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
         for obj_name in obj_names:
-            summ_test_bck.object(obj_name).get_writer().put_content(OBJ_CONTENT)
+            summ_test_bck.object(obj_name).get_writer().put_content(
+                OBJ_CONTENT.encode(UTF_ENCODING)
+            )
 
         # Verify the info with no prefix (should include all objects)
         bck_summ = summ_test_bck.summary()
@@ -462,7 +485,9 @@ class TestBucketOps(ParallelTestBase):
         # Upload objects to the bucket with different prefixes
         obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1"]
         for obj_name in obj_names:
-            info_test_bck.object(obj_name).get_writer().put_content(OBJ_CONTENT)
+            info_test_bck.object(obj_name).get_writer().put_content(
+                OBJ_CONTENT.encode(UTF_ENCODING)
+            )
 
         # Verify the info with no prefix (should include all objects)
         _, bck_info = info_test_bck.info()
@@ -558,3 +583,71 @@ class TestBucketOps(ParallelTestBase):
         self.bucket.write_dataset(
             dataset_config, skip_missing=False, pattern="dataset", maxcount=10
         )
+
+    def test_list_archive(self):
+        """Upload a tar archive and list its directory via ARCH_DIR flag."""
+        arch_bck = self._create_bucket(prefix="arch-int")
+
+        archive_name = f"{self.obj_prefix}-sample.tar"
+        content_map = {"a.txt": b"alpha", "b.txt": b"beta"}
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for fname, data in content_map.items():
+                info = tarfile.TarInfo(name=fname)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+        # Upload the tar object
+        arch_bck.object(archive_name).get_writer().put_content(buf.getvalue())
+
+        # List without parent
+        children_only = arch_bck.list_archive(archive_name, include_archive_obj=False)
+        self.assertEqual(len(children_only), len(content_map))
+        names_only = {e.name for e in children_only}
+        self.assertSetEqual(names_only, {archive_name + "/" + k for k in content_map})
+
+        # List with parent
+        with_parent = arch_bck.list_archive(archive_name, include_archive_obj=True)
+        self.assertEqual(len(with_parent), len(content_map) + 1)
+
+    def test_copy_dry_run(self):
+        src_bck = self._create_bucket(prefix="src-copy-dry")
+        dst_bck = self._create_bucket(prefix="dst-copy-dry")
+
+        obj_name = f"{PREFIX_NAME}dry-run-obj"
+        src_bck.object(obj_name).get_writer().put_content(b"dummy")
+
+        job_id = src_bck.copy(to_bck=dst_bck, dry_run=True, num_workers=2)
+
+        self.assertNotEqual(job_id, "")
+
+        result = self.client.job(job_id).wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
+
+        self.assertEqual(0, len(dst_bck.list_all_objects()))
+
+    @pytest.mark.etl
+    def test_transform_dry_run(self):
+        src_bck = self._create_bucket(prefix="src-transform-dry")
+        dst_bck = self._create_bucket(prefix="dst-transform-dry")
+
+        obj_name = f"{PREFIX_NAME}dry-run-obj.txt"
+        src_bck.object(obj_name).get_writer().put_content(b"dummy")
+        etl_name = f"etl-dry-{random_string(5)}"
+        etl = self.client.etl(etl_name)
+        echo_template = ECHO.format(communication_type=ETL_COMM_HPUSH)
+        etl.init_spec(template=echo_template)
+        job_id = src_bck.transform(
+            etl_name=etl.name,
+            to_bck=dst_bck,
+            dry_run=True,
+            num_workers=1,
+            prepend="new-",
+            ext={"txt": "bin"},
+        )
+        self.assertNotEqual(job_id, "")
+        result = self.client.job(job_id).wait_for_idle(timeout=TEST_TIMEOUT)
+        self.assertTrue(result.success)
+        self.assertEqual(0, len(dst_bck.list_all_objects()))
+        etl.stop()
+        etl.delete()

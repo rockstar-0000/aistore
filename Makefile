@@ -21,8 +21,8 @@ CLI_VERSION := $(shell ais version 2>/dev/null)
 MAKEFLAGS += --no-print-directory
 
 # Uncomment to cross-compile aisnode and cli, respectively:
-# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.24
-# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.24
+# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.25
+# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.25
 
 # Build version, flags, and tags
 VERSION = $(shell git rev-parse --short HEAD)
@@ -60,17 +60,29 @@ ifdef CPU_PROFILE
 	BUILD_SRC = $(BUILD_DIR)/aisnodeprofile/main.go
 endif
 
-# Intra-cluster networking: two alternative ways to build AIS `transport` package:
-# 1) using Go net/http, or
-# 2) with a 3rd party github.com/valyala/fasthttp aka "fasthttp"
+# Developer Notes:
 #
-# The second option is the current default.
-# To build with net/http, use `nethttp` build tag, for instance:
-# TAGS=nethttp make deploy <<< $'5\n5\n4\ny\ny\nn\n'
+# The following variables and flags are useful for debugging and profiling.
+#
+# 1. Race Detector:
+#    Finds data races in your code. The GORACE variable enables it and controls its output.
+#    Example: Find races and log reports to `/tmp/race/report`.
+#    $ GORACE='log_path=/tmp/race/report' make deploy
+#    or
+#    $ GORACE='log_path=/tmp/race' MODE=debug make test-aisloader
+#
+# 2. Go Compiler Flags (gcflags):
+#    Pass flags directly to the Go compiler.
+#    These are automatically applied when using `MODE=debug`.
+#    Example:
+#    -gcflags="all=-N -l":
+#      -N: Disable all compiler optimizations.
+#      -l: Disable function inlining.
+#      Important for getting accurate stack traces and a predictable debugging experience with tools like Delve.
 
 ifeq ($(MODE),debug)
 	# Debug mode
-	GCFLAGS = -gcflags="all=-N -l"
+	GCFLAGS = -gcflags="all=-N -l" # alternatively: -gcflags="all=-d=checkptr=1" for stricter pointer checks
 	LDFLAGS = -ldflags "-X 'main.build=$(VERSION)' -X 'main.buildtime=$(BUILD)'"
 	BUILD_TAGS += debug
 	GOFLAGS =
@@ -137,13 +149,19 @@ aisloader: build-aisloader ## Build aisloader
 xmeta: build-xmeta         ## Build xmeta
 aisinit: build-aisinit     ## Build aisinit
 
+#
+# Build standalone utilities and servers (authn, aisloader, xmeta, aisinit)
+#
 build-%:
 	@echo -n "Building $*... "
+ifdef WRD
+	@echo "(with race detector, writing reports to $(subst log_path=,,$(GORACE)).<pid>)"
+endif
 ifdef CROSS_COMPILE
-	@$(CROSS_COMPILE) go build -o ./$* $(BUILD_FLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
+	@$(CROSS_COMPILE) go build -o ./$* $(BUILD_FLAGS) -tags="$(BUILD_TAGS)" $(GCFLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
 	@mv ./$* $(BUILD_DEST)/.
 else
-	@go build -o $(BUILD_DEST)/$* $(BUILD_FLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
+	@$(WRD) go build -o $(BUILD_DEST)/$* $(BUILD_FLAGS) -tags="$(BUILD_TAGS)" $(GCFLAGS) $(GOFLAGS) $(LDFLAGS) $(BUILD_DIR)/$*/*.go
 endif
 	@echo "done."
 
@@ -180,6 +198,7 @@ endif
 clean: ## Remove all AIS related files and binaries
 	@echo -n "Cleaning... "
 	@"$(DEPLOY_DIR)/clean.sh"
+	@rm -rf .docs
 	@echo "done."
 
 #
@@ -225,17 +244,17 @@ test-envcheck:
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-env
 
 test-short: test-envcheck ## Run short tests
-	@RE="$(RE)" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-short
+	@RE="$(RE)" BUCKET="$(BUCKET)" NUM_CHUNKS="$(NUM_CHUNKS)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-short
 	@cd $(BUILD_DIR)/cli && go test -v -tags=debug ./...
 
 test-tracing-unit:
 	@cd tracing && go test -v -tags=oteltracing ./...
 
 test-assorted: test-envcheck # Run specific tests
-	@RE="ETLBucket|ETLConnectionError|ETLInitCode" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
+	@RE="ETLBucket|ETLFQN" BUCKET="$(BUCKET)" NUM_CHUNKS="$(NUM_CHUNKS)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
 
 test-long: test-envcheck ## Run all integration tests
-	@RE="$(RE)" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
+	@RE="$(RE)" BUCKET="$(BUCKET)" NUM_CHUNKS="$(NUM_CHUNKS)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
 	@cd $(BUILD_DIR)/cli && go test -v -tags=debug ./...
 
 test-aisloader:
@@ -265,12 +284,30 @@ lint-update:
 ## See also: .github/workflows/lint.yml
 lint-update-ci:
 	@rm -f $(GOPATH)/bin/golangci-lint
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v2.1.2
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v2.6.2
 
 lint:
 	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" lint
 	@$(MAKE) -C $(BUILD_DIR)/cli lint
+	@$(MAKE) -C $(BUILD_DIR)/ishard lint
+
+## Lint only the go files in the main AIS project included in build tags or .golangci.yml
+lint-scoped:
+	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
+	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" lint
+
+## Lint all python files, both inside and outside the SDK
+lint-python:
+	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
+	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" lint-python
+
+lint-cli:
+	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
+	@$(MAKE) -C $(BUILD_DIR)/cli lint
+
+lint-ishard:
+	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
 	@$(MAKE) -C $(BUILD_DIR)/ishard lint
 
 install-python-deps:
@@ -332,3 +369,61 @@ help:
 		"MEM_PROFILE=/tmp/mem make deploy" "Deploy cluster with memory profiling enabled, write reports to /tmp/mem.<PID> (and make sure to stop gracefully)" \
 		"CPU_PROFILE=/tmp/cpu make deploy" "Build and deploy cluster instrumented for CPU profiling, write reports to /tmp/cpu.<PID>" \
 		"TAGS=nethttp make deploy" "Build 'transport' package with net/http (see transport/README.md) and deploy cluster locally" \
+		"GORACE='log_path=/tmp/race' make aisloader test-aisloader" "Build and test aisloader with race detection" \
+
+.PHONY: restful-api-doc
+
+## Generate RESTful API documentation using swagger
+restful-api-doc: ## Generate OpenAPI/Swagger documentation from code annotations
+	@echo "Generating swagger annotations from code comments..."
+	@GOROOT="" go generate ./...
+	@echo "Installing swag if not present..."
+	@command -v swag >/dev/null 2>&1 || GOOS="" go install github.com/swaggo/swag/cmd/swag@v1.16.4
+	@echo "Generating OpenAPI specification..."
+	@mkdir -p .docs
+	@swag init --generalInfo tools/gendocs/gendocs-temp/annotations.go --output .docs
+	@echo "Injecting model extensions..."
+	@GOROOT="" go run ./tools/gendocs -inject-extensions
+	@echo "Cleaning up generated temp files..."
+	@GOROOT="" go run ./tools/gendocs -cleanup
+	@echo "$(cyan)Documentation generated successfully!$(term-reset)"
+	@echo "$(cyan)Generated files:$(term-reset)"
+	@echo "  .docs/swagger.json  - OpenAPI JSON specification"
+	@echo "  .docs/swagger.yaml  - OpenAPI YAML specification"
+	@echo "  .docs/docs.go       - Go documentation file"
+	@echo ""
+	@echo "$(cyan)To test the documentation:$(term-reset)"
+	@echo "  1. Copy the content of .docs/swagger.json"
+	@echo "  2. Paste it into https://editor.swagger.io/"
+	@echo "  3. View the rendered API documentation"
+
+
+.PHONY: api-docs-website
+
+## Generate API documentation for the website with custom template
+api-docs-website: restful-api-doc ## Generate complete API documentation for Jekyll website
+	@echo "$(cyan)Generating website API documentation...$(term-reset)"
+	@echo "Checking OpenAPI Generator CLI availability..."
+	@if ! command -v openapi-generator-cli >/dev/null 2>&1; then \
+		echo "$(red)Error: openapi-generator-cli not found in PATH$(term-reset)"; \
+		echo "$(cyan)Please install it using the bash launcher script:$(term-reset)"; \
+		echo "  mkdir -p ~/bin/openapitools"; \
+		echo "  curl https://raw.githubusercontent.com/OpenAPITools/openapi-generator/master/bin/utils/openapi-generator-cli.sh > ~/bin/openapitools/openapi-generator-cli"; \
+		echo "  chmod u+x ~/bin/openapitools/openapi-generator-cli"; \
+		echo "  export PATH=\$$PATH:~/bin/openapitools"; \
+		exit 1; \
+	fi
+	@echo "Generating markdown documentation with custom template..."
+	@openapi-generator-cli generate -i .docs/swagger.yaml -g markdown -o ./docs-generated --template-dir ./markdown-template --skip-validate-spec
+	@echo "Copying generated documentation to website location..."
+	@cp docs-generated/README.md docs/http-api.md
+	@cp -r docs-generated/Apis docs/
+	@cp -r docs-generated/Models docs/
+	@echo "Adding Jekyll front matter..."
+	@./scripts/website-preprocess.sh
+	@echo "$(cyan)Website API documentation generated successfully!$(term-reset)"
+	@echo "$(cyan)Updated files:$(term-reset)"
+	@echo "  docs/http-api.md - Website HTTP API documentation"
+	@echo "  docs-generated/README.md - Generated documentation"
+	@echo ""
+	@echo "$(cyan)The documentation is now ready for the Jekyll website!$(term-reset)"

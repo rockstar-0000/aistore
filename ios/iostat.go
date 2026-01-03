@@ -8,6 +8,7 @@ package ios
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	ratomic "sync/atomic"
@@ -46,6 +47,10 @@ type (
 	}
 )
 
+const (
+	cacheRingSize = 32
+)
+
 // internal
 type (
 	cache struct {
@@ -74,7 +79,7 @@ type (
 		disk2sysfn  cos.StrKVs
 		blockStats  allBlockStats
 		cache       ratomic.Pointer[cache]
-		cacheHst    [16]*cache
+		cacheHst    [cacheRingSize]*cache
 		cacheIdx    int
 		mu          sync.Mutex
 		busy        atomic.Bool
@@ -89,15 +94,22 @@ var _ IOS = (*ios)(nil)
 ///////////////
 
 func (x *MpathUtil) Get(mpath string) int64 {
-	if v, ok := (*sync.Map)(x).Load(mpath); ok {
+	m := (*sync.Map)(x)
+	if v, ok := m.Load(mpath); ok {
 		util := v.(int64)
 		return util
 	}
 	return 100 // assume the worst
 }
 
-func (x *MpathUtil) Set(mpath string, util int64) {
-	(*sync.Map)(x).Store(mpath, util)
+func (x *MpathUtil) set(mpath string, util int64) {
+	m := (*sync.Map)(x)
+	m.Store(mpath, util)
+}
+
+func (x *MpathUtil) del(mpath string) {
+	m := (*sync.Map)(x)
+	m.Delete(mpath)
 }
 
 /////////
@@ -259,7 +271,7 @@ func (ios *ios) RescanDisks(mpath, fsname string, disks []string) (out RescanDis
 		}
 	}
 	for d := range fsdisks {
-		if !cos.StringInSlice(d, disks) {
+		if !slices.Contains(disks, d) {
 			out.Attached = append(out.Attached, cmn.NewErrMpathNewDisk(mpath, fsname, disks, fsdisks.ToSlice()))
 
 			// TODO -- FIXME: under lock: update ios.mpath2disks and related state; log
@@ -283,6 +295,11 @@ func (ios *ios) _update(mpath string, fsdisks FsDisks, disks []string) {
 func (ios *ios) RemoveMpath(mpath string, testingEnv bool) {
 	ios.mu.Lock()
 	ios._del(mpath, testingEnv)
+
+	for _, cache := range ios.cacheHst {
+		cache.mpathUtilRO.del(mpath)
+	}
+
 	ios.mu.Unlock()
 }
 
@@ -320,7 +337,7 @@ func (ios *ios) _delDiskTesting(mpath, disk string) {
 			}
 		}
 	}
-	delete(ios.mpath2disks, disk)
+	delete(ios.mpath2disks, mpath)
 }
 
 func (ios *ios) _delDisk(mpath, disk string) {
@@ -407,11 +424,9 @@ func (ios *ios) doRefresh(nowTs int64) *cache {
 	return ncache
 }
 
-func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingInfo bool) {
-	ios.cacheIdx++
-	ios.cacheIdx %= len(ios.cacheHst)
-	ncache = ios.cacheHst[ios.cacheIdx] // from a pool
+func _nonneg(v int64) int64 { return max(v, 0) }
 
+func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingInfo bool) {
 	var (
 		statsCache     = ios._get()
 		nowTs          = mono.NanoTime()
@@ -419,6 +434,15 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 		elapsedSeconds = cos.DivRoundI64(elapsed, int64(time.Second))
 		elapsedMillis  = cos.DivRoundI64(elapsed, int64(time.Millisecond))
 	)
+
+	ios.cacheIdx++
+	ios.cacheIdx %= len(ios.cacheHst)
+	ncache = ios.cacheHst[ios.cacheIdx]
+	if ncache == statsCache { // (unlikely)
+		ios.cacheIdx++
+		ios.cacheIdx %= len(ios.cacheHst)
+		ncache = ios.cacheHst[ios.cacheIdx]
+	}
 
 	ncache.timestamp = nowTs
 	for mpath := range ios.mpath2disks {
@@ -453,23 +477,27 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 		}
 		// deltas
 		var (
-			ioMs       = ncache.ioms[disk] - statsCache.ioms[disk]
-			reads      = ncache.reads[disk] - statsCache.reads[disk]
-			writes     = ncache.writes[disk] - statsCache.writes[disk]
-			readBytes  = ncache.rbytes[disk] - statsCache.rbytes[disk]
-			writeBytes = ncache.wbytes[disk] - statsCache.wbytes[disk]
+			ioMs       = _nonneg(ncache.ioms[disk] - statsCache.ioms[disk])
+			reads      = _nonneg(ncache.reads[disk] - statsCache.reads[disk])
+			writes     = _nonneg(ncache.writes[disk] - statsCache.writes[disk])
+			readBytes  = _nonneg(ncache.rbytes[disk] - statsCache.rbytes[disk])
+			writeBytes = _nonneg(ncache.wbytes[disk] - statsCache.wbytes[disk])
 		)
 		if elapsedMillis > 0 {
-			// On macOS computation of `diskUtil` may sometimes exceed 100%
-			// which may cause some further inaccuracies.
 			if ioMs >= elapsedMillis {
-				ncache.util[disk] = 100
+				ncache.util[disk] = 100 // (unlikely)
 			} else {
 				ncache.util[disk] = cos.DivRoundI64(ioMs*100, elapsedMillis)
 			}
 		} else {
 			ncache.util[disk] = statsCache.util[disk]
 		}
+
+		debug.Func(func() {
+			u := ncache.util[disk]
+			debug.Assertf(u >= 0 && u <= 100, "util out of bounds: %d, %s", u, disk)
+		})
+
 		if !config.TestingEnv() {
 			ncache.mpathUtil[mpath] += ncache.util[disk]
 		}
@@ -509,8 +537,10 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 				ncache.mpathUtil[mpath] = u
 				break
 			}
-			ncache.mpathUtilRO.Set(mpath, u)
 			maxUtil = max(maxUtil, u)
+
+			smoothedUtil := ios._smoothedUtil(mpath, config, u, nowTs)
+			ncache.mpathUtilRO.set(mpath, smoothedUtil)
 		}
 		return ncache, maxUtil, missingInfo
 	}
@@ -523,24 +553,85 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 		}
 		u := cos.DivRoundI64(ncache.mpathUtil[mpath], num)
 		ncache.mpathUtil[mpath] = u
-		ncache.mpathUtilRO.Set(mpath, u)
 		maxUtil = max(maxUtil, u)
+
+		smoothedUtil := ios._smoothedUtil(mpath, config, u, nowTs)
+		ncache.mpathUtilRO.set(mpath, smoothedUtil)
 	}
 	return ncache, maxUtil, missingInfo
+}
+
+// Hybrid smoothing:
+// - compute a linear age-weighted average over the ring (excludes the current sample).
+// - blend with the current sample using the conventional 80/20 mix.
+// Note:
+// This is not an EMA and does not use exponential decay; it is a linear kernel + convex blend.
+// For responsiveness, if the instantaneous util >= max(high-wm, 90%) threshold
+// we return the instantaneous value unmodified.
+
+func (ios *ios) _smoothedUtil(mpath string, config *cmn.Config, currentUtil, nowTs int64) int64 {
+	var (
+		weightedSum int64
+		totalWeight int64
+		cnt         int
+		l           = len(ios.cacheHst)
+		maxDelta    = config.Disk.IostatTimeSmooth.D().Nanoseconds()
+
+		// system default is 80%;
+		// the motivation to apply smoothing all the way to at least 90%
+		highWM = max(config.Disk.DiskUtilHighWM, 90)
+	)
+	// better throttle right away
+	if currentUtil >= highWM {
+		return currentUtil
+	}
+	// when disabled via config
+	if maxDelta < config.Disk.IostatTimeLong.D().Nanoseconds() {
+		return currentUtil
+	}
+
+	for i := 1; i < l; i++ {
+		idx := (ios.cacheIdx - i + l) % l
+		cache := ios.cacheHst[idx]
+		if cache.timestamp == 0 || cache.timestamp > nowTs {
+			continue
+		}
+		timeDelta := nowTs - cache.timestamp
+		if timeDelta >= maxDelta {
+			break
+		}
+		util, ok := cache.mpathUtil[mpath]
+		if !ok {
+			continue
+		}
+		// simple linear decay
+		cnt++
+		weight := maxDelta - timeDelta
+		weightedSum += util * weight
+		totalWeight += weight
+	}
+	// need at least 2 valid samples
+	if totalWeight == 0 || cnt < 2 {
+		return currentUtil
+	}
+
+	// 80/20 mix (or same, smoothing factor alpha = 0.2)
+	avg := cos.DivRoundI64(weightedSum, totalWeight)
+	debug.Assertf(avg >= 0 && avg <= 100, "smooth util out of bounds: %d, %s", avg, mpath)
+
+	return cos.DivRoundI64(80*avg+20*currentUtil, 100)
 }
 
 /////////////
 // FsDisks //
 /////////////
 
-func (fsdisks FsDisks) ToSlice() (disks []string) {
-	disks = make([]string, len(fsdisks))
-	var i int
+func (fsdisks FsDisks) ToSlice() (out []string) {
+	out = make([]string, 0, len(fsdisks))
 	for d := range fsdisks {
-		disks[i] = d
-		i++
+		out = append(out, d)
 	}
-	return disks
+	return out
 }
 
 func (fsdisks FsDisks) _str() string {

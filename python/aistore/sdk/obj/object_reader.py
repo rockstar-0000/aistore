@@ -1,13 +1,16 @@
 #
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 from io import BufferedIOBase
-from typing import Iterator, Optional
+from typing import Optional, Generator, Any
 
 import requests
 
-from aistore.sdk.obj.content_iterator import ContentIterator
+from aistore.sdk.obj.content_iterator import (
+    ContentIterProvider,
+    ParallelContentIterProvider,
+)
 from aistore.sdk.obj.object_client import ObjectClient
 from aistore.sdk.obj.obj_file.object_file import ObjectFileReader
 from aistore.sdk.const import DEFAULT_CHUNK_SIZE
@@ -22,15 +25,24 @@ class ObjectReader:
         object_client (ObjectClient): Client for making requests to a specific object in AIS
         chunk_size (int, optional): Size of each data chunk to be fetched from the stream.
             Defaults to DEFAULT_CHUNK_SIZE.
+        num_workers (int, optional): If provided, use concurrent range-reads with this
+            many workers.
     """
 
     def __init__(
-        self, object_client: ObjectClient, chunk_size: int = DEFAULT_CHUNK_SIZE
+        self,
+        object_client: ObjectClient,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        num_workers: Optional[int] = None,
     ):
         self._object_client = object_client
         self._chunk_size = chunk_size
-        self._content_iterator = ContentIterator(self._object_client, self._chunk_size)
         self._attributes = None
+        self._content_provider = (
+            ParallelContentIterProvider(object_client, chunk_size, num_workers)
+            if num_workers
+            else ContentIterProvider(object_client, chunk_size)
+        )
 
     def head(self) -> ObjectAttributes:
         """
@@ -80,12 +92,12 @@ class ObjectReader:
         """
         return self._make_request(stream=False).content
 
-    def raw(self) -> requests.Response:
+    def raw(self) -> Any:
         """
-        Return the raw byte stream of object content.
+        Return the raw byte stream of the object content.
 
         Returns:
-            requests.Response: Raw byte stream of the object content.
+            requests.Response.raw: Raw byte stream of the object content.
         """
         return self._make_request(stream=True).raw
 
@@ -118,13 +130,13 @@ class ObjectReader:
                 f"Invalid max_resume (must be a non-negative integer): {max_resume}."
             )
 
-        return ObjectFileReader(self._content_iterator, max_resume=max_resume)
+        return ObjectFileReader(self._content_provider, max_resume=max_resume)
 
-    def __iter__(self) -> Iterator[bytes]:
+    def __iter__(self) -> Generator[bytes, None, None]:
         """
         Make a request to get a stream from the provided object and yield chunks of the stream content.
 
         Returns:
-            Iterator[bytes]: An iterator over each chunk of bytes in the object.
+            Generator[bytes, None, None]: An iterator over each chunk of bytes in the object.
         """
-        return self._content_iterator.iter()
+        return self._content_provider.create_iter()

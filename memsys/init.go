@@ -19,7 +19,7 @@ import (
 const (
 	minMemFree      = cos.GiB + cos.GiB>>1 // default minimum memory (see description above)
 	minMemFreeTests = cos.MiB * 128        // minimum free to run tests
-	maxMemUsedTests = cos.GiB * 10         // maximum tests allowed to allocate
+	maxMemUsedTests = cos.GiB * 20         // maximum tests allowed to allocate
 )
 
 var (
@@ -158,9 +158,10 @@ func (r *MMSA) Init(maxUse int64) {
 			r.MinFree = min(r.MinFree, x)
 		}
 	}
-	if maxUse > 0 {
+	if maxUse > 0 && free > uint64(maxUse) {
 		r.MinFree = max(r.MinFree, free-uint64(maxUse))
 	}
+
 	if r.MinFree == 0 {
 		r.MinFree = minMemFree
 	}
@@ -200,7 +201,7 @@ func (r *MMSA) Init(maxUse int64) {
 		bufSize := r.slabIncStep * int64(i+1)
 		slab := &Slab{
 			m:       r,
-			tag:     r.Name + "." + cos.ToSizeIEC(bufSize, 0),
+			tag:     r.Name + "." + cos.IEC(bufSize, 0),
 			bufSize: bufSize,
 			idx:     i,
 			get:     make([][]byte, 0, optDepth),

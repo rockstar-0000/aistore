@@ -18,10 +18,15 @@ func (p *proxy) ecHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		p.httpecpost(w, r)
 	default:
-		cmn.WriteErr405(w, r, http.MethodGet)
+		cmn.WriteErr405(w, r, http.MethodPost)
 	}
 }
 
+// +gen:endpoint POST /v1/ec/open-ec-streams
+// +gen:endpoint POST /v1/ec/close-ec-streams
+// +gen:endpoint POST /v1/ec/open-shared-dm
+// +gen:endpoint POST /v1/ec/close-shared-dm
+// Enable or disable erasure coding and shared data management
 func (p *proxy) httpecpost(w http.ResponseWriter, r *http.Request) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathEC.L, 1, false)
 	if err != nil {
@@ -29,15 +34,15 @@ func (p *proxy) httpecpost(w http.ResponseWriter, r *http.Request) {
 	}
 	action := apiItems[0]
 	switch action {
-	case apc.ActEcOpen:
+	case apc.ActOpenEC:
 		p.ec.setActive(mono.NanoTime())
-	case apc.ActEcClose:
+	case apc.ActCloseEC:
 		p.ec.setActive(0)
 
 	// TODO: refactor as post-toggle-shared-streams
-	case apc.ActDmOpen:
+	case apc.ActOpenSDM:
 		p.dm.setActive(mono.NanoTime())
-	case apc.ActDmClose:
+	case apc.ActCloseSDM:
 		p.dm.setActive(0)
 
 	default:

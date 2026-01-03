@@ -1,7 +1,7 @@
 // Package memsys provides memory management and slab/SGL allocation with io.Reader and io.Writer interfaces
 // on top of scatter-gather lists of reusable buffers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package memsys
 
@@ -116,7 +116,7 @@ const NumStats = NumPageSlabs // NOTE: must be >= NumSmallSlabs
 const (
 	optDepth = 128  // ring "depth", i.e., num free bufs we trend to (see grow())
 	minDepth = 4    // depth when idle or under OOM
-	maxDepth = 4096 // exceeding warrants reallocation
+	maxDepth = 4096 // exceeding warrants reallocation (see related `clipSGL`)
 )
 
 const countThreshold = 16 // exceeding this scatter-gather count warrants selecting a larger-(buffer)-size Slab
@@ -174,7 +174,7 @@ func (r *MMSA) String() string {
 
 func (r *MMSA) Str(mem *sys.MemStat) string {
 	if r.info == "" {
-		r.info = "(min-free " + cos.ToSizeIEC(int64(r.MinFree), 0) + ", low-wm " + cos.ToSizeIEC(int64(r.lowWM), 0)
+		r.info = "(min-free " + cos.IEC(int64(r.MinFree), 0) + ", low-wm " + cos.IEC(int64(r.lowWM), 0)
 	}
 
 	var (
@@ -185,7 +185,7 @@ func (r *MMSA) Str(mem *sys.MemStat) string {
 	sb.WriteString("[(")
 	mem.Str(&sb)
 	sb.WriteString("), ")
-	r.pressure2S(&sb, mem)
+	r._p2s(&sb, mem)
 	sb.WriteString(", ")
 	sb.WriteString(r.info)
 	sb.WriteString("]")
@@ -261,8 +261,7 @@ func (r *MMSA) AllocSize(size int64) (buf []byte, slab *Slab) {
 }
 
 func (r *MMSA) Alloc() (buf []byte, slab *Slab) {
-	size := r.defBufSize
-	_, slab = r.SelectMemAndSlab(size)
+	_, slab = r.SelectMemAndSlab(r.defBufSize)
 	buf = slab.Alloc()
 	return
 }
@@ -306,21 +305,65 @@ func (r *MMSA) _selectSlab(size int64) (slab *Slab) {
 	return
 }
 
-func (r *MMSA) Append(buf []byte, bytes string) (nbuf []byte) {
+func (r *MMSA) AppendB(buf []byte, b byte) (nbuf []byte) {
+	ll, c := len(buf), cap(buf)
+	if ll+1 > c {
+		nbuf = r._grow(buf, int64(c+1))
+		nbuf = nbuf[:ll+1]
+	} else {
+		nbuf = buf[:ll+1]
+	}
+	nbuf[ll] = b
+	return
+}
+
+func (r *MMSA) _grow(buf []byte, size int64) (nbuf []byte) {
+	nbuf, _ = r.AllocSize(size) // not returning slab - no need
+	copy(nbuf, buf)
+	r.Free(buf)
+	return
+}
+
+func (r *MMSA) AppendBytes(buf, data []byte) (nbuf []byte) {
 	var (
-		ll, l, c = len(buf), len(bytes), cap(buf)
-		a        = ll + l - c
+		ll, l, c = len(buf), len(data), cap(buf)
+		need     = ll + l
 	)
-	if a > 0 {
-		nbuf, _ = r.AllocSize(int64(c + a))
-		copy(nbuf, buf)
-		r.Free(buf)
+	if need > c {
+		nbuf = r._grow(buf, int64(need))
 		nbuf = nbuf[:ll+l]
 	} else {
 		nbuf = buf[:ll+l]
 	}
-	copy(nbuf[ll:], bytes)
+	copy(nbuf[ll:], data)
 	return
+}
+
+func (r *MMSA) AppendBytes2(buf, b1, b2 []byte) (nbuf []byte) {
+	var (
+		ll, c  = len(buf), cap(buf)
+		l1, l2 = len(b1), len(b2)
+		need   = ll + l1 + l2
+	)
+	if need > c {
+		nbuf = r._grow(buf, int64(need))
+		nbuf = nbuf[:need]
+	} else {
+		nbuf = buf[:need]
+	}
+	off := ll
+	if l1 != 0 {
+		copy(nbuf[off:], b1)
+		off += l1
+	}
+	if l2 != 0 {
+		copy(nbuf[off:], b2)
+	}
+	return
+}
+
+func (r *MMSA) AppendString(buf []byte, s string) (nbuf []byte) {
+	return r.AppendBytes(buf, cos.UnsafeB(s))
 }
 
 // private

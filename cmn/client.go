@@ -33,6 +33,8 @@ const (
 // - WriteBufferSize:       4KB
 // - ReadBufferSize:        4KB
 //
+// See also: docs/idle_connections.md
+//
 // Following are the defaults we use instead:
 const (
 	DefaultMaxIdleConns        = 0               // unlimited (in re: `http.errTooManyIdle`)
@@ -144,7 +146,7 @@ func NewTLS(sargs TLSArgs, intra bool) (tlsConf *tls.Config, err error) {
 		return tlsConf, nil
 	}
 
-	if os.IsNotExist(err) {
+	if cos.IsNotExist(err) {
 		hint = "\n(hint: check the two filenames for existence/accessibility)"
 	}
 	return nil, fmt.Errorf("client tls: failed to load public/private key pair: (%q, %q)%s", sargs.Certificate, sargs.Key, hint)

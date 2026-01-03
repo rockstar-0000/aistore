@@ -98,7 +98,7 @@ func CheckPathExists(t *testing.T, path string, dir bool) {
 }
 
 func CheckPathNotExists(t *testing.T, path string) {
-	if err := cos.Stat(path); err == nil || !os.IsNotExist(err) {
+	if err := cos.Stat(path); err == nil || !cos.IsNotExist(err) {
 		t.Fatal(err)
 	}
 }
@@ -167,11 +167,6 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 	mios := mock.NewIOS()
 	fs.TestNew(mios)
 
-	fs.CSM.Reg(fs.WorkfileType, &fs.WorkfileContentResolver{}, true)
-	fs.CSM.Reg(fs.ObjectType, &fs.ObjectContentResolver{}, true)
-	fs.CSM.Reg(fs.ECSliceType, &fs.ECSliceContentResolver{}, true)
-	fs.CSM.Reg(fs.ECMetaType, &fs.ECMetaContentResolver{}, true)
-
 	dir := t.TempDir()
 
 	for range desc.MountpathsCnt {
@@ -213,7 +208,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 			mpathCnts[parsed.Mountpath.Path]++
 
 			switch ct.Type {
-			case fs.ObjectType:
+			case fs.ObjCT:
 				lom := &core.LOM{}
 				err = lom.InitFQN(fqn, nil)
 				tassert.CheckFatal(t, err)
@@ -222,7 +217,7 @@ func PrepareObjects(t *testing.T, desc ObjectsDesc) *ObjectsOut {
 				lom.SetAtimeUnix(time.Now().UnixNano())
 				err = lom.Persist()
 				tassert.CheckFatal(t, err)
-			case fs.WorkfileType, fs.ECSliceType, fs.ECMetaType:
+			case fs.WorkCT, fs.ECSliceCT, fs.ECMetaCT:
 			default:
 				cos.AssertMsg(false, "non-implemented type")
 			}

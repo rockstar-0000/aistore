@@ -1,16 +1,15 @@
 // Package authn provides AuthN API over HTTP(S)
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package authn
 
 import (
-	"errors"
-	"fmt"
+	"crypto/rsa"
 	"strconv"
-	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/jsp"
@@ -18,19 +17,18 @@ import (
 
 type (
 	Config struct {
+		Server  ServerConf  `json:"auth"`
 		Log     LogConf     `json:"log"`
 		Net     NetConf     `json:"net"`
-		Server  ServerConf  `json:"auth"`
 		Timeout TimeoutConf `json:"timeout"`
-		// private
-		mu sync.RWMutex `json:"-"`
 	}
 	LogConf struct {
 		Dir   string `json:"dir"`
 		Level string `json:"level"`
 	}
 	NetConf struct {
-		HTTP HTTPConf `json:"http"`
+		ExternalURL string   `json:"external_url"`
+		HTTP        HTTPConf `json:"http"`
 	}
 	HTTPConf struct {
 		Certificate string `json:"server_crt"`
@@ -39,11 +37,14 @@ type (
 		UseHTTPS    bool   `json:"use_https"`
 	}
 	ServerConf struct {
-		Secret string       `json:"secret"`
+		psecret *string         `json:"-"`
+		pexpire *cos.Duration   `json:"-"`
+		pKey    *rsa.PrivateKey `json:"-"`
+		Secret  string          `json:"secret"`
+		// Determines when the secret or key expires
+		// Also used to determine max-age for client caches of JWKS
 		Expire cos.Duration `json:"expiration_time"`
-		// private
-		psecret *string       `json:"-"`
-		pexpire *cos.Duration `json:"-"`
+		PubKey *string      `json:"public_key"`
 	}
 	TimeoutConf struct {
 		Default cos.Duration `json:"default_timeout"`
@@ -71,46 +72,21 @@ var (
 
 func (*Config) JspOpts() jsp.Options { return authcfgJspOpts }
 
-func (c *Config) Lock()   { c.mu.Lock() }
-func (c *Config) Unlock() { c.mu.Unlock() }
-
 func (c *Config) Init() {
 	c.Server.psecret = &c.Server.Secret
 	c.Server.pexpire = &c.Server.Expire
 }
 
 func (c *Config) Verbose() bool {
+	if c.Log.Level == "" {
+		return false
+	}
 	level, err := strconv.Atoi(c.Log.Level)
 	debug.AssertNoErr(err)
 	return level > 3
 }
 
-func (c *Config) Secret() string        { return *c.Server.psecret }
-func (c *Config) Expire() time.Duration { return time.Duration(*c.Server.pexpire) }
-
-func (c *Config) SetSecret(val *string) {
-	c.Server.Secret = *val
-	c.Server.psecret = val
-}
-
-func (c *Config) ApplyUpdate(cu *ConfigToUpdate) error {
-	if cu.Server == nil {
-		return errors.New("configuration is empty")
-	}
-	if cu.Server.Secret != nil {
-		if *cu.Server.Secret == "" {
-			return errors.New("secret not defined")
-		}
-		c.SetSecret(cu.Server.Secret)
-	}
-	if cu.Server.Expire != nil {
-		dur, err := time.ParseDuration(*cu.Server.Expire)
-		if err != nil {
-			return fmt.Errorf("invalid time format %s: %v", *cu.Server.Expire, err)
-		}
-		v := cos.Duration(dur)
-		c.Server.Expire = v
-		c.Server.pexpire = &v
-	}
-	return nil
-}
+func (c *Config) SetPrivateKey(key *rsa.PrivateKey) { c.Server.pKey = key }
+func (c *Config) GetPrivateKey() *rsa.PrivateKey    { return c.Server.pKey }
+func (c *Config) Secret() cmn.Censored              { return cmn.Censored(*c.Server.psecret) }
+func (c *Config) Expire() time.Duration             { return time.Duration(*c.Server.pexpire) }

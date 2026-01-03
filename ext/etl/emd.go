@@ -12,12 +12,29 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 
 	jsoniter "github.com/json-iterator/go"
 )
 
 type (
-	ETLs map[string]InitMsg
+	// ETLEntity represents an ETL instance managed by an individual target.
+	// - Created and added to the manager before entering the `Initializing` stage.
+	// - Removed only after the user explicitly deletes it from the `Aborted` stage.
+	//
+	// Expected state transitions:
+	// - `Initializing`: Set up resources in the following order:
+	//     1. Create (or reuse) communicator and pod watcher
+	//     2. Start (or renew) xaction
+	//     3. Create Kubernetes resources (pod/service)
+	// - `Running`: All resources are active, handling inline and offline transform requests via the communicator.
+	// - `Aborted`: Kubernetes resources (pod/service) are cleaned up.
+	ETLEntity struct {
+		InitMsg InitMsg `json:"init_msg"`
+		PodMap  PodMap  `json:"pod_map"`
+		Stage   Stage   `json:"stage"`
+	}
+	ETLs map[string]ETLEntity
 
 	// ETL metadata
 	MD struct {
@@ -52,28 +69,24 @@ var (
 ////////
 
 func (e *MD) Init(l int) { e.ETLs = make(ETLs, l) }
-func (e *MD) Add(msg InitMsg) {
+func (e *MD) Add(msg InitMsg, stage Stage, podMap PodMap) error {
 	if msg == nil {
-		return
+		return nil
 	}
-	e.ETLs[msg.Name()] = msg
+	if _, ok := e.ETLs[msg.Name()]; !ok && stage == Aborted {
+		return fmt.Errorf("cannot add %s to stage %s: not exists", msg.Cname(), stage)
+	}
+	e.ETLs[msg.Name()] = ETLEntity{InitMsg: msg, Stage: stage, PodMap: podMap}
+	return nil
 }
 func (*MD) JspOpts() jsp.Options { return etlMDJspOpts }
 
-func (e *MD) Get(id string) (msg InitMsg, present bool) {
+func (e *MD) Get(id string) (en ETLEntity, present bool) {
 	if e == nil {
-		return nil, false
+		return ETLEntity{}, false
 	}
-	msg, present = e.ETLs[id]
+	en, present = e.ETLs[id]
 	return
-}
-
-func (e *MD) Del(id string) (deleted bool) {
-	if _, present := e.ETLs[id]; !present {
-		return
-	}
-	delete(e.ETLs, id)
-	return true
 }
 
 func (e *MD) String() string {
@@ -90,7 +103,7 @@ func (e *MD) MarshalJSON() ([]byte, error) {
 		Ext:     e.Ext,
 	}
 	for k, v := range e.ETLs {
-		jsonMD.ETLs[k] = jsonETL{v.MsgType(), cos.MustMarshal(v)}
+		jsonMD.ETLs[k] = jsonETL{v.InitMsg.MsgType(), cos.MustMarshal(v)}
 	}
 	return jsoniter.Marshal(jsonMD)
 }
@@ -98,26 +111,38 @@ func (e *MD) MarshalJSON() ([]byte, error) {
 func (e *MD) UnmarshalJSON(data []byte) (err error) {
 	jsonMD := &jsonMD{}
 	if err = jsoniter.Unmarshal(data, jsonMD); err != nil {
-		return
+		return err
 	}
 	e.Version, e.Ext = jsonMD.Version, jsonMD.Ext
 	e.ETLs = make(ETLs, len(jsonMD.ETLs))
 	for k, v := range jsonMD.ETLs {
+		en := ETLEntity{}
 		switch v.Type {
-		case CodeType:
-			e.ETLs[k] = &InitCodeMsg{}
+		case CodeType: // do nothing
 		case SpecType:
-			e.ETLs[k] = &InitSpecMsg{}
+			en.InitMsg = &InitSpecMsg{}
 		case ETLSpecType:
-			e.ETLs[k] = &ETLSpecMsg{}
+			en.InitMsg = &ETLSpecMsg{}
 		default:
 			err = fmt.Errorf("invalid InitMsg type %q", v.Type)
 			debug.AssertNoErr(err)
-			return
+			return err
 		}
-		if err = jsoniter.Unmarshal(v.Msg, e.ETLs[k]); err != nil {
-			break
+		err = jsoniter.Unmarshal(v.Msg, &en)
+		if err != nil || en.InitMsg == nil {
+			// NOTE; version 3.30 introduces new ETL MD format - a breaking change
+			// TODO -- FIXME: this is a workaround for incompatible etlMD formats
+			nlog.Errorln("failed to unmarshal etlMD (ignoring, proceeding anyway), err:", err, "type:", v.Type, "msg:", v.Msg)
+			err = nil
+			continue
 		}
+		if err = en.InitMsg.Validate(); err != nil {
+			// TODO -- FIXME: this is a workaround for incompatible etlMD formats
+			nlog.Errorln("failed to validate etlMD entry (ignoring, proceeding anyway), err:", err, "type:", v.Type, "msg:", v.Msg)
+			err = nil
+			continue
+		}
+		e.ETLs[k] = en
 	}
-	return
+	return err
 }

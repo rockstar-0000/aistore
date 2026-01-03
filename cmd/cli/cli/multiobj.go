@@ -56,7 +56,7 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		if err != nil && err != cos.ErrEmptyTemplate { // NOTE same as above: empty => entire bucket
 			return err
 		}
-		if len(pt.Ranges) > 0 {
+		if pt.IsRange() {
 			numObjs = pt.Count()
 		} else {
 			isPrefix = true
@@ -156,12 +156,19 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 //
 
 func evictHandler(c *cli.Context) error {
-	if flagIsSet(c, verboseFlag) && flagIsSet(c, nonverboseFlag) {
-		return incorrectUsageMsg(c, errFmtExclusive, qflprn(verboseFlag), qflprn(nonverboseFlag))
+	if err := errMutuallyExclusive(c, verboseFlag, nonverboseFlag); err != nil {
+		return err
 	}
 	if flagIsSet(c, dryRunFlag) {
 		dryRunCptn(c)
 	}
+	if flagIsSet(c, evictAllBucketsFlag) {
+		if c.NArg() > 0 {
+			return incorrectUsageMsg(c, "cannot use --all flag with specific bucket arguments")
+		}
+		return evictAllRemoteBuckets(c)
+	}
+
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
@@ -178,8 +185,7 @@ func _evictOne(c *cli.Context, shift int) error {
 	uri := preparseBckObjURI(c.Args().Get(shift))
 	bck, objNameOrTmpl, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
 	if err != nil {
-		// Only try bucket query parsing for "provider-only" patterns like "s3", "gs:", etc.
-		// These fail parsing as regular buckets but are valid bucket queries
+		// Try bucket query parsing for provider-only patterns like "s3:", "gs:", etc.
 		if strings.Contains(err.Error(), cos.OnlyPlus) || strings.Contains(err.Error(), "missing bucket name") {
 			qbck, _, errN := parseQueryBckURI(uri)
 			if errN == nil {
@@ -198,18 +204,17 @@ func _evictOne(c *cli.Context, shift int) error {
 		}
 	}
 
-	// Special case: evict entire bucket when no object/prefix specified
-	if objNameOrTmpl == "" {
-		return evictBucket(c, bck)
-	}
-
 	oltp, err := dopOLTP(c, bck, objNameOrTmpl)
 	if err != nil {
 		return err
 	}
 
-	// Convert objName to list when there's no list or template (same pattern as prefetch)
+	// Choose between bucket and object eviction; if no flags and no object specified, evict whole bucket
 	if oltp.list == "" && oltp.tmpl == "" {
+		if objNameOrTmpl == "" {
+			return evictBucket(c, bck)
+		}
+		// Treat objName as a single-object list
 		oltp.list = oltp.objName
 	}
 
@@ -230,7 +235,7 @@ func evictBucket(c *cli.Context, bck cmn.Bck) error {
 		return V(err)
 	}
 
-	msg := fmt.Sprintf("Evicted bucket %s from aistore", bck.Cname(""))
+	msg := "Evicted bucket " + bck.Cname("")
 	if keepMD {
 		msg += " (metadata preserved)"
 	}
@@ -238,7 +243,7 @@ func evictBucket(c *cli.Context, bck cmn.Bck) error {
 	return nil
 }
 
-// Evict multiple remote buckets based on query
+// Evict multiple remote buckets based on query (for provider patterns like s3:, gs:)
 func evictMultipleBuckets(c *cli.Context, qbck cmn.QueryBcks) error {
 	// List buckets that match the query
 	bcks, err := api.ListBuckets(apiBP, qbck, apc.FltPresent)
@@ -247,7 +252,12 @@ func evictMultipleBuckets(c *cli.Context, qbck cmn.QueryBcks) error {
 	}
 
 	if len(bcks) == 0 {
-		return fmt.Errorf("no buckets found matching %q", qbck.String())
+		if qbck.Provider != "" {
+			fmt.Fprintf(c.App.Writer, "No %s buckets to evict\n", qbck.Provider)
+		} else {
+			fmt.Fprintln(c.App.Writer, "No buckets found matching query")
+		}
+		return nil
 	}
 
 	// Check if all buckets are remote
@@ -259,34 +269,112 @@ func evictMultipleBuckets(c *cli.Context, qbck cmn.QueryBcks) error {
 
 	if flagIsSet(c, dryRunFlag) {
 		dryRunCptn(c)
+		return nil
 	}
 
-	// Evict each bucket using the single bucket function
-	evicted := make([]string, 0, len(bcks)) // Pre-allocate with capacity
+	// Evict all buckets immediately (no confirmation for provider patterns)
+	return evictBuckets(c, bcks)
+}
+
+// Evict all remote buckets from the cluster (for --all flag)
+func evictAllRemoteBuckets(c *cli.Context) error {
+	qbck := cmn.QueryBcks{}
+	bcks, err := api.ListBuckets(apiBP, qbck, apc.FltPresent)
+	if err != nil {
+		return V(err)
+	}
+
+	var remoteBuckets []cmn.Bck
 	for _, bck := range bcks {
+		if bck.IsRemote() {
+			remoteBuckets = append(remoteBuckets, bck)
+		}
+	}
+
+	// Get remote AIS buckets specifically
+	if remais, err := api.GetRemoteAIS(apiBP); err == nil && len(remais.A) > 0 {
+		qbckRemoteAIS := cmn.QueryBcks{Provider: apc.AIS, Ns: cmn.NsAnyRemote}
+		remoteAISBcks, err := api.ListBuckets(apiBP, qbckRemoteAIS, apc.FltPresent)
+		if err != nil {
+			return V(err)
+		}
+		remoteBuckets = append(remoteBuckets, remoteAISBcks...)
+	}
+
+	if len(remoteBuckets) == 0 {
+		fmt.Fprintln(c.App.Writer, "No remote buckets to evict")
+		return nil
+	}
+
+	// Single bucket: fall back to direct eviction
+	if len(remoteBuckets) == 1 {
+		return evictBucket(c, remoteBuckets[0])
+	}
+
+	// Require confirmation for --all flag
+	if !confirmAllBucketsEviction(c, remoteBuckets) {
+		return nil
+	}
+
+	return evictBuckets(c, remoteBuckets)
+}
+
+// confirmAllBucketsEviction handles confirmation for --all flag
+func confirmAllBucketsEviction(c *cli.Context, buckets []cmn.Bck) bool {
+	if flagIsSet(c, yesFlag) {
+		actionWarn(c, "The --yes flag is ignored for safety reasons")
+	}
+
+	fmt.Fprintf(c.App.Writer, "Found %d remote bucket%s to evict:\n", len(buckets), cos.Plural(len(buckets)))
+	for _, bck := range buckets {
+		fmt.Fprintln(c.App.Writer, "  -", bck.Cname(""))
+	}
+
+	keepMD := flagIsSet(c, keepMDFlag)
+	if !keepMD {
+		prompt := "This will remove all cached data AND bucket metadata from the cluster"
+		warning := "Bucket metadata will be permanently lost"
+		return confirmWithPhrase(c, "EVICT", prompt, warning)
+	}
+	return confirm(c, "Continue?")
+}
+
+// evictBuckets evicts multiple buckets and reports results
+func evictBuckets(c *cli.Context, buckets []cmn.Bck) error {
+	var evicted int
+	for _, bck := range buckets {
 		if err := evictBucket(c, bck); err != nil {
 			actionWarn(c, fmt.Sprintf("failed to evict %s: %v", bck.Cname(""), err))
 			continue
 		}
-		evicted = append(evicted, bck.Cname(""))
+		evicted++
 	}
 
-	if len(evicted) == 0 {
+	if evicted == 0 {
 		return errors.New("failed to evict any buckets")
 	}
 
+	if len(buckets) > 1 {
+		keepMD := flagIsSet(c, keepMDFlag)
+		if keepMD {
+			fmt.Fprintf(c.App.Writer, "\nEvicted data from %d remote bucket%s (metadata preserved).\n", evicted, cos.Plural(evicted))
+		} else {
+			fmt.Fprintf(c.App.Writer, "\nEvicted %d remote bucket%s.\n", evicted, cos.Plural(evicted))
+		}
+	}
 	return nil
 }
 
 func rmHandler(c *cli.Context) error {
-	if flagIsSet(c, verboseFlag) && flagIsSet(c, nonverboseFlag) {
-		return incorrectUsageMsg(c, errFmtExclusive, qflprn(verboseFlag), qflprn(nonverboseFlag))
+	if err := errMutuallyExclusive(c, verboseFlag, nonverboseFlag); err != nil {
+		return err
 	}
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
+	var warned bool
 	for shift := range c.Args() {
-		if err := _rmOne(c, shift); err != nil {
+		if err := _rmOne(c, shift, &warned); err != nil {
 			return err
 		}
 	}
@@ -294,12 +382,13 @@ func rmHandler(c *cli.Context) error {
 }
 
 // handle one BUCKET[/OBJECT_NAME_or_TEMPLATE] (command line may contain multiple of those)
-func _rmOne(c *cli.Context, shift int) error {
+func _rmOne(c *cli.Context, shift int, warned *bool) error {
 	uri := preparseBckObjURI(c.Args().Get(shift))
 	bck, objNameOrTmpl, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
 	if err != nil {
 		return err
 	}
+
 	if shouldHeadRemote(c, bck) {
 		bprops, err := headBucket(bck, false /* don't add */)
 		if err != nil {
@@ -317,6 +406,7 @@ func _rmOne(c *cli.Context, shift int) error {
 
 	switch {
 	case oltp.list != "" || oltp.tmpl != "": // 1. multi-obj
+		// TODO: warnEscapeObjName()
 		lrCtx := &lrCtx{oltp.list, oltp.tmpl, bck}
 		return lrCtx.do(c)
 	case oltp.objName == "": // 2. all objects
@@ -332,7 +422,8 @@ func _rmOne(c *cli.Context, shift int) error {
 		return incorrectUsageMsg(c, "to select objects to be removed use one of: (%s or %s or %s)",
 			qflprn(listFlag), qflprn(templateFlag), qflprn(rmrfFlag))
 	default: // 3. one obj
-		err := api.DeleteObject(apiBP, bck, oltp.objName)
+		encObjName := warnEscapeObjName(c, oltp.objName, warned)
+		err := api.DeleteObject(apiBP, bck, encObjName)
 		if err == nil && bck.IsCloud() && oltp.notFound {
 			// [NOTE]
 			// - certain backends return OK when specified object does not exist (see aws.go)
@@ -463,7 +554,7 @@ func (lr *lrCtx) do(c *cli.Context) error {
 		_, xname = xact.GetKindName(kind)
 		text = fmt.Sprintf("%s: %s %s from %s", xact.Cname(xname, xid), s, action, lr.bck.Cname(""))
 	} else {
-		if lr.tmplObjs != "" && !emptyTemplate && len(pt.Ranges) != 0 {
+		if lr.tmplObjs != "" && !emptyTemplate && pt.IsRange() {
 			num = pt.Count()
 		}
 		_, xname = xact.GetKindName(kind)
@@ -521,7 +612,27 @@ func (lr *lrCtx) dry(c *cli.Context, fileList []string, pt *cos.ParsedTemplate) 
 			dryRunExamplesCnt, strings.ToUpper(c.Command.Name)+" "+lr.bck.Cname("")+"/%s\n", fileList)
 		return
 	}
-	objs := pt.ToSlice(dryRunExamplesCnt)
+
+	// Handle simple prefix different from template pattern
+	if lr.tmplObjs != "" && pt.IsPrefixOnly() {
+		fmt.Fprintf(c.App.Writer, "[DRY RUN] %s objects with prefix %q from %s\n",
+			strings.ToUpper(c.Command.Name), lr.tmplObjs, lr.bck.Cname(""))
+		return
+	}
+
+	// Handle bucket-only URI (e.g., "s3://bucket" with no object specified)
+	if lr.listObjs == "" && lr.tmplObjs == "" && pt.IsPrefixOnly() && pt.Count() == 1 {
+		fmt.Fprintf(c.App.Writer, "[DRY RUN] %s all objects from %s\n",
+			strings.ToUpper(c.Command.Name), lr.bck.Cname(""))
+		return
+	}
+
+	objs, err := pt.Expand(dryRunExamplesCnt)
+	if err != nil {
+		debug.AssertNoErr(err)
+		fmt.Fprintln(c.App.ErrWriter, err)
+		return
+	}
 	limitedLineWriter(c.App.Writer,
 		dryRunExamplesCnt, strings.ToUpper(c.Command.Name)+" "+lr.bck.Cname("")+"/%s", objs)
 	if pt.Count() > dryRunExamplesCnt {

@@ -115,6 +115,85 @@ Additionally, the `--force`(`-f`) option can be used to override the bucket's `l
 $ ais start lru --buckets ais://buck1,aws://buck2 -f
 ```
 
+#### Re-chunk objects
+
+Re-chunking converts objects between monolithic and chunked representations based on the specified chunking parameters. The job processes objects in the bucket according to the configured threshold:
+
+- Objects below `objsize_limit` are stored as monolithic (single file)
+- Objects at or above `objsize_limit` are split into chunks of `chunk_size`
+- When `objsize_limit` is 0, chunking is disabled and all objects are restored as monolithic
+
+**Usage:**
+
+```console
+$ ais rechunk BUCKET [--chunk-size SIZE] [--objsize-limit SIZE] [--prefix PREFIX]
+```
+
+**Flags:**
+- `--chunk-size SIZE` - Size of each chunk (e.g., `16MiB`, `20mb`). Optional: if omitted, uses the bucket's current `chunk_size`
+- `--objsize-limit SIZE` - Object size threshold for chunking (e.g., `50MiB`, `100mb`); objects >= this size will be chunked. Optional: if omitted, uses the bucket's current `objsize_limit`
+- `--prefix PREFIX` - Only rechunk objects with the specified prefix (can also be embedded in the bucket URI)
+- `--wait` - Wait for the job to complete before returning
+- `--wait-timeout DURATION` - Maximum time to wait (e.g., `5m`, `1h`)
+- `--yes, -y` - Assume 'yes' to all prompts (skip confirmation)
+
+> **Note:** If either size argument is missing, you will be prompted to confirm using the bucket's current configuration.
+
+**Examples:**
+
+Rechunk using the bucket's existing chunk configuration (prompts for confirmation):
+
+```console
+$ ais rechunk ais://mybucket
+Rechunk configuration:
+	chunk_size:     16MiB
+	objsize_limit:  50MiB
+Proceed with these values? [Y/N]: y
+Started "rechunk" xaction "rechunk[aBc123]": ais://mybucket. To monitor, run 'ais show job aBc123'
+```
+
+Rechunk with one explicit flag and one from bucket (prompts for confirmation):
+
+```console
+$ ais rechunk ais://mybucket --chunk-size 32MiB
+Rechunk configuration:
+	chunk_size:     32MiB
+	objsize_limit:  50MiB
+Proceed with these values? [Y/N]: y
+Started "rechunk" xaction "rechunk[dEf456]": ais://mybucket. To monitor, run 'ais show job dEf456'
+```
+
+Rechunk all objects with both flags explicitly provided (no prompt):
+
+```console
+$ ais rechunk ais://mybucket --chunk-size 16MiB --objsize-limit 50MiB
+Started "rechunk" xaction "rechunk[gHi789]": ais://mybucket. To monitor, run 'ais show job gHi789'
+```
+
+Rechunk only objects with a specific prefix using embedded prefix in the URI:
+
+```console
+$ ais rechunk ais://mybucket/images/ --chunk-size 16MiB --objsize-limit 50MiB
+Started "rechunk" xaction "rechunk[mNo345]": ais://mybucket (prefix: "images/"). To monitor, run 'ais show job mNo345'
+```
+
+Disable chunking and restore all objects as monolithic:
+
+```console
+$ ais rechunk ais://mybucket --chunk-size 16MiB --objsize-limit 0
+```
+
+Wait for the rechunk job to complete:
+
+```console
+$ ais rechunk ais://mybucket --chunk-size 16MiB --objsize-limit 50MiB --wait
+Done.
+```
+
+> **Note**: Regardless of `objsize_limit` value (even when disabled), objects exceeding the bucket's `maxMonolithicSize` configuration will be automatically chunked at that size limit for performance and storage management reasons.
+
+> **See also**: [bucket properties](/docs/bucket.md), [`ais bucket props`](/docs/cli/bucket.md)
+
 ## Stop job
 
 Stop a single job or multiple jobs.
@@ -186,16 +265,19 @@ NAME:
      download       dsort          ec-bucket   ec-get            ec-put         ec-resp
      elect-primary  etl-bucket     etl-inline  etl-objects       evict-objects  evict-remote-bucket
      list           lru-eviction   mirror      prefetch-objects  promote-files  put-copies
-     rebalance      rename-bucket  resilver    summary           warm-up-metadata
+     rebalance      rechunk        rename-bucket  resilver       summary        warm-up-metadata
    (use any of these names with 'ais show job' command, or try shortcuts: "evict", "prefetch", "copy", "delete", "ec")
    e.g.:
      - show job prefetch-listrange         - show all running prefetch jobs;
      - show job prefetch                   - same as above;
+     - show job prefetch --top 5           - show 5 most recent prefetch jobs;
      - show job tco-cysbohAGL              - show a given (multi-object copy/transform) job identified by its unique ID;
      - show job copy-listrange             - show all running multi-object copies;
      - show job copy-objects               - same as above (using display name);
      - show job copy                       - show all copying jobs including both bucket-to-bucket and multi-object;
      - show job copy-objects --all         - show both running and already finished (or stopped) multi-object copies;
+     - show job copy-objects --all --top 10 - show 10 most recent multi-object copy jobs;
+     - show job rechunk                    - show all running rechunk jobs;
      - show job ec                         - show all erasure-coding;
      - show job list                       - show all running list-objects jobs;
      - show job ls                         - same as above;
@@ -220,6 +302,7 @@ OPTIONS:
    --refresh value   Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
                      valid time units: ns, us (or µs), ms, s (default), m, h
    --regex value     Regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   --top value       Show top N most recent jobs (e.g., --top 5 to show the 5 most recent jobs)
    --units value     Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
                      iec - IEC format, e.g.: KiB, MiB, GiB (default)
                      si  - SI (metric) format, e.g.: KB, MB, GB
@@ -269,6 +352,41 @@ The output contains a few extra columns:
 - `ERRORS` - the total number of objects EC failed to restore
 - `QUEUE` - the average length of working queue: the average number of objects waiting in the queue when a new EC encode request received. Values close to `0` mean that every object was processed immediately after the request had been received
 - `AVG TIME` - the average total processing time for an object: from the moment the object is put to the working queue and to the moment the last encoded slice is sent to another target
+
+### Examples using `--top` flag
+
+Show 2 most recent list jobs:
+
+```console
+$ ais show job list --top 2
+list[LIM_Ua6LV] (run options: ais://job-top-test, props:name,size,cached) 
+NODE             ID              KIND    BUCKET                  OBJECTS         BYTES   START           END     STATE
+ZXzt8081         LIM_Ua6LV       list    ais://job-top-test      6               36B     22:29:39        -       Running
+list[q9MIgaNLO] (run options: ais://job-top-test, props:name,size,cached) 
+NODE             ID              KIND    BUCKET                  OBJECTS         BYTES   START           END     STATE
+ZXzt8081         q9MIgaNLO       list    ais://job-top-test      6               36B     22:29:39        -       Running
+```
+
+Show 1 most recent job of any type:
+
+```console
+$ ais show job --top 1
+list[LIM_Ua6LV] (run options: ais://job-top-test, props:name,size,cached) 
+NODE             ID              KIND    BUCKET                  OBJECTS         BYTES   START           END     STATE
+ZXzt8081         LIM_Ua6LV       list    ais://job-top-test      6               36B     22:29:39        -       Running
+```
+
+Show 2 most recent list jobs including finished ones:
+
+```console
+$ ais show job list --all --top 2
+list[LIM_Ua6LV] (run options: ais://job-top-test, props:name,size,cached) 
+NODE             ID              KIND    BUCKET                  OBJECTS         BYTES   START           END     STATE
+ZXzt8081         LIM_Ua6LV       list    ais://job-top-test      6               36B     22:29:39        -       Running
+list[q9MIgaNLO] (run options: ais://job-top-test, props:name,size,cached) 
+NODE             ID              KIND    BUCKET                  OBJECTS         BYTES   START           END     STATE
+ZXzt8081         q9MIgaNLO       list    ais://job-top-test      6               36B     22:29:39        -       Running
+```
 
 ### Options
 
@@ -363,7 +481,7 @@ OPTIONS:
 
 ## Distributed Sort
 
-`ais start dsort` or `ais start dsort`
+`ais start dsort`
 
 Run [dSort](/docs/dsort.md).
 [Further reference for this command can be found here.](dsort.md)

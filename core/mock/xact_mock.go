@@ -30,12 +30,9 @@ func (*XactMock) Run(*sync.WaitGroup) {
 
 func NewXact(kind string) *XactMock {
 	xctn := &XactMock{}
-	xctn.InitBase(cos.GenUUID(), kind, "", nil)
+	xctn.InitBase(cos.GenUUID(), kind, nil)
 	return xctn
 }
 
-func (r *XactMock) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-	return
-}
+func (*XactMock) CtlMsg() string     { return "" }
+func (r *XactMock) Snap() *core.Snap { return r.Base.NewSnap(r) }

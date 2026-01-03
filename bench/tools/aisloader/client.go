@@ -13,20 +13,24 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/tools/readers"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"golang.org/x/sync/errgroup"
 )
 
 const longListTime = 10 * time.Second // list-objects progress
@@ -201,9 +205,10 @@ func s3put(bck cmn.Bck, objName string, reader cos.ReadOpenCloser) (err error) {
 		Key:    aws.String(objName),
 		Body:   reader,
 	})
-	erc := reader.Close()
-	debug.AssertNoErr(erc)
-	return
+	if erc := reader.Close(); erc != nil && err == nil {
+		err = erc
+	}
+	return err
 }
 
 func put(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum, reader cos.ReadOpenCloser) (err error) {
@@ -226,6 +231,94 @@ func put(proxyURL string, bck cmn.Bck, objName string, cksum *cos.Cksum, reader 
 	)
 	_, err = api.PutObject(&args)
 	return
+}
+
+func uploadMultipartPart(baseParams api.BaseParams, bck cmn.Bck, objName, uploadID string,
+	partNum int, partSize uint64, cksumType string,
+	mu *sync.Mutex, partNumbers []int) error {
+	partReader, err := readers.New(&readers.Arg{
+		Type:      readers.Rand,
+		Size:      int64(partSize),
+		CksumType: cksumType,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create reader for part %d of %s: %w", partNum, objName, err)
+	}
+	putPartArgs := &api.PutPartArgs{
+		PutArgs: api.PutArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+			Cksum:      partReader.Cksum(),
+			Reader:     partReader,
+			Size:       partSize,
+			SkipVC:     true,
+		},
+		UploadID:   uploadID,
+		PartNumber: partNum,
+	}
+	if err := api.UploadPart(putPartArgs); err != nil {
+		return fmt.Errorf("failed to upload part %d of %s: %w", partNum, objName, err)
+	}
+
+	mu.Lock()
+	partNumbers[partNum-1] = partNum
+	mu.Unlock()
+
+	return nil
+}
+
+// putMultipart performs multipart upload for the given object
+func putMultipart(proxyURL string, bck cmn.Bck, objName string, size int64, numChunks int, cksumType string) error {
+	baseParams := api.BaseParams{
+		Client: runParams.bp.Client,
+		URL:    proxyURL,
+		Token:  loggedUserToken,
+		UA:     ua,
+	}
+
+	// Create multipart upload
+	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	if err != nil {
+		return fmt.Errorf("failed to create multipart upload for %s: %w", objName, err)
+	}
+
+	// Upload parts in parallel
+	var (
+		partNumbers = make([]int, numChunks)
+		mu          = &sync.Mutex{}
+		group       = &errgroup.Group{}
+	)
+
+	for i := range numChunks {
+		var (
+			partNum    = i + 1
+			offset     = uint64(partNum-1) * uint64(size) / uint64(numChunks)
+			nextOffset = uint64(partNum) * uint64(size) / uint64(numChunks)
+			partSize   = nextOffset - offset
+		)
+		group.Go(func() error {
+			return uploadMultipartPart(baseParams, bck, objName, uploadID, partNum, partSize, cksumType, mu, partNumbers)
+		})
+	}
+
+	// Wait for all parts to complete
+	if err := group.Wait(); err != nil {
+		if abortErr := api.AbortMultipartUpload(baseParams, bck, objName, uploadID); abortErr != nil {
+			return fmt.Errorf("failed to upload parts and failed to abort upload %s: upload error: %w, abort error: %v", objName, err, abortErr)
+		}
+		return fmt.Errorf("failed to upload parts of %s: %w", objName, err)
+	}
+
+	// Complete multipart upload
+	if err := api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers); err != nil {
+		if abortErr := api.AbortMultipartUpload(baseParams, bck, objName, uploadID); abortErr != nil {
+			return fmt.Errorf("failed to complete multipart upload and failed to abort %s: complete error: %w, abort error: %v", objName, err, abortErr)
+		}
+		return fmt.Errorf("failed to complete multipart upload for %s: %w", objName, err)
+	}
+
+	return nil
 }
 
 // PUT with HTTP trace
@@ -284,26 +377,28 @@ func newTraceCtx(proxyURL string) *traceCtx {
 	return tctx
 }
 
-func newGetRequest(proxyURL string, bck cmn.Bck, objName string, offset, length int64, latest bool) (*http.Request, error) {
-	var (
-		hdr   http.Header
-		query = url.Values{}
-	)
-	query = bck.AddToQuery(query)
+func newGetRequest(proxyURL string, wo *workOrder, p *params) (*http.Request, error) {
+	query := p.bck.AddToQuery(nil)
 	if etlName != "" {
 		query.Add(apc.QparamETLName, etlName)
 	}
-	if latest {
+	if p.latest {
 		query.Add(apc.QparamLatestVer, "true")
 	}
-	if length > 0 {
-		rng := cmn.MakeRangeHdr(offset, length)
+	if wo.archpath != "" {
+		query.Add(apc.QparamArchpath, wo.archpath)
+	}
+
+	var hdr http.Header
+	if p.readLen > 0 {
+		rng := cmn.MakeRangeHdr(p.readOff, p.readLen)
 		hdr = http.Header{cos.HdrRange: []string{rng}}
 	}
+
 	reqArgs := cmn.HreqArgs{
 		Method: http.MethodGet,
 		Base:   proxyURL,
-		Path:   apc.URLPathObjects.Join(bck.Name, objName),
+		Path:   apc.URLPathObjects.Join(p.bck.Name, wo.objName),
 		Query:  query,
 		Header: hdr,
 	}
@@ -338,8 +433,8 @@ func s3getDiscard(bck cmn.Bck, objName string) (int64, error) {
 }
 
 // getDiscard sends a GET request and discards returned data.
-func getDiscard(proxyURL string, bck cmn.Bck, objName string, offset, length int64, validate, latest bool) (int64, error) {
-	req, err := newGetRequest(proxyURL, bck, objName, offset, length, latest)
+func getDiscard(proxyURL string, wo *workOrder, p *params) (int64, error) {
+	req, err := newGetRequest(proxyURL, wo, p)
 	if err != nil {
 		return 0, err
 	}
@@ -353,30 +448,33 @@ func getDiscard(proxyURL string, bck cmn.Bck, objName string, offset, length int
 	}
 
 	var hdrCksumValue, hdrCksumType string
-	if validate {
+	if p.verifyHash {
 		hdrCksumValue = resp.Header.Get(apc.HdrObjCksumVal)
 		hdrCksumType = resp.Header.Get(apc.HdrObjCksumType)
 	}
-	src := "GET " + bck.Cname(objName)
-	n, cksumValue, err := readDiscard(resp, src, hdrCksumType)
+	n, cksumValue, err := readDiscard(resp, hdrCksumType)
 
 	resp.Body.Close()
 	if err != nil {
-		return 0, err
+		tag := "GET " + p.bck.Cname(wo.objName)
+		if wo.archpath != "" {
+			tag += "/" + wo.archpath
+		}
+		return 0, fmt.Errorf("%s: %v", tag, err)
 	}
-	if validate && hdrCksumValue != cksumValue {
+	if p.verifyHash && hdrCksumValue != cksumValue {
 		return 0, cmn.NewErrInvalidCksum(hdrCksumValue, cksumValue)
 	}
 	return n, err
 }
 
 // Same as above, but with HTTP trace.
-func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, latencies *httpLatencies, offset, length int64, validate, latest bool) (int64, error) {
+func getTraceDiscard(proxyURL string, wo *workOrder, p *params) (int64, error) {
 	var (
 		hdrCksumValue string
 		hdrCksumType  string
 	)
-	req, err := newGetRequest(proxyURL, bck, objName, offset, length, latest)
+	req, err := newGetRequest(proxyURL, wo, p)
 	if err != nil {
 		return 0, err
 	}
@@ -393,47 +491,67 @@ func getTraceDiscard(proxyURL string, bck cmn.Bck, objName string, latencies *ht
 	defer resp.Body.Close()
 
 	tctx.tr.tsHTTPEnd = time.Now()
-	if validate {
+	if p.verifyHash {
 		hdrCksumValue = resp.Header.Get(apc.HdrObjCksumVal)
 		hdrCksumType = resp.Header.Get(apc.HdrObjCksumType)
 	}
 
-	src := "GET " + bck.Cname(objName)
-	n, cksumValue, err := readDiscard(resp, src, hdrCksumType)
+	n, cksumValue, err := readDiscard(resp, hdrCksumType)
 	if err != nil {
-		return 0, err
+		tag := "GET " + p.bck.Cname(wo.objName)
+		if wo.archpath != "" {
+			tag += "/" + wo.archpath
+		}
+		return 0, fmt.Errorf("%s: %v", tag, err)
 	}
-	if validate && hdrCksumValue != cksumValue {
+	if p.verifyHash && hdrCksumValue != cksumValue {
 		err = cmn.NewErrInvalidCksum(hdrCksumValue, cksumValue)
 	}
 
-	tctx.tr.set(latencies)
+	tctx.tr.set(wo.latencies)
 	return n, err
 }
 
-// getConfig sends a {what:config} request to the url and discard the message
-// For testing purpose only
-func getConfig(proxyURL string) (httpLatencies, error) {
-	tctx := newTraceCtx(proxyURL)
-
-	url := proxyURL + apc.URLPathDae.S
-	req, _ := http.NewRequest(http.MethodGet, url, http.NoBody)
-	req.URL.RawQuery = api.GetWhatRawQuery(apc.WhatNodeConfig, "")
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), tctx.trace))
-
-	resp, err := tctx.tracedClient.Do(req)
+func getBatchDiscard(proxyURL string, bck cmn.Bck, req *apc.MossReq) (int64, error) {
+	bp := api.BaseParams{
+		URL:    proxyURL,
+		Client: runParams.bp.Client,
+		Token:  runParams.bp.Token,
+		UA:     runParams.bp.UA,
+	}
+	// do
+	rc, hdr, err := api.GetBatchStream(bp, bck, req)
 	if err != nil {
-		return httpLatencies{}, err
+		return 0, err
 	}
-	defer resp.Body.Close()
+	defer rc.Close()
 
-	_, _, err = readDiscard(resp, "GetConfig", "" /*cksum type*/)
-
-	l := httpLatencies{
-		ProxyConn: timeDelta(tctx.tr.tsProxyConn, tctx.tr.tsBegin),
-		Proxy:     time.Since(tctx.tr.tsProxyConn),
+	// read every single archived file in a streaming mode
+	// (while the data arrives)
+	var (
+		drain archive.Drain
+		ar    archive.Reader
+		ctype = hdr.Get(cos.HdrContentType)
+		mime  = archive.ExtFromContentType(ctype)
+	)
+	if mime == "" { // (unlikely)
+		debug.Assert(false, "missing or unknown Content-Type for get-batch: ", ctype)
+		mime = archive.ExtTar
 	}
-	return l, err
+	ar, err = archive.NewReader(mime, rc)
+	if err != nil {
+		return 0, err
+	}
+	err = ar.ReadUntil(&drain, "" /*match all*/, cos.EmptyMatchAll)
+	if err != nil {
+		return 0, err
+	}
+	size, num := drain.Totals()
+	if batchSize := int64(len(req.In)); num != batchSize {
+		err = fmt.Errorf("expected to drain %d files (got %d), total size: %s",
+			batchSize, num, cos.ToSizeIEC(size, 2))
+	}
+	return size, err
 }
 
 func listObjCallback(ctx *api.LsoCounter) {
@@ -447,7 +565,7 @@ func listObjCallback(ctx *api.LsoCounter) {
 }
 
 // listObjectNames returns a slice of object names of all objects that match the prefix in a bucket.
-func listObjectNames(p *params) ([]string, error) {
+func listObjectNames(p *params) (names []string, fcnt int /*num archived files*/, _ error) {
 	var (
 		bp       = p.bp
 		bck      = p.bck
@@ -462,16 +580,37 @@ func listObjectNames(p *params) ([]string, error) {
 		msg.Flags |= apc.LsNoDirs // aisloader's default (to override, use --list-dirs)
 	}
 	args := api.ListArgs{Callback: listObjCallback, CallAfter: longListTime}
-	lst, err := api.ListObjects(bp, bck, msg, args)
-	if err != nil {
-		return nil, err
+	if p.archParams.pct > 0 {
+		msg.Flags |= apc.LsArchDir
 	}
 
-	objs := make([]string, 0, len(lst.Entries))
-	for _, obj := range lst.Entries {
-		objs = append(objs, obj.Name)
+	lst, err := api.ListObjects(bp, bck, msg, args)
+	if err != nil {
+		return nil, 0, err
 	}
-	return objs, nil
+
+	names = make([]string, 0, len(lst.Entries))
+	for _, en := range lst.Entries {
+		if en.Flags&apc.EntryInArch != 0 {
+			debug.Assert(msg.Flags&apc.LsArchDir != 0)
+			objName, archPath := archive.SplitAtExtension(en.Name)
+			if archPath != "" {
+				names = append(names, encodeArchName(objName, archPath)) // with `archSep` delimiter
+				fcnt++
+				continue
+			}
+		}
+		// skip archive/shard objects themselves
+		if en.Flags&apc.EntryIsArchive != 0 {
+			debug.Assert(msg.Flags&apc.LsArchDir != 0)
+			continue
+		}
+
+		// plain object or shard itself
+		names = append(names, en.Name)
+	}
+
+	return names, fcnt, nil
 }
 
 func initS3Svc() error {
@@ -558,13 +697,13 @@ func s3ListObjects() ([]string, error) {
 	return names, nil
 }
 
-func readDiscard(r *http.Response, tag, cksumType string) (int64, string, error) {
+func readDiscard(r *http.Response, cksumType string) (int64, string, error) {
 	if r.StatusCode >= http.StatusBadRequest {
 		bytes, err := cos.ReadAll(r.Body)
 		if err == nil {
-			return 0, "", fmt.Errorf("bad status %d from %s, response: %s", r.StatusCode, tag, string(bytes))
+			return 0, "", fmt.Errorf("bad status %d, response: %s", r.StatusCode, string(bytes))
 		}
-		return 0, "", fmt.Errorf("bad status %d from %s: %v", r.StatusCode, tag, err)
+		return 0, "", fmt.Errorf("bad status %d: %v", r.StatusCode, err)
 	}
 
 	n, cksum, err := cos.CopyAndChecksum(io.Discard, r.Body, nil, cksumType)

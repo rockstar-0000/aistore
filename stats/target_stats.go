@@ -1,5 +1,5 @@
 // Package stats provides methods and functionality to register, track, log,
-// and StatsD-notify statistics that, for the most part, include "counter" and "latency" kinds.
+// and export metrics that, for the most part, include "counter" and "latency" kinds.
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -31,24 +31,33 @@ import (
 //
 // all error counters must have "err_" prefix (see `errPrefix`)
 
+//
+// ais target metrics: groups 1 through 4 =====================
+//
+
+// 1. datapath (counters, sizes, latencies) and common errors
 const (
-	// KindCounter & KindSize - always incremented
+	// KindThroughput
+	GetThroughput = "get.bps" // bytes per second
+	PutThroughput = "put.bps" // ditto
 
-	LruEvictCount = "lru.evict.n"
-	LruEvictSize  = "lru.evict.size"
+	// same as above via `.cumulative`
+	GetSize = "get.size"
+	PutSize = "put.size"
 
-	CleanupStoreCount = "cleanup.store.n"
-	CleanupStoreSize  = "cleanup.store.size"
+	// common latencies
+	AppendLatency    = "append.ns"
+	GetRedirLatency  = "get.redir.ns"
+	PutRedirLatency  = "put.redir.ns"
+	HeadLatencyTotal = "head.ns.total"
 
+	// out-of-band
 	VerChangeCount = "ver.change.n"
 	VerChangeSize  = "ver.change.size"
 
-	// errors
+	// errors (note common prefix convention)
 	ErrPutCksumCount = errPrefix + "put.cksum.n"
-
-	ErrFSHCCount = errPrefix + "fshc.n"
-
-	ErrDloadCount = errPrefix + "dl.n"
+	ErrFSHCCount     = errPrefix + "fshc.n"
 
 	// IO errors (must have ioErrPrefix)
 	IOErrGetCount    = ioErrPrefix + "get.n"
@@ -69,14 +78,32 @@ const (
 	RatelimPutRetryCount        = "ratelim.retry.put.n"
 	RatelimPutRetryLatencyTotal = "ratelim.retry.put.ns.total"
 
-	AppendLatency     = "append.ns"
-	GetRedirLatency   = "get.redir.ns"
-	PutRedirLatency   = "put.redir.ns"
-	DloadLatencyTotal = "dl.ns.total"
-	HeadLatency       = "head.ns"
-	HeadLatencyTotal  = "head.ns.total"
+	// compare w/ common `DeleteCount`
+	RemoteDeletedDelCount = core.RemoteDeletedDelCount
+)
 
-	// Dsort
+// 2. object metadata in memory
+const (
+	LcacheCollisionCount = core.LcacheCollisionCount
+	LcacheEvictedCount   = core.LcacheEvictedCount
+	LcacheErrCount       = core.LcacheErrCount
+	LcacheFlushColdCount = core.LcacheFlushColdCount
+)
+
+// 3. xactions (jobs)
+const (
+	// blob downloader
+	GetBlobSize = "getblob.size"
+
+	// LRU eviction
+	LruEvictCount = "lru.evict.n"
+	LruEvictSize  = "lru.evict.size"
+
+	// space cleanup
+	CleanupStoreCount = "cleanup.store.n"
+	CleanupStoreSize  = "cleanup.store.size"
+
+	// distributed sort (ext/dsort)
 	DsortCreationReqCount    = "dsort.creation.req.n"
 	DsortCreationRespCount   = "dsort.creation.resp.n"
 	DsortCreationRespLatency = "dsort.creation.resp.ns"
@@ -84,30 +111,44 @@ const (
 	DsortExtractShardMemCnt  = "dsort.extract.shard.mem.n"
 	DsortExtractShardSize    = "dsort.extract.shard.size" // uncompressed
 
-	// ETL
+	// ETL (ext/etl)
+	ETLInlineCount         = "etl.inline.n"
+	ETLInlineLatencyTotal  = "etl.inline.ns.total"
+	ETLInlineSize          = "etl.inline.size"
 	ETLOfflineCount        = "etl.offline.n"
 	ETLOfflineLatencyTotal = "etl.offline.ns.total"
+	ETLOfflineSize         = "etl.offline.size"
 
-	// Downloader
-	DloadSize = "dl.size"
+	// downloader (ext/dload)
+	// (not to confuse with blob downloader)
+	DloadSize         = "dl.size"
+	DloadLatencyTotal = "dl.ns.total"
+	ErrDloadCount     = errPrefix + "dl.n"
 
-	// KindThroughput
-	GetThroughput = "get.bps" // bytes per second
-	PutThroughput = "put.bps" // ditto
+	// get-batch (x-moss)
+	GetBatchCount     = "getbatch.n"
+	GetBatchObjCount  = "getbatch.obj.n"
+	GetBatchFileCount = "getbatch.file.n"
+	GetBatchObjSize   = "getbatch.obj.size"
+	GetBatchFileSize  = "getbatch.file.size"
 
-	// same as above via `.cumulative`
-	GetSize = "get.size"
-	PutSize = "put.size"
+	GetBatchRxWaitTotal   = "getbatch.rxwait.ns"
+	GetBatchThrottleTotal = "getbatch.throttle.ns"
 
-	// core
-	RemoteDeletedDelCount = core.RemoteDeletedDelCount // compare w/ common `DeleteCount`
+	ErrGetBatchCount     = errPrefix + "getbatch.n"
+	GetBatchSoftErrCount = errPrefix + "soft.getbatch.n"
+)
 
-	LcacheCollisionCount = core.LcacheCollisionCount
-	LcacheEvictedCount   = core.LcacheEvictedCount
-	LcacheErrCount       = core.LcacheErrCount
-	LcacheFlushColdCount = core.LcacheFlushColdCount
+// 4, streams (peer-to-peer long-lived connections)
+const (
+	_ = cos.StreamsOutObjCount
+	_ = cos.StreamsOutObjSize
+	_ = cos.StreamsInObjCount
+	_ = cos.StreamsInObjSize
+)
 
-	// variable label used for prometheus disk metrics
+// variable label used for prometheus disk metrics
+const (
 	diskMetricLabel = "disk"
 )
 
@@ -139,6 +180,10 @@ const (
 	minLogDiskUtil = 15 // skip logging idle disks
 
 	numTargetStats = 48 // approx. initial
+
+	numDisks = 12 // recommended ballpark for production targets
+
+	clipLogLines = 64 // max r.lines cap
 )
 
 /////////////
@@ -168,10 +213,10 @@ func (r *Trunner) Init() *atomic.Bool {
 	r.regCommon(r.t.Snode())
 
 	r.ctracker = make(copyTracker, numTargetStats) // these two are allocated once and only used in serial context
-	r.lines = make([]string, 0, 16)
+	r.lines = make([]string, 0, min(clipLogLines/4, 16))
 
-	r.disk.stats = make(cos.AllDiskStats, 16)
-	r.disk.metrics = make(map[string]dmetric, 16)
+	r.disk.stats = make(cos.AllDiskStats, cos.NumDiskMetrics*numDisks)
+	r.disk.metrics = make(map[string]dmetric, cos.NumDiskMetrics*numDisks)
 
 	config := cmn.GCO.Get()
 	r.core.statsTime = config.Periodic.StatsTime.D()
@@ -311,12 +356,6 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 			VarLabs: BckXlabs,
 		},
 	)
-	r.reg(snode, HeadLatency, KindLatency,
-		&Extra{
-			Help:    "HEAD: average time (milliseconds) over the last periodic.stats_time interval",
-			VarLabs: BckVlabs,
-		},
-	)
 	r.reg(snode, HeadLatencyTotal, KindTotal,
 		&Extra{
 			Help:    "HEAD: total cumulative time (nanoseconds)",
@@ -366,6 +405,12 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 			VarLabs: BckXlabs,
 		},
 	)
+	r.reg(snode, GetBlobSize, KindSize,
+		&Extra{
+			Help:    "BLOB DOWNLOAD: total cumulative size (bytes)",
+			VarLabs: BckVlabs,
+		},
+	)
 
 	// errors
 	r.reg(snode, ErrPutCksumCount, KindCounter,
@@ -411,7 +456,7 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 		},
 	)
 
-	// streams
+	// streams: peer-to-peer long-lived connections
 	r.reg(snode, cos.StreamsOutObjCount, KindCounter,
 		&Extra{
 			Help: "intra-cluster streaming communications: number of sent objects",
@@ -433,6 +478,7 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 		},
 	)
 
+	// downloader (ext/dload)
 	r.reg(snode, DloadSize, KindSize,
 		&Extra{
 			Help:    "total downloaded size (bytes)",
@@ -504,15 +550,43 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 		},
 	)
 
-	// ETL
+	// ETL inline
+	r.reg(snode, ETLInlineCount, KindCounter,
+		&Extra{
+			Help:    "Total number of ETL inline transform requests",
+			VarLabs: BckXlabs,
+		},
+	)
+	r.reg(snode, ETLInlineLatencyTotal, KindTotal,
+		&Extra{
+			Help:    "Total accumulated latency of ETL inline transform requests (nanoseconds)",
+			VarLabs: BckXlabs,
+		},
+	)
+	r.reg(snode, ETLInlineSize, KindSize,
+		&Extra{
+			Help:    "ETL Inline Transformation: total cumulative size (bytes)",
+			VarLabs: BckXlabs,
+		},
+	)
+
+	// ETL offline
 	r.reg(snode, ETLOfflineCount, KindCounter,
 		&Extra{
-			Help: "Total number of requests to ETL made by offline transform jobs",
+			Help:    "Total number of requests to ETL made by offline transform jobs",
+			VarLabs: BckXlabs,
 		},
 	)
 	r.reg(snode, ETLOfflineLatencyTotal, KindTotal,
 		&Extra{
-			Help: "Total accumulated latency of requests to ETL made by offline transform jobs (nanoseconds)",
+			Help:    "Total accumulated latency of requests to ETL made by offline transform jobs (nanoseconds)",
+			VarLabs: BckXlabs,
+		},
+	)
+	r.reg(snode, ETLOfflineSize, KindSize,
+		&Extra{
+			Help:    "ETL Offline Transformation: total cumulative size (bytes)",
+			VarLabs: BckXlabs,
 		},
 	)
 
@@ -530,6 +604,53 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 	r.reg(snode, LcacheFlushColdCount, KindCounter,
 		&Extra{
 			Help: "number of times a LOM from cache was written to stable storage (core, internal)",
+		},
+	)
+
+	// get-batch (x-moss)
+	r.reg(snode, GetBatchCount, KindCounter,
+		&Extra{
+			Help: "total number of get-batch requests (work items)",
+		},
+	)
+	r.reg(snode, GetBatchObjCount, KindCounter,
+		&Extra{
+			Help: "get-batch: total number of whole objects retrieved and delivered via output archive",
+		},
+	)
+	r.reg(snode, GetBatchFileCount, KindCounter,
+		&Extra{
+			Help: "get-batch: total number of files extracted from shards and delivered via output archive",
+		},
+	)
+	r.reg(snode, GetBatchObjSize, KindSize,
+		&Extra{
+			Help: "get-batch: total cumulative size (bytes) of whole objects",
+		},
+	)
+	r.reg(snode, GetBatchFileSize, KindSize,
+		&Extra{
+			Help: "get-batch: total cumulative size (bytes) of archived files extracted from shards",
+		},
+	)
+	r.reg(snode, GetBatchRxWaitTotal, KindTotal,
+		&Extra{
+			Help: "get-batch: total cumulative time (nanoseconds) spent waiting to receive entries from peer targets",
+		},
+	)
+	r.reg(snode, GetBatchThrottleTotal, KindTotal,
+		&Extra{
+			Help: "get-batch: total cumulative time (nanoseconds) slept due to resource pressure",
+		},
+	)
+	r.reg(snode, GetBatchSoftErrCount, KindCounter,
+		&Extra{
+			Help: "get-batch: number of transient errors (retryable failures under configured limit)",
+		},
+	)
+	r.reg(snode, ErrGetBatchCount, KindCounter,
+		&Extra{
+			Help: "get-batch: number of hard errors including request failures and 429 rejections",
 		},
 	)
 }
@@ -604,9 +725,10 @@ func (r *Trunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 	r._fshcMaybe(config)
 
 	r.lines = r.lines[:0]
+	r.lines = cos.ResetSliceCap(r.lines, clipLogLines) // clip cap
 
 	// 1. disk stats
-	refreshCap := r.Tcdf.HasAlerts()
+	refreshCap := r.Tcdf.Alerts() != 0
 	fs.DiskStats(r.disk.stats, nil /*fs.TcdfExt*/, config, refreshCap)
 
 	s := r.core
@@ -617,22 +739,18 @@ func (r *Trunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 			nlog.Warningln("missing:", n)
 			continue
 		}
-		v.Value = stats.RBps
-		v = s.Tracker[r.nameRavg(disk)]
-		v.Value = stats.Ravg
-		v = s.Tracker[r.nameWbps(disk)]
-		v.Value = stats.WBps
-		v = s.Tracker[r.nameWavg(disk)]
-		v.Value = stats.Wavg
-		v = s.Tracker[r.nameUtil(disk)]
-		v.Value = stats.Util
+		s.set(n, stats.RBps)
+		s.set(r.nameRavg(disk), stats.Ravg)
+		s.set(r.nameWbps(disk), stats.WBps)
+		s.set(r.nameWavg(disk), stats.Wavg)
+		s.set(r.nameUtil(disk), stats.Util)
 	}
 
-	// 2 copy stats, reset latencies, send via StatsD if configured
+	// 2 copy stats, reset latencies
 	s.updateUptime(uptime)
 	idle := s.copyT(r.ctracker, config.Disk.DiskUtilLowWM)
 
-	verbose := cmn.Rom.FastV(4, cos.SmoduleStats)
+	verbose := cmn.Rom.V(4, cos.ModStats)
 	if (!idle && now >= r.next) || verbose {
 		s.sgl.Reset() // sharing w/ CoreStats.copyT
 		r.write(s.sgl, true /*target*/, idle)
@@ -680,7 +798,10 @@ func (r *Trunner) log(now int64, uptime time.Duration, config *cmn.Config) {
 }
 
 func (r *Trunner) _cap(config *cmn.Config, now int64, verbose bool) (set, clr cos.NodeStateFlags) {
-	cs, updated, err, errCap := fs.CapPeriodic(now, config, &r.Tcdf)
+	// currently set (and visible via Prometheus/Grafana)
+	flags := r.nodeStateFlags()
+
+	cs, updated, err, errCap := fs.CapPeriodic(now, config, &r.Tcdf, flags)
 	if err != nil {
 		nlog.Errorln(err)
 		debug.Assert(!updated && errCap == nil, updated, " ", errCap)
@@ -691,40 +812,37 @@ func (r *Trunner) _cap(config *cmn.Config, now int64, verbose bool) (set, clr co
 	}
 
 	var (
-		pcs       = &cs
-		hasAlerts bool
+		diskAlerts cos.NodeStateFlags
+		pcs        = &cs
 	)
 	if !updated {
 		pcs = nil // to possibly force refresh via t.OOS
 	} else {
-		hasAlerts = r.Tcdf.HasAlerts()
+		diskAlerts = r.Tcdf.Alerts()
 	}
 
 	// target to run x-space
 	if errCap != nil {
 		r.t.OOS(pcs, config, &r.Tcdf)
+		flags = r.nodeStateFlags()
 	} else if cs.PctMax > int32(config.Space.CleanupWM) { // remove deleted, other cleanup
 		debug.Assert(!cs.IsOOS(), cs.String())
 		errCap = cmn.NewErrCapExceeded(cs.TotalUsed, cs.TotalAvail+cs.TotalUsed, 0, config.Space.CleanupWM, cs.PctMax, false)
 		r.t.OOS(pcs, config, &r.Tcdf)
+		flags = r.nodeStateFlags()
 	}
 
-	//
-	// (periodically | on error | verbose): log mountpath cap and state
-	//
-	if now >= r.cs.last+dlftCapLogInterval || errCap != nil || hasAlerts || verbose {
+	// log (periodically | on error | verbose) mountpath cap and state
+	if now >= r.cs.last+dlftCapLogInterval || errCap != nil || diskAlerts != 0 || verbose {
 		r.logCapacity(now)
 	}
 
-	// and more
-	flags := r.nodeStateFlags()
-	if hasAlerts || flags.IsRed() {
+	// log warning
+	if diskAlerts != 0 || flags.IsRed() {
 		r.lines = append(r.lines, "Warning: state alerts:", flags.String())
-	} else if flags.IsSet(cos.DiskFault) && updated {
-		clr |= cos.DiskFault
 	}
 
-	// cap alert
+	// set/clear node cap alerts
 	switch {
 	case cs.IsOOS():
 		set = cos.OOS
@@ -734,6 +852,19 @@ func (r *Trunner) _cap(config *cmn.Config, now int64, verbose bool) (set, clr co
 	default:
 		clr = cos.OOS | cos.LowCapacity
 	}
+
+	// set/clear disk cap alerts
+	if updated {
+		// disk capacity alerts only; DiskFault is raised by the FSHC (tgtfshc)
+		const diskMask = cos.DiskOOS | cos.DiskLowCapacity
+		cur := flags & diskMask      // previous advertised disk bits
+		upd := diskAlerts & diskMask // freshly detected
+		if cur != upd {
+			set |= (^cur) & upd
+			clr |= cur & (^upd)
+		}
+	}
+
 	return set, clr
 }
 
@@ -765,7 +896,7 @@ func (r *Trunner) logCapacity(now int64) {
 				sb.WriteString(strconv.Itoa(int(cdf.Capacity.PctUsed)))
 				sb.WriteByte('%')
 				sb.WriteString(", avail ")
-				sb.WriteString(cos.ToSizeIEC(int64(cdf.Capacity.Avail), 2))
+				sb.WriteString(cos.IEC(int64(cdf.Capacity.Avail), 2))
 			}
 
 			r.lines = append(r.lines, sb.String())
@@ -783,10 +914,10 @@ func (r *Trunner) logDiskStats(verbose bool) {
 			continue
 		}
 
-		rbps := cos.ToSizeIEC(stats.RBps, 0)
-		wbps := cos.ToSizeIEC(stats.WBps, 0)
-		ravg := cos.ToSizeIEC(stats.Ravg, 0)
-		wavg := cos.ToSizeIEC(stats.Wavg, 0)
+		rbps := cos.IEC(stats.RBps, 0)
+		wbps := cos.IEC(stats.WBps, 0)
+		ravg := cos.IEC(stats.Ravg, 0)
+		wavg := cos.IEC(stats.Wavg, 0)
 		l := len(disk) + len(rbps) + len(wbps) + len(ravg) + len(wavg) + 64
 		buf := make([]byte, 0, l)
 		buf = append(buf, disk...)
@@ -805,6 +936,8 @@ func (r *Trunner) logDiskStats(verbose bool) {
 	}
 }
 
+const maxJobs2Log = 32
+
 func (r *Trunner) _jobs(verbose bool) string {
 	r.xallRun.Running = r.xallRun.Running[:0]
 	r.xallRun.Idle = r.xallRun.Idle[:0]
@@ -818,14 +951,8 @@ func (r *Trunner) _jobs(verbose bool) string {
 	}
 
 	var sb strings.Builder
-	if len(r.xallRun.Running) > 0 {
-		cos.AppendStrings(&sb, "running: ", ' ', r.xallRun.Running...)
-		if len(r.xallRun.Idle) > 0 {
-			cos.AppendStrings(&sb, ";  idle: ", ' ', r.xallRun.Idle...)
-		}
-	} else if len(r.xallRun.Idle) > 0 {
-		cos.AppendStrings(&sb, "idle: ", ' ', r.xallRun.Idle...)
-	}
+	_more(&sb, r.xallRun.Running, "running")
+	_more(&sb, r.xallRun.Idle, "idle")
 
 	ln := sb.String()
 	if ln != "" && ln != r.xln {
@@ -833,6 +960,48 @@ func (r *Trunner) _jobs(verbose bool) string {
 	}
 
 	return ln
+}
+
+func _more(sb *strings.Builder, xnames []string, prefix string) {
+	l := len(xnames)
+	if l == 0 {
+		return
+	}
+	show := xnames
+	more := l - maxJobs2Log
+	if more > 0 {
+		show = show[:maxJobs2Log]
+	}
+
+	if sb.Len() > 0 {
+		prefix = "; " + prefix
+	}
+	_apps(sb, prefix, show, l)
+	if more > 0 {
+		sb.WriteString("... (and ")
+		sb.WriteString(strconv.Itoa(more))
+		sb.WriteString(" more)")
+	}
+}
+
+func _apps(sb *strings.Builder, prefix string, items []string, total int) {
+	l := len(prefix)
+	l += 12             // count
+	l += len(items) - 1 // times sepa
+	for _, s := range items {
+		l += len(s)
+	}
+	sb.Grow(l)
+
+	sb.WriteString(prefix)
+	sb.WriteByte('(')
+	sb.WriteString(strconv.Itoa(total))
+	sb.WriteString("): ")
+	sb.WriteString(items[0])
+	for _, s := range items[1:] {
+		sb.WriteByte(' ')
+		sb.WriteString(s)
+	}
 }
 
 func (r *Trunner) statsTime(newval time.Duration) {

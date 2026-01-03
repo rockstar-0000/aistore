@@ -1,13 +1,13 @@
 //go:build nethttp
 
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strconv"
@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
 )
 
 const ua = "aisnode/streams"
@@ -35,6 +36,7 @@ func NewIntraDataClient() (client *http.Client) {
 		SndRcvBufSize:   cos.NonZero(config.Net.L4.SndRcvBufSize, int(cmn.DefaultSndRcvBufferSize)),
 		WriteBufferSize: cos.NonZero(httcfg.WriteBufferSize, int(cmn.DefaultWriteBufferSize)),
 		ReadBufferSize:  cos.NonZero(httcfg.ReadBufferSize, int(cmn.DefaultReadBufferSize)),
+		IdleConnTimeout: cmn.DfltMaxIdleTimeout,
 	}
 	if config.Net.HTTP.UseHTTPS {
 		client = cmn.NewClientTLS(cargs, config.Net.HTTP.ToTLS(), true /*intra-cluster*/) // streams
@@ -44,16 +46,16 @@ func NewIntraDataClient() (client *http.Client) {
 	return
 }
 
-func (s *streamBase) doPlain(body io.Reader) error {
-	req, err := http.NewRequest(http.MethodPut, s.dstURL, body)
+func (s *base) doPlain(body io.Reader) error {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, s.dstURL, body)
 	if err != nil {
 		return err
 	}
 	return s._do(req)
 }
 
-func (s *streamBase) doCmpr(body io.Reader) error {
-	req, err := http.NewRequest(http.MethodPut, s.dstURL, body)
+func (s *base) doCmpr(body io.Reader) error {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, s.dstURL, body)
 	if err != nil {
 		return err
 	}
@@ -63,8 +65,9 @@ func (s *streamBase) doCmpr(body io.Reader) error {
 	return err
 }
 
-func (s *streamBase) _do(req *http.Request) error {
+func (s *base) _do(req *http.Request) error {
 	req.Header.Set(apc.HdrSessID, strconv.FormatInt(s.sessID, 10))
+	req.Header.Set(apc.HdrSenderID, core.T.SID())
 	req.Header.Set(cos.HdrUserAgent, ua)
 
 	resp, err := s.client.Do(req)

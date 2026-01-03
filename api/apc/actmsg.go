@@ -39,6 +39,7 @@ const (
 
 	ActMakeNCopies = "make-n-copies"
 	ActPutCopies   = "put-copies"
+	ActRechunk     = "rechunk"
 
 	ActRebalance = "rebalance"
 	ActMoveBck   = "move-bck"
@@ -56,6 +57,11 @@ const (
 	ActNewPrimary     = "new-primary"
 	ActPromote        = "promote"
 	ActRenameObject   = "rename-obj"
+
+	// multipart upload
+	ActMptUpload   = "mpt-upload"   // create a new multipart upload
+	ActMptComplete = "mpt-complete" // complete a multipart upload
+	ActMptAbort    = "mpt-abort"    // abort a multipart upload
 
 	// cp (reverse)
 	ActResetStats  = "reset-stats"
@@ -113,6 +119,7 @@ const (
 // internal use
 const (
 	ActAddRemoteBck = "add-remote-bck"         // add to BMD existing remote bucket, usually on the fly
+	ActHeadBckWith  = "head-bck-with-bprops"   // HEAD(cloud bucket) with one-shot bprops (such as `extra.aws.profile` et al.)
 	ActRmNodeUnsafe = "rm-unsafe"              // primary => the node to be removed
 	ActStartGFN     = "start-gfn"              // get-from-neighbor
 	ActStopGFN      = "stop-gfn"               // off
@@ -134,18 +141,6 @@ const (
 	// Actions on xactions
 	ActXactStop  = Stop
 	ActXactStart = Start
-
-	// auxiliary
-	ActTransient = "transient" // transient - in-memory only
-)
-
-// xaction 2-phase commit and related control (compare w/ QparamPrepare)
-const (
-	ActBegin  = "begin"
-	ActCommit = "commit"
-	ActAbort  = "abort"
-
-	ActQuery = "query"
 )
 
 const (
@@ -154,23 +149,25 @@ const (
 )
 
 const (
-	ActDmOpen  = "open-shared-streams"
-	ActDmClose = "close-shared-streams"
+	ActOpenSDM  = "open-shared-dm"
+	ActCloseSDM = "close-shared-dm"
 )
 
 const (
-	ActEcOpen    = "open-ec-streams"
-	ActEcClose   = "close-ec-streams"
+	ActOpenEC    = "open-ec-streams"
+	ActCloseEC   = "close-ec-streams"
 	ActEcRecover = "recover" // check and recover missing or corrupted EC metadata and/or slices, if any
 )
 
 // ActMsg is a JSON-formatted control structures used in a majority of API calls
 type (
+	// swagger:model
 	ActMsg struct {
 		Value  any    `json:"value"`  // action-specific and optional
 		Action string `json:"action"` // ActShutdown, ActRebalance, and many more (see apc/const.go)
 		Name   string `json:"name"`   // action-specific info of any kind (not necessarily "name")
 	}
+	// swagger:model
 	ActValRmNode struct {
 		DaemonID          string `json:"sid"`
 		SkipRebalance     bool   `json:"skip_rebalance"`
@@ -181,6 +178,7 @@ type (
 )
 
 type (
+	// swagger:model
 	JoinNodeResult struct {
 		DaemonID    string `json:"daemon_id"`
 		RebalanceID string `json:"rebalance_id"`
@@ -193,6 +191,7 @@ type (
 //   - Disabled  - list of disabled mountpaths, the mountpaths that generated
 //     IO errors followed by (FSHC) health check, etc.
 type (
+	// swagger:model
 	MountpathList struct {
 		Available []string `json:"available"`
 		WaitingDD []string `json:"waiting_dd"`
@@ -202,19 +201,25 @@ type (
 
 // sysinfo
 type (
+	// swagger:model
 	CapacityInfo struct {
 		Used    uint64  `json:"fs_used,string"`
 		Total   uint64  `json:"fs_capacity,string"`
 		PctUsed float64 `json:"pct_fs_used"`
 	}
+	// swagger:model
 	TSysInfo struct {
 		MemCPUInfo
 		CapacityInfo
 	}
+
+	// swagger:model
 	ClusterSysInfo struct {
 		Proxy  map[string]*MemCPUInfo `json:"proxy"`
 		Target map[string]*TSysInfo   `json:"target"`
 	}
+
+	// swagger:model
 	ClusterSysInfoRaw struct {
 		Proxy  cos.JSONRawMsgs `json:"proxy"`
 		Target cos.JSONRawMsgs `json:"target"`

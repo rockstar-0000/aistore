@@ -7,6 +7,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -218,21 +219,21 @@ func helpMorePrinter(_ io.Writer, templ string, data any) {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if _, err := io.Copy(buffer, r); err != nil {
 			exitln("write sgl:", err)
 		}
 		r.Close()
-	}()
+	})
 
 	cli.HelpPrinterCustom(w, templ, data, funcColorMap)
 
 	w.Close()
 	wg.Wait()
 
-	cmd := exec.Command("more")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "more")
 	cmd.Stdin = buffer
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

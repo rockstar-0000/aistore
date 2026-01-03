@@ -1,11 +1,13 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -64,12 +66,12 @@ func (*llcFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) { return 
 func newXactLLC(uuid string, bck *meta.Bck) (r *xactLLC) {
 	r = &xactLLC{}
 	mpopts := &mpather.JgroupOpts{
-		CTs:      []string{fs.ObjectType},
+		CTs:      []string{fs.ObjCT},
 		VisitObj: func(*core.LOM, []byte) error { return nil },
 		DoLoad:   mpather.Load,
 	}
 	mpopts.Bck.Copy(bck.Bucket())
-	r.BckJog.Init(uuid, apc.ActLoadLomCache, "" /*ctlmsg*/, bck, mpopts, cmn.GCO.Get())
+	r.BckJog.Init(uuid, apc.ActLoadLomCache, bck, mpopts, cmn.GCO.Get())
 	return
 }
 
@@ -83,10 +85,16 @@ func (r *xactLLC) Run(*sync.WaitGroup) {
 	r.Finish()
 }
 
-func (r *xactLLC) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return
+func (r *xactLLC) CtlMsg() string {
+	nv := r.NumVisits()
+	if nv == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(16)
+	sb.WriteString(", visited:")
+	sb.WriteString(strconv.FormatInt(nv, 10))
+	return sb.String()
 }
+
+func (r *xactLLC) Snap() *core.Snap { return r.Base.NewSnap(r) }

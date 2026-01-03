@@ -1,9 +1,26 @@
+## Background and Introduction
+
+A **bucket** is a named container for objects - monolithic files or chunked representations - with associated metadata. It is the fundamental unit of data organization and data management.
+
+AIS buckets are categorized by their [provider](/docs/bucket.md#provider) and origin. **Native** `ais://` buckets managed by [this cluster](#at-a-glance) are always created explicitly (via `ais create` or the respective Go and/or Python [APIs](#aistore-api)).
+
+Remote buckets (including `s3://`, `gs://`, etc., and `ais://` buckets in remote AIS clusters) are [usually](/docs/bucket.md#creation) discovered and auto-added on-the-fly on first access.
+
+In a cluster, every bucket is assigned a unique, cluster-wide bucket ID (`BID`). Same-name remote buckets with different [namespaces](/docs/bucket.md#bucket-identity) get different IDs.
+Every object a) belongs to exactly one bucket and b) is identified by a unique name within that bucket.
+
+Bucket [properties](/docs/bucket.md#bucket-properties) define data protection (checksums, mirroring, erasure coding), chunked representation, versioning and synchronization with remote sources, access control, backend linkage, feature flags, rate-limit settings, and more.
+
+> For types of supported buckets (AIS, Cloud, remote AIS, etc.), bucket identity, properties, lifecycle, and associated policies, storage services and usage examples, see the comprehensive:
+> * [AIS Buckets: Design and Operations](/docs/bucket.md)
+
 It is easy to see all CLI operations on *buckets*:
 
 ```console
 $ ais bucket <TAB-TAB>
 
-ls   summary    validate   lru     evict   show    create     cp     mv      rm       props
+ls         validate   evict      show       cp         etl      rm
+summary    lru        prefetch   create     archive    mv       props
 ```
 
 For convenience, a few of the most popular verbs are also aliased:
@@ -16,8 +33,6 @@ evict           bucket evict
 ls              bucket ls
 rmb             bucket rm
 ```
-
-> For types of supported buckets (AIS, Cloud, remote AIS, etc.), bucket management and properties, storage services and more usage examples, see [in-depth overview](/docs/bucket.md).
 
 ## Table of Contents
 - [Create bucket](#create-bucket)
@@ -44,6 +59,50 @@ rmb             bucket rm
 `ais create BUCKET [BUCKET...]`
 
 Create bucket(s).
+
+```console
+$ ais create --help
+NAME:
+   ais create - (alias for "bucket create") Create AIS buckets or explicitly attach remote buckets with non-default credentials/properties.
+     Normally, AIS auto-adds remote buckets on first access (ls/get/put): when a user references a new bucket,
+     AIS looks it up behind the scenes, confirms its existence and accessibility, and "on-the-fly" updates its
+     cluster-wide global (BMD) metadata containing bucket definitions, management policies, and properties.
+     Use this command when you need to:
+       1) create an ais:// bucket in this cluster;
+       2) create a bucket in a remote AIS cluster (e.g., 'ais://@remais/BUCKET');
+       3) set up a cloud bucket with a custom profile and/or endpoint/region;
+       4) set bucket properties before first access;
+       5) attach multiple same-name cloud buckets under different namespaces (e.g., 's3://#ns1/bucket', 's3://#ns2/bucket');
+       6) and finally, register a cloud bucket that is not (yet) accessible (advanced-usage '--skip-lookup' option).
+   Examples:
+     - ais create ais://mybucket                                                                              - create AIS bucket 'mybucket' (must be done explicitly);
+     - ais create ais://@remais/BUCKET                                                                        - create a bucket in a remote AIS cluster referenced by the cluster's alias or UUID;
+     - ais create s3://mybucket                                                                               - add existing cloud (S3) bucket; normally AIS would auto-add it on first access;
+     - ais create s3://mybucket --props='extra.aws.profile=prod extra.aws.multipart_size=333M'                - add S3 bucket using a non-default cloud profile;
+     - ais create s3://#myaccount/mybucket --props='extra.aws.profile=swift extra.aws.endpoint=$S3_ENDPOINT'  - attach S3-compatible bucket via namespace '#myaccount';
+     - ais create s3://mybucket --skip-lookup --props='extra.aws.profile=...'                                 - advanced: register bucket without verifying its existence/accessibility (use with care).
+
+
+USAGE:
+   ais create BUCKET [BUCKET...] [command options]
+
+OPTIONS:
+   force,f       Force execution of the command (caution: advanced usage only)
+   ignore-error  Ignore "soft" failures such as "bucket already exists", etc.
+   props         Create bucket with the specified (non-default) properties, e.g.:
+                 * ais create ais://mmm --props="versioning.validate_warm_get=false versioning.synchronize=true"
+                 * ais create ais://nnn --props='mirror.enabled=true mirror.copies=4 checksum.type=md5'
+                 * ais create s3://bbb --props='extra.cloud.profile=prod extra.cloud.endpoint=https://s3.example.com'
+                 Tips:
+                   1) Use '--props' to override properties that a new bucket would normally inherit from cluster config at creation time.
+                   2) Use '--props' to set up an existing cloud bucket with a custom profile and/or custom endpoint/region.
+                 See also: 'ais bucket props show' and 'ais bucket props set'
+   skip-lookup   Do not execute HEAD(bucket) request to lookup remote bucket and its properties; possible usage scenarios include:
+                  1) adding remote bucket to aistore without first checking the bucket's accessibility
+                     (e.g., to configure the bucket's aistore properties with alternative security profile and/or endpoint)
+                  2) listing public-access Cloud buckets where certain operations (e.g., 'HEAD(bucket)') may be disallowed
+   help, h       Show help
+```
 
 ### Examples
 
@@ -102,6 +161,11 @@ $ ais create ais://@Bghort1l/bucket_name --props='{"versioning": {"enabled": tru
 $ ais create aws://bucket_name
 Create bucket "aws://bucket_name" failed: creating a bucket for any of the cloud or HTTP providers is not supported
 ```
+
+### See also
+
+* [AIS Buckets: Design and Operations: Part II](/docs/bucket.md#part-ii-how-to)
+* [Blog: The Many Lives of a Dataset Called "data"](https://aistore.nvidia.com/blog/2025/12/15/s3-data-with-namespace)
 
 ## Delete bucket
 
@@ -706,6 +770,10 @@ qFpwOOifUe.tar   8.50KiB         8b5919c0850a07d931c3c46ed9101eab               
 thmdpZXetG.tar   8.50KiB         cfe0c386e91daa1571d6a659f49b1408                1622137609269706        no      ok      0
 ```
 
+### See also
+
+* [AIS Buckets: Design and Operations: Part II](/docs/bucket.md#part-ii-how-to)
+
 ## Move or Rename a bucket
 
 `ais bucket mv BUCKET NEW_BUCKET`
@@ -736,7 +804,7 @@ $ ais cp --help
 NAME:
    ais cp - (alias for "bucket cp") Copy entire bucket or selected objects (to select, use '--list', '--template', or '--prefix'),
      e.g.:
-     - 'ais cp gs://webdaset-coco ais://dst'                                    - copy entire Cloud bucket;
+     - 'ais cp gs://webdataset-coco ais://dst'                                  - copy entire Cloud bucket;
      - 'ais cp s3://abc ais://nnn --all'                                        - copy Cloud bucket that may _not_ be present in cluster (and create destination if doesn't exist);
      - 'ais cp s3://abc ais://nnn --all --num-workers 16'                       - same as above employing 16 concurrent workers;
      - 'ais cp s3://abc ais://nnn --all --num-workers 16 --prefix dir/subdir/'  - same as above, but limit copying to a given virtual subdirectory;
@@ -1083,7 +1151,7 @@ OPTIONS:
    --help, -h        Show help
 ```
 
-If `BUCKET` is omitted, the command *applies* to all [AIS buckets](/docs/bucket.md#ais-bucket).
+If `BUCKET` is omitted, the command *applies* to all [AIS buckets](/docs/bucket.md).
 
 The output includes the total number of objects in a bucket, the bucket's size (bytes, megabytes, etc.), and the percentage of the total capacity used by the bucket.
 
@@ -1256,12 +1324,11 @@ All options are required and must be greater than `0`.
 
 Overall, the topic called "bucket properties" is rather involved and includes sub-topics "bucket property inheritance" and "cluster-wide global defaults". For background, please first see:
 
-* [Default Bucket Properties](/docs/bucket.md#default-bucket-properties)
-* [Inherited Bucket Properties and LRU](/docs/bucket.md#inherited-bucket-properties-and-lru)
+* [Bucket Properties](/docs/bucket.md#bucket-properties)
 * [Backend Provider](/docs/overview.md#backend-provider)
 * [Global cluster-wide configuration](/docs/configuration.md#cluster-and-node-configuration).
 
-Now, as far as CLI, run the following to list [properties](/docs/bucket.md#properties-and-options) of the specified bucket.
+Now, as far as CLI, run the following to list [properties](/docs/bucket.md#bucket-properties) of the specified bucket.
 By default, a certain compact form of bucket props sections is presented.
 
 `ais bucket props show BUCKET [PROP_PREFIX] [command options]`

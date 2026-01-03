@@ -8,6 +8,7 @@ package cmn
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 const IterFieldNameSepa = "."
@@ -53,6 +55,14 @@ type (
 	}
 
 	updateFunc func(uniqueTag string, field IterField) (error, bool)
+)
+
+type (
+	// controls how CopyProps/_copyProps enforce config scope and transient rules
+	CopyPropsOpts struct {
+		Transient   bool // treat changes as transient: forbid writes to allow:"cluster"
+		IgnoreScope bool // when true, skip allow:"cluster" violations instead of failing (config override-only)
+	}
 )
 
 // interface guard
@@ -134,10 +144,23 @@ func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, st
 		// If the field is a pointer to a struct we must dereference it.
 		if srcValField.Kind() == reflect.Ptr && srcValField.Type().Elem().Kind() == reflect.Struct {
 			if srcValField.IsNil() {
-				allocatedStruct = true
-				srcValField.Set(reflect.New(srcValField.Type().Elem()))
+				if opts.OnlyRead {
+					// read-only:
+					// - allocate a temporary struct just for iteration
+					// - do not assign it back to the parent (`allocatedStruct` remains false)
+					tmp := reflect.New(srcValField.Type().Elem())
+					srcValField = tmp.Elem()
+				} else {
+					// write mode: the field must be settable
+					debug.Assertf(srcValField.CanSet(), "write-mode: %q (type=%s) is not settable",
+						prefix+fieldName, srcValField.Type())
+					allocatedStruct = true
+					srcValField.Set(reflect.New(srcValField.Type().Elem()))
+					srcValField = srcValField.Elem()
+				}
+			} else {
+				srcValField = srcValField.Elem()
 			}
-			srcValField = srcValField.Elem()
 		}
 
 		// Read-only walk skips empty (zero) fields.
@@ -219,112 +242,285 @@ func iterFields(prefix string, v any, updf updateFunc, opts IterOpts) (dirty, st
 }
 
 // CopyProps update dst with the values from src
-func CopyProps(src, dst any, asType string) error {
+func CopyProps(src, dst any, asType string, copts ...CopyPropsOpts) error {
 	var (
 		srcVal = reflect.ValueOf(src)
 		dstVal = reflect.ValueOf(dst).Elem()
+		opts   CopyPropsOpts
 	)
-	debug.Assertf(cos.StringInSlice(asType, []string{apc.Daemon, apc.Cluster}), "unexpected config level: %s", asType)
+	if len(copts) > 0 {
+		opts = copts[0]
+	}
+	debug.Assertf(slices.Contains([]string{apc.Daemon, apc.Cluster}, asType), "unexpected config level: %s", asType)
 	if srcVal.Kind() == reflect.Ptr {
 		srcVal = srcVal.Elem()
 	}
-	return _copyProps(srcVal, dstVal, asType)
+	return _copyProps(srcVal, dstVal, asType, opts)
 }
 
-func _copyProps(srcVal, dstVal reflect.Value, asType string) error {
-	for i := range srcVal.NumField() {
-		copyTag, ok := srcVal.Type().Field(i).Tag.Lookup("copy")
-		if ok && copyTag == "skip" {
-			continue
-		}
+// copyProps helper: whether v.Kind() supports IsNil()
+func nilable(k reflect.Kind) bool {
+	switch k {
+	case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return true
+	default:
+		return false
+	}
+}
 
-		var (
-			srcValField = srcVal.Field(i)
-			fieldName   = srcVal.Type().Field(i).Name
-			dstValField = dstVal.FieldByName(fieldName)
-		)
-
-		// copy embedded struct recursively
-		if srcValField.Kind() == reflect.Struct {
-			if i >= dstVal.NumField() {
-				err := fmt.Errorf("source and destination structures mismatch [%s, idx %d, src-num %d, dst-num %d]",
-					fieldName, i, srcVal.NumField(), dstVal.NumField())
-				debug.AssertNoErr(err)
-				return err
+// copyProps helper: unwrap up to one pointer and one interface in any order
+// (as we don't have arbitrary nested config structs)
+func peel2(v reflect.Value) reflect.Value {
+	for range 2 {
+		switch v.Kind() {
+		case reflect.Interface:
+			if v.IsNil() {
+				return v
 			}
-			dstValField = dstVal.Field(i)
-			if !dstValField.IsValid() {
-				err := fmt.Errorf("destination field is invalid [src-name %s, dst-name %s, idx %d]",
-					fieldName, dstVal.Type().Field(i).Name, i)
-				debug.AssertNoErr(err)
-				return err
+			v = v.Elem()
+		case reflect.Ptr:
+			if v.IsNil() {
+				return v
 			}
-			if err := _copyProps(srcValField, dstValField, asType); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if srcValField.IsNil() {
-			continue
-		}
-
-		t, ok := dstVal.Type().FieldByName(fieldName)
-		debug.Assert(ok, fieldName)
-
-		// "allow" tag is used exclusively to enforce local vs global scope
-		// of the config updates
-		allowedScope := t.Tag.Get("allow")
-		if allowedScope != "" && allowedScope != asType {
-			name := strings.ToLower(fieldName)
-			if allowedScope == apc.Cluster && asType == apc.Daemon {
-				return fmt.Errorf("%s configuration can only be globally updated", name)
-			}
-			return fmt.Errorf("cannot update %s configuration: expecting %q scope, got %q", name, allowedScope, asType)
-		}
-
-		if dstValField.Kind() != reflect.Struct && dstValField.Kind() != reflect.Invalid {
-			// Set value for the field
-			if srcValField.Kind() != reflect.Ptr {
-				dstValField.Set(srcValField)
-			} else {
-				dstValField.Set(srcValField.Elem())
-			}
-		} else {
-			// Recurse into struct
-			if err := CopyProps(srcValField.Elem().Interface(), dstValField.Addr().Interface(), asType); err != nil {
-				return err
-			}
+			v = v.Elem()
+		default:
+			return v
 		}
 	}
+	return v
+}
+
+func _copyProps(srcVal, dstVal reflect.Value, asType string, opts CopyPropsOpts) error {
+	// normalize pointers on entry
+	for srcVal.Kind() == reflect.Ptr && !srcVal.IsNil() {
+		srcVal = srcVal.Elem()
+	}
+	for dstVal.Kind() == reflect.Ptr {
+		if dstVal.IsNil() && dstVal.CanSet() && dstVal.Type().Elem().Kind() == reflect.Struct {
+			dstVal.Set(reflect.New(dstVal.Type().Elem()))
+		}
+		dstVal = dstVal.Elem()
+	}
+
+	// leaf mode if src is not a struct
+	if srcVal.Kind() != reflect.Struct {
+		// peel pointer/interface on src
+		srcVal = peel2(srcVal)
+
+		// make dst addressable inner value
+		if dstVal.Kind() == reflect.Ptr {
+			if dstVal.IsNil() && dstVal.CanSet() {
+				dstVal.Set(reflect.New(dstVal.Type().Elem()))
+			}
+			dstVal = dstVal.Elem()
+		}
+
+		// expect to be able to set the leaf
+		debug.Assertf(!dstVal.IsValid() || dstVal.CanSet(), "copyProps: destination leaf not settable: %v", dstVal)
+
+		if !dstVal.IsValid() || !dstVal.CanSet() {
+			return nil
+		}
+		if srcVal.IsValid() && srcVal.Type().AssignableTo(dstVal.Type()) {
+			dstVal.Set(srcVal)
+			return nil
+		}
+		if srcVal.IsValid() && srcVal.Type().ConvertibleTo(dstVal.Type()) {
+			dstVal.Set(srcVal.Convert(dstVal.Type()))
+			return nil
+		}
+		return nil
+	}
+
+	// from here, expect dst to be struct too
+	if dstVal.Kind() != reflect.Struct {
+		err := fmt.Errorf("copyProps(%s): dst kind %s (type %s) is not struct for src %s",
+			asType, dstVal.Kind(), dstVal.Type(), srcVal.Type())
+		debug.AssertNoErr(err)
+		return err
+	}
+
+	for i := range srcVal.NumField() {
+		sf := srcVal.Type().Field(i)
+		// respect copy:"skip" and unexported fields
+		if copyTag, ok := sf.Tag.Lookup("copy"); ok && copyTag == "skip" {
+			continue
+		}
+		if sf.PkgPath != "" { // unexported
+			continue
+		}
+
+		fieldName := sf.Name
+		srcField := srcVal.Field(i)
+
+		// find destination by NAME
+		dstField := dstVal.FieldByName(fieldName)
+
+		// embedded (anonymous) src struct not present by name on dst: recurse into parent
+		if !dstField.IsValid() && sf.Anonymous {
+			kind := sf.Type.Kind()
+			if kind == reflect.Ptr {
+				kind = sf.Type.Elem().Kind()
+			}
+			if kind == reflect.Struct {
+				if nilable(srcField.Kind()) && srcField.IsNil() {
+					continue
+				}
+				if err := _copyProps(srcField, dstVal, asType, opts); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		// destination may legitimately not have this field (e.g., local-config FSPConf)
+		if !dstField.IsValid() {
+			continue
+		}
+		// skip nil leaves for nilable kinds (*ToSet style)
+		if nilable(srcField.Kind()) && srcField.IsNil() {
+			continue
+		}
+
+		// scope enforcement from dst tag
+		if dtf, ok := dstVal.Type().FieldByName(fieldName); ok {
+			allowedScope := dtf.Tag.Get("allow")
+
+			// 3 special cases
+			switch {
+			case opts.IgnoreScope && allowedScope == apc.Cluster && asType == apc.Daemon:
+				name := strings.ToLower(fieldName)
+				nlog.Warningln("ignoring node override for cluster-scoped config:", name)
+				continue
+			case opts.Transient && allowedScope == apc.Cluster:
+				name := strings.ToLower(fieldName)
+				return fmt.Errorf("%s (cluster-scoped) configuration cannot be changed transiently", name)
+			case allowedScope != "" && allowedScope != asType:
+				name := strings.ToLower(fieldName)
+				if allowedScope == apc.Cluster && asType == apc.Daemon {
+					return fmt.Errorf("%s configuration can only be globally updated", name)
+				}
+				return fmt.Errorf("cannot update %s configuration: expecting %q scope, got %q", name, allowedScope, asType)
+			}
+		}
+
+		//
+		// struct recurse vs leaf assign ----------------------
+		//
+		s := peel2(srcField)
+		if nilable(s.Kind()) && s.IsNil() {
+			continue
+		}
+
+		d := dstField
+		if d.Kind() == reflect.Ptr {
+			if d.IsNil() && d.CanSet() && d.Type().Elem().Kind() == reflect.Struct {
+				d.Set(reflect.New(d.Type().Elem()))
+			}
+			if d.Kind() == reflect.Ptr && d.Elem().IsValid() {
+				d = d.Elem()
+			}
+		}
+
+		// recurse only when _both_ are structs
+		if s.Kind() == reflect.Struct && d.Kind() == reflect.Struct {
+			if err := _copyProps(srcField, dstField, asType, opts); err != nil { // pass originals to allow alloc
+				return err
+			}
+			continue
+		}
+
+		//
+		// not recursing - assigning
+		//
+		leafDst := dstField
+		if leafDst.Kind() == reflect.Ptr {
+			// if nil, allocate only when we can set; skip otherwise
+			if leafDst.IsNil() {
+				if !leafDst.CanSet() {
+					// not settable and nil pointer: nothing we can do
+					continue
+				}
+				leafDst.Set(reflect.New(leafDst.Type().Elem()))
+			}
+			leafDst = leafDst.Elem()
+		}
+		leafSrc := peel2(srcField)
+
+		// require valid/settable dst and valid src
+		if !leafDst.IsValid() || !leafDst.CanSet() || !leafSrc.IsValid() {
+			continue
+		}
+
+		dstT := leafDst.Type()
+		srcT := leafSrc.Type()
+		if srcT.AssignableTo(dstT) {
+			leafDst.Set(leafSrc)
+			continue
+		}
+		if srcT.ConvertibleTo(dstT) {
+			leafDst.Set(leafSrc.Convert(dstT))
+			continue
+		}
+
+		// incompatible: assert and ignore
+		debug.Assertf(false, "copyProps: incompatible types for %q: src=%v dst=%v (asType=%s)", fieldName, srcT, dstT, asType)
+	}
+
 	return nil
 }
 
 func mergeProps(src, dst any) {
-	var (
-		srcVal = reflect.ValueOf(src).Elem()
-		dstVal = reflect.ValueOf(dst).Elem()
-	)
-
+	srcVal := getElem(src)
+	dstVal := getElem(dst)
 	for i := range srcVal.NumField() {
 		var (
-			srcValField = srcVal.Field(i)
-			dstValField = dstVal.FieldByName(srcVal.Type().Field(i).Name)
+			srcField = srcVal.Field(i)
+			dstField = dstVal.FieldByName(srcVal.Type().Field(i).Name)
 		)
 
-		if srcValField.IsNil() {
+		if srcField.IsNil() {
 			continue
 		}
 
-		if dstValField.IsNil() ||
-			(srcValField.Elem().Kind() != reflect.Struct && srcValField.Elem().Kind() != reflect.Invalid) {
-			dstValField.Set(srcValField)
+		// Special case to handle maps
+		if srcField.Kind() == reflect.Map && dstField.Kind() == reflect.Map {
+			if !srcField.IsNil() {
+				// Addr().Interface() allows us to modify the original dst, Interface() only makes a copy
+				mergeMaps(srcField.Interface(), dstField.Addr().Interface())
+			}
+			continue
+		}
+
+		if dstField.IsNil() ||
+			(srcField.Elem().Kind() != reflect.Struct && srcField.Elem().Kind() != reflect.Invalid) {
+			dstField.Set(srcField)
 			continue
 		}
 
 		// Recurse into struct
-		mergeProps(srcValField.Interface(), dstValField.Interface())
+		mergeProps(srcField.Interface(), dstField.Interface())
 	}
+}
+
+func mergeMaps(src, dst any) {
+	srcMap := getElem(src)
+	dstMap := getElem(dst)
+	if srcMap.Kind() != reflect.Map || dstMap.Kind() != reflect.Map {
+		return
+	}
+	for _, key := range srcMap.MapKeys() {
+		srcVal := srcMap.MapIndex(key)
+		dstMap.SetMapIndex(key, srcVal)
+	}
+}
+
+func getElem(a any) reflect.Value {
+	val := reflect.ValueOf(a)
+	if val.Kind() == reflect.Ptr {
+		return val.Elem()
+	}
+	return val
 }
 
 ///////////
@@ -415,9 +611,17 @@ reflectDst:
 			// A slice value looks like: "[value1 value2]"
 			s := strings.TrimPrefix(srcVal.String(), "[")
 			s = strings.TrimSuffix(s, "]")
+
+			// "none" is a system-wide convention
+			if s == apc.ResetToken {
+				empty := reflect.MakeSlice(dst.Type(), 0, 0)
+				dst.Set(empty)
+				break
+			}
+
 			if s != "" {
 				vals := strings.Split(s, " ")
-				tp := reflect.TypeOf(vals[0])
+				tp := reflect.TypeFor[string]()
 				lst := reflect.MakeSlice(reflect.SliceOf(tp), 0, 10)
 				for _, v := range vals {
 					if v == "" {

@@ -91,12 +91,11 @@ func fs2disks(mpath, fsname string, label cos.MountpathLabel, blockDevs BlockDev
 		}
 	}
 
-	var trimmedFS string
-	if strings.HasPrefix(fsname, devPrefixLVM) {
-		trimmedFS = strings.TrimPrefix(fsname, devPrefixLVM)
-	} else {
+	trimmedFS, ok := strings.CutPrefix(fsname, devPrefixLVM)
+	if !ok {
 		trimmedFS = strings.TrimPrefix(fsname, devPrefixReg)
 	}
+
 	disks = make(FsDisks, num)
 	findDevs(blockDevs, trimmedFS, label, disks) // map trimmed(fs) <= disk(s)
 
@@ -104,7 +103,7 @@ func fs2disks(mpath, fsname string, label cos.MountpathLabel, blockDevs BlockDev
 		return disks, nil // unit tests
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleIOS) {
+	if cmn.Rom.V(4, cos.ModIOS) {
 		_dump(blockDevs)
 	}
 

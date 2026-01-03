@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,6 +41,7 @@ type (
 		cptn       string
 		totalSize  int64
 		dryRun     bool
+		warned     bool
 	}
 	uctx struct {
 		wg            cos.WG
@@ -71,7 +71,7 @@ func verbFobjs(c *cli.Context, wop wop, fobjs []fobj, bck cmn.Bck, ndir int, rec
 		cptn                string
 		totalSize, extSizes = groupByExt(fobjs)
 		units, errU         = parseUnitsFlag(c, unitsFlag)
-		tmpl                = teb.MultiPutTmpl + strconv.Itoa(l) + "\t " + cos.ToSizeIEC(totalSize, 2) + "\n"
+		tmpl                = teb.MultiPutTmpl + strconv.Itoa(l) + "\t " + cos.IEC(totalSize, 2) + "\n"
 		opts                = teb.Opts{AltMap: teb.FuncMapUnits(units, false /*incl. calendar date*/)}
 	)
 	if errU != nil {
@@ -234,9 +234,7 @@ func (p *uparams) _putOne(c *cli.Context, fobj fobj, reader cos.ReadOpenCloser, 
 	}
 
 	// encode special symbols
-	if flagIsSet(c, encodeObjnameFlag) {
-		putArgs.ObjName = url.PathEscape(putArgs.ObjName)
-	}
+	putArgs.ObjName = warnEscapeObjName(c, putArgs.ObjName, &p.warned)
 
 	_, err = api.PutObject(&putArgs)
 	return
@@ -413,7 +411,7 @@ func (u *uctx) fini(c *cli.Context, p *uparams, f fobj) {
 	if !u.showProgress && time.Since(u.lastReport) > u.reportEvery {
 		fmt.Fprintf(
 			c.App.Writer, "Uploaded %d(%d%%) objects, %s (%d%%).\n",
-			total, 100*total/len(p.fobjs), cos.ToSizeIEC(size, 1), 100*size/p.totalSize,
+			total, 100*total/len(p.fobjs), cos.IEC(size, 1), 100*size/p.totalSize,
 		)
 		u.lastReport = time.Now()
 	}
@@ -435,6 +433,28 @@ func putRegular(c *cli.Context, bck cmn.Bck, objName, path string, finfo os.File
 	if err != nil {
 		return err
 	}
+
+	// Multipart upload path
+	fileSize := finfo.Size()
+	if flagIsSet(c, chunkSizeFlag) {
+		chunkSize, err := parseSizeFlag(c, chunkSizeFlag)
+		if err != nil {
+			return err
+		}
+		if fileSize > chunkSize {
+			return uploadFileInChunks(c, path, fileSize, chunkSize, bck, objName)
+		}
+	} else if fileSize > dfltObjSizeLimit {
+		chunkSize, shouldChunk, err := promptForChunking(c, fileSize, filepath.Base(path))
+		if err != nil {
+			return err
+		}
+		if shouldChunk {
+			return uploadFileInChunks(c, path, fileSize, chunkSize, bck, objName)
+		}
+	}
+
+	// Regular single file upload path
 	fh, err := cos.NewFileHandle(path)
 	if err != nil {
 		return err
@@ -458,9 +478,9 @@ func putRegular(c *cli.Context, bck cmn.Bck, objName, path string, finfo os.File
 		SkipVC:     flagIsSet(c, skipVerCksumFlag),
 	}
 	// encode special symbols
-	if flagIsSet(c, encodeObjnameFlag) {
-		putArgs.ObjName = url.PathEscape(putArgs.ObjName)
-	}
+	var warned bool
+	putArgs.ObjName = warnEscapeObjName(c, putArgs.ObjName, &warned)
+
 	iters := 1
 	iters += parseRetriesFlag(c, putRetriesFlag, true /*warn*/)
 
@@ -493,6 +513,7 @@ func putRegular(c *cli.Context, bck cmn.Bck, objName, path string, finfo os.File
 		progress.Wait()
 	}
 
+	actionDone(c, fmt.Sprintf("PUT %q => %s\n", path, bck.Cname(objName)))
 	return err
 }
 
@@ -558,10 +579,6 @@ func putAppendChunks(c *cli.Context, bck cmn.Bck, objName string, r io.Reader, c
 				ObjName:    objName,
 				Reader:     reader,
 				Size:       uint64(n),
-			}
-			// encode special symbols
-			if flagIsSet(c, encodeObjnameFlag) {
-				putArgs.ObjName = url.PathEscape(putArgs.ObjName)
 			}
 			_, err = api.PutObject(&putArgs)
 		} else {

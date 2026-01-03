@@ -19,6 +19,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/xact/xs"
 )
@@ -39,7 +40,7 @@ type (
 		isDone() (done bool, err error)
 		set(nlps []core.NLP)
 		// triggers
-		commitAfter(caller string, msg *actMsgExt, err error, args ...any) (bool, error)
+		commitAfter(sender string, msg *actMsgExt, err error, args ...any) (bool, error)
 		rsvp(err error)
 		// cleanup
 		abort(error)
@@ -49,7 +50,7 @@ type (
 	}
 	rndzvs struct { // rendezvous records
 		err        *txnError
-		callerName string
+		senderName string
 		timestamp  int64
 	}
 	// two maps, two locks
@@ -76,8 +77,8 @@ type (
 		xctn       core.Xact
 		err        ratomic.Pointer[txnError]
 		action     string
-		callerName string
-		callerID   string
+		senderName string
+		senderID   string
 		uid        string
 		smapVer    int64
 		bmdVer     int64
@@ -106,8 +107,7 @@ type (
 		txnBckBase
 	}
 	txnRenameBucket struct {
-		bckFrom *meta.Bck
-		bckTo   *meta.Bck
+		xbmv *xs.BckRename
 		txnBckBase
 	}
 	txnTCB struct {
@@ -136,6 +136,10 @@ type (
 		totalN int
 		fshare bool
 	}
+	txnETLInit struct {
+		msg etl.InitMsg
+		txnBase
+	}
 )
 
 // interface guard
@@ -149,6 +153,7 @@ var (
 	_ txn = (*txnTCObjs)(nil)
 	_ txn = (*txnECEncode)(nil)
 	_ txn = (*txnPromote)(nil)
+	_ txn = (*txnETLInit)(nil)
 )
 
 //////////////////
@@ -173,12 +178,12 @@ func (txns *txns) begin(txn txn, nlps ...core.NLP) (err error) {
 		debug.AssertNoErr(err)
 		return
 	}
-	txn.started(apc.ActBegin, time.Now())
+	txn.started(apc.Begin2PC, time.Now())
 	txn.set(nlps)
 	txns.m[txn.uuid()] = txn
 	txns.mtx.Unlock()
 
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.V(4, cos.ModAIS) {
 		nlog.Infof("%s begin: %s", txns.t, txn)
 	}
 	return
@@ -186,7 +191,7 @@ func (txns *txns) begin(txn txn, nlps ...core.NLP) (err error) {
 
 // find and term: [cleanup | Commit | Abort]
 func (txns *txns) term(uuid, act string) {
-	debug.Assert(act == actTxnCleanup || act == apc.ActCommit || act == apc.ActAbort, "invalid ", act)
+	debug.Assert(act == actTxnCleanup || act == apc.Commit2PC || act == apc.Abort2PC, "invalid ", act)
 
 	txns.mtx.Lock()
 	txn, ok := txns.m[uuid]
@@ -202,12 +207,12 @@ func (txns *txns) term(uuid, act string) {
 	delete(txns.rendezvous.m, uuid)
 	txns.rendezvous.mtx.Unlock()
 
-	if act == apc.ActAbort {
+	if act == apc.Abort2PC {
 		txn.abort(errors.New("action: abort")) // NOTE: may call txn-specific abort, e.g. TxnAbort
 	} else {
 		txn.unlock()
 	}
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+	if cmn.Rom.V(4, cos.ModAIS) {
 		nlog.Infof("%s %s: %s", txns.t, act, txn)
 	}
 }
@@ -222,14 +227,14 @@ func (txns *txns) find(uuid string) (_ txn, err error) {
 	return found, err
 }
 
-func (txns *txns) commitBefore(caller string, msg *actMsgExt) error {
+func (txns *txns) commitBefore(sender string, msg *actMsgExt) error {
 	var (
 		rndzvs rndzvs
 		ok     bool
 	)
 	txns.rendezvous.mtx.Lock()
 	if rndzvs, ok = txns.rendezvous.m[msg.UUID]; !ok {
-		rndzvs.callerName, rndzvs.timestamp = caller, mono.NanoTime()
+		rndzvs.senderName, rndzvs.timestamp = sender, mono.NanoTime()
 		txns.rendezvous.m[msg.UUID] = rndzvs
 		txns.rendezvous.mtx.Unlock()
 		return nil
@@ -238,7 +243,7 @@ func (txns *txns) commitBefore(caller string, msg *actMsgExt) error {
 	return fmt.Errorf("rendezvous record %s:%d already exists", msg.UUID, rndzvs.timestamp)
 }
 
-func (txns *txns) commitAfter(caller string, msg *actMsgExt, err error, args ...any) (errDone error) {
+func (txns *txns) commitAfter(sender string, msg *actMsgExt, err error, args ...any) (errDone error) {
 	txns.mtx.Lock()
 	txn, ok := txns.m[msg.UUID]
 	txns.mtx.Unlock()
@@ -251,7 +256,7 @@ func (txns *txns) commitAfter(caller string, msg *actMsgExt, err error, args ...
 			bmd := txns.t.owner.bmd.get()
 			nlog.Warningf("%s: commit with downgraded (current: %s)", txn, bmd)
 		}
-		if running, errDone = txn.commitAfter(caller, msg, err, args...); running {
+		if running, errDone = txn.commitAfter(sender, msg, err, args...); running {
 			nlog.Infoln(txn.String())
 		}
 	}
@@ -273,7 +278,7 @@ func (txns *txns) commitAfter(caller string, msg *actMsgExt, err error, args ...
 // given txn, wait for its completion, handle timeout, and ultimately remove
 func (txns *txns) wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err error) {
 	// timestamp
-	txn.started(apc.ActCommit, time.Now())
+	txn.started(apc.Commit2PC, time.Now())
 
 	// transfer err rendezvous => txn
 	txns.rendezvous.mtx.Lock()
@@ -286,10 +291,7 @@ func (txns *txns) wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err err
 	err = txns._wait(txn, timeoutNetw, timeoutHost)
 
 	// cleanup or abort, depending on the returned err
-	act := apc.ActCommit
-	if err != nil {
-		act = apc.ActAbort
-	}
+	act := cos.Ternary(err != nil, apc.Abort2PC, apc.Commit2PC)
 	txns.term(txn.uuid(), act)
 	return err
 }
@@ -297,7 +299,7 @@ func (txns *txns) wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err err
 // poll for 'done'
 func (txns *txns) _wait(txn txn, timeoutNetw, timeoutHost time.Duration) (err error) {
 	var (
-		sleep       = 100 * time.Millisecond
+		sleep       = cos.PollSleepShort
 		done, found bool
 	)
 	for total := sleep; ; {
@@ -387,8 +389,8 @@ func (txns *txns) cleanup(orphans []txn, errs []error) {
 }
 
 func checkTimeout(txn txn, now time.Time, config *cmn.Config) (err, warn error) {
-	elapsed := now.Sub(txn.started(apc.ActBegin))
-	if commitTimestamp := txn.started(apc.ActCommit); !commitTimestamp.IsZero() {
+	elapsed := now.Sub(txn.started(apc.Begin2PC))
+	if commitTimestamp := txn.started(apc.Commit2PC); !commitTimestamp.IsZero() {
 		elapsed = now.Sub(commitTimestamp)
 		if elapsed > gcTxnsTimeotMult*config.Timeout.MaxHostBusy.D() {
 			err = fmt.Errorf("gc %s: [commit - done] timeout", txn)
@@ -413,12 +415,12 @@ func (txn *txnBase) uuid() string { return txn.uid }
 
 func (txn *txnBase) started(phase string, tm ...time.Time) (ts time.Time) {
 	switch phase {
-	case apc.ActBegin:
+	case apc.Begin2PC:
 		if len(tm) > 0 {
 			txn.phase.begin = tm[0]
 		}
 		ts = txn.phase.begin
-	case apc.ActCommit:
+	case apc.Commit2PC:
 		if len(tm) > 0 {
 			txn.phase.commit = tm[0]
 		}
@@ -442,8 +444,8 @@ func (txn *txnBase) rsvp(err error) { txn.err.Store(&txnError{err: err}) }
 func (txn *txnBase) fillFromCtx(c *txnSrv) {
 	txn.uid = c.uuid
 	txn.action = c.msg.Action
-	txn.callerName = c.callerName
-	txn.callerID = c.callerID
+	txn.senderName = c.senderName
+	txn.senderID = c.senderID
 	txn.smapVer = c.t.owner.smap.get().version()
 	txn.bmdVer = c.t.owner.bmd.get().version()
 }
@@ -494,8 +496,8 @@ func (txn *txnBckBase) String() string {
 	return fmt.Sprintf("txn-%s[%s]-%s%s%s]", txn.action, txn.uid, txn.bck.Bucket().String(), tm, res)
 }
 
-func (txn *txnBckBase) commitAfter(caller string, msg *actMsgExt, err error, args ...any) (found bool, errDone error) {
-	if txn.callerName != caller || msg.UUID != txn.uuid() {
+func (txn *txnBase) commitAfter(sender string, msg *actMsgExt, err error, args ...any) (found bool, errDone error) {
+	if txn.senderName != sender || msg.UUID != txn.uuid() {
 		return
 	}
 	found = true
@@ -504,7 +506,7 @@ func (txn *txnBckBase) commitAfter(caller string, msg *actMsgExt, err error, arg
 		debug.Assert(bmd.version() >= txn.bmdVer)
 	})
 	if txnErr := txn.err.Swap(&txnError{err: err}); txnErr != nil {
-		errDone = fmt.Errorf("%s: already done with err=%v (%v)", txn, txnErr.err, err)
+		errDone = fmt.Errorf("%s: already done with err=%v (%v)", txn.uuid(), txnErr.err, err)
 		txn.err.Store(txnErr)
 	}
 	return
@@ -554,9 +556,9 @@ func newTxnSetBucketProps(c *txnSrv, nprops *cmn.Bprops) (txn *txnSetBucketProps
 // txnRenameBucket //
 /////////////////////
 
-func newTxnRenameBucket(c *txnSrv, bckFrom, bckTo *meta.Bck) (txn *txnRenameBucket) {
-	txn = &txnRenameBucket{bckFrom: bckFrom, bckTo: bckTo}
-	txn.init(bckFrom)
+func newTxnRenameBucket(c *txnSrv, xbmv *xs.BckRename) (txn *txnRenameBucket) {
+	txn = &txnRenameBucket{xbmv: xbmv}
+	txn.init(xbmv.Args().BckFrom)
 	txn.fillFromCtx(c)
 	return
 }
@@ -650,3 +652,24 @@ func (txn *txnPromote) String() (s string) {
 	txn.xctn = txn.xprm
 	return fmt.Sprintf("%s-src(%s)-N(%d)-fshare(%t)", txn.txnBckBase.String(), txn.dirFQN, txn.totalN, txn.fshare)
 }
+
+////////////////
+// txnETLInit //
+////////////////
+
+func newTxnETLInit(c *txnSrv, msg etl.InitMsg) (txn *txnETLInit) {
+	txn = &txnETLInit{msg: msg}
+	txn.fillFromCtx(c)
+	return
+}
+
+func (txn *txnETLInit) abort(err error) {
+	nlog.Infof("transaction %s aborted for %s, err: %v\n", txn.String(), txn.msg.Cname(), err)
+	etl.StopByXid(txn.uuid(), err) // only stop the ETL created from this transaction
+}
+
+func (txn *txnETLInit) String() string { return txn.msg.String() }
+
+// no-op: no bucket/resources needs to be locked for initializing ETL
+func (*txnETLInit) set(_ []core.NLP) {}
+func (*txnETLInit) unlock()          {}

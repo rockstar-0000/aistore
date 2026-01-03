@@ -7,6 +7,7 @@ package cos
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
 	"time"
 
@@ -40,7 +41,6 @@ const (
 const (
 	rltag  = "rate-limiter"
 	arltag = "adaptive-rate-limiter"
-	brltag = "bursty-rate-limiter"
 )
 
 // reason
@@ -198,9 +198,13 @@ func (arl *AdaptRateLim) Acquire() error {
 			arl.mu.Unlock()
 			return fmt.Errorf("%s: failed to acquire (%d, %v)", arltag, i, sleep)
 		}
-		sleep = min(max(sleep+sleep>>1, arl.minBtwn), arl.minBtwn<<2)
+		sleep = ClampDuration(sleep+sleep>>1, arl.minBtwn, arl.minBtwn<<2)
 		arl.mu.Unlock()
 		time.Sleep(sleep)
+		if i > 0 {
+			// poor-man's jitter
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -296,17 +300,17 @@ func (arl *AdaptRateLim) _str() string {
 // BurstRateLim //
 //////////////////
 
-func NewBurstRateLim(maxTokens, burstSize int, tokenIval time.Duration) (*BurstRateLim, error) {
+func NewBurstRateLim(tag string, maxTokens, burstSize int, tokenIval time.Duration) (*BurstRateLim, error) {
 	if burstSize <= 0 || burstSize > maxTokens*DfltRateMaxBurstPct/100 {
 		return nil, fmt.Errorf("%s: invalid burst size %d (expecting positive integer <= (%d%% of maxTokens %d)",
-			brltag, burstSize, DfltRateMaxBurstPct, maxTokens)
+			tag, burstSize, DfltRateMaxBurstPct, maxTokens)
 	}
 	brl := &BurstRateLim{
 		origTokens: maxTokens,
 		burstSize:  burstSize,
 	}
 	brl.stats.burstLeft = burstSize
-	return brl, brl.RateLim.init(brltag, maxTokens, tokenIval)
+	return brl, brl.RateLim.init(tag+" (bursty rate)", maxTokens, tokenIval)
 }
 
 func (brl *BurstRateLim) TryAcquire() bool {

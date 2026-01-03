@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	ratomic "sync/atomic"
@@ -36,31 +38,29 @@ type (
 	Errs struct {
 		errs []error
 		cnt  int64
+		cap  int
 		mu   sync.Mutex
-	}
-
-	// background:
-	// - normally, keeping objects under their original names
-	// - FNTL excepted (see core/lom)
-	ErrMv struct {
-		// - type 1: mv readme aaa/bbb, where destination aaa/bbb[/ccc/...] is a virtual directory
-		// - type 2 (a.k.a. ENOTDIR): mv readme aaa/bbb/ccc, where destination aaa/bbb is (or contains) a file
-		ty int
 	}
 )
 
-var (
-	ErrQuantityUsage   = errors.New("invalid quantity, format should be '81%' or '1GB'")
-	ErrQuantityPercent = errors.New("percent must be in the range (0, 100)")
-	ErrQuantityBytes   = errors.New("value (bytes) must be non-negative")
-
-	errQuantityNonNegative = errors.New("quantity should not be negative")
+type (
+	errInvalidObjName struct {
+		name string
+	}
+	errInvalidPrefix struct {
+		tag    string
+		prefix string
+	}
+	errInvalidArchpath struct {
+		path string
+	}
 )
 
 var errBufferUnderrun = errors.New("buffer underrun")
 
 // ErrNotFound
 
+// note: where == nil is fine
 func NewErrNotFound(where fmt.Stringer, what string) *ErrNotFound {
 	return &ErrNotFound{where: where, what: what}
 }
@@ -76,9 +76,25 @@ func (e *ErrNotFound) Error() string {
 	return e.where.String() + ": " + s
 }
 
+// TODO -- FIXME: deprecated and must be eventually absorbed into IsNotExist() below
 func IsErrNotFound(err error) bool {
-	_, ok := err.(*ErrNotFound)
-	return ok
+	if _, ok := err.(*ErrNotFound); ok {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "does not exist")
+}
+
+// non-existence checker that must be used instead of the one above;
+// includes:
+// - 404 when/if provided
+// - cos.ErrNotFound
+// - fs.ErrNotExist (covers *os.PathError)
+// - bare syscall.ENOENT (explicitly checked)
+func IsNotExist(err error, ecode ...int) bool {
+	if len(ecode) > 0 && ecode[0] == http.StatusNotFound {
+		return true
+	}
+	return IsErrNotFound(err) || errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOENT)
 }
 
 // ErrAlreadyExists
@@ -95,22 +111,21 @@ func (e *ErrAlreadyExists) Error() string {
 	return e.where.String() + ": " + s
 }
 
-//
-// gen-purpose not-finding-anything: objects, directories, xactions, nodes, ...
-//
+// Errs is a thread-safe collection of errors
 
-// NOTE: compare with cmn.IsErrObjNought() that also includes lmeta-not-found et al.
-func IsNotExist(err error, ecode int) bool {
-	if ecode == http.StatusNotFound || IsErrNotFound(err) {
-		return true
+const defaultMaxErrs = 8
+
+func NewErrs(maxErrs ...int) Errs {
+	capacity := defaultMaxErrs
+	if len(maxErrs) > 0 && maxErrs[0] > 0 {
+		capacity = maxErrs[0]
 	}
-	return os.IsNotExist(err) // unwraps for fs.ErrNotExist
+	debug.Assert(capacity > 0)
+	return Errs{
+		errs: make([]error, 0, capacity),
+		cap:  capacity,
+	}
 }
-
-// Errs
-// add Unwrap() if need be
-
-const maxErrs = 8
 
 func (e *Errs) Add(err error) {
 	debug.Assert(err != nil)
@@ -122,7 +137,7 @@ func (e *Errs) Add(err error) {
 			return
 		}
 	}
-	if len(e.errs) < maxErrs {
+	if len(e.errs) < e.cap {
 		e.errs = append(e.errs, err)
 		ratomic.StoreInt64(&e.cnt, int64(len(e.errs)))
 	}
@@ -159,28 +174,19 @@ func (e *Errs) Error() string {
 	return err.Error()
 }
 
+func (e *Errs) Unwrap() []error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.errs) // return a copy to avoid mutation
+}
+
 //
 // IS-syscall helpers
 //
 
-func UnwrapSyscallErr(err error) error {
-	if syscallErr, ok := err.(*os.SyscallError); ok {
-		return syscallErr.Unwrap()
-	}
-	return nil
-}
-
-func IsErrSyscallTimeout(err error) bool {
-	syscallErr, ok := err.(*os.SyscallError)
-	return ok && syscallErr.Timeout()
-}
-
-func IsPathErr(err error) (ok bool) {
-	pathErr := (*iofs.PathError)(nil)
-	if errors.As(err, &pathErr) {
-		ok = true
-	}
-	return ok
+func IsPathErr(err error) bool {
+	var pathErr *iofs.PathError
+	return errors.As(err, &pathErr)
 }
 
 // "file name too long" errno 0x24 (36); either one of the two possible reasons:
@@ -190,47 +196,84 @@ func IsErrFntl(err error) bool {
 	return strings.Contains(err.Error(), "too long") && errors.Is(err, syscall.ENAMETOOLONG)
 }
 
-func IsErrNotDir(err error) bool {
-	return strings.Contains(err.Error(), "directory") && errors.Is(err, syscall.ENOTDIR)
-}
-
 // likely out of socket descriptors
 func IsErrConnectionNotAvail(err error) (yes bool) {
 	return errors.Is(err, syscall.EADDRNOTAVAIL)
 }
 
-// retriable conn errs
-func IsErrConnectionRefused(err error) (yes bool) { return errors.Is(err, syscall.ECONNREFUSED) }
-func IsErrConnectionReset(err error) (yes bool)   { return errors.Is(err, syscall.ECONNRESET) }
-func IsErrBrokenPipe(err error) (yes bool)        { return errors.Is(err, syscall.EPIPE) }
+//
+// retriable connection errs
+//
 
-func IsRetriableConnErr(err error) (yes bool) {
-	return IsErrConnectionRefused(err) || IsErrConnectionReset(err) || IsErrBrokenPipe(err)
+// network-level (spurious or intermittent) timeout - always retriable
+// (compare w/ IsErrClientTimeout)
+func IsErrNetTimeoutConn(err error) bool {
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ETIMEDOUT)
 }
+
+// can be retried when client has the original request
+// (includes IsErrClientTimeout)
+func IsErrRetriableConn(err error) (yes bool) {
+	if IsErrClientTimeout(err) {
+		return true
+	}
+	// canonical retry-ables
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNABORTED)
+}
+
+// true when an HTTP response write failed
+// because the peer went away (client canceled/closed/reset)
+func IsClientGone(err error) bool {
+	if errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
+}
+
+// request/HTTP client timeout
+func IsErrClientTimeout(err error) bool {
+	// url.Error with Timeout()
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Timeout() {
+		return true
+	}
+	// context deadline exceeded
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// net.Error Timeout() / ETIMEDOUT
+	return IsErrNetTimeoutConn(err)
+}
+
+//
+// misc. Is* helpers
+//
 
 func IsErrOOS(err error) bool {
 	return errors.Is(err, syscall.ENOSPC)
 }
 
 func IsErrDNSLookup(err error) bool {
-	if _, ok := err.(*net.DNSError); ok {
-		return ok
-	}
-	wrapped := &net.DNSError{}
+	var wrapped *net.DNSError
 	return errors.As(err, &wrapped)
 }
 
-func IsClientTimeout(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded)
-}
-
 func IsUnreachable(err error, status int) bool {
-	return IsErrConnectionRefused(err) ||
+	return errors.Is(err, syscall.ECONNREFUSED) ||
 		IsErrDNSLookup(err) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		status == http.StatusRequestTimeout ||
 		status == http.StatusServiceUnavailable ||
-		IsEOF(err) ||
+		IsAnyEOF(err) ||
 		status == http.StatusBadGateway
 }
 
@@ -259,6 +302,23 @@ func IsErrClientURLTimeout(err error) bool {
 	return uerr != nil && uerr.Timeout()
 }
 
+//
+// ErrMv and related bits
+//
+
+const ErrENOTDIR = "destination contains an object in its path"
+
+type ErrMv struct {
+	// - type 1: mv readme aaa/bbb, where destination aaa/bbb[/ccc/...] is a virtual directory
+	// - type 2 (a.k.a. ENOTDIR): mv readme aaa/bbb/ccc, where destination aaa/bbb is (or contains) a file
+	// - see also: ErrMv.Is() below
+	ty int
+}
+
+func IsErrNotDir(err error) bool {
+	return errors.Is(err, syscall.ENOTDIR)
+}
+
 func checkMvErr(err error, dst string) error {
 	if finfo, errN := os.Stat(dst); errN == nil && finfo.IsDir() {
 		return &ErrMv{1}
@@ -274,10 +334,71 @@ func IsErrMv(err error) bool {
 	return ok
 }
 
+// to satisfy errors.Is()
+func (e *ErrMv) Is(target error) bool {
+	return e.ty == 2 && errors.Is(target, syscall.ENOTDIR)
+}
+
 func (e *ErrMv) Error() string {
 	if e.ty == 2 {
-		// with underlying `ENOTDIR`
-		return "destination contains an object in its path"
+		return ErrENOTDIR
 	}
 	return "destination exists and is a virtual directory"
 }
+
+// errInvalidObjName, errInvalidPrefix
+
+const (
+	inv1 = "../"
+	inv2 = "~/"
+)
+
+func ValidateOname(name string) error {
+	if name == "" {
+		return &errInvalidObjName{name}
+	}
+	return ValidOname(name)
+}
+
+func ValidOname(name string) error {
+	if IsLastB(name, filepath.Separator) {
+		return &errInvalidObjName{name}
+	}
+	if strings.IndexByte(name, inv1[0]) < 0 && strings.IndexByte(name, inv2[0]) < 0 { // most of the time
+		return nil
+	}
+	if strings.Contains(name, inv1) || strings.Contains(name, inv2) {
+		return &errInvalidObjName{name}
+	}
+	return nil
+}
+
+func (e *errInvalidObjName) Error() string {
+	return fmt.Sprintf("invalid object name %q", e.name)
+}
+
+func ValidatePrefix(tag, prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	if strings.IndexByte(prefix, inv1[0]) < 0 && strings.IndexByte(prefix, inv2[0]) < 0 { // ditto
+		return nil
+	}
+	if strings.Contains(prefix, inv1) || strings.Contains(prefix, inv2) {
+		return &errInvalidPrefix{tag, prefix}
+	}
+	return nil
+}
+
+func (e *errInvalidPrefix) Error() string {
+	return fmt.Sprintf("%s: invalid prefix %q", e.tag, e.prefix)
+}
+
+func ValidateArchpath(path string) error {
+	if ValidOname(path) != nil {
+		return &errInvalidArchpath{path}
+	}
+	return nil
+}
+
+func (e *errInvalidArchpath) Error() string { return "invalid archpath \"" + e.path + "\"" }

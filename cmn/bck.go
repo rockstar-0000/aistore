@@ -249,7 +249,9 @@ func (b *Bck) Str(sb *strings.Builder) {
 	}
 }
 
-// unique name => Bck (use MakeUname above to perform the reverse translation)
+// unique name => Bck
+// - MakeUname to make
+// - compare w/ meta.ParseUname (that does more) and maybe use the latter
 func ParseUname(uname string) (b Bck, objName string) {
 	var prev, itemIdx int
 	for i := range len(uname) {
@@ -347,7 +349,7 @@ func (b *Bck) LenUnameGlob(objName string) int {
 	return len(b.Provider) + 1 + len(NsGlobalUname) + 1 + len(b.Name) + 1 + len(objName) // compare with the below
 }
 
-// Bck => unique name
+// Bck and optional objName => unique name (uname); note:
 // - use ParseUname below to translate back
 // - compare with HashUname
 func (b *Bck) MakeUname(objName string) []byte {
@@ -479,11 +481,11 @@ func (b *Bck) AddToQuery(query url.Values) url.Values {
 	return query
 }
 
-func (b *Bck) AddUnameToQuery(query url.Values, uparam string) url.Values {
+func (b *Bck) AddUnameToQuery(query url.Values, uparam, objName string) url.Values {
 	if query == nil {
 		query = make(url.Values)
 	}
-	uname := b.MakeUname("")
+	uname := b.MakeUname(objName)
 	query.Set(uparam, cos.UnsafeS(uname))
 	return query
 }
@@ -506,10 +508,7 @@ func (qbck QueryBcks) String() string {
 		return ""
 	}
 	if qbck.Name == "" {
-		p := qbck.Provider
-		if p == "" {
-			p = apc.AIS // querying default = apc.NormalizeProvider("")
-		}
+		p := cos.Ternary(qbck.Provider == "", apc.AIS, qbck.Provider)
 		if qbck.Ns.IsGlobal() {
 			return apc.ToScheme(p) + apc.BckProviderSeparator
 		}

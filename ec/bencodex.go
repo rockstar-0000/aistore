@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/cmn/prob"
@@ -38,9 +39,10 @@ type (
 	}
 	XactBckEncode struct {
 		xact.Base
-		bck  *meta.Bck
-		wg   *sync.WaitGroup // to wait for EC finishes all objects
-		smap *meta.Smap
+		bck    *meta.Bck
+		wg     *sync.WaitGroup // to wait for EC finishes all objects
+		smap   *meta.Smap
+		config *cmn.Config
 		//
 		// check and recover slices and metafiles
 		//
@@ -55,6 +57,8 @@ type (
 		workCh   chan *core.LOM
 		r        *XactBckEncode
 		chanFull cos.ChanFull
+		// throttle
+		adv load.Advice
 	}
 )
 
@@ -79,10 +83,12 @@ func (p *encFactory) Start() error {
 	r := &XactBckEncode{
 		bck:             p.Bck,
 		checkAndRecover: custom.Recover,
+		config:          cmn.GCO.Get(),
 	}
 	if err := r.init(p.UUID()); err != nil {
 		return err
 	}
+
 	p.xctn = r
 	return nil
 }
@@ -92,8 +98,8 @@ func (p *encFactory) Get() core.Xact { return p.xctn }
 
 func (p *encFactory) WhenPrevIsRunning(prevEntry xreg.Renewable) (wpr xreg.WPR, err error) {
 	prev := prevEntry.(*encFactory)
-	if prev.phase == apc.ActBegin && p.phase == apc.ActCommit {
-		prev.phase = apc.ActCommit // transition
+	if prev.phase == apc.Begin2PC && p.phase == apc.Commit2PC {
+		prev.phase = apc.Commit2PC // transition
 		wpr = xreg.WprUse
 		return
 	}
@@ -109,12 +115,7 @@ func (r *XactBckEncode) init(uuid string) error {
 	r.wg = &sync.WaitGroup{}
 	r.smap = core.T.Sowner().Get()
 
-	var ctlmsg string
-	if r.checkAndRecover {
-		ctlmsg = "recover"
-		r.probFilter = prob.NewDefaultFilter()
-	}
-	r.InitBase(uuid, apc.ActECEncode, ctlmsg, r.bck)
+	r.InitBase(uuid, apc.ActECEncode, r.bck)
 
 	if err := r.bck.Init(core.T.Bowner()); err != nil {
 		return err
@@ -127,7 +128,10 @@ func (r *XactBckEncode) init(uuid string) error {
 	if len(avail) == 0 {
 		return cmn.ErrNoMountpaths
 	}
+
 	if r.checkAndRecover {
+		r.probFilter = prob.NewDefaultFilter()
+
 		// construct recovery joggers
 		r.rcvyJG = make(map[string]*rcvyJogger, len(avail))
 		for _, mi := range avail {
@@ -136,10 +140,13 @@ func (r *XactBckEncode) init(uuid string) error {
 				workCh: make(chan *core.LOM, rcvyWorkChanSize),
 				r:      r,
 			}
+			j.adv.Init(
+				load.FlMem|load.FlCla|load.FlDsk,
+				&load.Extra{Mi: mi, Cfg: &r.config.Disk, RW: true /* heavy IO */},
+			)
 			r.rcvyJG[mi.Path] = j
 		}
 	}
-
 	return nil
 }
 
@@ -148,15 +155,16 @@ func (r *XactBckEncode) Run(gowg *sync.WaitGroup) {
 	gowg.Done()
 
 	opts := &mpather.JgroupOpts{
-		CTs:      []string{fs.ObjectType},
+		CTs:      []string{fs.ObjCT},
 		VisitObj: r.encode,
-		DoLoad:   mpather.LoadUnsafe,
+		DoLoad:   mpather.Load,
+		RW:       true,
 	}
 	opts.Bck.Copy(r.bck.Bucket())
 
 	if r.checkAndRecover {
 		// additionally, traverse and visit
-		opts.CTs = []string{fs.ObjectType, fs.ECMetaType, fs.ECSliceType}
+		opts.CTs = []string{fs.ObjCT, fs.ECMetaCT, fs.ECSliceCT}
 		opts.VisitCT = r.checkRecover
 
 		r.last.Store(mono.NanoTime())
@@ -166,8 +174,7 @@ func (r *XactBckEncode) Run(gowg *sync.WaitGroup) {
 		}
 	}
 
-	config := cmn.GCO.Get()
-	jg := mpather.NewJoggerGroup(opts, config, nil)
+	jg := mpather.NewJgroup(opts, r.config, nil)
 	jg.Run()
 
 	select {
@@ -233,7 +240,7 @@ func (r *XactBckEncode) encode(lom *core.LOM, _ []byte) error {
 	if !local {
 		return nil
 	}
-	mdFQN, _, err := core.HrwFQN(lom.Bck().Bucket(), fs.ECMetaType, lom.ObjName)
+	mdFQN, _, err := core.HrwFQN(lom.Bck().Bucket(), fs.ECMetaCT, lom.ObjName)
 	if err != nil {
 		nlog.Warningln("failed to generate md FQN for", lom.Cname(), "err:", err)
 		return err
@@ -246,7 +253,7 @@ func (r *XactBckEncode) encode(lom *core.LOM, _ []byte) error {
 	if err == nil && !md.IsCopy {
 		return nil
 	}
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !cos.IsNotExist(err) {
 		nlog.Warningln("failed to fstat", mdFQN, "err:", err)
 		if errDel := os.Remove(mdFQN); errDel != nil {
 			nlog.Warningln("nested err: failed to delete broken metafile:", errDel)
@@ -264,13 +271,16 @@ func (r *XactBckEncode) encode(lom *core.LOM, _ []byte) error {
 	return nil
 }
 
+func (r *XactBckEncode) CtlMsg() (s string) {
+	if r.checkAndRecover {
+		s = "recover"
+	}
+	return
+}
+
 func (r *XactBckEncode) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
+	snap = r.Base.NewSnap(r)
 	snap.Pack(fs.NumAvail(), len(r.rcvyJG), r.chanFullTotal())
-
-	snap.IdleX = r.IsIdle()
 	return
 }
 
@@ -312,7 +322,7 @@ func (r *XactBckEncode) RecvRecover(lom *core.LOM) {
 		return
 	}
 
-	if r.done.Load() || r.IsAborted() || r.Finished() {
+	if r.done.Load() || r.IsAborted() || r.IsDone() {
 		core.FreeLOM(lom)
 		return
 	}
@@ -331,7 +341,7 @@ func (r *XactBckEncode) setLast(lom *core.LOM, err error) {
 	case errSkipped:
 		// do nothing
 	default:
-		r.AddErr(err, 4, cos.SmoduleEC)
+		r.AddErr(err, 4, cos.ModEC)
 	}
 }
 
@@ -346,7 +356,7 @@ func (j *rcvyJogger) run() {
 	)
 	for {
 		lom, ok := <-j.workCh
-		if !ok || r.done.Load() || r.IsAborted() || r.Finished() {
+		if !ok || r.done.Load() || r.IsAborted() || r.IsDone() {
 			break
 		}
 
@@ -358,11 +368,10 @@ func (j *rcvyJogger) run() {
 		core.FreeLOM(lom)
 
 		n++
-		// (compare with ec/putjogger where we also check memory pressure)
-		if err == nil && fs.IsThrottle(n) {
-			pct, _, _ := fs.ThrottlePct()
-			if pct >= fs.MaxThrottlePct {
-				time.Sleep(fs.Throttle10ms)
+		if err == nil && j.adv.ShouldCheck(n) {
+			j.adv.Refresh()
+			if j.adv.Sleep > 0 {
+				time.Sleep(j.adv.Sleep)
 			}
 		}
 	}

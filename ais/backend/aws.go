@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +35,8 @@ import (
 	"github.com/NVIDIA/aistore/tracing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -90,25 +94,25 @@ func NewAWS(t core.TargetPut, tstats stats.Tracker, startingUp bool) (core.Backe
 
 const gotBucketLocation = "got_bucket_location"
 
-func (*s3bp) HeadBucket(_ context.Context, bck *meta.Bck) (bckProps cos.StrKVs, ecode int, _ error) {
+func (*s3bp) HeadBucket(_ context.Context, bck *meta.Bck) (cos.StrKVs, int, error) {
 	var (
 		cloudBck = bck.RemoteBck()
 		sessConf = sessConf{bck: cloudBck}
 	)
 	svc, err := sessConf.s3client("")
 	if err != nil {
-		return nil, 0, err
+		return nil, http.StatusInternalServerError, err
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infoln("[head_bucket]", cloudBck.Name)
 	}
 	if sessConf.region == "" {
 		var region string
-		if region, err = getBucketLocation(svc, cloudBck.Name); err != nil {
-			ecode, err = awsErrorToAISError(err, cloudBck, "")
-			return nil, ecode, err
+		if region, err = _location(svc, cloudBck.Name); err != nil {
+			ecode, errV := awsErrorToAISError(err, cloudBck, "")
+			return nil, ecode, errV
 		}
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infoln("get-bucket-location", cloudBck.Name, "region", region)
 		}
 		svc, err = sessConf.s3client(gotBucketLocation)
@@ -116,20 +120,44 @@ func (*s3bp) HeadBucket(_ context.Context, bck *meta.Bck) (bckProps cos.StrKVs, 
 	}
 
 	// NOTE: return a few assorted fields, specifically to fill-in vendor-specific `cmn.ExtraProps`
-	bckProps = make(cos.StrKVs, 4)
+	bckProps := make(cos.StrKVs, 4)
 	bckProps[apc.HdrBackendProvider] = apc.AWS
 	bckProps[apc.HdrS3Region] = sessConf.region
 	bckProps[apc.HdrS3Endpoint] = ""
 	if bck.Props != nil {
 		bckProps[apc.HdrS3Endpoint] = bck.Props.Extra.AWS.Endpoint
 	}
-	versioned, errV := getBucketVersioning(svc, cloudBck)
+	versioned, errV := _versioning(svc, cloudBck)
 	if errV != nil {
-		ecode, err = awsErrorToAISError(errV, cloudBck, "")
+		ecode, err := awsErrorToAISError(errV, cloudBck, "")
 		return nil, ecode, err
 	}
 	bckProps[apc.HdrBucketVerEnabled] = strconv.FormatBool(versioned)
 	return bckProps, 0, nil
+}
+
+func _location(svc *s3.Client, bckName string) (region string, err error) {
+	resp, err := svc.GetBucketLocation(context.Background(), &s3.GetBucketLocationInput{
+		Bucket: aws.String(bckName),
+	})
+	if err != nil {
+		return
+	}
+	region = string(resp.LocationConstraint)
+	if region == "" {
+		region = env.AwsDefaultRegion() // env "AWS_REGION" or "us-east-1" - in that order
+	}
+	return
+}
+
+func _versioning(svc *s3.Client, bck *cmn.Bck) (enabled bool, errV error) {
+	input := &s3.GetBucketVersioningInput{Bucket: aws.String(bck.Name)}
+	result, err := svc.GetBucketVersioning(context.Background(), input)
+	if err != nil {
+		return false, err
+	}
+	enabled = result.Status == types.BucketVersioningStatusEnabled
+	return
 }
 
 //
@@ -152,7 +180,7 @@ func (s3bp *s3bp) GetBucketInv(bck *meta.Bck, ctx *core.LsoInvCtx) (int, error) 
 	// one bucket, one inventory, one statically defined name
 	prefix, objName := aiss3.InvPrefObjname(bck.Bucket(), ctx.Name, ctx.ID)
 	lom := core.AllocLOM(objName)
-	if err = lom.InitBck(bck.Bucket()); err != nil {
+	if err = lom.InitBck(bck); err != nil {
 		core.FreeLOM(lom)
 		return 0, err
 	}
@@ -332,7 +360,7 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 
 	resp, err := svc.ListObjectsV2(context.Background(), params)
 	if err != nil {
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infoln(tag, cloudBck.Name, err)
 		}
 		ecode, err = awsErrorToAISError(err, cloudBck, "")
@@ -375,13 +403,13 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	}
 
 	if len(lst.Entries) == 0 || !versioning {
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infoln(tag, cloudBck.Name, len(lst.Entries))
 		}
 		return 0, nil
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+	if cmn.Rom.V(4, cos.ModBackend) {
 		nlog.Infoln(tag, cloudBck.Name, "proceed to list", len(lst.Entries), "versions")
 	}
 	// [slow path] for each already listed object:
@@ -410,7 +438,7 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 			}
 		}
 	}
-	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+	if cmn.Rom.V(4, cos.ModBackend) {
 		nlog.Infoln(tag, cloudBck.Name, len(lst.Entries), num)
 	}
 	return 0, nil
@@ -438,7 +466,7 @@ func (*s3bp) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, ecode int, _ error) {
 
 	bcks = make(cmn.Bcks, len(result.Buckets))
 	for idx, bck := range result.Buckets {
-		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Infoln("[bucket_names]", aws.ToString(bck.Name), "created", *bck.CreationDate)
 		}
 		bcks[idx] = cmn.Bck{
@@ -525,7 +553,7 @@ func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *
 	}
 
 exit:
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infoln(tag, cloudBck.Cname(lom.ObjName))
 	}
 	return oa, 0, nil
@@ -565,7 +593,7 @@ finalize:
 	params := allocPutParams(res, owt)
 	err := s3bp.t.PutObject(lom, params)
 	core.FreePutParams(params)
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infoln("[get_object]", lom.String(), err)
 	}
 	return 0, err
@@ -688,9 +716,8 @@ func (*s3bp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, oreq *h
 	md[cos.S3MetadataChecksumType] = cksumType
 	md[cos.S3MetadataChecksumVal] = cksumValue
 	if oreq != nil {
-		for k, v := range cmn.BackendHelpers.Amazon.DecodeMetadata(oreq.Header) {
-			md[k] = v
-		}
+		dm := cmn.BackendHelpers.Amazon.DecodeMetadata(oreq.Header)
+		maps.Copy(md, dm)
 	}
 
 	uploader = s3manager.NewUploader(svc)
@@ -735,7 +762,7 @@ setmd:
 			}
 		}
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infoln(tag, lom.String())
 	}
 	return 0, nil
@@ -769,7 +796,7 @@ func (*s3bp) DeleteObj(ctx context.Context, lom *core.LOM) (ecode int, err error
 		ecode, err = awsErrorToAISError(err, cloudBck, lom.ObjName)
 		return
 	}
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infoln(tag, lom.String())
 	}
 	return
@@ -813,7 +840,9 @@ func (sessConf *sessConf) s3client(tag string) (*s3.Client, error) {
 	// slow path
 	cfg, err := loadConfig(endpoint, profile)
 	if err != nil {
-		return nil, err
+		// normalize s3 error
+		_, errV := awsErrorToAISError(err, sessConf.bck, "")
+		return nil, errV
 	}
 
 	svc := s3.NewFromConfig(cfg, sessConf.options)
@@ -822,14 +851,14 @@ func (sessConf *sessConf) s3client(tag string) (*s3.Client, error) {
 	// - gotBucketLocation special case
 	// - otherwise, not caching s3 client for an unknown or missing region
 	if sessConf.region == "" && tag != gotBucketLocation {
-		if tag != "" && cmn.Rom.FastV(4, cos.SmoduleBackend) {
+		if tag != "" && cmn.Rom.V(4, cos.ModBackend) {
 			nlog.Warningln(tag, "no region for bucket", sessConf.bck.Cname(""))
 		}
 		return svc, nil
 	}
 
 	// cache (without recomputing _cid and possibly an empty region)
-	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
+	if cmn.Rom.V(4, cos.ModBackend) {
 		nlog.Infoln("add s3client for tuple (profile, region, endpoint):", cid)
 	}
 	clients.Store(cid, svc) // race or no race, no particular reason to do LoadOrStore
@@ -874,11 +903,22 @@ func _cid(profile, region, endpoint string) string {
 
 // loadConfig create config using default creds from ~/.aws/credentials and environment variables.
 func loadConfig(endpoint, profile string) (aws.Config, error) {
+	// Disable SDK rate limiting to rely on configured backend.rate_limit
+	retryConfig := retry.NewStandard(func(o *retry.StandardOptions) {
+		o.RateLimiter = ratelimit.None
+	})
+	confFiles, credFiles := getS3ConfFiles()
+	nlog.Infoln("Loading config for profile:", profile, "config files:", confFiles, "credential files:", credFiles)
 	// NOTE: The AWS SDK for Go v2, uses lower case header maps by default.
 	cfg, err := config.LoadDefaultConfig(
 		context.Background(),
 		config.WithHTTPClient(tracing.NewTraceableClient(cmn.NewClient(cmn.TransportArgs{}))),
+		config.WithSharedConfigFiles(confFiles),
+		config.WithSharedCredentialsFiles(credFiles),
 		config.WithSharedConfigProfile(profile),
+		config.WithRetryer(func() aws.Retryer {
+			return retryConfig
+		}),
 	)
 	if err != nil {
 		return cfg, err
@@ -889,33 +929,40 @@ func loadConfig(endpoint, profile string) (aws.Config, error) {
 	return cfg, nil
 }
 
-func getBucketVersioning(svc *s3.Client, bck *cmn.Bck) (enabled bool, errV error) {
-	input := &s3.GetBucketVersioningInput{Bucket: aws.String(bck.Name)}
-	result, err := svc.GetBucketVersioning(context.Background(), input)
-	if err != nil {
-		return false, err
-	}
-	enabled = result.Status == types.BucketVersioningStatusEnabled
-	return
-}
-
-func getBucketLocation(svc *s3.Client, bckName string) (region string, err error) {
-	resp, err := svc.GetBucketLocation(context.Background(), &s3.GetBucketLocationInput{
-		Bucket: aws.String(bckName),
-	})
-	if err != nil {
+func getS3ConfFiles() (confFiles, credFiles []string) {
+	const (
+		s3ConfigDir     = "AIS_S3_CONFIG_DIR"
+		s3ConfIndicator = "conf"
+		s3CredIndicator = "cred"
+	)
+	s3Dir := os.Getenv(s3ConfigDir)
+	if s3Dir == "" {
 		return
 	}
-	region = string(resp.LocationConstraint)
-	if region == "" {
-		region = env.AwsDefaultRegion() // env "AWS_REGION" or "us-east-1" - in that order
+	entries, err := os.ReadDir(s3Dir)
+	if err != nil {
+		nlog.Warningln("Failed to read S3 configuration directory:", s3Dir, "err:", err)
+		return
+	}
+	confFiles = make([]string, 0, len(entries))
+	credFiles = make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.Contains(entry.Name(), s3ConfIndicator) {
+			confFiles = append(confFiles, filepath.Join(s3Dir, entry.Name()))
+		}
+		if strings.Contains(entry.Name(), s3CredIndicator) {
+			credFiles = append(credFiles, filepath.Join(s3Dir, entry.Name()))
+		}
 	}
 	return
 }
 
 // For reference see https://github.com/aws/aws-sdk-go-v2/issues/1110#issuecomment-1054643716.
 func awsErrorToAISError(awsError error, bck *cmn.Bck, objName string) (int, error) {
-	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
+	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.InfoDepth(1, "begin "+aiss3.ErrPrefix+" =========================")
 		nlog.InfoDepth(1, awsError)
 		nlog.InfoDepth(1, "end "+aiss3.ErrPrefix+" ===========================")
@@ -929,7 +976,7 @@ func awsErrorToAISError(awsError error, bck *cmn.Bck, objName string) (int, erro
 	code := reqErr.ErrorCode()
 	switch reqErr.(type) {
 	case *types.NoSuchBucket:
-		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
+		return http.StatusNotFound, cmn.NewErrRemBckNotFound(bck)
 	case *types.NoSuchKey:
 		e := fmt.Errorf("%s[%s: %s]", aiss3.ErrPrefix, reqErr.ErrorCode(), bck.Cname(objName))
 		return http.StatusNotFound, e
@@ -943,7 +990,7 @@ func awsErrorToAISError(awsError error, bck *cmn.Bck, objName string) (int, erro
 		case http.StatusMovedPermanently:
 			// [BUG] when bucket does not exist or isn't accessible AWS may return
 			// 301 ("MovedPermanently") with code == "PermanentRedirect" which is 308
-			err := cmn.NewErrRemoteBckNotFound(bck)
+			err := cmn.NewErrRemBckNotFound(bck)
 			err.Set(" (PermanentRedirect)")
 			return http.StatusNotFound, err
 		case http.StatusTooManyRequests, http.StatusServiceUnavailable:

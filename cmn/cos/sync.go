@@ -13,6 +13,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 type (
@@ -28,7 +30,7 @@ type (
 	// designed for that and bugs can be expected, especially when previous
 	// group was not called with successful (without timeout) WaitTimeout.
 	TimeoutGroup struct {
-		fin       chan struct{}
+		finCh     chan struct{}
 		pending   atomic.Int32
 		postedFin atomic.Int32
 	}
@@ -41,7 +43,7 @@ type (
 
 	// Semaphore is a textbook _sempahore_ implemented as a wrapper on `chan struct{}`.
 	Semaphore struct {
-		s chan struct{}
+		ch chan struct{}
 	}
 
 	// DynSemaphore implements semaphore which can change its size.
@@ -69,6 +71,13 @@ type (
 	NopLocker struct{}
 )
 
+type (
+	// Commonly known as "sharded mutex"
+	SharMutex16 struct {
+		m [16]sync.Mutex
+	}
+)
+
 // interface guard
 var (
 	_ WG = (*LimitedWaitGroup)(nil)
@@ -88,7 +97,7 @@ func (NopLocker) Unlock() {}
 
 func NewTimeoutGroup() *TimeoutGroup {
 	return &TimeoutGroup{
-		fin: make(chan struct{}, 1),
+		finCh: make(chan struct{}, 1),
 	}
 }
 
@@ -114,7 +123,7 @@ func (twg *TimeoutGroup) WaitTimeout(timeout time.Duration) bool {
 func (twg *TimeoutGroup) WaitTimeoutWithStop(timeout time.Duration, stop <-chan struct{}) (timed, stopped bool) {
 	t := time.NewTimer(timeout)
 	select {
-	case <-twg.fin:
+	case <-twg.finCh:
 		twg.postedFin.Store(0)
 	case <-t.C:
 		timed, stopped = true, false
@@ -130,7 +139,7 @@ func (twg *TimeoutGroup) WaitTimeoutWithStop(timeout time.Duration, stop <-chan 
 func (twg *TimeoutGroup) Done() {
 	if n := twg.pending.Dec(); n == 0 {
 		if posted := twg.postedFin.Swap(1); posted == 0 {
-			twg.fin <- struct{}{}
+			twg.finCh <- struct{}{}
 		}
 	} else if n < 0 {
 		debug.Assertf(false, "invalid num pending %d", n)
@@ -160,20 +169,22 @@ func (sch *StopCh) Close() {
 	}
 }
 
+func (sch *StopCh) Stopped() bool { return sch.stopped.Load() }
+
 ///////////////
 // Semaphore //
 ///////////////
 
 func NewSemaphore(n int) *Semaphore {
-	s := &Semaphore{s: make(chan struct{}, n)}
+	s := &Semaphore{ch: make(chan struct{}, n)}
 	for range n {
-		s.s <- struct{}{}
+		s.ch <- struct{}{}
 	}
 	return s
 }
-func (s *Semaphore) TryAcquire() <-chan struct{} { return s.s }
+func (s *Semaphore) TryAcquire() <-chan struct{} { return s.ch }
 func (s *Semaphore) Acquire()                    { <-s.TryAcquire() }
-func (s *Semaphore) Release()                    { s.s <- struct{}{} }
+func (s *Semaphore) Release()                    { s.ch <- struct{}{} }
 
 func NewDynSemaphore(n int) *DynSemaphore {
 	sema := &DynSemaphore{size: n}
@@ -264,7 +275,7 @@ func (lwg *LimitedWaitGroup) Wait() {
 //
 
 const (
-	chanFullSleep = 100 * time.Millisecond
+	chanFullSleep = PollSleepShort
 )
 
 type (
@@ -301,3 +312,42 @@ func (u *ChanFull) Check(l, c int) bool {
 }
 
 func (u *ChanFull) Load() int64 { return u.Int64.Load() }
+
+/////////////////
+// SharMutex16 //
+/////////////////
+
+func (shar *SharMutex16) Lock(i int)   { shar.m[i].Lock() }
+func (shar *SharMutex16) Unlock(i int) { shar.m[i].Unlock() }
+func (shar *SharMutex16) Len() int     { return cap(shar.m) }
+
+func (shar *SharMutex16) LockAll() {
+	for i := range shar.m {
+		shar.m[i].Lock()
+	}
+}
+
+func (shar *SharMutex16) UnlockAll() {
+	for i := range shar.m {
+		shar.m[i].Unlock()
+	}
+}
+
+func (shar *SharMutex16) Index(id string) int {
+	hash := onexxh.Checksum64S(UnsafeB(id), MLCG32)
+	return int(hash & uint64(cap(shar.m)-1))
+}
+
+// drain any channel (generic; best-effort)
+func DrainAnyChan[T any](ch <-chan T) {
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
+}

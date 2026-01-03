@@ -1,25 +1,28 @@
 // Package archive provides common low-level utilities for testing archives
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tarch
 
 import (
 	"archive/tar"
 	"bytes"
-	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"os"
 	"strconv"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/ext/dsort/shard"
+	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/trand"
 )
 
@@ -49,23 +52,35 @@ type (
 	}
 )
 
-func addBufferToArch(aw archive.Writer, path string, l int, buf []byte) error {
+func randomizeSize(size int, seed uint64) int {
+	if size <= 100 {
+		return size
+	}
+	jitter := (int(seed&0x7) - 4) * size / 10
+	return size + jitter
+}
+
+func addBufferToArch(aw archive.Writer, path string, seed uint64, size int, buf []byte, exactSize bool) (uint64, error) {
+	l := size
+	if !exactSize {
+		l = randomizeSize(size, seed)
+	}
 	if buf == nil {
 		buf = newBuf(l)
 		defer freeBuf(buf)
 		buf = buf[:l]
-		_, err := cryptorand.Read(buf[:l/3])
-		debug.AssertNoErr(err)
-		copy(buf[2*l/3:], buf)
+		for i := 0; i < len(buf)-cos.SizeofI64; i += cos.SizeofI64 {
+			binary.BigEndian.PutUint64(buf[i:], seed+uint64(i))
+		}
 	}
 	reader := bytes.NewBuffer(buf)
 	oah := cos.SimpleOAH{Size: int64(l)}
-	return aw.Write(path, oah, reader)
+	return seed + uint64(l), aw.Write(path, oah, reader)
 }
 
 // TODO: refactor to reduce number of arguments
-func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, fileCnt, fileSize int,
-	dup, randDir bool, recExts, randNames []string) error {
+func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, fileCnt, fileSize int, recExts, randNames []string,
+	dup, randDir, exactSize bool) error {
 	wfh, err := cos.CreateFile(shardName)
 	if err != nil {
 		return err
@@ -84,6 +99,7 @@ func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, f
 	if len(recExts) == 0 {
 		recExts = []string{".txt"}
 	}
+	seed := uint64(mono.NanoTime())
 	for i := range fileCnt {
 		var randomName int
 		if randNames == nil {
@@ -105,7 +121,8 @@ func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, f
 					fileName = trand.String(5) + "/" + fileName
 				}
 			}
-			if err := addBufferToArch(aw, fileName, fileSize, nil); err != nil {
+			var err error
+			if seed, err = addBufferToArch(aw, fileName, seed, fileSize, nil, exactSize); err != nil {
 				return err
 			}
 			prevFileName = fileName
@@ -115,12 +132,15 @@ func CreateArchRandomFiles(shardName string, tarFormat tar.Format, ext string, f
 }
 
 func CreateArchCustomFilesToW(w io.Writer, tarFormat tar.Format, ext string, fileCnt, fileSize int,
-	customFileType, customFileExt string, missingKeys bool) error {
+	customFileType, customFileExt string, missingKeys, exactSize bool) error {
 	aw := archive.NewWriter(ext, w, nil, &archive.Opts{TarFormat: tarFormat})
 	defer aw.Fini()
+
+	seed := uint64(mono.NanoTime())
 	for range fileCnt {
 		fileName := strconv.Itoa(rand.Int()) // generate random names
-		if err := addBufferToArch(aw, fileName+".txt", fileSize, nil); err != nil {
+		var err error
+		if seed, err = addBufferToArch(aw, fileName+".txt", seed, fileSize, nil, exactSize); err != nil {
 			return err
 		}
 		// If missingKeys enabled we should only add keys randomly
@@ -140,7 +160,7 @@ func CreateArchCustomFilesToW(w io.Writer, tarFormat tar.Format, ext string, fil
 			default:
 				debug.Assert(false, customFileType) // validated above
 			}
-			if err := addBufferToArch(aw, fileName+customFileExt, len(buf), buf); err != nil {
+			if seed, err = addBufferToArch(aw, fileName+customFileExt, seed, len(buf), buf, exactSize); err != nil {
 				return err
 			}
 		}
@@ -149,13 +169,13 @@ func CreateArchCustomFilesToW(w io.Writer, tarFormat tar.Format, ext string, fil
 }
 
 func CreateArchCustomFiles(shardName string, tarFormat tar.Format, ext string, fileCnt, fileSize int,
-	customFileType, customFileExt string, missingKeys bool) error {
+	customFileType, customFileExt string, missingKeys, exactSize bool) error {
 	wfh, err := cos.CreateFile(shardName)
 	if err != nil {
 		return err
 	}
 	defer wfh.Close()
-	return CreateArchCustomFilesToW(wfh, tarFormat, ext, fileCnt, fileSize, customFileType, customFileExt, missingKeys)
+	return CreateArchCustomFilesToW(wfh, tarFormat, ext, fileCnt, fileSize, customFileType, customFileExt, missingKeys, exactSize)
 }
 
 func newArchReader(mime string, buffer *bytes.Buffer) (ar archive.Reader, err error) {
@@ -308,4 +328,46 @@ func newBuf32k() (buf []byte) {
 
 func freeBuf32k(buf []byte) {
 	pool32k.Put(&buf)
+}
+
+///////////
+// DrainVerify (compare w/ Drain{} in cmn/archive)
+///////////
+
+type (
+	DrainVerify struct {
+		t         *testing.T
+		wantNames []string
+		wantSizes []int64
+		i         int
+		total     int64
+	}
+)
+
+func NewDrainVerify(t *testing.T, wantNames []string, wantSizes []int64) *DrainVerify {
+	return &DrainVerify{
+		t:         t,
+		wantNames: wantNames,
+		wantSizes: wantSizes,
+	}
+}
+
+func (drain *DrainVerify) Call(name string, r cos.ReadCloseSizer, hdr any) (bool, error) {
+	tarhdr, ok := hdr.(*tar.Header)
+	if !ok {
+		tassert.Fatalf(drain.t, false, "expected *tar.Header, got %T", hdr)
+	}
+	expSize := drain.wantSizes[drain.i]
+	tassert.Errorf(drain.t, tarhdr.Size == expSize, "entry[%d] size mismatch: hdr=%d exp=%d", drain.i, tarhdr.Size, expSize)
+
+	expName := drain.wantNames[drain.i]
+	tassert.Errorf(drain.t, name == expName, "entry[%d] name mismatch: got %q exp %q", drain.i, name, expName)
+
+	n, err := io.Copy(io.Discard, r)
+	drain.total += n
+	_ = r.Close()
+	tassert.Errorf(drain.t, n == tarhdr.Size, "entry[%d] drained %d bytes != hdr.Size %d", drain.i, n, tarhdr.Size)
+
+	drain.i++
+	return false, err
 }

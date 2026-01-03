@@ -15,21 +15,18 @@
 # and so on. This rule holds for all AIS "applications" except `aisnode` itself.
 # See https://github.com/NVIDIA/aistore/tree/main/cmn/fname for the most updated locations.
 #
-# NOTE: Prometheus is the Local Playground's default; use TAGS to specify `statsd` and/or
-# any other non-default build tag.
-#
 ############################################
 
 if ! command -v go &> /dev/null; then
   echo "Go (toolchain) is not installed"
   echo "Use https://go.dev/dl to install the required (as per go.mod) version of Go"
-  echo "See https://aiatscale.org/docs/getting-started for step-by-step instruction"
+  echo "See https://aistore.nvidia.com/docs/getting_started for step-by-step instruction"
   exit 1
 fi
 
 if [[ -z $GOPATH ]]; then
   echo "Warning: GOPATH variable is not defined, using home directory ${HOME}"
-  echo "(Tip: see https://aiatscale.org/docs/getting-started for step-by-step instruction)"
+  echo "(Tip: see https://aistore.nvidia.com/docs/getting_started for step-by-step instruction)"
   echo ""
   if [ ! -d "${HOME}/go/pkg" ]; then
     echo "${HOME}/go/pkg does not exist (deploying the very first time and from scratch?)"
@@ -81,10 +78,8 @@ if $AIS_USE_HTTPS; then
 fi
 LOG_ROOT="${LOG_ROOT:-/tmp/ais}${NEXT_TIER}"
 #### Authentication setup #########
-AIS_AUTHN_SECRET_KEY="${AIS_AUTHN_SECRET_KEY:-aBitLongSecretKey}"
 AIS_AUTHN_ENABLED="${AIS_AUTHN_ENABLED:-false}"
 AIS_AUTHN_SU_NAME="${AIS_AUTHN_SU_NAME:-admin}"
-AIS_AUTHN_SU_PASS="${AIS_AUTHN_SU_PASS:-admin}"
 ###################################
 #
 # fspaths config is used if and only if test_fspaths.count == 0
@@ -99,8 +94,6 @@ AIS_CONF_DIR="$HOME/.ais$NEXT_TIER"
 APP_CONF_DIR="$HOME/.config/ais"
 mkdir -p $AIS_CONF_DIR
 mkdir -p $APP_CONF_DIR
-COLLECTD_CONF_FILE="${APP_CONF_DIR}/collectd.conf"
-STATSD_CONF_FILE="${APP_CONF_DIR}/statsd.conf"
 
 if lsof -Pi :$PORT -sTCP:LISTEN -t >/dev/null; then
   exit_error "TCP port $PORT is not open (check if AIStore is already running)"
@@ -182,10 +175,7 @@ rm $TMPF 2>/dev/null
 ### end reading STDIN ============================ 5 steps above =================================
 
 
-## NOTE: to enable StatsD instead of Prometheus, use build tag `statsd` in the make command, as follows:
-## TAGS=statsd make ...
 ## For more information, see docs/build_tags.md and/or docs/monitoring-overview.md.
-##
 if ! TAGS=${TAGS} AIS_BACKEND_PROVIDERS=${AIS_BACKEND_PROVIDERS} make --no-print-directory -C ${AISTORE_PATH} node; then
   exit_error "failed to compile 'aisnode' binary"
 fi

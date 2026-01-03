@@ -1,0 +1,68 @@
+# Setup test files and bucket
+echo "Part 1: This is the first part of our multipart upload test." > /tmp/mpu_part1.txt
+echo "Part 2: Here comes the second segment with more data to test." > /tmp/mpu_part2.txt  
+echo "Part 3: This is the final third part to complete our test upload." > /tmp/mpu_part3.txt
+
+ais bucket create ais://$BUCKET_1 | awk '{print $1 " " $2}'
+
+# Test 1: Create and verify upload ID is returned
+ais object mpu create ais://$BUCKET_1/test-object
+
+# Test 2: Error conditions - missing arguments
+ais object mpu create // FAIL "bucket/object_name"
+ais object mpu put-part ais://$BUCKET_1/test // FAIL "arguments"
+ais object mpu complete ais://$BUCKET_1/test // FAIL "arguments"  
+ais object mpu abort ais://$BUCKET_1/test // FAIL "arguments"
+
+# Test 3: Error conditions - invalid bucket
+ais object mpu create ais://nonexistent-bucket/test // FAIL "bucket"
+
+# Test 4: Error conditions - missing object name
+ais object mpu create ais://$BUCKET_1 // FAIL "object name"
+
+# Test 5: Test put-part with missing upload ID
+ais object mpu put-part ais://$BUCKET_1/test-object invalidID 1 /tmp/mpu_part1.txt // FAIL "failed to upload part"
+
+# Test 6: Test put-part with invalid part number  
+ais object mpu put-part ais://$BUCKET_1/test-object someID 0 /tmp/mpu_part1.txt // FAIL "part number must be positive"
+ais object mpu put-part ais://$BUCKET_1/test-object someID -1 /tmp/mpu_part1.txt // FAIL "part number must be positive"
+
+# Test 7: Test complete with invalid upload ID
+ais object mpu complete ais://$BUCKET_1/test-object invalidID 1,2,3 // FAIL "failed to complete"
+
+# Test 8: Test abort with invalid upload ID 
+ais object mpu abort ais://$BUCKET_1/test-object invalidID // FAIL "failed to abort multipart upload"
+
+# Test 9: Large file multipart upload tests
+# Create a small file (below 16MB threshold)
+dd if=/dev/zero of=/tmp/small_file.bin bs=1M count=8 // IGNORE
+# Create a large file (above 16MB threshold)  
+dd if=/dev/zero of=/tmp/large_file.bin bs=1M count=32 // IGNORE
+# Create content-based large file for integrity testing
+seq 1 1000000 > /tmp/large_content.txt // IGNORE
+
+# Test 10: Small file should not trigger multipart upload
+ais put /tmp/small_file.bin ais://$BUCKET_1/small-file
+
+# Test 11: Large file with --chunk-size flag
+ais put /tmp/large_file.bin ais://$BUCKET_1/large-file-chunked --chunk-size=8MB
+
+# Test 12: File smaller than threshold with --chunk-size flag
+ais put /tmp/large_content.txt ais://$BUCKET_1/content-file --chunk-size=4MB
+
+# Test 13: Verify uploaded files integrity
+ais get ais://$BUCKET_1/small-file /tmp/downloaded_small.bin --silent // IGNORE
+ais get ais://$BUCKET_1/large-file-chunked /tmp/downloaded_large.bin --silent // IGNORE
+ais get ais://$BUCKET_1/content-file /tmp/downloaded_content.txt --silent // IGNORE
+
+# Compare file sizes and checksums
+echo "Verifying file integrity..."
+ls -la /tmp/small_file.bin /tmp/downloaded_small.bin | awk '{print $5}' | sort -u | wc -l | grep -q "1" && echo "Small file size matches"
+ls -la /tmp/large_file.bin /tmp/downloaded_large.bin | awk '{print $5}' | sort -u | wc -l | grep -q "1" && echo "Large file size matches"  
+diff /tmp/large_content.txt /tmp/downloaded_content.txt > /dev/null && echo "Content file matches"
+
+# Cleanup
+rm -f /tmp/mpu_part1.txt /tmp/mpu_part2.txt /tmp/mpu_part3.txt // IGNORE
+rm -f /tmp/small_file.bin /tmp/large_file.bin /tmp/large_content.txt // IGNORE
+rm -f /tmp/downloaded_small.bin /tmp/downloaded_large.bin /tmp/downloaded_content.txt // IGNORE
+ais bucket rm ais://$BUCKET_1 --yes // IGNORE

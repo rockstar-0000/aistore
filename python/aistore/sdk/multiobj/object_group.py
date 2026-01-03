@@ -48,9 +48,9 @@ class ObjectGroup(AISSource):
     def __init__(
         self,
         bck: "Bucket",
-        obj_names: List = None,
-        obj_range: ObjectRange = None,
-        obj_template: str = None,
+        obj_names: Optional[List] = None,
+        obj_range: Optional[ObjectRange] = None,
+        obj_template: Optional[str] = None,
     ):
         self.bck = bck
         num_args = sum(
@@ -67,7 +67,7 @@ class ObjectGroup(AISSource):
             self._obj_collection = obj_range
         elif obj_names:
             self._obj_collection = ObjectNames(obj_names)
-        else:
+        elif obj_template:
             self._obj_collection = ObjectTemplate(obj_template)
 
     @property
@@ -76,9 +76,22 @@ class ObjectGroup(AISSource):
         return self.bck.client
 
     @client.setter
-    def client(self, client) -> RequestClient:
+    def client(self, client):
         """Update the client bound to the bucket used by the ObjectGroup."""
         self.bck.client = client
+
+    def _parse_job_ids(self, response_text: str) -> List[str]:
+        """
+        Parse job ID response that may contain comma-separated UUIDs.
+        Used only for copy and archive operations which can return multiple UUIDs.
+
+        Args:
+            response_text (str): Raw response text
+
+        Returns:
+            List[str]: List of individual job IDs
+        """
+        return response_text.split(",") if response_text else []
 
     def list_urls(
         self, prefix: str = "", etl: Optional[ETLConfig] = None
@@ -91,8 +104,8 @@ class ObjectGroup(AISSource):
             etl (Optional[ETLConfig], optional): An optional ETL configuration. If provided, the URLs
                 will include ETL processing parameters. Defaults to None.
 
-        Returns:
-            Iterator of all object URLs in the group
+        Yields:
+            str: Full URLs of objects in the group.
         """
         for obj_name in self._obj_collection:
             yield self.bck.object(obj_name).get_url(etl=etl)
@@ -109,8 +122,8 @@ class ObjectGroup(AISSource):
             props (str, optional): By default, will include all object properties.
                 Pass in None to skip and avoid the extra API call.
 
-        Returns:
-            Iterator of all the objects in the group
+        Yields:
+            Object: Objects in the group matching the specified prefix.
         """
         for obj_name in self._obj_collection:
 
@@ -174,8 +187,8 @@ class ObjectGroup(AISSource):
 
     def prefetch(
         self,
-        blob_threshold: int = None,
-        num_workers: int = None,
+        blob_threshold: Optional[int] = None,
+        num_workers: Optional[int] = None,
         latest: bool = False,
         continue_on_error: bool = False,
     ):
@@ -231,7 +244,7 @@ class ObjectGroup(AISSource):
         latest: bool = False,
         sync: bool = False,
         num_workers: int = None,
-    ):
+    ) -> List[str]:
         """
         Copies a list or range of objects in a bucket
 
@@ -257,7 +270,7 @@ class ObjectGroup(AISSource):
             requests.ReadTimeout: Timed out receiving response from AIStore
 
         Returns:
-            Job ID (as str) that can be used to check the status of the operation
+            List[str]: List of job IDs that can be used to check the status of the operation
 
         """
         if dry_run:
@@ -280,11 +293,13 @@ class ObjectGroup(AISSource):
             num_workers=num_workers,
         ).as_dict()
 
-        return self.bck.make_request(
+        response = self.bck.make_request(
             HTTP_METHOD_POST,
             ACT_COPY_OBJECTS,
             value=value,
-        ).text
+        )
+
+        return self._parse_job_ids(response.text)
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments, too-many-locals
     def transform(
@@ -293,13 +308,14 @@ class ObjectGroup(AISSource):
         etl_name: str,
         timeout: str = DEFAULT_ETL_TIMEOUT,
         prepend: str = "",
-        ext: Dict[str, str] = None,
+        ext: Optional[Dict[str, str]] = None,
         continue_on_error: bool = False,
         dry_run: bool = False,
         force: bool = False,
         latest: bool = False,
         sync: bool = False,
-        num_workers: int = None,
+        num_workers: Optional[int] = None,
+        etl_pipeline: Optional[List[str]] = None,
     ):
         """
         Performs ETL operation on a list or range of objects in a bucket, placing the results in the destination bucket
@@ -320,6 +336,7 @@ class ObjectGroup(AISSource):
             num_workers (int, optional): Number of concurrent workers (readers). Defaults to the number of target
                 mountpaths if omitted or zero. A value of -1 indicates no workers at all (i.e., single-threaded
                 execution). Any positive value will be adjusted not to exceed the number of target CPUs.
+            etl_pipeline (List[str], optional): List of ETL names to be used for the transformation pipeline.
 
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
@@ -344,7 +361,9 @@ class ObjectGroup(AISSource):
         copy_msg = CopyBckMsg(
             prepend=prepend, dry_run=dry_run, force=force, latest=latest, sync=sync
         )
-        transform_msg = TransformBckMsg(etl_name=etl_name, timeout=timeout)
+        transform_msg = TransformBckMsg(
+            etl_name=etl_name, timeout=timeout, etl_pipeline=etl_pipeline
+        )
         value = TCMultiObj(
             to_bck=to_bck.as_model(),
             tc_msg=TCBckMsg(ext=ext, transform_msg=transform_msg, copy_msg=copy_msg),
@@ -365,7 +384,7 @@ class ObjectGroup(AISSource):
         include_source_name: bool = False,
         allow_append: bool = False,
         continue_on_err: bool = False,
-    ):
+    ) -> List[str]:
         """
         Create or append to an archive
 
@@ -378,7 +397,7 @@ class ObjectGroup(AISSource):
             continue_on_err (bool, optional): Whether to continue if there is an error archiving a single object
 
         Returns:
-            Job ID (as str) that can be used to check the status of the operation
+            List[str]: List of job IDs that can be used to check the status of the operation
 
         """
         val = ArchiveMultiObj(
@@ -390,9 +409,12 @@ class ObjectGroup(AISSource):
             allow_append=allow_append,
             continue_on_err=continue_on_err,
         ).as_dict()
-        return self.bck.make_request(
+
+        response = self.bck.make_request(
             HTTP_METHOD_PUT, ACT_ARCHIVE_OBJECTS, value=val
-        ).text
+        )
+
+        return self._parse_job_ids(response.text)
 
     def list_names(self) -> List[str]:
         """

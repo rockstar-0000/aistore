@@ -1,7 +1,6 @@
 //go:build !nethttp
 
-// Package transport provides long-lived http/tcp connections for
-// intra-cluster communications (see README for details and usage example).
+// Package transport provides long-lived http/tcp connections for intra-cluster communications
 /*
  * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
@@ -16,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/core"
 
 	"github.com/valyala/fasthttp"
 )
@@ -54,7 +54,7 @@ func NewIntraDataClient() Client {
 	return cl
 }
 
-func (s *streamBase) doPlain(body io.Reader) (err error) {
+func (s *base) doPlain(body io.Reader) (err error) {
 	var (
 		req  = fasthttp.AcquireRequest()
 		resp = fasthttp.AcquireResponse()
@@ -65,7 +65,7 @@ func (s *streamBase) doPlain(body io.Reader) (err error) {
 	return err
 }
 
-func (s *streamBase) doCmpr(body io.Reader) (err error) {
+func (s *base) doCmpr(body io.Reader) (err error) {
 	var (
 		req  = fasthttp.AcquireRequest()
 		resp = fasthttp.AcquireResponse()
@@ -80,11 +80,12 @@ func (s *streamBase) doCmpr(body io.Reader) (err error) {
 	return err
 }
 
-func (s *streamBase) _do(body io.Reader, req *fasthttp.Request, resp *fasthttp.Response) (err error) {
+func (s *base) _do(body io.Reader, req *fasthttp.Request, resp *fasthttp.Response) (err error) {
 	req.Header.SetMethod(http.MethodPut)
 	req.SetRequestURI(s.dstURL)
 	req.SetBodyStream(body, -1)
 	req.Header.Set(apc.HdrSessID, strconv.FormatInt(s.sessID, 10))
+	req.Header.Set(apc.HdrSenderID, core.T.SID())
 	req.Header.Set(cos.HdrUserAgent, ua)
 
 	// do

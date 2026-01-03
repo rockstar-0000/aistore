@@ -27,19 +27,19 @@ type EchoServer struct {
 	ETLServer
 }
 
-func (*EchoServer) Transform(input io.ReadCloser, _, _ string) (io.ReadCloser, error) {
+func (*EchoServer) Transform(input io.ReadCloser, _, _ string) (io.ReadCloser, int64, error) {
 	data, err := io.ReadAll(input)
 	if err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 	input.Close()
-	return io.NopCloser(bytes.NewReader(data)), nil
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
 }
 
 func TestInvalidETLServer(t *testing.T) {
 	err := Run(nil, "0.0.0.0", 8080)
 	if err == nil {
-		t.Fatalf("invalid ETL Server should return an error")
+		t.Fatal("invalid ETL Server should return an error")
 	}
 }
 
@@ -51,7 +51,6 @@ func TestETLServerPutHandler(t *testing.T) {
 
 		svr = &etlServerBase{
 			aisTargetURL: host + secretPrefix,
-			argType:      etl.ArgTypeDefault,
 			endpoint:     host + ":" + port,
 			client:       &http.Client{},
 			ETLServer:    &EchoServer{},
@@ -76,7 +75,6 @@ func TestETLServerPutHandler(t *testing.T) {
 		})
 
 		t.Run("argType=fqn", func(t *testing.T) {
-			svr.argType = etl.ArgTypeFQN
 			file, content := createFQNFile(t)
 			defer os.Remove(file)
 
@@ -84,8 +82,10 @@ func TestETLServerPutHandler(t *testing.T) {
 				path = "/" + url.PathEscape(file)
 				req  = httptest.NewRequest(http.MethodPut, path, http.NoBody)
 				w    = httptest.NewRecorder()
+				q    = req.URL.Query()
 			)
-
+			q.Set(apc.QparamETLFQN, file)
+			req.URL.RawQuery = q.Encode()
 			svr.putHandler(w, req)
 
 			resp := w.Result()
@@ -100,13 +100,12 @@ func TestETLServerPutHandler(t *testing.T) {
 		var directPutPath = "ais@#test/obj"
 		directPutTargetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tassert.Fatalf(t, r.Method == http.MethodPut, "expected PUT method, got %s", r.Method)
-			tassert.Fatalf(t, cos.JoinWords(secretPrefix, directPutPath) == r.URL.Path, "expected path %s, got %s", cos.JoinWords(secretPrefix, directPutPath), r.URL.Path)
+			tassert.Fatalf(t, cos.JoinWP(secretPrefix, directPutPath) == r.URL.Path, "expected path %s, got %s", cos.JoinWP(secretPrefix, directPutPath), r.URL.Path)
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer directPutTargetServer.Close()
 
 		t.Run("argType=default", func(t *testing.T) {
-			svr.argType = etl.ArgTypeDefault
 			var (
 				content = []byte("test bytes")
 				req     = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(content))
@@ -125,7 +124,6 @@ func TestETLServerPutHandler(t *testing.T) {
 		})
 
 		t.Run("argType=fqn", func(t *testing.T) {
-			svr.argType = etl.ArgTypeFQN
 			file, _ := createFQNFile(t)
 			defer os.Remove(file)
 
@@ -133,7 +131,10 @@ func TestETLServerPutHandler(t *testing.T) {
 				path = "/" + url.PathEscape(file)
 				req  = httptest.NewRequest(http.MethodPut, path, http.NoBody)
 				w    = httptest.NewRecorder()
+				q    = req.URL.Query()
 			)
+			q.Set(apc.QparamETLFQN, file)
+			req.URL.RawQuery = q.Encode()
 			req.Header = http.Header{apc.HdrNodeURL: []string{cos.JoinPath(directPutTargetServer.URL, url.PathEscape(directPutPath))}}
 
 			svr.putHandler(w, req)
@@ -150,13 +151,12 @@ func TestETLServerPutHandler(t *testing.T) {
 		var directPutPath = "ais@#test/obj"
 		directPutTargetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tassert.Fatalf(t, r.Method == http.MethodPut, "expected PUT method, got %s", r.Method)
-			tassert.Fatalf(t, cos.JoinWords(secretPrefix, directPutPath) == r.URL.Path, "expected path %s, got %s", cos.JoinWords(secretPrefix, directPutPath), r.URL.Path)
+			tassert.Fatalf(t, cos.JoinWP(secretPrefix, directPutPath) == r.URL.Path, "expected path %s, got %s", cos.JoinWP(secretPrefix, directPutPath), r.URL.Path)
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
 		defer directPutTargetServer.Close()
 
 		t.Run("argType=default", func(t *testing.T) {
-			svr.argType = etl.ArgTypeDefault
 			var (
 				content = []byte("test bytes")
 				req     = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(content))
@@ -173,7 +173,6 @@ func TestETLServerPutHandler(t *testing.T) {
 		})
 
 		t.Run("argType=fqn", func(t *testing.T) {
-			svr.argType = etl.ArgTypeFQN
 			file, _ := createFQNFile(t)
 			defer os.Remove(file)
 
@@ -181,7 +180,10 @@ func TestETLServerPutHandler(t *testing.T) {
 				path = "/" + url.PathEscape(file)
 				req  = httptest.NewRequest(http.MethodPut, path, http.NoBody)
 				w    = httptest.NewRecorder()
+				q    = req.URL.Query()
 			)
+			q.Set(apc.QparamETLFQN, file)
+			req.URL.RawQuery = q.Encode()
 			req.Header = http.Header{apc.HdrNodeURL: []string{cos.JoinPath(directPutTargetServer.URL, url.PathEscape(directPutPath))}}
 
 			svr.putHandler(w, req)
@@ -205,7 +207,7 @@ func TestEchoServerGetHandler(t *testing.T) {
 	)
 	localTargetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tassert.Fatalf(t, r.Method == http.MethodGet, "expected GET method, got %s", r.Method)
-		tassert.Fatalf(t, cos.JoinWords(secretPrefix, objUname) == r.URL.Path, "expected path %s, got %s", cos.JoinWords(secretPrefix, objUname), r.URL.Path)
+		tassert.Fatalf(t, cos.JoinWP(secretPrefix, objUname) == r.URL.Path, "expected path %s, got %s", cos.JoinWP(secretPrefix, objUname), r.URL.Path)
 
 		w.WriteHeader(http.StatusOK)
 		w.Write(objContent)
@@ -214,7 +216,6 @@ func TestEchoServerGetHandler(t *testing.T) {
 
 	svr := &etlServerBase{
 		aisTargetURL: localTargetServer.URL + secretPrefix,
-		argType:      etl.ArgTypeDefault,
 		endpoint:     host + ":" + port,
 		client:       &http.Client{},
 		ETLServer:    &EchoServer{},
@@ -222,7 +223,6 @@ func TestEchoServerGetHandler(t *testing.T) {
 
 	t.Run("directPut=none", func(t *testing.T) {
 		t.Run("argType=default", func(t *testing.T) {
-			svr.argType = etl.ArgTypeDefault
 			var (
 				req = httptest.NewRequest(http.MethodGet, "/"+objUname, http.NoBody)
 				w   = httptest.NewRecorder()
@@ -238,7 +238,6 @@ func TestEchoServerGetHandler(t *testing.T) {
 		})
 
 		t.Run("argType=fqn", func(t *testing.T) {
-			svr.argType = etl.ArgTypeFQN
 			file, content := createFQNFile(t)
 			defer os.Remove(file)
 
@@ -246,8 +245,10 @@ func TestEchoServerGetHandler(t *testing.T) {
 				path = "/" + url.PathEscape(file)
 				req  = httptest.NewRequest(http.MethodGet, path, http.NoBody)
 				w    = httptest.NewRecorder()
+				q    = req.URL.Query()
 			)
-
+			q.Set(apc.QparamETLFQN, file)
+			req.URL.RawQuery = q.Encode()
 			svr.getHandler(w, req)
 
 			resp := w.Result()
@@ -262,14 +263,13 @@ func TestEchoServerGetHandler(t *testing.T) {
 		var directPutPath = "ais@#test/obj"
 		directPutTargetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tassert.Fatalf(t, r.Method == http.MethodPut, "expected PUT method, got %s", r.Method)
-			tassert.Fatalf(t, cos.JoinWords(secretPrefix, directPutPath) == r.URL.Path, "expected path %s, got %s", cos.JoinWords(secretPrefix, directPutPath), r.URL.Path)
+			tassert.Fatalf(t, cos.JoinWP(secretPrefix, directPutPath) == r.URL.Path, "expected path %s, got %s", cos.JoinWP(secretPrefix, directPutPath), r.URL.Path)
 
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer directPutTargetServer.Close()
 
 		t.Run("argType=default", func(t *testing.T) {
-			svr.argType = etl.ArgTypeDefault
 			var (
 				req = httptest.NewRequest(http.MethodGet, "/"+objUname, http.NoBody)
 				w   = httptest.NewRecorder()
@@ -287,7 +287,6 @@ func TestEchoServerGetHandler(t *testing.T) {
 		})
 
 		t.Run("argType=fqn", func(t *testing.T) {
-			svr.argType = etl.ArgTypeFQN
 			file, _ := createFQNFile(t)
 			defer os.Remove(file)
 
@@ -295,7 +294,10 @@ func TestEchoServerGetHandler(t *testing.T) {
 				path = "/" + url.PathEscape(file)
 				req  = httptest.NewRequest(http.MethodGet, path, http.NoBody)
 				w    = httptest.NewRecorder()
+				q    = req.URL.Query()
 			)
+			q.Set(apc.QparamETLFQN, file)
+			req.URL.RawQuery = q.Encode()
 			req.Header = http.Header{apc.HdrNodeURL: []string{cos.JoinPath(directPutTargetServer.URL, url.PathEscape(directPutPath))}}
 
 			svr.getHandler(w, req)
@@ -333,7 +335,6 @@ func TestWebSocketHandler(t *testing.T) {
 		if r.URL.Path == "/ws" {
 			base := &etlServerBase{
 				aisTargetURL: host + secretPrefix,
-				argType:      etl.ArgTypeDefault,
 				endpoint:     host + ":" + port,
 				client:       &http.Client{},
 				ETLServer:    &EchoServer{},
@@ -349,7 +350,7 @@ func TestWebSocketHandler(t *testing.T) {
 	tassert.Fatalf(t, err == nil, "WebSocket connection failed: %v", err)
 
 	// Test direct PUT
-	err = conn.WriteJSON(etl.WebsocketCtrlMsg{Daddr: directPutServer.URL + directPutURL})
+	err = conn.WriteJSON(etl.WebsocketCtrlMsg{Pipeline: directPutServer.URL + directPutURL})
 	tassert.Fatalf(t, err == nil, "Write JSON failed")
 	err = conn.WriteMessage(websocket.BinaryMessage, originalData)
 	tassert.Fatalf(t, err == nil, "Write message failed")

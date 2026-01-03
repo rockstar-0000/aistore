@@ -47,6 +47,10 @@ type (
 	}
 )
 
+var (
+	errUserCancel = errors.New("operation canceled")
+)
+
 //////////////
 // errUsage //
 //////////////
@@ -113,21 +117,24 @@ func isCertificateVerificationError(err error) bool {
 func isUnreachableError(err error) (msg string, unreachable bool) {
 	switch err := err.(type) {
 	case *cmn.ErrHTTP:
-		herr := cmn.Err2HTTPErr(err)
 		if cliConfVerbose() {
-			herr.Message = herr.StringEx()
+			err.Message = err.StringEx()
 		}
-		msg = herr.Message
+		msg = err.Message
 		unreachable = cos.IsUnreachable(err, err.Status)
 	case *errUsage, *errAdditionalInfo:
 		return "", false
 	default:
 		msg = err.Error()
-		regx := regexp.MustCompile("dial.*(timeout|refused)")
-		if unreachable = regx.MatchString(msg); unreachable {
-			i := strings.Index(msg, "dial")
-			debug.Assert(i >= 0)
-			msg = msg[i:]
+		if herr := cmn.AsErrHTTP(err); herr != nil {
+			unreachable = cos.IsUnreachable(herr, herr.Status)
+		} else {
+			regx := regexp.MustCompile("dial.*(timeout|refused)")
+			if unreachable = regx.MatchString(msg); unreachable {
+				i := strings.Index(msg, "dial")
+				debug.Assert(i >= 0)
+				msg = msg[i:]
+			}
 		}
 	}
 	return
@@ -294,6 +301,19 @@ func incorrectUsageMsg(c *cli.Context, fmtMsg string, args ...any) *errUsage {
 	return _errUsage(c, fmt.Sprintf(fmtMsg, args...))
 }
 
+func errMutuallyExclusive(c *cli.Context, flags ...cli.Flag) error {
+	for i := range flags {
+		fli := flags[i]
+		for j := i + 1; j < len(flags); j++ {
+			flj := flags[j]
+			if flagIsSet(c, fli) && flagIsSet(c, flj) {
+				return incorrectUsageMsg(c, errFmtExclusive, qflprn(fli), qflprn(flj))
+			}
+		}
+	}
+	return nil
+}
+
 func missingArgumentsError(c *cli.Context, missingArgs ...string) *errUsage {
 	var msg string
 	if len(missingArgs) == 1 && !strings.Contains(missingArgs[0], " ") {
@@ -338,15 +358,16 @@ func completionErr(c *cli.Context, err error) {
 
 func notV(err error) error {
 	if err != nil && !cliConfVerbose() {
-		if herr, ok := err.(*cmn.ErrHTTP); ok {
+		if herr := cmn.AsErrHTTP(err); herr != nil {
 			return errors.New(herr.Message)
 		}
 	}
 	return err
 }
+
 func V(err error) error {
 	if err != nil && cliConfVerbose() {
-		if herr, ok := err.(*cmn.ErrHTTP); ok {
+		if herr := cmn.AsErrHTTP(err); herr != nil {
 			herr.Message = herr.StringEx()
 			return herr
 		}

@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -75,6 +75,7 @@ func NewDiffResolver(ctx DiffResolverCtx) *DiffResolver {
 		srcCh:    make(chan *core.LOM, 128),
 		dstCh:    make(chan *DstElement, 128),
 		resultCh: make(chan DiffResolverResult, 128),
+		err:      cos.NewErrs(),
 	}
 }
 
@@ -204,7 +205,7 @@ func (dr *DiffResolver) Abort(err error) { dr.err.Add(err) }
 func (dr *DiffResolver) walk(job jobif) {
 	defer dr.CloseSrc()
 	opts := &fs.WalkBckOpts{
-		WalkOpts: fs.WalkOpts{CTs: []string{fs.ObjectType}, Sorted: true},
+		WalkOpts: fs.WalkOpts{CTs: []string{fs.ObjCT}, Sorted: true},
 	}
 	opts.WalkOpts.Bck.Copy(job.Bck())
 	opts.Callback = func(fqn string, _ fs.DirEntry) error { return dr.cb(fqn, job) }
@@ -260,7 +261,7 @@ func (dr *DiffResolver) push(job jobif, d *dispatcher) {
 				// When it is not a sync job, push LOM for a given object
 				// because we need to check if it exists.
 				lom := &core.LOM{ObjName: obj.objName}
-				if err := lom.InitBck(job.Bck()); err != nil {
+				if err := lom.InitCmnBck(job.Bck()); err != nil {
 					dr.Abort(err)
 					return
 				}
@@ -288,7 +289,7 @@ func (*defaultDiffResolverCtx) CompareObjects(src *core.LOM, dst *DstElement) (b
 	src.Lock(false)
 	defer src.Unlock(false)
 	if err := src.Load(true /*cache it*/, true /*locked*/); err != nil {
-		if cos.IsNotExist(err, 0) {
+		if cos.IsNotExist(err) {
 			return false, nil
 		}
 		return false, err
@@ -298,7 +299,7 @@ func (*defaultDiffResolverCtx) CompareObjects(src *core.LOM, dst *DstElement) (b
 
 func (*defaultDiffResolverCtx) IsObjFromRemote(src *core.LOM) (bool, error) {
 	if err := src.Load(true /*cache it*/, false /*locked*/); err != nil {
-		if cos.IsNotExist(err, 0) {
+		if cos.IsNotExist(err) {
 			return false, nil
 		}
 		return false, err

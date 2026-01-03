@@ -8,19 +8,34 @@ package xs
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"time"
 
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
+	"github.com/NVIDIA/aistore/transport"
 )
+
+var (
+	errRecvAbort = errors.New("remote target abort") // to avoid duplicated broadcast
+)
+
+func newErrRecvAbort(r core.Xact, hdr *transport.ObjHdr) error {
+	return fmt.Errorf("%s: %w [%s: %s]", r.Name(), errRecvAbort, meta.Tname(hdr.SID), hdr.ObjName /*emsg*/)
+}
+
+func isErrRecvAbort(err error) bool {
+	return errors.Is(err, errRecvAbort)
+}
 
 func rgetstats(bp core.Backend, vlabs map[string]string, size, started int64) {
 	tstats := core.T.StatsUpdater()
@@ -46,9 +61,16 @@ type tcrate struct {
 }
 
 func (rate *tcrate) init(src, dst *meta.Bck, nat int) {
-	rate.src = src.NewFrontendRateLim(nat)
-	if dst.Props != nil { // destination may not exist
-		rate.dst = dst.NewFrontendRateLim(nat)
+	var err error
+	rate.src, err = src.NewFrontendRateLim(nat)
+	if err == nil {
+		if dst.Props != nil { // destination may not exist
+			rate.dst, err = dst.NewFrontendRateLim(nat)
+			if err != nil {
+				rate.src = nil
+				rate.dst = nil
+			}
+		}
 	}
 }
 
@@ -81,40 +103,55 @@ const (
 	nwpDflt = 0  // (number of mountpaths)
 )
 
-// strict rules
-func throttleNwp(xname string, n int) (int, error) {
-	// 1. alert 'too many gorutines'
-	tstats := core.T.StatsUpdater()
-	flags := cos.NodeStateFlags(tstats.Get(cos.NodeAlerts))
-	if flags.IsSet(cos.NumGoroutines) {
-		nlog.Warningln(xname, "too many gorutines")
+// clamp the requested number of workers based on node load
+// usage: all list-range type jobs and tcb
+// - xname is xaction name
+// - n is the requested number of workers
+func clampNumWorkers(xname string, n, numMpaths int) (int, error) {
+	const memExtremeMsg = "extreme memory pressure"
+	var (
+		ngr     = runtime.NumGoroutine()
+		ngrLoad = load.Gor(ngr)
+	)
+	// 1. goroutine
+	if ngrLoad == load.Critical {
+		nlog.Warningln(xname, stats.NgrPrompt, ngr)
 		return nwpNone, nil
 	}
 
-	// 2. number of available cores(*)
 	n = min(sys.MaxParallelism()+4, n)
 
-	// 3. factor in memory pressure
-	var (
-		mm       = core.T.PageMM()
-		pressure = mm.Pressure()
-	)
-	switch pressure {
-	case memsys.OOM, memsys.PressureExtreme:
-		oom.FreeToOS(true)
-		return 0, errors.New(xname + ": extreme memory pressure - not starting")
-	case memsys.PressureHigh:
-		n = min(nwpMin+1, n)
-		nlog.Warningln(xname, "high memory pressure detected...")
+	// yellow alert (high)
+	if ngrLoad == load.High {
+		nlog.Warningln(xname, stats.NgrPrompt, ngr)
+		n = min(n, numMpaths)
 	}
 
-	// 4. finally, take into account load averages
-	var (
-		load     = sys.MaxLoad()
-		highLoad = sys.HighLoadWM()
-	)
-	if load >= float64(highLoad) {
-		nlog.Warningln(xname, "high load [", load, highLoad, "]")
+	// 2. memory pressure
+	memLoad := load.Mem()
+	switch memLoad {
+	case load.Critical:
+		oom.FreeToOS(true)
+		if !cmn.Rom.TestingEnv() {
+			return 0, errors.New(xname + ": " + memExtremeMsg + " - not starting")
+		}
+		return nwpNone, nil
+	case load.High:
+		if ngrLoad == load.High {
+			return nwpNone, nil
+		}
+		n = min(nwpMin+1, n)
+	}
+
+	// 3. CPU load averages
+	cpuLoad := load.CPU()
+	if cpuLoad >= load.High {
+		if lv, wm := sys.MaxLoad(), sys.HighLoadWM(); lv >= float64(wm) {
+			nlog.Warningln(xname, "high load [", lv, wm, "]")
+		}
+		if ngrLoad == load.High {
+			return nwpNone, nil
+		}
 		n = min(nwpMin, n)
 	}
 
@@ -127,13 +164,3 @@ func abortOpcode(r core.Xact, opcode int) error {
 	r.Abort(err)
 	return err
 }
-
-//
-// recvAbortErr - to avoid duplicated broadcast
-//
-
-type recvAbortErr struct {
-	err error
-}
-
-func (e *recvAbortErr) Error() string { return e.err.Error() }

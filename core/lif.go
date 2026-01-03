@@ -58,21 +58,18 @@ func (lif *LIF) LOM() (lom *LOM, err error) {
 	}
 	b, objName := cmn.ParseUname(lif.uname)
 	lom = AllocLOM(objName)
-	if err = lom.InitBck(&b); err != nil {
+	if err = lom.InitCmnBck(&b); err != nil {
 		FreeLOM(lom)
 		return nil, err
 	}
 	bprops := lom.Bprops()
-	if bprops == nil {
-		err = cmn.NewErrObjDefunct(lom.String(), 0, lif.lid.bid())
+	debug.Assert(bprops != nil)
+	if bid := lif.lid.bid(); bid != 0 && bid != bprops.BID {
+		err = cmn.NewErrObjDefunct(lom.String(), lif.lid.bid(), bprops.BID)
 		FreeLOM(lom)
 		return nil, err
 	}
-	if lif.lid.bid() != bprops.BID {
-		err = cmn.NewErrObjDefunct(lom.String(), bprops.BID, lif.lid.bid())
-		FreeLOM(lom)
-		return nil, err
-	}
+	lom.setbid(bprops.BID) // reconstruction path
 	return lom, nil
 }
 
@@ -84,4 +81,18 @@ func (lif *LIF) getLocker() *nlc { return &g.locker[lif.CacheIdx()] }
 func (lif *LIF) Unlock(exclusive bool) {
 	nlc := lif.getLocker()
 	nlc.Unlock(lif.uname, exclusive)
+}
+
+// non-blocking drain LIF workCh
+func DrainLIF(workCh chan LIF) (n int) {
+	for {
+		select {
+		case _, ok := <-workCh:
+			if ok {
+				n++
+			}
+		default:
+			return n
+		}
+	}
 }

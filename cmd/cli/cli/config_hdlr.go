@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -24,6 +25,28 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 )
+
+// note apc.ResetToken usage in examples
+const configClusterUsage = "Configure AIS cluster.\n" +
+	indent1 + "Examples:\n" +
+	indent1 + "\t- 'ais config cluster --json'\t- show entire cluster config in JSON;\n" +
+	indent1 + "\t- 'ais config cluster log'\t- show 'log' section;\n" +
+	indent1 + "\t- 'ais config cluster log.level 4'\t- set log level to 4;\n" +
+	indent1 + "\t- 'ais config cluster log.modules ec xs'\t- elevate verbosity for selected modules;\n" +
+	indent1 + "\t- 'ais config cluster features S3-API-via-Root'\t- enable feature flag;\n" +
+	indent1 + "\t- 'ais config cluster features none'\t- reset all feature flags;\n" +
+	indent1 + "\t- 'ais config cluster log.modules none'\t- reset log modules"
+
+const configNodeUsage = "Configure AIS node.\n" +
+	indent1 + "Each node distributed across the cluster has 'inherited' (from cluster config) and 'local' configuration.\n" +
+	indent1 + "Distributed nodes can override inherited defaults with local values; use caution: local changes\n" +
+	indent1 + "may cause inconsistent behavior across the cluster. Examples:\n" +
+	indent1 + "\t- 'ais config node NODE local --json'\t- show node's local config in JSON;\n" +
+	indent1 + "\t- 'ais config node NODE inherited log'\t- show 'log' section (inherited);\n" +
+	indent1 + "\t- 'ais config node NODE local host_net --json'\t- show node's network config;\n" +
+	indent1 + "\t- 'ais config node NODE log.level 4'\t- set node's log level;\n" +
+	indent1 + "\t- 'ais config node NODE log.modules none'\t- reset log modules;\n" +
+	indent1 + "\t- 'ais config node NODE disk.iostat_time_long=4s'\t- update disk timing (in re: \"disk utilization smoothing\")"
 
 var (
 	configCmdsFlags = map[string][]cli.Flag{
@@ -72,20 +95,20 @@ updated via CLI. To update local config, lookup it's location, edit the file
 var (
 	configCmd = cli.Command{
 		Name:  commandConfig,
-		Usage: "configure AIS cluster and individual nodes (in the cluster); configure CLI (tool)",
+		Usage: "Configure AIS cluster and individual nodes (in the cluster); configure CLI (tool)",
 		Subcommands: []cli.Command{
-			makeAlias(showCmdConfig, "", true, commandShow), // alias for `ais show`
+			makeAlias(&showCmdConfig, &mkaliasOpts{newName: commandShow}),
 			{
 				Name:         cmdCluster,
-				Usage:        "Configure AIS cluster",
 				ArgsUsage:    keyValuePairsArgument,
 				Flags:        sortFlags(configCmdsFlags[cmdCluster]),
 				Action:       setCluConfigHandler,
+				Usage:        configClusterUsage,
 				BashComplete: setCluConfigCompletions,
 			},
 			{
 				Name:         cmdNode,
-				Usage:        "Configure AIS node",
+				Usage:        configNodeUsage,
 				ArgsUsage:    nodeConfigArgument,
 				Flags:        sortFlags(configCmdsFlags[cmdNode]),
 				Action:       setNodeConfigHandler,
@@ -152,7 +175,7 @@ func setCluConfigHandler(c *cli.Context) error {
 	}, cmn.IterOpts{Allowed: apc.Cluster})
 	debug.AssertNoErr(err)
 
-	if cos.StringInSlice(args.First(), propList) || strings.Contains(args.First(), keyAndValueSeparator) {
+	if slices.Contains(propList, args.First()) || strings.Contains(args.First(), keyAndValueSeparator) {
 		kvs = args
 	}
 	if len(kvs) == 0 {
@@ -170,7 +193,7 @@ func setCluConfigHandler(c *cli.Context) error {
 		return err
 	}
 	for k := range nvs {
-		if !cos.StringInSlice(k, propList) {
+		if !slices.Contains(propList, k) {
 			return fmt.Errorf("invalid property name %q%s", k, examplesCluSetCfg)
 		}
 	}
@@ -241,7 +264,7 @@ func parseLogModules(v string) (string, error) {
 		return "", V(err)
 	}
 	level, _ := config.Log.Level.Parse()
-	if v == "" || v == apc.NilValue {
+	if v == "" || v == apc.ResetToken {
 		config.Log.Level.Set(level, []string{""})
 	} else {
 		config.Log.Level.Set(level, splitCsv(v))
@@ -307,7 +330,7 @@ func setNodeConfigHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if cos.StringInSlice(cfgScopeLocal, args) {
+	if slices.Contains(args, cfgScopeLocal) {
 		v = &config.LocalConfig
 	}
 	err = cmn.IterFields(v, func(tag string, _ cmn.IterField) (err error, b bool) {
@@ -317,7 +340,7 @@ func setNodeConfigHandler(c *cli.Context) error {
 	debug.AssertNoErr(err)
 
 	kvs := args.Tail()
-	if cos.StringInSlice(args.First(), propList) || strings.Contains(args.First(), keyAndValueSeparator) {
+	if slices.Contains(propList, args.First()) || strings.Contains(args.First(), keyAndValueSeparator) {
 		kvs = args
 	}
 	if len(kvs) == 0 || (len(kvs) == 1 && (kvs[0] == cfgScopeLocal || kvs[0] == cfgScopeInherited)) {
@@ -351,7 +374,7 @@ func setNodeConfigHandler(c *cli.Context) error {
 		}
 	}
 	for k := range nvs {
-		if !cos.StringInSlice(k, propList) {
+		if !slices.Contains(propList, k) {
 			return fmt.Errorf("invalid property name %q%s", k, examplesNodeSetCfg)
 		}
 	}
@@ -432,7 +455,7 @@ func showCfgCLI(c *cli.Context) (err error) {
 		return
 	}
 	if flagIsSet(c, jsonFlag) {
-		out, errV := jsonMarshalIndent(cfg)
+		out, errV := jsonMarshalIndent(gcfg)
 		if errV != nil {
 			return errV
 		}
@@ -440,7 +463,7 @@ func showCfgCLI(c *cli.Context) (err error) {
 		return
 	}
 
-	flat := flattenJSON(cfg, c.Args().Get(0))
+	flat := flattenJSON(gcfg, c.Args().Get(0))
 	sort.Slice(flat, func(i, j int) bool {
 		return flat[i].Name < flat[j].Name
 	})
@@ -463,14 +486,14 @@ func setCfgCLI(c *cli.Context) (err error) {
 		return err
 	}
 
-	flatOld := flattenJSON(cfg, "")
+	flatOld := flattenJSON(gcfg, "")
 	for k, v := range nvs {
-		if err := cmn.UpdateFieldValue(cfg, k, v); err != nil {
+		if err := cmn.UpdateFieldValue(gcfg, k, v); err != nil {
 			return err
 		}
 	}
 
-	flatNew := flattenJSON(cfg, "")
+	flatNew := flattenJSON(gcfg, "")
 	diff := diffConfigs(flatNew, flatOld)
 	for _, val := range diff {
 		if val.Old == "-" {
@@ -479,7 +502,7 @@ func setCfgCLI(c *cli.Context) (err error) {
 		fmt.Fprintf(c.App.Writer, "%q set to: %q (was: %q)\n", val.Name, val.Current, val.Old)
 	}
 
-	return config.Save(cfg)
+	return config.Save(gcfg)
 }
 
 func resetCfgCLI(c *cli.Context) (err error) {

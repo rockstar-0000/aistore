@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/NVIDIA/aistore/cmn/atomic"
+	"github.com/NVIDIA/aistore/cmn/mono"
 
 	onexxh "github.com/OneOfOne/xxhash"
 	"github.com/teris-io/shortid"
@@ -43,11 +46,14 @@ const (
 
 var (
 	sid  *shortid.Shortid
-	rtie atomic.Uint32
+	rtie atomic.Uint64
 )
 
 func InitShortID(seed uint64) {
-	sid = shortid.MustNew(4 /*worker*/, uuidABC, seed)
+	worker := uint8(seed & 0x1f) // must be < 32
+	sid = shortid.MustNew(worker, uuidABC, seed)
+
+	rtie.Store(uint64(mono.NanoTime()) ^ seed)
 }
 
 //
@@ -55,18 +61,33 @@ func InitShortID(seed uint64) {
 //
 
 // compare with xreg.GenBEID
-func GenUUID() (uuid string) {
-	var h, t string
-	uuid = sid.MustGenerate()
-	if c := uuid[0]; c == 'g' || !isAlpha(c) { // see also: `xact.RebID2S`
-		tie := int(rtie.Add(1))
+// (see also: bench/micro/uuid/genid_test.go)
+
+func GenUUID() string {
+	var (
+		h, t string
+		uuid = sid.MustGenerate()
+	)
+	c := uuid[0]
+	if (c == 'g' && looksLikeReb(uuid)) || !isAlpha(c) { // cosmetic prefix
+		tie := rtie.Add(1)
 		h = string(rune('A' + tie%26))
 	}
-	if c := uuid[len(uuid)-1]; c == '-' || c == '_' {
-		tie := int(rtie.Add(1))
+	c = uuid[len(uuid)-1]
+	if c == '-' || c == '_' { // ditto
+		tie := rtie.Add(1)
 		t = string(rune('a' + tie%26))
 	}
 	return h + uuid + t
+}
+
+func looksLikeReb(id string) bool {
+	for i := 1; i < len(id); i++ {
+		if !isNum(id[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // "best-effort ID" - to independently and locally generate globally unique ID
@@ -123,12 +144,44 @@ func GenTestingDaemonID(suffix string) string {
 }
 
 //
+// chunk manifest ID
+//
+
+func ValidateManifestID(id string) error {
+	const (
+		utag = "chunk-manifest ID"
+		lmin = 8
+		lmax = 128
+	)
+	l := len(id)
+	if l < lmin {
+		return fmt.Errorf("%s %q is too short (expecting >= %d chars)", utag, id, lmin)
+	}
+	if l > lmax {
+		return fmt.Errorf("%s %q is too long (expecting <= %d chars)", utag, id, lmax)
+	}
+	if strings.Contains(id, inv1) || strings.Contains(id, inv2) {
+		return fmt.Errorf("%s %q contains invalid substring %q or %q", utag, id, inv1, inv2)
+	}
+	for i := range l {
+		c := id[i]
+		if c < 32 || c > 126 || c == '/' || c == '\\' || c == ' ' {
+			return fmt.Errorf("%s %q contains invalid character at position %d (expecting printable ASCII with no space and no slashes)",
+				utag, id, i)
+		}
+	}
+	return nil
+}
+
+//
 // utility functions
 //
 
 func isAlpha(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
+
+func isNum(c byte) bool { return c >= '0' && c <= '9' }
 
 // letters and numbers w/ '-' and '_' permitted with limitations (see OnlyNice const)
 func IsAlphaNice(s string) bool {
@@ -138,7 +191,7 @@ func IsAlphaNice(s string) bool {
 	}
 	for i := range l {
 		c := s[i]
-		if isAlpha(c) || (c >= '0' && c <= '9') {
+		if isAlpha(c) || isNum(c) {
 			continue
 		}
 		if c != '-' && c != '_' {
@@ -160,7 +213,7 @@ func CheckAlphaPlus(s, tag string) error {
 	}
 	for i := range l {
 		c := s[i]
-		if isAlpha(c) || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+		if isAlpha(c) || isNum(c) || c == '-' || c == '_' {
 			continue
 		}
 		if c != '.' {
@@ -173,11 +226,70 @@ func CheckAlphaPlus(s, tag string) error {
 	return nil
 }
 
+// value is exactly n hex chars
+func isHexN(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := range n {
+		c := s[i]
+		if isNum(c) {
+			continue
+		}
+		lc := c | 0x20 // lowercase
+		if lc >= 'a' && lc <= 'f' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // 3-letter tie breaker (fast)
+// see also:
+// - bench/micro/uuid/genid_test.go
+// - cmn/xoshiro256
 func GenTie() string {
 	tie := rtie.Add(1)
-	b0 := uuidABC[tie&0x3f]
-	b1 := uuidABC[-tie&0x3f]
-	b2 := uuidABC[(tie>>2)&0x3f]
-	return string([]byte{b0, b1, b2})
+	tie *= 0x9e3779b97f4a7c15 // golden ratio multiplier (bit spread)
+
+	b := [3]byte{
+		uuidABC[tie&0x3f],
+		uuidABC[(tie>>6)&0x3f],
+		uuidABC[(tie>>12)&0x3f],
+	}
+	return UnsafeS(b[:])
+}
+
+// GenYAID - yet another unique ID:
+// - it uses simple multiplicative by golden ratio to spread sequential counter values
+// - for stronger mixing, see cmn/xoshiro256 package
+// - compare w/ GenUUID and GenBEID above
+func GenYAID(sid string) string {
+	const (
+		lsuffix = 5
+		lprefix = 7
+	)
+	var (
+		shift uint
+		l     = min(len(sid), lprefix)
+		b     = make([]byte, l+1+lsuffix)
+	)
+	copy(b, sid[:l])
+	tie := rtie.Add(1)
+	tie *= 0x9e3779b97f4a7c15 // ditto
+	b[l] = '-'
+	for i := range lsuffix {
+		b[l+1+i] = uuidABC[(tie>>shift)&0x3f]
+		shift += 6
+	}
+	return UnsafeS(b)
+}
+
+func GenTAID(t time.Time) string {
+	timeStr := t.Format(StampSec2) // HHMMSS format
+	baseID := "t" + timeStr        // must start with a letter
+
+	id := GenYAID(baseID)
+	return id
 }

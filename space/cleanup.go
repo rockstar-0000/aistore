@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +22,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -30,15 +33,31 @@ import (
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
-// stats counters "cleanup.store.n" & "cleanup.store.size" (not to confuse with generic ""loc-objs", "in-objs", etc.)
+// NOTE:
+// - for cleanup policies and implementation details, see README.md in this package
+// - report stats counters "cleanup.store.n" & "cleanup.store.size" (not to confuse with generic ""loc-objs", "in-objs", etc.)
+
+// (batch sizing)
+const (
+	flagRmOldWork = 1 << iota
+	flagRmMisplacedLOMs
+	flagRmMisplacedEC
+	flagRmInvalid
+	flagRmAll = flagRmOldWork | flagRmMisplacedLOMs | flagRmMisplacedEC | flagRmInvalid
+)
+
+const (
+	sparseLogCnt = 100
+)
 
 type (
 	XactCln struct {
+		p   *clnFactory
+		ini *IniCln
 		xact.Base
 	}
 	IniCln struct {
 		StatsT  stats.Tracker
-		Config  *cmn.Config
 		Xaction *XactCln
 		WG      *sync.WaitGroup
 		Args    *xact.ArgsMsg
@@ -49,38 +68,46 @@ type (
 type (
 	// parent (contains mpath joggers)
 	clnP struct {
-		wg      sync.WaitGroup
-		joggers map[string]*clnJ
 		ini     IniCln
+		joggers map[string]*clnJ
 		cs      struct {
 			a fs.CapStatus // initial
-			b fs.CapStatus // capacity after removing 'deleted'
+			b fs.CapStatus // after removing 'deleted'
 			c fs.CapStatus // upon finishing
 		}
-		jcnt atomic.Int32
+		wg   sync.WaitGroup
+		jcnt atomic.Int32 // initial
+		// upon finishing
 	}
 	// clnJ represents a single cleanup context and a single /jogger/
 	// that traverses and evicts a single given mountpath.
 	clnJ struct {
-		// runtime
-		oldWork   []string
+		now       time.Time
+		p         *clnP
+		config    *cmn.Config
+		mi        *fs.Mountpath
+		joggers   map[string]*clnJ
+		stopCh    chan struct{}
+		ini       *IniCln
+		bck       cmn.Bck
+		name      string
 		misplaced struct {
 			loms []*core.LOM
 			ec   []*core.CT // EC slices and replicas without corresponding metafiles (CT FQN -> Meta FQN)
 		}
-		bck cmn.Bck
-		now int64
-		// init-time
-		p       *clnP
-		ini     *IniCln
-		stopCh  chan struct{}
-		joggers map[string]*clnJ
-		mi      *fs.Mountpath
-		config  *cmn.Config
+		oldWork []string // EC slices and replicas without corresponding metafiles (CT FQN -> Meta FQN)
+
+		invalid []string
+		nmisplc int64
+		norphan int64
+		nvisits int64
+
+		// throttle
+		adv load.Advice
 	}
 	clnFactory struct {
-		xreg.RenewBase
 		xctn *XactCln
+		xreg.RenewBase
 	}
 )
 
@@ -90,15 +117,17 @@ var (
 	_ core.Xact      = (*XactCln)(nil)
 )
 
-func (*XactCln) Run(*sync.WaitGroup) { debug.Assert(false) }
+func (*XactCln) Run(*sync.WaitGroup) { debug.Assert(false) } // via RunCleanup() below
 
-func (r *XactCln) Snap() (snap *core.Snap) {
-	snap = &core.Snap{}
-	r.ToSnap(snap)
-
-	snap.IdleX = r.IsIdle()
-	return
+func (r *XactCln) CtlMsg() string {
+	s := r.p.Args.Custom.(string)
+	if r.ini == nil {
+		return s
+	}
+	return s + ", " + r.ini.Args.String()
 }
+
+func (r *XactCln) Snap() *core.Snap { return r.Base.NewSnap(r) }
 
 ////////////////
 // clnFactory //
@@ -109,9 +138,8 @@ func (*clnFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 }
 
 func (p *clnFactory) Start() error {
-	p.xctn = &XactCln{}
-	ctlmsg := p.Args.Custom.(string)
-	p.xctn.InitBase(p.UUID(), apc.ActStoreCleanup, ctlmsg, nil)
+	p.xctn = &XactCln{p: p}
+	p.xctn.InitBase(p.UUID(), apc.ActStoreCleanup, nil)
 	return nil
 }
 
@@ -141,10 +169,14 @@ func RunCleanup(ini *IniCln) fs.CapStatus {
 		xcln.Finish()
 		return fs.CapStatus{}
 	}
-	now := time.Now().UnixNano()
+
+	xcln.ini = ini
+
+	now := time.Now()
 	for mpath, mi := range avail {
-		joggers[mpath] = &clnJ{
+		j := &clnJ{
 			oldWork: make([]string, 0, 64),
+			invalid: make([]string, 0, 64),
 			stopCh:  make(chan struct{}, 1),
 			mi:      mi,
 			config:  config,
@@ -152,6 +184,13 @@ func RunCleanup(ini *IniCln) fs.CapStatus {
 			p:       parent,
 			now:     now,
 		}
+		j.name = j._str()
+
+		// init throttling context
+		j.adv.Init(load.FlMem|load.FlCla|load.FlDsk, &load.Extra{Mi: j.mi, Cfg: &j.config.Disk, RW: false})
+
+		// add
+		joggers[mpath] = j
 		joggers[mpath].misplaced.loms = make([]*core.LOM, 0, 64)
 		joggers[mpath].misplaced.ec = make([]*core.CT, 0, 64)
 	}
@@ -160,7 +199,7 @@ func RunCleanup(ini *IniCln) fs.CapStatus {
 	for _, j := range joggers {
 		parent.wg.Add(1)
 		j.joggers = joggers
-		go j.run(providers)
+		go j.jog(providers)
 	}
 
 	parent.cs.a = fs.Cap()
@@ -182,10 +221,11 @@ func RunCleanup(ini *IniCln) fs.CapStatus {
 	}
 	if errCap != nil {
 		xcln.AddErr(errCap)
+		xcln.Finish()
+		nlog.Warningln(xcln.Name(), "finished with cap error:", errCap)
+	} else {
+		xcln.Finish()
 	}
-	xcln.Finish()
-	nlog.Infoln(xcln.Name(), "finished:", errCap)
-
 	return parent.cs.c
 }
 
@@ -223,10 +263,11 @@ func (p *clnP) rmMisplaced() bool {
 	if cserr != nil {
 		flog = nlog.Errorln
 	}
+	xcln := p.ini.Xaction
 	if ok {
-		flog(core.T.String(), p.ini.Xaction.String(), "proceeding to remove misplaced obj-s with force, ignoring: [", cserr, why, "]")
+		flog(core.T.String(), xcln.String(), "proceeding to remove misplaced obj-s with force, ignoring: [", cserr, why, "]")
 	} else {
-		flog(core.T.String(), p.ini.Xaction.String(), "not removing misplaced obj-s: [", cserr, why, "]")
+		flog(core.T.String(), xcln.String(), "not removing misplaced obj-s: [", cserr, why, "]")
 	}
 	return ok
 }
@@ -235,86 +276,89 @@ func (p *clnP) rmMisplaced() bool {
 // clnJ //
 //////////
 
-// mountpath cleanup j
+func (j *clnJ) String() string { return j.name }
 
-func (j *clnJ) String() string {
+func (j *clnJ) _str() string {
 	var sb strings.Builder
 	sb.Grow(128)
-	sb.WriteString(j.ini.Xaction.String())
-	sb.WriteString(": jog-")
-	sb.WriteString(j.mi.String())
+	sb.WriteString(j.ini.Xaction.Name())
+	sb.WriteString("-j[")
+	sb.WriteString(j.mi.Path)
 	if j.ini.Args.Force {
-		sb.WriteString("-with-force")
+		sb.WriteString("--f") // force
 	}
+	if j.rmZeroSize() {
+		sb.WriteString("--z") // rm zero-size
+	}
+	if _, ok := j.keepMisplaced(); ok {
+		sb.WriteString("--k") // keep misplaced
+	}
+	sb.WriteByte(']')
 	return sb.String()
 }
 
 func (j *clnJ) stop() { j.stopCh <- struct{}{} }
 
-func (j *clnJ) run(providers []string) {
-	const f = "%s: freed space %s (not including removed 'deleted')"
-	var (
-		size     int64
-		err, erm error
-	)
-	// globally
-	erm = j.removeDeleted()
-	if erm != nil {
-		nlog.Errorln(erm)
+func (j *clnJ) dont() time.Duration { return j.config.Space.DontCleanupTime.D() }
+
+func (j *clnJ) rmZeroSize() bool { return j.ini.Args.Flags&xact.FlagZeroSize != 0 }
+
+func (j *clnJ) keepMisplaced() (string, bool) {
+	if j.ini.Args.Flags&xact.FlagKeepMisplaced != 0 {
+		return "keeping", true
 	}
+	return "removing", false
+}
+
+func (j *clnJ) jog(providers []string) {
+	// globally
+	j.rmDeleted()
 
 	// traverse
 	if len(j.ini.Args.Buckets) != 0 {
-		size, err = j.jogBcks(j.ini.Args.Buckets)
+		j.jogBcks(j.ini.Args.Buckets)
 	} else {
-		size, err = j.jog(providers)
+		j.jogProviders(providers)
 	}
-	if err == nil {
-		err = erm
-	}
-	if err == nil {
-		if size != 0 {
-			nlog.Infof(f, j, cos.ToSizeIEC(size, 1))
-		}
-	} else {
-		nlog.Errorf(f+", err: %v", j, cos.ToSizeIEC(size, 1), err)
-	}
+
+	j.oldWork = slices.Clip(j.oldWork)
+	j.invalid = slices.Clip(j.invalid)
+	j.misplaced.loms = slices.Clip(j.misplaced.loms)
+	j.misplaced.ec = slices.Clip(j.misplaced.ec)
+
 	j.p.wg.Done()
 }
 
-func (j *clnJ) jog(providers []string) (size int64, rerr error) {
+func (j *clnJ) jogProviders(providers []string) {
+	xcln := j.ini.Xaction
 	for _, provider := range providers { // for each provider (NOTE: ordering is random)
 		var (
-			sz   int64
 			bcks []cmn.Bck
 			err  error
 			opts = fs.WalkOpts{Mi: j.mi, Bck: cmn.Bck{Provider: provider, Ns: cmn.NsGlobal}}
 		)
 		if bcks, err = fs.AllMpathBcks(&opts); err != nil {
-			nlog.Errorln(err)
-			if rerr == nil {
-				rerr = err
-			}
+			xcln.AddErr(err, 0)
 			continue
 		}
 		if len(bcks) == 0 {
 			continue
 		}
-		sz, err = j.jogBcks(bcks)
-		size += sz
-		if err != nil && rerr == nil {
-			rerr = err
+		j.jogBcks(bcks)
+		if xcln.IsAborted() || j.done() {
+			return
 		}
 	}
-	return size, rerr
 }
 
-func (j *clnJ) jogBcks(bcks []cmn.Bck) (size int64, rerr error) {
-	bowner := core.T.Bowner()
+func (j *clnJ) jogBcks(bcks []cmn.Bck) {
+	var (
+		xcln   = j.ini.Xaction
+		bowner = core.T.Bowner()
+	)
 	for i := range bcks { // for each bucket under a given provider
 		var (
 			err error
-			sz  int64
 			bck = bcks[i]
 			b   = meta.CloneBck(&bck)
 		)
@@ -326,151 +370,303 @@ func (j *clnJ) jogBcks(bcks []cmn.Bck) (size int64, rerr error) {
 				if err = fs.DestroyBucket(act, &bck, 0 /*unknown BID*/); err == nil {
 					nlog.Infof("%s: %s %s", j, act, bck.String())
 				} else {
-					j.ini.Xaction.AddErr(err)
+					xcln.AddErr(err)
 					nlog.Errorf("%s %s: %v - skipping", j, act, err)
 				}
 			} else {
 				// TODO: config option to scrub `fs.AllMpathBcks` buckets
-				j.ini.Xaction.AddErr(err)
+				xcln.AddErr(err)
 				nlog.Errorf("%s: %v - skipping %s", j, err, bck.String())
 			}
 			continue
 		}
-		sz, err = j.jogBck()
-		size += sz
-		if err != nil && rerr == nil {
-			rerr = err
+		j._jogBck()
+		if xcln.IsAborted() || j.done() {
+			return
 		}
 	}
-	return size, rerr
 }
 
-func (j *clnJ) removeDeleted() (err error) {
-	err = j.mi.RemoveDeleted(j.String())
-	if err != nil {
-		j.ini.Xaction.AddErr(err)
-	}
-	if cnt := j.p.jcnt.Dec(); cnt > 0 {
-		return err
-	}
-
-	// last rm-deleted done: refresh cap now
-	var errCap error
-	j.p.cs.b, err, errCap = fs.CapRefresh(j.config, nil /*tcdf*/)
-	if err != nil {
-		j.ini.Xaction.Abort(err)
-	} else {
-		nlog.Infoln(j.ini.Xaction.Name(), "post-rm('deleted'):", errCap)
-	}
-	return err
-}
-
-func (j *clnJ) jogBck() (int64, error) {
+// walk a given bucket and visit assorted content types (below)
+func (j *clnJ) _jogBck() {
+	xcln := j.ini.Xaction
 	opts := &fs.WalkOpts{
 		Mi:       j.mi,
 		Bck:      j.bck,
-		CTs:      []string{fs.WorkfileType, fs.ObjectType, fs.ECSliceType, fs.ECMetaType},
-		Callback: j.walk,
+		CTs:      []string{fs.WorkCT, fs.ObjCT, fs.ECSliceCT, fs.ECMetaCT, fs.ChunkCT, fs.ChunkMetaCT},
+		Callback: j.visit,
 		Sorted:   false,
 	}
-	if err := fs.Walk(opts); err != nil {
-		return 0, err
+	err := fs.Walk(opts)
+	if j.norphan > 0 {
+		nlog.Warningln(j.String(), "removed", j.norphan, "orphan chunks")
 	}
-	return j.rmLeftovers()
-}
-
-func (j *clnJ) visitCT(parsedFQN *fs.ParsedFQN, fqn string) {
-	switch parsedFQN.ContentType {
-	case fs.WorkfileType:
-		_, base := filepath.Split(fqn)
-		contentResolver := fs.CSM.Resolver(fs.WorkfileType)
-		_, old, ok := contentResolver.ParseUniqueFQN(base)
-		// workfiles: remove old or do nothing
-		if ok && old {
-			j.oldWork = append(j.oldWork, fqn)
-		}
-	case fs.ECSliceType:
-		// EC slices:
-		// - EC enabled: remove only slices with missing metafiles
-		// - EC disabled: remove all slices
-		ct, err := core.NewCTFromFQN(fqn, core.T.Bowner())
-		if err != nil || !ct.Bck().Props.EC.Enabled {
-			j.oldWork = append(j.oldWork, fqn)
-			return
-		}
-		if err := ct.LoadSliceFromFS(); err != nil {
-			return
-		}
-		// Saving a CT is not atomic: first it saves CT, then its metafile
-		// follows. Ignore just updated CTs to avoid processing incomplete data.
-		if ct.MtimeUnix()+int64(j.config.LRU.DontEvictTime) > j.now {
-			return
-		}
-		metaFQN := fs.CSM.Gen(ct, fs.ECMetaType, "")
-		if cos.Stat(metaFQN) != nil {
-			j.misplaced.ec = append(j.misplaced.ec, ct)
-		}
-	case fs.ECMetaType:
-		// EC metafiles:
-		// - EC enabled: remove only without corresponding slice or replica
-		// - EC disabled: remove all metafiles
-		ct, err := core.NewCTFromFQN(fqn, core.T.Bowner())
-		if err != nil || !ct.Bck().Props.EC.Enabled {
-			j.oldWork = append(j.oldWork, fqn)
-			return
-		}
-		// Metafile is saved the last. If there is no corresponding replica or
-		// slice, it is safe to remove the stray metafile.
-		sliceCT := ct.Clone(fs.ECSliceType)
-		if cos.Stat(sliceCT.FQN()) == nil {
-			return
-		}
-		objCT := ct.Clone(fs.ObjectType)
-		if cos.Stat(objCT.FQN()) == nil {
-			return
-		}
-		j.oldWork = append(j.oldWork, fqn)
-	default:
-		debug.Assert(false, "Unsupported content type: ", parsedFQN.ContentType)
-	}
-}
-
-// [TODO]
-// - add stats error counters (stats.ErrLmetaCorruptedCount, ...)
-// - revisit rm-ed byte counting
-// - dry-run (feature) with all to-be removed listed
-func (j *clnJ) visitObj(fqn string, lom *core.LOM) {
-	if err := lom.InitFQN(fqn, &j.bck); err != nil {
-		nlog.Errorln(j.String(), "unexpected object fqn", fqn, err)
-		// TODO -- FIXME: consider applying force
+	if err != nil {
+		xcln.AddErr(err)
 		return
 	}
-	// handle load err
-	if errLoad := lom.Load(false /*cache it*/, false /*locked*/); errLoad != nil {
-		_, atimefs, _, err := lom.Fstat(true /*get-atime*/)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				err = os.NewSyscallError("stat", err)
-				j.ini.Xaction.AddErr(err)
-				core.T.FSHC(err, lom.Mountpath(), lom.FQN)
+	j.rmLeftovers(flagRmAll)
+}
+
+func (j *clnJ) visit(fqn string, de fs.DirEntry) error {
+	if de.IsDir() {
+		j.rmEmptyDir(fqn)
+		return nil
+	}
+	if j.done() {
+		return nil
+	}
+
+	j.nvisits++
+	if finfo, err := os.Lstat(fqn); err == nil {
+		mtime := finfo.ModTime()
+		if mtime.Add(j.dont()).After(j.now) {
+			return nil // skipping - too early
+		}
+	}
+
+	var parsed fs.ParsedFQN
+	if err := parsed.Init(fqn); err != nil {
+		j.rmInvalidFQN(fqn, "", err)
+		return nil
+	}
+
+	if !parsed.Bck.Equal(&j.bck) {
+		err := fmt.Errorf("%s: unexpected bucket mismatch: [%q, %s, %s]", j, fqn, parsed.Bck.String(), j.bck.String())
+		debug.AssertNoErr(err)
+		j.ini.Xaction.AddErr(err, 0)
+		return nil
+	}
+
+	if parsed.ContentType != fs.ObjCT {
+		j.visitCT(&parsed, fqn)
+	} else {
+		lom := core.AllocLOM("")
+		j.visitObj(fqn, lom)
+		core.FreeLOM(lom)
+	}
+
+	if j.adv.ShouldCheck(j.nvisits) {
+		j.adv.Refresh()
+		if j.adv.Sleep > 0 {
+			time.Sleep(j.adv.Sleep)
+		}
+	}
+
+	return nil
+}
+
+func (j *clnJ) rmInvalidFQN(fqn, ctType string, err error) {
+	if cmn.Rom.Features().IsSet(feat.KeepUnknownFQN) {
+		return
+	}
+
+	var e error
+	if err != nil {
+		e = fmt.Errorf("invalid fqn %q: %v", fqn, err)
+	} else {
+		e = fmt.Errorf("invalid %q fqn: %q", ctType, fqn)
+	}
+	xcln := j.ini.Xaction
+	xcln.AddErr(e)
+
+	nlog.Warningln(j.String(), "rm", e)
+	j.invalid = append(j.invalid, fqn)
+	j.rmAnyBatch(flagRmInvalid)
+}
+
+func (j *clnJ) visitCT(parsed *fs.ParsedFQN, fqn string) {
+	switch parsed.ContentType {
+	case fs.WorkCT:
+		_, ubase := filepath.Split(fqn)
+		contentInfo := fs.CSM.ParseUbase(ubase, fs.WorkCT)
+		if !contentInfo.Ok {
+			j.rmInvalidFQN(fqn, "work", nil)
+		} else if contentInfo.Old {
+			j.oldWork = append(j.oldWork, fqn)
+			j.rmAnyBatch(flagRmOldWork)
+		}
+
+	// EC enabled:
+	// - remove slices with missing metafiles
+	// - remove metafiles with missing slice _and_ replica
+	// EC disabled:
+	// - remove all slices and metafiles
+	case fs.ECSliceCT:
+		if !j.bck.Props.EC.Enabled {
+			j.oldWork = append(j.oldWork, fqn)
+			j.rmAnyBatch(flagRmOldWork)
+			return
+		}
+		ct := core.NewCTFromParsed(parsed, fqn)
+		metaFQN := ct.GenFQN(fs.ECMetaCT)
+		if cos.Stat(metaFQN) == nil {
+			// metafile present, nothing to do
+			return
+		}
+		j.misplaced.ec = append(j.misplaced.ec, ct)
+		j.rmAnyBatch(flagRmMisplacedEC)
+	case fs.ECMetaCT:
+		if !j.bck.Props.EC.Enabled {
+			j.oldWork = append(j.oldWork, fqn)
+			j.rmAnyBatch(flagRmOldWork)
+			return
+		}
+		ct := core.NewCTFromParsed(parsed, fqn)
+
+		sliceCT := ct.Clone(fs.ECSliceCT)
+		if cos.Stat(sliceCT.FQN()) == nil {
+			// keep meta if any EC slice exists
+			return
+		}
+		replicaCT := ct.Clone(fs.ObjCT)
+		if cos.Stat(replicaCT.FQN()) == nil {
+			// keep meta if a local full replica (fs.ObjCT) exists
+			return
+		}
+
+		// Metafile is saved the last. Since there is no corresponding replica and slice,
+		// it is safe to remove the meta.
+		j.oldWork = append(j.oldWork, fqn)
+		j.rmAnyBatch(flagRmOldWork)
+
+	case fs.ChunkCT:
+		contentInfo := fs.CSM.ParseUbase(parsed.ObjName, fs.ChunkCT)
+		if !contentInfo.Ok {
+			j.rmInvalidFQN(fqn, "chunk", nil)
+			return
+		}
+		uploadID := contentInfo.Extras[0]
+		lom := core.AllocLOM(contentInfo.Base)
+		if j.initCTLOM(lom, fqn) == nil {
+			j.visitChunk(fqn, lom, uploadID)
+		}
+		core.FreeLOM(lom)
+	case fs.ChunkMetaCT:
+		contentInfo := fs.CSM.ParseUbase(parsed.ObjName, fs.ChunkMetaCT)
+		if !contentInfo.Ok {
+			j.rmInvalidFQN(fqn, "chunk-manifest", nil)
+			return
+		}
+		if len(contentInfo.Extras) > 0 {
+			// old partial manifest
+			nlog.Warningln(j.String(), "rm old partial:", fqn, "[", contentInfo.Extras[0], j.bck.Cname(contentInfo.Base), "]")
+			j.oldWork = append(j.oldWork, fqn)
+			j.rmAnyBatch(flagRmOldWork)
+		}
+
+	default:
+		debug.Assert(false, "Unsupported content type: ", parsed.ContentType)
+	}
+}
+
+func (j *clnJ) initCTLOM(lom *core.LOM, fqn string) error {
+	err := lom.InitCmnBck(&j.bck)
+	if err == nil {
+		return nil
+	}
+	xcln := j.ini.Xaction
+	if cmn.IsErrBckNotFound(err) || cmn.IsErrRemoteBckNotFound(err) {
+		nlog.Warningln(j.String(), "bucket gone - aborting:", err)
+	} else {
+		err = fmt.Errorf("%s: unexpected lom-init fail [ %q => %q, %w ]", j, fqn, lom.ObjName, err)
+		nlog.Errorln(err)
+	}
+	xcln.Abort(err)
+	return err
+}
+
+func (j *clnJ) visitChunk(chunkFQN string, lom *core.LOM, uploadID string) {
+	lom.Lock(false)
+	completedID := j._getCompletedID(lom)
+	lom.Unlock(false)
+
+	// 1. have completed
+	if completedID != "" {
+		if completedID != uploadID {
+			j.norphan++
+			if j.norphan%sparseLogCnt == 1 || cmn.Rom.V(5, cos.ModSpace) {
+				nlog.Warningln(j.String(), "orphan chunk", chunkFQN, "vs completed: [", completedID, lom.Cname(), j.norphan, "]")
 			}
+			j.oldWork = append(j.oldWork, chunkFQN)
+			j.rmAnyBatch(flagRmOldWork)
+		}
+		return
+	}
+
+	j.norphan++
+
+	// 2. resolve partial; if exists check its age
+	fqn := lom.GenFQN(fs.ChunkMetaCT, uploadID) // (compare with Ufest._fqns())
+	if finfo, err := os.Lstat(fqn); err == nil {
+		if finfo.ModTime().Add(j.dont()).After(j.now) {
 			return
 		}
-		// too early to remove anything
-		if atimefs+int64(j.config.LRU.DontEvictTime) > j.now {
-			return
+		if j.norphan%sparseLogCnt == 1 || cmn.Rom.V(5, cos.ModSpace) {
+			nlog.Warningln(j.String(), "orphan chunk", chunkFQN, "from partial: [", fqn, lom.Cname(), j.norphan, "]")
 		}
+		j.oldWork = append(j.oldWork, chunkFQN)
+		j.rmAnyBatch(flagRmOldWork)
+	}
+
+	// 3. no partial and no completed: the chunk appears to be orphan and old
+	if j.norphan%sparseLogCnt == 1 || cmn.Rom.V(4, cos.ModSpace) {
+		nlog.Warningln(j.String(), "orphan chunk w/ no manifests", chunkFQN, j.norphan)
+	}
+	j.oldWork = append(j.oldWork, chunkFQN)
+	j.rmAnyBatch(flagRmOldWork)
+}
+
+func (j *clnJ) _getCompletedID(lom *core.LOM) (id string) {
+	xcln := j.ini.Xaction
+	if err := lom.Load(false, true); err != nil {
+		return
+	}
+	if !lom.IsChunked() {
+		return
+	}
+
+	manifest, err := core.NewUfest("", lom, true /*must-exist*/)
+	if err != nil {
+		debug.AssertNoErr(err)
+		xcln.AddErr(err, 0)
+		return
+	}
+	if err := manifest.LoadCompleted(lom); err != nil {
+		e := fmt.Errorf("%s: failed to load completed manifest that must exist: %v", j, err)
+		xcln.AddErr(e, 0)
+		return
+	}
+	return manifest.ID()
+}
+
+func (j *clnJ) visitObj(fqn string, lom *core.LOM) {
+	xcln := j.ini.Xaction
+	if err := lom.InitFQN(fqn, &j.bck); err != nil {
+		if cmn.IsErrBckNotFound(err) || cmn.IsErrRemoteBckNotFound(err) {
+			nlog.Warningln(j.String(), "bucket gone - aborting:", err)
+			xcln.Abort(err)
+		} else {
+			err := fmt.Errorf("%s: unexpected object fqn %q: %v", j, fqn, err)
+			xcln.AddErr(err, 0)
+		}
+		return
+	}
+	// force md loading from disk
+	lom.Uncache()
+	// and load
+	if errLoad := lom.Load(false /*cache it*/, false /*locked*/); errLoad != nil {
 		if cmn.IsErrLmetaCorrupted(errLoad) {
 			if err := lom.RemoveMain(); err != nil {
-				nlog.Errorf("%s: failed to rm MD-corrupted %s: %v (nested: %v)", j, lom, errLoad, err)
-				j.ini.Xaction.AddErr(err)
+				e := fmt.Errorf("%s rm MD-corrupted %s: %v (nested: %v)", j, lom, errLoad, err)
+				xcln.AddErr(e, 0)
 			} else {
 				nlog.Errorf("%s: removed MD-corrupted %s: %v", j, lom, errLoad)
 			}
 		} else if cmn.IsErrLmetaNotFound(errLoad) {
 			if err := lom.RemoveMain(); err != nil {
-				nlog.Errorf("%s: failed to rm no-MD %s: %v (nested: %v)", j, lom, errLoad, err)
-				j.ini.Xaction.AddErr(err)
+				e := fmt.Errorf("%s rm no-MD %s: %v (nested: %v)", j, lom, errLoad, err)
+				xcln.AddErr(e, 0)
 			} else {
 				nlog.Errorf("%s: removed no-MD %s: %v", j, lom, errLoad)
 			}
@@ -478,105 +674,144 @@ func (j *clnJ) visitObj(fqn string, lom *core.LOM) {
 		return
 	}
 
-	// TODO: switch
-	// too early; NOTE: default dont-evict = 2h
-	if lom.AtimeUnix()+int64(j.config.LRU.DontEvictTime) > j.now {
-		if cmn.Rom.FastV(5, cos.SmoduleSpace) {
-			nlog.Infoln("too early for", lom.String(), "atime", lom.Atime().String(), "dont-evict", j.config.LRU.DontEvictTime.D())
+	atime := lom.Atime()
+	switch {
+	// too early atime-wise
+	case atime.Add(j.dont()).After(j.now):
+		if cmn.Rom.V(5, cos.ModSpace) {
+			nlog.Infoln("too early for", lom.String(), "atime", lom.Atime().String(), "dont-cleanup", j.dont())
 		}
-		return
-	}
-	if lom.IsHRW() {
+	case lom.IsHRW():
+		// cleanup extra copies; rm zero size if requested
 		if lom.HasCopies() {
 			j.rmExtraCopies(lom)
 		}
-		if lom.Lsize() == 0 {
-			if j.ini.Args.Flags&xact.XrmZeroSize == xact.XrmZeroSize {
-				// remove in place
-				if ecode, err := core.T.DeleteObject(lom, false /*evict*/); err != nil {
-					nlog.Errorln("failed to remove zero size", lom.Cname(), "err: [", err, ecode, "]")
-				} else {
-					if lom.Bck().IsRemote() {
-						nlog.Warningln("removed zero size", lom.Cname(), "(both cluster and remote)")
-					} else {
-						nlog.Warningln("removed zero size", lom.Cname())
-					}
-					j.ini.StatsT.Inc(stats.CleanupStoreCount)
-				}
+		if lom.Lsize() == 0 && j.rmZeroSize() {
+			// remove in place
+			if err := lom.RemoveMain(); err != nil {
+				e := fmt.Errorf("%s rm zero-size %s: %v", j, lom, err)
+				xcln.AddErr(e, 0)
+			} else {
+				nlog.Warningln(j.String(), "removed zero-size", lom.Cname())
+				j.ini.StatsT.Inc(stats.CleanupStoreCount)
 			}
 		}
-		return
-	}
-	if lom.IsCopy() {
+	case lom.IsCopy():
 		// will be _visited_ separately (if not already)
+	case lom.ECEnabled():
+		// misplaced EC
+		metaFQN := lom.GenFQN(fs.ECMetaCT)
+		if cos.Stat(metaFQN) != nil {
+			j.misplaced.ec = append(j.misplaced.ec, core.NewCTFromLOM(lom, fs.ObjCT))
+			j.rmAnyBatch(flagRmMisplacedEC)
+		}
+	default:
+		// misplaced object
+		j.nmisplc++
+		tag, keep := j.keepMisplaced()
+
+		// an unlikely corner case: taking precedence
+		if lom.Lsize() == 0 && j.rmZeroSize() {
+			tag, keep = "removing", false
+		}
+
+		if j.nmisplc%sparseLogCnt == 1 || cmn.Rom.V(4, cos.ModSpace) {
+			nlog.Warningln(j.String(), tag, "misplaced object:", lom.Cname(), j.nmisplc)
+		}
+		if !keep {
+			lom = lom.Clone()
+			j.misplaced.loms = append(j.misplaced.loms, lom)
+			j.rmAnyBatch(flagRmMisplacedLOMs)
+		}
+	}
+}
+
+//
+// removals --------------------------------------------
+//
+
+func (j *clnJ) rmAnyBatch(specifier int) {
+	batch := j.config.Space.BatchSize
+	debug.Assert(batch >= cmn.GCBatchSizeMin)
+
+	switch specifier {
+	case flagRmOldWork:
+		if int64(len(j.oldWork)) < batch {
+			return
+		}
+	case flagRmMisplacedLOMs:
+		if int64(len(j.misplaced.loms)) < batch {
+			return
+		}
+	case flagRmMisplacedEC:
+		if int64(len(j.misplaced.ec)) < batch {
+			return
+		}
+	case flagRmInvalid:
+		if int64(len(j.invalid)) < batch {
+			return
+		}
+	default:
+		debug.Assert(false, "invalid rm-batch specifier: ", specifier)
 		return
 	}
-	if lom.ECEnabled() {
-		// misplaced EC
-		metaFQN := fs.CSM.Gen(lom, fs.ECMetaType, "")
-		if cos.Stat(metaFQN) != nil {
-			j.misplaced.ec = append(j.misplaced.ec, core.NewCTFromLOM(lom, fs.ObjectType))
-		}
-	} else {
-		// misplaced object
-		lom = lom.CloneMD(lom.FQN)
-		j.misplaced.loms = append(j.misplaced.loms, lom)
+	j.rmLeftovers(specifier)
+}
+
+func (j *clnJ) rmDeleted() {
+	xcln := j.ini.Xaction
+	err := j.mi.RemoveDeleted(j.String())
+	if err != nil {
+		xcln.AddErr(err)
+	}
+	if cnt := j.p.jcnt.Dec(); cnt > 0 {
+		return
+	}
+
+	// last rm-deleted done: refresh cap now
+	var errCap error
+	j.p.cs.b, err, errCap = fs.CapRefresh(j.config, nil /*tcdf*/)
+	if err != nil {
+		xcln.Abort(err)
+		return
+	}
+	if errCap != nil {
+		nlog.Warningln(xcln.Name(), "post-rm('deleted'):", errCap)
 	}
 }
 
 func (j *clnJ) rmExtraCopies(lom *core.LOM) {
+	xcln := j.ini.Xaction
 	if !lom.TryLock(true) {
 		return // must be busy
 	}
 	defer lom.Unlock(true)
 
-	// TODO: switch
-
 	// reload under lock and check atime - again
 	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
-		if !cos.IsNotExist(err, 0) {
-			j.ini.Xaction.AddErr(err)
+		if !cos.IsNotExist(err) {
+			xcln.AddErr(err)
 		}
 		return
 	}
-	if lom.AtimeUnix()+int64(j.config.LRU.DontEvictTime) > j.now {
+	atime := lom.Atime()
+	if atime.Add(j.dont()).After(j.now) {
 		return
 	}
 	if lom.IsCopy() {
 		return // extremely unlikely but ok
 	}
 	if _, err := lom.DelExtraCopies(); err != nil {
-		err = fmt.Errorf("%s: failed delete redundant copies of %s: %v", j, lom, err)
-		j.ini.Xaction.AddErr(err, 5, cos.SmoduleSpace)
+		e := fmt.Errorf("%s: failed delete redundant copies of %s: %v", j, lom, err)
+		xcln.AddErr(e, 5, cos.ModSpace)
 	}
 }
 
-func (j *clnJ) walk(fqn string, de fs.DirEntry) error {
-	if de.IsDir() {
-		j._rmEmptyDir(fqn)
-		return nil
-	}
-	if err := j.yieldTerm(); err != nil {
-		return err
-	}
-
-	var parsed fs.ParsedFQN
-	if _, err := core.ResolveFQN(fqn, &parsed); err != nil {
-		return nil
-	}
-	if parsed.ContentType != fs.ObjectType {
-		j.visitCT(&parsed, fqn)
-	} else {
-		lom := core.AllocLOM("")
-		j.visitObj(fqn, lom)
-		core.FreeLOM(lom)
-	}
-	return nil
-}
-
-func (j *clnJ) _rmEmptyDir(fqn string) {
-	base := filepath.Base(fqn)
-
+func (j *clnJ) rmEmptyDir(fqn string) {
+	var (
+		xcln = j.ini.Xaction
+		base = filepath.Base(fqn)
+	)
 	if fs.LikelyCT(base) {
 		return
 	}
@@ -589,8 +824,8 @@ func (j *clnJ) _rmEmptyDir(fqn string) {
 
 	fh, err := os.Open(fqn)
 	if err != nil {
-		j.ini.Xaction.AddErr(fmt.Errorf("check-empty-dir: failed to open %q: %v", fqn, err))
-		core.T.FSHC(err, j.mi, "")
+		xcln.AddErr(fmt.Errorf("check-empty-dir: open %q: %v", fqn, err))
+		core.T.FSHC(err, j.mi, fqn)
 		return
 	}
 	names, ern := fh.Readdirnames(1)
@@ -600,112 +835,170 @@ func (j *clnJ) _rmEmptyDir(fqn string) {
 	case nil:
 		// do nothing
 	case io.EOF:
-		// note: removing a child may render its parent empty as well, but we do not recurs
 		debug.Assert(len(names) == 0, names)
-		err := syscall.Rmdir(fqn)
-		debug.AssertNoErr(err)
-		if cmn.Rom.FastV(4, cos.SmoduleSpace) {
-			nlog.Infoln(j.String(), "rm empty dir:", fqn)
+
+		// note: removing a child may render its parent empty as well, but we do not recurs
+		if err := syscall.Rmdir(fqn); err == nil {
+			if cmn.Rom.V(4, cos.ModSpace) {
+				nlog.Infoln(j.String(), "rm empty dir:", fqn)
+			}
+		} else if errno, ok := err.(syscall.Errno); ok {
+			switch errno {
+			case syscall.ENOENT, syscall.ENOTEMPTY, syscall.EBUSY, syscall.EEXIST, syscall.ENOTDIR:
+				// benign
+			default:
+				xcln.AddErr(fmt.Errorf("%s rmdir %q: %v", j, fqn, err), 0) // consider FSHC
+			}
+		} else {
+			xcln.AddErr(fmt.Errorf("%s rmdir %q: %v", j, fqn, err), 0) // ditto FSHC
 		}
+
 	default:
-		nlog.Warningf("%s: failed to read dir %q: %v", j, fqn, ern)
+		nlog.Warningf("%s read dir %q: %v", j, fqn, ern)
 	}
 }
 
-func (j *clnJ) rmLeftovers() (size int64, _ error) {
+func (j *clnJ) rmLeftovers(specifier int) {
 	var (
-		fevicted, bevicted int64
-		xcln               = j.ini.Xaction
+		nfiles, nbytes int64
+		xcln           = j.ini.Xaction
 	)
-	if cmn.Rom.FastV(4, cos.SmoduleSpace) {
-		nlog.Infof("%s: num-old %d, misplaced (%d, ec=%d)", j, len(j.oldWork), len(j.misplaced.loms), len(j.misplaced.ec))
-	}
+	old, ml, me, inv := len(j.oldWork), len(j.misplaced.loms), len(j.misplaced.ec), len(j.invalid)
+	nlog.Infoln(j.String(), "[ old:", old, "misplaced obj:", ml, "misplaced ec:", me, "invalid:", inv, "]")
 
 	// 1. rm older work
-	for _, workfqn := range j.oldWork {
-		finfo, erw := os.Stat(workfqn)
-		if erw == nil {
-			if err := cos.RemoveFile(workfqn); err != nil {
-				nlog.Errorf("%s: failed to rm old work %q: %v", j, workfqn, err)
-			} else {
-				size += finfo.Size()
-				fevicted++
-				bevicted += finfo.Size()
-				if cmn.Rom.FastV(4, cos.SmoduleSpace) {
-					nlog.Infof("%s: rm old work %q, size=%d", j, workfqn, size)
+	if specifier&flagRmOldWork != 0 {
+		for _, workfqn := range j.oldWork {
+			finfo, erw := os.Lstat(workfqn)
+			if erw == nil {
+				if err := cos.RemoveFile(workfqn); err != nil {
+					e := fmt.Errorf("%s: rm old %q: %v", j, workfqn, err)
+					xcln.AddErr(e)
+				} else {
+					nfiles++
+					nbytes += finfo.Size()
+					j._throttle(nfiles)
+					if cmn.Rom.V(5, cos.ModSpace) {
+						nlog.Infoln(j.String(), "rm old", workfqn, "size", finfo.Size())
+					}
 				}
 			}
 		}
+		j.oldWork = j.oldWork[:0]
+		j.now = time.Now()
 	}
-	j.oldWork = j.oldWork[:0]
 
 	// 2. rm misplaced
-	if len(j.misplaced.loms) > 0 && j.p.rmMisplaced() {
-		for _, mlom := range j.misplaced.loms {
-			var (
-				fqn     = mlom.FQN
-				removed bool
-			)
-			lom := core.AllocLOM(mlom.ObjName)
-			switch {
-			case lom.InitBck(&j.bck) != nil:
-				removed = os.Remove(fqn) == nil
-			case lom.FromFS() != nil:
-				removed = os.Remove(fqn) == nil
-			default:
-				removed, _ = lom.DelExtraCopies(fqn)
-			}
-			core.FreeLOM(lom)
-
-			if removed {
-				fevicted++
-				bevicted += mlom.Lsize(true /*not loaded*/)
-				if cmn.Rom.FastV(4, cos.SmoduleSpace) {
-					nlog.Infof("%s: rm misplaced %q, size=%d", j, mlom, mlom.Lsize(true /*not loaded*/))
+	if specifier&flagRmMisplacedLOMs != 0 {
+		if len(j.misplaced.loms) > 0 && j.p.rmMisplaced() /*note: caution*/ {
+			for _, mlom := range j.misplaced.loms {
+				var (
+					err     error
+					fqn     = mlom.FQN
+					removed bool
+				)
+				lom := core.AllocLOM(mlom.ObjName)
+				switch {
+				case lom.InitCmnBck(&j.bck) != nil:
+					err = os.Remove(fqn)
+					removed = err == nil
+				case lom.FromFS() != nil:
+					err = os.Remove(fqn)
+					removed = err == nil
+				default:
+					removed, err = lom.DelExtraCopies(fqn)
 				}
-				if err := j.yieldTerm(); err != nil {
-					return size, err
+				if err != nil {
+					e := fmt.Errorf("%s rm misplaced %q: %v", j, lom.String(), err)
+					xcln.AddErr(e)
+				}
+				core.FreeLOM(lom)
+
+				if removed {
+					nfiles++
+					size := mlom.Lsize(true /*not loaded*/)
+					nbytes += size
+					if cmn.Rom.V(4, cos.ModSpace) {
+						nlog.Infoln(j.String(), "rm misplaced", mlom.String(), "size", size)
+					}
+
+					j._throttle(nfiles)
+					if j.done() {
+						return
+					}
 				}
 			}
 		}
+		j.misplaced.loms = j.misplaced.loms[:0]
+		j.now = time.Now()
 	}
-	j.misplaced.loms = j.misplaced.loms[:0]
 
 	// 3. rm EC slices and replicas that are still without corresponding metafile
-	for _, ct := range j.misplaced.ec {
-		metaFQN := fs.CSM.Gen(ct, fs.ECMetaType, "")
-		if cos.Stat(metaFQN) == nil {
-			continue
-		}
-		if os.Remove(ct.FQN()) == nil {
-			fevicted++
-			bevicted += ct.Lsize()
-			if err := j.yieldTerm(); err != nil {
-				return size, err
+	if specifier&flagRmMisplacedEC != 0 {
+		for _, ct := range j.misplaced.ec {
+			metaFQN := ct.GenFQN(fs.ECMetaCT)
+			if cos.Stat(metaFQN) == nil {
+				continue
+			}
+			if os.Remove(ct.FQN()) == nil {
+				nfiles++
+				nbytes += ct.Lsize()
+
+				j._throttle(nfiles)
+				if j.done() {
+					return
+				}
 			}
 		}
+		j.misplaced.ec = j.misplaced.ec[:0]
+		j.now = time.Now()
 	}
-	j.misplaced.ec = j.misplaced.ec[:0]
 
-	j.ini.StatsT.Add(stats.CleanupStoreSize, bevicted)
-	j.ini.StatsT.Add(stats.CleanupStoreCount, fevicted)
-	xcln.ObjsAdd(int(fevicted), bevicted)
+	// 4. rm invalid FQNs - unrecognized or malformed content types
+	if specifier&flagRmInvalid != 0 {
+		for _, fqn := range j.invalid {
+			finfo, erw := os.Lstat(fqn)
+			if erw == nil {
+				if err := cos.RemoveFile(fqn); err != nil {
+					e := fmt.Errorf("%s: rm invalid %q: %v", j, fqn, err)
+					xcln.AddErr(e)
+				} else {
+					nfiles++
+					nbytes += finfo.Size()
+					if cmn.Rom.V(5, cos.ModSpace) {
+						nlog.Infoln(j.String(), "rm invalid", fqn, "size", finfo.Size())
+					}
+					j._throttle(nfiles)
+				}
+			}
+		}
+		j.invalid = j.invalid[:0]
+		j.now = time.Now()
+	}
 
-	return size, nil
+	j.ini.StatsT.Add(stats.CleanupStoreSize, nbytes)
+	j.ini.StatsT.Add(stats.CleanupStoreCount, nfiles)
+	xcln.ObjsAdd(int(nfiles), nbytes)
 }
 
-func (j *clnJ) yieldTerm() error {
+func (j *clnJ) _throttle(n int64) {
+	if j.adv.ShouldCheck(n) {
+		j.adv.Refresh()
+		if j.adv.Sleep > 0 {
+			time.Sleep(j.adv.Sleep)
+		}
+	}
+}
+
+func (j *clnJ) done() bool {
 	xcln := j.ini.Xaction
 	select {
-	case errCause := <-xcln.ChanAbort():
-		return cmn.NewErrAborted(xcln.Name(), "", errCause)
+	case <-xcln.ChanAbort():
+		return true
 	case <-j.stopCh:
-		return cmn.NewErrAborted(xcln.Name(), "", nil)
+		return true
 	default:
 		break
 	}
-	if xcln.Finished() {
-		return cmn.NewErrAborted(xcln.Name(), "", nil)
-	}
-	return nil
+	return xcln.IsDone()
 }

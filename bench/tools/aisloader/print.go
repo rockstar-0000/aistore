@@ -15,12 +15,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/aistore/bench/tools/aisloader/namegetter"
 	"github.com/NVIDIA/aistore/bench/tools/aisloader/stats"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/tools/readers"
 
 	jsoniter "github.com/json-iterator/go"
+)
+
+const (
+	opLabelPut = "PUT"
+	opLabelGet = "GET"
+	opLabelMPU = "MPU"
+	opLabelGBT = "GBT"
 )
 
 var examples = `# 1. Cleanup (i.e., destroy) an existing bucket:
@@ -59,7 +69,7 @@ var examples = `# 1. Cleanup (i.e., destroy) an existing bucket:
      $ aisloader -loaderid=loaderstring -loaderidhashlen=8 -getloaderid	# 0xdb
 # 12. Timed 100% GET _directly_ from S3 bucket (notice '-s3endpoint' command line):
      $ aisloader -bucket=s3://xyz -cleanup=false -numworkers=8 -pctput=0 -duration=10m -s3endpoint=https://s3.amazonaws.com
-# 13. PUT approx. 8000 files into s3 bucket directly, skip printing usage and defaults (NOTE: aistore is not being used):
+# 13. PUT approx. 8000 files into s3 bucket directly, skip printing usage and defaults (NOTE: AIStore is not being used):
      $ aisloader -bucket=s3://xyz -cleanup=false -minsize=16B -maxsize=16B -numworkers=8 -pctput=100 -totalputsize=128k -s3endpoint=https://s3.amazonaws.com -quiet
 `
 
@@ -98,14 +108,14 @@ func prettyBytes(n int64) string {
 	if n <= 0 { // process special case that B2S do not cover
 		return "-"
 	}
-	return cos.ToSizeIEC(n, 1)
+	return cos.IEC(n, 1)
 }
 
 func prettySpeed(n int64) string {
 	if n <= 0 {
 		return "-"
 	}
-	return cos.ToSizeIEC(n, 2) + "/s"
+	return cos.IEC(n, 2) + "/s"
 }
 
 // prettyDuration converts an integer representing a time in nano second to a string
@@ -196,13 +206,13 @@ func jsonStatsFromReq(r stats.HTTPReq) *jsonStats {
 
 func writeStatsJSON(to io.Writer, s *sts, withcomma ...bool) {
 	jStats := struct {
-		Get *jsonStats `json:"get"`
-		Put *jsonStats `json:"put"`
-		Cfg *jsonStats `json:"cfg"`
+		Get      *jsonStats `json:"get"`
+		Put      *jsonStats `json:"put"`
+		GetBatch *jsonStats `json:"get_batch"`
 	}{
-		Get: jsonStatsFromReq(s.get),
-		Put: jsonStatsFromReq(s.put),
-		Cfg: jsonStatsFromReq(s.getConfig),
+		Get:      jsonStatsFromReq(s.get),
+		Put:      jsonStatsFromReq(s.put),
+		GetBatch: jsonStatsFromReq(s.getBatch),
 	}
 
 	jsonOutput, err := json.MarshalIndent(jStats, "", "  ")
@@ -235,7 +245,7 @@ func writeHumanReadibleIntervalStats(to io.Writer, s, t *sts) {
 		errs = pn(s.put.TotalErrs()) + " (" + pn(t.put.TotalErrs()) + ")"
 	}
 	if s.put.Total() != 0 {
-		p(to, statsPrintHeader, pt(), "PUT",
+		p(to, statsPrintHeader, pt(), opLabelPut,
 			pn(s.put.Total())+" ("+pn(t.put.Total())+" "+pn(putPending)+" "+pn(workOrderResLen)+")",
 			pb(s.put.TotalBytes())+" ("+pb(t.put.TotalBytes())+")",
 			pl(s.put.MinLatency(), s.put.AvgLatency(), s.put.MaxLatency()),
@@ -243,24 +253,40 @@ func writeHumanReadibleIntervalStats(to io.Writer, s, t *sts) {
 			errs)
 	}
 	errs = "-"
+	if t.putMPU.TotalErrs() != 0 {
+		errs = pn(s.putMPU.TotalErrs()) + " (" + pn(t.putMPU.TotalErrs()) + ")"
+	}
+	if s.putMPU.Total() != 0 {
+		p(to, statsPrintHeader, pt(), opLabelMPU,
+			pn(s.putMPU.Total())+" ("+pn(t.putMPU.Total())+")",
+			pb(s.putMPU.TotalBytes())+" ("+pb(t.putMPU.TotalBytes())+")",
+			pl(s.putMPU.MinLatency(), s.putMPU.AvgLatency(), s.putMPU.MaxLatency()),
+			ps(s.putMPU.Throughput(s.putMPU.Start(), time.Now()))+" ("+ps(t.putMPU.Throughput(t.putMPU.Start(), time.Now()))+")",
+			errs)
+	}
+	errs = "-"
 	if t.get.TotalErrs() != 0 {
 		errs = pn(s.get.TotalErrs()) + " (" + pn(t.get.TotalErrs()) + ")"
 	}
 	if s.get.Total() != 0 {
-		p(to, statsPrintHeader, pt(), "GET",
+		p(to, statsPrintHeader, pt(), opLabelGet,
 			pn(s.get.Total())+" ("+pn(t.get.Total())+" "+pn(getPending)+" "+pn(workOrderResLen)+")",
 			pb(s.get.TotalBytes())+" ("+pb(t.get.TotalBytes())+")",
 			pl(s.get.MinLatency(), s.get.AvgLatency(), s.get.MaxLatency()),
 			ps(s.get.Throughput(s.get.Start(), time.Now()))+" ("+ps(t.get.Throughput(t.get.Start(), time.Now()))+")",
 			errs)
 	}
-	if s.getConfig.Total() != 0 {
-		p(to, statsPrintHeader, pt(), "CFG",
-			pn(s.getConfig.Total())+" ("+pn(t.getConfig.Total())+")",
-			pb(s.getConfig.TotalBytes())+" ("+pb(t.getConfig.TotalBytes())+")",
-			pl(s.getConfig.MinLatency(), s.getConfig.AvgLatency(), s.getConfig.MaxLatency()),
-			ps(s.getConfig.Throughput(s.getConfig.Start(), time.Now()))+" ("+ps(t.getConfig.Throughput(t.getConfig.Start(), time.Now()))+")",
-			pn(s.getConfig.TotalErrs())+" ("+pn(t.getConfig.TotalErrs())+")")
+	errs = "-"
+	if t.getBatch.TotalErrs() != 0 {
+		errs = pn(s.getBatch.TotalErrs()) + " (" + pn(t.getBatch.TotalErrs()) + ")"
+	}
+	if s.getBatch.Total() != 0 {
+		p(to, statsPrintHeader, pt(), opLabelGBT,
+			pn(s.getBatch.Total())+" ("+pn(t.getBatch.Total())+")",
+			pb(s.getBatch.TotalBytes())+" ("+pb(t.getBatch.TotalBytes())+")",
+			pl(s.getBatch.MinLatency(), s.getBatch.AvgLatency(), s.getBatch.MaxLatency()),
+			ps(s.getBatch.Throughput(s.getBatch.Start(), time.Now()))+" ("+ps(t.getBatch.Throughput(t.getBatch.Start(), time.Now()))+")",
+			errs)
 	}
 }
 
@@ -275,30 +301,39 @@ func writeHumanReadibleFinalStats(to io.Writer, t *sts) {
 
 	sput := &t.put
 	if sput.Total() > 0 {
-		p(to, statsPrintHeader, pt(), "PUT",
+		p(to, statsPrintHeader, pt(), opLabelPut,
 			pn(sput.Total()),
 			pb(sput.TotalBytes()),
 			pl(sput.MinLatency(), sput.AvgLatency(), sput.MaxLatency()),
 			ps(sput.Throughput(sput.Start(), time.Now())),
 			pn(sput.TotalErrs()))
 	}
+	smpu := &t.putMPU
+	if smpu.Total() > 0 {
+		p(to, statsPrintHeader, pt(), opLabelMPU,
+			pn(smpu.Total()),
+			pb(smpu.TotalBytes()),
+			pl(smpu.MinLatency(), smpu.AvgLatency(), smpu.MaxLatency()),
+			ps(smpu.Throughput(smpu.Start(), time.Now())),
+			pn(smpu.TotalErrs()))
+	}
 	sget := &t.get
 	if sget.Total() > 0 {
-		p(to, statsPrintHeader, pt(), "GET",
+		p(to, statsPrintHeader, pt(), opLabelGet,
 			pn(sget.Total()),
 			pb(sget.TotalBytes()),
 			pl(sget.MinLatency(), sget.AvgLatency(), sget.MaxLatency()),
 			ps(sget.Throughput(sget.Start(), time.Now())),
 			pn(sget.TotalErrs()))
 	}
-	sconfig := &t.getConfig
-	if sconfig.Total() > 0 {
-		p(to, statsPrintHeader, pt(), "CFG",
-			pn(sconfig.Total()),
-			pb(sconfig.TotalBytes()),
-			pl(sconfig.MinLatency(), sconfig.AvgLatency(), sconfig.MaxLatency()),
-			pb(sconfig.Throughput(sconfig.Start(), time.Now())),
-			pn(sconfig.TotalErrs()))
+	sgbatch := &t.getBatch
+	if sgbatch.Total() > 0 {
+		p(to, statsPrintHeader, pt(), opLabelGBT,
+			pn(sgbatch.Total()),
+			pb(sgbatch.TotalBytes()),
+			pl(sgbatch.MinLatency(), sgbatch.AvgLatency(), sgbatch.MaxLatency()),
+			ps(sgbatch.Throughput(sgbatch.Start(), time.Now())),
+			pn(sgbatch.TotalErrs()))
 	}
 }
 
@@ -313,44 +348,108 @@ func writeStats(to io.Writer, jsonFormat, final bool, s, t *sts) {
 	}
 }
 
-// printRunParams show run parameters in json format
-func printRunParams(p *params) {
-	var d = p.duration.String()
-	if p.duration.Val == time.Duration(math.MaxInt64) {
-		d = "-"
+// when starting to run show essential parameters in JSON format
+type (
+	ppEssential struct {
+		URL           string  `json:"proxy"`
+		Bucket        string  `json:"bucket"`
+		Duration      string  `json:"duration"`
+		NumWorkers    int     `json:"# workers"`
+		StatsInterval string  `json:"stats interval"`
+		PutPct        int     `json:"% PUT,omitempty"`
+		UpdatePct     int     `json:"% Update Existing,omitempty"`
+		MultipartPct  int     `json:"% Multipart PUT,omitempty"`
+		GetBatchSize  int     `json:"GET(batch): batch size,omitempty"`
+		MinSize       int64   `json:"minimum object size (bytes),omitempty"`
+		MaxSize       int64   `json:"maximum object size (bytes),omitempty"`
+		MaxPutBytes   int64   `json:"PUT upper bound,string,omitempty"`
+		Arch          *ppArch `json:"archive (shards),omitempty"`
+		NameGetter    string  `json:"name-getter"`
+		ReaderType    string  `json:"reader-type,omitempty"`
+		Cleanup       bool    `json:"cleanup"`
 	}
-	b, err := jsoniter.MarshalIndent(struct {
-		StatsInterval string `json:"stats interval"`
-		URL           string `json:"proxy"`
-		Bucket        string `json:"bucket"`
-		Provider      string `json:"provider"`
-		Namespace     string `json:"namespace"`
-		Duration      string `json:"duration"`
-		Backing       string `json:"backed by"`
-		MaxPutBytes   int64  `json:"PUT upper bound,string"`
-		MinSize       int64  `json:"minimum object size (bytes)"`
-		MaxSize       int64  `json:"maximum object size (bytes)"`
-		NumWorkers    int    `json:"# workers"`
-		PutPct        int    `json:"% PUT"`
-		Seed          int64  `json:"seed,string"`
-		Cleanup       bool   `json:"cleanup"`
-	}{
-		Seed:          p.seed,
+	ppArch struct {
+		Pct      int    `json:"% workload"`
+		Format   string `json:"format"`
+		Prefix   string `json:"prefix,omitempty"`
+		NumFiles int    `json:"files per shard,omitempty"`
+		MinSize  int64  `json:"minimum file size"`
+		MaxSize  int64  `json:"maximum file size"`
+	}
+)
+
+func printRunParams(p *params) {
+	var arch *ppArch
+	if p.archParams.pct != 0 {
+		// temp readers.Arch to run Init() and get computed values
+		// aisloader's default format: TAR
+		mime := cos.NonZero(p.archParams.format, archive.ExtTar)
+		tmpArch := &readers.Arch{
+			Mime:    mime,
+			Prefix:  p.archParams.prefix,
+			MinSize: p.archParams.minSz,
+			MaxSize: p.archParams.maxSz,
+			Num:     p.archParams.numFiles,
+		}
+		err := tmpArch.Init(p.maxSize)
+		cos.AssertNoErr(err)
+
+		numf := cos.Ternary(tmpArch.Num == readers.DynamicNumFiles, 0, p.archParams.numFiles)
+		arch = &ppArch{
+			Pct:      p.archParams.pct,
+			Format:   tmpArch.Mime,
+			Prefix:   tmpArch.Prefix,
+			NumFiles: numf,
+			MinSize:  tmpArch.MinSize,
+			MaxSize:  tmpArch.MaxSize,
+		}
+	}
+
+	// omit PUT-only
+	var (
+		minsize, maxsize int64
+		readerType       string
+	)
+	if p.putPct > 0 {
+		minsize, maxsize = p.minSize, p.maxSize
+		readerType = p.readerType
+	}
+	b, err := jsoniter.MarshalIndent(ppEssential{
 		URL:           p.proxyURL,
-		Bucket:        p.bck.Name,
-		Provider:      p.bck.Provider,
-		Namespace:     p.bck.Ns.String(),
-		Duration:      d,
-		MaxPutBytes:   p.putSizeUpperBound,
-		PutPct:        p.putPct,
-		MinSize:       p.minSize,
-		MaxSize:       p.maxSize,
+		Bucket:        p.bck.Cname(""),
+		Duration:      cos.Ternary(p.duration.Val == time.Duration(math.MaxInt64), "-", p.duration.String()),
 		NumWorkers:    p.numWorkers,
 		StatsInterval: (time.Duration(runParams.statsShowInterval) * time.Second).String(),
-		Backing:       p.readerType,
+		PutPct:        p.putPct,
+		UpdatePct:     p.updateExistingPct,
+		MultipartPct:  p.multipartPct,
+		GetBatchSize:  p.getBatchSize,
+		MinSize:       minsize,
+		MaxSize:       maxsize,
+		MaxPutBytes:   p.putSizeUpperBound,
+		Arch:          arch,
+		NameGetter:    ngLabel(),
+		ReaderType:    readerType,
 		Cleanup:       p.cleanUp.Val,
 	}, "", "   ")
-	cos.AssertNoErr(err)
 
+	cos.AssertNoErr(err)
 	fmt.Printf("Runtime configuration:\n%s\n\n", string(b))
+}
+
+func ngLabel() string {
+	switch objnameGetter.(type) {
+	case *namegetter.Random:
+		return "random non-unique"
+	case *namegetter.RandomUnique:
+		return "random unique"
+	case *namegetter.PermShuffle:
+		return "unique sequential"
+	case *namegetter.PermAffinePrime:
+		return "unique epoch-based"
+	default:
+		s := fmt.Sprintf("%T", objnameGetter)
+		debug.Assert(false, s)
+		return s
+	}
 }

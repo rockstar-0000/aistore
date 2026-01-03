@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -67,7 +67,7 @@ func parallelOpLoop(bck cmn.Bck, cksumType string,
 }
 
 func opPut(objName, cksumType string, bck cmn.Bck) opRes {
-	r, err := readers.NewRand(fileSize, cksumType)
+	r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: fileSize, CksumType: cksumType})
 	if err != nil {
 		return opRes{http.MethodPut, err}
 	}
@@ -118,6 +118,7 @@ func reportErr(t *testing.T, errCh chan opRes, ignoreStatusNotFound bool) {
 			continue
 		}
 		status := api.HTTPStatus(opRes.err)
+
 		if status == http.StatusNotFound && ignoreStatusNotFound {
 			continue
 		}
@@ -210,15 +211,15 @@ func rwstress(t *testing.T) {
 }
 
 func TestRWStressShort(t *testing.T) {
-	numLoops = 8
-	numFiles = 25
+	numLoops = 32
+	numFiles = 150
 	rwstress(t)
 }
 
 func TestRWStress(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 
-	numLoops = 30
+	numLoops = 100
 	numFiles = 1000
 	rwstress(t)
 }

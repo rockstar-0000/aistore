@@ -31,6 +31,7 @@ func TestConfig(t *testing.T) {
 		lowWM            = int32(60)
 		cleanupWM        = int32(55)
 		updTime          = time.Second * 20
+		dontEvictTime    = time.Hour * 2
 		configRegression = map[string]string{
 			"periodic.stats_time":   updTime.String(),
 			"space.cleanupwm":       strconv.Itoa(int(cleanupWM)),
@@ -38,7 +39,7 @@ func TestConfig(t *testing.T) {
 			"space.highwm":          strconv.Itoa(int(highWM)),
 			"lru.enabled":           "true",
 			"lru.capacity_upd_time": updTime.String(),
-			"lru.dont_evict_time":   updTime.String(),
+			"lru.dont_evict_time":   dontEvictTime.String(),
 		}
 		oconfig      = tools.GetClusterConfig(t)
 		ospaceconfig = oconfig.Space
@@ -207,8 +208,8 @@ func TestConfigOverrideAndRestart(t *testing.T) {
 		errWMConfigNotExpected, newLowWM, daemonConfig.Disk.DiskUtilLowWM)
 
 	// Restart and check that config persisted
-	tlog.Logf("Killing %s\n", proxy.StringEx())
-	cmd, err := tools.KillNode(proxy)
+	tlog.Logfln("Killing %s", proxy.StringEx())
+	cmd, err := tools.KillNode(baseParams, proxy)
 	tassert.CheckFatal(t, err)
 	smap, err = tools.WaitForClusterState(proxyURL, "proxy removed", smap.Version, origProxyCnt-1, origTargetCnt)
 	tassert.CheckFatal(t, err)
@@ -241,8 +242,8 @@ func TestConfigSyncToNewNode(t *testing.T) {
 	proxy, err := smap.GetRandProxy(true /*exclude primary*/)
 	tassert.CheckFatal(t, err)
 
-	tlog.Logf("Killing %s\n", proxy.StringEx())
-	cmd, err := tools.KillNode(proxy)
+	tlog.Logfln("Killing %s", proxy.StringEx())
+	cmd, err := tools.KillNode(baseParams, proxy)
 	tassert.CheckFatal(t, err)
 
 	t.Cleanup(func() {
@@ -262,7 +263,7 @@ func TestConfigSyncToNewNode(t *testing.T) {
 
 	// 2. After proxy is killed, update cluster configuration
 	newECEnabled := !config.EC.Enabled
-	tlog.Logf("Globally changing ec.enabled to %t (%s)\n", newECEnabled, smap.StringEx())
+	tlog.Logfln("Globally changing ec.enabled to %t (%s)", newECEnabled, smap.StringEx())
 	tools.SetClusterConfig(t, cos.StrKVs{
 		"ec.enabled": strconv.FormatBool(newECEnabled),
 	})

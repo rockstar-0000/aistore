@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -9,24 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
 
 const maxNumCopies = 16
-
-var (
-	pid  int64 = 0xDEADBEEF   // pid of the current process
-	spid       = "0xDEADBEEF" // string version of the pid
-)
-
-func init() {
-	pid = int64(os.Getpid())
-	spid = strconv.FormatInt(pid, 16)
-
-	CSM = &contentSpecMgr{m: make(map[string]ContentResolver, 8)}
-}
 
 func IsDirEmpty(dir string) (names []string, empty bool, err error) {
 	var f *os.File

@@ -1,12 +1,13 @@
+# pylint: disable=too-many-lines
+from pathlib import Path
+from urllib.parse import quote
 import unittest
 from unittest.mock import Mock, call, patch, MagicMock, mock_open
-from urllib.parse import quote
-
 from requests import PreparedRequest
 from requests.structures import CaseInsensitiveDict
 
 from aistore.sdk.ais_source import AISSource
-from aistore.sdk.bucket import Bucket, Header
+from aistore.sdk.bucket import Bucket
 from aistore.sdk.obj.object import Object
 from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
 from aistore.sdk.obj.object_iterator import ObjectIterator
@@ -32,8 +33,8 @@ from aistore.sdk.const import (
     HTTP_METHOD_DELETE,
     HTTP_METHOD_GET,
     HTTP_METHOD_HEAD,
-    HTTP_METHOD_PUT,
     HTTP_METHOD_POST,
+    HTTP_METHOD_PUT,
     URL_PATH_BUCKETS,
     HEADER_ACCEPT,
     HEADER_BUCKET_PROPS,
@@ -140,7 +141,7 @@ class TestBucket(unittest.TestCase):
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_POST,
             path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-            json=ActionMsg(action=ACT_CREATE_BCK).dict(),
+            json=ActionMsg(action=ACT_CREATE_BCK).model_dump(),
             params=self.ais_bck.qparam,
         )
         self.assertIsInstance(bck, Bucket)
@@ -178,7 +179,7 @@ class TestBucket(unittest.TestCase):
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_POST,
             path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-            json=ActionMsg(action=ACT_MOVE_BCK).dict(),
+            json=ActionMsg(action=ACT_MOVE_BCK).model_dump(),
             params=self.ais_bck_params,
         )
         self.assertEqual(self.ais_bck.name, new_bck_name)
@@ -192,7 +193,7 @@ class TestBucket(unittest.TestCase):
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_DELETE,
             path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-            json=ActionMsg(action=ACT_DESTROY_BCK).dict(),
+            json=ActionMsg(action=ACT_DESTROY_BCK).model_dump(),
             params=self.ais_bck.qparam,
         )
 
@@ -208,7 +209,7 @@ class TestBucket(unittest.TestCase):
         self.mock_client.request.assert_called_with(
             HTTP_METHOD_DELETE,
             path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-            json=ActionMsg(action=ACT_DESTROY_BCK).dict(),
+            json=ActionMsg(action=ACT_DESTROY_BCK).model_dump(),
             params=self.ais_bck.qparam,
         )
 
@@ -224,13 +225,13 @@ class TestBucket(unittest.TestCase):
             self.mock_client.request.assert_called_with(
                 HTTP_METHOD_DELETE,
                 path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-                json=ActionMsg(action=ACT_EVICT_REMOTE_BCK).dict(),
+                json=ActionMsg(action=ACT_EVICT_REMOTE_BCK).model_dump(),
                 params=self.amz_bck_params,
             )
 
     def test_head(self):
         mock_header = Mock()
-        mock_header.headers = Header("value")
+        mock_header.headers = {"key": "value"}
         self.mock_client.request.return_value = mock_header
         headers = self.ais_bck.head()
         # Ensure that the last request was called with right args
@@ -300,7 +301,7 @@ class TestBucket(unittest.TestCase):
         self.ais_bck_params[QPARAM_BCK_TO] = to_bck.get_path()
         expected_action = ActionMsg(
             action=ACT_COPY_BCK, value=expected_act_value
-        ).dict()
+        ).model_dump()
 
         job_id = self.ais_bck.copy(to_bck=to_bck, **kwargs)
 
@@ -355,7 +356,7 @@ class TestBucket(unittest.TestCase):
         self._list_objects_exec_assert(expected_act_value)
 
     def _list_objects_exec_assert(self, expected_act_value, **kwargs):
-        action = ActionMsg(action=ACT_LIST, value=expected_act_value).dict()
+        action = ActionMsg(action=ACT_LIST, value=expected_act_value).model_dump()
 
         object_names = ["obj_name", "obj_name2"]
         bucket_entries = [BucketEntry(n=name) for name in object_names]
@@ -381,7 +382,9 @@ class TestBucket(unittest.TestCase):
     def test_list_objects_iter(self):
         # Ensure that iterator returned is correct type
         self.assertIsInstance(
-            self.ais_bck.list_objects_iter(PREFIX_NAME, "obj props", 123),
+            self.ais_bck.list_objects_iter(
+                prefix=PREFIX_NAME, props="obj props", page_size=123
+            ),
             ObjectIterator,
         )
 
@@ -489,7 +492,7 @@ class TestBucket(unittest.TestCase):
                     path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
                     headers={HEADER_ACCEPT: MSGPACK_CONTENT_TYPE},
                     res_model=BucketList,
-                    json=ActionMsg(action=ACT_LIST, value=expected_val).dict(),
+                    json=ActionMsg(action=ACT_LIST, value=expected_val).model_dump(),
                     params=self.ais_bck_params,
                 )
             )
@@ -535,6 +538,7 @@ class TestBucket(unittest.TestCase):
     def test_transform_default_params(self):
         action_value = {
             "id": ETL_NAME,
+            "pipeline": None,
             "prefix": "",
             "prepend": "",
             "force": False,
@@ -547,9 +551,11 @@ class TestBucket(unittest.TestCase):
         self._transform_exec_assert(ETL_NAME, action_value)
 
     def _transform_exec_assert(self, etl_name, expected_act_value, **kwargs):
-        to_bck = Bucket(name="new-bucket")
+        to_bck = Bucket(client=self.mock_client, name="new-bucket")
         self.ais_bck_params[QPARAM_BCK_TO] = to_bck.get_path()
-        expected_action = ActionMsg(action=ACT_ETL_BCK, value=expected_act_value).dict()
+        expected_action = ActionMsg(
+            action=ACT_ETL_BCK, value=expected_act_value
+        ).model_dump()
         expected_response = "job-id"
         mock_response = Mock()
         mock_response.text = expected_response
@@ -616,10 +622,10 @@ class TestBucket(unittest.TestCase):
             mock_open(read_data=b"bytes in the first file").return_value,
             mock_open(read_data=b"bytes in the second file").return_value,
         ]
-        mock_file = mock_open()
-        mock_file.side_effect = file_readers
 
         # Set up mock files
+        mock_file = mock_open()
+        mock_file.side_effect = file_readers
         mock_files = [
             Mock(
                 is_file=Mock(return_value=True),
@@ -656,7 +662,12 @@ class TestBucket(unittest.TestCase):
 
     def test_get_path(self):
         namespace = Namespace(uuid="ns-id", name="ns-name")
-        bucket = Bucket(name=BCK_NAME, namespace=namespace, provider=Provider.AMAZON)
+        bucket = Bucket(
+            client=self.mock_client,
+            name=BCK_NAME,
+            namespace=namespace,
+            provider=Provider.AMAZON,
+        )
         expected_path = (
             f"{Provider.AMAZON.value}/@{namespace.uuid}#{namespace.name}/{bucket.name}/"
         )
@@ -689,11 +700,6 @@ class TestBucket(unittest.TestCase):
         for obj in objects_iter:
             self.assertIsInstance(obj, Object)
 
-    def test_make_request_no_client(self):
-        bucket = Bucket(name="name")
-        with self.assertRaises(ValueError):
-            bucket.make_request("method", "action")
-
     def test_make_request_default_params(self):
         method = "method"
         action = "action"
@@ -702,7 +708,7 @@ class TestBucket(unittest.TestCase):
         self.mock_client.request.assert_called_with(
             method,
             path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-            json=ActionMsg(action=action, value=None).dict(),
+            json=ActionMsg(action=action, value=None).model_dump(),
             params=self.ais_bck.qparam,
         )
 
@@ -716,7 +722,7 @@ class TestBucket(unittest.TestCase):
         self.mock_client.request.assert_called_with(
             method,
             path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
-            json=ActionMsg(action=action, value=value).dict(),
+            json=ActionMsg(action=action, value=value).model_dump(),
             params=params,
         )
 
@@ -745,11 +751,11 @@ class TestBucket(unittest.TestCase):
 
         # Ensure that request was called with the correct sequence of calls
         bsumm_ctrl_msg = BsummCtrlMsg(
-            uuid="", prefix="", fast=True, cached=True, present=True
-        ).dict()
+            uuid="", prefix="", cached=True, present=True
+        ).model_dump()
         bsumm_ctrl_msg_with_uuid = BsummCtrlMsg(
-            uuid="job_id", prefix="", fast=True, cached=True, present=True
-        ).dict()
+            uuid="job_id", prefix="", cached=True, present=True
+        ).model_dump()
 
         calls = []
 
@@ -857,3 +863,235 @@ class TestBucket(unittest.TestCase):
         self.dataset_config.write_shards.assert_called()
         _, kwargs = self.dataset_config.write_shards.call_args
         self.assertTrue(callable(kwargs["post"]))
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    def _list_archive_exec_assert(
+        self,
+        list_1_id,
+        list_1_cont,
+        expected_act_value_1,
+        expected_act_value_2,
+        archive_obj_name,
+        include_archive_obj=False,
+        **kwargs,
+    ):
+        entry_archive = BucketEntry(n=archive_obj_name)
+        entry_1 = BucketEntry(n=f"{archive_obj_name}/file1.txt")
+        entry_2 = BucketEntry(n=f"{archive_obj_name}/file2.txt")
+
+        list_1 = BucketList(
+            UUID=list_1_id,
+            ContinuationToken=list_1_cont,
+            Flags=0,
+            Entries=[entry_archive],
+        )
+        list_2 = BucketList(
+            UUID="456", ContinuationToken="", Flags=0, Entries=[entry_1, entry_2]
+        )
+        self.mock_client.request_deserialize.return_value = BucketList(
+            UUID="empty", ContinuationToken="", Flags=0
+        )
+        self.assertEqual([], self.ais_bck.list_archive(archive_obj_name, **kwargs))
+        self.mock_client.request_deserialize.side_effect = [
+            list_1,
+            list_2,
+            BucketList(UUID="empty", ContinuationToken="", Flags=0),
+        ]
+        result = self.ais_bck.list_archive(
+            archive_obj_name, include_archive_obj=include_archive_obj, **kwargs
+        )
+
+        if include_archive_obj:
+            expected_res = [entry_archive, entry_1, entry_2]
+        else:
+            expected_res = [entry_1, entry_2]
+        self.assertEqual(expected_res, result)
+
+        expected_calls = []
+        for expected_val in (expected_act_value_1, expected_act_value_2):
+            expected_calls.append(
+                call(
+                    HTTP_METHOD_GET,
+                    path=f"{URL_PATH_BUCKETS}/{BCK_NAME}",
+                    headers={HEADER_ACCEPT: MSGPACK_CONTENT_TYPE},
+                    res_model=BucketList,
+                    json=ActionMsg(action=ACT_LIST, value=expected_val).model_dump(),
+                    params=self.ais_bck_params,
+                )
+            )
+        for exp in expected_calls:
+            self.assertIn(exp, self.mock_client.request_deserialize.call_args_list)
+
+    def test_list_archive_parametrized(self):
+        test_cases = [
+            {
+                "include_archive_obj": False,
+                "list_1_id": "123",
+                "list_1_cont": "cont",
+                "archive_name": "my-archive.tar",
+                "page_size": 5,
+                "props": "name",
+                "flag_value": "8",
+            },
+            {
+                "include_archive_obj": True,
+                "list_1_id": "789",
+                "list_1_cont": "cont2",
+                "archive_name": "dataset.zip",
+                "page_size": 0,
+                "props": "name,size",
+                "flag_value": "8",
+            },
+        ]
+
+        for case in test_cases:
+            with self.subTest(case=case):
+                expected_act_value_1 = {
+                    "prefix": case["archive_name"],
+                    "pagesize": case["page_size"],
+                    "uuid": "",
+                    "props": case["props"],
+                    "continuation_token": "",
+                    "flags": case["flag_value"],
+                    "target": "",
+                }
+                expected_act_value_2 = {
+                    "prefix": case["archive_name"],
+                    "pagesize": case["page_size"],
+                    "uuid": case["list_1_id"],
+                    "props": case["props"],
+                    "continuation_token": case["list_1_cont"],
+                    "flags": case["flag_value"],
+                    "target": "",
+                }
+
+                self._list_archive_exec_assert(
+                    case["list_1_id"],
+                    case["list_1_cont"],
+                    expected_act_value_1,
+                    expected_act_value_2,
+                    case["archive_name"],
+                    include_archive_obj=case["include_archive_obj"],
+                    props=case["props"],
+                    page_size=case["page_size"],
+                )
+
+    def test_summary_initial_resp_status_error(self):
+        # Mock responses with wrong status code
+        first_response = Mock()
+        first_response.status_code = STATUS_OK  # Wrong status, should be 202
+        first_response.text = "fake-job-id"
+
+        self.mock_client.request.return_value = first_response
+
+        with self.assertRaises(UnexpectedHTTPStatusCode):
+            self.ais_bck.summary()
+
+    # pylint: disable=protected-access
+    def test_get_uploaded_obj_name_helper(self):
+        tmp_dir = Path("dummy_root")
+        file_path = tmp_dir / "sub" / "file.txt"
+
+        name1 = Bucket._get_uploaded_obj_name(
+            file_path, tmp_dir, basename=False, prepend=None
+        )
+        self.assertEqual(name1, "sub/file.txt")
+
+        name2 = Bucket._get_uploaded_obj_name(
+            file_path, tmp_dir, basename=True, prepend=None
+        )
+        self.assertEqual(name2, "file.txt")
+
+        name3 = Bucket._get_uploaded_obj_name(
+            file_path, tmp_dir, basename=True, prepend="P/"
+        )
+        self.assertEqual(name3, "P/file.txt")
+
+    def test_list_objects_iter_pagination(self):
+        entries_page1 = [BucketEntry(n="obj1"), BucketEntry(n="obj2")]
+        entries_page2 = [BucketEntry(n="obj3")]
+        list1 = BucketList(
+            UUID="uid", ContinuationToken="tok", Flags=0, Entries=entries_page1
+        )
+        list2 = BucketList(
+            UUID="uid", ContinuationToken="", Flags=0, Entries=entries_page2
+        )
+
+        self.mock_client.request_deserialize.side_effect = [list1, list2]
+
+        it = self.ais_bck.list_objects_iter(page_size=2)
+        names = [entry.name for entry in it]
+
+        self.assertEqual(names, ["obj1", "obj2", "obj3"])
+        self.assertEqual(self.mock_client.request_deserialize.call_count, 2)
+
+    def test_copy_with_latest_sync_and_workers(self):
+        dst = Bucket(client=self.mock_client, name=f"dst-copy-flags-{BCK_NAME}")
+
+        expected_value = TCBckMsg(
+            ext=None,
+            num_workers=2,
+            copy_msg=CopyBckMsg(
+                prefix="",
+                prepend="",
+                force=False,
+                dry_run=False,
+                latest=True,
+                sync=True,
+            ),
+        ).as_dict()
+
+        self._copy_exec_assert(
+            dst,
+            expected_value,
+            latest=True,
+            sync=True,
+            num_workers=2,
+        )
+
+    def test_write_dataset_post_callback(self):
+        mock_post = Mock()
+        # Call write_dataset with a post callback
+        self.ais_bck.write_dataset(self.dataset_config, post=mock_post)
+        # Verify was called with a wrapped callback
+        self.dataset_config.write_shards.assert_called_once()
+        args, kwargs = self.dataset_config.write_shards.call_args
+        self.assertIn("post", kwargs)
+        self.assertNotEqual(kwargs["post"], mock_post)
+
+    def test_verify_cloud_bucket(self):
+        self.amz_bck.verify_cloud_bucket()
+        with self.assertRaises(InvalidBckProvider):
+            self.ais_bck.verify_cloud_bucket()
+
+    @patch("aistore.sdk.bucket.validate_directory")
+    @patch("pathlib.Path.glob")
+    def test_put_files_dry_run(self, mock_glob, _validate_dir):
+        mock_file = Mock(
+            is_file=Mock(return_value=True),
+            relative_to=Mock(return_value="f.txt"),
+            stat=Mock(return_value=Mock(st_size=1)),
+            name="f.txt",
+        )
+        mock_glob.return_value = [mock_file]
+
+        res = self.ais_bck.put_files("/path", dry_run=True)
+
+        self.assertEqual(res, ["f.txt"])
+        self.mock_client.request.assert_not_called()
+
+    @patch("aistore.sdk.bucket.validate_directory")
+    @patch("logging.getLogger")
+    @cases((True, False), (False, True))
+    def test_put_files_verbose(self, test_case, mock_get_logger, _mock_validate_dir):
+        verbose, expected_disabled = test_case
+
+        mock_logger = Mock()
+        mock_get_logger.return_value = mock_logger
+
+        # Mock an empty directory to avoid file processing
+        with patch("pathlib.Path.glob", return_value=[]):
+            self.ais_bck.put_files("/path", verbose=verbose)
+
+        # Verify logger disabled state matches expectation
+        self.assertEqual(mock_logger.disabled, expected_disabled)

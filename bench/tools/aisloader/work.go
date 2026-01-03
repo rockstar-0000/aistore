@@ -8,39 +8,59 @@ package aisloader
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/bench/tools/aisloader/stats"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
+	"github.com/NVIDIA/aistore/cmn/xoshiro256"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/tools/readers"
 )
 
+// GET(batch): an operation that gets a batch of objects (or archived files) in one shot.
+//
+// TODO:
+// * stats - to compare get-batch vs GET
+// * features
+//   - plain vs archive
+//   - multipart mode (w/ streaming default)
+//   - continue-on-error
+//   - multiple buckets
+//   - supported input and output formats (other than TAR)
+// * documentation
+//   - update docs/aisloader.md; add usage examples
+// ---------------------------------------------------------------------------------------
+
 const (
-	opPut = iota
+	opFree = iota
+	opPut
+	opPutShard
 	opGet
 	opUpdateExisting // {GET followed by PUT(same name, same size)} combo
-	opConfig
+	opPutMultipart   // multipart upload operation
+	opGetBatch       // get-batch
 )
 
 type (
 	workOrder struct {
 		err       error
 		sgl       *memsys.SGL
-		bck       cmn.Bck
-		proxyURL  string
-		objName   string // virtual-dir + "/" + objName
+		moss      *apc.MossReq // <= name-getter.PickBatch()
+		objName   string
+		archpath  string
 		cksumType string
-		latencies httpLatencies
+		latencies *httpLatencies
 		op        int
 		size      int64
 		start     int64
@@ -50,41 +70,44 @@ type (
 )
 
 func postNewWorkOrder() (err error) {
-	if runParams.getConfig {
-		workCh <- newGetConfigWorkOrder()
-		return nil
-	}
+	totalWOs++
 
-	var (
-		pct = runParams.putPct
-		put bool
-	)
-	switch pct {
-	case 0:
-	case 25:
-		put = mono.NanoTime()&0x3 == 0x3
-	case 50:
-		put = mono.NanoTime()&1 == 1
-	case 75:
-		put = mono.NanoTime()&0x3 > 0
-	case 100:
-		put = true
-	default:
-		put = pct > rnd.IntN(100)
-	}
+	// operation
+	op := opGet
+	switch {
+	case shouldUsePercentage(runParams.putPct):
+		// when a certain percentage of PUTs becomes PUT(multi-part)
+		op = opPut
+		debug.Assert(runParams.multipartChunks*runParams.archParams.pct == 0, "multipart uploads of shards not yet supported")
 
-	var wo *workOrder
-	if put {
-		wo, err = newPutWorkOrder()
-	} else {
-		var op = opGet
-		if pct = runParams.updateExistingPct; pct > 0 {
-			if pct > rnd.IntN(100) {
-				op = opUpdateExisting
-			}
+		if runParams.multipartChunks > 0 && shouldUsePercentage(runParams.multipartPct) {
+			op = opPutMultipart
 		}
-		wo, err = newGetWorkOrder(op)
+		if runParams.archParams.pct > 0 && shouldUsePercentage(runParams.archParams.pct) {
+			op = opPutShard
+		}
+	case runParams.getBatchSize > 0:
+		// when GET becomes GET(batch)
+		op = opGetBatch
+	case runParams.updateExistingPct > 0 && shouldUsePercentage(runParams.updateExistingPct):
+		// when a percentage of GET(foo) is followed up by PUT(foo)
+		op = opUpdateExisting
 	}
+
+	// work order
+	var wo *workOrder
+	switch op {
+	case opPut, opPutShard:
+		wo, err = newPutWorkOrder(op)
+	case opPutMultipart:
+		wo, err = newMultipartWorkOrder()
+	case opGet, opUpdateExisting:
+		wo, err = newGetWorkOrder(op)
+	default:
+		debug.Assert(op == opGetBatch, op)
+		wo, err = newGetBatchWorkOrder()
+	}
+
 	if err == nil {
 		workCh <- wo
 	}
@@ -97,7 +120,7 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 		switch wo.op {
 		case opGet:
 			lat = &intervalStats.statsd.GetLat
-		case opPut:
+		case opPut, opPutShard:
 			lat = &intervalStats.statsd.PutLat
 		}
 		if lat != nil {
@@ -115,49 +138,49 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 		}
 	}
 
-	delta := time.Duration(wo.end - wo.start)
+	elapsed := time.Duration(wo.end - wo.start)
+	if elapsed <= 0 {
+		err := fmt.Errorf("unexpected: non-positive latency %v: %s", elapsed, wo.String())
+		debug.AssertNoErr(err)
+		elapsed = 0
+	}
 
 	switch wo.op {
 	case opUpdateExisting:
-		delta = time.Duration(wo.startPut - wo.start)
+		elapsed = time.Duration(wo.startPut - wo.start)
+		debug.Assert(elapsed >= 0)
 		fallthrough
 	case opGet:
-		if delta <= 0 {
-			fmt.Fprintf(os.Stderr, "[ERROR] %s has the same start time as end time", wo)
-			return
-		}
 		getPending--
 		intervalStats.statsd.Get.AddPending(getPending)
 		if wo.err != nil {
-			fmt.Println("GET failed:", wo.err) // TODO: not necessarily when opGetPutNewVer
+			fmt.Fprintln(os.Stderr, "GET failed:", wo.err)
 			intervalStats.statsd.Get.AddErr()
 			intervalStats.get.AddErr()
 			return
 		}
-		intervalStats.get.Add(wo.size, delta)
-		intervalStats.statsd.Get.Add(wo.size, delta)
+		intervalStats.get.Add(wo.size, elapsed)
+		intervalStats.statsd.Get.Add(wo.size, elapsed)
 		if wo.op == opGet {
 			return
 		}
 
-		delta = time.Duration(wo.end - wo.startPut)
+		elapsed = time.Duration(wo.end - wo.startPut)
 		putPending++
 		fallthrough
-	case opPut:
-		if delta <= 0 {
-			fmt.Fprintf(os.Stderr, "[ERROR] %s has the same start time as end time", wo)
-			return
-		}
+	case opPut, opPutShard:
 		putPending--
 		intervalStats.statsd.Put.AddPending(putPending)
 		if wo.err == nil {
 			if wo.op != opUpdateExisting {
-				bucketObjsNames.AddObjName(wo.objName)
+				if !stopping.Load() {
+					objnameGetter.Add(wo.objName)
+				}
 			}
-			intervalStats.put.Add(wo.size, delta)
-			intervalStats.statsd.Put.Add(wo.size, delta)
+			intervalStats.put.Add(wo.size, elapsed)
+			intervalStats.statsd.Put.Add(wo.size, elapsed)
 		} else {
-			fmt.Println("PUT failed:", wo.err)
+			fmt.Fprintln(os.Stderr, "PUT failed:", wo.err)
 			intervalStats.put.AddErr()
 			intervalStats.statsd.Put.AddErr()
 		}
@@ -166,7 +189,8 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 		}
 
 		now, l := mono.NanoTime(), len(wo2Free)
-		// free previously executed PUT SGLs
+
+		// cleanup: free previously executed PUT SGLs
 		for i := 0; i < l; i++ {
 			if terminating {
 				return
@@ -179,6 +203,8 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 			}
 			if w.sgl != nil && !w.sgl.IsNil() {
 				w.sgl.Free()
+				w.sgl = nil
+				freeWO(w)
 				copy(wo2Free[i:], wo2Free[i+1:])
 				i--
 				l--
@@ -187,94 +213,167 @@ func completeWorkOrder(wo *workOrder, terminating bool) {
 		}
 		// append to free later
 		wo2Free = append(wo2Free, wo)
-	case opConfig:
+	case opPutMultipart:
+		putPending--
+		intervalStats.statsd.Put.AddPending(putPending)
 		if wo.err == nil {
-			intervalStats.getConfig.Add(1, delta)
-			intervalStats.statsd.Config.Add(delta, wo.latencies.Proxy, wo.latencies.ProxyConn)
+			if !stopping.Load() {
+				objnameGetter.Add(wo.objName)
+			}
+			intervalStats.putMPU.Add(wo.size, elapsed)
+			intervalStats.statsd.Put.Add(wo.size, elapsed)
 		} else {
-			fmt.Println("get-config failed:", wo.err)
-			intervalStats.getConfig.AddErr()
+			fmt.Fprintln(os.Stderr, "Multipart PUT failed:", wo.err)
+			intervalStats.putMPU.AddErr()
+			intervalStats.statsd.Put.AddErr()
 		}
+		// No SGL cleanup needed for multipart operations
+
+	case opGetBatch:
+		getBatchPending--
+		intervalStats.statsd.GetBatch.AddPending(getBatchPending)
+		if wo.err == nil {
+			intervalStats.getBatch.Add(wo.size, elapsed)
+			intervalStats.statsd.GetBatch.Add(wo.size, elapsed)
+
+			// TODO: possibly, check unusually long `elapsed`
+		} else {
+			fmt.Fprintln(os.Stderr, "GetBatch failed:", wo.err)
+			intervalStats.getBatch.AddErr()
+			intervalStats.statsd.GetBatch.AddErr()
+		}
+
 	default:
 		debug.Assert(false, wo.op)
 	}
 }
 
 func doPut(wo *workOrder) {
-	var (
-		sgl *memsys.SGL
-		url = wo.proxyURL
-	)
-	if runParams.readerType == readers.TypeSG {
-		sgl = gmm.NewSGL(wo.size)
-		wo.sgl = sgl
+	var readParams = readers.Arg{
+		Type:      runParams.readerType,
+		Path:      runParams.tmpDir,
+		Name:      wo.objName,
+		Size:      wo.size,
+		CksumType: wo.cksumType,
 	}
-	r, err := readers.New(readers.Params{
-		Type: runParams.readerType,
-		SGL:  sgl,
-		Path: runParams.tmpDir,
-		Name: wo.objName,
-		Size: wo.size,
-	}, wo.cksumType)
+	if runParams.readerType == readers.SG {
+		wo.sgl = gmm.NewSGL(wo.size)
+		readParams.SGL = wo.sgl
+	}
 
+	// PUT(shard)
+	if wo.op == opPutShard {
+		mime, err := archive.Mime(runParams.archParams.format, wo.objName)
+		if err != nil {
+			wo.err = err
+			return
+		}
+		readParams.Arch = &readers.Arch{
+			Mime:    mime,
+			Prefix:  runParams.archParams.prefix,
+			MinSize: runParams.archParams.minSz,
+			MaxSize: runParams.archParams.maxSz,
+			Num:     runParams.archParams.numFiles,
+		}
+	}
+
+	r, err := readers.New(&readParams)
 	if err != nil {
 		wo.err = err
 		return
 	}
+
+	url := runParams.proxyURL
 	if runParams.randomProxy {
 		debug.Assert(!isDirectS3())
 		psi, err := runParams.smap.GetRandProxy(false /*excl. primary*/)
 		if err != nil {
-			fmt.Printf("PUT(wo): %v\n", err)
+			fmt.Fprintln(os.Stderr, "PUT(wo) err:", err, wo.String())
 			os.Exit(1)
 		}
 		url = psi.URL(cmn.NetPublic)
 	}
 	if !traceHTTPSig.Load() {
 		if isDirectS3() {
-			wo.err = s3put(wo.bck, wo.objName, r)
+			wo.err = s3put(runParams.bck, wo.objName, r)
 		} else {
-			wo.err = put(url, wo.bck, wo.objName, r.Cksum(), r)
+			wo.err = put(url, runParams.bck, wo.objName, r.Cksum(), r)
 		}
 	} else {
 		debug.Assert(!isDirectS3())
-		wo.err = putWithTrace(url, wo.bck, wo.objName, &wo.latencies, r.Cksum(), r)
+		wo.latencies = new(httpLatencies)
+		wo.err = putWithTrace(url, runParams.bck, wo.objName, wo.latencies, r.Cksum(), r)
 	}
-	if runParams.readerType == readers.TypeFile {
+	if runParams.readerType == readers.File {
 		r.Close()
 		os.Remove(path.Join(runParams.tmpDir, wo.objName))
 	}
 }
 
+func doMultipart(wo *workOrder) {
+	var url = runParams.proxyURL
+
+	if runParams.randomProxy {
+		debug.Assert(!isDirectS3())
+		psi, err := runParams.smap.GetRandProxy(false /*excl. primary*/)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Multipart PUT(wo) err:", err, wo.String())
+			os.Exit(1)
+		}
+		url = psi.URL(cmn.NetPublic)
+	}
+
+	wo.err = putMultipart(url, runParams.bck, wo.objName, wo.size, runParams.multipartChunks, wo.cksumType)
+}
+
 func doGet(wo *workOrder) {
 	var (
-		url = wo.proxyURL
+		url = runParams.proxyURL
 	)
 	if runParams.randomProxy {
 		debug.Assert(!isDirectS3())
 		psi, err := runParams.smap.GetRandProxy(false /*excl. primary*/)
 		if err != nil {
-			fmt.Printf("GET(wo): %v\n", err)
+			fmt.Fprintln(os.Stderr, "GET(wo) err:", err, wo.String())
 			os.Exit(1)
 		}
 		url = psi.URL(cmn.NetPublic)
 	}
 	if !traceHTTPSig.Load() {
 		if isDirectS3() {
-			wo.size, wo.err = s3getDiscard(wo.bck, wo.objName)
+			wo.size, wo.err = s3getDiscard(runParams.bck, wo.objName)
 		} else {
-			wo.size, wo.err = getDiscard(url, wo.bck,
-				wo.objName, runParams.readOff, runParams.readLen, runParams.verifyHash, runParams.latest)
+			wo.size, wo.err = getDiscard(url, wo, runParams)
 		}
 	} else {
 		debug.Assert(!isDirectS3())
-		wo.size, wo.err = getTraceDiscard(url, wo.bck,
-			wo.objName, &wo.latencies, runParams.readOff, runParams.readLen, runParams.verifyHash, runParams.latest)
+		wo.latencies = new(httpLatencies)
+		wo.size, wo.err = getTraceDiscard(url, wo, runParams)
 	}
 }
 
-func doGetConfig(wo *workOrder) {
-	wo.latencies, wo.err = getConfig(wo.proxyURL)
+func doGetBatch(wo *workOrder) {
+	var url = runParams.proxyURL
+
+	if runParams.randomProxy {
+		debug.Assert(!isDirectS3())
+		psi, err := runParams.smap.GetRandProxy(false /*excl. primary*/)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "GetBatch(wo):", err, wo.String())
+			os.Exit(1)
+		}
+		url = psi.URL(cmn.NetPublic)
+	}
+
+	// build GetBatch request from wo.batch
+	// (earlier objnameGetter.PickBatch())
+	debug.Assert(wo.moss != nil && len(wo.moss.In) > 0)
+
+	// TODO: command-line to support multipart
+	wo.moss.StreamingGet = true
+
+	// do
+	wo.size, wo.err = getBatchDiscard(url, runParams.bck, wo.moss)
 }
 
 func worker(wos <-chan *workOrder, results chan<- *workOrder, wg *sync.WaitGroup, numGets *atomic.Int64) {
@@ -289,7 +388,7 @@ func worker(wos <-chan *workOrder, results chan<- *workOrder, wg *sync.WaitGroup
 		wo.start = mono.NanoTime()
 
 		switch wo.op {
-		case opPut:
+		case opPut, opPutShard:
 			doPut(wo)
 		case opGet:
 			doGet(wo)
@@ -302,8 +401,10 @@ func worker(wos <-chan *workOrder, results chan<- *workOrder, wg *sync.WaitGroup
 				wo.startPut = mono.NanoTime()
 				doPut(wo)
 			}
-		case opConfig:
-			doGetConfig(wo)
+		case opPutMultipart:
+			doMultipart(wo)
+		case opGetBatch:
+			doGetBatch(wo)
 		default:
 			debug.Assert(false, wo.op)
 		}
@@ -317,31 +418,34 @@ func worker(wos <-chan *workOrder, results chan<- *workOrder, wg *sync.WaitGroup
 // workOrder //
 ///////////////
 
-func newPutWorkOrder() (*workOrder, error) {
-	objName, err := _genObjName()
-	if err != nil {
-		return nil, err
-	}
-	size := runParams.minSize
-	if runParams.maxSize != runParams.minSize {
-		d := rnd.Int64N(runParams.maxSize + 1 - runParams.minSize)
-		size = runParams.minSize + d
-	}
-	putPending++
-	return &workOrder{
-		proxyURL:  runParams.proxyURL,
-		bck:       runParams.bck,
-		op:        opPut,
-		objName:   objName,
-		size:      size,
-		cksumType: runParams.cksumType,
-	}, nil
+func newPutWorkOrder(op int) (*workOrder, error) { return _newPutWO(op) }
+func newMultipartWorkOrder() (*workOrder, error) { return _newPutWO(opPutMultipart) }
+
+func _randInRange(minSize, maxSize int64) int64 {
+	span := uint64(maxSize - minSize + 1)
+	v := xoshiro256.Hash(totalWOs) % span
+	return minSize + int64(v)
 }
 
-func _genObjName() (string, error) {
+func _newPutWO(op int) (*workOrder, error) {
+	size := runParams.minSize
+	if runParams.maxSize != runParams.minSize {
+		size = _randInRange(runParams.minSize, runParams.maxSize)
+	}
+	putPending++
+
+	wo := allocWO(op)
+	wo.size = size
+	wo.cksumType = runParams.cksumType
+
+	err := wo.genObjName()
+	return wo, err
+}
+
+func (wo *workOrder) genObjName() error {
 	cnt := objNameCnt.Inc()
 	if runParams.maxputs != 0 && cnt-1 == runParams.maxputs {
-		return "", fmt.Errorf("number of PUT objects reached maxputs limit (%d)", runParams.maxputs)
+		return fmt.Errorf("number of PUT objects reached '--maxputs' limit (%d)", runParams.maxputs)
 	}
 
 	var (
@@ -354,8 +458,8 @@ func _genObjName() (string, error) {
 		idx++
 	}
 
-	if runParams.putShards != 0 {
-		comps[idx] = fmt.Sprintf("%05x", cnt%runParams.putShards)
+	if runParams.numVirtDirs != 0 {
+		comps[idx] = fmt.Sprintf("%05x", cnt%runParams.numVirtDirs)
 		idx++
 	}
 
@@ -369,47 +473,118 @@ func _genObjName() (string, error) {
 		idx++
 	}
 
-	return path.Join(comps[0:idx]...), nil
+	name := path.Join(comps[0:idx]...)
+
+	// PUT(shard): add extension
+	if wo.op == opPutShard && cos.Ext(name) == "" {
+		if f := runParams.archParams.format; f != "" {
+			mime, err := archive.Mime(f, name)
+			if err != nil {
+				return fmt.Errorf("failed to generate object name: %v", err)
+			}
+			name += mime
+		} else {
+			name += archive.ExtTar // default .tar
+		}
+	}
+
+	wo.objName = name
+	return nil
 }
 
 func newGetWorkOrder(op int) (*workOrder, error) {
-	if bucketObjsNames.Len() == 0 {
+	debug.Assert(op == opGet || op == opUpdateExisting, op)
+	if objnameGetter.Len() == 0 {
 		return nil, errors.New("no objects in bucket")
 	}
 
 	getPending++
-	return &workOrder{
-		proxyURL: runParams.proxyURL,
-		bck:      runParams.bck,
-		op:       op,
-		objName:  bucketObjsNames.ObjName(),
-	}, nil
+	wo := allocWO(op)
+	name := objnameGetter.Pick()
+	wo.objName, wo.archpath = decodeArchName(name)
+
+	return wo, nil
 }
 
-func newGetConfigWorkOrder() *workOrder {
-	return &workOrder{
-		proxyURL: runParams.proxyURL,
-		op:       opConfig,
+func newGetBatchWorkOrder() (*workOrder, error) {
+	if objnameGetter.Len() == 0 {
+		err := errors.New("no objects in bucket")
+		fmt.Fprintln(os.Stderr, "newGetBatchWorkOrder:", err)
+		return nil, err
 	}
+
+	getBatchPending++
+	wo := allocGetBatchWO(runParams.getBatchSize)
+
+	var i int
+	objnameGetter.IterBatch(runParams.getBatchSize, func(name string) bool {
+		wo.moss.In[i].ObjName, wo.moss.In[i].ArchPath = decodeArchName(name)
+		i++
+		return true
+	})
+
+	wo.moss.ContinueOnErr = runParams.continueOnErr
+
+	return wo, nil
 }
 
 func (wo *workOrder) String() string {
-	var errstr, opName string
+	var opName, s string
 	switch wo.op {
-	case opPut:
-		opName = http.MethodPut
+	case opPut, opPutShard:
+		opName = opLabelPut
 	case opGet:
-		opName = http.MethodGet
+		opName = opLabelGet
+	case opPutMultipart:
+		opName = opLabelMPU
 	case opUpdateExisting:
 		opName = "GET-PUT(new-version)"
-	case opConfig:
-		opName = "CONFIG"
+	case opGetBatch:
+		opName = opLabelGBT
+		if wo.moss != nil && len(wo.moss.In) > 0 {
+			s = ", batch " + strconv.Itoa(len(wo.moss.In))
+		}
 	}
-
-	if wo.err != nil {
-		errstr = ", error: " + wo.err.Error()
+	cname := runParams.bck.Cname(wo.objName)
+	if wo.start == 0 {
+		return fmt.Sprintf("wo[%s %s%s]", opName, cname, s)
 	}
+	lat := time.Duration(wo.end - wo.start)
+	return fmt.Sprintf("wo[%s %s, %v, size: %d%s]", opName, cname, lat, wo.size, s)
+}
 
-	return fmt.Sprintf("WO: %s/%s, duration %s, size: %d, type: %s%s",
-		wo.bck.String(), wo.objName, time.Duration(wo.end-wo.start), wo.size, opName, errstr)
+// returns true based on the given PUT percentage (0-100)
+// uses totalWOs counter with xoshiro256 hash for deterministic, well-distributed decisions
+func shouldUsePercentage(pct int) bool {
+	if pct <= 0 {
+		return false
+	}
+	if pct >= 100 {
+		return true
+	}
+	v := xoshiro256.Hash(totalWOs) % 100
+	return v < uint64(pct)
+}
+
+//
+// within bucket conversions: {objname[, archpath]} <=> FQN
+//
+
+const archSep = '\x00'
+
+func encodeArchName(objName, archpath string) string {
+	if archpath == "" {
+		return objName
+	}
+	debug.Assert(!strings.ContainsRune(objName, archSep))
+	debug.Assert(!strings.ContainsRune(archpath, archSep))
+	return objName + string(archSep) + archpath
+}
+
+func decodeArchName(s string) (objName, archpath string) {
+	i := strings.IndexByte(s, archSep)
+	if i < 0 {
+		return s, ""
+	}
+	return s[:i], s[i+1:]
 }

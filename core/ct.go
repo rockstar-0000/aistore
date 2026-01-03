@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -34,9 +34,6 @@ type CT struct {
 	mtime       int64
 }
 
-// interface guard
-var _ fs.PartsFQN = (*CT)(nil)
-
 func (ct *CT) FQN() string              { return ct.fqn }
 func (ct *CT) ObjectName() string       { return ct.objName }
 func (ct *CT) ContentType() string      { return ct.contentType }
@@ -49,8 +46,8 @@ func (ct *CT) Digest() uint64           { return ct.digest }
 func (ct *CT) Cname() string            { return ct.bck.Cname(ct.objName) }
 
 func (ct *CT) LoadSliceFromFS() error {
-	debug.Assert(ct.ContentType() == fs.ECSliceType, "unexpected content type: ", ct.ContentType())
-	st, err := os.Stat(ct.FQN())
+	debug.Assert(ct.ContentType() == fs.ECSliceCT, "unexpected content type: ", ct.ContentType())
+	st, err := os.Lstat(ct.FQN())
 	if err != nil {
 		return err
 	}
@@ -81,16 +78,14 @@ func (ct *CT) Unlock(exclusive bool) {
 	nlc.Unlock(*uname, exclusive)
 }
 
-// e.g.: generate workfile FQN from object FQN:
-//  ct, err := NewCTFromFQN(fqn, nil)
-//  if err != nil { ... }
-//  fqn := ct.Make(fs.WorkfileType)
 //
-// e.g.: generate EC metafile FQN from bucket name, backend provider and object name:
-//  ct, err := NewCTFromBO(bckName, bckProvider, objName, nil)
-//  if err != nil { ... }
-//  fqn := ct.Make(fs.ECMetaType)
+// begin: CT constructors (flavors) -----------------------------------------------------
+//
 
+// full construction and init, including:
+// - parse fqn
+// - init bucket
+// - HRW
 func NewCTFromFQN(fqn string, b meta.Bowner) (ct *CT, err error) {
 	var (
 		hrwFQN string
@@ -114,56 +109,83 @@ func NewCTFromFQN(fqn string, b meta.Bowner) (ct *CT, err error) {
 	return ct, err
 }
 
-func NewCTFromBO(bck *cmn.Bck, objName string, b meta.Bowner, ctType ...string) (ct *CT, err error) {
-	ct = &CT{objName: objName, bck: meta.CloneBck(bck)}
-	if b != nil {
-		if err = ct.bck.Init(b); err != nil {
-			return
-		}
-	}
-	var digest uint64
-	ct.mi, digest, err = fs.Hrw(ct.bck.MakeUname(objName))
-	if err != nil {
-		return
-	}
-	ct.digest = digest
-	if len(ctType) == 0 {
-		ct.contentType = fs.ObjectType
-	} else {
-		ct.contentType = ctType[0]
-	}
-	ct.fqn = fs.CSM.Gen(ct, ct.contentType, "")
+// usage: dsort only
+func NewDsortCT(bck *cmn.Bck, objName string) (ct *CT, err error) {
+	ct = &CT{objName: objName, bck: meta.CloneBck(bck), contentType: fs.ObjCT}
+	err = ct.init()
 	return
 }
 
-// Construct CT from LOM and change ContentType and FQN
-func NewCTFromLOM(lom *LOM, ctType string) *CT {
+// bare minimum: from fs.ParsedFQN
+func NewCTFromParsed(parsed *fs.ParsedFQN, fqn string) *CT {
 	return &CT{
-		fqn:         fs.CSM.Gen(lom, ctType, ""),
+		fqn:         fqn,
+		objName:     parsed.ObjName,
+		contentType: parsed.ContentType,
+		bck:         meta.CloneBck(&parsed.Bck),
+		mi:          parsed.Mountpath,
+		digest:      parsed.Digest,
+	}
+}
+
+// bare minimum: from LOM
+func NewCTFromLOM(lom *LOM, ctType string, extras ...string) (ct *CT) {
+	ct = &CT{
 		objName:     lom.ObjName,
 		contentType: ctType,
 		bck:         lom.Bck(),
 		mi:          lom.mi,
 		digest:      lom.digest,
 	}
+	ct.fqn = ct.GenFQN("", extras...)
+	return ct
 }
 
-// Clone CT and change ContentType and FQN
-func (ct *CT) Clone(ctType string) *CT {
-	return &CT{
-		fqn:         fs.CSM.Gen(ct, ctType, ""),
+// same as above but with a designated mountpath
+func newChunkCT(lom *LOM, mi *fs.Mountpath) (ct *CT) {
+	ct = &CT{objName: lom.ObjName, bck: lom.Bck(), contentType: fs.ChunkCT}
+	ct.mi = mi // instead of ct.init()
+	return
+}
+
+// bare minimum: from CT
+func (ct *CT) Clone(ctType string) (clone *CT) {
+	clone = &CT{
 		objName:     ct.objName,
 		contentType: ctType,
 		bck:         ct.bck,
 		mi:          ct.mi,
 		digest:      ct.digest,
 	}
+	clone.fqn = clone.GenFQN("")
+	return clone
 }
 
-func (ct *CT) Make(toType string) string {
-	debug.Assert(toType != "")
-	return fs.CSM.Gen(ct, toType, "")
+// construct, init bucket and compute HRW
+// (similar to lom.InitBck())
+func NewCTFromBO(bck *meta.Bck, objName, ctType string, extras ...string) (ct *CT, err error) {
+	ct = &CT{objName: objName, bck: bck, contentType: ctType}
+	if err = ct.bck.Init(T.Bowner()); err != nil {
+		return
+	}
+	err = ct.init(extras...)
+	return
 }
+
+func (ct *CT) init(extras ...string) error {
+	var digest uint64
+	mi, digest, err := fs.Hrw(ct.bck.MakeUname(ct.objName))
+	if err != nil {
+		return err
+	}
+	ct.mi, ct.digest = mi, digest
+	ct.fqn = ct.GenFQN("", extras...)
+	return nil
+}
+
+//
+// end: CT constructors (flavors) -----------------------------------------------------
+//
 
 // Save CT to local drives. If workFQN is set, it saves in two steps: first,
 // save to workFQN; second, rename workFQN to ct.fqn. If unset, it writes
@@ -194,4 +216,34 @@ func (ct *CT) saveAndRename(tmpfqn string, reader io.Reader, buf []byte, cksumTy
 		}
 	}
 	return
+}
+
+// Content FQN makers
+//
+// Both LOM and CT provide convenience methods to generate a fully qualified name (FQN)
+// for any derived piece of content (workfiles, EC slices, chunks, etc.).
+// Internally both delegate to fs.CSM.Gen, which applies type-specific naming rules
+// (shortening long object names, attaching tie-breakers, etc.).
+//
+// - LOM.GenFQN(cttype, extras...)
+//   Use when you have an initialized (not necessarily loaded) LOM.
+//  `cttype` must be one of the `fs` declared constants (WorkCT, ChunkCT, ChunkMetaCT, ...).
+//
+// - CT.GenFQN(cttype, extras...)
+//   Same as above but for an existing CT. If `cttype` is empty, the CT's own
+//   content type is reused.
+//
+// - `extras` provide disambiguation (e.g., work tag, uploadID, chunk number).
+
+func (lom *LOM) GenFQN(cttype string, extras ...string) string {
+	debug.Assert(lom.mi != nil)
+	return fs.CSM.Gen(lom.ObjName, cttype, lom.Bucket(), lom.mi, extras...)
+}
+
+func (ct *CT) GenFQN(cttype string, extras ...string) string {
+	if cttype == "" {
+		cttype = ct.contentType
+	}
+	debug.Assert(cttype != "")
+	return fs.CSM.Gen(ct.objName, cttype, ct.Bucket(), ct.Mountpath(), extras...)
 }

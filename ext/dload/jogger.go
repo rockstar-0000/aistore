@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -136,15 +136,18 @@ func (j *jogger) getTask(jobID string) (task *singleTask) {
 }
 
 func (j *jogger) abortJob(id string) {
-	var task *singleTask
-
+	var (
+		task *singleTask
+		cnt  int
+	)
 	j.mtx.Lock()
 
 	j.q.mu.Lock()
-	cnt := j.q.removeJob(id) // remove from pending
+	cnt = j.q.removeJob(id) // remove from pending
 	j.q.mu.Unlock()
-	j.parent.xdl.SubPending(cnt)
-
+	if cnt > 0 {
+		j.parent.xdl.SubPending(cnt)
+	}
 	if j.task != nil && j.task.jobID() == id {
 		task = j.task
 		// iff the task belongs to the specified job
@@ -153,7 +156,7 @@ func (j *jogger) abortJob(id string) {
 
 	j.mtx.Unlock()
 
-	if task != nil && cmn.Rom.FastV(4, cos.SmoduleDload) /*verbose*/ {
+	if task != nil && cmn.Rom.V(4, cos.ModDload) /*verbose*/ {
 		nlog.Infof("%s: abort-job[%s, mpath=%s], task=%s", core.T.String(), id, j.mpath, j.task.String())
 	}
 }

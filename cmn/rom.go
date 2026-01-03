@@ -11,8 +11,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 )
 
-// read-mostly and most often used timeouts: assign at startup to reduce the number of GCO.Get() calls
-// updating: a) upon startup, b) periodically, via stats runner, and c) upon receiving new global config
+// read-mostly and most often used config values: assigned at startup and updated
+// when cluster config changes to reduce the number of GCO.Get() calls
 
 type readMostly struct {
 	timeout struct {
@@ -24,6 +24,7 @@ type readMostly struct {
 	level, modules int
 	testingEnv     bool
 	authEnabled    bool
+	cskEnabled     bool
 }
 
 var Rom readMostly
@@ -41,9 +42,11 @@ func (rom *readMostly) Set(cfg *ClusterConfig) {
 		rom.timeout.ecstreams = d.D()
 	}
 	rom.features = cfg.Features
-	rom.authEnabled = cfg.Auth.Enabled
 
-	// pre-parse for FastV (below)
+	rom.authEnabled = cfg.Auth.Enabled
+	rom.cskEnabled = cfg.Auth.CSKEnabled()
+
+	// pre-parse for V (below)
 	rom.level, rom.modules = cfg.Log.Level.Parse()
 }
 
@@ -53,7 +56,8 @@ func (rom *readMostly) EcStreams() time.Duration       { return rom.timeout.ecst
 func (rom *readMostly) Features() feat.Flags           { return rom.features }
 func (rom *readMostly) TestingEnv() bool               { return rom.testingEnv }
 func (rom *readMostly) AuthEnabled() bool              { return rom.authEnabled }
+func (rom *readMostly) CSKEnabled() bool               { return rom.cskEnabled }
 
-func (rom *readMostly) FastV(verbosity, fl int) bool {
+func (rom *readMostly) V(verbosity, fl int) bool {
 	return rom.level >= verbosity || rom.modules&fl != 0
 }

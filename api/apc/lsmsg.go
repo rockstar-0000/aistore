@@ -86,6 +86,9 @@ const (
 
 	// do not return virtual subdirectories - do not include them as `cmn.LsoEnt` entries
 	LsNoDirs
+
+	// the caller is s3 compatibility API
+	LsIsS3
 )
 
 // max page sizes
@@ -98,6 +101,13 @@ const (
 	MaxPageSizeOCI   = 1000
 )
 
+// cmn/objlist_utils
+const (
+	statusBits    = 5
+	LsoStatusMask = (1 << statusBits) - 1
+)
+
+// NOTE: approaching uint16 limit - bits 9,14,15 remaining
 const (
 	// location _status_
 	LocOK = iota
@@ -113,14 +123,9 @@ const (
 	EntryIsArchive  = 1 << (statusBits + 4)
 	EntryVerChanged = 1 << (statusBits + 5) // see also: QparamLatestVer, et al.
 	EntryVerRemoved = 1 << (statusBits + 6) // ditto
-	// added v3.26
-	EntryHeadFail = 1 << (statusBits + 7)
-)
-
-// cmn/objlist_utils
-const (
-	statusBits    = 5
-	LsoStatusMask = (1 << statusBits) - 1
+	EntryHeadFail   = 1 << (statusBits + 7)
+	// added v4.0
+	EntryIsChunked = 1 << (statusBits + 8) // see NOTE above
 )
 
 // LsoMsg and HEAD(object) enum
@@ -136,6 +141,9 @@ const (
 	GetPropsEC       = "ec"
 	GetPropsCustom   = "custom"
 	GetPropsLocation = "location" // advanced usage
+
+	// 4.0 and future use
+	GetPropsChunked = "chunked"
 )
 
 const GetPropsNameSize = GetPropsName + LsPropsSepa + GetPropsSize
@@ -151,6 +159,7 @@ var (
 		GetPropsVersion, GetPropsCached, GetPropsStatus, GetPropsCopies, GetPropsEC, GetPropsCustom, GetPropsLocation}
 )
 
+// swagger:model
 type LsoMsg struct {
 	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 	UUID              string      `json:"uuid"`                  // ID to identify a single multi-page request
@@ -216,43 +225,70 @@ func (lsmsg *LsoMsg) PropsSet() (s cos.StrSet) {
 	return s
 }
 
-func (lsmsg *LsoMsg) Str(cname string) string {
-	var sb strings.Builder
-	sb.Grow(80)
-
+func (lsmsg *LsoMsg) Str(cname string, sb *strings.Builder) {
 	sb.WriteString(cname)
 	if lsmsg.Props != "" {
 		sb.WriteString(", props:")
 		sb.WriteString(lsmsg.Props)
 	}
-	if lsmsg.Flags == 0 {
-		return sb.String()
+	if fl := lsmsg.Flags; fl != 0 {
+		sb.WriteString(", flags:")
+		lsmsg.appendFlags(sb)
 	}
+}
 
-	sb.WriteString(", flags:")
+func (lsmsg *LsoMsg) appendFlags(sb *strings.Builder) {
+	flags := make([]string, 0, 8)
+
 	if lsmsg.IsFlagSet(LsCached) {
-		sb.WriteString("cached,")
+		flags = append(flags, "cached")
 	}
 	if lsmsg.IsFlagSet(LsMissing) {
-		sb.WriteString("missing,")
+		flags = append(flags, "missing")
+	}
+	if lsmsg.IsFlagSet(LsDeleted) {
+		flags = append(flags, "deleted")
 	}
 	if lsmsg.IsFlagSet(LsArchDir) {
-		sb.WriteString("arch,")
+		flags = append(flags, "arch-dir")
+	}
+	if lsmsg.IsFlagSet(LsNameOnly) {
+		flags = append(flags, "name-only")
+	}
+	if lsmsg.IsFlagSet(LsNameSize) {
+		flags = append(flags, "name-size")
 	}
 	if lsmsg.IsFlagSet(LsBckPresent) {
-		sb.WriteString("bck-present,")
+		flags = append(flags, "bck-present")
+	}
+	if lsmsg.IsFlagSet(LsDontHeadRemote) {
+		flags = append(flags, "no-head-remote")
 	}
 	if lsmsg.IsFlagSet(LsDontAddRemote) {
-		sb.WriteString("skip-lookup,")
+		flags = append(flags, "no-add-remote")
+	}
+	if lsmsg.IsFlagSet(LsNotCached) {
+		flags = append(flags, "not-cached")
+	}
+	if lsmsg.IsFlagSet(LsWantOnlyRemoteProps) {
+		flags = append(flags, "only-remote-props")
 	}
 	if lsmsg.IsFlagSet(LsNoRecursion) {
-		sb.WriteString("no-recurs,")
+		flags = append(flags, "no-recursion")
 	}
 	if lsmsg.IsFlagSet(LsDiff) {
-		sb.WriteString("diff,")
+		flags = append(flags, "diff")
 	}
-	s := sb.String()
-	return s[:len(s)-1]
+	if lsmsg.IsFlagSet(LsNoDirs) {
+		flags = append(flags, "no-dirs")
+	}
+	if lsmsg.IsFlagSet(LsIsS3) {
+		flags = append(flags, "s3")
+	}
+
+	if len(flags) > 0 {
+		sb.WriteString(strings.Join(flags, ","))
+	}
 }
 
 // LsoMsg flags enum: LsCached, ...

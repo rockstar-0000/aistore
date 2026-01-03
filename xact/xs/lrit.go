@@ -48,7 +48,7 @@ type (
 	lrxact interface {
 		Abort(error) bool
 		IsAborted() bool // used exclusively to break iteration
-		Finished() bool  // ditto
+		IsDone() bool    // ditto
 		Name() string
 		ChanAbort() <-chan error
 	}
@@ -66,22 +66,18 @@ type (
 	lrit struct {
 		parent lrxact
 		bck    *meta.Bck
-		// [--- traverse
-		msg     *apc.ListRange
-		pt      *cos.ParsedTemplate
-		prefix  string // bucket/prefix
-		lsflags uint64 // assorted lsmsg flags (`LsNoRecursion`)
-		// --- traverse]
-		buf []byte // when (prealloc && no-workers)
-		// nwp: num-workers parallelism
-		// (these are _not_ joggers)
-		nwp struct {
+		msg    *apc.ListRange      // traverse: msg
+		pt     *cos.ParsedTemplate // traverse: template
+		prefix string              // traverse: bucket/prefix
+		buf    []byte              // when (prealloc && no-workers)
+		nwp    struct {            // nwp: num-workers parallelism (these are _not_ joggers)
 			workCh   chan lrpair
 			workers  []*lrworker
 			chanFull cos.ChanFull
 			wg       sync.WaitGroup
 		}
-		lrp int // enum { lrpList, ... }
+		lsflags uint64 // traverse: assorted lsmsg flags (`LsNoRecursion`)
+		lrp     int    // enum { lrpList, ... }
 	}
 )
 
@@ -134,9 +130,13 @@ func (r *lrit) init(xctn lrxact, msg *apc.ListRange, bck *meta.Bck, lsflags uint
 			numWorkers += 2
 		}
 	}
-	numWorkers, err := throttleNwp(r.parent.Name(), numWorkers)
+	n, err := clampNumWorkers(r.parent.Name(), numWorkers, l)
 	if err != nil {
 		return err
+	}
+	if n != numWorkers {
+		nlog.Warningln(r.parent.Name(), "throttle num-workers:", n, "[ from", numWorkers, "]")
+		numWorkers = n
 	}
 	if numWorkers == nwpNone {
 		return nil
@@ -154,7 +154,8 @@ func (r *lrit) _iniNwp(numWorkers, confBurst int) {
 	}
 
 	// [burst] work channel capacity: up to 4 pending work items per
-	r.nwp.workCh = make(chan lrpair, max(min(numWorkers*nwpBurstMult, nwpBurstMax), confBurst))
+	chsize := cos.ClampInt(numWorkers*nwpBurstMult, confBurst, nwpBurstMax)
+	r.nwp.workCh = make(chan lrpair, chsize)
 	nlog.Infoln(r.parent.Name(), "workers:", numWorkers)
 }
 
@@ -172,16 +173,17 @@ func (r *lrit) _inipr(msg *apc.ListRange) error {
 		}
 		return err
 	}
-	if err := cmn.ValidatePrefix("bad list-range request", pt.Prefix); err != nil {
+	if err := cos.ValidatePrefix("bad list-range request", pt.Prefix); err != nil {
 		nlog.Errorln(err)
 		return err
 	}
-	if len(pt.Ranges) != 0 {
+	if pt.IsRange() {
 		r.pt = &pt
 		r.lrp = lrpRange
 		return nil
 	}
 pref:
+	debug.Assert(pt.IsPrefixOnly())
 	r.prefix = pt.Prefix
 	r.lrp = lrpPrefix
 	return nil
@@ -228,7 +230,7 @@ func (r *lrit) wait() {
 	r.nwp.wg.Wait()
 }
 
-func (r *lrit) done() bool { return r.parent.IsAborted() || r.parent.Finished() }
+func (r *lrit) done() bool { return r.parent.IsAborted() || r.parent.IsDone() }
 
 func (r *lrit) _list(wi lrwi, smap *meta.Smap) error {
 	r.lrp = lrpList
@@ -339,7 +341,7 @@ func (r *lrit) _prefix(wi lrwi, smap *meta.Smap) error {
 }
 
 func (r *lrit) do(lom *core.LOM, wi lrwi, smap *meta.Smap) (bool /*this lom done*/, error) {
-	if err := lom.InitBck(r.bck.Bucket()); err != nil {
+	if err := lom.InitBck(r.bck); err != nil {
 		return false, err
 	}
 	// (smap != nil) to filter non-locals

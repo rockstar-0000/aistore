@@ -5,16 +5,15 @@
 package ais
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/authn"
-	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -22,23 +21,64 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
+
+	onexxh "github.com/OneOfOne/xxhash"
 )
 
 type (
-	tokenList   authn.TokenList       // token strings
-	tkList      map[string]*tok.Token // tk structs
+	tokenList   authn.TokenList // token strings
 	authManager struct {
-		// cache of decrypted tokens
-		tkList tkList
+		// used for parsing and validating claims from token strings
+		tokenParser tok.Parser
+		// provides thread-safe access to a cache of decrypted token claims
+		tokenMap *shardedTokenMap
+		// provides thread-safe access to an underlying map of tokens
+		revokedTokens *RevokedTokensMap
+		// for canceling internal long-lived context
+		cancelCtx context.CancelFunc
+	}
+
+	RevokedTokensMap struct {
 		// list of invalid tokens(revoked or of deleted users)
 		// Authn sends these tokens to primary for broadcasting
 		revokedTokens map[string]bool
-		version       int64
-		// signing key secret
-		secret string
+		// latest revoked version
+		version int64
 		// lock
-		sync.Mutex
+		sync.RWMutex
 	}
+
+	shardedTokenMap struct {
+		// Shard tokens into separate maps for improved locking
+		shards []*tokenMap
+	}
+
+	tokenMap struct {
+		tokens map[string]*tok.AISClaims
+		sync.RWMutex
+	}
+)
+
+// TokenMapShardExponent is used to define the number of maps used for parallel locking of token -> claims
+// The actual number of shards will be equal to 2^TokenMapShardExponent
+const (
+	TokenMapShardExponent  = 4
+	TokenParserInitTimeout = 10 * time.Second
+)
+
+// Client defaults for issuer requests
+// Used for JWKS URL discovery and fetching
+// See cmn/client.go
+const (
+	// KeyCacheDialTimeout and KeyCacheTimeout are set for faster proxy startup in case of an unresponsive issuer service
+	KeyCacheDialTimeout = 5 * time.Second
+	KeyCacheTimeout     = 10 * time.Second
+
+	// KeyCacheIdleConnsPerHost overrides AIS client settings to match http.Transport.DefaultMaxIdleConnsPerHost
+	// Because of cached key sets, we don't expect to need idle connections to the same issuer host
+	KeyCacheIdleConnsPerHost = 2
+	// KeyCacheMaxIdleConnsLimit caps the maximum idle conns based on number of allowed issuers
+	KeyCacheMaxIdleConnsLimit = 16
 )
 
 /////////////////
@@ -46,107 +86,111 @@ type (
 /////////////////
 
 func newAuthManager(config *cmn.Config) *authManager {
-	return &authManager{
-		tkList:        make(tkList),
-		revokedTokens: make(map[string]bool), // TODO: preallocate
-		version:       1,
-		secret:        cos.Right(config.Auth.Secret, os.Getenv(env.AisAuthSecretKey)), // environment override
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	keyCacheClient := newKeyCacheClient(config)
+	keyCacheManager := tok.NewKeyCacheManager(config.Auth.OIDC, keyCacheClient, nil)
+	keyCacheManager.Init(rootCtx)
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), TokenParserInitTimeout)
+	defer cancel()
+	if err := keyCacheManager.PopulateJWKSCache(timeoutCtx); err != nil {
+		nlog.Errorf("Errors occurred while pre-populating JWKS key cache: %v", err)
 	}
+	return &authManager{
+		tokenParser:   tok.NewTokenParser(&config.Auth, keyCacheManager),
+		tokenMap:      newShardedTokenMap(TokenMapShardExponent),
+		revokedTokens: newRevokedTokensMap(),
+		cancelCtx:     rootCancel,
+	}
+}
+
+// Define the client used by the key cache manager for contacting token issuers
+func newKeyCacheClient(config *cmn.Config) *http.Client {
+	var tls cmn.TLSArgs
+	// Set our own certificate, key, and verification settings from AIS network config
+	if config.Net.HTTP.UseHTTPS {
+		tls = config.Net.HTTP.ToTLS()
+	} else {
+		tls = cmn.TLSArgs{
+			SkipVerify: false,
+		}
+	}
+	// Override the trusted CA for issuers if location provided
+	if config.Auth.OIDC != nil && config.Auth.OIDC.IssuerCA != "" {
+		tls.ClientCA = config.Auth.OIDC.IssuerCA
+	}
+	// Key cache client should never need more idle connections than configured issuers
+	// Set MaxIdleConns to limit the idle connections kept to issuers when we don't expect any subsequent requests
+	maxIdleConns := KeyCacheIdleConnsPerHost
+	if config.Auth.OIDC != nil && len(config.Auth.OIDC.AllowedIssuers) > maxIdleConns {
+		maxIdleConns = min(len(config.Auth.OIDC.AllowedIssuers), KeyCacheMaxIdleConnsLimit)
+	}
+
+	transport := cmn.TransportArgs{
+		DialTimeout:      KeyCacheDialTimeout,
+		Timeout:          KeyCacheTimeout,
+		IdleConnsPerHost: KeyCacheIdleConnsPerHost,
+		MaxIdleConns:     maxIdleConns,
+	}
+	return cmn.NewClientTLS(transport, tls, false)
+}
+
+func (a *authManager) stop() {
+	a.cancelCtx()
 }
 
 // Add tokens to the list of invalid ones and clean up the list from expired tokens.
-func (a *authManager) updateRevokedList(newRevoked *tokenList) (allRevoked *tokenList) {
-	a.Lock()
-	defer a.Unlock()
-
-	switch {
-	case newRevoked.Version == 0: // Manually revoked tokens
-		a.version++
-	case newRevoked.Version > a.version:
-		a.version = newRevoked.Version
-	default:
-		nlog.Errorf("Current token list v%d is greater than received v%d", a.version, newRevoked.Version)
+func (a *authManager) updateRevokedList(ctx context.Context, newRevoked *tokenList) (allRevoked *tokenList) {
+	// Add new revoked tokens -- error if invalid version
+	err := a.revokedTokens.update(newRevoked)
+	if err != nil {
 		return nil
 	}
-
-	// Add new revoked tokens and remove them from the valid token list.
-	for _, token := range newRevoked.Tokens {
-		a.revokedTokens[token] = true
-		delete(a.tkList, token)
-	}
-
-	allRevoked = &tokenList{
-		Tokens:  make([]string, 0, len(a.revokedTokens)),
-		Version: a.version,
-	}
-
-	// Clean up expired tokens from the revoked list.
-	now := time.Now()
-
-	for token := range a.revokedTokens {
-		tk, err := tok.DecryptToken(token, a.secret)
-		debug.AssertNoErr(err)
-		if tk.Expires.Before(now) {
-			delete(a.revokedTokens, token)
-		} else {
-			allRevoked.Tokens = append(allRevoked.Tokens, token)
-		}
-	}
-	if len(allRevoked.Tokens) == 0 {
-		allRevoked = nil
-	}
-	return allRevoked
+	// Remove revoked tokens from the token cache
+	a.tokenMap.deleteMultiple(newRevoked.Tokens)
+	// Clean up any expired tokens from the revoked list
+	return a.revokedTokens.cleanup(ctx, a.tokenParser)
 }
 
 func (a *authManager) revokedTokenList() (allRevoked *tokenList) {
-	a.Lock()
-	l := len(a.revokedTokens)
-	if l == 0 {
-		a.Unlock()
-		return
-	}
-	allRevoked = &tokenList{Tokens: make([]string, 0, l), Version: a.version}
-	for token := range a.revokedTokens {
-		allRevoked.Tokens = append(allRevoked.Tokens, token)
-	}
-	a.Unlock()
-	return
+	return a.revokedTokens.getAll()
 }
 
 // Checks if a token is valid:
 //   - must not be revoked one
 //   - must not be expired
-//   - must have all mandatory fields: userID, creds, issued, expires
+//   - must have valid JWT claims or equivalent: sub, iss, aud, exp
 //
-// Returns decrypted token information if it is valid
-func (a *authManager) validateToken(token string) (tk *tok.Token, err error) {
-	a.Lock()
-	if _, ok := a.revokedTokens[token]; ok {
-		tk, err = nil, fmt.Errorf("%v: %s", tok.ErrTokenRevoked, tk)
-	} else {
-		tk, err = a.validateAddRm(token, time.Now())
+// Caches and returns decoded token claims if it is valid
+func (a *authManager) validateToken(ctx context.Context, token string) (*tok.AISClaims, error) {
+	if a.revokedTokens.contains(token) {
+		return nil, fmt.Errorf("%w [err: %w]: %s", tok.ErrInvalidToken, tok.ErrTokenRevoked, token)
 	}
-	a.Unlock()
-	return
+	claims, ok := a.tokenMap.getClaims(token)
+	debug.Assert(!ok || claims != nil)
+	// If token string exists in cache, only need to check claim expiry
+	if ok && claims != nil {
+		if claims.IsExpired() {
+			// This takes a separate write lock than the previous read, but:
+			// - claims are immutable once cached
+			// - we only delete expired claims, never modify them
+			a.tokenMap.delete(token)
+			return nil, fmt.Errorf("%w [err: %w]: %s", tok.ErrInvalidToken, tok.ErrTokenExpired, token)
+		}
+		return claims, nil
+	}
+	return a.cacheNewToken(ctx, token)
 }
 
-// Decrypts and validates token. Adds it to authManager.token if not found. Removes if expired.
-// Must be called under lock.
-func (a *authManager) validateAddRm(token string, now time.Time) (*tok.Token, error) {
-	tk, ok := a.tkList[token]
-	if !ok || tk == nil {
-		var err error
-		if tk, err = tok.DecryptToken(token, a.secret); err != nil {
-			nlog.Errorln(err)
-			return nil, tok.ErrInvalidToken
-		}
-		a.tkList[token] = tk
+// Take a token string, validate the signature and claims, and add to the authManager cache
+func (a *authManager) cacheNewToken(ctx context.Context, token string) (claims *tok.AISClaims, err error) {
+	// Validate token signature and extract
+	claims, err = a.tokenParser.ValidateToken(ctx, token)
+	if err != nil {
+		return nil, err
 	}
-	if tk.Expires.Before(now) {
-		delete(a.tkList, token)
-		return nil, fmt.Errorf("%v: %s", tok.ErrTokenExpired, tk)
-	}
-	return tk, nil
+	// We aren't guaranteed someone else didn't do this, but worth a separate attempt to validate outside of lock
+	a.tokenMap.set(token, claims)
+	return claims, nil
 }
 
 ///////////////
@@ -168,31 +212,87 @@ func (t *tokenList) String() string    { return fmt.Sprintf("TokenList v%d", t.V
 // proxy cont-ed
 //
 
+// is called when authentication is being enabled at runtime to guard the transition
+//
+//	auth.enabled: false -> true
+//
+// - if the caller has a valid token under the current config, enabling auth is allowed unconditionally
+// - otherwise, we fail with one of the specific reasons (below)
+// - note that enabling cluster-key signing (auth.cluster_key.*) is handled separately
+
+func (p *proxy) validateEnableAuth(r *http.Request, clone *cmn.AuthConf, toUpdate *cmn.AuthConfToSet) (int, error) {
+	if clone.Enabled || toUpdate == nil || toUpdate.Enabled == nil || !*toUpdate.Enabled {
+		debug.Assertf(false, "%v %+v", clone.Enabled, toUpdate)
+		return 0, nil
+	}
+
+	claims, err := p.validateToken(r.Context(), r.Header)
+	if err != nil || claims == nil {
+		reason := "no claims in provided token"
+		if err != nil {
+			reason = err.Error()
+		}
+		return http.StatusUnauthorized, fmt.Errorf("enabling JWT/OIDC auth requires a valid token (%s)", reason)
+	}
+	if !claims.IsAdmin {
+		return http.StatusUnauthorized, errors.New("enabling JWT/OIDC auth requires a token with an 'admin' claim")
+	}
+
+	// apply and check
+	if e := cmn.CopyProps(toUpdate, clone, apc.Cluster); e != nil {
+		return 0, e
+	}
+
+	// validate config
+	err = clone.Validate()
+	if err != nil {
+		return http.StatusUnauthorized, fmt.Errorf("enabling JWT/OIDC auth requires valid config (%s)", err)
+	}
+	return 0, nil
+}
+
 // [METHOD] /v1/tokens
 func (p *proxy) tokenHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
-		p.validateSecret(w, r)
+		p.validateKey(w, r)
 	case http.MethodDelete:
 		p.delToken(w, r)
 	default:
-		cmn.WriteErr405(w, r, http.MethodDelete)
+		cmn.WriteErr405(w, r, http.MethodPost, http.MethodDelete)
 	}
 }
 
-func (p *proxy) validateSecret(w http.ResponseWriter, r *http.Request) {
+// Given a secret key or a public key, validate if that key is valid for requests to this cluster
+func (p *proxy) validateKey(w http.ResponseWriter, r *http.Request) {
 	if _, err := p.parseURL(w, r, apc.URLPathTokens.L, 0, false); err != nil {
 		return
 	}
 
-	cluConf := &authn.ServerConf{}
-	if err := cmn.ReadJSON(w, r, cluConf); err != nil {
+	reqConf := &authn.ServerConf{}
+	if err := cmn.ReadJSON(w, r, reqConf); err != nil {
 		return
 	}
 
-	cksumVal := cos.ChecksumB2S(cos.UnsafeB(p.authn.secret), cos.ChecksumSHA256)
-	if cksumVal != cluConf.Secret {
-		p.writeErrf(w, r, "%s: invalid secret sha256(%q)", p, cos.SHead(cluConf.Secret))
+	if reqConf.Secret == "" && reqConf.PubKey == nil {
+		p.writeErrf(w, r, "no secret or public key provided to validate")
+		return
+	}
+	if reqConf.Secret != "" {
+		if !p.authn.tokenParser.IsSecretCksumValid(reqConf.Secret) {
+			p.writeErrf(w, r, "%s: invalid secret sha256(%q)", p, cos.SHead(reqConf.Secret))
+		}
+	}
+	if reqConf.PubKey != nil {
+		valid, err := p.authn.tokenParser.IsPublicKeyValid(*reqConf.PubKey)
+		if err != nil {
+			p.writeErrf(w, r, "%s: invalid public key (%q)", p, cos.SHead(*reqConf.PubKey))
+			return
+		}
+		if !valid {
+			p.writeErrf(w, r, "%s: provided public key (%q) does not match cluster's public key", p, cos.SHead(*reqConf.PubKey))
+			return
+		}
 	}
 }
 
@@ -207,25 +307,26 @@ func (p *proxy) delToken(w http.ResponseWriter, r *http.Request) {
 	if err := cmn.ReadJSON(w, r, tokenList); err != nil {
 		return
 	}
-	allRevoked := p.authn.updateRevokedList(tokenList)
+	allRevoked := p.authn.updateRevokedList(r.Context(), tokenList)
 	if allRevoked != nil && p.owner.smap.get().isPrimary(p.si) {
 		msg := p.newAmsgStr(apc.ActNewPrimary, nil)
 		_ = p.metasyncer.sync(revsPair{allRevoked, msg})
 	}
 }
 
-// Validates a token from the request header
-func (p *proxy) validateToken(hdr http.Header) (*tok.Token, error) {
-	token, err := tok.ExtractToken(hdr)
+// Validates a token from the request header.
+// Supports both standard Bearer tokens and X-Amz-Security-Token
+// as fallback for AWS SDK compatibility.
+func (p *proxy) validateToken(ctx context.Context, hdr http.Header) (*tok.AISClaims, error) {
+	tokenHdr, err := tok.ExtractToken(hdr)
 	if err != nil {
 		return nil, err
 	}
-	tk, err := p.authn.validateToken(token)
+	claims, err := p.authn.validateToken(ctx, tokenHdr.Token)
 	if err != nil {
-		nlog.Errorf("invalid token: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("invalid token from header %q: %w ", tokenHdr.Header, err)
 	}
-	return tk, nil
+	return claims, nil
 }
 
 // When AuthN is on, accessing a bucket requires two permissions:
@@ -239,9 +340,12 @@ func (p *proxy) validateToken(hdr http.Header) (*tok.Token, error) {
 //	- read-only access to a bucket is always granted
 //	- PATCH cannot be forbidden
 func (p *proxy) checkAccess(w http.ResponseWriter, r *http.Request, bck *meta.Bck, ace apc.AccessAttrs) (err error) {
-	if err = p.access(r.Header, bck, ace); err != nil {
-		p.writeErr(w, r, err, aceErrToCode(err))
+	if err = p.access(r.Context(), r.Header, bck, ace); err != nil {
+		// Use writeErrMsg (with the combined message from wrapped errors) instead of writeErr
+		// aceErrToCode parses code from the type so additional status code parsing is not necessary
+		p.writeErrMsg(w, r, err.Error(), aceErrToCode(err))
 	}
+
 	return
 }
 
@@ -256,20 +360,24 @@ func aceErrToCode(err error) (status int) {
 	return status
 }
 
-func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err error) {
+// Validate the given header contains a token allowing access to the given bucket with the requested permissions
+// All failures must be logged at this level
+func (p *proxy) access(ctx context.Context, hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err error) {
 	var (
-		tk     *tok.Token
+		claims *tok.AISClaims
 		bucket *cmn.Bck
 	)
 	if p.checkIntraCall(hdr, false /*from primary*/) == nil {
 		return nil
 	}
 	if cmn.Rom.AuthEnabled() { // config.Auth.Enabled
-		tk, err = p.validateToken(hdr)
+		claims, err = p.validateToken(ctx, hdr)
 		if err != nil {
 			// NOTE: making exception to allow 3rd party clients read remote ht://bucket
-			if err == tok.ErrNoToken && bck != nil && bck.IsHT() {
+			if errors.Is(err, tok.ErrNoToken) && bck != nil && bck.IsHT() {
 				err = nil
+			} else {
+				nlog.Warningln("token validation failed:", err)
 			}
 			return err
 		}
@@ -277,7 +385,8 @@ func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err
 		if bck != nil {
 			bucket = bck.Bucket()
 		}
-		if err := tk.CheckPermissions(uid, bucket, ace); err != nil {
+		if err = claims.CheckPermissions(uid, bucket, ace); err != nil {
+			nlog.Warningln("access permission check failed:", err)
 			return err
 		}
 	}
@@ -290,12 +399,185 @@ func (p *proxy) access(hdr http.Header, bck *meta.Bck, ace apc.AccessAttrs) (err
 	// - without AuthN: read-only access, PATCH, and ACL
 	// - with AuthN:    superuser can PATCH and change ACL
 	if !cmn.Rom.AuthEnabled() {
-		ace &^= (apc.AcePATCH | apc.AceBckSetACL | apc.AccessRO)
-	} else if tk.IsAdmin {
-		ace &^= (apc.AcePATCH | apc.AceBckSetACL)
+		ace &^= apc.AcePATCH | apc.AceBckSetACL | apc.AccessRO
+	} else if claims != nil && claims.IsAdmin {
+		ace &^= apc.AcePATCH | apc.AceBckSetACL
 	}
 	if ace == 0 {
 		return nil
 	}
-	return bck.Allow(ace)
+	err = bck.Allow(ace)
+	if err != nil {
+		nlog.Warningln("bucket ACL check failed:", err)
+	}
+	return err
+}
+
+/////////////////////
+// shardedTokenMap //
+/////////////////////
+
+func newShardedTokenMap(exponent int) *shardedTokenMap {
+	// Force size to be a power of 2 so we can use bitmask
+	size := 1 << exponent
+	shardedMap := &shardedTokenMap{
+		shards: make([]*tokenMap, size),
+	}
+	for i := range size {
+		shardedMap.shards[i] = newTokenMap()
+	}
+	return shardedMap
+}
+
+func (sm *shardedTokenMap) getClaims(token string) (*tok.AISClaims, bool) {
+	m := sm.shards[sm.getShardIndex(token)]
+	m.RLock()
+	claims, ok := m.tokens[token]
+	m.RUnlock()
+	return claims, ok
+}
+
+func (sm *shardedTokenMap) set(token string, claims *tok.AISClaims) {
+	m := sm.shards[sm.getShardIndex(token)]
+	m.Lock()
+	m.tokens[token] = claims
+	m.Unlock()
+}
+
+func (sm *shardedTokenMap) delete(token string) {
+	m := sm.shards[sm.getShardIndex(token)]
+	m.Lock()
+	delete(m.tokens, token)
+	m.Unlock()
+}
+
+func (sm *shardedTokenMap) deleteMultiple(tokens []string) {
+	if len(tokens) == 0 {
+		return
+	}
+	// Map from shard index to slice of tokens to delete in that shard
+	shardTokens := make(map[int][]string)
+	for _, token := range tokens {
+		idx := sm.getShardIndex(token)
+		shardTokens[idx] = append(shardTokens[idx], token)
+	}
+
+	// Delete from each touched shard
+	for idx, tkList := range shardTokens {
+		tm := sm.shards[idx]
+		tm.Lock()
+		for _, token := range tkList {
+			delete(tm.tokens, token)
+		}
+		tm.Unlock()
+	}
+}
+
+func (sm *shardedTokenMap) getShardIndex(token string) int {
+	tkHash := onexxh.ChecksumString64(token)
+	// Pick a shard by bitmasking against the total number (power of 2)
+	return int(tkHash & uint64(len(sm.shards)-1))
+}
+
+//////////////
+// tokenMap //
+//////////////
+
+func newTokenMap() *tokenMap {
+	return &tokenMap{
+		tokens: make(map[string]*tok.AISClaims),
+	}
+}
+
+//////////////////////
+// RevokedTokensMap //
+//////////////////////
+
+func newRevokedTokensMap() *RevokedTokensMap {
+	return &RevokedTokensMap{
+		revokedTokens: make(map[string]bool),
+		version:       1,
+	}
+}
+
+func (r *RevokedTokensMap) update(newRevoked *tokenList) error {
+	// Lock over the whole operation as we must verify the final updated version matches the version number
+	r.Lock()
+	defer r.Unlock()
+	err := r.updateVersion(newRevoked)
+	if err != nil {
+		return err
+	}
+	for _, token := range newRevoked.Tokens {
+		r.revokedTokens[token] = true
+	}
+	return nil
+}
+
+// Must be called under lock
+func (r *RevokedTokensMap) updateVersion(newRevoked *tokenList) error {
+	currentVersion := r.version
+	switch {
+	case newRevoked.Version == 0:
+		r.version++
+		return nil
+	case newRevoked.Version > currentVersion:
+		r.version = newRevoked.Version
+		return nil
+	case newRevoked.Version == currentVersion:
+		nlog.Warningf("received token list v%d equal to current token list v%d, ignoring", newRevoked.Version, currentVersion)
+	default:
+		nlog.Errorf("received token list v%d less than current token list v%d", newRevoked.Version, currentVersion)
+	}
+	return fmt.Errorf("received invalid token list version v%d compared to current token list v%d", newRevoked.Version, currentVersion)
+}
+
+func (r *RevokedTokensMap) cleanup(ctx context.Context, tkParser tok.Parser) (allRevoked *tokenList) {
+	r.Lock()
+	defer r.Unlock()
+	allRevoked = &tokenList{
+		Tokens:  make([]string, 0, len(r.revokedTokens)),
+		Version: r.version,
+	}
+
+	// Clean up expired tokens from the revoked list.
+	for token := range r.revokedTokens {
+		_, err := tkParser.ValidateToken(ctx, token)
+		switch {
+		case errors.Is(err, tok.ErrTokenExpired):
+			delete(r.revokedTokens, token)
+		case err == nil:
+			allRevoked.Tokens = append(allRevoked.Tokens, token)
+		default:
+			// Keep tokens if error validating that's not expiration
+			// We don't want to un-revoke this token in case expected claims revert to previous
+			allRevoked.Tokens = append(allRevoked.Tokens, token)
+			nlog.Errorf("Unexpected token validation error: %v (token: %s)", err, token)
+		}
+	}
+	if len(allRevoked.Tokens) == 0 {
+		allRevoked = nil
+	}
+	return allRevoked
+}
+
+func (r *RevokedTokensMap) contains(token string) bool {
+	r.RLock()
+	_, ok := r.revokedTokens[token]
+	r.RUnlock()
+	return ok
+}
+
+func (r *RevokedTokensMap) getAll() *tokenList {
+	r.RLock()
+	defer r.RUnlock()
+	l := len(r.revokedTokens)
+	if l == 0 {
+		return nil
+	}
+	allRevoked := &tokenList{Tokens: make([]string, 0, l), Version: r.version}
+	for token := range r.revokedTokens {
+		allRevoked.Tokens = append(allRevoked.Tokens, token)
+	}
+	return allRevoked
 }

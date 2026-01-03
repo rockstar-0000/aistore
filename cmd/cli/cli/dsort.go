@@ -6,13 +6,10 @@
 package cli
 
 import (
-	"bytes"
 	jsonStd "encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -21,20 +18,17 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
 	"github.com/NVIDIA/aistore/cmn"
-	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/xact"
 
-	jsoniter "github.com/json-iterator/go"
 	"github.com/urfave/cli"
 	"github.com/vbauerster/mpb/v4"
 	"github.com/vbauerster/mpb/v4/decor"
-	"gopkg.in/yaml.v2"
 )
 
 const (
-	dsortExampleJ = `$ ais start dsort '{
+	dsortExampleJ = `$ ais start dsort --spec '{
 			"input_extension": ".tar",
 			"input_bck": {"name": "dsort-testing"},
 			"input_format": {"template": "shard-{0..9}"},
@@ -111,69 +105,31 @@ var phasesOrdered = [...]string{
 
 func startDsortHandler(c *cli.Context) error {
 	var (
-		specPath       string
-		specBytes      []byte
-		shift          int
-		srcbck, dstbck cmn.Bck
-		spec           dsort.RequestSpec
+		srcbck cmn.Bck
+		dstbck cmn.Bck
+		spec   dsort.RequestSpec
 	)
-	// parse command line
-	specPath = parseStrFlag(c, dsortSpecFlag)
-	if c.NArg() == 0 && specPath == "" {
-		return fmt.Errorf("missing %q argument (see %s for details and usage examples)",
-			c.Command.ArgsUsage, qflprn(cli.HelpFlag))
+
+	// Load spec (required)
+	specBytes, ext, err := loadSpec(c)
+	if err != nil {
+		return err
 	}
-	if specPath == "" {
-		// spec is inline
-		specBytes = []byte(c.Args().Get(0))
-		shift = 1
-	}
-	if c.NArg() > shift {
-		var err error
-		srcbck, err = parseBckURI(c, c.Args().Get(shift), true)
-		if err != nil {
-			return fmt.Errorf("failed to parse source bucket: %v\n(see %s for details)",
-				err, qflprn(cli.HelpFlag))
-		}
-	}
-	if c.NArg() > shift+1 {
-		var err error
-		dstbck, err = parseBckURI(c, c.Args().Get(shift+1), true)
-		if err != nil {
-			return fmt.Errorf("failed to parse destination bucket: %v\n(see %s for details)",
-				err, qflprn(cli.HelpFlag))
-		}
+	if err := parseSpec(ext, specBytes, &spec); err != nil {
+		return err
 	}
 
-	// load spec from file or standard input
-	if specPath != "" {
-		var r io.Reader
-		if specPath == fileStdIO {
-			r = os.Stdin
-		} else {
-			f, err := os.Open(specPath)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			r = f
+	// Parse command line: source and destination buckets
+	if c.NArg() > 0 {
+		srcbck, err = parseBckURI(c, c.Args().Get(0), true)
+		if err != nil {
+			return fmt.Errorf("failed to parse source bucket: %v", err)
 		}
-
-		var b bytes.Buffer
-		// Read at most 1MB so we don't blow up when reading don't know what
-		if _, errV := io.CopyN(&b, r, cos.MiB); errV == nil {
-			return errors.New("file too big")
-		} else if errV != io.EOF {
-			return errV
-		}
-		specBytes = b.Bytes()
 	}
-	if errj := jsoniter.Unmarshal(specBytes, &spec); errj != nil {
-		if erry := yaml.Unmarshal(specBytes, &spec); erry != nil {
-			return fmt.Errorf(
-				"failed to determine the type of the job specification, errs: (%v, %v)",
-				errj, erry,
-			)
+	if c.NArg() > 1 {
+		dstbck, err = parseBckURI(c, c.Args().Get(1), true)
+		if err != nil {
+			return fmt.Errorf("failed to parse destination bucket: %v", err)
 		}
 	}
 
@@ -695,7 +651,7 @@ func dsortJobStatus(c *cli.Context, id string) error {
 				return err
 			}
 
-			fmt.Fprintf(c.App.Writer, "\n")
+			fmt.Fprintln(c.App.Writer)
 			return printCondensedStats(c, id, units, false)
 		}
 		return printCondensedStats(c, id, units, true)
@@ -707,12 +663,18 @@ func dsortJobStatus(c *cli.Context, id string) error {
 
 	rate := _refreshRate(c)
 	if logging {
-		file, err := cos.CreateFile(c.String(dsortLogFlag.Name))
+		logFname := parseStrFlag(c, dsortLogFlag)
+		ww, wfh, err := createDstFile(c, logFname, true /*allow stdout*/)
 		if err != nil {
+			if err == errUserCancel {
+				return nil
+			}
 			return err
 		}
-		w = file
-		defer file.Close()
+		w = ww
+		if wfh != nil {
+			defer wfh.Close()
+		}
 	}
 
 	var (
